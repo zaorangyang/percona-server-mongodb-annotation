@@ -41,6 +41,7 @@ namespace mongo {
 
 using Parser = DocumentSource::Parser;
 using boost::intrusive_ptr;
+using std::list;
 using std::string;
 using std::vector;
 
@@ -60,7 +61,7 @@ void DocumentSource::registerParser(string name, Parser parser) {
     parserMap[name] = parser;
 }
 
-vector<intrusive_ptr<DocumentSource>> DocumentSource::parse(
+list<intrusive_ptr<DocumentSource>> DocumentSource::parse(
     const intrusive_ptr<ExpressionContext>& expCtx, BSONObj stageObj) {
     uassert(16435,
             "A pipeline stage specification object must contain exactly one field.",
@@ -164,7 +165,7 @@ Pipeline::SourceContainer::iterator DocumentSource::optimizeAt(
     Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
     invariant(*itr == this && (std::next(itr) != container->end()));
     auto nextMatch = dynamic_cast<DocumentSourceMatch*>((*std::next(itr)).get());
-    if (canSwapWithMatch() && nextMatch && !nextMatch->isTextQuery()) {
+    if (constraints().canSwapWithMatch && nextMatch && !nextMatch->isTextQuery()) {
         // We're allowed to swap with a $match and the stage after us is a $match. Furthermore, the
         // $match does not contain a text search predicate, which we do not attempt to optimize
         // because such a $match must already be the first stage in the pipeline. We can attempt to

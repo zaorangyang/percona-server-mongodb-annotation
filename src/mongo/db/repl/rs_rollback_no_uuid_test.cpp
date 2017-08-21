@@ -74,6 +74,8 @@ public:
     BSONObj findOne(const NamespaceString& nss, const BSONObj& filter) const override;
     void copyCollectionFromRemote(OperationContext* opCtx,
                                   const NamespaceString& nss) const override;
+    StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+                                                const UUID& uuid) const override;
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
 
 private:
@@ -109,6 +111,11 @@ BSONObj RollbackSourceMock::findOne(const NamespaceString& nss, const BSONObj& f
 
 void RollbackSourceMock::copyCollectionFromRemote(OperationContext* opCtx,
                                                   const NamespaceString& nss) const {}
+
+StatusWith<BSONObj> RollbackSourceMock::getCollectionInfoByUUID(const std::string& db,
+                                                                const UUID& uuid) const {
+    return BSON("info" << BSON("uuid" << uuid) << "options" << BSONObj());
+}
 
 StatusWith<BSONObj> RollbackSourceMock::getCollectionInfo(const NamespaceString& nss) const {
     return BSON("name" << nss.ns() << "options" << BSONObj());
@@ -528,7 +535,7 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommandIndexNotInCatalog) {
     }
 }
 
-TEST_F(RSRollbackTest, RollbackCreateIndexCommandMissingNamespace) {
+TEST_F(RSRollbackTest, RollbackInsertSystemIndexesMissingNamespace) {
     createOplog(_opCtx.get());
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
@@ -571,6 +578,55 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommandMissingNamespace) {
         1, countLogLinesContaining("Missing collection namespace in system.indexes operation,"));
     ASSERT_FALSE(rollbackSource.called);
 }
+
+TEST_F(RSRollbackTest, RollbackCreateIndexCommandInvalidNamespace) {
+    createOplog(_opCtx.get());
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+    auto createIndexesOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 1LL << "op"
+                                 << "c"
+                                 << "ns"
+                                 << "test.$cmd"
+                                 << "o"
+                                 << BSON("createIndexes"
+                                         << ""
+                                         << "key"
+                                         << BSON("a" << 1)
+                                         << "name"
+                                         << "a_1")),
+                       RecordId(2));
+    class RollbackSourceLocal : public RollbackSourceMock {
+    public:
+        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
+            : RollbackSourceMock(std::move(oplog)), called(false) {}
+        void copyCollectionFromRemote(OperationContext* opCtx,
+                                      const NamespaceString& nss) const override {
+            called = true;
+        }
+        mutable bool called;
+
+    private:
+        BSONObj _documentAtSource;
+    };
+    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+    startCapturingLogMessages();
+    auto status = syncRollbackNoUUID(_opCtx.get(),
+                                     OplogInterfaceMock({createIndexesOperation, commonOperation}),
+                                     rollbackSource,
+                                     {},
+                                     _coordinator,
+                                     _replicationProcess.get());
+    stopCapturingLogMessages();
+    ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status.code());
+    ASSERT_EQUALS(18752, status.location());
+    ASSERT_EQUALS(
+        1, countLogLinesContaining("Invalid collection namespace in createIndexes operation,"));
+    ASSERT_FALSE(rollbackSource.called);
+}
+
 
 TEST_F(RSRollbackTest, RollbackDropIndexCommandWithOneIndex) {
     createOplog(_opCtx.get());
@@ -710,7 +766,7 @@ TEST_F(RSRollbackTest, RollbackDropIndexCommandWithMultipleIndexes) {
     ASSERT(rollbackSource.called);
 }
 
-TEST_F(RSRollbackTest, RollbackCreateIndexCommandInvalidNamespace) {
+TEST_F(RSRollbackTest, RollbackInsertSystemIndexesCommandInvalidNamespace) {
     createOplog(_opCtx.get());
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
@@ -754,7 +810,7 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommandInvalidNamespace) {
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status.code());
     ASSERT_EQUALS(18752, status.location());
     ASSERT_EQUALS(
-        1, countLogLinesContaining("Invalid collection namespace in system.indexes operation,"));
+        1, countLogLinesContaining("Invalid collection namespace in createIndexes operation,"));
     ASSERT_FALSE(rollbackSource.called);
 }
 
@@ -799,7 +855,7 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommandMissingIndexName) {
     stopCapturingLogMessages();
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status.code());
     ASSERT_EQUALS(18752, status.location());
-    ASSERT_EQUALS(1, countLogLinesContaining("Missing index name in system.indexes operation,"));
+    ASSERT_EQUALS(1, countLogLinesContaining("Missing index name in createIndexes operation,"));
     ASSERT_FALSE(rollbackSource.called);
 }
 

@@ -45,6 +45,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/client/version_manager.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/create_database_gen.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
@@ -229,6 +230,7 @@ StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGather(
     const boost::optional<BSONObj> query,
     const boost::optional<BSONObj> collation,
     const bool appendShardVersion,
+    const bool retryOnStaleShardVersion,
     BSONObj* viewDefinition) {
 
     // If a NamespaceString is specified, it must match the dbName.
@@ -276,7 +278,8 @@ StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGather(
                            << " while dispatching " << redact(cmdObj) << " after " << numAttempts
                            << " dispatch attempts";
                 }
-            } while (numAttempts < kMaxNumStaleVersionRetries && !swResponses.getStatus().isOK());
+            } while (retryOnStaleShardVersion && numAttempts < kMaxNumStaleVersionRetries &&
+                     !swResponses.getStatus().isOK());
 
             return swResponses;
         }
@@ -404,13 +407,13 @@ bool appendEmptyResultSet(BSONObjBuilder& result, Status status, const std::stri
     return Command::appendCommandStatus(result, status);
 }
 
-std::vector<NamespaceString> getAllShardedCollectionsForDb(OperationContext* opCtx,
-                                                           StringData dbName) {
+std::vector<NamespaceString> getAllShardedCollectionsForDb(
+    OperationContext* opCtx, StringData dbName, const repl::ReadConcernLevel& readConcern) {
     const auto dbNameStr = dbName.toString();
 
     std::vector<CollectionType> collectionsOnConfig;
-    uassertStatusOK(Grid::get(opCtx)->catalogClient(opCtx)->getCollections(
-        opCtx, &dbNameStr, &collectionsOnConfig, nullptr));
+    uassertStatusOK(Grid::get(opCtx)->catalogClient()->getCollections(
+        opCtx, &dbNameStr, &collectionsOnConfig, nullptr, readConcern));
 
     std::vector<NamespaceString> collectionsToReturn;
     for (const auto& coll : collectionsOnConfig) {
@@ -437,8 +440,20 @@ CachedCollectionRoutingInfo getShardedCollection(OperationContext* opCtx,
 StatusWith<CachedDatabaseInfo> createShardDatabase(OperationContext* opCtx, StringData dbName) {
     auto dbStatus = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName);
     if (dbStatus == ErrorCodes::NamespaceNotFound) {
+        ConfigsvrCreateDatabase configCreateDatabaseRequest;
+        configCreateDatabaseRequest.set_configsvrCreateDatabase(dbName);
+
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+
         auto createDbStatus =
-            Grid::get(opCtx)->catalogClient(opCtx)->createDatabase(opCtx, dbName.toString());
+            uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+                                opCtx,
+                                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                "admin",
+                                configCreateDatabaseRequest.toBSON(),
+                                Shard::RetryPolicy::kIdempotent))
+                .commandStatus;
+
         if (createDbStatus.isOK() || createDbStatus == ErrorCodes::NamespaceExists) {
             dbStatus = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName);
         } else {

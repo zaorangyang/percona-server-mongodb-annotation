@@ -28,9 +28,9 @@
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
-#include <third_party/murmurhash3/MurmurHash3.h>
-
 #include "mongo/platform/basic.h"
+
+#include "mongo/db/catalog/private/record_store_validate_adaptor.h"
 
 #include "mongo/db/catalog/collection_impl.h"
 
@@ -162,8 +162,6 @@ using std::string;
 using std::vector;
 
 using logger::LogComponent;
-
-static const int IndexKeyMaxSize = 1024;  // this goes away with SERVER-3372
 
 CollectionImpl::CollectionImpl(Collection* _this_init,
                                OperationContext* opCtx,
@@ -541,8 +539,12 @@ Status CollectionImpl::aboutToDeleteCapped(OperationContext* opCtx,
     return Status::OK();
 }
 
-void CollectionImpl::deleteDocument(
-    OperationContext* opCtx, const RecordId& loc, OpDebug* opDebug, bool fromMigrate, bool noWarn) {
+void CollectionImpl::deleteDocument(OperationContext* opCtx,
+                                    StmtId stmtId,
+                                    const RecordId& loc,
+                                    OpDebug* opDebug,
+                                    bool fromMigrate,
+                                    bool noWarn) {
     if (isCapped()) {
         log() << "failing remove on a capped ns " << _ns;
         uasserted(10089, "cannot remove from a capped collection");
@@ -566,7 +568,7 @@ void CollectionImpl::deleteDocument(
     _recordStore->deleteRecord(opCtx, loc);
 
     getGlobalServiceContext()->getOpObserver()->onDelete(
-        opCtx, ns(), uuid(), std::move(deleteState), fromMigrate);
+        opCtx, ns(), uuid(), stmtId, std::move(deleteState), fromMigrate);
 }
 
 Counter64 moveCounter;
@@ -1000,239 +1002,157 @@ const CollatorInterface* CollectionImpl::getDefaultCollator() const {
 
 namespace {
 
-static const uint32_t kKeyCountTableSize = 1U << 22;
-
-using IndexKeyCountTable = std::array<uint64_t, kKeyCountTableSize>;
 using ValidateResultsMap = std::map<std::string, ValidateResults>;
 
-class RecordStoreValidateAdaptor : public ValidateAdaptor {
-public:
-    RecordStoreValidateAdaptor(OperationContext* opCtx,
-                               ValidateCmdLevel level,
-                               IndexCatalog* ic,
-                               ValidateResultsMap* irm)
-        : _opCtx(opCtx), _level(level), _indexCatalog(ic), _indexNsResultsMap(irm) {
-        _ikc = stdx::make_unique<IndexKeyCountTable>();
+void _validateRecordStore(OperationContext* opCtx,
+                          RecordStore* recordStore,
+                          ValidateCmdLevel level,
+                          bool background,
+                          RecordStoreValidateAdaptor* indexValidator,
+                          ValidateResults* results,
+                          BSONObjBuilder* output) {
+
+    // Validate RecordStore and, if `level == kValidateFull`, use the RecordStore's validate
+    // function.
+    if (background) {
+        indexValidator->traverseRecordStore(recordStore, level, results, output);
+    } else {
+        auto status = recordStore->validate(opCtx, level, indexValidator, results, output);
+        // RecordStore::validate always returns Status::OK(). Errors are reported through
+        // `results`.
+        dassert(status.isOK());
     }
+}
 
-    virtual Status validate(const RecordId& recordId, const RecordData& record, size_t* dataSize) {
-        BSONObj recordBson = record.toBson();
+void _validateIndexes(OperationContext* opCtx,
+                      IndexCatalog* indexCatalog,
+                      BSONObjBuilder* keysPerIndex,
+                      RecordStoreValidateAdaptor* indexValidator,
+                      ValidateCmdLevel level,
+                      ValidateResultsMap* indexNsResultsMap,
+                      ValidateResults* results) {
 
-        const Status status = validateBSON(
-            recordBson.objdata(), recordBson.objsize(), Validator<BSONObj>::enabledBSONVersion());
-        if (status.isOK()) {
-            *dataSize = recordBson.objsize();
+    IndexCatalog::IndexIterator i = indexCatalog->getIndexIterator(opCtx, false);
+
+    // Validate Indexes.
+    while (i.more()) {
+        opCtx->checkForInterrupt();
+        const IndexDescriptor* descriptor = i.next();
+        log(LogComponent::kIndex) << "validating index " << descriptor->indexNamespace() << endl;
+        IndexAccessMethod* iam = indexCatalog->getIndex(descriptor);
+        ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexNamespace()];
+        bool checkCounts = false;
+        int64_t numTraversedKeys;
+        int64_t numValidatedKeys;
+
+        if (level == kValidateFull) {
+            iam->validate(opCtx, &numValidatedKeys, &curIndexResults);
+            checkCounts = true;
+        }
+
+        if (curIndexResults.valid) {
+            indexValidator->traverseIndex(iam, descriptor, &curIndexResults, &numTraversedKeys);
+
+            if (checkCounts && (numValidatedKeys != numTraversedKeys)) {
+                curIndexResults.valid = false;
+                string msg = str::stream()
+                    << "number of traversed index entries (" << numTraversedKeys
+                    << ") does not match the number of expected index entries (" << numValidatedKeys
+                    << ")";
+                results->errors.push_back(msg);
+                results->valid = false;
+            }
+
+            if (curIndexResults.valid) {
+                keysPerIndex->appendNumber(descriptor->indexNamespace(),
+                                           static_cast<long long>(numTraversedKeys));
+            } else {
+                results->valid = false;
+            }
         } else {
-            return status;
-        }
-
-        if (_level != kValidateFull || !_indexCatalog->haveAnyIndexes()) {
-            return status;
-        }
-
-        IndexCatalog::IndexIterator i = _indexCatalog->getIndexIterator(_opCtx, false);
-
-        while (i.more()) {
-            const IndexDescriptor* descriptor = i.next();
-            const string indexNs = descriptor->indexNamespace();
-            ValidateResults& results = (*_indexNsResultsMap)[indexNs];
-            if (!results.valid) {
-                // No point doing additional validation if the index is already invalid.
-                continue;
-            }
-
-            const IndexAccessMethod* iam = _indexCatalog->getIndex(descriptor);
-
-            if (descriptor->isPartial()) {
-                const IndexCatalogEntry* ice = _indexCatalog->getEntry(descriptor);
-                if (!ice->getFilterExpression()->matchesBSON(recordBson)) {
-                    continue;
-                }
-            }
-
-            BSONObjSet documentKeySet = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-            // There's no need to compute the prefixes of the indexed fields that cause the
-            // index to be multikey when validating the index keys.
-            MultikeyPaths* multikeyPaths = nullptr;
-            iam->getKeys(recordBson,
-                         IndexAccessMethod::GetKeysMode::kEnforceConstraints,
-                         &documentKeySet,
-                         multikeyPaths);
-
-            if (!descriptor->isMultikey(_opCtx) && documentKeySet.size() > 1) {
-                string msg = str::stream() << "Index " << descriptor->indexName()
-                                           << " is not multi-key but has more than one"
-                                           << " key in document " << recordId;
-                results.errors.push_back(msg);
-                results.valid = false;
-            }
-
-            uint32_t indexNsHash;
-            const auto& pattern = descriptor->keyPattern();
-            const Ordering ord = Ordering::make(pattern);
-            MurmurHash3_x86_32(indexNs.c_str(), indexNs.size(), 0, &indexNsHash);
-
-            for (const auto& key : documentKeySet) {
-                if (key.objsize() >= IndexKeyMaxSize) {
-                    // Index keys >= 1024 bytes are not indexed.
-                    _longKeys[indexNs]++;
-                    continue;
-                }
-
-                // We want to use the latest version of KeyString here.
-                KeyString ks(KeyString::kLatestVersion, key, ord, recordId);
-                uint32_t indexEntryHash = hashIndexEntry(ks, indexNsHash);
-                uint64_t& indexEntryCount = (*_ikc)[indexEntryHash];
-                if (indexEntryCount != 0) {
-                    indexEntryCount--;
-                    dassert(indexEntryCount >= 0);
-                    if (indexEntryCount == 0) {
-                        _indexKeyCountTableNumEntries--;
-                    }
-                } else {
-                    _hasDocWithoutIndexEntry = true;
-                    results.valid = false;
-                }
-            }
-        }
-        return status;
-    }
-
-    bool tooManyIndexEntries() const {
-        return _indexKeyCountTableNumEntries != 0;
-    }
-
-    bool tooFewIndexEntries() const {
-        return _hasDocWithoutIndexEntry;
-    }
-
-    /**
-     * Traverse the index to validate the entries and cache index keys for later use.
-     */
-    void traverseIndex(const IndexAccessMethod* iam,
-                       const IndexDescriptor* descriptor,
-                       ValidateResults& results,
-                       long long numKeys) {
-        auto indexNs = descriptor->indexNamespace();
-        _keyCounts[indexNs] = numKeys;
-
-        uint32_t indexNsHash;
-        MurmurHash3_x86_32(indexNs.c_str(), indexNs.size(), 0, &indexNsHash);
-
-        if (_level == kValidateFull) {
-            const auto& key = descriptor->keyPattern();
-            const Ordering ord = Ordering::make(key);
-            KeyString::Version version = KeyString::kLatestVersion;
-            std::unique_ptr<KeyString> prevIndexKeyString = nullptr;
-            bool isFirstEntry = true;
-
-            std::unique_ptr<SortedDataInterface::Cursor> cursor = iam->newCursor(_opCtx, true);
-            // Seeking to BSONObj() is equivalent to seeking to the first entry of an index.
-            for (auto indexEntry = cursor->seek(BSONObj(), true); indexEntry;
-                 indexEntry = cursor->next()) {
-
-                // We want to use the latest version of KeyString here.
-                std::unique_ptr<KeyString> indexKeyString =
-                    stdx::make_unique<KeyString>(version, indexEntry->key, ord, indexEntry->loc);
-                // Ensure that the index entries are in increasing or decreasing order.
-                if (!isFirstEntry && *indexKeyString < *prevIndexKeyString) {
-                    if (results.valid) {
-                        results.errors.push_back(
-                            "one or more indexes are not in strictly ascending or descending "
-                            "order");
-                    }
-                    results.valid = false;
-                }
-
-                // Cache the index keys to cross-validate with documents later.
-                uint32_t keyHash = hashIndexEntry(*indexKeyString, indexNsHash);
-                if ((*_ikc)[keyHash] == 0) {
-                    _indexKeyCountTableNumEntries++;
-                }
-                (*_ikc)[keyHash]++;
-
-                isFirstEntry = false;
-                prevIndexKeyString.swap(indexKeyString);
-            }
+            results->valid = false;
         }
     }
+}
 
-    void validateIndexKeyCount(IndexDescriptor* idx, int64_t numRecs, ValidateResults& results) {
-        const string indexNs = idx->indexNamespace();
-        long long numIndexedKeys = _keyCounts[indexNs];
-        long long numLongKeys = _longKeys[indexNs];
-        auto totalKeys = numLongKeys + numIndexedKeys;
+void _markIndexEntriesInvalid(ValidateResultsMap* indexNsResultsMap, ValidateResults* results) {
 
-        bool hasTooFewKeys = false;
-        bool noErrorOnTooFewKeys = !failIndexKeyTooLong.load() && (_level != kValidateFull);
+    // The error message can't be more specific because even though the index is
+    // invalid, we won't know if the corruption occurred on the index entry or in
+    // the document.
+    for (auto& it : *indexNsResultsMap) {
+        // Marking all indexes as invalid since we don't know which one failed.
+        ValidateResults& r = it.second;
+        r.valid = false;
+    }
+    string msg = "one or more indexes contain invalid index entries.";
+    results->errors.push_back(msg);
+    results->valid = false;
+}
 
-        if (idx->isIdIndex() && totalKeys != numRecs) {
-            hasTooFewKeys = totalKeys < numRecs ? true : hasTooFewKeys;
-            string msg = str::stream() << "number of _id index entries (" << numIndexedKeys
-                                       << ") does not match the number of documents in the index ("
-                                       << numRecs - numLongKeys << ")";
-            if (noErrorOnTooFewKeys && (numIndexedKeys < numRecs)) {
-                results.warnings.push_back(msg);
-            } else {
-                results.errors.push_back(msg);
-                results.valid = false;
+void _validateIndexKeyCount(OperationContext* opCtx,
+                            IndexCatalog* indexCatalog,
+                            RecordStore* recordStore,
+                            RecordStoreValidateAdaptor* indexValidator,
+                            ValidateResultsMap* indexNsResultsMap) {
+
+    IndexCatalog::IndexIterator indexIterator = indexCatalog->getIndexIterator(opCtx, false);
+    while (indexIterator.more()) {
+        IndexDescriptor* descriptor = indexIterator.next();
+        ValidateResults& curIndexResults = (*indexNsResultsMap)[descriptor->indexNamespace()];
+
+        if (curIndexResults.valid) {
+            indexValidator->validateIndexKeyCount(
+                descriptor, recordStore->numRecords(opCtx), curIndexResults);
+        }
+    }
+}
+
+void _reportValidationResults(OperationContext* opCtx,
+                              IndexCatalog* indexCatalog,
+                              ValidateResultsMap* indexNsResultsMap,
+                              BSONObjBuilder* keysPerIndex,
+                              ValidateCmdLevel level,
+                              ValidateResults* results,
+                              BSONObjBuilder* output) {
+
+    std::unique_ptr<BSONObjBuilder> indexDetails;
+    if (level == kValidateFull) {
+        indexDetails = stdx::make_unique<BSONObjBuilder>();
+    }
+
+    // Report index validation results.
+    for (const auto& it : *indexNsResultsMap) {
+        const std::string indexNs = it.first;
+        const ValidateResults& vr = it.second;
+
+        if (!vr.valid) {
+            results->valid = false;
+        }
+
+        if (indexDetails.get()) {
+            BSONObjBuilder bob(indexDetails->subobjStart(indexNs));
+            bob.appendBool("valid", vr.valid);
+
+            if (!vr.warnings.empty()) {
+                bob.append("warnings", vr.warnings);
+            }
+
+            if (!vr.errors.empty()) {
+                bob.append("errors", vr.errors);
             }
         }
 
-        if (results.valid && !idx->isMultikey(_opCtx) && totalKeys > numRecs) {
-            string err = str::stream()
-                << "index " << idx->indexName() << " is not multi-key, but has more entries ("
-                << numIndexedKeys << ") than documents in the index (" << numRecs - numLongKeys
-                << ")";
-            results.errors.push_back(err);
-            results.valid = false;
-        }
-        // Ignore any indexes with a special access method. If an access method name is given, the
-        // index may be a full text, geo or special index plugin with different semantics.
-        if (results.valid && !idx->isSparse() && !idx->isPartial() && !idx->isIdIndex() &&
-            idx->getAccessMethodName() == "" && totalKeys < numRecs) {
-            hasTooFewKeys = true;
-            string msg = str::stream() << "index " << idx->indexName()
-                                       << " is not sparse or partial, but has fewer entries ("
-                                       << numIndexedKeys << ") than documents in the index ("
-                                       << numRecs - numLongKeys << ")";
-            if (noErrorOnTooFewKeys) {
-                results.warnings.push_back(msg);
-            } else {
-                results.errors.push_back(msg);
-                results.valid = false;
-            }
-        }
-
-        if ((_level != kValidateFull) && hasTooFewKeys) {
-            string warning = str::stream()
-                << "index " << idx->indexName()
-                << " has fewer keys than records. This may be the result of currently or "
-                   "previously running the server with the failIndexKeyTooLong parameter set to "
-                   "false. Please re-run the validate command with {full: true}";
-            results.warnings.push_back(warning);
-        }
+        results->warnings.insert(results->warnings.end(), vr.warnings.begin(), vr.warnings.end());
+        results->errors.insert(results->errors.end(), vr.errors.begin(), vr.errors.end());
     }
 
-private:
-    std::map<string, long long> _longKeys;
-    std::map<string, long long> _keyCounts;
-    std::unique_ptr<IndexKeyCountTable> _ikc;
-
-    uint32_t _indexKeyCountTableNumEntries = 0;
-    bool _hasDocWithoutIndexEntry = false;
-
-    OperationContext* _opCtx;  // Not owned.
-    ValidateCmdLevel _level;
-    IndexCatalog* _indexCatalog;             // Not owned.
-    ValidateResultsMap* _indexNsResultsMap;  // Not owned.
-
-    uint32_t hashIndexEntry(KeyString& ks, uint32_t hash) {
-        MurmurHash3_x86_32(ks.getTypeBits().getBuffer(), ks.getTypeBits().getSize(), hash, &hash);
-        MurmurHash3_x86_32(ks.getBuffer(), ks.getSize(), hash, &hash);
-        return hash % kKeyCountTableSize;
+    output->append("nIndexes", indexCatalog->numIndexesReady(opCtx));
+    output->append("keysPerIndex", keysPerIndex->done());
+    if (indexDetails.get()) {
+        output->append("indexDetails", indexDetails->done());
     }
-};
+}
 }  // namespace
 
 Status CollectionImpl::validate(OperationContext* opCtx,
@@ -1243,112 +1163,50 @@ Status CollectionImpl::validate(OperationContext* opCtx,
 
     try {
         ValidateResultsMap indexNsResultsMap;
-        auto indexValidator = stdx::make_unique<RecordStoreValidateAdaptor>(
-            opCtx, level, &_indexCatalog, &indexNsResultsMap);
-
         BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe
-        IndexCatalog::IndexIterator i = _indexCatalog.getIndexIterator(opCtx, false);
+        RecordStoreValidateAdaptor indexValidator =
+            RecordStoreValidateAdaptor(opCtx, level, &_indexCatalog, &indexNsResultsMap);
 
-        // Validate Indexes.
-        while (i.more()) {
-            opCtx->checkForInterrupt();
-            const IndexDescriptor* descriptor = i.next();
-            log(LogComponent::kIndex) << "validating index " << descriptor->indexNamespace()
-                                      << endl;
-            IndexAccessMethod* iam = _indexCatalog.getIndex(descriptor);
-            ValidateResults curIndexResults;
-            int64_t numKeys;
-            iam->validate(opCtx, &numKeys, &curIndexResults).transitional_ignore();
-            keysPerIndex.appendNumber(descriptor->indexNamespace(),
-                                      static_cast<long long>(numKeys));
 
-            if (curIndexResults.valid) {
-                indexValidator->traverseIndex(iam, descriptor, curIndexResults, numKeys);
-            } else {
-                results->valid = false;
-            }
-            indexNsResultsMap[descriptor->indexNamespace()] = curIndexResults;
-        }
+        // Validate the record store
+        log(LogComponent::kIndex) << "validating collection " << ns().toString() << endl;
+        _validateRecordStore(
+            opCtx, _recordStore, level, /*somgarg*/ false, &indexValidator, results, output);
 
-        // Validate RecordStore and, if `level == kValidateFull`, cross validate indexes and
-        // RecordStore.
+        // Validate indexes and check for mismatches.
         if (results->valid) {
-            auto status =
-                _recordStore->validate(opCtx, level, indexValidator.get(), results, output);
-            // RecordStore::validate always returns Status::OK(). Errors are reported through
-            // `results`.
-            dassert(status.isOK());
+            _validateIndexes(opCtx,
+                             &_indexCatalog,
+                             &keysPerIndex,
+                             &indexValidator,
+                             level,
+                             &indexNsResultsMap,
+                             results);
 
-            // The error message can't be more specific because even if the index is invalid, we
-            // won't know if the corruption occurred on the index entry or in the document.
-            const std::string invalidIdxMsg = "One or more indexes contain invalid index entries.";
-
-            // when there's an index key/document mismatch, both `if` and `else if` statements
-            // will be true. But if we only check tooFewIndexEntries(), we'll be able to see
-            // which specific index is invalid.
-            if (indexValidator->tooFewIndexEntries()) {
-                results->errors.push_back(invalidIdxMsg);
+            if (indexValidator.tooFewIndexEntries()) {
+                string msg = "one or more indexes contain invalid index entries.";
+                results->errors.push_back(msg);
                 results->valid = false;
-            } else if (indexValidator->tooManyIndexEntries()) {
-                for (auto& it : indexNsResultsMap) {
-                    // Marking all indexes as invalid since we don't know which one failed.
-                    ValidateResults& r = it.second;
-                    r.valid = false;
-                }
-                results->errors.push_back(invalidIdxMsg);
-                results->valid = false;
+            } else if (indexValidator.tooManyIndexEntries()) {
+                _markIndexEntriesInvalid(&indexNsResultsMap, results);
             }
         }
 
         // Validate index key count.
         if (results->valid) {
-            IndexCatalog::IndexIterator i = _indexCatalog.getIndexIterator(opCtx, false);
-            while (i.more()) {
-                IndexDescriptor* descriptor = i.next();
-                ValidateResults& curIndexResults = indexNsResultsMap[descriptor->indexNamespace()];
-
-                if (curIndexResults.valid) {
-                    indexValidator->validateIndexKeyCount(
-                        descriptor, _recordStore->numRecords(opCtx), curIndexResults);
-                }
-            }
+            _validateIndexKeyCount(
+                opCtx, &_indexCatalog, _recordStore, &indexValidator, &indexNsResultsMap);
         }
 
-        std::unique_ptr<BSONObjBuilder> indexDetails;
-        if (level == kValidateFull)
-            indexDetails = stdx::make_unique<BSONObjBuilder>();
+        // Report the validation results for the user to see
+        _reportValidationResults(
+            opCtx, &_indexCatalog, &indexNsResultsMap, &keysPerIndex, level, results, output);
 
-        // Report index validation results.
-        for (const auto& it : indexNsResultsMap) {
-            const std::string indexNs = it.first;
-            const ValidateResults& vr = it.second;
-
-            if (!vr.valid) {
-                results->valid = false;
-            }
-
-            if (indexDetails.get()) {
-                BSONObjBuilder bob(indexDetails->subobjStart(indexNs));
-                bob.appendBool("valid", vr.valid);
-
-                if (!vr.warnings.empty()) {
-                    bob.append("warnings", vr.warnings);
-                }
-
-                if (!vr.errors.empty()) {
-                    bob.append("errors", vr.errors);
-                }
-            }
-
-            results->warnings.insert(
-                results->warnings.end(), vr.warnings.begin(), vr.warnings.end());
-            results->errors.insert(results->errors.end(), vr.errors.begin(), vr.errors.end());
-        }
-
-        output->append("nIndexes", _indexCatalog.numIndexesReady(opCtx));
-        output->append("keysPerIndex", keysPerIndex.done());
-        if (indexDetails.get()) {
-            output->append("indexDetails", indexDetails->done());
+        if (!results->valid) {
+            log(LogComponent::kIndex) << "validating collection " << ns().toString() << " failed"
+                                      << endl;
+        } else {
+            log(LogComponent::kIndex) << "validated collection " << ns().toString() << endl;
         }
     } catch (DBException& e) {
         if (ErrorCodes::isInterruption(ErrorCodes::Error(e.getCode()))) {

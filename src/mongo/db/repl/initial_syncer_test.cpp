@@ -619,6 +619,22 @@ TEST_F(InitialSyncerTest, StartupSetsInitialSyncFlagOnSuccess) {
     ASSERT_TRUE(_replicationProcess->getConsistencyMarkers()->getInitialSyncFlag(opCtx.get()));
 }
 
+TEST_F(InitialSyncerTest, StartupSetsInitialDataTimestampAndStableTimestampOnSuccess) {
+    auto initialSyncer = &getInitialSyncer();
+    auto opCtx = makeOpCtx();
+
+    // Set initial data timestamp forward first.
+    _storageInterface->setInitialDataTimestamp(opCtx.get(), SnapshotName(Timestamp(5, 5)));
+    _storageInterface->setStableTimestamp(opCtx.get(), SnapshotName(Timestamp(6, 6)));
+
+    ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
+    ASSERT_TRUE(initialSyncer->isActive());
+
+    ASSERT_EQUALS(SnapshotName(Timestamp::kAllowUnstableCheckpointsSentinel),
+                  _storageInterface->getInitialDataTimestamp());
+    ASSERT_EQUALS(SnapshotName::min(), _storageInterface->getStableTimestamp());
+}
+
 TEST_F(InitialSyncerTest, InitialSyncerReturnsCallbackCanceledIfShutdownImmediatelyAfterStartup) {
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
@@ -739,13 +755,15 @@ TEST_F(InitialSyncerTest, InitialSyncerResetsOptimesOnNewAttempt) {
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort());
 
+    // Set the last optime to an arbitrary nonzero value.
+    auto origOptime = OpTime(Timestamp(1000, 1), 1);
+    _setMyLastOptime(origOptime);
+
+    // Start initial sync.
     const std::uint32_t initialSyncMaxAttempts = 1U;
     ASSERT_OK(initialSyncer->startup(opCtx.get(), initialSyncMaxAttempts));
 
     auto net = getNet();
-    auto origOptime = OpTime(Timestamp(1000, 1), 1);
-
-    _setMyLastOptime(origOptime);
 
     // Simulate a failed initial sync attempt
     _simulateChooseSyncSourceFailure(net, _options.syncSourceRetryWait);
@@ -3016,6 +3034,9 @@ TEST_F(InitialSyncerTest,
     initialSyncer->join();
     ASSERT_EQUALS(lastOp.getOpTime(), unittest::assertGet(_lastApplied).opTime);
     ASSERT_EQUALS(lastOp.getHash(), unittest::assertGet(_lastApplied).value);
+
+    ASSERT_EQUALS(SnapshotName(lastOp.getOpTime().getTimestamp()),
+                  _storageInterface->getInitialDataTimestamp());
 }
 
 TEST_F(InitialSyncerTest,

@@ -85,7 +85,7 @@ class Document;
     MONGO_INITIALIZER(addToDocSourceParserMap_##key)(InitializerContext*) {                  \
         auto fullParserWrapper = [](BSONElement stageSpec,                                   \
                                     const boost::intrusive_ptr<ExpressionContext>& expCtx) { \
-            return std::vector<boost::intrusive_ptr<DocumentSource>>{                        \
+            return std::list<boost::intrusive_ptr<DocumentSource>>{                          \
                 (fullParser)(stageSpec, expCtx)};                                            \
         };                                                                                   \
         LiteParsedDocumentSource::registerParser("$" #key, liteParser);                      \
@@ -115,17 +115,42 @@ class Document;
 
 class DocumentSource : public IntrusiveCounterUnsigned {
 public:
-    using Parser = stdx::function<std::vector<boost::intrusive_ptr<DocumentSource>>(
+    using Parser = stdx::function<std::list<boost::intrusive_ptr<DocumentSource>>(
         BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
 
-    enum class InitialSourceType {
-        // Stage requires input from a preceding DocumentSource.
-        kNotInitialSource,
-        // Stage does not need an input source and should be the first stage in the pipeline.
-        kInitialSource,
-        // Similar to kInitialSource, but does not require an underlying collection to produce
-        // output.
-        kCollectionlessInitialSource
+    /**
+     * A struct describing various constraints about where this stage can run, where it must be in
+     * the pipeline, and things like that.
+     */
+    struct StageConstraints {
+        /**
+         * A Position describes a requirement of the position of the stage within the pipeline.
+         */
+        enum class PositionRequirement { kNone, kFirst, kLast };
+
+        // Set if this stage needs to be in a particular position of the pipeline.
+        PositionRequirement requiredPosition = PositionRequirement::kNone;
+
+        bool isAllowedInsideFacetStage = true;
+
+        // True if this stage does not generate results itself, and instead pulls inputs from an
+        // input DocumentSource (via 'pSource').
+        bool requiresInputDocSource = true;
+
+        // True if this stage operates on a global or database level, like $currentOp.
+        bool isIndependentOfAnyCollection = false;
+
+        // True if this stage can ever be safely swapped with a subsequent $match stage, provided
+        // that the match does not depend on the paths returned by getModifiedPaths().
+        //
+        // Stages that want to participate in match swapping should set this to true. Such a stage
+        // must also override getModifiedPaths() to provide information about which particular
+        // $match predicates be swapped before itself.
+        bool canSwapWithMatch = false;
+
+        // True if this stage must run on the primary shard when the collection being aggregated is
+        // sharded.
+        bool mustRunOnPrimaryShardIfSharded = false;
     };
 
     /**
@@ -219,6 +244,14 @@ public:
     virtual GetNextResult getNext() = 0;
 
     /**
+     * Returns a struct containing information about any special constraints imposed on using this
+     * stage.
+     */
+    virtual StageConstraints constraints() const {
+        return StageConstraints{};
+    }
+
+    /**
      * Informs the stage that it is no longer needed and can release its resources. After dispose()
      * is called the stage must still be able to handle calls to getNext(), but can return kEOF.
      *
@@ -259,38 +292,6 @@ public:
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const;
 
     /**
-     * Subclasses should return InitialSourceType::kInitialSource if the stage does not require an
-     * input source, or InitialSourceType::kCollectionlessInitialSource if the stage will produce
-     * the input for the pipeline independent of an underlying collection. The latter are specified
-     * with {aggregate: 1}, e.g. $currentOp.
-     */
-    virtual InitialSourceType getInitialSourceType() const {
-        return InitialSourceType::kNotInitialSource;
-    }
-
-    /**
-     * Returns true if this stage does not require an input source.
-     */
-    bool isInitialSource() const {
-        return getInitialSourceType() != InitialSourceType::kNotInitialSource;
-    }
-
-    /**
-     * Returns true if this stage will produce the input for the pipeline independent of an
-     * underlying collection. These are specified with {aggregate: 1}, e.g. $currentOp.
-     */
-    bool isCollectionlessInitialSource() const {
-        return getInitialSourceType() == InitialSourceType::kCollectionlessInitialSource;
-    }
-
-    /**
-     * Returns true if the DocumentSource needs to be run on the primary shard.
-     */
-    virtual bool needsPrimaryShard() const {
-        return false;
-    }
-
-    /**
      * If DocumentSource uses additional collections, it adds the namespaces to the input vector.
      */
     virtual void addInvolvedCollections(std::vector<NamespaceString>* collections) const {}
@@ -302,7 +303,7 @@ public:
     /**
      * Create a DocumentSource pipeline stage from 'stageObj'.
      */
-    static std::vector<boost::intrusive_ptr<DocumentSource>> parse(
+    static std::list<boost::intrusive_ptr<DocumentSource>> parse(
         const boost::intrusive_ptr<ExpressionContext>& expCtx, BSONObj stageObj);
 
     /**
@@ -426,18 +427,6 @@ public:
         return {GetModPathsReturn::Type::kNotSupported, std::set<std::string>{}, {}};
     }
 
-    /**
-     * Returns whether this stage can swap with a subsequent $match stage, provided that the match
-     * does not depend on the paths returned by getModifiedPaths().
-     *
-     * Subclasses which want to participate in match swapping should override this to return true.
-     * Such a subclass must also override getModifiedPaths() to provide information about which
-     * $match predicates be swapped before itself.
-     */
-    virtual bool canSwapWithMatch() const {
-        return false;
-    }
-
     enum GetDepsReturn {
         // The full object and all metadata may be required.
         NOT_SUPPORTED = 0x0,
@@ -523,18 +512,23 @@ private:
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const = 0;
 };
 
-/** This class marks DocumentSources that should be split between the merger and the shards.
- *  See Pipeline::Optimizations::Sharded::findSplitPoint() for details.
+/**
+ * This class marks DocumentSources that should be split between the merger and the shards. See
+ * Pipeline::Optimizations::Sharded::findSplitPoint() for details.
  */
 class SplittableDocumentSource {
 public:
-    /** returns a source to be run on the shards.
-     *  if NULL, don't run on shards
+    /**
+     * Returns a source to be run on the shards, or NULL if no work should be done on the shards for
+     * this stage. Must not mutate the existing source object; if different behaviour is required in
+     * the split-pipeline case, a new source should be created and configured appropriately.
      */
     virtual boost::intrusive_ptr<DocumentSource> getShardSource() = 0;
 
-    /** returns a source that combines results from shards.
-     *  if NULL, don't run on merger
+    /**
+     * Returns a source that combines results from the shards, or NULL if no work should be done in
+     * the merge pipeline for this stage. Must not mutate the existing source object; if different
+     * behaviour is required, a new source should be created and configured appropriately.
      */
     virtual boost::intrusive_ptr<DocumentSource> getMergeSource() = 0;
 

@@ -373,6 +373,26 @@ functions:
         make CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ static_lib
         fi
 
+  "build cdriver" :
+    command: shell.exec
+    params:
+      script: |
+        set -o errexit
+        set -o verbose
+        if [ "${build_cdriver|}" = "true" ]; then 
+        CDRIVER_VERSION=1.6.3
+        rm -rf mongo-c-driver-$CDRIVER_VERSION
+        rm -rf mongo-c-driver
+        curl -LO https://github.com/mongodb/mongo-c-driver/releases/download/$CDRIVER_VERSION/mongo-c-driver-$CDRIVER_VERSION.tar.gz
+        tar xzf mongo-c-driver-$CDRIVER_VERSION.tar.gz
+        mv mongo-c-driver-$CDRIVER_VERSION mongo-c-driver
+        cd mongo-c-driver
+        export ${compile_env|}
+        ./configure --prefix=$(pwd)/install --build x86_64-apple-darwin16.6.0 --host arm-apple-darwin --with-libbson=bundled --disable-automatic-init-and-cleanup --disable-ssl --disable-sasl --disable-examples --disable-man-pages --disable-html-docs --disable-shm-counters --disable-shared --enable-static CC="$(xcrun -f --sdk iphoneos clang)" CXX="$(xcrun -f --sdk iphoneos clang++)" CPPFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 -fembed-bitcode"  CFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 -fembed-bitcode" CXXFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 -fembed-bitcode" LDFLAGS="-miphoneos-version-min=10.2 -arch arm64"
+        make
+        make install
+        fi
+
   "build new tools" :
     command: shell.exec
     params:
@@ -580,7 +600,7 @@ functions:
 
         # Run reliable set of tests once.
         eval $preamble $wrapper $wrapper_report_file $resmoke_base
-        exit_codes=$?
+        reliable_exit_code=$?
 
         # Set report file for unreliable test run.
         report_file=report_unreliable.json
@@ -599,7 +619,7 @@ functions:
 
         # Run unreliable set of tests.
         eval $preamble $wrapper $wrapper_report_file $resmoke_base
-        exit_codes="$exit_codes $?"
+        unreliable_exit_code=$?
 
         #  Reenable errexit, as the return from combine_reports will return the cumulative error.
         set -o errexit
@@ -614,13 +634,15 @@ functions:
         # We mask any errors from the resmoke runs above (by disabling errexit) until both have
         # completed. If any of the resmoke runs failed due to non-test failures
         # (i.e fixture failures), we need to exit with non-zero status.
-        for exit_code in $exit_codes
-        do
-          if [ $exit_code -ne 0 ]; then
-            echo "resmoke.py failed with error code: $exit_code"
-            exit $exit_code
-          fi
-        done
+        if [ $reliable_exit_code -ne 0 ]; then
+          echo "resmoke.py reliable run failed with error code: $reliable_exit_code"
+          exit $reliable_exit_code
+        fi
+        # Ignoring the error code 1 that is returned when there are only silent failures.
+        if [ $unreliable_exit_code -ne 0 ] && [ $unreliable_exit_code -ne 1 ]; then
+          echo "resmoke.py unreliable run failed with error code: $unreliable_exit_code"
+          exit $unreliable_exit_code
+        fi
 
   "do jepsen setup" :
     - command: shell.exec
@@ -866,6 +888,16 @@ functions:
         mkdir -p snmpconf
         cp -f src/mongo/db/modules/enterprise/docs/mongod.conf.master snmpconf/mongod.conf
 
+  "do watchdog setup" :
+    command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        bash src/mongo/db/modules/enterprise/jstests/watchdog/charybdefs_setup.sh
+
   "cleanup environment" :
     command: shell.exec
     params:
@@ -882,7 +914,7 @@ functions:
       script: |
         process_kill_list="(^cl\.exe$|bsondump|java|lein|lldb|mongo|python|_test$|_test\.exe$)"
         # Exclude Evergreen agent processes and other system daemons
-        process_exclude_list="(main|tuned)"
+        process_exclude_list="(main|tuned|evergreen)"
 
         if [ "Windows_NT" = "$OS" ]; then
           # Get the list of Windows tasks (tasklist list format):
@@ -975,7 +1007,7 @@ functions:
         export KITCHEN_SUBNET="${kitchen_subnet}"
 
         # set expiration tag 2 hours in the future, since no test should take this long
-        export KITCHEN_EXPIRE="$(${python|/opt/mongodbtoolchain/v2/bin/python2} -c 'import datetime; print((datetime.datetime.now() + datetime.timedelta(0, 2*60*60)).strftime("%Y-%m-%d %H:%M:%S"))')"
+        export KITCHEN_EXPIRE="$(${python|/opt/mongodbtoolchain/v2/bin/python2} -c 'import datetime; print((datetime.datetime.utcnow() + datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"))')"
 
         for i in {1..3}
         do
@@ -991,6 +1023,28 @@ functions:
 
         kitchen destroy "${packager_distro}" || true
         test "$verified" = "true"
+
+  "fetch test_lifecycle.yml":
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src
+      script: |
+        set -o verbose
+
+        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/fetch_test_lifecycle.py \
+            --metadataRepo git@github.com:mongodb/mongo-test-metadata.git \
+            --lifecycleFile etc/test_lifecycle.yml \
+            --referencesFile references.yml \
+            --destinationFile etc/test_lifecycle.yml \
+            --revision ${revision} \
+            ${project}
+        exit_code=$?
+        if [ ${fail_task_on_error|false} = true ]; then
+          exit $exit_code
+        else
+          exit 0
+        fi
 
 pre:
   - func: "kill processes"
@@ -1067,6 +1121,19 @@ post:
           echo "No OOM (Out of memory) killed processes detected"
         fi
 
+  # Cleanup after the watchdog FUSE testing
+  - command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        if [ -d /data/thrift ]; then
+          rm -rf /data/thrift
+        fi
+
+        if [ -d /data/charybdefs ]; then
+          rm -rf /data/charybdefs
+        fi
+
   # Gather and archive FTDC data.
   - command: shell.exec
     params:
@@ -1130,7 +1197,7 @@ post:
       working_dir: src
       script: |
         # For Jepsen tasks, archive the mongod log files.
-        if [ -d jepsen ]; then
+        if [ ${distro_id} = "ubuntu1404-jepsen" ]; then
           # Copy mongod.log & stdout.log from each LXC host for archive purposes. Note that
           # stdout.log is also generated as a result of starting mongod.
           # The logs can reside in 1 of 2 places:
@@ -1369,7 +1436,12 @@ timeout:
           ${set_sudo}
         fi
 
-        hang_analyzer_option="-c -o file -o stdout -p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test} -g bsondump,mongodump,mongoexport,mongofiles,mongoimport,mongooplog,mongoreplay,mongorestore,mongostat,mongotop"
+        hang_analyzer_option="-o file -o stdout -p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test} -g bsondump,mongodump,mongoexport,mongofiles,mongoimport,mongooplog,mongoreplay,mongorestore,mongostat,mongotop"
+
+        if [ ${hang_analyzer_dump_core|true} = true ]; then
+          hang_analyzer_option="-c $hang_analyzer_option"
+        fi
+
         echo "Calling the hang analyzer: PATH=\"/opt/mongodbtoolchain/gdb/bin:$PATH\" $sudo ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/hang_analyzer.py $hang_analyzer_option"
         PATH="/opt/mongodbtoolchain/gdb/bin:$PATH" $sudo ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/hang_analyzer.py $hang_analyzer_option
 
@@ -1464,6 +1536,11 @@ tasks:
           ${python|/opt/mongodbtoolchain/v2/bin/python2} ../buildscripts/make_archive.py -o mongodb-shell.${ext|tgz} $(find mongodb-* -type f)
           cd ..
 
+    - func: "fetch test_lifecycle.yml"
+      vars:
+        # Do not fail the task if we fail to fetch the test_lifecycle.yml file
+        fail_task_on_error: false
+
     - command: archive.targz_pack
       params:
         target: "artifacts.tgz"
@@ -1550,6 +1627,7 @@ tasks:
     - func: "setup credentials"
     - func: "build new tools" # noop if ${newtools} is not "true"
     - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
+    - func: "build cdriver" # noop if ${build_cdriver} is not "true"
     - *generate_compile_expansions
     # Then we load the generated version data into the agent so we can use it in task definitions.
     - *apply_compile_expansions
@@ -1757,6 +1835,19 @@ tasks:
       jepsen_storage_engine: --storage-engine wiredTiger
       jepsen_test_name: read-concern-majority
       jepsen_write_concern: --write-concern w1
+
+## jstestfuzz standalone generational fuzzer WT ##
+- <<: *jstestfuzz_template
+  name: generational_jstestfuzz_WT
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: -g
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=generational_jstestfuzz --storageEngine=wiredTiger
 
 ## jstestfuzz mmapv1 ##
 - <<: *jstestfuzz_template
@@ -2778,6 +2869,17 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: sharding_jscore_op_query_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_jscore_op_query_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: sharding_jscore_passthrough_wire_ops_WT
   depends_on:
   - name: jsCore_WT
@@ -3236,6 +3338,17 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: session_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=session_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: causally_consistent_jscore_passthrough_auth_WT
   depends_on:
   - name: jsCore_WT
@@ -3245,6 +3358,26 @@ tasks:
     vars:
       resmoke_args: --suites=causally_consistent_jscore_passthrough_auth --storageEngine=wiredTiger
       run_multiple_jobs: true
+
+- <<: *task_template
+  name: watchdog
+  commands:
+  - func: "do setup"
+  - func: "do watchdog setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=watchdog --storageEngine=mmapv1
+      run_multiple_jobs: false
+
+- <<: *task_template
+  name: watchdog_WT
+  commands:
+  - func: "do setup"
+  - func: "do watchdog setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=watchdog --storageEngine=wiredTiger
+      run_multiple_jobs: false
 
 - name: idl_tests
   depends_on:
@@ -3307,10 +3440,10 @@ tasks:
           EOF
 
           cat <<EOF > notary_env.sh
-          export NOTARY_TOKEN=${signing_auth_token_34}
+          export NOTARY_TOKEN=${signing_auth_token_36}
           EOF
 
-          echo "${signing_auth_token_34}" > signing_auth_token
+          echo "${signing_auth_token_36}" > signing_auth_token
 
     - command: shell.exec
       params:
@@ -3327,7 +3460,7 @@ tasks:
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-win32-${push_arch}-${suffix}.msi || true
 
-          /usr/local/bin/notary-client.py --key-name "server-3.4" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
+          /usr/local/bin/notary-client.py --key-name "server-3.6" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
           if [ "${has_packages|}" = "true" ]; then
              CURATOR_RELEASE="88f34a9f1c79db7ea9597b6e85eb5995d03714ba"
@@ -3729,6 +3862,63 @@ tasks:
             - {'source': {'path': '${push_path}-STAGE/${push_name}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}-${task_id}.${ext|tgz}.md5', 'bucket': 'build-push-testing'},
                'destination': {'path': '${push_path}/mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz}.md5', 'bucket': '${push_bucket}'}}
 
+- name: fetch_test_lifecycle
+  depends_on: []
+  commands:
+  - *git_get_project
+  - func: "fetch test_lifecycle.yml"
+    vars:
+      # This task is meant to fail if there is an error while fetching test_lifecycle.yml since
+      # the compile task won't fail.
+      fail_task_on_error: true
+
+- name: update_test_lifecycle
+  exec_timeout_secs: 21600 # 6 hour timeout for the task overall
+  depends_on: []
+  commands:
+  - *git_get_project
+  - command: shell.exec
+    timeout_secs: 14400 # Timeout if there is no output for 4 hours
+    type: test
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+
+        # Setup the git ssh private key
+        mkdir -p ~/.ssh
+        echo -n "${testlifecycle_ssh_key}" > ~/.ssh/test_lifecycle.pem
+        chmod 0600 ~/.ssh/test_lifecycle.pem
+        export GIT_SSH_COMMAND="ssh -i ~/.ssh/test_lifecycle.pem"
+
+        # Create the jira credentials configuration file
+        cat > ~/.jira.yml <<END_OF_CREDS
+        user: "${testlifecycle_jira_user}"
+        password: "${testlifecycle_jira_password}"
+        server: "https://jira.mongodb.org"
+        END_OF_CREDS
+
+        set -o verbose
+
+        # Create and activate the virtualenv. We use the MongoDB toolchain's Python (with --python)
+        # as this task is only expected to run on a Linux builder.
+        /opt/mongodbtoolchain/v2/bin/virtualenv --python=/opt/mongodbtoolchain/v2/bin/python2 \
+            --system-site-packages ./venv
+        . ./venv/bin/activate
+
+        # Install Python jira client with pip until it is available in the toolchain
+        pip install jira==1.0.10
+
+        python buildscripts/update_test_lifecycle.py \
+            --project ${project} \
+            --commit \
+            --resmokeTagFile "etc/test_lifecycle.yml" \
+            --metadataRepo "git@github.com:mongodb/mongo-test-metadata" \
+            --referencesFile "references.yml" \
+            --gitUserName "Test Lifecycle" \
+            --gitUserEmail "build+testlifecycle@mongodb.com" \
+            --jiraConfig ~/.jira.yml
+
 
 #######################################
 #               Modules               #
@@ -3816,6 +4006,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -3880,6 +4071,7 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: tool
@@ -4003,6 +4195,7 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool
   - name: tool_WT
@@ -4043,6 +4236,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -4110,6 +4304,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -4134,6 +4329,7 @@ buildvariants:
   - name: serial_run_WT
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool_WT
 
@@ -4198,6 +4394,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -4349,6 +4546,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -4473,6 +4671,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -4582,6 +4781,7 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -4671,6 +4871,7 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -4762,6 +4963,7 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -4856,6 +5058,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -4887,6 +5090,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   - name: slow1_WT
@@ -4946,6 +5150,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -4981,6 +5186,7 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: snmp
   - name: snmp_WT
@@ -5052,6 +5258,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -5108,6 +5315,7 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: ssl
   - name: sslSpecial
@@ -5179,6 +5387,7 @@ buildvariants:
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
   - name: noPassthroughWithMongod_WT
+  - name: session_jscore_passthrough_WT
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
   - name: parallel
@@ -5314,6 +5523,7 @@ buildvariants:
   - name: jsCore_decimal_WT
   - name: sharding_WT_ese
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -5339,6 +5549,35 @@ buildvariants:
   - name: push
     distros:
     - rhel70-small
+
+- name: enterprise-windows-64-2k8-async
+  display_name: "~ Enterprise Windows 2008R2 async"
+  modules:
+  - enterprise
+  run_on:
+  - windows-64-vs2015-small
+  expansions:
+    platform_decompress: unzip
+    tooltags: "-tags 'ssl sasl'"
+    exe: ".exe"
+    gorootvars: 'PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    push_path: win32
+    push_bucket: downloads.10gen.com
+    push_name: win32
+    push_arch: x86_64-enterprise-windows-64
+    msi_target: msi
+    content_type: application/zip
+    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    python: python
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    ext: zip
+    use_scons_cache: true
+    test_flags: --serviceExecutor=adaptive
+  tasks:
+  - name: compile
+    distros:
+    - windows-64-vs2015-large
+  - name: jsCore
 
 - name: enterprise-windows-64-2k8-inmem
   display_name: Enterprise Windows 2008R2 (inMemory)
@@ -5383,6 +5622,7 @@ buildvariants:
   - name: concurrency_simultaneous
   - name: jsCore
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_WT
@@ -5468,6 +5708,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -5517,6 +5758,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: slow1
@@ -5619,6 +5861,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -5653,6 +5896,7 @@ buildvariants:
   - name: replica_sets_kill_secondaries_jscore_passthrough_WT
   - name: serial_run
   - name: serial_run_WT
+  - name: session_jscore_passthrough_WT
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough
@@ -5661,6 +5905,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: slow1
   - name: slow1_WT
@@ -5746,6 +5991,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -5773,8 +6019,9 @@ buildvariants:
   - macos-1012
   batchtime: 1440 # 1 day
   expansions:
+    build_cdriver: true
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_ios.vars all
+    compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_ios.vars  CPPPATH=$(readlink -f ../mongo-c-driver/build/c-driver-install/include/libbson-1.0 ../mongo-c-driver/build/c-driver-install/include/libmongoc-1.0 /opt/mongodbtoolchain/v2/include) LIBPATH=$(readlink -f ../mongo-c-driver/build/c-driver-install/lib) all 
     python: python2.7
   tasks:
   - name: compile_all_notest
@@ -5913,6 +6160,7 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query
   - name: jsCore_op_query_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -5942,6 +6190,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: parallel_compatibility_WT
   - name: read_concern_linearizable_passthrough
+  - name: session_jscore_passthrough_WT
     distros:
     - rhel62-large
   - name: read_concern_linearizable_passthrough_WT
@@ -6027,6 +6276,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_last_stable_mongos_and_mixed_shards
     distros:
@@ -6186,6 +6436,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: sharding_op_query_WT
@@ -6236,6 +6487,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -6325,6 +6577,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -6450,6 +6703,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -6591,6 +6845,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6622,6 +6877,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   - name: slow1_WT
@@ -6695,6 +6951,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6726,6 +6983,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   - name: slow1_WT
@@ -6860,6 +7118,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   # - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   # - name: slow1
@@ -6918,6 +7177,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -7008,6 +7268,7 @@ buildvariants:
     - ubuntu1404-jepsen
   - name: jsCore
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -7071,6 +7332,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -7091,6 +7353,8 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
+  - name: watchdog
+  - name: watchdog_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7158,6 +7422,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -7244,6 +7509,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7275,6 +7541,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   - name: slow1_WT
@@ -7347,6 +7614,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -7447,6 +7715,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -7526,6 +7795,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7557,6 +7827,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_WT
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   - name: slow1_WT
@@ -7628,6 +7899,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -7741,6 +8013,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_decimal_WT
   - name: jsCore_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -7776,6 +8049,7 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_WT
   - name: slow1
@@ -7829,6 +8103,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -7892,6 +8167,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore
   - name: jsCore_auth
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -7978,6 +8254,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -8034,6 +8311,7 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: ssl
   - name: sslSpecial
@@ -8105,6 +8383,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_compatibility_WT
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -8161,6 +8440,7 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: ssl
   - name: sslSpecial
@@ -8230,6 +8510,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8252,6 +8533,7 @@ buildvariants:
   - name: master_slave_jscore_passthrough
   - name: rlp
   - name: sasl
+  - name: session_jscore_passthrough_WT
   - name: sharded_collections_jscore_passthrough
   - name: sharding
   - name: sharding_auth
@@ -8259,6 +8541,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_jscore_passthrough
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   - name: slow1
@@ -8312,6 +8595,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_op_query
   - name: jsCore_compatibility
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8341,6 +8625,7 @@ buildvariants:
   - name: serial_run
   - name: sharded_collections_jscore_passthrough
   - name: sharding_jscore_passthrough
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool
 
@@ -8417,6 +8702,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_jscore_passthrough
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   - name: slow1
@@ -8506,6 +8792,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough
   - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: sharding_jscore_passthrough
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   - name: slow1
@@ -8555,6 +8842,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8603,12 +8891,13 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
-    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true
+    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform_arch: "ubuntu1604"
     multiversion_edition: "targeted"
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
     build_mongoreplay: true
+    hang_analyzer_dump_core: false
   tasks:
   - name: compile
   - name: compile_all
@@ -8710,6 +8999,7 @@ buildvariants:
   - name: master_slave_jscore_passthrough
   - name: master_slave_jscore_passthrough_WT
   - name: sasl
+  - name: session_jscore_passthrough_WT
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding
@@ -8724,6 +9014,7 @@ buildvariants:
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   - name: slow1
@@ -8747,13 +9038,15 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
-    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true
+    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
     build_mongoreplay: true
+    hang_analyzer_dump_core: false
   tasks:
   - name: compile
   - name: compile_all
+  - name: generational_jstestfuzz_WT
   - name: jstestfuzz
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent
@@ -8887,6 +9180,7 @@ buildvariants:
   - name: master_slave_jscore_passthrough
   - name: master_slave_jscore_passthrough_WT
   - name: sasl
+  - name: session_jscore_passthrough_WT
   - name: sharded_collections_jscore_passthrough
   - name: sharded_collections_jscore_passthrough_WT
   - name: sharding
@@ -8901,6 +9195,7 @@ buildvariants:
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_op_query_WT
   - name: slow1
@@ -8925,10 +9220,11 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
-    san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true
+    san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
     build_mongoreplay: true
+    hang_analyzer_dump_core: false
   tasks:
   - name: compile
   - name: compile_all
@@ -8936,6 +9232,156 @@ buildvariants:
   - name: dbtest_WT
   - name: jsCore
   - name: jsCore_WT
+  - name: watchdog
+  - name: watchdog_WT
+
+- name: ubuntu1604-debug-aubsan-async
+  display_name: "~ {A,UB}SAN Enterprise SSL Ubuntu 16.04 async"
+  modules:
+  - enterprise
+  run_on:
+  - ubuntu1604-build
+  stepback: true
+  expansions:
+    tooltags: "-tags 'ssl'"
+    # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
+    variant_path_suffix: /opt/mongodbtoolchain/v2/bin
+    san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
+    compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
+    num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
+    build_mongoreplay: false
+    hang_analyzer_dump_core: false
+    test_flags: --serviceExecutor=adaptive
+  tasks:
+  - name: compile
+  - name: compile_all
+  - name: aggregation
+  - name: aggregation_WT
+  - name: aggregation_WT_ese
+  - name: aggregation_auth
+  - name: aggregation_facet_unwind_passthrough_WT
+  - name: aggregation_read_concern_majority_passthrough_WT
+  - name: aggregation_sharded_collections_passthrough_WT
+# TODO Put back when SERVER-30471 is done
+#  - name: audit
+#  - name: audit_WT
+#  - name: auth
+#  - name: auth_WT
+#  - name: auth_audit
+#  - name: auth_audit_WT
+  - name: bulk_gle_passthrough
+  - name: bulk_gle_passthrough_WT
+  - name: causally_consistent_jscore_passthrough_WT
+  - name: causally_consistent_jscore_passthrough_auth_WT
+  - name: concurrency
+  - name: concurrency_WT
+  - name: concurrency_replication
+  - name: concurrency_replication_WT
+  - name: concurrency_sharded
+  - name: concurrency_sharded_WT
+  - name: concurrency_simultaneous
+  - name: concurrency_simultaneous_WT
+  - name: dbtest
+  - name: dbtest_WT
+  - name: disk
+  - name: disk_WT
+  - name: dur_jscore_passthrough
+  - name: durability
+  - name: ese_WT
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth
+  - name: gle_auth_WT
+  - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_WT
+  - name: gle_auth_basics_passthrough_write_cmd
+  - name: gle_auth_basics_passthrough_write_cmd_WT
+  - name: gle_auth_write_cmd
+  - name: gle_auth_write_cmd_WT
+  - name: integration_tests_replset
+  - name: integration_tests_sharded
+  - name: integration_tests_standalone
+  - name: jsCore
+  - name: jsCore_WT
+  - name: jsCore_WT_ese
+  - name: jsCore_inMem
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_compatibility_WT
+  - name: jsCore_decimal
+  - name: jsCore_decimal_WT
+  - name: jsCore_minimum_batch_size_WT
+  - name: jsCore_op_query
+  - name: jsCore_op_query_WT
+  - name: mmap
+  - name: mongosTest
+  - name: multiversion
+  - name: multiversion_auth
+  - name: multiversion_WT
+  - name: multiversion_multistorage_engine
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: noPassthroughWithMongod_WT
+  - name: noPassthrough_WT
+  - name: parallel
+  - name: parallel_WT
+  - name: parallel_compatibility
+  - name: parallel_compatibility_WT
+  - name: read_concern_linearizable_passthrough
+  - name: read_concern_linearizable_passthrough_WT
+  - name: read_concern_majority_passthrough_WT
+  - name: read_only
+  - name: read_only_WT
+  - name: read_only_sharded
+  - name: read_only_sharded_WT
+# TODO Put back when SERVER-30471 is done
+#  - name: replica_sets
+#  - name: replica_sets_WT
+#  - name: replica_sets_WT_ese
+#  - name: replica_sets_auth
+#  - name: replica_sets_pv0
+  - name: replica_sets_jscore_passthrough
+  - name: replica_sets_jscore_passthrough_WT
+  - name: replica_sets_initsync_jscore_passthrough
+  - name: replica_sets_initsync_jscore_passthrough_WT
+  - name: replica_sets_initsync_static_jscore_passthrough
+  - name: replica_sets_initsync_static_jscore_passthrough_WT
+  - name: replica_sets_resync_static_jscore_passthrough
+  - name: replica_sets_resync_static_jscore_passthrough_WT
+  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
+  - name: master_slave
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough
+  - name: master_slave_jscore_passthrough_WT
+  - name: sasl
+  - name: sharded_collections_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough_WT
+  - name: sharding
+  - name: sharding_WT
+  - name: sharding_WT_ese
+  - name: sharding_auth
+  - name: sharding_auth_audit_WT
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_WT
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  - name: sharding_last_stable_mongos_and_mixed_shards
+  - name: sharding_jscore_passthrough
+  - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
+  - name: sharding_jscore_passthrough_wire_ops_WT
+  - name: sharding_op_query_WT
+  - name: slow1
+  - name: slow1_WT
+  - name: serial_run
+  - name: serial_run_WT
+  - name: snmp
+  - name: snmp_WT
+  - name: ssl
+  - name: sslSpecial
+  - name: tool
+  - name: tool_WT
 
 - name: enterprise-ubuntu-dynamic-1604-64-bit
   display_name: "* Shared Library Enterprise Ubuntu 16.04"
@@ -9058,6 +9504,7 @@ buildvariants:
     - rhel62-large
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_last_stable_mongos_and_mixed_shards
     distros:
@@ -9070,3 +9517,15 @@ buildvariants:
     - rhel62-large
   - name: slow1
   - name: slow1_WT
+
+- name: tig-daily-cron
+  display_name: "~ TIG Daily Cron"
+  run_on:
+  - rhel62-large
+  batchtime: 1440 # 1 day
+  stepback: false
+  tasks:
+  - name: update_test_lifecycle
+  - name: fetch_test_lifecycle
+    distros:
+    - rhel62-small

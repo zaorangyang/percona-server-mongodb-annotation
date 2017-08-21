@@ -35,9 +35,9 @@ using namespace mongo;
 
 namespace percona {
 
-class CreateBackupCommand : public Command {
+class CreateBackupCommand : public ErrmsgCommandDeprecated {
 public:
-    CreateBackupCommand() : Command("createBackup") {}
+    CreateBackupCommand() : ErrmsgCommandDeprecated("createBackup") {}
     void help(std::stringstream& help) const override {
         help << "Creates a hot backup, into the given directory, of the files currently in the "
                 "storage engine's data directory."
@@ -61,14 +61,14 @@ public:
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    bool run(mongo::OperationContext* txn,
+    bool errmsgRun(mongo::OperationContext* txn,
              const std::string& db,
              const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override;
 } createBackupCmd;
 
-bool CreateBackupCommand::run(mongo::OperationContext* txn,
+bool CreateBackupCommand::errmsgRun(mongo::OperationContext* txn,
                               const std::string& db,
                               const BSONObj& cmdObj,
                               std::string& errmsg,

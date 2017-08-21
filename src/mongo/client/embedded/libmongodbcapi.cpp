@@ -56,6 +56,11 @@ struct libmongodbcapi_db {
     mongo::stdx::unordered_map<libmongodbcapi_client*, std::unique_ptr<libmongodbcapi_client>>
         open_clients;
     std::unique_ptr<mongo::transport::TransportLayerMock> transportLayer;
+
+    std::vector<std::unique_ptr<char[]>> argvStorage;
+    std::vector<char*> argvPointers;
+    std::vector<std::unique_ptr<char[]>> envpStorage;
+    std::vector<char*> envpPointers;
 };
 struct libmongodbcapi_client {
     libmongodbcapi_client(libmongodbcapi_db* db) : parent_db(db) {}
@@ -77,15 +82,39 @@ libmongodbcapi_db* global_db = nullptr;
 thread_local int last_error = LIBMONGODB_CAPI_ERROR_SUCCESS;
 bool run_setup = false;
 
-libmongodbcapi_db* db_new(int argc, char** argv, char** envp) noexcept try {
+libmongodbcapi_db* db_new(int argc, const char** argv, const char** envp) noexcept try {
     last_error = LIBMONGODB_CAPI_ERROR_SUCCESS;
     if (global_db) {
         throw std::runtime_error("DB already exists");
     }
     global_db = new libmongodbcapi_db;
+
     if (!run_setup) {
+        // iterate over argv and copy them to argvStorage
+        for (int i = 0; i < argc; i++) {
+            // allocate space for the null terminator
+            auto s = mongo::stdx::make_unique<char[]>(std::strlen(argv[i]) + 1);
+            // copy the string + null terminator
+            std::strncpy(s.get(), argv[i], std::strlen(argv[i]) + 1);
+            global_db->argvPointers.push_back(s.get());
+            global_db->argvStorage.push_back(std::move(s));
+        }
+        global_db->argvPointers.push_back(nullptr);
+
+        // iterate over envp and copy them to envpStorage
+        while (envp != nullptr && *envp != nullptr) {
+            auto s = mongo::stdx::make_unique<char[]>(std::strlen(*envp) + 1);
+            std::strncpy(s.get(), *envp, std::strlen(*envp) + 1);
+            global_db->envpPointers.push_back(s.get());
+            global_db->envpStorage.push_back(std::move(s));
+            envp++;
+        }
+        global_db->envpPointers.push_back(nullptr);
+
         // call mongoDbMain() in a new thread because it currently does not terminate
-        global_db->mongodThread = stdx::thread([=] { mongoDbMain(argc, argv, envp); });
+        global_db->mongodThread = stdx::thread([=] {
+            mongoDbMain(argc, global_db->argvPointers.data(), global_db->envpPointers.data());
+        });
         global_db->mongodThread.detach();
 
         // wait until the global service context is not null
@@ -178,7 +207,7 @@ int get_last_capi_error() noexcept {
 }  // namespace mongo
 
 extern "C" {
-libmongodbcapi_db* libmongodbcapi_db_new(int argc, char** argv, char** envp) {
+libmongodbcapi_db* libmongodbcapi_db_new(int argc, const char** argv, const char** envp) {
     return mongo::db_new(argc, argv, envp);
 }
 

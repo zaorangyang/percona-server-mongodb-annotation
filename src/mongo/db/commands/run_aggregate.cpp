@@ -41,6 +41,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/pipeline_proxy.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
@@ -294,8 +295,8 @@ Status runAggregate(OperationContext* opCtx,
     auto curOp = CurOp::get(opCtx);
     {
         const LiteParsedPipeline liteParsedPipeline(request);
-        if (liteParsedPipeline.startsWithChangeNotification()) {
-            nss = NamespaceString(repl::rsOplogName);
+        if (liteParsedPipeline.hasChangeNotification()) {
+            nss = NamespaceString::kRsOplogNamespace;
         }
 
         const auto& pipelineInvolvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
@@ -325,7 +326,7 @@ Status runAggregate(OperationContext* opCtx,
         // collection.  (The lock must be released because recursively acquiring locks on the
         // database will prohibit yielding.)
         if (ctx && ctx->getView() && !liteParsedPipeline.startsWithCollStats()) {
-            invariant(nss != repl::rsOplogName);
+            invariant(nss != NamespaceString::kRsOplogNamespace);
             invariant(!nss.isCollectionlessAggregateNS());
             // Check that the default collation of 'view' is compatible with the operation's
             // collation. The check is skipped if the 'request' has the empty collation, which
@@ -395,19 +396,14 @@ Status runAggregate(OperationContext* opCtx,
                                   uassertStatusOK(resolveInvolvedNamespaces(opCtx, request))));
         expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
 
-        if (liteParsedPipeline.startsWithChangeNotification()) {
+        if (liteParsedPipeline.hasChangeNotification()) {
             expCtx->tailableMode = ExpressionContext::TailableMode::kTailableAndAwaitData;
         }
 
-        // Parse the pipeline.
-        auto statusWithPipeline = Pipeline::parse(request.getPipeline(), expCtx);
-        if (!statusWithPipeline.isOK()) {
-            return statusWithPipeline.getStatus();
-        }
-        auto pipeline = std::move(statusWithPipeline.getValue());
+        auto pipeline = uassertStatusOK(Pipeline::parse(request.getPipeline(), expCtx));
 
-        // Check that the view's collation matches the collation of any views involved
-        // in the pipeline.
+        // Check that the view's collation matches the collation of any views involved in the
+        // pipeline.
         if (!pipelineInvolvedNamespaces.empty()) {
             invariant(ctx);
             auto pipelineCollationStatus = collatorCompatibleWithPipeline(
@@ -419,11 +415,11 @@ Status runAggregate(OperationContext* opCtx,
 
         pipeline->optimizePipeline();
 
-        if (kDebugBuild && !expCtx->explain && !expCtx->inShard) {
+        if (kDebugBuild && !expCtx->explain && !expCtx->fromRouter) {
             // Make sure all operations round-trip through Pipeline::serialize() correctly by
             // re-parsing every command in debug builds. This is important because sharded
-            // aggregations rely on this ability.  Skipping when inShard because this has
-            // already been through the transformation (and this un-sets expCtx->inShard).
+            // aggregations rely on this ability.  Skipping when fromRouter because this has
+            // already been through the transformation (and this un-sets expCtx->fromRouter).
             pipeline = reparsePipeline(pipeline.get(), request, expCtx);
         }
 

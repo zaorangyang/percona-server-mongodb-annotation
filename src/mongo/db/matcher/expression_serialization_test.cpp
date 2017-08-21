@@ -238,7 +238,7 @@ TEST(SerializeBasic, ExpressionAllWithEmptyArraySerializesCorrectly) {
     Matcher original(fromjson("{x: {$all: []}}"), ExtensionsCallbackNoop(), kSimpleCollator);
     Matcher reserialized(
         serialize(original.getMatchExpression()), ExtensionsCallbackNoop(), kSimpleCollator);
-    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), fromjson("{x: {$all: []}}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), fromjson("{$alwaysFalse: 1}"));
     ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
 
     BSONObj obj = fromjson("{x: [1, 2, 3]}");
@@ -950,6 +950,26 @@ TEST(SerializeBasic, ExpressionTextWithDefaultLanguageSerializesCorrectly) {
     ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
 }
 
+TEST(SerializeBasic, ExpressionAlwaysTrueSerializesCorrectly) {
+    Matcher original(
+        fromjson("{$alwaysTrue: 1}"), ExtensionsCallbackDisallowExtensions(), kSimpleCollator);
+    Matcher reserialized(serialize(original.getMatchExpression()),
+                         ExtensionsCallbackDisallowExtensions(),
+                         kSimpleCollator);
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), fromjson("{$alwaysTrue: 1}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
+}
+
+TEST(SerializeBasic, ExpressionAlwaysFalseSerializesCorrectly) {
+    Matcher original(
+        fromjson("{$alwaysFalse: 1}"), ExtensionsCallbackDisallowExtensions(), kSimpleCollator);
+    Matcher reserialized(serialize(original.getMatchExpression()),
+                         ExtensionsCallbackDisallowExtensions(),
+                         kSimpleCollator);
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), fromjson("{$alwaysFalse: 1}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
+}
+
 TEST(SerializeInternalSchema, ExpressionInternalSchemaMinItemsSerializesCorrectly) {
     Matcher original(fromjson("{x: {$_internalSchemaMinItems: 1}}"),
                      ExtensionsCallbackDisallowExtensions(),
@@ -983,6 +1003,7 @@ TEST(SerializeInternalSchema, ExpressionInternalSchemaUniqueItemsSerializesCorre
                       fromjson("{x: {$_internalSchemaUniqueItems: true}}"));
     ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
 }
+
 TEST(SerializeInternalSchema, ExpressionInternalSchemaObjectMatchSerializesCorrectly) {
     Matcher original(fromjson("{x: {$_internalSchemaObjectMatch: {y: 1}}}"),
                      ExtensionsCallbackDisallowExtensions(),
@@ -992,6 +1013,63 @@ TEST(SerializeInternalSchema, ExpressionInternalSchemaObjectMatchSerializesCorre
                          kSimpleCollator);
     ASSERT_BSONOBJ_EQ(*reserialized.getQuery(),
                       fromjson("{x: {$_internalSchemaObjectMatch: {y: {$eq: 1}}}}"));
+}
+
+TEST(SerializeInternalSchema, ExpressionInternalSchemaMinLengthSerializesCorrectly) {
+    Matcher original(fromjson("{x: {$_internalSchemaMinLength: 1}}"),
+                     ExtensionsCallbackDisallowExtensions(),
+                     kSimpleCollator);
+    Matcher reserialized(serialize(original.getMatchExpression()),
+                         ExtensionsCallbackDisallowExtensions(),
+                         kSimpleCollator);
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), fromjson("{x: {$_internalSchemaMinLength: 1}}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
+}
+
+TEST(SerializeInternalSchema, ExpressionInternalSchemaMaxLengthSerializesCorrectly) {
+    Matcher original(fromjson("{x: {$_internalSchemaMaxLength: 1}}"),
+                     ExtensionsCallbackDisallowExtensions(),
+                     kSimpleCollator);
+    Matcher reserialized(serialize(original.getMatchExpression()),
+                         ExtensionsCallbackDisallowExtensions(),
+                         kSimpleCollator);
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), fromjson("{x: {$_internalSchemaMaxLength: 1}}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
+}
+
+TEST(SerializeInternalSchema, ExpressionInternalSchemaCondSerializesCorrectly) {
+    Matcher original(fromjson("{$_internalSchemaCond: [{a: 1}, {b: 2}, {c: 3}]}}"),
+                     ExtensionsCallbackDisallowExtensions(),
+                     kSimpleCollator);
+    Matcher reserialized(serialize(original.getMatchExpression()),
+                         ExtensionsCallbackDisallowExtensions(),
+                         kSimpleCollator);
+    BSONObjBuilder builder;
+    ASSERT_BSONOBJ_EQ(
+        *reserialized.getQuery(),
+        fromjson("{$_internalSchemaCond: [{a: {$eq: 1}}, {b: {$eq: 2}}, {c: {$eq: 3}}]}}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
+}
+
+TEST(SerializeInternalSchema, ExpressionInternalSchemaMinPropertiesSerializesCorrectly) {
+    const CollatorInterface* collator = nullptr;
+    Matcher original(fromjson("{$_internalSchemaMinProperties: 1}"),
+                     ExtensionsCallbackDisallowExtensions(),
+                     collator);
+    Matcher reserialized(
+        serialize(original.getMatchExpression()), ExtensionsCallbackDisallowExtensions(), collator);
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), fromjson("{$_internalSchemaMinProperties: 1}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
+}
+
+TEST(SerializeInternalSchema, ExpressionInternalSchemaMaxPropertiesSerializesCorrectly) {
+    const CollatorInterface* collator = nullptr;
+    Matcher original(fromjson("{$_internalSchemaMaxProperties: 1}"),
+                     ExtensionsCallbackDisallowExtensions(),
+                     collator);
+    Matcher reserialized(
+        serialize(original.getMatchExpression()), ExtensionsCallbackDisallowExtensions(), collator);
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), fromjson("{$_internalSchemaMaxProperties: 1}"));
     ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
 }
 

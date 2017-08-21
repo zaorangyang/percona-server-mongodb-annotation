@@ -217,7 +217,7 @@ void recordStatsForTopCommand(OperationContext* opCtx) {
 }  // namespace
 
 /* Find and Modify an object returning either the old (default) or new value*/
-class CmdFindAndModify : public Command {
+class CmdFindAndModify : public BasicCommand {
 public:
     void help(std::stringstream& help) const override {
         help << "{ findAndModify: \"collection\", query: {processed:false}, update: {$set: "
@@ -228,7 +228,7 @@ public:
                 "Output is in the \"value\" field\n";
     }
 
-    CmdFindAndModify() : Command("findAndModify", "findandmodify") {}
+    CmdFindAndModify() : BasicCommand("findAndModify", "findandmodify") {}
 
     bool slaveOk() const override {
         return false;
@@ -338,7 +338,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& dbName,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) override {
         // findAndModify command is not replicated directly.
         invariant(opCtx->writesAreReplicated());
@@ -360,18 +359,6 @@ public:
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj))
             maybeDisableValidation.emplace(opCtx);
-
-        auto client = opCtx->getClient();
-        auto lastOpAtOperationStart = repl::ReplClientInfo::forClient(client).getLastOp();
-        ScopeGuard lastOpSetterGuard =
-            MakeObjGuard(repl::ReplClientInfo::forClient(client),
-                         &repl::ReplClientInfo::setLastOpToSystemLastOpTime,
-                         opCtx);
-
-        // If this is the local database, don't set last op.
-        if (dbName == "local") {
-            lastOpSetterGuard.Dismiss();
-        }
 
         auto curOp = CurOp::get(opCtx);
         OpDebug* opDebug = &curOp->debug();
@@ -576,13 +563,6 @@ public:
 
         if (!success) {
             return false;
-        }
-
-        if (repl::ReplClientInfo::forClient(client).getLastOp() != lastOpAtOperationStart) {
-            // If this operation has already generated a new lastOp, don't bother setting it here.
-            // No-op updates will not generate a new lastOp, so we still need the guard to fire in
-            // that case.
-            lastOpSetterGuard.Dismiss();
         }
 
         return true;

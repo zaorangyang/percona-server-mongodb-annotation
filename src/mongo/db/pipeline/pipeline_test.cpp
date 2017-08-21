@@ -37,7 +37,11 @@
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_change_notification.h"
+#include "mongo/db/pipeline/document_source_lookup_change_post_image.h"
+#include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
+#include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/document_value_test_util.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/field_path.h"
@@ -51,6 +55,8 @@ namespace PipelineTests {
 using boost::intrusive_ptr;
 using std::string;
 using std::vector;
+
+const NamespaceString kTestNss = NamespaceString("a.collection");
 
 namespace Optimizations {
 using namespace mongo;
@@ -77,7 +83,7 @@ void assertPipelineOptimizesAndSerializesTo(std::string inputPipeJson,
         ASSERT_EQUALS(stageElem.type(), BSONType::Object);
         rawPipeline.push_back(stageElem.embeddedObject());
     }
-    AggregationRequest request(NamespaceString("a.collection"), rawPipeline);
+    AggregationRequest request(kTestNss, rawPipeline);
     intrusive_ptr<ExpressionContextForTest> ctx =
         new ExpressionContextForTest(opCtx.get(), request);
 
@@ -942,6 +948,72 @@ TEST(PipelineOptimizationTest, MatchOnMaxItemsShouldNotMoveAcrossRename) {
     assertPipelineOptimizesTo(pipeline, pipeline);
 }
 
+TEST(PipelineOptimizationTest, MatchOnMinLengthShouldMoveAcrossRename) {
+    string inputPipe =
+        "[{$project: {_id: true, a: '$b'}}, "
+        "{$match: {a: {$_internalSchemaMinLength: 1}}}]";
+    string outputPipe =
+        "[{$match: {b: {$_internalSchemaMinLength: 1}}},"
+        "{$project: {_id: true, a: '$b'}}]";
+    assertPipelineOptimizesTo(inputPipe, outputPipe);
+}
+
+TEST(PipelineOptimizationTest, MatchOnMaxLengthShouldMoveAcrossRename) {
+    string inputPipe =
+        "[{$project: {_id: true, a: '$b'}}, "
+        "{$match: {a: {$_internalSchemaMaxLength: 1}}}]";
+    string outputPipe =
+        "[{$match: {b: {$_internalSchemaMaxLength: 1}}},"
+        "{$project: {_id: true, a: '$b'}}]";
+    assertPipelineOptimizesTo(inputPipe, outputPipe);
+}
+
+TEST(PipelineOptimizationTest, ChangeNotificationLookupSwapsWithIndependentMatch) {
+    QueryTestServiceContext testServiceContext;
+    auto opCtx = testServiceContext.makeOperationContext();
+
+    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest(kTestNss));
+    expCtx->opCtx = opCtx.get();
+
+    auto spec = BSON("$changeNotification" << BSON("fullDocument"
+                                                   << "lookup"));
+    auto stages = DocumentSourceChangeNotification::createFromBson(spec.firstElement(), expCtx);
+    ASSERT_EQ(stages.size(), 3UL);
+    // Make sure the change lookup is at the end.
+    ASSERT(dynamic_cast<DocumentSourceLookupChangePostImage*>(stages.back().get()));
+
+    auto matchPredicate = BSON("extra"
+                               << "predicate");
+    stages.push_back(DocumentSourceMatch::create(matchPredicate, expCtx));
+    auto pipeline = uassertStatusOK(Pipeline::create(stages, expCtx));
+    pipeline->optimizePipeline();
+
+    // Make sure the $match stage has swapped before the change look up.
+    ASSERT(dynamic_cast<DocumentSourceLookupChangePostImage*>(pipeline->getSources().back().get()));
+}
+
+TEST(PipelineOptimizationTest, ChangeNotificationLookupDoesNotSwapWithMatchOnPostImage) {
+    QueryTestServiceContext testServiceContext;
+    auto opCtx = testServiceContext.makeOperationContext();
+
+    intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest(kTestNss));
+    expCtx->opCtx = opCtx.get();
+
+    auto spec = BSON("$changeNotification" << BSON("fullDocument"
+                                                   << "lookup"));
+    auto stages = DocumentSourceChangeNotification::createFromBson(spec.firstElement(), expCtx);
+    ASSERT_EQ(stages.size(), 3UL);
+    // Make sure the change lookup is at the end.
+    ASSERT(dynamic_cast<DocumentSourceLookupChangePostImage*>(stages.back().get()));
+
+    stages.push_back(DocumentSourceMatch::create(
+        BSON(DocumentSourceLookupChangePostImage::kFullDocumentFieldName << BSONNULL), expCtx));
+    auto pipeline = uassertStatusOK(Pipeline::create(stages, expCtx));
+    pipeline->optimizePipeline();
+
+    // Make sure the $match stage stays at the end.
+    ASSERT(dynamic_cast<DocumentSourceMatch*>(pipeline->getSources().back().get()));
+}
 }  // namespace Local
 
 namespace Sharded {
@@ -966,7 +1038,7 @@ public:
             ASSERT_EQUALS(stageElem.type(), BSONType::Object);
             rawPipeline.push_back(stageElem.embeddedObject());
         }
-        AggregationRequest request(NamespaceString("a.collection"), rawPipeline);
+        AggregationRequest request(kTestNss, rawPipeline);
         intrusive_ptr<ExpressionContextForTest> ctx =
             new ExpressionContextForTest(&_opCtx, request);
 
@@ -975,11 +1047,23 @@ public:
         NamespaceString lookupCollNs("a", "lookupColl");
         ctx->setResolvedNamespace(lookupCollNs, {lookupCollNs, std::vector<BSONObj>{}});
 
+        // Test that we can both split the pipeline and reassemble it into its original form.
         mergePipe = uassertStatusOK(Pipeline::parse(request.getPipeline(), ctx));
         mergePipe->optimizePipeline();
 
+        auto beforeSplit = Value(mergePipe->serialize());
+
         shardPipe = mergePipe->splitForSharded();
-        ASSERT(shardPipe != nullptr);
+        ASSERT(shardPipe);
+
+        shardPipe->unsplitFromSharded(std::move(mergePipe));
+        ASSERT_FALSE(mergePipe);
+
+        ASSERT_VALUE_EQ(Value(shardPipe->serialize()), beforeSplit);
+
+        mergePipe = std::move(shardPipe);
+        shardPipe = mergePipe->splitForSharded();
+        ASSERT(shardPipe);
 
         ASSERT_VALUE_EQ(Value(shardPipe->writeExplainOps(ExplainOptions::Verbosity::kQueryPlanner)),
                         Value(shardPipeExpected["pipeline"]));
@@ -1329,8 +1413,10 @@ class DocumentSourceCollectionlessMock : public DocumentSourceMock {
 public:
     DocumentSourceCollectionlessMock() : DocumentSourceMock({}) {}
 
-    InitialSourceType getInitialSourceType() const final {
-        return InitialSourceType::kCollectionlessInitialSource;
+    StageConstraints constraints() const final {
+        StageConstraints constraints;
+        constraints.isIndependentOfAnyCollection = true;
+        return constraints;
     }
 
     static boost::intrusive_ptr<DocumentSourceCollectionlessMock> create() {
@@ -1369,7 +1455,7 @@ TEST_F(PipelineInitialSourceNSTest, CollectionNSNotValidIfInitialStageIsCollecti
     auto collectionlessSource = DocumentSourceCollectionlessMock::create();
     auto ctx = getExpCtx();
 
-    ctx->ns = NamespaceString("a.collection");
+    ctx->ns = kTestNss;
 
     ASSERT_NOT_OK(Pipeline::create({collectionlessSource}, ctx).getStatus());
 }
@@ -1381,6 +1467,34 @@ TEST_F(PipelineInitialSourceNSTest, AggregateOneNSValidForFacetPipelineRegardles
     ctx->ns = NamespaceString::makeCollectionlessAggregateNSS("unittests");
 
     ASSERT_OK(Pipeline::parseFacetPipeline(rawPipeline, ctx).getStatus());
+}
+
+TEST_F(PipelineInitialSourceNSTest, ChangeNotificationIsValidAsFirstStage) {
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeNotification: {}}")};
+    auto ctx = getExpCtx();
+    ctx->ns = NamespaceString("a.collection");
+    ASSERT_OK(Pipeline::parse(rawPipeline, ctx).getStatus());
+}
+
+TEST_F(PipelineInitialSourceNSTest, ChangeNotificationIsNotValidIfNotFirstStage) {
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$match: {custom: 'filter'}}"),
+                                              fromjson("{$changeNotification: {}}")};
+    auto ctx = getExpCtx();
+    ctx->ns = NamespaceString("a.collection");
+    auto parseStatus = Pipeline::parse(rawPipeline, ctx).getStatus();
+    ASSERT_EQ(parseStatus, ErrorCodes::BadValue);
+    ASSERT_EQ(parseStatus.location(), 40549);
+}
+
+TEST_F(PipelineInitialSourceNSTest, ChangeNotificationIsNotValidIfNotFirstStageInFacet) {
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$match: {custom: 'filter'}}"),
+                                              fromjson("{$changeNotification: {}}")};
+    auto ctx = getExpCtx();
+    ctx->ns = NamespaceString("a.collection");
+    auto parseStatus = Pipeline::parseFacetPipeline(rawPipeline, ctx).getStatus();
+    ASSERT_EQ(parseStatus, ErrorCodes::BadValue);
+    ASSERT_EQ(parseStatus.location(), 40550);
+    ASSERT(std::string::npos != parseStatus.reason().find("$changeNotification"));
 }
 
 }  // namespace Namespaces
@@ -1410,8 +1524,8 @@ class DocumentSourceDependencyDummy : public DocumentSourceMock {
 public:
     DocumentSourceDependencyDummy() : DocumentSourceMock({}) {}
 
-    InitialSourceType getInitialSourceType() const final {
-        return InitialSourceType::kNotInitialSource;
+    StageConstraints constraints() const final {
+        return StageConstraints{};  // Overrides DocumentSourceMock's required position.
     }
 };
 

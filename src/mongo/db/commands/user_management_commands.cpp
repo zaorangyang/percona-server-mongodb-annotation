@@ -47,10 +47,12 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/privilege_parser.h"
 #include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/auth/user.h"
@@ -61,13 +63,11 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/write_ops/batched_command_response.h"
-#include "mongo/s/write_ops/batched_delete_request.h"
-#include "mongo/s/write_ops/batched_insert_request.h"
-#include "mongo/s/write_ops/batched_update_request.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
@@ -77,8 +77,6 @@
 #include "mongo/util/time_support.h"
 
 namespace mongo {
-
-namespace str = mongoutils::str;
 
 using std::endl;
 using std::string;
@@ -181,8 +179,7 @@ Status checkOkayToGrantRolesToRole(OperationContext* opCtx,
         }
 
         BSONObj roleToAddDoc;
-        Status status = authzManager->getRoleDescription(
-            opCtx, roleToAdd, PrivilegeFormat::kOmit, &roleToAddDoc);
+        Status status = authzManager->getRoleDescription(opCtx, roleToAdd, &roleToAddDoc);
         if (status == ErrorCodes::RoleNotFound) {
             return Status(ErrorCodes::RoleNotFound,
                           "Cannot grant nonexistent role " + roleToAdd.toString());
@@ -270,12 +267,14 @@ Status insertAuthzDocument(OperationContext* opCtx,
     try {
         DBDirectClient client(opCtx);
 
-        BatchedInsertRequest req;
-        req.setNS(collectionName);
-        req.addToDocuments(document);
-
         BSONObj res;
-        client.runCommand(collectionName.db().toString(), req.toBSON(), res);
+        client.runCommand(collectionName.db().toString(),
+                          [&] {
+                              write_ops::Insert insertOp(collectionName);
+                              insertOp.setDocuments({document});
+                              return insertOp.toBSON({});
+                          }(),
+                          res);
 
         BatchedCommandResponse response;
         std::string errmsg;
@@ -304,18 +303,21 @@ Status updateAuthzDocuments(OperationContext* opCtx,
     try {
         DBDirectClient client(opCtx);
 
-        auto doc = stdx::make_unique<BatchedUpdateDocument>();
-        doc->setQuery(query);
-        doc->setUpdateExpr(updatePattern);
-        doc->setMulti(multi);
-        doc->setUpsert(upsert);
-
-        BatchedUpdateRequest req;
-        req.setNS(collectionName);
-        req.addToUpdates(doc.release());
-
         BSONObj res;
-        client.runCommand(collectionName.db().toString(), req.toBSON(), res);
+        client.runCommand(collectionName.db().toString(),
+                          [&] {
+                              write_ops::Update updateOp(collectionName);
+                              updateOp.setUpdates({[&] {
+                                  write_ops::UpdateOpEntry entry;
+                                  entry.setQ(query);
+                                  entry.setU(updatePattern);
+                                  entry.setMulti(multi);
+                                  entry.setUpsert(upsert);
+                                  return entry;
+                              }()});
+                              return updateOp.toBSON({});
+                          }(),
+                          res);
 
         BatchedCommandResponse response;
         std::string errmsg;
@@ -374,16 +376,19 @@ Status removeAuthzDocuments(OperationContext* opCtx,
     try {
         DBDirectClient client(opCtx);
 
-        auto doc = stdx::make_unique<BatchedDeleteDocument>();
-        doc->setQuery(query);
-        doc->setLimit(0);
-
-        BatchedDeleteRequest req;
-        req.setNS(collectionName);
-        req.addToDeletes(doc.release());
-
         BSONObj res;
-        client.runCommand(collectionName.db().toString(), req.toBSON(), res);
+        client.runCommand(collectionName.db().toString(),
+                          [&] {
+                              write_ops::Delete deleteOp(collectionName);
+                              deleteOp.setDeletes({[&] {
+                                  write_ops::DeleteOpEntry entry;
+                                  entry.setQ(query);
+                                  entry.setMulti(true);
+                                  return entry;
+                              }()});
+                              return deleteOp.toBSON({});
+                          }(),
+                          res);
 
         BatchedCommandResponse response;
         std::string errmsg;
@@ -594,9 +599,9 @@ Status requireAuthSchemaVersion26UpgradeOrFinal(OperationContext* opCtx,
 }  // namespace
 
 
-class CmdCreateUser : public Command {
+class CmdCreateUser : public BasicCommand {
 public:
-    CmdCreateUser() : Command("createUser") {}
+    CmdCreateUser() : BasicCommand("createUser") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -619,7 +624,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::CreateOrUpdateUserArgs args;
         Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, "createUser", dbname, &args);
@@ -696,9 +700,15 @@ public:
         }
         credentialsBuilder.done();
 
+        if (args.authenticationRestrictions && !args.authenticationRestrictions->isEmpty()) {
+            credentialsBuilder.append("authenticationRestrictions",
+                                      *args.authenticationRestrictions);
+        }
+
         if (args.hasCustomData) {
             userObjBuilder.append("customData", args.customData);
         }
+
         userObjBuilder.append("roles", rolesVectorToBSONArray(args.roles));
 
         BSONObj userObj = userObjBuilder.obj();
@@ -718,8 +728,7 @@ public:
         // Role existence has to be checked after acquiring the update lock
         for (size_t i = 0; i < args.roles.size(); ++i) {
             BSONObj ignored;
-            status = authzManager->getRoleDescription(
-                opCtx, args.roles[i], PrivilegeFormat::kOmit, &ignored);
+            status = authzManager->getRoleDescription(opCtx, args.roles[i], &ignored);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -729,7 +738,8 @@ public:
                              args.userName,
                              args.hasHashedPassword,
                              args.hasCustomData ? &args.customData : NULL,
-                             args.roles);
+                             args.roles,
+                             args.authenticationRestrictions);
         status = insertPrivilegeDocument(opCtx, userObj);
         return appendCommandStatus(result, status);
     }
@@ -740,9 +750,9 @@ public:
 
 } cmdCreateUser;
 
-class CmdUpdateUser : public Command {
+class CmdUpdateUser : public BasicCommand {
 public:
-    CmdUpdateUser() : Command("updateUser") {}
+    CmdUpdateUser() : BasicCommand("updateUser") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -765,7 +775,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::CreateOrUpdateUserArgs args;
         Status status = auth::parseCreateOrUpdateUserCommands(cmdObj, "updateUser", dbname, &args);
@@ -773,7 +782,8 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        if (!args.hasHashedPassword && !args.hasCustomData && !args.hasRoles) {
+        if (!args.hasHashedPassword && !args.hasCustomData && !args.hasRoles &&
+            !args.authenticationRestrictions) {
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::BadValue,
@@ -789,6 +799,7 @@ public:
         }
 
         BSONObjBuilder updateSetBuilder;
+        BSONObjBuilder updateUnsetBuilder;
         if (args.hasHashedPassword) {
             BSONObjBuilder credentialsBuilder(updateSetBuilder.subobjStart("credentials"));
 
@@ -809,11 +820,38 @@ public:
             }
             credentialsBuilder.done();
         }
+
         if (args.hasCustomData) {
             updateSetBuilder.append("customData", args.customData);
         }
+
+        if (args.authenticationRestrictions) {
+            if (args.authenticationRestrictions->isEmpty()) {
+                updateUnsetBuilder.append("authenticationRestrictions", "");
+            } else {
+                auto swParsedRestrictions =
+                    parseAuthenticationRestriction(*args.authenticationRestrictions);
+                if (!swParsedRestrictions.isOK()) {
+                    return appendCommandStatus(result, swParsedRestrictions.getStatus());
+                }
+
+                updateSetBuilder.append("authenticationRestrictions",
+                                        *args.authenticationRestrictions);
+            }
+        }
+
         if (args.hasRoles) {
             updateSetBuilder.append("roles", rolesVectorToBSONArray(args.roles));
+        }
+
+        BSONObj updateSet = updateSetBuilder.done();
+        BSONObj updateUnset = updateUnsetBuilder.done();
+        BSONObjBuilder updateDocumentBuilder;
+        if (!updateSet.isEmpty()) {
+            updateDocumentBuilder << "$set" << updateSet;
+        }
+        if (!updateUnset.isEmpty()) {
+            updateDocumentBuilder << "$unset" << updateUnset;
         }
 
         ServiceContext* serviceContext = opCtx->getClient()->getServiceContext();
@@ -825,13 +863,11 @@ public:
             return appendCommandStatus(result, status);
         }
 
-
         // Role existence has to be checked after acquiring the update lock
         if (args.hasRoles) {
             for (size_t i = 0; i < args.roles.size(); ++i) {
                 BSONObj ignored;
-                status = authzManager->getRoleDescription(
-                    opCtx, args.roles[i], PrivilegeFormat::kOmit, &ignored);
+                status = authzManager->getRoleDescription(opCtx, args.roles[i], &ignored);
                 if (!status.isOK()) {
                     return appendCommandStatus(result, status);
                 }
@@ -842,10 +878,10 @@ public:
                              args.userName,
                              args.hasHashedPassword,
                              args.hasCustomData ? &args.customData : NULL,
-                             args.hasRoles ? &args.roles : NULL);
+                             args.hasRoles ? &args.roles : NULL,
+                             args.authenticationRestrictions);
 
-        status =
-            updatePrivilegeDocument(opCtx, args.userName, BSON("$set" << updateSetBuilder.done()));
+        status = updatePrivilegeDocument(opCtx, args.userName, updateDocumentBuilder.done());
         // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
         authzManager->invalidateUserByName(args.userName);
         return appendCommandStatus(result, status);
@@ -857,9 +893,9 @@ public:
 
 } cmdUpdateUser;
 
-class CmdDropUser : public Command {
+class CmdDropUser : public BasicCommand {
 public:
-    CmdDropUser() : Command("dropUser") {}
+    CmdDropUser() : BasicCommand("dropUser") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -882,7 +918,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         UserName userName;
         Status status = auth::parseAndValidateDropUserCommand(cmdObj, dbname, &userName);
@@ -925,9 +960,9 @@ public:
 
 } cmdDropUser;
 
-class CmdDropAllUsersFromDatabase : public Command {
+class CmdDropAllUsersFromDatabase : public BasicCommand {
 public:
-    CmdDropAllUsersFromDatabase() : Command("dropAllUsersFromDatabase") {}
+    CmdDropAllUsersFromDatabase() : BasicCommand("dropAllUsersFromDatabase") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -950,7 +985,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         Status status = auth::parseAndValidateDropAllUsersFromDatabaseCommand(cmdObj, dbname);
         if (!status.isOK()) {
@@ -982,9 +1016,9 @@ public:
 
 } cmdDropAllUsersFromDatabase;
 
-class CmdGrantRolesToUser : public Command {
+class CmdGrantRolesToUser : public BasicCommand {
 public:
-    CmdGrantRolesToUser() : Command("grantRolesToUser") {}
+    CmdGrantRolesToUser() : BasicCommand("grantRolesToUser") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1007,7 +1041,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         std::string userNameString;
         std::vector<RoleName> roles;
@@ -1036,8 +1069,7 @@ public:
         for (vector<RoleName>::iterator it = roles.begin(); it != roles.end(); ++it) {
             RoleName& roleName = *it;
             BSONObj roleDoc;
-            status =
-                authzManager->getRoleDescription(opCtx, roleName, PrivilegeFormat::kOmit, &roleDoc);
+            status = authzManager->getRoleDescription(opCtx, roleName, &roleDoc);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1056,9 +1088,9 @@ public:
 
 } cmdGrantRolesToUser;
 
-class CmdRevokeRolesFromUser : public Command {
+class CmdRevokeRolesFromUser : public BasicCommand {
 public:
-    CmdRevokeRolesFromUser() : Command("revokeRolesFromUser") {}
+    CmdRevokeRolesFromUser() : BasicCommand("revokeRolesFromUser") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1081,7 +1113,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         std::string userNameString;
         std::vector<RoleName> roles;
@@ -1110,8 +1141,7 @@ public:
         for (vector<RoleName>::iterator it = roles.begin(); it != roles.end(); ++it) {
             RoleName& roleName = *it;
             BSONObj roleDoc;
-            status =
-                authzManager->getRoleDescription(opCtx, roleName, PrivilegeFormat::kOmit, &roleDoc);
+            status = authzManager->getRoleDescription(opCtx, roleName, &roleDoc);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -1130,7 +1160,7 @@ public:
 
 } cmdRevokeRolesFromUser;
 
-class CmdUsersInfo : public Command {
+class CmdUsersInfo : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return false;
@@ -1144,7 +1174,7 @@ public:
         return false;
     }
 
-    CmdUsersInfo() : Command("usersInfo") {}
+    CmdUsersInfo() : BasicCommand("usersInfo") {}
 
     virtual void help(stringstream& ss) const {
         ss << "Returns information about users." << endl;
@@ -1159,7 +1189,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::UsersInfoArgs args;
         Status status = auth::parseUsersInfoCommand(cmdObj, dbname, &args);
@@ -1172,17 +1201,21 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        if (args.allForDB && args.showPrivileges) {
+        if (args.allForDB &&
+            (args.showPrivileges ||
+             args.authenticationRestrictionsFormat == AuthenticationRestrictionsFormat::kShow)) {
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::IllegalOperation,
-                       "Can only get privilege details on exact-match usersInfo "
+                       "Can only get privilege or restriction details on exact-match usersInfo "
                        "queries."));
         }
 
         BSONArrayBuilder usersArrayBuilder;
-        if (args.showPrivileges) {
-            // If you want privileges you need to call getUserDescription on each user.
+        if (args.showPrivileges ||
+            args.authenticationRestrictionsFormat == AuthenticationRestrictionsFormat::kShow) {
+            // If you want privileges or restrictions you need to call getUserDescription on each
+            // user.
             for (size_t i = 0; i < args.userNames.size(); ++i) {
                 BSONObj userDetails;
                 status = getGlobalAuthorizationManager()->getUserDescription(
@@ -1194,22 +1227,29 @@ public:
                     return appendCommandStatus(result, status);
                 }
 
-                if (!args.showCredentials) {
-                    // getUserDescription always includes credentials, need to strip it out
-                    BSONObjBuilder userWithoutCredentials(usersArrayBuilder.subobjStart());
-                    for (BSONObjIterator it(userDetails); it.more();) {
-                        BSONElement e = it.next();
-                        if (e.fieldNameStringData() != "credentials" &&
-                            e.fieldNameStringData() != AuthorizationManager::USER_ID_FIELD_NAME)
-                            userWithoutCredentials.append(e);
+                // getUserDescription always includes credentials and restrictions, which may need
+                // to be stripped out
+                BSONObjBuilder strippedUser(usersArrayBuilder.subobjStart());
+                for (const BSONElement& e : userDetails) {
+                    if (!args.showCredentials &&
+                        (e.fieldNameStringData() == "credentials" ||
+                         e.fieldNameStringData() == AuthorizationManager::USER_ID_FIELD_NAME)) {
+                        continue;
                     }
-                    userWithoutCredentials.doneFast();
-                } else {
-                    usersArrayBuilder.append(userDetails);
+
+                    if (e.fieldNameStringData() == "authenticationRestrictions" &&
+                        args.authenticationRestrictionsFormat ==
+                            AuthenticationRestrictionsFormat::kOmit) {
+                        continue;
+                    }
+
+                    strippedUser.append(e);
                 }
+                strippedUser.doneFast();
             }
         } else {
-            // If you don't need privileges, you can just do a regular query on system.users
+            // If you don't need privileges, or authenticationRestrictions, you can just do a
+            // regular query on system.users
             BSONObjBuilder queryBuilder;
             if (args.allForDB) {
                 queryBuilder.append("query",
@@ -1228,18 +1268,22 @@ public:
             queryBuilder.append("orderby", BSON("user" << 1 << "db" << 1));
 
             BSONObjBuilder projection;
+            projection.append("authenticationRestrictions", 0);
             if (!args.showCredentials) {
                 projection.append(AuthorizationManager::USER_ID_FIELD_NAME, 0);
                 projection.append("credentials", 0);
             }
             const stdx::function<void(const BSONObj&)> function = stdx::bind(
                 appendBSONObjToBSONArrayBuilder, &usersArrayBuilder, stdx::placeholders::_1);
-            queryAuthzDocument(opCtx,
-                               AuthorizationManager::usersCollectionNamespace,
-                               queryBuilder.done(),
-                               projection.done(),
-                               function)
-                .transitional_ignore();
+
+            Status status = queryAuthzDocument(opCtx,
+                                               AuthorizationManager::usersCollectionNamespace,
+                                               queryBuilder.done(),
+                                               projection.done(),
+                                               function);
+            if (!status.isOK()) {
+                return appendCommandStatus(result, status);
+            }
         }
         result.append("users", usersArrayBuilder.arr());
         return true;
@@ -1247,9 +1291,9 @@ public:
 
 } cmdUsersInfo;
 
-class CmdCreateRole : public Command {
+class CmdCreateRole : public BasicCommand {
 public:
-    CmdCreateRole() : Command("createRole") {}
+    CmdCreateRole() : BasicCommand("createRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1272,7 +1316,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::CreateOrUpdateRoleArgs args;
         Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj, "createRole", dbname, &args);
@@ -1332,6 +1375,11 @@ public:
 
         roleObjBuilder.append("roles", rolesVectorToBSONArray(args.roles));
 
+        if (args.authenticationRestrictions && !args.authenticationRestrictions->isEmpty()) {
+            roleObjBuilder.append("authenticationRestrictions",
+                                  args.authenticationRestrictions.get());
+        }
+
         ServiceContext* serviceContext = opCtx->getClient()->getServiceContext();
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
@@ -1352,7 +1400,11 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        audit::logCreateRole(Client::getCurrent(), args.roleName, args.roles, args.privileges);
+        audit::logCreateRole(Client::getCurrent(),
+                             args.roleName,
+                             args.roles,
+                             args.privileges,
+                             args.authenticationRestrictions);
 
         status = insertRoleDocument(opCtx, roleObjBuilder.done());
         return appendCommandStatus(result, status);
@@ -1360,9 +1412,9 @@ public:
 
 } cmdCreateRole;
 
-class CmdUpdateRole : public Command {
+class CmdUpdateRole : public BasicCommand {
 public:
-    CmdUpdateRole() : Command("updateRole") {}
+    CmdUpdateRole() : BasicCommand("updateRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1385,7 +1437,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::CreateOrUpdateRoleArgs args;
         Status status = auth::parseCreateOrUpdateRoleCommands(cmdObj, "updateRole", dbname, &args);
@@ -1393,7 +1444,7 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        if (!args.hasPrivileges && !args.hasRoles) {
+        if (!args.hasPrivileges && !args.hasRoles && !args.authenticationRestrictions) {
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::BadValue,
@@ -1401,6 +1452,7 @@ public:
         }
 
         BSONObjBuilder updateSetBuilder;
+        BSONObjBuilder updateUnsetBuilder;
 
         if (args.hasPrivileges) {
             BSONArray privileges;
@@ -1415,6 +1467,15 @@ public:
             updateSetBuilder.append("roles", rolesVectorToBSONArray(args.roles));
         }
 
+        if (args.authenticationRestrictions) {
+            if (args.authenticationRestrictions->isEmpty()) {
+                updateUnsetBuilder.append("authenticationRestrictions", "");
+            } else {
+                updateSetBuilder.append("authenticationRestrictions",
+                                        args.authenticationRestrictions.get());
+            }
+        }
+
         ServiceContext* serviceContext = opCtx->getClient()->getServiceContext();
         stdx::lock_guard<stdx::mutex> lk(getAuthzDataMutex(serviceContext));
 
@@ -1426,8 +1487,7 @@ public:
 
         // Role existence has to be checked after acquiring the update lock
         BSONObj ignored;
-        status = authzManager->getRoleDescription(
-            opCtx, args.roleName, PrivilegeFormat::kOmit, &ignored);
+        status = authzManager->getRoleDescription(opCtx, args.roleName, &ignored);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1448,19 +1508,30 @@ public:
 
         audit::logUpdateRole(Client::getCurrent(),
                              args.roleName,
-                             args.hasRoles ? &args.roles : NULL,
-                             args.hasPrivileges ? &args.privileges : NULL);
+                             args.hasRoles ? &args.roles : nullptr,
+                             args.hasPrivileges ? &args.privileges : nullptr,
+                             args.authenticationRestrictions);
 
-        status = updateRoleDocument(opCtx, args.roleName, BSON("$set" << updateSetBuilder.done()));
+        const auto updateSet = updateSetBuilder.obj();
+        const auto updateUnset = updateUnsetBuilder.obj();
+        BSONObjBuilder updateDocumentBuilder;
+        if (!updateSet.isEmpty()) {
+            updateDocumentBuilder.append("$set", updateSet);
+        }
+        if (!updateUnset.isEmpty()) {
+            updateDocumentBuilder.append("$unset", updateUnset);
+        }
+
+        status = updateRoleDocument(opCtx, args.roleName, updateDocumentBuilder.obj());
         // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
         authzManager->invalidateUserCache();
         return appendCommandStatus(result, status);
     }
 } cmdUpdateRole;
 
-class CmdGrantPrivilegesToRole : public Command {
+class CmdGrantPrivilegesToRole : public BasicCommand {
 public:
-    CmdGrantPrivilegesToRole() : Command("grantPrivilegesToRole") {}
+    CmdGrantPrivilegesToRole() : BasicCommand("grantPrivilegesToRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1483,7 +1554,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
 
         RoleName roleName;
@@ -1517,8 +1587,11 @@ public:
         }
 
         BSONObj roleDoc;
-        status = authzManager->getRoleDescription(
-            opCtx, roleName, PrivilegeFormat::kShowSeparate, &roleDoc);
+        status = authzManager->getRoleDescription(opCtx,
+                                                  roleName,
+                                                  PrivilegeFormat::kShowSeparate,
+                                                  AuthenticationRestrictionsFormat::kOmit,
+                                                  &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1566,9 +1639,9 @@ public:
 
 } cmdGrantPrivilegesToRole;
 
-class CmdRevokePrivilegesFromRole : public Command {
+class CmdRevokePrivilegesFromRole : public BasicCommand {
 public:
-    CmdRevokePrivilegesFromRole() : Command("revokePrivilegesFromRole") {}
+    CmdRevokePrivilegesFromRole() : BasicCommand("revokePrivilegesFromRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1591,7 +1664,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         RoleName roleName;
         PrivilegeVector privilegesToRemove;
@@ -1619,8 +1691,11 @@ public:
         }
 
         BSONObj roleDoc;
-        status = authzManager->getRoleDescription(
-            opCtx, roleName, PrivilegeFormat::kShowSeparate, &roleDoc);
+        status = authzManager->getRoleDescription(opCtx,
+                                                  roleName,
+                                                  PrivilegeFormat::kShowSeparate,
+                                                  AuthenticationRestrictionsFormat::kOmit,
+                                                  &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1676,9 +1751,9 @@ public:
 
 } cmdRevokePrivilegesFromRole;
 
-class CmdGrantRolesToRole : public Command {
+class CmdGrantRolesToRole : public BasicCommand {
 public:
-    CmdGrantRolesToRole() : Command("grantRolesToRole") {}
+    CmdGrantRolesToRole() : BasicCommand("grantRolesToRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1701,7 +1776,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         std::string roleNameString;
         std::vector<RoleName> rolesToAdd;
@@ -1731,8 +1805,7 @@ public:
 
         // Role existence has to be checked after acquiring the update lock
         BSONObj roleDoc;
-        status =
-            authzManager->getRoleDescription(opCtx, roleName, PrivilegeFormat::kOmit, &roleDoc);
+        status = authzManager->getRoleDescription(opCtx, roleName, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1767,9 +1840,9 @@ public:
 
 } cmdGrantRolesToRole;
 
-class CmdRevokeRolesFromRole : public Command {
+class CmdRevokeRolesFromRole : public BasicCommand {
 public:
-    CmdRevokeRolesFromRole() : Command("revokeRolesFromRole") {}
+    CmdRevokeRolesFromRole() : BasicCommand("revokeRolesFromRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1792,7 +1865,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         std::string roleNameString;
         std::vector<RoleName> rolesToRemove;
@@ -1821,8 +1893,7 @@ public:
         }
 
         BSONObj roleDoc;
-        status =
-            authzManager->getRoleDescription(opCtx, roleName, PrivilegeFormat::kOmit, &roleDoc);
+        status = authzManager->getRoleDescription(opCtx, roleName, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -1853,9 +1924,9 @@ public:
 
 } cmdRevokeRolesFromRole;
 
-class CmdDropRole : public Command {
+class CmdDropRole : public BasicCommand {
 public:
-    CmdDropRole() : Command("dropRole") {}
+    CmdDropRole() : BasicCommand("dropRole") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -1882,7 +1953,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         RoleName roleName;
         Status status = auth::parseDropRoleCommand(cmdObj, dbname, &roleName);
@@ -1908,8 +1978,7 @@ public:
         }
 
         BSONObj roleDoc;
-        status =
-            authzManager->getRoleDescription(opCtx, roleName, PrivilegeFormat::kOmit, &roleDoc);
+        status = authzManager->getRoleDescription(opCtx, roleName, &roleDoc);
         if (!status.isOK()) {
             return appendCommandStatus(result, status);
         }
@@ -2006,9 +2075,9 @@ public:
 
 } cmdDropRole;
 
-class CmdDropAllRolesFromDatabase : public Command {
+class CmdDropAllRolesFromDatabase : public BasicCommand {
 public:
-    CmdDropAllRolesFromDatabase() : Command("dropAllRolesFromDatabase") {}
+    CmdDropAllRolesFromDatabase() : BasicCommand("dropAllRolesFromDatabase") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -2036,7 +2105,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         Status status = auth::parseDropAllRolesFromDatabaseCommand(cmdObj, dbname);
         if (!status.isOK()) {
@@ -2150,7 +2218,7 @@ public:
  *                    schema.
  */
 
-class CmdRolesInfo : public Command {
+class CmdRolesInfo : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return false;
@@ -2164,7 +2232,7 @@ public:
         return false;
     }
 
-    CmdRolesInfo() : Command("rolesInfo") {}
+    CmdRolesInfo() : BasicCommand("rolesInfo") {}
 
     virtual void help(stringstream& ss) const {
         ss << "Returns information about roles." << endl;
@@ -2179,7 +2247,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::RolesInfoArgs args;
         Status status = auth::parseRolesInfoCommand(cmdObj, dbname, &args);
@@ -2195,7 +2262,12 @@ public:
         if (args.allForDB) {
             std::vector<BSONObj> rolesDocs;
             status = getGlobalAuthorizationManager()->getRoleDescriptionsForDB(
-                opCtx, dbname, args.privilegeFormat, args.showBuiltinRoles, &rolesDocs);
+                opCtx,
+                dbname,
+                args.privilegeFormat,
+                args.authenticationRestrictionsFormat,
+                args.showBuiltinRoles,
+                &rolesDocs);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -2214,7 +2286,11 @@ public:
         } else {
             BSONObj roleDetails;
             status = getGlobalAuthorizationManager()->getRolesDescription(
-                opCtx, args.roleNames, args.privilegeFormat, &roleDetails);
+                opCtx,
+                args.roleNames,
+                args.privilegeFormat,
+                args.authenticationRestrictionsFormat,
+                &roleDetails);
             if (!status.isOK()) {
                 return appendCommandStatus(result, status);
             }
@@ -2231,7 +2307,7 @@ public:
 
 } cmdRolesInfo;
 
-class CmdInvalidateUserCache : public Command {
+class CmdInvalidateUserCache : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return true;
@@ -2245,7 +2321,7 @@ public:
         return false;
     }
 
-    CmdInvalidateUserCache() : Command("invalidateUserCache") {}
+    CmdInvalidateUserCache() : BasicCommand("invalidateUserCache") {}
 
     virtual void help(stringstream& ss) const {
         ss << "Invalidates the in-memory cache of user information" << endl;
@@ -2260,7 +2336,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         authzManager->invalidateUserCache();
@@ -2269,7 +2344,7 @@ public:
 
 } cmdInvalidateUserCache;
 
-class CmdGetCacheGeneration : public Command {
+class CmdGetCacheGeneration : public BasicCommand {
 public:
     virtual bool slaveOk() const {
         return true;
@@ -2283,7 +2358,7 @@ public:
         return false;
     }
 
-    CmdGetCacheGeneration() : Command("_getUserCacheGeneration") {}
+    CmdGetCacheGeneration() : BasicCommand("_getUserCacheGeneration") {}
 
     virtual void help(stringstream& ss) const {
         ss << "internal" << endl;
@@ -2298,7 +2373,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         AuthorizationManager* authzManager = getGlobalAuthorizationManager();
         result.append("cacheGeneration", authzManager->getCacheGeneration());
@@ -2317,9 +2391,9 @@ public:
  * It either adds the users/roles to the existing ones or replaces the existing ones, depending
  * on whether the "drop" argument is true or false.
  */
-class CmdMergeAuthzCollections : public Command {
+class CmdMergeAuthzCollections : public BasicCommand {
 public:
-    CmdMergeAuthzCollections() : Command("_mergeAuthzCollections") {}
+    CmdMergeAuthzCollections() : BasicCommand("_mergeAuthzCollections") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -2402,18 +2476,28 @@ public:
             customData = userObj["customData"].Obj();
         }
 
+        boost::optional<BSONArray> authenticationRestrictions;
+        if (userObj.hasField("authenticationRestrictions")) {
+            auto r = getRawAuthenticationRestrictions(
+                BSONArray(userObj["authenticationRestrictions"].Obj()));
+            uassertStatusOK(r);
+            authenticationRestrictions = r.getValue();
+        }
+
         if (create) {
             audit::logCreateUser(Client::getCurrent(),
                                  userName,
                                  userObj["credentials"].Obj().hasField("MONGODB-CR"),
                                  userObj.hasField("customData") ? &customData : NULL,
-                                 roles);
+                                 roles,
+                                 authenticationRestrictions);
         } else {
             audit::logUpdateUser(Client::getCurrent(),
                                  userName,
                                  userObj["credentials"].Obj().hasField("MONGODB-CR"),
                                  userObj.hasField("customData") ? &customData : NULL,
-                                 &roles);
+                                 &roles,
+                                 authenticationRestrictions);
         }
     }
 
@@ -2428,10 +2512,21 @@ public:
             BSONArray(roleObj["roles"].Obj()), roleName.getDB(), &roles));
         uassertStatusOK(auth::parseAndValidatePrivilegeArray(BSONArray(roleObj["privileges"].Obj()),
                                                              &privileges));
+
+        boost::optional<BSONArray> authenticationRestrictions;
+        if (roleObj.hasField("authenticationRestrictions")) {
+            auto r = getRawAuthenticationRestrictions(
+                BSONArray(roleObj["authenticationRestrictions"].Obj()));
+            uassertStatusOK(r);
+            authenticationRestrictions = r.getValue();
+        }
+
         if (create) {
-            audit::logCreateRole(Client::getCurrent(), roleName, roles, privileges);
+            audit::logCreateRole(
+                Client::getCurrent(), roleName, roles, privileges, authenticationRestrictions);
         } else {
-            audit::logUpdateRole(Client::getCurrent(), roleName, &roles, &privileges);
+            audit::logUpdateRole(
+                Client::getCurrent(), roleName, &roles, &privileges, authenticationRestrictions);
         }
     }
 
@@ -2675,7 +2770,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         auth::MergeAuthzCollectionsArgs args;
         Status status = auth::parseMergeAuthzCollectionsCommand(cmdObj, &args);
@@ -2887,9 +2981,9 @@ Status upgradeAuthSchema(OperationContext* opCtx,
                                             << " successful steps.");
 }
 
-class CmdAuthSchemaUpgrade : public Command {
+class CmdAuthSchemaUpgrade : public BasicCommand {
 public:
-    CmdAuthSchemaUpgrade() : Command("authSchemaUpgrade") {}
+    CmdAuthSchemaUpgrade() : BasicCommand("authSchemaUpgrade") {}
 
     virtual bool slaveOk() const {
         return false;
@@ -2916,7 +3010,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         auth::AuthSchemaUpgradeArgs parsedArgs;
         Status status = auth::parseAuthSchemaUpgradeCommand(cmdObj, dbname, &parsedArgs);

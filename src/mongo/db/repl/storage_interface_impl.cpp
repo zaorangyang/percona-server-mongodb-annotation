@@ -830,7 +830,7 @@ Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
     request.setMulti(true);
     request.setYieldPolicy(PlanExecutor::NO_YIELD);
 
-    // This disables the legalClientSystemNS() check in getExecutorDelete() which is used to
+    // This disables the isLegalClientSystemNS() check in getExecutorDelete() which is used to
     // disallow client deletes from unrecognized system collections.
     request.setGod();
 
@@ -892,6 +892,15 @@ StatusWith<StorageInterface::CollectionCount> StorageInterfaceImpl::getCollectio
     auto collection = collectionResult.getValue();
 
     return collection->numRecords(opCtx);
+}
+
+void StorageInterfaceImpl::setStableTimestamp(OperationContext* opCtx, SnapshotName snapshotName) {
+    opCtx->getServiceContext()->getGlobalStorageEngine()->setStableTimestamp(snapshotName);
+}
+
+void StorageInterfaceImpl::setInitialDataTimestamp(OperationContext* opCtx,
+                                                   SnapshotName snapshotName) {
+    opCtx->getServiceContext()->getGlobalStorageEngine()->setInitialDataTimestamp(snapshotName);
 }
 
 Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {

@@ -37,6 +37,7 @@
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
@@ -75,6 +76,8 @@ public:
     BSONObj findOne(const NamespaceString& nss, const BSONObj& filter) const override;
     void copyCollectionFromRemote(OperationContext* opCtx,
                                   const NamespaceString& nss) const override;
+    StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+                                                const UUID& uuid) const override;
     StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override;
 
 private:
@@ -115,6 +118,12 @@ StatusWith<BSONObj> RollbackSourceMock::getCollectionInfo(const NamespaceString&
     return BSON("name" << nss.ns() << "options" << BSONObj());
 }
 
+StatusWith<BSONObj> RollbackSourceMock::getCollectionInfoByUUID(const std::string& db,
+                                                                const UUID& uuid) const {
+    return BSON("options" << BSON("uuid" << uuid));
+}
+
+
 class RSRollbackTest : public RollbackTest {
 private:
     void setUp() override;
@@ -133,6 +142,89 @@ void RSRollbackTest::tearDown() {
 OplogInterfaceMock::Operation makeNoopOplogEntryAndRecordId(Seconds seconds) {
     OpTime ts(Timestamp(seconds, 0), 0);
     return std::make_pair(BSON("ts" << ts.getTimestamp() << "h" << ts.getTerm()), RecordId(1));
+}
+
+OplogInterfaceMock::Operation makeDropIndexOplogEntry(Collection* collection,
+                                                      BSONObj key,
+                                                      std::string indexName,
+                                                      int time) {
+    auto indexSpec =
+        BSON("ns" << collection->ns().ns() << "key" << key << "name" << indexName << "v"
+                  << static_cast<int>(kIndexVersion));
+
+    return std::make_pair(
+        BSON("ts" << Timestamp(Seconds(time), 0) << "h" << 1LL << "op"
+                  << "c"
+                  << "ui"
+                  << collection->uuid().get()
+                  << "ns"
+                  << "test.$cmd"
+                  << "o"
+                  << BSON("dropIndexes" << collection->ns().coll() << "index" << indexName)
+                  << "o2"
+                  << indexSpec),
+        RecordId(time));
+}
+
+OplogInterfaceMock::Operation makeCreateIndexOplogEntry(Collection* collection,
+                                                        BSONObj key,
+                                                        std::string indexName,
+                                                        int time) {
+    auto indexSpec = BSON("createIndexes"
+                          << "t"
+                          << "ns"
+                          << collection->ns().ns()
+                          << "v"
+                          << static_cast<int>(kIndexVersion)
+                          << "key"
+                          << key
+                          << "name"
+                          << indexName);
+
+    return std::make_pair(BSON("ts" << Timestamp(Seconds(time), 0) << "h" << 1LL << "op"
+                                    << "c"
+                                    << "ns"
+                                    << "test.$cmd"
+                                    << "ui"
+                                    << collection->uuid().get()
+                                    << "o"
+                                    << indexSpec),
+                          RecordId(time));
+}
+
+OplogInterfaceMock::Operation makeRenameCollectionOplogEntry(const NamespaceString& renameFrom,
+                                                             const NamespaceString& renameTo,
+                                                             const UUID collectionUUID,
+                                                             OptionalCollectionUUID dropTarget,
+                                                             OptionalCollectionUUID dropSource,
+                                                             const bool stayTemp,
+                                                             OpTime opTime) {
+    BSONObjBuilder cmd;
+    cmd.append("renameCollection", renameFrom.ns());
+    cmd.append("to", renameTo.ns());
+    cmd.append("stayTemp", stayTemp);
+
+    BSONObj obj = cmd.obj();
+
+    if (dropTarget) {
+        obj = obj.addField(BSON("dropTarget" << *dropTarget).firstElement());
+    } else {
+        obj = obj.addField(BSON("dropTarget" << false).firstElement());
+    }
+    if (dropSource) {
+        obj = obj.addField(BSON("dropSource" << *dropSource).firstElement());
+    }
+
+    return std::make_pair(
+        BSON("ts" << opTime.getTimestamp() << "t" << opTime.getTerm() << "h" << 1LL << "op"
+                  << "c"
+                  << "ui"
+                  << collectionUUID
+                  << "ns"
+                  << renameFrom.ns()
+                  << "o"
+                  << obj),
+        RecordId(opTime.getTimestamp().getSecs()));
 }
 
 TEST_F(RSRollbackTest, InconsistentMinValid) {
@@ -337,7 +429,9 @@ TEST_F(RSRollbackTest, RollbackDeleteNoDocumentAtSourceCollectionDoesNotExist) {
 
 TEST_F(RSRollbackTest, RollbackDeleteNoDocumentAtSourceCollectionExistsNonCapped) {
     createOplog(_opCtx.get());
-    auto coll = _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto coll = _createCollection(_opCtx.get(), "test.t", options);
     _testRollbackDelete(
         _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid().get(), BSONObj());
     ASSERT_EQUALS(
@@ -349,6 +443,7 @@ TEST_F(RSRollbackTest, RollbackDeleteNoDocumentAtSourceCollectionExistsNonCapped
 TEST_F(RSRollbackTest, RollbackDeleteNoDocumentAtSourceCollectionExistsCapped) {
     createOplog(_opCtx.get());
     CollectionOptions options;
+    options.uuid = UUID::gen();
     options.capped = true;
     auto coll = _createCollection(_opCtx.get(), "test.t", options);
     ASSERT_EQUALS(
@@ -359,7 +454,9 @@ TEST_F(RSRollbackTest, RollbackDeleteNoDocumentAtSourceCollectionExistsCapped) {
 
 TEST_F(RSRollbackTest, RollbackDeleteRestoreDocument) {
     createOplog(_opCtx.get());
-    auto coll = _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto coll = _createCollection(_opCtx.get(), "test.t", options);
     BSONObj doc = BSON("_id" << 0 << "a" << 1);
     _testRollbackDelete(
         _opCtx.get(), _coordinator, _replicationProcess.get(), coll->uuid().get(), doc);
@@ -415,15 +512,17 @@ TEST_F(RSRollbackTest, RollbackInsertDocumentWithNoId) {
 
 TEST_F(RSRollbackTest, RollbackCreateIndexCommand) {
     createOplog(_opCtx.get());
-    auto collection = _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto collection = _createCollection(_opCtx.get(), "test.t", options);
     auto indexSpec = BSON("ns"
                           << "test.t"
+                          << "v"
+                          << static_cast<int>(kIndexVersion)
                           << "key"
                           << BSON("a" << 1)
                           << "name"
-                          << "a_1"
-                          << "v"
-                          << static_cast<int>(kIndexVersion));
+                          << "a_1");
     {
         Lock::DBLock dbLock(_opCtx.get(), "test", MODE_X);
         MultiIndexBlock indexer(_opCtx.get(), collection);
@@ -435,47 +534,28 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommand) {
         ASSERT(indexCatalog);
         ASSERT_EQUALS(2, indexCatalog->numIndexesReady(_opCtx.get()));
     }
+
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
-    auto insertDocumentOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 1LL << "op"
-                                 << "i"
-                                 << "ui"
-                                 << UUID::gen()
-                                 << "ns"
-                                 << "test.system.indexes"
-                                 << "o"
-                                 << indexSpec),
-                       RecordId(2));
-    class RollbackSourceLocal : public RollbackSourceMock {
-    public:
-        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
-            : RollbackSourceMock(std::move(oplog)), called(false) {}
-        void copyCollectionFromRemote(OperationContext* opCtx,
-                                      const NamespaceString& nss) const override {
-            called = true;
-        }
-        mutable bool called;
+    auto createIndexOperation = makeCreateIndexOplogEntry(collection, BSON("a" << 1), "a_1", 2);
 
-    private:
-        BSONObj _documentAtSource;
-    };
-    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
-        commonOperation,
-    })));
     // Repeat index creation operation and confirm that rollback attempts to drop index just once.
     // This can happen when an index is re-created with different options.
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+
     startCapturingLogMessages();
     ASSERT_OK(syncRollback(
         _opCtx.get(),
-        OplogInterfaceMock({insertDocumentOperation, insertDocumentOperation, commonOperation}),
+        OplogInterfaceMock({createIndexOperation, createIndexOperation, commonOperation}),
         rollbackSource,
         {},
         _coordinator,
         _replicationProcess.get()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("Dropping index: collection = test.t. index = a_1"));
-    ASSERT_FALSE(rollbackSource.called);
+    ASSERT_EQUALS(
+        1, countLogLinesContaining("Dropped index in rollback: collection = test.t, index = a_1"));
     {
         Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
         auto indexCatalog = collection->getIndexCatalog();
@@ -486,7 +566,9 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommand) {
 
 TEST_F(RSRollbackTest, RollbackCreateIndexCommandIndexNotInCatalog) {
     createOplog(_opCtx.get());
-    auto collection = _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto collection = _createCollection(_opCtx.get(), "test.t", options);
     auto indexSpec = BSON("ns"
                           << "test.t"
                           << "key"
@@ -500,102 +582,36 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommandIndexNotInCatalog) {
         ASSERT(indexCatalog);
         ASSERT_EQUALS(1, indexCatalog->numIndexesReady(_opCtx.get()));
     }
+
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
-    auto insertDocumentOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 1LL << "op"
-                                 << "i"
-                                 << "ui"
-                                 << UUID::gen()
-                                 << "ns"
-                                 << "test.system.indexes"
-                                 << "o"
-                                 << indexSpec),
-                       RecordId(2));
-    class RollbackSourceLocal : public RollbackSourceMock {
-    public:
-        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
-            : RollbackSourceMock(std::move(oplog)), called(false) {}
-        void copyCollectionFromRemote(OperationContext* opCtx,
-                                      const NamespaceString& nss) const override {
-            called = true;
-        }
-        mutable bool called;
+    auto createIndexOperation = makeCreateIndexOplogEntry(collection, BSON("a" << 1), "a_1", 2);
 
-    private:
-        BSONObj _documentAtSource;
-    };
-    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
         commonOperation,
     })));
     startCapturingLogMessages();
     ASSERT_OK(syncRollback(_opCtx.get(),
-                           OplogInterfaceMock({insertDocumentOperation, commonOperation}),
+                           OplogInterfaceMock({createIndexOperation, commonOperation}),
                            rollbackSource,
                            {},
                            _coordinator,
                            _replicationProcess.get()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(1, countLogLinesContaining("Dropping index: collection = test.t. index = a_1"));
     ASSERT_EQUALS(1, countLogLinesContaining("Rollback failed to drop index a_1 in test.t"));
-    ASSERT_FALSE(rollbackSource.called);
     {
         Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
         auto indexCatalog = collection->getIndexCatalog();
         ASSERT(indexCatalog);
         ASSERT_EQUALS(1, indexCatalog->numIndexesReady(_opCtx.get()));
     }
-}
-
-TEST_F(RSRollbackTest, RollbackCreateIndexCommandMissingNamespace) {
-    createOplog(_opCtx.get());
-    auto commonOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
-    auto insertDocumentOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 1LL << "op"
-                                 << "i"
-                                 << "ui"
-                                 << UUID::gen()
-                                 << "ns"
-                                 << "test.system.indexes"
-                                 << "o"
-                                 << BSON("key" << BSON("a" << 1) << "name"
-                                               << "a_1")),
-                       RecordId(2));
-    class RollbackSourceLocal : public RollbackSourceMock {
-    public:
-        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
-            : RollbackSourceMock(std::move(oplog)), called(false) {}
-        void copyCollectionFromRemote(OperationContext* opCtx,
-                                      const NamespaceString& nss) const override {
-            called = true;
-        }
-        mutable bool called;
-
-    private:
-        BSONObj _documentAtSource;
-    };
-    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
-        commonOperation,
-    })));
-    startCapturingLogMessages();
-    auto status = syncRollback(_opCtx.get(),
-                               OplogInterfaceMock({insertDocumentOperation, commonOperation}),
-                               rollbackSource,
-                               {},
-                               _coordinator,
-                               _replicationProcess.get());
-    stopCapturingLogMessages();
-    ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status.code());
-    ASSERT_EQUALS(18752, status.location());
-    ASSERT_EQUALS(
-        1, countLogLinesContaining("Missing collection namespace in system.indexes operation,"));
-    ASSERT_FALSE(rollbackSource.called);
 }
 
 TEST_F(RSRollbackTest, RollbackDropIndexCommandWithOneIndex) {
     createOplog(_opCtx.get());
-    auto collection = _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto collection = _createCollection(_opCtx.get(), "test.t", options);
     {
         Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
         auto indexCatalog = collection->getIndexCatalog();
@@ -603,45 +619,11 @@ TEST_F(RSRollbackTest, RollbackDropIndexCommandWithOneIndex) {
         ASSERT_EQUALS(1, indexCatalog->numIndexesReady(_opCtx.get()));
     }
 
-    auto indexSpec = BSON("ns"
-                          << "test.t"
-                          << "key"
-                          << BSON("a" << 1)
-                          << "name"
-                          << "a_1"
-                          << "v"
-                          << static_cast<int>(kIndexVersion));
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
-    auto dropIndexOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 1LL << "op"
-                                 << "c"
-                                 << "ui"
-                                 << collection->uuid().get()
-                                 << "ns"
-                                 << "test.$cmd"
-                                 << "o"
-                                 << BSON("dropIndexes"
-                                         << "t"
-                                         << "index"
-                                         << "a_1")
-                                 << "o2"
-                                 << indexSpec),
-                       RecordId(2));
-    class RollbackSourceLocal : public RollbackSourceMock {
-    public:
-        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
-            : RollbackSourceMock(std::move(oplog)), called(false) {}
-        void copyCollectionFromRemote(OperationContext* opCtx,
-                                      const NamespaceString& nss) const override {
-            called = true;
-        }
-        mutable bool called;
+    auto dropIndexOperation = makeDropIndexOplogEntry(collection, BSON("a" << 1), "a_1", 2);
 
-    private:
-        BSONObj _documentAtSource;
-    };
-    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
         commonOperation,
     })));
     ASSERT_OK(syncRollback(_opCtx.get(),
@@ -650,12 +632,19 @@ TEST_F(RSRollbackTest, RollbackDropIndexCommandWithOneIndex) {
                            {},
                            _coordinator,
                            _replicationProcess.get()));
-    ASSERT(rollbackSource.called);
+    {
+        Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
+        auto indexCatalog = collection->getIndexCatalog();
+        ASSERT(indexCatalog);
+        ASSERT_EQUALS(2, indexCatalog->numIndexesReady(_opCtx.get()));
+    }
 }
 
 TEST_F(RSRollbackTest, RollbackDropIndexCommandWithMultipleIndexes) {
     createOplog(_opCtx.get());
-    auto collection = _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto collection = _createCollection(_opCtx.get(), "test.t", options);
     {
         Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
         auto indexCatalog = collection->getIndexCatalog();
@@ -663,68 +652,13 @@ TEST_F(RSRollbackTest, RollbackDropIndexCommandWithMultipleIndexes) {
         ASSERT_EQUALS(1, indexCatalog->numIndexesReady(_opCtx.get()));
     }
 
-    auto indexSpec1 = BSON("ns"
-                           << "test.t"
-                           << "key"
-                           << BSON("a" << 1)
-                           << "name"
-                           << "a_1"
-                           << "v"
-                           << static_cast<int>(kIndexVersion));
-    auto indexSpec2 = BSON("ns"
-                           << "test.t"
-                           << "key"
-                           << BSON("b" << 1)
-                           << "name"
-                           << "b_1"
-                           << "v"
-                           << static_cast<int>(kIndexVersion));
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
-    auto dropIndexOperation1 =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 1LL << "op"
-                                 << "c"
-                                 << "ui"
-                                 << collection->uuid().get()
-                                 << "ns"
-                                 << "test.$cmd"
-                                 << "o"
-                                 << BSON("dropIndexes"
-                                         << "t"
-                                         << "index"
-                                         << "a_1")
-                                 << "o2"
-                                 << indexSpec1),
-                       RecordId(2));
-    auto dropIndexOperation2 =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 1LL << "op"
-                                 << "c"
-                                 << "ui"
-                                 << collection->uuid().get()
-                                 << "ns"
-                                 << "test.$cmd"
-                                 << "o"
-                                 << BSON("dropIndexes"
-                                         << "t"
-                                         << "index"
-                                         << "b_1")
-                                 << "o2"
-                                 << indexSpec2),
-                       RecordId(3));
-    class RollbackSourceLocal : public RollbackSourceMock {
-    public:
-        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
-            : RollbackSourceMock(std::move(oplog)), called(false) {}
-        void copyCollectionFromRemote(OperationContext* opCtx,
-                                      const NamespaceString& nss) const override {
-            called = true;
-        }
-        mutable bool called;
 
-    private:
-        BSONObj _documentAtSource;
-    };
-    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+    auto dropIndexOperation1 = makeDropIndexOplogEntry(collection, BSON("a" << 1), "a_1", 2);
+    auto dropIndexOperation2 = makeDropIndexOplogEntry(collection, BSON("b" << 1), "b_1", 3);
+
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
         commonOperation,
     })));
     ASSERT_OK(syncRollback(
@@ -734,95 +668,155 @@ TEST_F(RSRollbackTest, RollbackDropIndexCommandWithMultipleIndexes) {
         {},
         _coordinator,
         _replicationProcess.get()));
-    ASSERT(rollbackSource.called);
+    {
+        Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
+        auto indexCatalog = collection->getIndexCatalog();
+        ASSERT(indexCatalog);
+        ASSERT_EQUALS(3, indexCatalog->numIndexesReady(_opCtx.get()));
+    }
 }
 
-TEST_F(RSRollbackTest, RollbackCreateIndexCommandInvalidNamespace) {
+TEST_F(RSRollbackTest, RollingBackCreateAndDropOfSameIndexIgnoresBothCommands) {
     createOplog(_opCtx.get());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto collection = _createCollection(_opCtx.get(), "test.t", options);
+
+    {
+        Lock::DBLock dbLock(_opCtx.get(), "test", MODE_X);
+        auto indexCatalog = collection->getIndexCatalog();
+        ASSERT(indexCatalog);
+        ASSERT_EQUALS(1, indexCatalog->numIndexesReady(_opCtx.get()));
+    }
+
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
-    auto insertDocumentOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 1LL << "op"
-                                 << "i"
-                                 << "ui"
-                                 << UUID::gen()
-                                 << "ns"
-                                 << "test.system.indexes"
-                                 << "o"
-                                 << BSON("ns"
-                                         << "test."
-                                         << "key"
-                                         << BSON("a" << 1)
-                                         << "name"
-                                         << "a_1")),
-                       RecordId(2));
-    class RollbackSourceLocal : public RollbackSourceMock {
-    public:
-        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
-            : RollbackSourceMock(std::move(oplog)), called(false) {}
-        void copyCollectionFromRemote(OperationContext* opCtx,
-                                      const NamespaceString& nss) const override {
-            called = true;
-        }
-        mutable bool called;
 
-    private:
-        BSONObj _documentAtSource;
-    };
-    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+    auto createIndexOperation = makeCreateIndexOplogEntry(collection, BSON("a" << 1), "a_1", 2);
+
+    auto dropIndexOperation = makeDropIndexOplogEntry(collection, BSON("a" << 1), "a_1", 3);
+
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
         commonOperation,
     })));
+
+    ASSERT_OK(syncRollback(
+        _opCtx.get(),
+        OplogInterfaceMock({dropIndexOperation, createIndexOperation, commonOperation}),
+        rollbackSource,
+        {},
+        _coordinator,
+        _replicationProcess.get()));
+    {
+        Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
+        auto indexCatalog = collection->getIndexCatalog();
+        ASSERT(indexCatalog);
+        ASSERT_EQUALS(1, indexCatalog->numIndexesReady(_opCtx.get()));
+        auto indexDescriptor = indexCatalog->findIndexByName(_opCtx.get(), "a_1", false);
+        ASSERT(!indexDescriptor);
+    }
+}
+
+TEST_F(RSRollbackTest, RollingBackDropAndCreateOfSameIndexNameWithDifferentSpecs) {
+    createOplog(_opCtx.get());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto collection = _createCollection(_opCtx.get(), "test.t", options);
+
+    auto indexSpec = BSON("ns"
+                          << "test.t"
+                          << "v"
+                          << static_cast<int>(kIndexVersion)
+                          << "key"
+                          << BSON("b" << 1)
+                          << "name"
+                          << "a_1");
+    {
+        Lock::DBLock dbLock(_opCtx.get(), "test", MODE_X);
+        MultiIndexBlock indexer(_opCtx.get(), collection);
+        ASSERT_OK(indexer.init(indexSpec).getStatus());
+        WriteUnitOfWork wunit(_opCtx.get());
+        indexer.commit();
+        wunit.commit();
+        auto indexCatalog = collection->getIndexCatalog();
+        ASSERT(indexCatalog);
+        ASSERT_EQUALS(2, indexCatalog->numIndexesReady(_opCtx.get()));
+    }
+
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+
+    auto dropIndexOperation = makeDropIndexOplogEntry(collection, BSON("a" << 1), "a_1", 2);
+
+    auto createIndexOperation = makeCreateIndexOplogEntry(collection, BSON("b" << 1), "a_1", 3);
+
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+
     startCapturingLogMessages();
-    auto status = syncRollback(_opCtx.get(),
-                               OplogInterfaceMock({insertDocumentOperation, commonOperation}),
-                               rollbackSource,
-                               {},
-                               _coordinator,
-                               _replicationProcess.get());
+    ASSERT_OK(syncRollback(
+        _opCtx.get(),
+        OplogInterfaceMock({createIndexOperation, dropIndexOperation, commonOperation}),
+        rollbackSource,
+        {},
+        _coordinator,
+        _replicationProcess.get()));
     stopCapturingLogMessages();
-    ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status.code());
-    ASSERT_EQUALS(18752, status.location());
-    ASSERT_EQUALS(
-        1, countLogLinesContaining("Invalid collection namespace in system.indexes operation,"));
-    ASSERT_FALSE(rollbackSource.called);
+    {
+        Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
+        auto indexCatalog = collection->getIndexCatalog();
+        ASSERT(indexCatalog);
+        ASSERT_EQUALS(2, indexCatalog->numIndexesReady(_opCtx.get()));
+        ASSERT_EQUALS(
+            1,
+            countLogLinesContaining("Dropped index in rollback: collection = test.t, index = a_1"));
+        ASSERT_EQUALS(
+            1,
+            countLogLinesContaining("Created index in rollback: collection = test.t, index = a_1"));
+        std::vector<IndexDescriptor*> indexes;
+        indexCatalog->findIndexesByKeyPattern(_opCtx.get(), BSON("a" << 1), false, &indexes);
+        ASSERT(indexes.size() == 1);
+        ASSERT(indexes[0]->indexName() == "a_1");
+
+        std::vector<IndexDescriptor*> indexes2;
+        indexCatalog->findIndexesByKeyPattern(_opCtx.get(), BSON("b" << 1), false, &indexes2);
+        ASSERT(indexes2.size() == 0);
+    }
 }
 
 TEST_F(RSRollbackTest, RollbackCreateIndexCommandMissingIndexName) {
     createOplog(_opCtx.get());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto collection = _createCollection(_opCtx.get(), "test.t", options);
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
-    auto insertDocumentOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 1LL << "op"
-                                 << "i"
-                                 << "ui"
-                                 << UUID::gen()
-                                 << "ns"
-                                 << "test.system.indexes"
-                                 << "o"
-                                 << BSON("ns"
-                                         << "test.t"
-                                         << "key"
-                                         << BSON("a" << 1))),
-                       RecordId(2));
-    class RollbackSourceLocal : public RollbackSourceMock {
-    public:
-        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
-            : RollbackSourceMock(std::move(oplog)), called(false) {}
-        void copyCollectionFromRemote(OperationContext* opCtx,
-                                      const NamespaceString& nss) const override {
-            called = true;
-        }
-        mutable bool called;
+    BSONObj command = BSON("createIndexes"
+                           << "t"
+                           << "ns"
+                           << "test.t"
+                           << "v"
+                           << static_cast<int>(kIndexVersion)
+                           << "key"
+                           << BSON("a" << 1));
 
-    private:
-        BSONObj _documentAtSource;
-    };
-    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+    auto createIndexOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 1LL << "op"
+                                 << "c"
+                                 << "ns"
+                                 << "test.$cmd"
+                                 << "ui"
+                                 << collection->uuid().get()
+                                 << "o"
+                                 << command),
+                       RecordId(2));
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
         commonOperation,
     })));
     startCapturingLogMessages();
     auto status = syncRollback(_opCtx.get(),
-                               OplogInterfaceMock({insertDocumentOperation, commonOperation}),
+                               OplogInterfaceMock({createIndexOperation, commonOperation}),
                                rollbackSource,
                                {},
                                _coordinator,
@@ -830,8 +824,9 @@ TEST_F(RSRollbackTest, RollbackCreateIndexCommandMissingIndexName) {
     stopCapturingLogMessages();
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status.code());
     ASSERT_EQUALS(18752, status.location());
-    ASSERT_EQUALS(1, countLogLinesContaining("Missing index name in system.indexes operation,"));
-    ASSERT_FALSE(rollbackSource.called);
+    ASSERT_EQUALS(1,
+                  countLogLinesContaining(
+                      "Missing index name in createIndexes operation on rollback, document: "));
 }
 
 TEST_F(RSRollbackTest, RollbackUnknownCommand) {
@@ -868,7 +863,9 @@ TEST_F(RSRollbackTest, RollbackDropCollectionCommand) {
 
     OpTime dropTime = OpTime(Timestamp(2, 0), 5);
     auto dpns = NamespaceString("test.t").makeDropPendingNamespace(dropTime);
-    auto coll = _createCollection(_opCtx.get(), dpns, CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto coll = _createCollection(_opCtx.get(), dpns, options);
     _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpns);
 
     auto commonOperation =
@@ -920,9 +917,528 @@ TEST_F(RSRollbackTest, RollbackDropCollectionCommand) {
     }
 }
 
+TEST_F(RSRollbackTest, RollbackRenameCollectionInSameDatabaseCommand) {
+    createOplog(_opCtx.get());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto collection = _createCollection(_opCtx.get(), "test.y", options);
+    UUID collectionUUID = collection->uuid().get();
+
+    OpTime renameTime = OpTime(Timestamp(2, 0), 5);
+
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.x"),
+                                                                    NamespaceString("test.y"),
+                                                                    collectionUUID,
+                                                                    boost::none,
+                                                                    boost::none,
+                                                                    false,
+                                                                    renameTime);
+
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+
+    {
+        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.y"));
+        ASSERT_TRUE(renamedColl.getCollection());
+
+        AutoGetCollectionForReadCommand oldCollName(_opCtx.get(), NamespaceString("test.x"));
+        ASSERT_FALSE(oldCollName.getCollection());
+    }
+
+    ASSERT_OK(syncRollback(_opCtx.get(),
+                           OplogInterfaceMock({renameCollectionOperation, commonOperation}),
+                           rollbackSource,
+                           {},
+                           _coordinator,
+                           _replicationProcess.get()));
+    {
+        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.y"));
+        ASSERT_FALSE(renamedColl.getCollection());
+
+        AutoGetCollectionForReadCommand oldCollName(_opCtx.get(), NamespaceString("test.x"));
+        ASSERT_TRUE(oldCollName.getCollection());
+    }
+}
+
+// TODO: Un-comment this test once options.temp is properly resynced during rollback.
+// See SERVER-30413
+
+// TEST_F(RSRollbackTest,
+// RollingBackRenameCollectionFromTempToPermanentCollectionSetsCollectionOptionToTemp) {
+//    createOplog(_opCtx.get());
+//
+//    CollectionOptions options;
+//    options.uuid = UUID::gen();
+//    auto collection = _createCollection(_opCtx.get(), "test.y", options);
+//    auto collectionUUID = collection->uuid().get();
+//
+//    class RollbackSourceLocal : public RollbackSourceMock {
+//    public:
+//        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
+//            : RollbackSourceMock(std::move(oplog)) {}
+//        StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db, const UUID& uuid) const
+//        {
+//            getCollectionInfoCalled = true;
+//            return BSON("options" << BSON("uuid" << uuid << "temp" << true));
+//        }
+//        mutable bool getCollectionInfoCalled = false;
+//    };
+//
+//    auto commonOperation =
+//        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+//
+//    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.x"),
+//                                                                    NamespaceString("test.y"),
+//                                                                    collectionUUID,
+//                                                                    boost::none,
+//                                                                    boost::none,
+//                                                                    false,
+//                                                                    OpTime(Timestamp(2, 0), 5));
+//
+//    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+//        commonOperation,
+//    })));
+//
+//    ASSERT_OK(syncRollback(_opCtx.get(),
+//                           OplogInterfaceMock({renameCollectionOperation, commonOperation}),
+//                           rollbackSource,
+//                           {},
+//                           _coordinator,
+//                           _replicationProcess.get()));
+//
+//    ASSERT_TRUE(rollbackSource.getCollectionInfoCalled);
+//    ASSERT_EQUALS(options.temp, true);
+//}
+
+TEST_F(RSRollbackTest, RollbackRenameCollectionInDatabaseWithDropTargetTrueCommand) {
+    createOplog(_opCtx.get());
+
+    OpTime dropTime = OpTime(Timestamp(2, 0), 5);
+    auto dpns = NamespaceString("test.y").makeDropPendingNamespace(dropTime);
+    CollectionOptions droppedCollOptions;
+    droppedCollOptions.uuid = UUID::gen();
+    auto droppedColl = _createCollection(_opCtx.get(), dpns, droppedCollOptions);
+    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpns);
+    auto droppedCollectionUUID = droppedColl->uuid().get();
+
+    CollectionOptions renamedCollOptions;
+    renamedCollOptions.uuid = UUID::gen();
+    auto renamedCollection = _createCollection(_opCtx.get(), "test.y", renamedCollOptions);
+    auto renamedCollectionUUID = renamedCollection->uuid().get();
+
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.x"),
+                                                                    NamespaceString("test.y"),
+                                                                    renamedCollectionUUID,
+                                                                    droppedCollectionUUID,
+                                                                    boost::none,
+                                                                    false,
+                                                                    dropTime);
+
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+
+    {
+        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
+        ASSERT_TRUE(autoCollDropPending.getCollection());
+
+        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.y"));
+        ASSERT_TRUE(renamedColl.getCollection());
+
+        AutoGetCollectionForReadCommand oldCollName(_opCtx.get(), NamespaceString("test.x"));
+        ASSERT_FALSE(oldCollName.getCollection());
+    }
+    ASSERT_OK(syncRollback(_opCtx.get(),
+                           OplogInterfaceMock({renameCollectionOperation, commonOperation}),
+                           rollbackSource,
+                           {},
+                           _coordinator,
+                           _replicationProcess.get()));
+    {
+        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
+        ASSERT_FALSE(autoCollDropPending.getCollection());
+
+        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.x"));
+        ASSERT_TRUE(renamedColl.getCollection());
+        ASSERT_EQUALS(renamedColl.getCollection()->uuid().get(), renamedCollectionUUID);
+
+        AutoGetCollectionForReadCommand droppedColl(_opCtx.get(), NamespaceString("test.y"));
+        ASSERT_TRUE(droppedColl.getCollection());
+        ASSERT_EQUALS(droppedColl.getCollection()->uuid().get(), droppedCollectionUUID);
+    }
+}
+
+TEST_F(RSRollbackTest, RollbackRenamingCollectionsToEachOther) {
+    createOplog(_opCtx.get());
+
+    CollectionOptions coll1Options;
+    coll1Options.uuid = UUID::gen();
+    auto collection1 = _createCollection(_opCtx.get(), "test.y", coll1Options);
+    auto collection1UUID = collection1->uuid().get();
+
+    CollectionOptions coll2Options;
+    coll2Options.uuid = UUID::gen();
+    auto collection2 = _createCollection(_opCtx.get(), "test.x", coll2Options);
+    auto collection2UUID = collection2->uuid().get();
+
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+    auto renameCollectionOperationXtoZ = makeRenameCollectionOplogEntry(NamespaceString("test.x"),
+                                                                        NamespaceString("test.z"),
+                                                                        collection1UUID,
+                                                                        boost::none,
+                                                                        boost::none,
+                                                                        false,
+                                                                        OpTime(Timestamp(2, 0), 5));
+
+    auto renameCollectionOperationYtoX = makeRenameCollectionOplogEntry(NamespaceString("test.y"),
+                                                                        NamespaceString("test.x"),
+                                                                        collection2UUID,
+                                                                        boost::none,
+                                                                        boost::none,
+                                                                        false,
+                                                                        OpTime(Timestamp(3, 0), 5));
+
+    auto renameCollectionOperationZtoY = makeRenameCollectionOplogEntry(NamespaceString("test.z"),
+                                                                        NamespaceString("test.y"),
+                                                                        collection1UUID,
+                                                                        boost::none,
+                                                                        boost::none,
+                                                                        false,
+                                                                        OpTime(Timestamp(4, 0), 5));
+
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+
+    ASSERT_OK(syncRollback(_opCtx.get(),
+                           OplogInterfaceMock({renameCollectionOperationZtoY,
+                                               renameCollectionOperationYtoX,
+                                               renameCollectionOperationXtoZ,
+                                               commonOperation}),
+                           rollbackSource,
+                           {},
+                           _coordinator,
+                           _replicationProcess.get()));
+
+    {
+
+        AutoGetCollectionForReadCommand coll1(_opCtx.get(), NamespaceString("test.x"));
+        ASSERT_TRUE(coll1.getCollection());
+        ASSERT_EQUALS(coll1.getCollection()->uuid().get(), collection1UUID);
+
+        AutoGetCollectionForReadCommand coll2(_opCtx.get(), NamespaceString("test.y"));
+        ASSERT_TRUE(coll2.getCollection());
+        ASSERT_EQUALS(coll2.getCollection()->uuid().get(), collection2UUID);
+    }
+}
+
+TEST_F(RSRollbackTest, RollbackDropCollectionThenRenameCollectionToDroppedCollectionNS) {
+    createOplog(_opCtx.get());
+
+    CollectionOptions renamedCollOptions;
+    renamedCollOptions.uuid = UUID::gen();
+    auto renamedCollection = _createCollection(_opCtx.get(), "test.x", renamedCollOptions);
+    auto renamedCollectionUUID = renamedCollection->uuid().get();
+
+    OpTime dropTime = OpTime(Timestamp(2, 0), 5);
+    auto dpns = NamespaceString("test.x").makeDropPendingNamespace(dropTime);
+    CollectionOptions droppedCollOptions;
+    droppedCollOptions.uuid = UUID::gen();
+    auto droppedCollection = _createCollection(_opCtx.get(), dpns, droppedCollOptions);
+    auto droppedCollectionUUID = droppedCollection->uuid().get();
+    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpns);
+
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+
+    auto dropCollectionOperation =
+        std::make_pair(
+            BSON("ts" << dropTime.getTimestamp() << "t" << dropTime.getTerm() << "h" << 1LL << "op"
+                      << "c"
+                      << "ui"
+                      << droppedCollectionUUID
+                      << "ns"
+                      << "test.x"
+                      << "o"
+                      << BSON("drop"
+                              << "x")),
+            RecordId(2));
+
+    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.y"),
+                                                                    NamespaceString("test.x"),
+                                                                    renamedCollectionUUID,
+                                                                    boost::none,
+                                                                    boost::none,
+                                                                    false,
+                                                                    OpTime(Timestamp(3, 0), 5));
+
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+
+    {
+        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
+        ASSERT_TRUE(autoCollDropPending.getCollection());
+        AutoGetCollectionForReadCommand autoCollX(_opCtx.get(), NamespaceString("test.x"));
+        ASSERT_TRUE(autoCollX.getCollection());
+        AutoGetCollectionForReadCommand autoCollY(_opCtx.get(), NamespaceString("test.y"));
+        ASSERT_FALSE(autoCollY.getCollection());
+    }
+    ASSERT_OK(syncRollback(
+        _opCtx.get(),
+        OplogInterfaceMock({renameCollectionOperation, dropCollectionOperation, commonOperation}),
+        rollbackSource,
+        {},
+        _coordinator,
+        _replicationProcess.get()));
+
+    {
+        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
+        ASSERT_FALSE(autoCollDropPending.getCollection());
+
+        AutoGetCollectionForReadCommand autoCollX(_opCtx.get(), NamespaceString("test.x"));
+        ASSERT_TRUE(autoCollX.getCollection());
+        ASSERT_EQUALS(autoCollX.getCollection()->uuid().get(), droppedCollectionUUID);
+
+        AutoGetCollectionForReadCommand autoCollY(_opCtx.get(), NamespaceString("test.y"));
+        ASSERT_TRUE(autoCollY.getCollection());
+        ASSERT_EQUALS(autoCollY.getCollection()->uuid().get(), renamedCollectionUUID);
+    }
+}
+
+TEST_F(RSRollbackTest, RollbackRenameCollectionThenCreateNewCollectionWithOldName) {
+    createOplog(_opCtx.get());
+
+    CollectionOptions renamedCollOptions;
+    renamedCollOptions.uuid = UUID::gen();
+    auto renamedCollection = _createCollection(_opCtx.get(), "test.y", renamedCollOptions);
+    auto renamedCollectionUUID = renamedCollection->uuid().get();
+
+    CollectionOptions createdCollOptions;
+    createdCollOptions.uuid = UUID::gen();
+    auto createdCollection = _createCollection(_opCtx.get(), "test.x", createdCollOptions);
+    auto createdCollectionUUID = createdCollection->uuid().get();
+
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+
+    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.x"),
+                                                                    NamespaceString("test.y"),
+                                                                    renamedCollectionUUID,
+                                                                    boost::none,
+                                                                    boost::none,
+                                                                    false,
+                                                                    OpTime(Timestamp(2, 0), 5));
+
+    auto createCollectionOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(3), 0) << "h" << 1LL << "op"
+                                 << "c"
+                                 << "ui"
+                                 << createdCollectionUUID
+                                 << "ns"
+                                 << "test.x"
+                                 << "o"
+                                 << BSON("create"
+                                         << "x")),
+                       RecordId(3));
+
+
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+
+    {
+        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.y"));
+        ASSERT_TRUE(renamedColl.getCollection());
+        AutoGetCollectionForReadCommand createdColl(_opCtx.get(), NamespaceString("test.x"));
+        ASSERT_TRUE(createdColl.getCollection());
+    }
+    ASSERT_OK(syncRollback(
+        _opCtx.get(),
+        OplogInterfaceMock({createCollectionOperation, renameCollectionOperation, commonOperation}),
+        rollbackSource,
+        {},
+        _coordinator,
+        _replicationProcess.get()));
+
+    {
+
+        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.x"));
+        ASSERT_TRUE(renamedColl.getCollection());
+        ASSERT_EQUALS(renamedColl.getCollection()->uuid().get(), renamedCollectionUUID);
+
+        AutoGetCollectionForReadCommand createdColl(_opCtx.get(), NamespaceString("test.y"));
+        ASSERT_FALSE(createdColl.getCollection());
+    }
+}
+
+TEST_F(RSRollbackTest, RollbackRenameCollectionAcrossDatabases) {
+    createOplog(_opCtx.get());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto collection = _createCollection(_opCtx.get(), "foo.t", options);
+    auto renamedCollectionUUID = collection->uuid().get();
+
+    OpTime dropTime = OpTime(Timestamp(2, 0), 5);
+    auto dpSourceNs = NamespaceString("test.t").makeDropPendingNamespace(dropTime);
+    CollectionOptions dpSourceOptions;
+    dpSourceOptions.uuid = UUID::gen();
+    auto droppedSource = _createCollection(_opCtx.get(), dpSourceNs, dpSourceOptions);
+    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpSourceNs);
+    auto droppedSourceUUID = droppedSource->uuid().get();
+
+    auto dpTargetNs = NamespaceString("foo.t").makeDropPendingNamespace(dropTime);
+    CollectionOptions dpTargetOptions;
+    dpTargetOptions.uuid = UUID::gen();
+    auto droppedTarget = _createCollection(_opCtx.get(), dpTargetNs, dpTargetOptions);
+    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpTargetNs);
+    auto droppedTargetUUID = droppedTarget->uuid().get();
+
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+
+    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.t"),
+                                                                    NamespaceString("foo.t"),
+                                                                    renamedCollectionUUID,
+                                                                    droppedTargetUUID,
+                                                                    droppedSourceUUID,
+                                                                    false,
+                                                                    dropTime);
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+
+    {
+        AutoGetCollectionForReadCommand autoDropSource(_opCtx.get(), dpSourceNs);
+        ASSERT_TRUE(autoDropSource.getCollection());
+        AutoGetCollectionForReadCommand autoDropTarget(_opCtx.get(), dpTargetNs);
+        ASSERT_TRUE(autoDropTarget.getCollection());
+        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("foo.t"));
+        ASSERT_TRUE(renamedColl.getCollection());
+        AutoGetCollectionForReadCommand droppedColl(_opCtx.get(), NamespaceString("test.t"));
+        ASSERT_FALSE(droppedColl.getCollection());
+    }
+    ASSERT_OK(syncRollback(_opCtx.get(),
+                           OplogInterfaceMock({renameCollectionOperation, commonOperation}),
+                           rollbackSource,
+                           {},
+                           _coordinator,
+                           _replicationProcess.get()));
+
+    {
+        AutoGetCollectionForReadCommand autoDropSource(_opCtx.get(), dpSourceNs);
+        ASSERT_FALSE(autoDropSource.getCollection());
+
+        AutoGetCollectionForReadCommand autoDropTarget(_opCtx.get(), dpTargetNs);
+        ASSERT_FALSE(autoDropTarget.getCollection());
+
+        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.t"));
+        ASSERT_TRUE(renamedColl.getCollection());
+        ASSERT_EQUALS(renamedColl.getCollection()->uuid().get(), droppedSourceUUID);
+
+        AutoGetCollectionForReadCommand droppedColl(_opCtx.get(), NamespaceString("foo.t"));
+        ASSERT_TRUE(droppedColl.getCollection());
+        ASSERT_EQUALS(droppedColl.getCollection()->uuid().get(), droppedTargetUUID);
+    }
+}
+
+TEST_F(RSRollbackTest, NewDocumentsInsertedAfterRenamingCollectionAcrossDatabasesShouldBeDropped) {
+    createOplog(_opCtx.get());
+    Collection* collection = nullptr;
+    {
+        AutoGetOrCreateDb autoDb(_opCtx.get(), "foo", MODE_X);
+        mongo::WriteUnitOfWork wuow(_opCtx.get());
+        collection = autoDb.getDb()->getCollection(_opCtx.get(), "foo.t");
+        if (!collection) {
+            CollectionOptions options;
+            options.uuid = UUID::gen();
+            collection = _createCollection(_opCtx.get(), "foo.t", options);
+        }
+        ASSERT(collection);
+        OpDebug* const nullOpDebug = nullptr;
+        ASSERT_OK(collection->insertDocument(
+            _opCtx.get(), InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, false));
+        wuow.commit();
+    }
+
+    auto renamedCollectionUUID = collection->uuid().get();
+    ASSERT(collection->numRecords(_opCtx.get()) == 1);
+
+    OpTime dropTime = OpTime(Timestamp(2, 0), 5);
+    auto dpns = NamespaceString("test.t").makeDropPendingNamespace(dropTime);
+
+    CollectionOptions droppedCollOptions;
+    droppedCollOptions.uuid = UUID::gen();
+    auto droppedColl = _createCollection(_opCtx.get(), dpns, droppedCollOptions);
+    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpns);
+    auto droppedCollectionUUID = droppedColl->uuid().get();
+
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+
+    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.t"),
+                                                                    NamespaceString("foo.t"),
+                                                                    renamedCollectionUUID,
+                                                                    boost::none,
+                                                                    droppedCollectionUUID,
+                                                                    false,
+                                                                    OpTime(Timestamp(2, 0), 5));
+
+    auto insertDocumentOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(3), 0) << "h" << 1LL << "op"
+                                 << "i"
+                                 << "ui"
+                                 << renamedCollectionUUID
+                                 << "ns"
+                                 << "foo.t"
+                                 << "o"
+                                 << BSON("_id" << 1 << "a" << 1)),
+                       RecordId(3));
+
+    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+
+    {
+        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
+        ASSERT_TRUE(autoCollDropPending.getCollection());
+        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("foo.t"));
+        ASSERT_TRUE(renamedColl.getCollection());
+        AutoGetCollectionForReadCommand droppedColl(_opCtx.get(), NamespaceString("test.t"));
+        ASSERT_FALSE(droppedColl.getCollection());
+    }
+    ASSERT_OK(syncRollback(
+        _opCtx.get(),
+        OplogInterfaceMock({insertDocumentOperation, renameCollectionOperation, commonOperation}),
+        rollbackSource,
+        {},
+        _coordinator,
+        _replicationProcess.get()));
+
+    {
+        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
+        ASSERT_FALSE(autoCollDropPending.getCollection());
+        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.t"));
+        ASSERT_TRUE(renamedColl.getCollection());
+        ASSERT_EQUALS(renamedColl.getCollection()->uuid().get(), droppedCollectionUUID);
+        ASSERT(renamedColl.getCollection()->numRecords(_opCtx.get()) == 0);
+        AutoGetCollectionForReadCommand droppedColl(_opCtx.get(), NamespaceString("foo.t"));
+        ASSERT_FALSE(droppedColl.getCollection());
+    }
+}
+
+
 TEST_F(RSRollbackTest, RollbackCollModCommandFailsIfRBIDChangesWhileSyncingCollectionMetadata) {
     createOplog(_opCtx.get());
-    auto coll = _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto coll = _createCollection(_opCtx.get(), "test.t", options);
 
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
@@ -945,7 +1461,8 @@ TEST_F(RSRollbackTest, RollbackCollModCommandFailsIfRBIDChangesWhileSyncingColle
         int getRollbackId() const override {
             return getCollectionInfoCalled ? 1 : 0;
         }
-        StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const override {
+        StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db,
+                                                    const UUID& uuid) const override {
             getCollectionInfoCalled = true;
             return BSONObj();
         }
@@ -1025,12 +1542,14 @@ OpTime getOpTimeFromOplogEntry(const BSONObj& entry) {
 TEST_F(RSRollbackTest, RollbackApplyOpsCommand) {
     createOplog(_opCtx.get());
     Collection* coll = nullptr;
+    CollectionOptions options;
+    options.uuid = UUID::gen();
     {
         AutoGetOrCreateDb autoDb(_opCtx.get(), "test", MODE_X);
         mongo::WriteUnitOfWork wuow(_opCtx.get());
         coll = autoDb.getDb()->getCollection(_opCtx.get(), "test.t");
         if (!coll) {
-            coll = autoDb.getDb()->createCollection(_opCtx.get(), "test.t");
+            coll = autoDb.getDb()->createCollection(_opCtx.get(), "test.t", options);
         }
         ASSERT(coll);
         OpDebug* const nullOpDebug = nullptr;
@@ -1140,7 +1659,7 @@ TEST_F(RSRollbackTest, RollbackApplyOpsCommand) {
         mutable std::multiset<int> searchedIds;
     } rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({commonOperation})));
 
-    _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    _createCollection(_opCtx.get(), "test.t", options);
     ASSERT_OK(syncRollback(_opCtx.get(),
                            OplogInterfaceMock({applyOpsOperation, commonOperation}),
                            rollbackSource,
@@ -1167,7 +1686,9 @@ TEST_F(RSRollbackTest, RollbackApplyOpsCommand) {
 
 TEST_F(RSRollbackTest, RollbackCreateCollectionCommand) {
     createOplog(_opCtx.get());
-    auto coll = _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto coll = _createCollection(_opCtx.get(), "test.t", options);
 
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
@@ -1201,7 +1722,9 @@ TEST_F(RSRollbackTest, RollbackCreateCollectionCommand) {
 
 TEST_F(RSRollbackTest, RollbackCollectionModificationCommand) {
     createOplog(_opCtx.get());
-    auto coll = _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto coll = _createCollection(_opCtx.get(), "test.t", options);
 
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
@@ -1222,9 +1745,9 @@ TEST_F(RSRollbackTest, RollbackCollectionModificationCommand) {
     public:
         RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
             : RollbackSourceMock(std::move(oplog)), called(false) {}
-        StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const {
+        StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db, const UUID& uuid) const {
             called = true;
-            return RollbackSourceMock::getCollectionInfo(nss);
+            return RollbackSourceMock::getCollectionInfoByUUID(db, uuid);
         }
         mutable bool called;
     };
@@ -1248,7 +1771,9 @@ TEST_F(RSRollbackTest, RollbackCollectionModificationCommand) {
 
 TEST_F(RSRollbackTest, RollbackCollectionModificationCommandInvalidCollectionOptions) {
     createOplog(_opCtx.get());
-    auto coll = _createCollection(_opCtx.get(), "test.t", CollectionOptions());
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    auto coll = _createCollection(_opCtx.get(), "test.t", options);
 
     auto commonOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
@@ -1269,8 +1794,8 @@ TEST_F(RSRollbackTest, RollbackCollectionModificationCommandInvalidCollectionOpt
     public:
         RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
             : RollbackSourceMock(std::move(oplog)) {}
-        StatusWith<BSONObj> getCollectionInfo(const NamespaceString& nss) const {
-            return BSON("name" << nss.ns() << "options" << 12345);
+        StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db, const UUID& uuid) const {
+            return BSON("options" << 12345);
         }
     };
     RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
@@ -1432,8 +1957,8 @@ DEATH_TEST_F(RSRollbackTest, LocalEntryWithTxnNumberWithoutStmtIdIsFatal, "invar
     const auto txnNumber = BSON("txnNumber" << 1LL);
     const auto noSessionIdOrStmtId = validOplogEntry.addField(txnNumber.firstElement());
 
-    const auto uuid = UUID::gen();
-    const auto sessionId = BSON("lsid" << BSON("id" << uuid.toBSON()));
+    const auto lsid = makeLogicalSessionIdForTest();
+    const auto sessionId = BSON("lsid" << lsid.toBSON());
     const auto noStmtId = noSessionIdOrStmtId.addField(sessionId.firstElement());
     ASSERT_THROWS(updateFixUpInfoFromLocalOplogEntry(fui, noStmtId).transitional_ignore(),
                   RSFatalException);
@@ -1469,7 +1994,7 @@ TEST(RSRollbackTest, LocalEntryWithTxnNumberAddsTransactionTableDocToBeRefetched
                   << "stmtId"
                   << 1
                   << "lsid"
-                  << BSON("id" << UUID::gen().toBSON()));
+                  << makeLogicalSessionIdForTest().toBSON());
     ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, entryWithTxnNumber));
 
     // If txnNumber is present, the session transactions table document corresponding to the oplog

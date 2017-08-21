@@ -62,7 +62,7 @@ using std::stringstream;
 
 const bool autoAuthorizeDefault = true;
 
-class CmdSaslStart : public Command {
+class CmdSaslStart : public BasicCommand {
 public:
     CmdSaslStart();
     virtual ~CmdSaslStart();
@@ -76,7 +76,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const std::string& db,
                      const BSONObj& cmdObj,
-                     std::string& ignored,
                      BSONObjBuilder& result);
 
     virtual void help(stringstream& help) const;
@@ -86,12 +85,12 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool requiresAuth() {
+    bool requiresAuth() const override {
         return false;
     }
 };
 
-class CmdSaslContinue : public Command {
+class CmdSaslContinue : public BasicCommand {
 public:
     CmdSaslContinue();
     virtual ~CmdSaslContinue();
@@ -103,7 +102,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const std::string& db,
                      const BSONObj& cmdObj,
-                     std::string& ignored,
                      BSONObjBuilder& result);
 
     virtual void help(stringstream& help) const;
@@ -113,7 +111,7 @@ public:
     virtual bool slaveOk() const {
         return true;
     }
-    virtual bool requiresAuth() {
+    bool requiresAuth() const override {
         return false;
     }
 };
@@ -254,7 +252,7 @@ Status doSaslContinue(const Client* client,
     return doSaslStep(client, session, cmdObj, result);
 }
 
-CmdSaslStart::CmdSaslStart() : Command(saslStartCommandName) {}
+CmdSaslStart::CmdSaslStart() : BasicCommand(saslStartCommandName) {}
 CmdSaslStart::~CmdSaslStart() {}
 
 void CmdSaslStart::help(std::stringstream& os) const {
@@ -271,7 +269,6 @@ void CmdSaslStart::redactForLogging(mutablebson::Document* cmdObj) {
 bool CmdSaslStart::run(OperationContext* opCtx,
                        const std::string& db,
                        const BSONObj& cmdObj,
-                       std::string& ignored,
                        BSONObjBuilder& result) {
     Client* client = Client::getCurrent();
     AuthenticationSession::set(client, std::unique_ptr<AuthenticationSession>());
@@ -302,7 +299,7 @@ bool CmdSaslStart::run(OperationContext* opCtx,
     return status.isOK();
 }
 
-CmdSaslContinue::CmdSaslContinue() : Command(saslContinueCommandName) {}
+CmdSaslContinue::CmdSaslContinue() : BasicCommand(saslContinueCommandName) {}
 CmdSaslContinue::~CmdSaslContinue() {}
 
 void CmdSaslContinue::help(std::stringstream& os) const {
@@ -312,7 +309,6 @@ void CmdSaslContinue::help(std::stringstream& os) const {
 bool CmdSaslContinue::run(OperationContext* opCtx,
                           const std::string& db,
                           const BSONObj& cmdObj,
-                          std::string& ignored,
                           BSONObjBuilder& result) {
     Client* client = Client::getCurrent();
     std::unique_ptr<AuthenticationSession> sessionGuard;

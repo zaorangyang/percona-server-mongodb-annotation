@@ -56,9 +56,9 @@ using std::string;
 using std::stringstream;
 
 /* For testing only, not for general use. Enabled via command-line */
-class GodInsert : public Command {
+class GodInsert : public ErrmsgCommandDeprecated {
 public:
-    GodInsert() : Command("godinsert") {}
+    GodInsert() : ErrmsgCommandDeprecated("godinsert") {}
     virtual bool adminOnly() const {
         return false;
     }
@@ -75,11 +75,11 @@ public:
     virtual void help(stringstream& help) const {
         help << "internal. for testing only.";
     }
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     string& errmsg,
-                     BSONObjBuilder& result) {
+    virtual bool errmsgRun(OperationContext* opCtx,
+                           const string& dbname,
+                           const BSONObj& cmdObj,
+                           string& errmsg,
+                           BSONObjBuilder& result) {
         const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
         log() << "test only command godinsert invoked coll:" << nss.coll();
         BSONObj obj = cmdObj["obj"].embeddedObjectUserCheck();
@@ -108,7 +108,7 @@ public:
 };
 
 /* for diagnostic / testing purposes. Enabled via command line. */
-class CmdSleep : public Command {
+class CmdSleep : public BasicCommand {
 public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -148,11 +148,10 @@ public:
         opCtx->sleepFor(Milliseconds(millis));
     }
 
-    CmdSleep() : Command("sleep") {}
+    CmdSleep() : BasicCommand("sleep") {}
     bool run(OperationContext* opCtx,
              const string& ns,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         log() << "test only command sleep invoked";
         long long millis = 0;
@@ -199,9 +198,9 @@ public:
 };
 
 // Testing only, enabled via command-line.
-class CapTrunc : public Command {
+class CapTrunc : public BasicCommand {
 public:
-    CapTrunc() : Command("captrunc") {}
+    CapTrunc() : BasicCommand("captrunc") {}
     virtual bool slaveOk() const {
         return false;
     }
@@ -215,7 +214,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         const NamespaceString fullNs = parseNsCollectionRequired(dbname, cmdObj);
         if (!fullNs.isValid()) {
@@ -275,9 +273,9 @@ public:
 };
 
 // Testing-only, enabled via command line.
-class EmptyCapped : public Command {
+class EmptyCapped : public BasicCommand {
 public:
-    EmptyCapped() : Command("emptycapped") {}
+    EmptyCapped() : BasicCommand("emptycapped") {}
     virtual bool slaveOk() const {
         return false;
     }
@@ -292,7 +290,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         const NamespaceString nss = parseNsCollectionRequired(dbname, cmdObj);
 

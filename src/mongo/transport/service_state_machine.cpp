@@ -51,7 +51,6 @@
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/thread_idle_callback.h"
 #include "mongo/util/quick_exit.h"
-#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
@@ -91,137 +90,7 @@ bool setExhaustMessage(Message* m, const DbResponse& dbresponse) {
 }  // namespace
 
 using transport::TransportLayer;
-ServiceStateMachine::ServiceStateMachine(ServiceContext* svcContext,
-                                         transport::SessionHandle session,
-                                         bool sync)
-    : _state{State::Source},
-      _sep{svcContext->getServiceEntryPoint()},
-      _sync(sync),
-      _dbClient{svcContext->makeClient("conn", std::move(session))},
-      _dbClientPtr{_dbClient.get()},
-      _threadName{str::stream() << "conn" << _dbClient->session()->id()},
-      _currentOwningThread{stdx::this_thread::get_id()} {}
-
-const transport::SessionHandle& ServiceStateMachine::session() const {
-    // The _dbClientPtr should always point to our Client which should always own our SessionHandle
-    return _dbClientPtr->session();
-}
-
-void ServiceStateMachine::sourceCallback(Status status) {
-    // Make sure we just called sourceMessage();
-    invariant(_state == State::SourceWait);
-    auto remote = session()->remote();
-
-    if (status.isOK()) {
-        _state = State::Process;
-    } else if (ErrorCodes::isInterruption(status.code()) ||
-               ErrorCodes::isNetworkError(status.code())) {
-        LOG(2) << "Session from " << remote << " encountered a network error during SourceMessage";
-        _state = State::EndSession;
-    } else if (status == TransportLayer::TicketSessionClosedStatus) {
-        // Our session may have been closed internally.
-        LOG(2) << "Session from " << remote << " was closed internally during SourceMessage";
-        _state = State::EndSession;
-    } else {
-        log() << "Error receiving request from client: " << status << ". Ending connection from "
-              << remote << " (connection id: " << session()->id() << ")";
-        _state = State::EndSession;
-    }
-
-    // In asyncronous mode this is the entrypoint back into the database from the network layer
-    // after a message has been received, so we want to call runNext() to process the message.
-    //
-    // In synchronous mode, runNext() will fall through to call processMessage() so we avoid
-    // the recursive call.
-    if (!_sync)
-        return runNext();
-}
-
-void ServiceStateMachine::sinkCallback(Status status) {
-    invariant(_state == State::SinkWait);
-
-    if (!status.isOK()) {
-        log() << "Error sending response to client: " << status << ". Ending connection from "
-              << session()->remote() << " (connection id: " << session()->id() << ")";
-        _state = State::EndSession;
-    } else if (inExhaust) {
-        _state = State::Process;
-    } else {
-        _state = State::Source;
-    }
-
-    return scheduleNext();
-}
-
-void ServiceStateMachine::processMessage() {
-    // This may have been called just after a failure to source a message, in which case this
-    // should return early so the session can be cleaned up.
-    if (_state != State::Process) {
-        return;
-    }
-    invariant(!_inMessage.empty());
-
-    auto& compressorMgr = MessageCompressorManager::forSession(session());
-
-    if (_inMessage.operation() == dbCompressed) {
-        auto swm = compressorMgr.decompressMessage(_inMessage);
-        uassertStatusOK(swm.getStatus());
-        _inMessage = swm.getValue();
-        wasCompressed = true;
-    } else {
-        wasCompressed = false;
-    }
-
-    networkCounter.hitLogicalIn(_inMessage.size());
-
-    // 2. Pass sourced Message to handler to generate response.
-    auto opCtx = cc().makeOperationContext();
-
-    // The handleRequest is implemented in a subclass for mongod/mongos and actually all the
-    // database work for this request.
-    DbResponse dbresponse = _sep->handleRequest(opCtx.get(), _inMessage);
-
-    // opCtx must be destroyed here so that the operation cannot show
-    // up in currentOp results after the response reaches the client
-    opCtx.reset();
-
-    // 3. Format our response, if we have one
-    Message& toSink = dbresponse.response;
-    if (!toSink.empty()) {
-        toSink.header().setId(nextMessageId());
-        toSink.header().setResponseToMsgId(_inMessage.header().getId());
-
-        // If this is an exhaust cursor, don't source more Messages
-        if (dbresponse.exhaustNS.size() > 0 && setExhaustMessage(&_inMessage, dbresponse)) {
-            inExhaust = true;
-        } else {
-            inExhaust = false;
-            _inMessage.reset();
-        }
-
-        networkCounter.hitLogicalOut(toSink.size());
-
-        if (wasCompressed) {
-            auto swm = compressorMgr.compressMessage(toSink);
-            uassertStatusOK(swm.getStatus());
-            toSink = swm.getValue();
-        }
-
-        // 4. Sink our response to the client
-        auto ticket = session()->sinkMessage(toSink);
-        _state = State::SinkWait;
-        if (_sync) {
-            sinkCallback(session()->getTransportLayer()->wait(std::move(ticket)));
-        } else {
-            session()->getTransportLayer()->asyncWait(
-                std::move(ticket), [this](Status status) { sinkCallback(status); });
-        }
-    } else {
-        _state = State::Source;
-        _inMessage.reset();
-        return scheduleNext();
-    }
-}
+using transport::ServiceExecutor;
 
 /*
  * This class wraps up the logic for swapping/unswapping the Client during runNext().
@@ -260,9 +129,25 @@ public:
     }
 
     ~ThreadGuard() {
+        // If we are not the owner of the SSM, then do nothing. Something higher up the call stack
+        // will have to clean up.
         if (!_haveTakenOwnership)
             return;
 
+        // If the session has ended, then assume that it's unsafe to do anything but call the
+        // cleanup hook.
+        if (_ssm->state() == State::Ended) {
+            // The cleanup hook may change as soon as we unlock the mutex, so move it out of the
+            // ssm before unlocking the lock.
+            auto cleanupHook = std::move(_ssm->_cleanupHook);
+            if (cleanupHook)
+                cleanupHook();
+
+            return;
+        }
+
+        // Otherwise swap thread locals and thread names back into the SSM so its ready for the
+        // next run.
         if (haveClient()) {
             _ssm->_dbClient = Client::releaseCurrent();
         }
@@ -270,12 +155,18 @@ public:
         _ssm->_isOwned.clear();
     }
 
-    void dismiss() {
-        _haveTakenOwnership = false;
-    }
-
+    // This bool operator reflects whether the ThreadGuard was able to take ownership of the thread
+    // either higher up the call chain, or in this call. If this returns false, then it is not safe
+    // to assume the thread has been setup correctly, or that any mutable state of the SSM is safe
+    // to access except for the current _state value.
     explicit operator bool() const {
         return _okayToRunNext;
+    }
+
+    // Returns whether the thread guard is the owner of the SSM's state or not. Callers can use this
+    // to determine whether their callchain is recursive.
+    bool isOwner() const {
+        return _haveTakenOwnership;
     }
 
 private:
@@ -285,31 +176,234 @@ private:
     bool _okayToRunNext = true;
 };
 
-void ServiceStateMachine::runNext() {
+std::shared_ptr<ServiceStateMachine> ServiceStateMachine::create(ServiceContext* svcContext,
+                                                                 transport::SessionHandle session,
+                                                                 bool sync) {
+    return std::make_shared<ServiceStateMachine>(svcContext, std::move(session), sync);
+}
+
+ServiceStateMachine::ServiceStateMachine(ServiceContext* svcContext,
+                                         transport::SessionHandle session,
+                                         bool sync)
+    : _state{State::Created},
+      _sep{svcContext->getServiceEntryPoint()},
+      _sync(sync),
+      _serviceContext(svcContext),
+      _sessionHandle(session),
+      _dbClient{svcContext->makeClient("conn", std::move(session))},
+      _dbClientPtr{_dbClient.get()},
+      _threadName{str::stream() << "conn" << _session()->id()},
+      _currentOwningThread{stdx::this_thread::get_id()} {}
+
+const transport::SessionHandle& ServiceStateMachine::_session() const {
+    return _sessionHandle;
+}
+
+void ServiceStateMachine::_sourceCallback(Status status) {
+    // The first thing to do is create a ThreadGuard which will take ownership of the SSM in this
+    // thread.
     ThreadGuard guard(this);
-    if (!guard)
-        return scheduleNext();
+    // If the guard wasn't able to take ownership of the thread, then reschedule this call to
+    // runNext() so that this thread can do other useful work with its timeslice instead of going
+    // to sleep while waiting for the SSM to be released.
+    if (!guard) {
+        return _scheduleFunc([this, status] { _sourceCallback(status); },
+                             ServiceExecutor::DeferredTask);
+    }
+
+    // Make sure we just called sourceMessage();
+    invariant(state() == State::SourceWait);
+    auto remote = _session()->remote();
+
+    if (status.isOK()) {
+        _state.store(State::Process);
+
+        // Since we know that we're going to process a message, call scheduleNext() immediately
+        // to schedule the call to processMessage() on the serviceExecutor (or just unwind the
+        // stack)
+
+        // If this callback doesn't own the ThreadGuard, then we're being called recursively,
+        // and the executor shouldn't start a new thread to process the message - it can use this
+        // one just after this returns.
+        auto flags = guard.isOwner() ? ServiceExecutor::EmptyFlags : ServiceExecutor::DeferredTask;
+        return scheduleNext(flags);
+    } else if (ErrorCodes::isInterruption(status.code()) ||
+               ErrorCodes::isNetworkError(status.code())) {
+        LOG(2) << "Session from " << remote << " encountered a network error during SourceMessage";
+        _state.store(State::EndSession);
+    } else if (status == TransportLayer::TicketSessionClosedStatus) {
+        // Our session may have been closed internally.
+        LOG(2) << "Session from " << remote << " was closed internally during SourceMessage";
+        _state.store(State::EndSession);
+    } else {
+        log() << "Error receiving request from client: " << status << ". Ending connection from "
+              << remote << " (connection id: " << _session()->id() << ")";
+        _state.store(State::EndSession);
+    }
+
+    // There was an error receiving a message from the client and we've already printed the error
+    // so call runNextInGuard() to clean up the session without waiting.
+    _runNextInGuard(guard);
+}
+
+void ServiceStateMachine::_sinkCallback(Status status) {
+    // The first thing to do is create a ThreadGuard which will take ownership of the SSM in this
+    // thread.
+    ThreadGuard guard(this);
+    // If the guard wasn't able to take ownership of the thread, then reschedule this call to
+    // runNext() so that this thread can do other useful work with its timeslice instead of going
+    // to sleep while waiting for the SSM to be released.
+    if (!guard) {
+        return _scheduleFunc([this, status] { _sinkCallback(status); },
+                             ServiceExecutor::DeferredTask);
+    }
+
+    invariant(state() == State::SinkWait);
+
+    // If there was an error sinking the message to the client, then we should print an error and
+    // end the session. No need to unwind the stack, so this will runNextInGuard() and return.
+    //
+    // Otherwise, update the current state depending on whether we're in exhaust or not, and call
+    // scheduleNext() to unwind the stack and do the next step.
+    if (!status.isOK()) {
+        log() << "Error sending response to client: " << status << ". Ending connection from "
+              << _session()->remote() << " (connection id: " << _session()->id() << ")";
+        _state.store(State::EndSession);
+        return _runNextInGuard(guard);
+    } else if (inExhaust) {
+        _state.store(State::Process);
+    } else {
+        _state.store(State::Source);
+    }
+
+    // If the session ended, then runNext to clean it up
+    if (state() == State::EndSession) {
+        _runNextInGuard(guard);
+    } else {  // Otherwise scheduleNext to unwind the stack and run the next step later
+        // If this callback doesn't own the ThreadGuard, then we're being called recursively,
+        // and the executor shouldn't start a new thread to process the message - it can use this
+        // one just after this returns.
+        auto flags = guard.isOwner() ? ServiceExecutor::EmptyFlags : ServiceExecutor::DeferredTask;
+        return scheduleNext(flags);
+    }
+}
+
+void ServiceStateMachine::_processMessage(ThreadGuard& guard) {
+    // This may have been called just after a failure to source a message, in which case this
+    // should return early so the session can be cleaned up.
+    if (state() != State::Process) {
+        return;
+    }
+    invariant(!_inMessage.empty());
+
+    auto& compressorMgr = MessageCompressorManager::forSession(_session());
+
+    if (_inMessage.operation() == dbCompressed) {
+        auto swm = compressorMgr.decompressMessage(_inMessage);
+        uassertStatusOK(swm.getStatus());
+        _inMessage = swm.getValue();
+        wasCompressed = true;
+    } else {
+        wasCompressed = false;
+    }
+
+    networkCounter.hitLogicalIn(_inMessage.size());
+
+    // Pass sourced Message to handler to generate response.
+    auto opCtx = Client::getCurrent()->makeOperationContext();
+
+    // The handleRequest is implemented in a subclass for mongod/mongos and actually all the
+    // database work for this request.
+    DbResponse dbresponse = _sep->handleRequest(opCtx.get(), _inMessage);
+
+    // opCtx must be destroyed here so that the operation cannot show
+    // up in currentOp results after the response reaches the client
+    opCtx.reset();
+
+    // Format our response, if we have one
+    Message& toSink = dbresponse.response;
+    if (!toSink.empty()) {
+        toSink.header().setId(nextMessageId());
+        toSink.header().setResponseToMsgId(_inMessage.header().getId());
+
+        // If this is an exhaust cursor, don't source more Messages
+        if (dbresponse.exhaustNS.size() > 0 && setExhaustMessage(&_inMessage, dbresponse)) {
+            inExhaust = true;
+        } else {
+            inExhaust = false;
+            _inMessage.reset();
+        }
+
+        networkCounter.hitLogicalOut(toSink.size());
+
+        if (wasCompressed) {
+            auto swm = compressorMgr.compressMessage(toSink);
+            uassertStatusOK(swm.getStatus());
+            toSink = swm.getValue();
+        }
+
+        // Sink our response to the client
+        auto ticket = _session()->sinkMessage(toSink);
+
+        _state.store(State::SinkWait);
+        if (_sync) {
+            _sinkCallback(_session()->getTransportLayer()->wait(std::move(ticket)));
+        } else {
+            _session()->getTransportLayer()->asyncWait(
+                std::move(ticket), [this](Status status) { _sinkCallback(status); });
+        }
+    } else {
+        _state.store(State::Source);
+        _inMessage.reset();
+        return scheduleNext(ServiceExecutor::DeferredTask);
+    }
+}
+
+void ServiceStateMachine::runNext() {
+    // The first thing to do is create a ThreadGuard which will take ownership of the SSM in this
+    // thread.
+    ThreadGuard guard(this);
+    // If the guard wasn't able to take ownership of the thread, then reschedule this call to
+    // runNext() so that this thread can do other useful work with its timeslice instead of going
+    // to sleep while waiting for the SSM to be released.
+    if (!guard) {
+        return scheduleNext(ServiceExecutor::DeferredTask);
+    }
+    return _runNextInGuard(guard);
+}
+
+void ServiceStateMachine::_runNextInGuard(ThreadGuard& guard) {
+    auto curState = state();
+    invariant(curState != State::Ended);
+
+    // If this is the first run of the SSM, then update its state to Source
+    if (curState == State::Created) {
+        curState = State::Source;
+        _state.store(curState);
+    }
 
     // Make sure the current Client got set correctly
     invariant(Client::getCurrent() == _dbClientPtr);
     try {
-        switch (_state) {
+        switch (curState) {
             case State::Source: {
                 invariant(_inMessage.empty());
 
-                auto ticket = session()->sourceMessage(&_inMessage);
-                _state = State::SourceWait;
+                auto ticket = _session()->sourceMessage(&_inMessage);
+                _state.store(State::SourceWait);
                 if (_sync) {
-                    MONGO_IDLE_THREAD_BLOCK;
-                    sourceCallback(session()->getTransportLayer()->wait(std::move(ticket)));
+                    _sourceCallback([this](auto ticket) {
+                        MONGO_IDLE_THREAD_BLOCK;
+                        return _session()->getTransportLayer()->wait(std::move(ticket));
+                    }(std::move(ticket)));
                 } else {
-                    session()->getTransportLayer()->asyncWait(
-                        std::move(ticket), [this](Status status) { sourceCallback(status); });
+                    _session()->getTransportLayer()->asyncWait(
+                        std::move(ticket), [this](Status status) { _sourceCallback(status); });
                     break;
                 }
             }
             case State::Process:
-                processMessage();
+                _processMessage(guard);
                 break;
             case State::EndSession:
                 // This will get handled below in an if statement. That way if an error occurs
@@ -319,14 +413,14 @@ void ServiceStateMachine::runNext() {
                 MONGO_UNREACHABLE;
         }
 
-        if (_state == State::EndSession) {
-            guard.dismiss();
-            endSession();
-        }
-
         if ((_counter++ & 0xf) == 0) {
             markThreadIdle();
-        };
+        }
+
+        if (state() == State::EndSession) {
+            _cleanupSession(guard);
+        }
+
         return;
     } catch (const AssertionException& e) {
         log() << "AssertionException handling request, closing client connection: " << e;
@@ -340,54 +434,56 @@ void ServiceStateMachine::runNext() {
         quickExit(EXIT_UNCAUGHT);
     }
 
-    _state = State::EndSession;
-    guard.dismiss();
-    endSession();
+    _state.store(State::EndSession);
+    _cleanupSession(guard);
 }
 
-// TODO: Right now this is a noop because we only run in synchronous mode. When an async
-// TransportLayer is written, this will call the serviceexecutor to schedule calls to runNext().
-void ServiceStateMachine::scheduleNext() {}
+void ServiceStateMachine::scheduleNext(ServiceExecutor::ScheduleFlags flags) {
+    _maybeScheduleFunc(_serviceContext->getServiceExecutor(), [this] { runNext(); }, flags);
+}
 
-void ServiceStateMachine::endSession() {
-    auto tl = session()->getTransportLayer();
+void ServiceStateMachine::terminateIfTagsDontMatch(transport::Session::TagMask tags) {
+    if (state() == State::Ended)
+        return;
+
+    if (_session()->getTags() & tags) {
+        log() << "Skip closing connection for connection # " << _session()->id();
+        return;
+    }
+
+    _session()->getTransportLayer()->end(_session());
+}
+
+void ServiceStateMachine::setCleanupHook(stdx::function<void()> hook) {
+    invariant(state() == State::Created);
+    _cleanupHook = std::move(hook);
+}
+
+ServiceStateMachine::State ServiceStateMachine::state() {
+    return _state.load();
+}
+
+void ServiceStateMachine::_cleanupSession(ThreadGuard& guard) {
+    _state.store(State::Ended);
+
+    auto tl = _session()->getTransportLayer();
+    auto remote = _session()->remote();
 
     _inMessage.reset();
-    auto remote = session()->remote();
 
+    // By ignoring the return value of Client::releaseCurrent() we destroy the session.
+    // _dbClient is now nullptr and _dbClientPtr is invalid and should never be accessed.
     Client::releaseCurrent();
 
     if (!serverGlobalParams.quiet.load()) {
-        auto conns = tl->sessionStats().numOpenSessions;
+        // Get the number of open sessions minus 1 (this one will get cleaned up when
+        // this SSM gets destroyed)
+        // TODO Swich to using ServiceEntryPointImpl::getNumberOfConnections(), or move this
+        // into the ServiceEntryPoint
+        auto conns = tl->sessionStats().numOpenSessions - 1;
         const char* word = (conns == 1 ? " connection" : " connections");
         log() << "end connection " << remote << " (" << conns << word << " now open)";
     }
-
-    _state = State::Ended;
-}
-
-std::ostream& operator<<(std::ostream& stream, const ServiceStateMachine::State& state) {
-    switch (state) {
-        case ServiceStateMachine::State::Source:
-            stream << "source";
-            break;
-        case ServiceStateMachine::State::SourceWait:
-            stream << "sourceWait";
-            break;
-        case ServiceStateMachine::State::Process:
-            stream << "process";
-            break;
-        case ServiceStateMachine::State::SinkWait:
-            stream << "sinkWait";
-            break;
-        case ServiceStateMachine::State::EndSession:
-            stream << "endSession";
-            break;
-        case ServiceStateMachine::State::Ended:
-            stream << "ended";
-            break;
-    }
-    return stream;
 }
 
 }  // namespace mongo

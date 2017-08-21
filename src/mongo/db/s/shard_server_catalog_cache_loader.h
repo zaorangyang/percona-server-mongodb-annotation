@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include "mongo/db/operation_context_group.h"
 #include "mongo/db/s/namespace_metadata_change_notifications.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/util/concurrency/thread_pool.h"
@@ -46,7 +47,7 @@ class ShardServerCatalogCacheLoader : public CatalogCacheLoader {
     MONGO_DISALLOW_COPYING(ShardServerCatalogCacheLoader);
 
 public:
-    ShardServerCatalogCacheLoader(std::unique_ptr<CatalogCacheLoader> configLoader);
+    ShardServerCatalogCacheLoader(std::unique_ptr<CatalogCacheLoader> configServerLoader);
     ~ShardServerCatalogCacheLoader();
 
     /**
@@ -71,7 +72,19 @@ public:
      */
     void notifyOfCollectionVersionUpdate(OperationContext* opCtx,
                                          const NamespaceString& nss,
-                                         const ChunkVersion& version);
+                                         const ChunkVersion& version) override;
+
+    /**
+     * This function can throw a DBException if the opCtx is interrupted. A lock must not be held
+     * when calling this because it would prevent using the latest snapshot and actually seeing the
+     * change after it arrives.
+     *
+     * See CatalogCache::waitForCollectionVersion for function details: it's a passthrough function
+     * to give external access to this function, and so it is the interface.
+     */
+    Status waitForCollectionVersion(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    const ChunkVersion& version) override;
 
     /**
      * This must be called serially, never in parallel, including waiting for the returned
@@ -86,8 +99,9 @@ public:
     std::shared_ptr<Notification<void>> getChunksSince(
         const NamespaceString& nss,
         ChunkVersion version,
-        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn)
-        override;
+        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn,
+        const repl::ReadConcernLevel& readConcern =
+            repl::ReadConcernLevel::kMajorityReadConcern) override;
 
 private:
     // Differentiates the server's role in the replica set so that the chunk loader knows whether to
@@ -100,6 +114,9 @@ private:
      * metadata for a specific collection.
      */
     struct Task {
+        MONGO_DISALLOW_COPYING(Task);
+        Task(Task&&) = default;
+
         /**
          * Initializes a task for either dropping or updating the persisted metadata for the
          * associated collection. Which type of task is determined by the Status of
@@ -295,7 +312,7 @@ private:
      *
      * Only run on the shard primary.
      */
-    bool _updatePersistedMetadata(OperationContext* opCtx, const NamespaceString& nss);
+    void _updatePersistedMetadata(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Attempt to read the collection and chunk metadata since version 'sinceVersion' from the shard
@@ -334,6 +351,9 @@ private:
     // Indicates whether this server is the primary or not, so that the appropriate loading action
     // can be taken.
     ReplicaSetRole _role{ReplicaSetRole::None};
+
+    // The collection of operation contexts in use by all threads.
+    OperationContextGroup _contexts;
 };
 
 }  // namespace mongo

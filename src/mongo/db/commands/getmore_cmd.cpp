@@ -75,11 +75,11 @@ MONGO_FP_DECLARE(rsStopGetMoreCmd);
  * Can be used in combination with any cursor-generating command (e.g. find, aggregate,
  * listIndexes).
  */
-class GetMoreCmd : public Command {
+class GetMoreCmd : public BasicCommand {
     MONGO_DISALLOW_COPYING(GetMoreCmd);
 
 public:
-    GetMoreCmd() : Command("getMore") {}
+    GetMoreCmd() : BasicCommand("getMore") {}
 
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -150,7 +150,6 @@ public:
                    const NamespaceString& origNss,
                    const GetMoreRequest& request,
                    const BSONObj& cmdObj,
-                   std::string& errmsg,
                    BSONObjBuilder& result) {
 
         auto curOp = CurOp::get(opCtx);
@@ -199,11 +198,6 @@ public:
                     opCtx, *nssForCurOp, Top::LockType::NotLocked, dbProfilingLevel);
             }
         } else {
-            // getMore commands are always unversioned, so prevent AutoGetCollectionForRead from
-            // checking the shard version.
-            OperationShardingState::get(opCtx).setShardVersion(request.nss,
-                                                               ChunkVersion::IGNORED());
-
             readLock.emplace(opCtx, request.nss);
             const int doNotChangeProfilingLevel = 0;
             statsTracker.emplace(opCtx,
@@ -336,12 +330,9 @@ public:
 
         // Mark this as an AwaitData operation if appropriate.
         if (isCursorAwaitData(cursor)) {
-            // Do not wait if we need to update the commit time; just get whatever is available
-            // now.
-            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-            if (!request.lastKnownCommittedOpTime ||
-                (request.lastKnownCommittedOpTime == replCoord->getLastCommittedOpTime()))
-                shouldWaitForInserts(opCtx) = true;
+            if (request.lastKnownCommittedOpTime)
+                clientsLastKnownCommittedOpTime(opCtx) = request.lastKnownCommittedOpTime.get();
+            shouldWaitForInserts(opCtx) = true;
         }
 
         Status batchStatus = generateBatch(opCtx, cursor, request, &nextBatch, &state, &numResults);
@@ -399,23 +390,16 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) override {
         // Counted as a getMore, not as a command.
         globalOpCounters.gotGetMore();
-
-        if (opCtx->getClient()->isInDirectClient()) {
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation, "Cannot run getMore command from eval()"));
-        }
 
         StatusWith<GetMoreRequest> parsedRequest = GetMoreRequest::parseFromBSON(dbname, cmdObj);
         if (!parsedRequest.isOK()) {
             return appendCommandStatus(result, parsedRequest.getStatus());
         }
         auto request = parsedRequest.getValue();
-        return runParsed(opCtx, request.nss, request, cmdObj, errmsg, result);
+        return runParsed(opCtx, request.nss, request, cmdObj, result);
     }
 
     /**

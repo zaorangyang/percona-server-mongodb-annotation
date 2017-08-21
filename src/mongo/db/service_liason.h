@@ -35,6 +35,8 @@
 
 namespace mongo {
 
+class ServiceContext;
+
 /**
  * A service-dependent type for the LogicalSessionCache to use to find the
  * current time, schedule periodic refresh jobs, and get a list of sessions
@@ -73,6 +75,12 @@ public:
      * Return the current time.
      */
     virtual Date_t now() const = 0;
+
+protected:
+    /**
+     * Returns the service context.
+     */
+    virtual ServiceContext* _context() = 0;
 };
 
 }  // namespace mongo

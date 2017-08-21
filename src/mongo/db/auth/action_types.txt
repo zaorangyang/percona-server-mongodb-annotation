@@ -103,6 +103,7 @@
 "splitChunk",
 "splitVector",
 "startBackup",
+"startSession",
 "storageDetails",
 "top",
 "touch",

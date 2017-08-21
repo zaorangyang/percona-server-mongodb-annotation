@@ -49,7 +49,7 @@ using stdx::make_unique;
 
 namespace {
 
-class ParallelCollectionScanCmd : public Command {
+class ParallelCollectionScanCmd : public BasicCommand {
 public:
     struct ExtentInfo {
         ExtentInfo(RecordId dl, size_t s) : diskLoc(dl), size(s) {}
@@ -57,7 +57,7 @@ public:
         size_t size;
     };
 
-    ParallelCollectionScanCmd() : Command("parallelCollectionScan") {}
+    ParallelCollectionScanCmd() : BasicCommand("parallelCollectionScan") {}
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -88,7 +88,6 @@ public:
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         const NamespaceString ns(parseNsOrUUID(opCtx, dbname, cmdObj));
 
@@ -110,9 +109,20 @@ public:
                                                   << " was: "
                                                   << numCursors));
 
-        auto iterators = collection->getManyCursors(opCtx);
-        if (iterators.size() < numCursors) {
-            numCursors = iterators.size();
+        std::vector<std::unique_ptr<RecordCursor>> iterators;
+        // Opening multiple cursors on a capped collection and reading them in parallel can produce
+        // behavior that is not well defined. This can be removed when support for parallel
+        // collection scan on capped collections is officially added. The 'getCursor' function
+        // ensures that the cursor returned iterates the capped collection in proper document
+        // insertion order.
+        if (collection->isCapped()) {
+            iterators.push_back(collection->getCursor(opCtx));
+            numCursors = 1;
+        } else {
+            iterators = collection->getManyCursors(opCtx);
+            if (iterators.size() < numCursors) {
+                numCursors = iterators.size();
+            }
         }
 
         std::vector<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> execs;

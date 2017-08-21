@@ -75,10 +75,14 @@ struct ServerGlobalParams {
     int defaultLocalThresholdMillis = 15;  // --localThreshold in ms to consider a node local
     bool moveParanoia = false;             // for move chunk paranoia
 
-    bool noUnixSocket = false;        // --nounixsocket
-    bool doFork = false;              // --fork
-    std::string socket = "/tmp";      // UNIX domain socket directory
-    std::string transportLayer;       // --transportLayer (must be either "asio" or "legacy")
+    bool noUnixSocket = false;    // --nounixsocket
+    bool doFork = false;          // --fork
+    std::string socket = "/tmp";  // UNIX domain socket directory
+    std::string transportLayer;   // --transportLayer (must be either "asio" or "legacy")
+
+    // --serviceExecutor ("adaptive", "synchronous", or "fixedForTesting")
+    std::string serviceExecutor;
+
     int maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
 
     int unixSocketPermissions = DEFAULT_UNIX_PERMS;  // permissions for the UNIX domain socket
@@ -173,6 +177,10 @@ struct ServerGlobalParams {
 
         // Read-only parameter featureCompatibilityVersion.
         AtomicWord<Version> version{Version::k34};
+
+        // Read-only global isSchemaVersion36. This determines whether to give Collections UUIDs
+        // upon creation.
+        AtomicWord<bool> isSchemaVersion36{false};
 
         // Feature validation differs depending on the role of a mongod in a replica set or
         // master/slave configuration. Masters/primaries can accept user-initiated writes and

@@ -73,6 +73,7 @@
 #include "mongo/db/initialize_snmp.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/json.h"
+#include "mongo/db/keys_collection_manager.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_cache.h"
@@ -117,8 +118,11 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/network_interface_thread_pool.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
+#include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/sharding_initialization.h"
@@ -288,7 +292,7 @@ unsigned long long checkIfReplMissingFromCommandLine(OperationContext* opCtx) {
  * Caller must lock DB before calling this function.
  */
 void checkForCappedOplog(OperationContext* opCtx, Database* db) {
-    const NamespaceString oplogNss(repl::rsOplogName);
+    const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
     invariant(opCtx->lockState()->isDbLockedForMode(oplogNss.db(), MODE_IS));
     Collection* oplogCollection = db->getCollection(opCtx, oplogNss);
     if (oplogCollection && !oplogCollection->isCapped()) {
@@ -384,6 +388,11 @@ void repairDatabasesAndCheckVersion(OperationContext* opCtx) {
                         fassertFailedNoTrace(40283);
                     }
                     serverGlobalParams.featureCompatibility.version.store(version.getValue());
+
+                    // Update schemaVersion parameter.
+                    serverGlobalParams.featureCompatibility.isSchemaVersion36.store(
+                        serverGlobalParams.featureCompatibility.version.load() ==
+                        ServerGlobalParams::FeatureCompatibility::Version::k36);
                 }
             }
         }
@@ -667,14 +676,20 @@ ExitCode _initAndListen(int listenPort) {
             }
         } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             ShardedConnectionInfo::addHook(startupOpCtx->getServiceContext());
+
             uassertStatusOK(
                 initializeGlobalShardingStateForMongod(startupOpCtx.get(),
                                                        ConnectionString::forLocal(),
                                                        kDistLockProcessIdForConfigServer));
+
             Balancer::create(startupOpCtx->getServiceContext());
+
+            ShardingCatalogManager::create(
+                startupOpCtx->getServiceContext(),
+                makeShardingTaskExecutor(executor::makeNetworkInterface("AddShard-TaskExecutor")));
         }
 
-        repl::getGlobalReplicationCoordinator()->startup(startupOpCtx.get());
+        repl::ReplicationCoordinator::get(startupOpCtx.get())->startup(startupOpCtx.get());
 
         const unsigned long long missingRepl =
             checkIfReplMissingFromCommandLine(startupOpCtx.get());
@@ -724,7 +739,7 @@ ExitCode _initAndListen(int listenPort) {
     }
 
     auto sessionCache = makeLogicalSessionCacheD(kind);
-    globalServiceContext->setLogicalSessionCache(std::move(sessionCache));
+    LogicalSessionCache::set(globalServiceContext, std::move(sessionCache));
 
     // MessageServer::run will return when exit code closes its socket and we don't need the
     // operation context anymore
@@ -734,6 +749,14 @@ ExitCode _initAndListen(int listenPort) {
     if (!start.isOK()) {
         error() << "Failed to start the listener: " << start.toString();
         return EXIT_NET_ERROR;
+    }
+
+    if (globalServiceContext->getServiceExecutor()) {
+        start = globalServiceContext->getServiceExecutor()->start();
+        if (!start.isOK()) {
+            error() << "Failed to start the service executor: " << start;
+            return EXIT_NET_ERROR;
+        }
     }
 
     globalServiceContext->notifyStartupComplete();
@@ -960,6 +983,13 @@ static void shutdownTask() {
     _diaglog.flush();
 
     if (opCtx) {
+        if (serverGlobalParams.featureCompatibility.version.load() ==
+            ServerGlobalParams::FeatureCompatibility::Version::k34) {
+            log(LogComponent::kReplication) << "shutdown: removing all drop-pending collections...";
+            repl::DropPendingCollectionReaper::get(opCtx)->dropCollectionsOlderThan(
+                opCtx, repl::OpTime::max());
+        }
+
         // This can wait a long time while we drain the secondary's apply queue, especially if it is
         // building an index.
         repl::ReplicationCoordinator::get(opCtx)->shutdown(opCtx);
@@ -976,7 +1006,8 @@ static void shutdownTask() {
     }
 
     ReplicaSetMonitor::shutdown();
-    if (auto sr = grid.shardRegistry()) {  // TODO: race: sr is a naked pointer
+
+    if (auto sr = Grid::get(opCtx)->shardRegistry()) {
         sr->shutdown();
     }
 
@@ -996,18 +1027,22 @@ static void shutdownTask() {
 
         log(LogComponent::kNetwork)
             << "shutdown: going to close all sockets because ASAN is active...";
+
+        // Shutdown the TransportLayer so that new connections aren't accepted
         tl->shutdown();
+
+        // Request that all sessions end.
+        sep->endAllSessions(transport::Session::kEmptyTagMask);
 
         // Close all sockets in a detached thread, and then wait for the number of active
         // connections to reach zero. Give the detached background thread a 10 second deadline. If
         // we haven't closed drained all active operations within that deadline, just keep going
         // with shutdown: the OS will do it for us when the process terminates.
-
         stdx::packaged_task<void()> dryOutTask([sep] {
             // There isn't currently a way to wait on the TicketHolder to have all its tickets back,
             // unfortunately. So, busy wait in this detached thread.
             while (true) {
-                const auto runningWorkers = sep->getNumberOfActiveWorkerThreads();
+                const auto runningWorkers = sep->getNumberOfConnections();
 
                 if (runningWorkers == 0) {
                     log(LogComponent::kNetwork) << "shutdown: no running workers found...";
@@ -1025,6 +1060,12 @@ static void shutdownTask() {
             stdx::future_status::ready) {
             log(LogComponent::kNetwork) << "shutdown: exhausted grace period for"
                                         << " active workers to drain; continuing with shutdown... ";
+        }
+
+        // Shutdown and wait for the service executor to exit
+        auto svcExec = serviceContext->getServiceExecutor();
+        if (svcExec) {
+            fassertStatusOK(40550, svcExec->shutdown());
         }
     }
 #endif

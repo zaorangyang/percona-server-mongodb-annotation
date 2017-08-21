@@ -153,6 +153,9 @@ const char* encodeMatchType(MatchExpression::MatchType mt) {
         case MatchExpression::ALWAYS_FALSE:
             return "af";
             break;
+        case MatchExpression::ALWAYS_TRUE:
+            return "at";
+            break;
         case MatchExpression::GEO_NEAR:
             return "gn";
             break;
@@ -171,6 +174,9 @@ const char* encodeMatchType(MatchExpression::MatchType mt) {
         case MatchExpression::BITS_ANY_CLEAR:
             return "yc";
             break;
+        case MatchExpression::INTERNAL_SCHEMA_COND:
+            return "internalSchemaCond";
+            break;
         case MatchExpression::INTERNAL_SCHEMA_MIN_ITEMS:
             return "internalSchemaMinItems";
             break;
@@ -185,6 +191,17 @@ const char* encodeMatchType(MatchExpression::MatchType mt) {
             break;
         case MatchExpression::INTERNAL_SCHEMA_OBJECT_MATCH:
             return "internalSchemaObjectMatch";
+        case MatchExpression::INTERNAL_SCHEMA_MIN_LENGTH:
+            return "internalSchemaMinLength";
+            break;
+        case MatchExpression::INTERNAL_SCHEMA_MAX_LENGTH:
+            return "internalSchemaMaxLength";
+            break;
+        case MatchExpression::INTERNAL_SCHEMA_MIN_PROPERTIES:
+            return "internalSchemaMinProperties";
+            break;
+        case MatchExpression::INTERNAL_SCHEMA_MAX_PROPERTIES:
+            return "internalSchemaMaxProperties";
             break;
         default:
             MONGO_UNREACHABLE;

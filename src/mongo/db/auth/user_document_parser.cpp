@@ -34,7 +34,9 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
+#include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/privilege_parser.h"
 #include "mongo/db/auth/user.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
@@ -58,6 +60,9 @@ const std::string ROLE_DB_FIELD_NAME = "db";
 const std::string MONGODB_CR_CREDENTIAL_FIELD_NAME = "MONGODB-CR";
 const std::string SCRAM_CREDENTIAL_FIELD_NAME = "SCRAM-SHA-1";
 const std::string MONGODB_EXTERNAL_CREDENTIAL_FIELD_NAME = "external";
+constexpr StringData AUTHENTICATION_RESTRICTIONS_FIELD_NAME = "authenticationRestrictions"_sd;
+constexpr StringData INHERITED_AUTHENTICATION_RESTRICTIONS_FIELD_NAME =
+    "inheritedAuthenticationRestrictions"_sd;
 
 inline Status _badValue(const char* reason, int location) {
     return Status(ErrorCodes::BadValue, reason, location);
@@ -299,6 +304,12 @@ Status V2UserDocumentParser::checkValidUserDocument(const BSONObj& doc) const {
     if (!status.isOK())
         return status;
 
+    // Validate the "authenticationRestrictions" element.
+    status = initializeAuthenticationRestrictionsFromUserDocument(doc, nullptr);
+    if (!status.isOK()) {
+        return status;
+    }
+
     return Status::OK();
 }
 
@@ -440,6 +451,58 @@ Status V2UserDocumentParser::parseRoleVector(const BSONArray& rolesArray,
         roles.push_back(role);
     }
     std::swap(*result, roles);
+    return Status::OK();
+}
+
+Status V2UserDocumentParser::initializeAuthenticationRestrictionsFromUserDocument(
+    const BSONObj& privDoc, User* user) const {
+    RestrictionDocuments::sequence_type restrictionVector;
+
+    // Restrictions on the user
+    const auto authenticationRestrictions = privDoc[AUTHENTICATION_RESTRICTIONS_FIELD_NAME];
+    if (!authenticationRestrictions.eoo()) {
+        if (authenticationRestrictions.type() != Array) {
+            return Status(ErrorCodes::UnsupportedFormat,
+                          "'authenticationRestrictions' field must be an array");
+        }
+
+        auto restrictions =
+            parseAuthenticationRestriction(BSONArray(authenticationRestrictions.Obj()));
+        if (!restrictions.isOK()) {
+            return restrictions.getStatus();
+        }
+
+        restrictionVector.push_back(restrictions.getValue());
+    }
+
+    // Restrictions from roles
+    const auto inherited = privDoc[INHERITED_AUTHENTICATION_RESTRICTIONS_FIELD_NAME];
+    if (!inherited.eoo()) {
+        if (inherited.type() != Array) {
+            return Status(ErrorCodes::UnsupportedFormat,
+                          "'inheritedAuthenticationRestrictions' field must be an array");
+        }
+
+        for (const auto& roleRestriction : BSONArray(inherited.Obj())) {
+            if (roleRestriction.type() != Array) {
+                return Status(ErrorCodes::UnsupportedFormat,
+                              "'inheritedAuthenticationRestrictions' sub-fields must be arrays");
+            }
+
+            auto roleRestrictionDoc =
+                parseAuthenticationRestriction(BSONArray(roleRestriction.Obj()));
+            if (!roleRestrictionDoc.isOK()) {
+                return roleRestrictionDoc.getStatus();
+            }
+
+            restrictionVector.push_back(roleRestrictionDoc.getValue());
+        }
+    }
+
+    if (user) {
+        user->setRestrictions(RestrictionDocuments(restrictionVector));
+    }
+
     return Status::OK();
 }
 

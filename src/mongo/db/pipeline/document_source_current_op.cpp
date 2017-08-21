@@ -48,25 +48,54 @@ const StringData kShardFieldName = "shard"_sd;
 using boost::intrusive_ptr;
 
 REGISTER_DOCUMENT_SOURCE(currentOp,
-                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceCurrentOp::LiteParsed::parse,
                          DocumentSourceCurrentOp::createFromBson);
+
+std::unique_ptr<DocumentSourceCurrentOp::LiteParsed> DocumentSourceCurrentOp::LiteParsed::parse(
+    const AggregationRequest& request, const BSONElement& spec) {
+    // Need to check the value of allUsers; if true then inprog privilege is required.
+    if (spec.type() != BSONType::Object) {
+        uasserted(ErrorCodes::TypeMismatch,
+                  str::stream() << "$currentOp options must be specified in an object, but found: "
+                                << typeName(spec.type()));
+    }
+
+    bool allUsers = false;
+
+    // Check the spec for all fields named 'allUsers'. If any of them are 'true', we require
+    // the 'inprog' privilege. This avoids the possibility that a spec with multiple
+    // allUsers fields might allow an unauthorized user to view all operations.
+    for (auto&& elem : spec.embeddedObject()) {
+        if (elem.fieldNameStringData() == "allUsers"_sd) {
+            if (elem.type() != BSONType::Bool) {
+                uasserted(ErrorCodes::TypeMismatch,
+                          str::stream() << "The 'allUsers' parameter of the $currentOp stage "
+                                           "must be a boolean value, but found: "
+                                        << typeName(elem.type()));
+            }
+
+            allUsers = allUsers || elem.boolean();
+        }
+    }
+
+    return stdx::make_unique<DocumentSourceCurrentOp::LiteParsed>(allUsers);
+}
+
 
 const char* DocumentSourceCurrentOp::getSourceName() const {
     return "$currentOp";
 }
 
-DocumentSource::InitialSourceType DocumentSourceCurrentOp::getInitialSourceType() const {
-    return InitialSourceType::kCollectionlessInitialSource;
-}
-
 DocumentSource::GetNextResult DocumentSourceCurrentOp::getNext() {
+    pExpCtx->checkForInterrupt();
+
     if (_ops.empty()) {
         _ops =
             _mongod->getCurrentOps(_includeIdleConnections, _includeOpsFromAllUsers, _truncateOps);
 
         _opsIter = _ops.begin();
 
-        if (pExpCtx->inShard) {
+        if (pExpCtx->fromRouter) {
             _shardName = _mongod->getShardName(pExpCtx->opCtx);
 
             uassert(40465,
@@ -77,7 +106,7 @@ DocumentSource::GetNextResult DocumentSourceCurrentOp::getNext() {
     }
 
     if (_opsIter != _ops.end()) {
-        if (!pExpCtx->inShard) {
+        if (!pExpCtx->fromRouter) {
             return Document(*_opsIter++);
         }
 

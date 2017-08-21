@@ -33,7 +33,7 @@
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/json.h"
-#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/update/update_node_test_fixture.h"
 #include "mongo/db/update/update_object_node.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
@@ -41,16 +41,16 @@
 namespace mongo {
 namespace {
 
+using UpdateArrayNodeTest = UpdateNodeTest;
 using mongo::mutablebson::Document;
 using mongo::mutablebson::Element;
 
-TEST(UpdateArrayNodeTest, ApplyCreatePathFails) {
+TEST_F(UpdateArrayNodeTest, ApplyCreatePathFails) {
     auto update = fromjson("{$set: {'a.b.$[i]': 0}}");
     auto arrayFilter = fromjson("{i: 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -61,42 +61,20 @@ TEST(UpdateArrayNodeTest, ApplyCreatePathFails) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: {}}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
+    addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
-        root.apply(doc.root(),
-                   &pathToCreate,
-                   &pathTaken,
-                   matchedField,
-                   fromReplication,
-                   validateForStorage,
-                   immutablePaths,
-                   &indexData,
-                   &logBuilder,
-                   &indexesAffected,
-                   &noop),
+        root.apply(getApplyParams(doc.root())),
         UserException,
         ErrorCodes::BadValue,
         "The path 'a.b' must exist in the document in order to apply array updates.");
 }
 
-TEST(UpdateArrayNodeTest, ApplyToNonArrayFails) {
+TEST_F(UpdateArrayNodeTest, ApplyToNonArrayFails) {
     auto update = fromjson("{$set: {'a.$[i]': 0}}");
     auto arrayFilter = fromjson("{i: 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -107,41 +85,19 @@ TEST(UpdateArrayNodeTest, ApplyToNonArrayFails) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: {}}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(doc.root(),
-                                           &pathToCreate,
-                                           &pathTaken,
-                                           matchedField,
-                                           fromReplication,
-                                           validateForStorage,
-                                           immutablePaths,
-                                           &indexData,
-                                           &logBuilder,
-                                           &indexesAffected,
-                                           &noop),
+    addIndexedPath("a");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
                                 UserException,
                                 ErrorCodes::BadValue,
                                 "Cannot apply array updates to non-array element a: {}");
 }
 
-TEST(UpdateArrayNodeTest, UpdateIsAppliedToAllMatchingElements) {
+TEST_F(UpdateArrayNodeTest, UpdateIsAppliedToAllMatchingElements) {
     auto update = fromjson("{$set: {'a.$[i]': 2}}");
     auto arrayFilter = fromjson("{i: 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -152,45 +108,23 @@ TEST(UpdateArrayNodeTest, UpdateIsAppliedToAllMatchingElements) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [0, 1, 0]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_TRUE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [2, 1, 2]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: [2, 1, 2]}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {a: [2, 1, 2]}}"), getLogDoc());
 }
 
-DEATH_TEST(UpdateArrayNodeTest,
-           ArrayElementsMustNotBeDeserialized,
-           "Invariant failure childElement.hasValue()") {
+DEATH_TEST_F(UpdateArrayNodeTest,
+             ArrayElementsMustNotBeDeserialized,
+             "Invariant failure childElement.hasValue()") {
     auto update = fromjson("{$set: {'a.$[i].b': 0}}");
     auto arrayFilter = fromjson("{'i.c': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -203,35 +137,14 @@ DEATH_TEST(UpdateArrayNodeTest,
     Document doc(fromjson("{a: [{c: 0}, {c: 0}, {c: 1}]}"));
     doc.root()["a"]["1"]["c"].setValueInt(1).transitional_ignore();
     doc.root()["a"]["2"]["c"].setValueInt(0).transitional_ignore();
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
+    addIndexedPath("a");
+    root.apply(getApplyParams(doc.root()));
 }
 
-TEST(UpdateArrayNodeTest, UpdateForEmptyIdentifierIsAppliedToAllArrayElements) {
+TEST_F(UpdateArrayNodeTest, UpdateForEmptyIdentifierIsAppliedToAllArrayElements) {
     auto update = fromjson("{$set: {'a.$[]': 1}}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -242,49 +155,25 @@ TEST(UpdateArrayNodeTest, UpdateForEmptyIdentifierIsAppliedToAllArrayElements) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [0, 0, 0]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_TRUE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [1, 1, 1]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: [1, 1, 1]}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {a: [1, 1, 1]}}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElement) {
+TEST_F(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElement) {
     auto update = fromjson("{$set: {'a.$[i].b': 1, 'a.$[j].c': 1, 'a.$[k].d': 1}}");
     auto arrayFilterI = fromjson("{'i.b': 0}");
     auto arrayFilterJ = fromjson("{'j.c': 0}");
     auto arrayFilterK = fromjson("{'k.d': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterI, ExtensionsCallbackNoop(), collator));
-    arrayFilters["j"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterJ, ExtensionsCallbackNoop(), collator));
-    arrayFilters["k"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterK, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterI, collator));
+    arrayFilters["j"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterJ, collator));
+    arrayFilters["k"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterK, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -307,46 +196,23 @@ TEST(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElement) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{b: 0, c: 0, d: 0}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_TRUE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [{b: 1, c: 1, d: 1}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'a.0.b': 1, 'a.0.c': 1, 'a.0.d': 1}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {'a.0.b': 1, 'a.0.c': 1, 'a.0.d': 1}}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementsUsingMergedChildrenCache) {
+TEST_F(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementsUsingMergedChildrenCache) {
     auto update = fromjson("{$set: {'a.$[i].b': 1, 'a.$[j].c': 1}}");
     auto arrayFilterI = fromjson("{'i.b': 0}");
     auto arrayFilterJ = fromjson("{'j.c': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterI, ExtensionsCallbackNoop(), collator));
-    arrayFilters["j"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterJ, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterI, collator));
+    arrayFilters["j"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterJ, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -363,49 +229,25 @@ TEST(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementsUsingMergedChildren
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{b: 0, c: 0}, {b: 0, c: 0}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    auto fromReplication = false;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_TRUE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [{b: 1, c: 1}, {b: 1, c: 1}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: [{b: 1, c: 1}, {b: 1, c: 1}]}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {a: [{b: 1, c: 1}, {b: 1, c: 1}]}}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementsWithoutMergedChildrenCache) {
+TEST_F(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementsWithoutMergedChildrenCache) {
     auto update = fromjson("{$set: {'a.$[i].b': 2, 'a.$[j].c': 2, 'a.$[k].d': 2}}");
     auto arrayFilterI = fromjson("{'i.b': 0}");
     auto arrayFilterJ = fromjson("{'j.c': 0}");
     auto arrayFilterK = fromjson("{'k.d': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterI, ExtensionsCallbackNoop(), collator));
-    arrayFilters["j"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterJ, ExtensionsCallbackNoop(), collator));
-    arrayFilters["k"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterK, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterI, collator));
+    arrayFilters["j"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterJ, collator));
+    arrayFilters["k"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterK, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -428,40 +270,19 @@ TEST(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementsWithoutMergedChildr
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{b: 0, c: 0, d: 1}, {b: 1, c: 0, d: 0}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_TRUE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [{b: 2, c: 2, d: 1}, {b: 1, c: 2, d: 2}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: [{b: 2, c: 2, d: 1}, {b: 1, c: 2, d: 2}]}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {a: [{b: 2, c: 2, d: 1}, {b: 1, c: 2, d: 2}]}}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementWithEmptyIdentifiers) {
+TEST_F(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementWithEmptyIdentifiers) {
     auto update = fromjson("{$set: {'a.$[].b': 1, 'a.$[].c': 1}}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -478,52 +299,27 @@ TEST(UpdateArrayNodeTest, ApplyMultipleUpdatesToArrayElementWithEmptyIdentifiers
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_TRUE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [{b: 1, c: 1}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'a.0.b': 1, 'a.0.c': 1}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {'a.0.b': 1, 'a.0.c': 1}}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, ApplyNestedArrayUpdates) {
+TEST_F(UpdateArrayNodeTest, ApplyNestedArrayUpdates) {
     auto update = fromjson("{$set: {'a.$[i].b.$[j].c': 1, 'a.$[k].b.$[l].d': 1}}");
     auto arrayFilterI = fromjson("{'i.x': 0}");
     auto arrayFilterJ = fromjson("{'j.c': 0}");
     auto arrayFilterK = fromjson("{'k.x': 0}");
     auto arrayFilterL = fromjson("{'l.d': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterI, ExtensionsCallbackNoop(), collator));
-    arrayFilters["j"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterJ, ExtensionsCallbackNoop(), collator));
-    arrayFilters["k"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterK, ExtensionsCallbackNoop(), collator));
-    arrayFilters["l"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterL, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterI, collator));
+    arrayFilters["j"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterJ, collator));
+    arrayFilters["k"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterK, collator));
+    arrayFilters["l"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterL, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -540,46 +336,23 @@ TEST(UpdateArrayNodeTest, ApplyNestedArrayUpdates) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{x: 0, b: [{c: 0, d: 0}]}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_TRUE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [{x: 0, b: [{c: 1, d: 1}]}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'a.0.b.0.c': 1, 'a.0.b.0.d': 1}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {'a.0.b.0.c': 1, 'a.0.b.0.d': 1}}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, ApplyUpdatesWithMergeConflictToArrayElementFails) {
+TEST_F(UpdateArrayNodeTest, ApplyUpdatesWithMergeConflictToArrayElementFails) {
     auto update = fromjson("{$set: {'a.$[i]': 1, 'a.$[j]': 1}}");
     auto arrayFilterI = fromjson("{'i': 0}");
     auto arrayFilterJ = fromjson("{'j': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterI, ExtensionsCallbackNoop(), collator));
-    arrayFilters["j"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterJ, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterI, collator));
+    arrayFilters["j"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterJ, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -596,44 +369,21 @@ TEST(UpdateArrayNodeTest, ApplyUpdatesWithMergeConflictToArrayElementFails) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [0]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(doc.root(),
-                                           &pathToCreate,
-                                           &pathTaken,
-                                           matchedField,
-                                           fromReplication,
-                                           validateForStorage,
-                                           immutablePaths,
-                                           &indexData,
-                                           &logBuilder,
-                                           &indexesAffected,
-                                           &noop),
+    addIndexedPath("a");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
                                 UserException,
                                 ErrorCodes::ConflictingUpdateOperators,
                                 "Update created a conflict at 'a.0'");
 }
 
-TEST(UpdateArrayNodeTest, ApplyUpdatesWithEmptyIdentifiersWithMergeConflictToArrayElementFails) {
+TEST_F(UpdateArrayNodeTest, ApplyUpdatesWithEmptyIdentifiersWithMergeConflictToArrayElementFails) {
     auto update = fromjson("{$set: {'a.$[].b.$[i]': 1, 'a.$[].b.$[j]': 1}}");
     auto arrayFilterI = fromjson("{'i': 0}");
     auto arrayFilterJ = fromjson("{'j': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterI, ExtensionsCallbackNoop(), collator));
-    arrayFilters["j"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterJ, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterI, collator));
+    arrayFilters["j"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterJ, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -650,50 +400,25 @@ TEST(UpdateArrayNodeTest, ApplyUpdatesWithEmptyIdentifiersWithMergeConflictToArr
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{b: [0]}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(doc.root(),
-                                           &pathToCreate,
-                                           &pathTaken,
-                                           matchedField,
-                                           fromReplication,
-                                           validateForStorage,
-                                           immutablePaths,
-                                           &indexData,
-                                           &logBuilder,
-                                           &indexesAffected,
-                                           &noop),
+    addIndexedPath("a");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
                                 UserException,
                                 ErrorCodes::ConflictingUpdateOperators,
                                 "Update created a conflict at 'a.0.b.0'");
 }
 
-TEST(UpdateArrayNodeTest, ApplyNestedArrayUpdatesWithMergeConflictFails) {
+TEST_F(UpdateArrayNodeTest, ApplyNestedArrayUpdatesWithMergeConflictFails) {
     auto update = fromjson("{$set: {'a.$[i].b.$[j]': 1, 'a.$[k].b.$[l]': 1}}");
     auto arrayFilterI = fromjson("{'i.c': 0}");
     auto arrayFilterJ = fromjson("{j: 0}");
     auto arrayFilterK = fromjson("{'k.c': 0}");
     auto arrayFilterL = fromjson("{l: 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterI, ExtensionsCallbackNoop(), collator));
-    arrayFilters["j"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterJ, ExtensionsCallbackNoop(), collator));
-    arrayFilters["k"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterK, ExtensionsCallbackNoop(), collator));
-    arrayFilters["l"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilterL, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterI, collator));
+    arrayFilters["j"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterJ, collator));
+    arrayFilters["k"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterK, collator));
+    arrayFilters["l"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilterL, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -710,41 +435,19 @@ TEST(UpdateArrayNodeTest, ApplyNestedArrayUpdatesWithMergeConflictFails) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{b: [0], c: 0}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(doc.root(),
-                                           &pathToCreate,
-                                           &pathTaken,
-                                           matchedField,
-                                           fromReplication,
-                                           validateForStorage,
-                                           immutablePaths,
-                                           &indexData,
-                                           &logBuilder,
-                                           &indexesAffected,
-                                           &noop),
+    addIndexedPath("a");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
                                 UserException,
                                 ErrorCodes::ConflictingUpdateOperators,
                                 "Update created a conflict at 'a.0.b.0'");
 }
 
-TEST(UpdateArrayNodeTest, NoArrayElementsMatch) {
+TEST_F(UpdateArrayNodeTest, NoArrayElementsMatch) {
     auto update = fromjson("{$set: {'a.$[i]': 1}}");
     auto arrayFilter = fromjson("{'i': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -755,43 +458,21 @@ TEST(UpdateArrayNodeTest, NoArrayElementsMatch) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [2, 2, 2]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_FALSE(indexesAffected);
-    ASSERT_TRUE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_TRUE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [2, 2, 2]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), logDoc);
+    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, UpdatesToAllArrayElementsAreNoops) {
+TEST_F(UpdateArrayNodeTest, UpdatesToAllArrayElementsAreNoops) {
     auto update = fromjson("{$set: {'a.$[i]': 1}}");
     auto arrayFilter = fromjson("{'i': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -802,43 +483,21 @@ TEST(UpdateArrayNodeTest, UpdatesToAllArrayElementsAreNoops) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [1, 1, 1]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_FALSE(indexesAffected);
-    ASSERT_TRUE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_TRUE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [1, 1, 1]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), logDoc);
+    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, NoArrayElementAffectsIndexes) {
+TEST_F(UpdateArrayNodeTest, NoArrayElementAffectsIndexes) {
     auto update = fromjson("{$set: {'a.$[i].b': 0}}");
     auto arrayFilter = fromjson("{'i.c': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -849,43 +508,21 @@ TEST(UpdateArrayNodeTest, NoArrayElementAffectsIndexes) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{c: 0}, {c: 0}, {c: 0}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a.c");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_FALSE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a.c");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [{c: 0, b: 0}, {c: 0, b: 0}, {c: 0, b: 0}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {a: [{c: 0, b: 0}, {c: 0, b: 0}, {c: 0, b: 0}]}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {a: [{c: 0, b: 0}, {c: 0, b: 0}, {c: 0, b: 0}]}}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, WhenOneElementIsMatchedLogElementUpdateDirectly) {
+TEST_F(UpdateArrayNodeTest, WhenOneElementIsMatchedLogElementUpdateDirectly) {
     auto update = fromjson("{$set: {'a.$[i].b': 0}}");
     auto arrayFilter = fromjson("{'i.c': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -896,43 +533,21 @@ TEST(UpdateArrayNodeTest, WhenOneElementIsMatchedLogElementUpdateDirectly) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{c: 1}, {c: 0}, {c: 1}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_TRUE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [{c: 1}, {c: 0, b: 0}, {c: 1}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'a.1.b': 0}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {'a.1.b': 0}}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, WhenOneElementIsModifiedLogElement) {
+TEST_F(UpdateArrayNodeTest, WhenOneElementIsModifiedLogElement) {
     auto update = fromjson("{$set: {'a.$[i].b': 0}}");
     auto arrayFilter = fromjson("{'i.c': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -943,40 +558,19 @@ TEST(UpdateArrayNodeTest, WhenOneElementIsModifiedLogElement) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{c: 0, b: 0}, {c: 0}, {c: 1}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_TRUE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [{c: 0, b: 0}, {c: 0, b: 0}, {c: 1}]}"), doc);
     ASSERT_FALSE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'a.1': {c: 0, b: 0}}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {'a.1': {c: 0, b: 0}}}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, ArrayUpdateOnEmptyArrayIsANoop) {
+TEST_F(UpdateArrayNodeTest, ArrayUpdateOnEmptyArrayIsANoop) {
     auto update = fromjson("{$set: {'a.$[]': 0}}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -987,43 +581,21 @@ TEST(UpdateArrayNodeTest, ArrayUpdateOnEmptyArrayIsANoop) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: []}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_FALSE(indexesAffected);
-    ASSERT_TRUE(noop);
+    addIndexedPath("a");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_TRUE(result.noop);
     ASSERT_EQUALS(fromjson("{a: []}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), logDoc);
+    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, ApplyPositionalInsideArrayUpdate) {
+TEST_F(UpdateArrayNodeTest, ApplyPositionalInsideArrayUpdate) {
     auto update = fromjson("{$set: {'a.$[i].b.$': 1}}");
     auto arrayFilter = fromjson("{'i.c': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -1034,43 +606,22 @@ TEST(UpdateArrayNodeTest, ApplyPositionalInsideArrayUpdate) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [{b: [0, 0], c: 0}]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField = "1";
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_TRUE(indexesAffected);
-    ASSERT_FALSE(noop);
+    addIndexedPath("a");
+    setMatchedField("1");
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_TRUE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [{b: [0, 1], c: 0}]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{$set: {'a.0.b.1': 1}}"), logDoc);
+    ASSERT_EQUALS(fromjson("{$set: {'a.0.b.1': 1}}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, ApplyArrayUpdateFromReplication) {
+TEST_F(UpdateArrayNodeTest, ApplyArrayUpdateFromReplication) {
     auto update = fromjson("{$set: {'a.$[i].b': 1}}");
     auto arrayFilter = fromjson("{'i': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -1081,43 +632,22 @@ TEST(UpdateArrayNodeTest, ApplyArrayUpdateFromReplication) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [0]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = true;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               &indexData,
-               &logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_FALSE(indexesAffected);
-    ASSERT_TRUE(noop);
+    addIndexedPath("a");
+    setFromReplication(true);
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_TRUE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [0]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
-    ASSERT_EQUALS(fromjson("{}"), logDoc);
+    ASSERT_EQUALS(fromjson("{}"), getLogDoc());
 }
 
-TEST(UpdateArrayNodeTest, ApplyArrayUpdateNotFromReplication) {
+TEST_F(UpdateArrayNodeTest, ApplyArrayUpdateNotFromReplication) {
     auto update = fromjson("{$set: {'a.$[i].b': 1}}");
     auto arrayFilter = fromjson("{'i': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -1128,41 +658,19 @@ TEST(UpdateArrayNodeTest, ApplyArrayUpdateNotFromReplication) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [0]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = false;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    UpdateIndexData indexData;
-    indexData.addPath("a");
-    Document logDoc;
-    LogBuilder logBuilder(logDoc.root());
-    auto indexesAffected = false;
-    auto noop = false;
-    ASSERT_THROWS_CODE_AND_WHAT(root.apply(doc.root(),
-                                           &pathToCreate,
-                                           &pathTaken,
-                                           matchedField,
-                                           fromReplication,
-                                           validateForStorage,
-                                           immutablePaths,
-                                           &indexData,
-                                           &logBuilder,
-                                           &indexesAffected,
-                                           &noop),
+    addIndexedPath("a");
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
                                 UserException,
                                 ErrorCodes::PathNotViable,
                                 "Cannot create field 'b' in element {0: 0}");
 }
 
-TEST(UpdateArrayNodeTest, ApplyArrayUpdateWithoutLogBuilderOrIndexData) {
+TEST_F(UpdateArrayNodeTest, ApplyArrayUpdateWithoutLogBuilderOrIndexData) {
     auto update = fromjson("{$set: {'a.$[i]': 1}}");
     auto arrayFilter = fromjson("{'i': 0}");
     const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
-    arrayFilters["i"] =
-        uassertStatusOK(ArrayFilter::parse(arrayFilter, ExtensionsCallbackNoop(), collator));
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    arrayFilters["i"] = uassertStatusOK(ExpressionWithPlaceholder::parse(arrayFilter, collator));
     std::set<std::string> foundIdentifiers;
     UpdateObjectNode root;
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
@@ -1173,29 +681,10 @@ TEST(UpdateArrayNodeTest, ApplyArrayUpdateWithoutLogBuilderOrIndexData) {
                                               foundIdentifiers));
 
     Document doc(fromjson("{a: [0]}"));
-    FieldRef pathToCreate("");
-    FieldRef pathTaken("");
-    StringData matchedField;
-    auto fromReplication = true;
-    auto validateForStorage = true;
-    FieldRefSet immutablePaths;
-    const UpdateIndexData* indexData = nullptr;
-    LogBuilder* logBuilder = nullptr;
-    auto indexesAffected = false;
-    auto noop = false;
-    root.apply(doc.root(),
-               &pathToCreate,
-               &pathTaken,
-               matchedField,
-               fromReplication,
-               validateForStorage,
-               immutablePaths,
-               indexData,
-               logBuilder,
-               &indexesAffected,
-               &noop);
-    ASSERT_FALSE(indexesAffected);
-    ASSERT_FALSE(noop);
+    setLogBuilderToNull();
+    auto result = root.apply(getApplyParams(doc.root()));
+    ASSERT_FALSE(result.indexesAffected);
+    ASSERT_FALSE(result.noop);
     ASSERT_EQUALS(fromjson("{a: [1]}"), doc);
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
 }

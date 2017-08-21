@@ -113,7 +113,8 @@ public:
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
     boost::optional<ExplainOptions::Verbosity> explain;
 
-    bool inShard = false;
+    bool fromRouter = false;
+    bool needsMerge = false;
     bool inRouter = false;
     bool extSortAllowed = false;
     bool bypassDocumentValidation = false;
@@ -134,7 +135,9 @@ public:
 
 protected:
     static const int kInterruptCheckPeriod = 128;
-    ExpressionContext() : variablesParseState(variables.useIdGenerator()) {}
+
+    ExpressionContext(NamespaceString nss)
+        : ns(std::move(nss)), variablesParseState(variables.useIdGenerator()) {}
 
     /**
      * Sets '_collator' and resets '_documentComparator' and '_valueComparator'.

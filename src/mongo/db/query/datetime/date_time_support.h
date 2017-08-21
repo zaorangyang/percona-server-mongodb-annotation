@@ -36,6 +36,7 @@
 #include "mongo/util/string_map.h"
 #include "mongo/util/time_support.h"
 
+struct timelib_error_container;
 struct timelib_time;
 struct _timelib_tzdb;
 struct timelib_tzinfo;
@@ -48,6 +49,7 @@ namespace mongo {
  * for the hour, minute, or second of a date, even when given the same date.
  */
 class TimeZone {
+
 public:
     /**
      * A struct with member variables describing the different parts of the date.
@@ -88,6 +90,7 @@ public:
     };
 
     explicit TimeZone(timelib_tzinfo* tzInfo);
+    explicit TimeZone(Seconds utcOffsetSeconds);
     TimeZone() = default;
 
     /**
@@ -123,6 +126,27 @@ public:
     long long isoYear(Date_t) const;
 
     /**
+     * Returns whether this is the zone representing UTC.
+     */
+    bool isUtcZone() const {
+        return (_tzInfo == nullptr && !durationCount<Seconds>(_utcOffset));
+    }
+
+    /**
+     * Returns whether this is a zone representing a UTC offset, like "+04:00".
+     */
+    bool isUtcOffsetZone() const {
+        return durationCount<Seconds>(_utcOffset) != 0;
+    }
+
+    /**
+     * Returns whether this is a zone representing an Olson time zone, like "Europe/London".
+     */
+    bool isTimeZoneIDZone() const {
+        return _tzInfo != nullptr;
+    }
+
+    /**
      * Returns the weekday number, ranging from 1 (for Sunday) to 7 (for Saturday).
      */
     int dayOfWeek(Date_t) const;
@@ -153,6 +177,11 @@ public:
      * Returns the number of seconds offset from UTC.
      */
     Seconds utcOffset(Date_t) const;
+
+    /**
+     * Adjusts 'timelibTime' according to this time zone definition.
+     */
+    void adjustTimeZone(timelib_time* timelibTime) const;
 
     /**
      * Converts a date object to a string according to 'format'. 'format' can be any string literal,
@@ -286,8 +315,11 @@ private:
         void operator()(timelib_tzinfo* tzInfo);
     };
 
-    // null if this TimeZone represents the default UTC TimeZone.
+    // null if this TimeZone represents the default UTC time zone, or a UTC-offset time zone
     std::shared_ptr<timelib_tzinfo> _tzInfo;
+
+    // represents the UTC offset in seconds if _tzInfo is null and it is not 0
+    Seconds _utcOffset{0};
 };
 
 /**
@@ -308,6 +340,14 @@ public:
     };
 
     /**
+     * A custom-deleter which destructs a timelib_error_container* when it goes out of scope.
+     */
+    struct TimelibErrorContainerDeleter {
+        TimelibErrorContainerDeleter() = default;
+        void operator()(timelib_error_container* errorContainer);
+    };
+
+    /**
      * Returns the TimeZoneDatabase object associated with the specified service context.
      */
     static const TimeZoneDatabase* get(ServiceContext* serviceContext);
@@ -317,6 +357,23 @@ public:
      */
     static void set(ServiceContext* serviceContext,
                     std::unique_ptr<TimeZoneDatabase> timeZoneDatabase);
+
+    /**
+     * Constructs a Date_t from a string description of a date.
+     *
+     * 'dateString' may contain time zone information if the information is simply an offset from
+     * UTC, in which case the returned Date_t will be adjusted accordingly.
+     *
+     * Throws a UserException if any of the following occur:
+     *  * The string cannot be parsed into a date.
+     *  * The string specifies a time zone that is not simply an offset from UTC, like
+     *    in the string "July 4, 2017 America/New_York".
+     *  * 'tz' is provided, but 'dateString' specifies a timezone, like 'Z' in the
+     *    string '2017-07-04T00:00:00Z'.
+     *  * 'tz' is provided, but 'dateString' specifies an offset from UTC, like '-0400'
+     *    in the string '2017-07-04 -0400'.
+     */
+    Date_t fromString(StringData dateString, boost::optional<TimeZone> tz) const;
 
     /**
      * Returns a TimeZone object representing the UTC time zone.
@@ -346,6 +403,12 @@ private:
      * 'timeZoneDatabase'.
      */
     void loadTimeZoneInfo(std::unique_ptr<_timelib_tzdb, TimeZoneDBDeleter> timeZoneDatabase);
+
+    /**
+     * Tries to find a UTC offset in 'offsetSpec' in an ISO8601 format (±HH, ±HHMM, or ±HH:MM) and
+     * returns it as an offset to UTC in seconds.
+     */
+    boost::optional<Seconds> parseUtcOffset(StringData offsetSpec) const;
 
     // A map from the time zone name to the struct describing the timezone. These are pre-populated
     // at startup to avoid reading the source files repeatedly.

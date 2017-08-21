@@ -47,7 +47,6 @@ class DistLockManager;
 class NamespaceString;
 class RemoteCommandTargeterFactoryMock;
 class ShardingCatalogClient;
-class ShardingCatalogManager;
 class ShardRegistry;
 
 namespace executor {
@@ -97,7 +96,6 @@ public:
     // Syntactic sugar for getting sharding components off the Grid, if they have been initialized.
 
     ShardingCatalogClient* catalogClient() const;
-    ShardingCatalogManager* catalogManager() const;
     CatalogCache* catalogCache() const;
     ShardRegistry* shardRegistry() const;
     ClusterCursorManager* clusterCursorManager() const;
@@ -200,7 +198,7 @@ protected:
     /**
      * Base class returns nullptr.
      */
-    virtual std::unique_ptr<DistLockCatalog> makeDistLockCatalog(ShardRegistry* shardRegistry);
+    virtual std::unique_ptr<DistLockCatalog> makeDistLockCatalog();
 
     /**
      * Base class returns nullptr.
@@ -223,19 +221,7 @@ protected:
     /**
      * Base class returns nullptr.
      */
-    virtual std::unique_ptr<ShardingCatalogManager> makeShardingCatalogManager(
-        ShardingCatalogClient* catalogClient);
-
-    /**
-     * Base class returns nullptr.
-     */
-    virtual std::unique_ptr<CatalogCacheLoader> makeCatalogCacheLoader();
-
-    /**
-     * Base class returns nullptr.
-     */
-    virtual std::unique_ptr<CatalogCache> makeCatalogCache(
-        std::unique_ptr<CatalogCacheLoader> catalogCacheLoader);
+    virtual std::unique_ptr<CatalogCache> makeCatalogCache();
 
     /**
      * Base class returns nullptr.

@@ -90,8 +90,8 @@
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/transport/service_entry_point.h"
 #include "mongo/transport/session.h"
-#include "mongo/transport/transport_layer.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/exit.h"
@@ -616,7 +616,7 @@ void ReplicationCoordinatorExternalStateImpl::cleanUpLastApplyBatch(OperationCon
           << topOfOplog << " (inclusive).";
 
     DBDirectClient db(opCtx);
-    auto cursor = db.query(rsOplogName,
+    auto cursor = db.query(NamespaceString::kRsOplogNamespace.ns(),
                            QUERY("ts" << BSON("$gte" << appliedThrough.getTimestamp())),
                            /*batchSize*/ 0,
                            /*skip*/ 0,
@@ -661,15 +661,16 @@ StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
         }
 
         BSONObj oplogEntry;
-        if (!Helpers::getLast(opCtx, rsOplogName.c_str(), oplogEntry)) {
+        if (!Helpers::getLast(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry)) {
             return StatusWith<OpTime>(ErrorCodes::NoMatchingDocument,
                                       str::stream() << "Did not find any entries in "
-                                                    << rsOplogName);
+                                                    << NamespaceString::kRsOplogNamespace.ns());
         }
         BSONElement tsElement = oplogEntry[tsFieldName];
         if (tsElement.eoo()) {
             return StatusWith<OpTime>(ErrorCodes::NoSuchKey,
-                                      str::stream() << "Most recent entry in " << rsOplogName
+                                      str::stream() << "Most recent entry in "
+                                                    << NamespaceString::kRsOplogNamespace.ns()
                                                     << " missing \""
                                                     << tsFieldName
                                                     << "\" field");
@@ -678,7 +679,7 @@ StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
             return StatusWith<OpTime>(ErrorCodes::TypeMismatch,
                                       str::stream() << "Expected type of \"" << tsFieldName
                                                     << "\" in most recent "
-                                                    << rsOplogName
+                                                    << NamespaceString::kRsOplogNamespace.ns()
                                                     << " entry to have type Timestamp, but found "
                                                     << typeName(tsElement.type()));
         }
@@ -698,7 +699,7 @@ HostAndPort ReplicationCoordinatorExternalStateImpl::getClientHostAndPort(
 }
 
 void ReplicationCoordinatorExternalStateImpl::closeConnections() {
-    _service->getTransportLayer()->endAllSessions(transport::Session::kKeepOpen);
+    _service->getServiceEntryPoint()->endAllSessions(transport::Session::kKeepOpen);
 }
 
 void ReplicationCoordinatorExternalStateImpl::killAllUserOperations(OperationContext* opCtx) {
@@ -711,6 +712,7 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
         Balancer::get(_service)->interruptBalancer();
     } else if (ShardingState::get(_service)->enabled()) {
         invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
+        ShardingState::get(_service)->interruptChunkSplitter();
         Grid::get(_service)->catalogCache()->onStepDown();
     }
 
@@ -743,7 +745,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
     fassertStatusOK(40107, status);
 
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-        status = Grid::get(opCtx)->catalogManager()->initializeConfigDatabaseIfNeeded(opCtx);
+        status = ShardingCatalogManager::get(opCtx)->initializeConfigDatabaseIfNeeded(opCtx);
         if (!status.isOK() && status != ErrorCodes::AlreadyInitialized) {
             if (ErrorCodes::isShutdownError(status.code())) {
                 // Don't fassert if we're mid-shutdown, let the shutdown happen gracefully.
@@ -778,7 +780,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         }
 
         // Free any leftover locks from previous instantiations.
-        auto distLockManager = Grid::get(opCtx)->catalogClient(opCtx)->getDistLockManager();
+        auto distLockManager = Grid::get(opCtx)->catalogClient()->getDistLockManager();
         distLockManager->unlockAll(opCtx, distLockManager->getProcessID());
 
         // If this is a config server node becoming a primary, start the balancer
@@ -800,6 +802,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         }
 
         Grid::get(_service)->catalogCache()->onStepUp();
+        ShardingState::get(_service)->initiateChunkSplitter();
     }
 
     SessionCatalog::get(_service)->onStepUp(opCtx);

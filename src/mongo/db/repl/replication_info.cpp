@@ -41,6 +41,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/master_slave.h"
@@ -56,7 +57,6 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
-#include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/util/map_util.h"
 
 namespace mongo {
@@ -200,7 +200,7 @@ public:
 
         const std::string& oplogNS =
             replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet
-            ? rsOplogName
+            ? NamespaceString::kRsOplogNamespace.ns()
             : masterSlaveOplogName;
         BSONObj o;
         uassert(17347,
@@ -211,9 +211,9 @@ public:
     }
 } oplogInfoServerStatus;
 
-class CmdIsMaster : public Command {
+class CmdIsMaster : public BasicCommand {
 public:
-    virtual bool requiresAuth() {
+    bool requiresAuth() const override {
         return false;
     }
     virtual bool slaveOk() const {
@@ -230,11 +230,10 @@ public:
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) {}  // No auth required
-    CmdIsMaster() : Command("isMaster", "ismaster") {}
+    CmdIsMaster() : BasicCommand("isMaster", "ismaster") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
-                     string& errmsg,
                      BSONObjBuilder& result) {
         /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
            authenticated.
@@ -354,7 +353,7 @@ public:
 
         result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
         result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
-        result.appendNumber("maxWriteBatchSize", BatchedCommandRequest::kMaxWriteBatchSize);
+        result.appendNumber("maxWriteBatchSize", write_ops::kMaxWriteBatchSize);
         result.appendDate("localTime", jsTime());
         result.append("maxWireVersion", WireSpec::instance().incoming.maxWireVersion);
 

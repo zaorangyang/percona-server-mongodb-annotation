@@ -30,6 +30,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/stdx/functional.h"
@@ -120,7 +121,6 @@
 namespace mongo {
 
 class DBClientConnection;
-class NamespaceString;
 class OperationContext;
 
 namespace repl {
@@ -231,24 +231,48 @@ struct DocID {
     }
 };
 
+struct RenameCollectionInfo {
+
+    // The renameFrom and renameTo fields are the fields necessary to roll back the original
+    // renameCollection operation. For example, if the original command was test.x -> test.y,
+    // renameFrom would be "test.y" and renameTo would be "test.x".
+    NamespaceString renameFrom;
+    NamespaceString renameTo;
+};
+
 struct FixUpInfo {
     // Note this is a set -- if there are many $inc's on a single document we need to roll back,
     // we only need to refetch it once.
     std::set<DocID> docsToRefetch;
 
-    // Key is collection namespace. Value is name of index to drop.
-    std::multimap<std::string, std::string> indexesToDrop;
-
-    // Namespaces of collections that need to be dropped or resynced from the sync source.
-    std::set<std::string> collectionsToDrop;
+    // Namespaces of collections that need to be resynced from the sync source.
     std::set<std::string> collectionsToResyncData;
-    std::set<std::string> collectionsToResyncMetadata;
+
+    // UUID of collections that need to be dropped.
+    stdx::unordered_set<UUID, UUID::Hash> collectionsToDrop;
+
+    // Key is the UUID of the collection. Value is the set of index names to drop for each
+    // collection.
+    stdx::unordered_map<UUID, std::set<std::string>, UUID::Hash> indexesToDrop;
+
+    // Key is the UUID of the collection. Value is a map from indexName to indexSpec for the index.
+    stdx::unordered_map<UUID, std::map<std::string, BSONObj>, UUID::Hash> indexesToCreate;
+
+    // UUIDs of collections that need to have their metadata resynced from the sync source.
+    stdx::unordered_set<UUID, UUID::Hash> collectionsToResyncMetadata;
+
+    // Map of collections to rename. The key is the UUID of the collection and
+    // the value is a RenameCollectionInfo that contains the current namespace of the
+    // collection and the namespace to rename it to. Among the collections that need to
+    // be renamed, it is possible that a collection  was 2-phase dropped and needs to be
+    // renamed from its drop pending namespace to its original namespace.
+    stdx::unordered_map<UUID, RenameCollectionInfo, UUID::Hash> collectionsToRename;
 
     // When collections are dropped, they are added to a list of drop-pending collections. We keep
     // the OpTime and the namespace of the collection because the DropPendingCollectionReaper
     // does not store the original name or UUID of the collection.
-    stdx::unordered_map<UUID, std::pair<OpTime, std::string>, UUID::Hash>
-        collectionsToRollBackPendingDrop;
+    stdx::unordered_map<UUID, std::pair<OpTime, NamespaceString>, UUID::Hash>
+        collectionsToRemoveFromDropPendingCollections;
 
     // True if rollback requires re-fetching documents in the session transaction table. If true,
     // after rollback the in-memory transaction table is cleared.
@@ -281,6 +305,45 @@ struct FixUpInfo {
      * to be dropped, or fully resynced.
      */
     void removeRedundantOperations();
+
+    /**
+     * Removes any redundant index commands. An example is if we create
+     * an index with name "a_1" and then later proceed to drop that index.
+     * We return true if a redundant index command was found and false
+     * if it was not.
+     */
+    bool removeRedundantIndexCommands(UUID uuid, std::string indexName);
+
+    /**
+     * We roll back all collection drops in two steps. We need to rename the collection
+     * from its drop pending namespace back to its original namespace. Additionally,
+     * we need to remove the collection from the list of drop-pending collections
+     * in the DropPendingCollectionReaper. This function records the necessary information
+     * into the fixUpInfo struct to undo the drop collection command.
+     */
+    void recordRollingBackDrop(const NamespaceString& nss, OpTime opTime, UUID uuid);
+
+    /**
+     * When we roll back a renameCollection that had previously set dropTarget to a UUID,
+     * we record the necessary information for undoing the collection drop by adding
+     * the collection which was dropped into collectionsToRemoveFromDropPendingCollections
+     * and collectionsToRename by calling recordRollingBackDrop().
+     */
+    Status recordDropTargetInfo(const BSONElement& dropTarget, const BSONObj& obj, OpTime opTime);
+
+    /**
+     * This function handles adding the necessary information into the fixUpInfo struct to
+     * roll back cross database renames. We handle cross database renames differently from
+     * within database renames. We add the collection that was created during the renameCollection
+     * to collectionsToDrop, and add the source collection that was dropped into
+     * collectionsToRemoveFromDropPendingCollections and collectionsToRename by calling
+     * recordRollingBackDrop(). We handle the dropTarget in the rename in a separate step.
+     */
+    Status recordCrossDatabaseRenameRollbackInfo(const BSONElement& dropSource,
+                                                 const BSONObj& obj,
+                                                 const NamespaceString& nss,
+                                                 UUID uuid,
+                                                 OpTime opTime);
 };
 
 // Indicates that rollback cannot complete and the server must abort.

@@ -36,7 +36,7 @@
 
 namespace mongo {
 
-namespace detail {
+namespace restriction_detail {
 
 // Represents a set of restrictions, which may be attached to a user or role.
 // This set of restrictions is met by a RestrictionEnvironment, if any restriction
@@ -44,14 +44,14 @@ namespace detail {
 template <typename T,
           template <typename...> class Pointer = std::unique_ptr,
           template <typename...> class Sequence = std::vector>
-class RestrictionSetAny : public Restriction {
-    static_assert(std::is_base_of<Restriction, T>::value,
-                  "RestrictionSets must contain restrictions");
-
+class RestrictionSetAny : public UnnamedRestriction {
 public:
+    using element_type = T;
+    using pointer_type = Pointer<element_type>;
+    using sequence_type = Sequence<pointer_type>;
+
     RestrictionSetAny() = default;
-    explicit RestrictionSetAny(Sequence<Pointer<T>> restrictions) noexcept(
-        noexcept(Sequence<Pointer<T>>(std::move(std::declval<Sequence<Pointer<T>>>()))))
+    explicit RestrictionSetAny(sequence_type restrictions)
         : _restrictions(std::move(restrictions)) {}
 
     template <typename U>
@@ -63,7 +63,7 @@ public:
         if (_restrictions.empty()) {
             return Status::OK();
         }
-        for (const Pointer<T>& restriction : _restrictions) {
+        for (const pointer_type& restriction : _restrictions) {
             Status status = restriction->validate(environment);
             if (status.isOK()) {
                 return status;
@@ -73,10 +73,22 @@ public:
                       str::stream() << "No member restriction in '" << *this << "' met");
     }
 
+    void appendToBuilder(BSONArrayBuilder* builder) const final {
+        builder->append(toBSON());
+    }
+
+    typename T::serialization_type::bson_type toBSON() const {
+        typename T::serialization_type::bson_builder_type builder;
+        for (const auto& r : _restrictions) {
+            r->appendToBuilder(&builder);
+        }
+        return T::serialization_type::finalize(&builder);
+    }
+
 private:
-    void serialize(std::ostream& os) const override final {
+    void serialize(std::ostream& os) const final {
         os << "{anyOf: [";
-        for (const Pointer<T>& restriction : _restrictions) {
+        for (const pointer_type& restriction : _restrictions) {
             if (restriction.get() != _restrictions.front().get()) {
                 os << ", ";
             }
@@ -85,7 +97,7 @@ private:
         os << "]}";
     }
 
-    Sequence<Pointer<T>> _restrictions;
+    sequence_type _restrictions;
 };
 
 // Represents a set of restrictions which may be attached to a user or role. This set of is met by
@@ -93,13 +105,14 @@ private:
 template <typename T,
           template <typename...> class Pointer = std::unique_ptr,
           template <typename...> class Sequence = std::vector>
-class RestrictionSetAll : public Restriction {
-    static_assert(std::is_base_of<Restriction, T>::value,
-                  "RestrictionSets must contain restrictions");
-
+class RestrictionSetAll : public UnnamedRestriction {
 public:
+    using element_type = T;
+    using pointer_type = Pointer<element_type>;
+    using sequence_type = Sequence<pointer_type>;
+
     RestrictionSetAll() = default;
-    explicit RestrictionSetAll(Sequence<Pointer<T>> restrictions)
+    explicit RestrictionSetAll(sequence_type restrictions)
         : _restrictions(std::move(restrictions)) {}
 
     template <typename U>
@@ -107,14 +120,12 @@ public:
         _restrictions.push_back(std::move(restriction));
     }
 
-    template <typename R>
-    explicit RestrictionSetAll(const R& restriction) {
-        static_assert(std::is_base_of<Restriction, R>::value, "Must pass a Restriction type.");
-        _restrictions.push_back(stdx::make_unique<R>(restriction));
+    explicit RestrictionSetAll(const T& restriction) {
+        _restrictions.push_back(stdx::make_unique<T>(restriction));
     }
 
     Status validate(const RestrictionEnvironment& environment) const final {
-        for (const Pointer<T>& restriction : _restrictions) {
+        for (const pointer_type& restriction : _restrictions) {
             Status status = restriction->validate(environment);
             if (!status.isOK()) {
                 return Status(ErrorCodes::AuthenticationRestrictionUnmet,
@@ -125,10 +136,22 @@ public:
         return Status::OK();
     }
 
+    void appendToBuilder(BSONArrayBuilder* builder) const final {
+        builder->append(toBSON());
+    }
+
+    typename T::serialization_type::bson_type toBSON() const {
+        typename T::serialization_type::bson_builder_type builder;
+        for (const auto& r : _restrictions) {
+            r->appendToBuilder(&builder);
+        }
+        return T::serialization_type::finalize(&builder);
+    }
+
 private:
     void serialize(std::ostream& os) const final {
         os << "{allOf: [";
-        for (const Pointer<T>& restriction : _restrictions) {
+        for (const pointer_type& restriction : _restrictions) {
             if (restriction.get() != _restrictions.front().get()) {
                 os << ", ";
             }
@@ -137,9 +160,9 @@ private:
         os << "]}";
     }
 
-    Sequence<Pointer<T>> _restrictions;
+    sequence_type _restrictions;
 };
-}  // namespace detail
+}  // namespace restriction_detail
 
 // Users and roles may have a set of sets of restrictions. The set of set of restrictions is met if
 // any of the sets are met. The sets are met if all of their restrictions are met.
@@ -148,15 +171,17 @@ private:
 // be met.
 template <template <typename...> class Pointer = std::unique_ptr,
           template <typename...> class Sequence = std::vector>
-using RestrictionSet = detail::RestrictionSetAll<Restriction, Pointer, Sequence>;
+using RestrictionSet = restriction_detail::RestrictionSetAll<NamedRestriction, Pointer, Sequence>;
 template <template <typename...> class Pointer = std::unique_ptr,
           template <typename...> class Sequence = std::vector>
-using RestrictionDocument = detail::RestrictionSetAny<RestrictionSet<>, Pointer, Sequence>;
+using RestrictionDocument =
+    restriction_detail::RestrictionSetAny<RestrictionSet<>, Pointer, Sequence>;
 template <template <typename...> class Pointer = std::unique_ptr,
           template <typename...> class Sequence = std::vector>
 using RestrictionDocumentsSequence =
-    detail::RestrictionSetAll<RestrictionDocument<>, Pointer, Sequence>;
+    restriction_detail::RestrictionSetAll<RestrictionDocument<>, Pointer, Sequence>;
 
-using RestrictionDocuments = RestrictionDocumentsSequence<std::shared_ptr, std::vector>;
+using SharedRestrictionDocument = std::shared_ptr<RestrictionDocument<>>;
+using RestrictionDocuments = RestrictionDocumentsSequence<std::shared_ptr>;
 
 }  // namespace mongo

@@ -87,13 +87,16 @@ QueryAndSort createConfigDiffQuery(const NamespaceString& nss, ChunkVersion coll
 /**
  * Blocking method, which returns the chunks which changed since the specified version.
  */
-CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
-                                            const NamespaceString& nss,
-                                            ChunkVersion sinceVersion) {
-    const auto catalogClient = Grid::get(opCtx)->catalogClient(opCtx);
+CollectionAndChangedChunks getChangedChunks(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    ChunkVersion sinceVersion,
+    const repl::ReadConcernLevel& readConcern = repl::ReadConcernLevel::kMajorityReadConcern) {
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
 
     // Decide whether to do a full or partial load based on the state of the collection
-    const auto coll = uassertStatusOK(catalogClient->getCollection(opCtx, nss.ns())).value;
+    const auto coll =
+        uassertStatusOK(catalogClient->getCollection(opCtx, nss.ns(), readConcern)).value;
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "Collection " << nss.ns() << " is dropped.",
             !coll.getDropped());
@@ -109,14 +112,14 @@ CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
     // Query the chunks which have changed
     std::vector<ChunkType> changedChunks;
     repl::OpTime opTime;
-    uassertStatusOK(Grid::get(opCtx)->catalogClient(opCtx)->getChunks(
-        opCtx,
-        diffQuery.query,
-        diffQuery.sort,
-        boost::none,
-        &changedChunks,
-        &opTime,
-        repl::ReadConcernLevel::kMajorityReadConcern));
+    uassertStatusOK(
+        Grid::get(opCtx)->catalogClient()->getChunks(opCtx,
+                                                     diffQuery.query,
+                                                     diffQuery.sort,
+                                                     boost::none,
+                                                     &changedChunks,
+                                                     &opTime,
+                                                     repl::ReadConcernLevel::kMajorityReadConcern));
 
     uassert(ErrorCodes::ConflictingOperationInProgress,
             "No chunks were found for the collection",
@@ -159,27 +162,35 @@ void ConfigServerCatalogCacheLoader::notifyOfCollectionVersionUpdate(OperationCo
     MONGO_UNREACHABLE;
 }
 
+Status ConfigServerCatalogCacheLoader::waitForCollectionVersion(OperationContext* opCtx,
+                                                                const NamespaceString& nss,
+                                                                const ChunkVersion& version) {
+    MONGO_UNREACHABLE;
+}
+
 std::shared_ptr<Notification<void>> ConfigServerCatalogCacheLoader::getChunksSince(
     const NamespaceString& nss,
     ChunkVersion version,
-    stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn) {
+    stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn,
+    const repl::ReadConcernLevel& readConcern) {
 
     auto notify = std::make_shared<Notification<void>>();
 
-    uassertStatusOK(_threadPool.schedule([ this, nss, version, notify, callbackFn ]() noexcept {
-        auto opCtx = Client::getCurrent()->makeOperationContext();
+    uassertStatusOK(
+        _threadPool.schedule([ this, nss, version, notify, callbackFn, readConcern ]() noexcept {
+            auto opCtx = Client::getCurrent()->makeOperationContext();
 
-        auto swCollAndChunks = [&]() -> StatusWith<CollectionAndChangedChunks> {
-            try {
-                return getChangedChunks(opCtx.get(), nss, version);
-            } catch (const DBException& ex) {
-                return ex.toStatus();
-            }
-        }();
+            auto swCollAndChunks = [&]() -> StatusWith<CollectionAndChangedChunks> {
+                try {
+                    return getChangedChunks(opCtx.get(), nss, version, readConcern);
+                } catch (const DBException& ex) {
+                    return ex.toStatus();
+                }
+            }();
 
-        callbackFn(opCtx.get(), std::move(swCollAndChunks));
-        notify->set();
-    }));
+            callbackFn(opCtx.get(), std::move(swCollAndChunks));
+            notify->set();
+        }));
 
     return notify;
 }

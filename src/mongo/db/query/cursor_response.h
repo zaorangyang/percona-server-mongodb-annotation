@@ -134,7 +134,8 @@ public:
     CursorResponse(NamespaceString nss,
                    CursorId cursorId,
                    std::vector<BSONObj> batch,
-                   boost::optional<long long> numReturnedSoFar = boost::none);
+                   boost::optional<long long> numReturnedSoFar = boost::none,
+                   boost::optional<BSONObj> writeConcernError = boost::none);
 
     CursorResponse(CursorResponse&& other) = default;
     CursorResponse& operator=(CursorResponse&& other) = default;
@@ -155,8 +156,16 @@ public:
         return _batch;
     }
 
+    std::vector<BSONObj> releaseBatch() {
+        return std::move(_batch);
+    }
+
     boost::optional<long long> getNumReturnedSoFar() const {
         return _numReturnedSoFar;
+    }
+
+    boost::optional<BSONObj> getWriteConcernError() const {
+        return _writeConcernError;
     }
 
     /**
@@ -175,6 +184,7 @@ private:
     CursorId _cursorId;
     std::vector<BSONObj> _batch;
     boost::optional<long long> _numReturnedSoFar;
+    boost::optional<BSONObj> _writeConcernError;
 };
 
 }  // namespace mongo

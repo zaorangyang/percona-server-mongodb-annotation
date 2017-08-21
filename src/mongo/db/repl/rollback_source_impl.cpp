@@ -90,6 +90,22 @@ void RollbackSourceImpl::copyCollectionFromRemote(OperationContext* opCtx,
             cloner.copyCollection(opCtx, nss.ns(), BSONObj(), errmsg, true));
 }
 
+StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfoByUUID(const std::string& db,
+                                                                const UUID& uuid) const {
+    std::list<BSONObj> info =
+        _getConnection()->getCollectionInfos(db, BSON("options.uuid" << uuid));
+    if (info.empty()) {
+        return StatusWith<BSONObj>(ErrorCodes::NoSuchKey,
+                                   str::stream()
+                                       << "No collection info found for collection with uuid: "
+                                       << uuid.toString()
+                                       << " in db: "
+                                       << db);
+    }
+    invariant(info.size() == 1U);
+    return info.front();
+}
+
 StatusWith<BSONObj> RollbackSourceImpl::getCollectionInfo(const NamespaceString& nss) const {
     std::list<BSONObj> info =
         _getConnection()->getCollectionInfos(nss.db().toString(), BSON("name" << nss.coll()));
