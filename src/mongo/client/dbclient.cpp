@@ -65,9 +65,7 @@
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/asio_message_port.h"
 #include "mongo/util/net/message_port.h"
-#include "mongo/util/net/message_port_startup_param.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
@@ -230,22 +228,6 @@ std::pair<rpc::UniqueReply, DBClientWithCommands*> DBClientWithCommands::runComm
     }
 
     return {rpc::UniqueReply(std::move(replyMsg), std::move(commandReply)), this};
-}
-
-rpc::UniqueReply DBClientWithCommands::runCommandWithMetadata(StringData database,
-                                                              StringData command,
-                                                              const BSONObj& metadata,
-                                                              BSONObj commandArgs) {
-    return runCommand(OpMsgRequest::fromDBAndBody(database, std::move(commandArgs), metadata));
-}
-
-std::tuple<rpc::UniqueReply, DBClientWithCommands*>
-DBClientWithCommands::runCommandWithMetadataAndTarget(StringData database,
-                                                      StringData command,
-                                                      const BSONObj& metadata,
-                                                      BSONObj commandArgs) {
-    return runCommandWithTarget(
-        OpMsgRequest::fromDBAndBody(database, std::move(commandArgs), metadata));
 }
 
 std::tuple<bool, DBClientWithCommands*> DBClientWithCommands::runCommandWithTarget(
@@ -453,11 +435,9 @@ void DBClientWithCommands::_auth(const BSONObj& params) {
             BSONObj info;
             auto start = Date_t::now();
 
-            auto commandName = request.cmdObj.firstElementFieldName();
-
             try {
-                auto reply = runCommandWithMetadata(
-                    request.dbname, commandName, request.metadata, request.cmdObj);
+                auto reply = runCommand(
+                    OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj, request.metadata));
 
                 BSONObj data = reply->getCommandReply().getOwned();
                 BSONObj metadata = reply->getMetadata().getOwned();
@@ -668,7 +648,7 @@ void DBClientInterface::findN(vector<BSONObj>& out,
     for (int i = 0; i < nToReturn; i++) {
         if (!c->more())
             break;
-        out.push_back(c->nextSafeOwned());
+        out.push_back(c->nextSafe());
     }
 }
 
@@ -740,8 +720,7 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
         }
 
         Date_t start{Date_t::now()};
-        auto result =
-            conn->runCommandWithMetadata("admin", "isMaster", rpc::makeEmptyMetadata(), bob.done());
+        auto result = conn->runCommand(OpMsgRequest::fromDBAndBody("admin", bob.obj()));
         Date_t finish{Date_t::now()};
 
         BSONObj isMasterObj = result->getCommandReply().getOwned();
@@ -845,7 +824,9 @@ Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
     _failed = true;
 
     // We need to construct a SockAddr so we can resolve the address.
-    SockAddr osAddr{serverAddress.host().c_str(), serverAddress.port()};
+    SockAddr osAddr{serverAddress.host().c_str(),
+                    serverAddress.port(),
+                    static_cast<sa_family_t>(IPv6Enabled() ? AF_UNSPEC : AF_INET)};
 
     if (!osAddr.isValid()) {
         return Status(ErrorCodes::InvalidOptions,
@@ -854,14 +835,7 @@ Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
                                     << ", address is invalid");
     }
 
-    if (isMessagePortImplASIO()) {
-        // `_so_timeout` is in seconds.
-        auto ms = representAs<int64_t>(std::floor(_so_timeout * 1000)).value_or(kMaxMillisCount);
-        _port.reset(new ASIOMessagingPort(
-            ms > kMaxMillisCount ? Milliseconds::max() : Milliseconds(ms), _logLevel));
-    } else {
-        _port.reset(new MessagingPort(_so_timeout, _logLevel));
-    }
+    _port.reset(new MessagingPort(_so_timeout, _logLevel));
 
     if (serverAddress.host().empty()) {
         return Status(ErrorCodes::InvalidOptions,
@@ -1393,7 +1367,10 @@ bool hasErrField(const BSONObj& o) {
     return !getErrField(o).eoo();
 }
 
-void DBClientConnection::checkResponse(const char* data, int nReturned, bool* retry, string* host) {
+void DBClientConnection::checkResponse(const std::vector<BSONObj>& batch,
+                                       bool networkError,
+                                       bool* retry,
+                                       string* host) {
     /* check for errors.  the only one we really care about at
      * this stage is "not master"
     */
@@ -1401,10 +1378,8 @@ void DBClientConnection::checkResponse(const char* data, int nReturned, bool* re
     *retry = false;
     *host = _serverAddress.toString();
 
-    if (!_parentReplSetName.empty() && nReturned) {
-        verify(data);
-        BSONObj bsonView(data);
-        handleNotMasterResponse(getErrField(bsonView));
+    if (!_parentReplSetName.empty() && !batch.empty()) {
+        handleNotMasterResponse(getErrField(batch[0]));
     }
 }
 

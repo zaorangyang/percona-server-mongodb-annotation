@@ -35,6 +35,8 @@
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/update/conflict_placeholder_node.h"
+#include "mongo/db/update/rename_node.h"
 #include "mongo/db/update/update_array_node.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
@@ -90,6 +92,34 @@ TEST(UpdateObjectNodeTest, ValidMulPathParsesSuccessfully) {
                                               foundIdentifiers));
 }
 
+TEST(UpdateObjectNodeTest, ValidRenamePathParsesSuccessfully) {
+    auto update = fromjson("{$rename: {'a.b': 'c.d'}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_RENAME,
+                                              update["$rename"]["a.b"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    // There should be a ConflictPlaceHolderNode along the "a.b" path.
+    auto aChild = dynamic_cast<UpdateObjectNode*>(root.getChild("a"));
+    ASSERT(aChild);
+
+    auto bChild = dynamic_cast<ConflictPlaceholderNode*>(aChild->getChild("b"));
+    ASSERT(bChild);
+
+    // There should be a RenameNode along the "c.d" path.
+    auto cChild = dynamic_cast<UpdateObjectNode*>(root.getChild("c"));
+    ASSERT(cChild);
+
+    auto dChild = dynamic_cast<RenameNode*>(cChild->getChild("d"));
+    ASSERT(dChild);
+}
+
 TEST(UpdateObjectNodeTest, ValidSetPathParsesSuccessfully) {
     auto update = fromjson("{$set: {'a.b': 5}}");
     const CollatorInterface* collator = nullptr;
@@ -113,6 +143,34 @@ TEST(UpdateObjectNodeTest, ValidUnsetPathParsesSuccessfully) {
     ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
                                               modifiertable::ModifierType::MOD_UNSET,
                                               update["$unset"]["a.b"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(UpdateObjectNodeTest, ValidAddToSetPathParsesSuccessfully) {
+    auto update = fromjson("{$addToSet: {'a.b': 5}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_ADD_TO_SET,
+                                              update["$addToSet"]["a.b"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
+TEST(UpdateObjectNodeTest, ValidPopPathParsesSuccessfully) {
+    auto update = fromjson("{$pop: {'a.b': 1}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_POP,
+                                              update["$pop"]["a.b"],
                                               collator,
                                               arrayFilters,
                                               foundIdentifiers));
@@ -1647,6 +1705,8 @@ TEST(UpdateObjectNodeTest, ApplyCreateField) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("b");
     Document logDoc;
@@ -1658,6 +1718,8 @@ TEST(UpdateObjectNodeTest, ApplyCreateField) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -1687,6 +1749,8 @@ TEST(UpdateObjectNodeTest, ApplyExistingField) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -1698,6 +1762,8 @@ TEST(UpdateObjectNodeTest, ApplyExistingField) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -1745,6 +1811,8 @@ TEST(UpdateObjectNodeTest, ApplyExistingAndNonexistingFields) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -1756,6 +1824,8 @@ TEST(UpdateObjectNodeTest, ApplyExistingAndNonexistingFields) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -1803,6 +1873,8 @@ TEST(UpdateObjectNodeTest, ApplyExistingNestedPaths) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -1814,6 +1886,8 @@ TEST(UpdateObjectNodeTest, ApplyExistingNestedPaths) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -1862,6 +1936,8 @@ TEST(UpdateObjectNodeTest, ApplyCreateNestedPaths) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -1873,6 +1949,8 @@ TEST(UpdateObjectNodeTest, ApplyCreateNestedPaths) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -1915,6 +1993,8 @@ TEST(UpdateObjectNodeTest, ApplyCreateDeeplyNestedPaths) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -1926,6 +2006,8 @@ TEST(UpdateObjectNodeTest, ApplyCreateDeeplyNestedPaths) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -1980,6 +2062,8 @@ TEST(UpdateObjectNodeTest, ChildrenShouldBeAppliedInAlphabeticalOrder) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -1991,6 +2075,8 @@ TEST(UpdateObjectNodeTest, ChildrenShouldBeAppliedInAlphabeticalOrder) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2026,6 +2112,8 @@ TEST(UpdateObjectNodeTest, CollatorShouldNotAffectUpdateOrder) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("abc");
     Document logDoc;
@@ -2037,6 +2125,8 @@ TEST(UpdateObjectNodeTest, CollatorShouldNotAffectUpdateOrder) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2078,6 +2168,8 @@ TEST(UpdateObjectNodeTest, ApplyNoop) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     indexData.addPath("b");
@@ -2091,6 +2183,8 @@ TEST(UpdateObjectNodeTest, ApplyNoop) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2132,6 +2226,8 @@ TEST(UpdateObjectNodeTest, ApplySomeChildrenNoops) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     indexData.addPath("b");
@@ -2145,6 +2241,8 @@ TEST(UpdateObjectNodeTest, ApplySomeChildrenNoops) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2174,6 +2272,8 @@ TEST(UpdateObjectNodeTest, ApplyBlockingElement) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -2185,6 +2285,8 @@ TEST(UpdateObjectNodeTest, ApplyBlockingElement) {
                                            &pathTaken,
                                            matchedField,
                                            fromReplication,
+                                           validateForStorage,
+                                           immutablePaths,
                                            &indexData,
                                            &logBuilder,
                                            &indexesAffected,
@@ -2218,6 +2320,8 @@ TEST(UpdateObjectNodeTest, ApplyBlockingElementFromReplication) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = true;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -2229,6 +2333,8 @@ TEST(UpdateObjectNodeTest, ApplyBlockingElementFromReplication) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2258,6 +2364,8 @@ TEST(UpdateObjectNodeTest, ApplyPositionalMissingMatchedField) {
     FieldRef pathTaken("");
     StringData matchedField;
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -2270,6 +2378,8 @@ TEST(UpdateObjectNodeTest, ApplyPositionalMissingMatchedField) {
                    &pathTaken,
                    matchedField,
                    fromReplication,
+                   validateForStorage,
+                   immutablePaths,
                    &indexData,
                    &logBuilder,
                    &indexesAffected,
@@ -2303,6 +2413,8 @@ TEST(UpdateObjectNodeTest, ApplyMergePositionalChild) {
     FieldRef pathTaken("");
     StringData matchedField = "0";
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -2314,6 +2426,8 @@ TEST(UpdateObjectNodeTest, ApplyMergePositionalChild) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2361,6 +2475,8 @@ TEST(UpdateObjectNodeTest, ApplyOrderMergedPositionalChild) {
     FieldRef pathTaken("");
     StringData matchedField = "1";
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -2372,6 +2488,8 @@ TEST(UpdateObjectNodeTest, ApplyOrderMergedPositionalChild) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2408,6 +2526,8 @@ TEST(UpdateObjectNodeTest, ApplyMergeConflictWithPositionalChild) {
     FieldRef pathTaken("");
     StringData matchedField = "0";
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -2419,6 +2539,8 @@ TEST(UpdateObjectNodeTest, ApplyMergeConflictWithPositionalChild) {
                                            &pathTaken,
                                            matchedField,
                                            fromReplication,
+                                           validateForStorage,
+                                           immutablePaths,
                                            &indexData,
                                            &logBuilder,
                                            &indexesAffected,
@@ -2458,6 +2580,8 @@ TEST(UpdateObjectNodeTest, ApplyDoNotMergePositionalChild) {
     FieldRef pathTaken("");
     StringData matchedField = "1";
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -2469,6 +2593,8 @@ TEST(UpdateObjectNodeTest, ApplyDoNotMergePositionalChild) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2510,6 +2636,8 @@ TEST(UpdateObjectNodeTest, ApplyPositionalChildLast) {
     FieldRef pathTaken("");
     StringData matchedField = "2";
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -2521,6 +2649,8 @@ TEST(UpdateObjectNodeTest, ApplyPositionalChildLast) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2556,6 +2686,8 @@ TEST(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
     FieldRef pathTaken("");
     StringData matchedField = "0";
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -2567,6 +2699,8 @@ TEST(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2585,6 +2719,8 @@ TEST(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder2,
                &indexesAffected,
@@ -2626,6 +2762,8 @@ TEST(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
     FieldRef pathTaken("");
     StringData matchedField = "0";
     auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
     UpdateIndexData indexData;
     indexData.addPath("a");
     Document logDoc;
@@ -2637,6 +2775,8 @@ TEST(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
                &pathTaken,
                matchedField,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder,
                &indexesAffected,
@@ -2656,6 +2796,8 @@ TEST(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
                &pathTaken,
                matchedField2,
                fromReplication,
+               validateForStorage,
+               immutablePaths,
                &indexData,
                &logBuilder2,
                &indexesAffected,
@@ -2666,6 +2808,430 @@ TEST(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
     ASSERT_TRUE(doc2.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.1.c': 6, 'a.1.d': 7}}"),
                       logDoc2.getObject());
+}
+
+/**
+ * The leading zero case is interesting, because if we try to look up an array element by the index
+ * string, a leading zero will cause the lookup to fail. That is, even if 'element' is an array,
+ * element["02"] will not find the element with subscript 2.
+ */
+TEST(UpdateObjectNodeTest, ApplyToArrayByIndexWithLeadingZero) {
+    auto setUpdate = fromjson("{$set: {'a.02': 2}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.02"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    Document doc(fromjson("{a: [0, 0, 0, 0, 0]}"));
+    FieldRef pathToCreate("");
+    FieldRef pathTaken("");
+    StringData matchedField;
+    auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
+    UpdateIndexData indexData;
+    indexData.addPath("a");
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    auto indexesAffected = false;
+    auto noop = false;
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               validateForStorage,
+               immutablePaths,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
+    ASSERT_TRUE(indexesAffected);
+    ASSERT_FALSE(noop);
+    ASSERT_BSONOBJ_EQ(fromjson("{a: [0, 0, 2, 0, 0]}"), doc.getObject());
+    ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.02': 2}}"), logDoc.getObject());
+}
+
+/**
+ * This test mimics a failure we saw in SERVER-29762. The failure occurred when the 'a.10' update
+   (which was applied first) padded the empty array to have 10 elements, but the new padding
+   elements did not have field names to match their array indexes. As a result, the 'a.2' update
+   failed.
+ */
+TEST(UpdateObjectNodeTest, ApplyMultipleArrayUpdates) {
+    auto setUpdate = fromjson("{$set: {'a.2': 2, 'a.10': 10}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.2"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.10"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    Document doc(fromjson("{a: []}"));
+    FieldRef pathToCreate("");
+    FieldRef pathTaken("");
+    StringData matchedField;
+    auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
+    UpdateIndexData indexData;
+    indexData.addPath("a");
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    auto indexesAffected = false;
+    auto noop = false;
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               validateForStorage,
+               immutablePaths,
+               &indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
+    ASSERT_TRUE(indexesAffected);
+    ASSERT_FALSE(noop);
+    ASSERT_BSONOBJ_EQ(
+        fromjson("{a: [null, null, 2, null, null, null, null, null, null, null, 10]}"),
+        doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.10': 10, 'a.2': 2}}"), logDoc.getObject());
+}
+
+TEST(UpdateObjectNodeTest, ApplyUpdateToNonViablePathInArray) {
+    auto setUpdate = fromjson("{$set: {'a.b': 3}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              setUpdate["$set"]["a.b"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    Document doc(fromjson("{a: [{b: 1}, {b: 2}]}"));
+    FieldRef pathToCreate("");
+    FieldRef pathTaken("");
+    StringData matchedField;
+    auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
+    UpdateIndexData indexData;
+    indexData.addPath("a");
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    auto indexesAffected = false;
+    auto noop = false;
+    ASSERT_THROWS_CODE_AND_WHAT(root.apply(doc.root(),
+                                           &pathToCreate,
+                                           &pathTaken,
+                                           matchedField,
+                                           fromReplication,
+                                           validateForStorage,
+                                           immutablePaths,
+                                           &indexData,
+                                           &logBuilder,
+                                           &indexesAffected,
+                                           &noop),
+                                UserException,
+                                ErrorCodes::PathNotViable,
+                                "Cannot create field 'b' in element {a: [ { b: 1 }, { b: 2 } ]}");
+}
+
+TEST(UpdateObjectNodeTest, SetAndPopModifiersWithCommonPrefixApplySuccessfully) {
+    auto update = fromjson("{$set: {'a.b': 5}, $pop: {'a.c': -1}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a.b"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_POP,
+                                              update["$pop"]["a.c"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+
+    Document doc(fromjson("{a: {b: 3, c: [1, 2, 3, 4]}}"));
+    FieldRef pathToCreate("");
+    FieldRef pathTaken("");
+    StringData matchedField;
+    auto fromReplication = false;
+    auto validateForStorage = true;
+    FieldRefSet immutablePaths;
+    const UpdateIndexData* indexData = nullptr;
+    Document logDoc;
+    LogBuilder logBuilder(logDoc.root());
+    bool indexesAffected;
+    bool noop;
+    root.apply(doc.root(),
+               &pathToCreate,
+               &pathTaken,
+               matchedField,
+               fromReplication,
+               validateForStorage,
+               immutablePaths,
+               indexData,
+               &logBuilder,
+               &indexesAffected,
+               &noop);
+    ASSERT_FALSE(noop);
+    ASSERT_FALSE(indexesAffected);
+    ASSERT_BSONOBJ_EQ(fromjson("{a: {b: 5, c: [2, 3, 4]}}"), doc.getObject());
+    ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.b': 5, 'a.c': [2, 3, 4]}}"), logDoc.getObject());
+}
+
+TEST(ParseRenameTest, RenameToStringWithEmbeddedNullFails) {
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+
+    {
+        const auto embeddedNull = "a\0b"_sd;
+        auto update = BSON("$rename" << BSON("a.b" << embeddedNull));
+
+        UpdateObjectNode root;
+        auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                      modifiertable::ModifierType::MOD_RENAME,
+                                                      update["$rename"]["a.b"],
+                                                      collator,
+                                                      arrayFilters,
+                                                      foundIdentifiers);
+        ASSERT_NOT_OK(result);
+        ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    }
+
+    {
+        const auto singleNullByte = "\0"_sd;
+        auto update = BSON("$rename" << BSON("a.b" << singleNullByte));
+
+        UpdateObjectNode root;
+        auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                      modifiertable::ModifierType::MOD_RENAME,
+                                                      update["$rename"]["a.b"],
+                                                      collator,
+                                                      arrayFilters,
+                                                      foundIdentifiers);
+        ASSERT_NOT_OK(result);
+        ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    }
+
+    {
+        const auto leadingNullByte = "\0bbbb"_sd;
+        auto update = BSON("$rename" << BSON("a.b" << leadingNullByte));
+
+        UpdateObjectNode root;
+        auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                      modifiertable::ModifierType::MOD_RENAME,
+                                                      update["$rename"]["a.b"],
+                                                      collator,
+                                                      arrayFilters,
+                                                      foundIdentifiers);
+        ASSERT_NOT_OK(result);
+        ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    }
+
+    {
+        const auto trailingNullByte = "bbbb\0"_sd;
+        auto update = BSON("$rename" << BSON("a.b" << trailingNullByte));
+
+        UpdateObjectNode root;
+        auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                      modifiertable::ModifierType::MOD_RENAME,
+                                                      update["$rename"]["a.b"],
+                                                      collator,
+                                                      arrayFilters,
+                                                      foundIdentifiers);
+        ASSERT_NOT_OK(result);
+        ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    }
+}
+
+TEST(ParseRenameTest, RenameToNonUpdatablePathFails) {
+    auto update = fromjson("{$rename: {'a': 'b.'}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["a"],
+                                                  collator,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::EmptyFieldName);
+    ASSERT_EQ(result.getStatus().reason(),
+              "The update path 'b.' contains an empty field name, which is not allowed.");
+}
+
+TEST(ParseRenameTest, RenameFromNonUpdatablePathFails) {
+    auto update = fromjson("{$rename: {'.a': 'b'}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"][".a"],
+                                                  collator,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::EmptyFieldName);
+    ASSERT_EQ(result.getStatus().reason(),
+              "The update path '.a' contains an empty field name, which is not allowed.");
+}
+
+TEST(ParseRenameTest, RenameToNonStringPathFails) {
+    auto update = fromjson("{$rename: {'a': 5}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["a"],
+                                                  collator,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(), "The 'to' field for $rename must be a string: a: 5");
+}
+
+/**
+ * This test, RenameUpwardFails, and RenameDownwardFails mirror similar tests in
+ * rename_node_test.cpp. They exist to make sure that UpdateObjectNode::parseAndMerge() does not
+ * observe a conflict between the RenameNode and the dummy ConflictPlaceHolderNode (generating an
+ * "Update created a conflict" error message that does not really apply to these cases) before it
+ * observes the more specific errors in RenameNode::init().
+ */
+TEST(ParseRenameTest, RenameWithSameNameFails) {
+    auto update = fromjson("{$rename: {'a': 'a'}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["a"],
+                                                  collator,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "The source and target field for $rename must differ: a: \"a\"");
+}
+
+TEST(ParseRenameTest, RenameUpwardFails) {
+    auto update = fromjson("{$rename: {'b.a': 'b'}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["b.a"],
+                                                  collator,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "The source and target field for $rename must not be on the same path: b.a: \"b\"");
+}
+
+TEST(ParseRenameTest, RenameDownwardFails) {
+    auto update = fromjson("{$rename: {'b': 'b.a'}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["b"],
+                                                  collator,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
+    ASSERT_EQ(result.getStatus().reason(),
+              "The source and target field for $rename must not be on the same path: b: \"b.a\"");
+}
+
+TEST(ParseRenameTest, ConflictWithRenameSourceFailsToParse) {
+    auto update = fromjson("{$set: {a: 5}, $rename: {a: 'b'}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["a"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["a"],
+                                                  collator,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(), "Updating the path 'a' would create a conflict at 'a'");
+}
+
+TEST(ParseRenameTest, ConflictWithRenameDestinationFailsToParse) {
+    auto update = fromjson("{$set: {b: 5}, $rename: {a: 'b'}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ArrayFilter>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_SET,
+                                              update["$set"]["b"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+    auto result = UpdateObjectNode::parseAndMerge(&root,
+                                                  modifiertable::ModifierType::MOD_RENAME,
+                                                  update["$rename"]["a"],
+                                                  collator,
+                                                  arrayFilters,
+                                                  foundIdentifiers);
+    ASSERT_NOT_OK(result);
+    ASSERT_EQ(result.getStatus().code(), ErrorCodes::ConflictingUpdateOperators);
+    ASSERT_EQ(result.getStatus().reason(), "Updating the path 'b' would create a conflict at 'b'");
 }
 
 }  // namespace

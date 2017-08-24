@@ -75,12 +75,9 @@ MONGO_FP_DECLARE(checkForInterruptFail);
 
 }  // namespace
 
-OperationContext::OperationContext(Client* client,
-                                   unsigned int opId,
-                                   boost::optional<LogicalSessionId> lsid)
+OperationContext::OperationContext(Client* client, unsigned int opId)
     : _client(client),
       _opId(opId),
-      _lsid(std::move(lsid)),
       _elapsedTime(client ? client->getServiceContext()->getTickSource()
                           : SystemTickSource::get()) {}
 
@@ -291,7 +288,17 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
         _waitCV = &cv;
     }
 
-    if (hasDeadline()) {
+    // If the maxTimeNeverTimeOut failpoint is set, behave as though the operation's deadline does
+    // not exist. Under normal circumstances, if the op has an existing deadline which is sooner
+    // than the deadline passed into this method, we replace our deadline with the op's. This means
+    // that we expect to time out at the same time as the existing deadline expires. If, when we
+    // time out, we find that the op's deadline has not expired (as will always be the case if
+    // maxTimeNeverTimeOut is set) then we assume that the incongruity is due to a clock mismatch
+    // and return ExceededTimeLimit regardless. To prevent this behaviour, only consider the op's
+    // deadline in the event that the maxTimeNeverTimeOut failpoint is not set.
+    bool opHasDeadline = (hasDeadline() && !MONGO_FAIL_POINT(maxTimeNeverTimeOut));
+
+    if (opHasDeadline) {
         deadline = std::min(deadline, getDeadline());
     }
 
@@ -318,7 +325,7 @@ StatusWith<stdx::cv_status> OperationContext::waitForConditionOrInterruptNoAsser
     if (!status.isOK()) {
         return status;
     }
-    if (hasDeadline() && waitStatus == stdx::cv_status::timeout && deadline == getDeadline()) {
+    if (opHasDeadline && waitStatus == stdx::cv_status::timeout && deadline == getDeadline()) {
         // It's possible that the system clock used in stdx::condition_variable::wait_until
         // is slightly ahead of the FastClock used in checkForInterrupt. In this case,
         // we treat the operation as though it has exceeded its time limit, just as if the
@@ -348,6 +355,17 @@ void OperationContext::markKilled(ErrorCodes::Error killCode) {
     }
 }
 
+void OperationContext::setLogicalSessionId(LogicalSessionId lsid) {
+    invariant(!_lsid);
+    _lsid = std::move(lsid);
+}
+
+void OperationContext::setTxnNumber(TxnNumber txnNumber) {
+    invariant(_lsid);
+    invariant(!_txnNumber);
+    _txnNumber = txnNumber;
+}
+
 RecoveryUnit* OperationContext::releaseRecoveryUnit() {
     return _recoveryUnit.release();
 }
@@ -373,6 +391,27 @@ void OperationContext::setLockState(std::unique_ptr<Locker> locker) {
 
 Date_t OperationContext::getExpirationDateForWaitForValue(Milliseconds waitFor) {
     return getServiceContext()->getPreciseClockSource()->now() + waitFor;
+}
+
+void initializeOperationSessionInfo(OperationContext* opCtx, const BSONObj& requestBody) {
+    auto osi =
+        OperationSessionInfo::parse(IDLParserErrorContext("OperationSessionInfo"), requestBody);
+
+    if (osi.getSessionId()) {
+        auto lsid = *osi.getSessionId();
+        opCtx->setLogicalSessionId(LogicalSessionId(std::move(lsid)));
+    }
+
+    if (osi.getTxnNumber()) {
+        uassert(ErrorCodes::IllegalOperation,
+                "Transaction number requires a sessionId to be specified",
+                opCtx->getLogicalSessionId());
+        uassert(ErrorCodes::BadValue,
+                "Transaction number cannot be negative",
+                *osi.getTxnNumber() >= 0);
+
+        opCtx->setTxnNumber(*osi.getTxnNumber());
+    }
 }
 
 }  // namespace mongo

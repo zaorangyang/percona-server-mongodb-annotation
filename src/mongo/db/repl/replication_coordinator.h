@@ -396,8 +396,9 @@ public:
     /**
      * Sets this node into a specific follower mode.
      *
-     * Returns true if the follower mode was successfully set.  Returns false if the
-     * node is or becomes a leader before setFollowerMode completes.
+     * Returns OK if the follower mode was successfully set.  Returns NotSecondary if the
+     * node is a leader when setFollowerMode is called and ElectionInProgess if the node is in the
+     * process of trying to elect itself primary.
      *
      * Follower modes are RS_STARTUP2 (initial sync), RS_SECONDARY, RS_ROLLBACK and
      * RS_RECOVERING.  They are the valid states of a node whose topology coordinator has the
@@ -407,7 +408,7 @@ public:
      * becoming a candidate or accepting reads, depending on circumstances in the oplog
      * application process.
      */
-    virtual bool setFollowerMode(const MemberState& newState) = 0;
+    virtual Status setFollowerMode(const MemberState& newState) = 0;
 
     /**
      * Step-up

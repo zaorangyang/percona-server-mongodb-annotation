@@ -33,6 +33,10 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/namespace_uuid_cache.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
@@ -42,8 +46,6 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/views/durable_view_catalog.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/util/namespace_uuid_cache.h"
-#include "mongo/util/uuid_catalog.h"
 
 namespace mongo {
 
@@ -55,7 +57,7 @@ void OpObserverImpl::onCreateIndex(OperationContext* opCtx,
     NamespaceString systemIndexes{nss.getSystemIndexesCollection()};
     if (uuid) {
         BSONObjBuilder builder;
-        builder.append("createIndex", nss.coll());
+        builder.append("createIndexes", nss.coll());
 
         for (const auto& e : indexDoc) {
             if (e.fieldNameStringData() != "ns"_sd)
@@ -77,23 +79,24 @@ void OpObserverImpl::onCreateIndex(OperationContext* opCtx,
 void OpObserverImpl::onInserts(OperationContext* opCtx,
                                const NamespaceString& nss,
                                OptionalCollectionUUID uuid,
-                               std::vector<BSONObj>::const_iterator begin,
-                               std::vector<BSONObj>::const_iterator end,
+                               std::vector<InsertStatement>::const_iterator begin,
+                               std::vector<InsertStatement>::const_iterator end,
                                bool fromMigrate) {
-    repl::logOps(opCtx, "i", nss, uuid, begin, end, fromMigrate);
+    repl::logInsertOps(opCtx, nss, uuid, begin, end, fromMigrate);
 
     auto css = CollectionShardingState::get(opCtx, nss.ns());
 
     for (auto it = begin; it != end; it++) {
-        AuthorizationManager::get(opCtx->getServiceContext())->logOp(opCtx, "i", nss, *it, nullptr);
+        AuthorizationManager::get(opCtx->getServiceContext())
+            ->logOp(opCtx, "i", nss, it->doc, nullptr);
         if (!fromMigrate) {
-            css->onInsertOp(opCtx, *it);
+            css->onInsertOp(opCtx, it->doc);
         }
     }
 
     if (nss.ns() == FeatureCompatibilityVersion::kCollection) {
         for (auto it = begin; it != end; it++) {
-            FeatureCompatibilityVersion::onInsertOrUpdate(*it);
+            FeatureCompatibilityVersion::onInsertOrUpdate(it->doc);
         }
     }
 
@@ -215,8 +218,11 @@ void OpObserverImpl::onCreateCollection(OperationContext* opCtx,
     getGlobalAuthorizationManager()->logOp(opCtx, "c", dbName, cmdObj, nullptr);
 
     if (options.uuid) {
-        UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
+        UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
         catalog.onCreateCollection(opCtx, coll, options.uuid.get());
+        opCtx->recoveryUnit()->onRollback([opCtx, collectionName]() {
+            NamespaceUUIDCache::get(opCtx).evictNamespace(collectionName);
+        });
     }
 }
 
@@ -292,6 +298,8 @@ void OpObserverImpl::onDropDatabase(OperationContext* opCtx, const std::string& 
         FeatureCompatibilityVersion::onDropCollection();
     }
 
+    NamespaceUUIDCache::get(opCtx).evictNamespacesInDatabase(dbName);
+
     getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
 }
 
@@ -321,12 +329,11 @@ repl::OpTime OpObserverImpl::onDropCollection(OperationContext* opCtx,
     css->onDropCollection(opCtx, collectionName);
 
     // Evict namespace entry from the namespace/uuid cache if it exists.
-    NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
-    cache.onDropCollection(collectionName);
+    NamespaceUUIDCache::get(opCtx).evictNamespace(collectionName);
 
     // Remove collection from the uuid catalog.
     if (uuid) {
-        UUIDCatalog& catalog = UUIDCatalog::get(opCtx->getServiceContext());
+        UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
         catalog.onDropCollection(opCtx, uuid.get());
     }
 
@@ -379,7 +386,20 @@ void OpObserverImpl::onRenameCollection(OperationContext* opCtx,
 
     // Evict namespace entry from the namespace/uuid cache if it exists.
     NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
-    cache.onRenameCollection(fromCollection);
+    cache.evictNamespace(fromCollection);
+    cache.evictNamespace(toCollection);
+    opCtx->recoveryUnit()->onRollback(
+        [&cache, toCollection]() { cache.evictNamespace(toCollection); });
+
+
+    // Finally update the UUID Catalog.
+    if (uuid) {
+        auto db = dbHolder().get(opCtx, toCollection.db());
+        auto newColl = db->getCollection(opCtx, toCollection);
+        invariant(newColl);
+        UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
+        catalog.onRenameCollection(opCtx, newColl, uuid.get());
+    }
 }
 
 void OpObserverImpl::onApplyOps(OperationContext* opCtx,
@@ -389,21 +409,6 @@ void OpObserverImpl::onApplyOps(OperationContext* opCtx,
     repl::logOp(opCtx, "c", cmdNss, {}, applyOpCmd, nullptr, false);
 
     getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, applyOpCmd, nullptr);
-}
-
-void OpObserverImpl::onConvertToCapped(OperationContext* opCtx,
-                                       const NamespaceString& collectionName,
-                                       OptionalCollectionUUID uuid,
-                                       double size) {
-    const NamespaceString cmdNss = collectionName.getCommandNS();
-    BSONObj cmdObj = BSON("convertToCapped" << collectionName.coll() << "size" << size);
-
-    if (!collectionName.isSystemDotProfile()) {
-        // do not replicate system.profile modifications
-        repl::logOp(opCtx, "c", cmdNss, uuid, cmdObj, nullptr, false);
-    }
-
-    getGlobalAuthorizationManager()->logOp(opCtx, "c", cmdNss, cmdObj, nullptr);
 }
 
 void OpObserverImpl::onEmptyCapped(OperationContext* opCtx,

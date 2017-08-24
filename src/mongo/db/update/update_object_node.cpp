@@ -35,19 +35,11 @@
 #include "mongo/db/update/update_array_node.h"
 #include "mongo/db/update/update_leaf_node.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/stringutils.h"
 
 namespace mongo {
 
 namespace {
-
-bool isPositionalElement(const std::string& field) {
-    return field.length() == 1 && field[0] == '$';
-}
-
-bool isArrayFilterIdentifier(StringData field) {
-    return field.size() >= 3 && field[0] == '$' && field[1] == '[' &&
-        field[field.size() - 1] == ']';
-}
 
 /**
  * Parses a field of the form $[<identifier>] into <identifier>. 'field' must be of the form
@@ -61,7 +53,7 @@ StatusWith<std::string> parseArrayFilterIdentifier(
     const FieldRef& fieldRef,
     const std::map<StringData, std::unique_ptr<ArrayFilter>>& arrayFilters,
     std::set<std::string>& foundIdentifiers) {
-    dassert(isArrayFilterIdentifier(field));
+    dassert(fieldchecker::isArrayFilterIdentifier(field));
 
     if (position == 0) {
         return Status(ErrorCodes::BadValue,
@@ -100,19 +92,45 @@ void applyChild(const UpdateNode& child,
                 FieldRef* pathTaken,
                 StringData matchedField,
                 bool fromReplication,
+                bool validateForStorage,
+                const FieldRefSet& immutablePaths,
                 const UpdateIndexData* indexData,
                 LogBuilder* logBuilder,
                 bool* indexesAffected,
                 bool* noop) {
 
-    auto childElement = *element;
     auto pathTakenSizeBefore = pathTaken->numParts();
 
-    // If 'field' exists in 'element', append 'field' to the end of 'pathTaken' and advance
-    // 'childElement'. Otherwise, append 'field' to the end of 'pathToCreate'.
-    if (pathToCreate->empty() && (childElement = (*element)[field]).ok()) {
+    // A non-ok value for childElement will indicate that we need to append 'field' to the
+    // 'pathToCreate' FieldRef.
+    auto childElement = element->getDocument().end();
+    invariant(!childElement.ok());
+    if (!pathToCreate->empty()) {
+        // We're already traversing a path with elements that don't exist yet, so we will definitely
+        // need to append.
+    } else if (element->getType() == BSONType::Object) {
+        childElement = element->findFirstChildNamed(field);
+    } else if (element->getType() == BSONType::Array) {
+        boost::optional<size_t> indexFromField = parseUnsignedBase10Integer(field);
+        if (indexFromField) {
+            childElement = element->findNthChild(*indexFromField);
+        } else {
+            // We're trying to traverse an array element, but the path specifies a name instead of
+            // an index. We append the name to 'pathToCreate' for now, even though we know we won't
+            // be able to create it. If the update eventually needs to create the path,
+            // pathsupport::createPathAt() will provide a sensible PathNotViable UserError.
+        }
+    }
+
+    if (childElement.ok()) {
+        // The path we've traversed so far already exists in our document, and 'childElement'
+        // represents the Element indicated by the 'field' name or index, which we indicate by
+        // updating the 'pathTaken' FieldRef.
         pathTaken->appendPart(field);
     } else {
+        // We are traversing path components that do not exist in our document. Any update modifier
+        // that creates new path components (i.e., any PathCreatingNode update nodes) will need to
+        // create this component, so we append it to the 'pathToCreate' FieldRef.
         childElement = *element;
         pathToCreate->appendPart(field);
     }
@@ -125,6 +143,8 @@ void applyChild(const UpdateNode& child,
                 pathTaken,
                 matchedField,
                 fromReplication,
+                validateForStorage,
+                immutablePaths,
                 indexData,
                 logBuilder,
                 &childAffectsIndexes,
@@ -179,8 +199,37 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
     const CollatorInterface* collator,
     const std::map<StringData, std::unique_ptr<ArrayFilter>>& arrayFilters,
     std::set<std::string>& foundIdentifiers) {
+    FieldRef fieldRef;
+    if (type != modifiertable::ModifierType::MOD_RENAME) {
+        // General case: Create a path in the tree according to the path specified in the field name
+        // of the "modExpr" element.
+        fieldRef.parse(modExpr.fieldNameStringData());
+    } else {
+        // Special case: For $rename modifiers, we add two nodes to the tree:
+        // 1) a ConflictPlaceholderNode at the path specified in the field name of the "modExpr"
+        //    element and
+        auto status = parseAndMerge(root,
+                                    modifiertable::ModifierType::MOD_CONFLICT_PLACEHOLDER,
+                                    modExpr,
+                                    collator,
+                                    arrayFilters,
+                                    foundIdentifiers);
+        if (!status.isOK()) {
+            return status;
+        }
+
+        // 2) a RenameNode at the path specified by the value of the "modExpr" element, which must
+        //    be a string value.
+        if (BSONType::String != modExpr.type()) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "The 'to' field for $rename must be a string: "
+                                        << modExpr);
+        }
+
+        fieldRef.parse(modExpr.valueStringData());
+    }
+
     // Check that the path is updatable.
-    FieldRef fieldRef(modExpr.fieldNameStringData());
     auto status = fieldchecker::isUpdatable(fieldRef);
     if (!status.isOK()) {
         return status;
@@ -225,7 +274,8 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
     // Create UpdateInternalNodes along the path.
     UpdateInternalNode* current = static_cast<UpdateInternalNode*>(root);
     for (size_t i = 0; i < fieldRef.numParts() - 1; ++i) {
-        auto fieldIsArrayFilterIdentifier = isArrayFilterIdentifier(fieldRef.getPart(i));
+        auto fieldIsArrayFilterIdentifier =
+            fieldchecker::isArrayFilterIdentifier(fieldRef.getPart(i));
 
         std::string childName;
         if (fieldIsArrayFilterIdentifier) {
@@ -240,7 +290,8 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
         }
 
         auto child = current->getChild(childName);
-        auto childShouldBeArrayNode = isArrayFilterIdentifier(fieldRef.getPart(i + 1));
+        auto childShouldBeArrayNode =
+            fieldchecker::isArrayFilterIdentifier(fieldRef.getPart(i + 1));
         if (child) {
             if ((childShouldBeArrayNode && child->type != UpdateNode::Type::Array) ||
                 (!childShouldBeArrayNode && child->type != UpdateNode::Type::Object)) {
@@ -265,7 +316,7 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
 
     // Add the leaf node to the end of the path.
     auto fieldIsArrayFilterIdentifier =
-        isArrayFilterIdentifier(fieldRef.getPart(fieldRef.numParts() - 1));
+        fieldchecker::isArrayFilterIdentifier(fieldRef.getPart(fieldRef.numParts() - 1));
 
     std::string childName;
     if (fieldIsArrayFilterIdentifier) {
@@ -312,7 +363,7 @@ std::unique_ptr<UpdateNode> UpdateObjectNode::createUpdateNodeByMerging(
 }
 
 UpdateNode* UpdateObjectNode::getChild(const std::string& field) const {
-    if (isPositionalElement(field)) {
+    if (fieldchecker::isPositionalElement(field)) {
         return _positionalChild.get();
     }
 
@@ -324,7 +375,7 @@ UpdateNode* UpdateObjectNode::getChild(const std::string& field) const {
 }
 
 void UpdateObjectNode::setChild(std::string field, std::unique_ptr<UpdateNode> child) {
-    if (isPositionalElement(field)) {
+    if (fieldchecker::isPositionalElement(field)) {
         invariant(!_positionalChild);
         _positionalChild = std::move(child);
     } else {
@@ -338,6 +389,8 @@ void UpdateObjectNode::apply(mutablebson::Element element,
                              FieldRef* pathTaken,
                              StringData matchedField,
                              bool fromReplication,
+                             bool validateForStorage,
+                             const FieldRefSet& immutablePaths,
                              const UpdateIndexData* indexData,
                              LogBuilder* logBuilder,
                              bool* indexesAffected,
@@ -353,7 +406,8 @@ void UpdateObjectNode::apply(mutablebson::Element element,
     }
 
     // Capture arguments to applyChild() to avoid code duplication.
-    auto applyChildClosure = [=, &element](const UpdateNode& child, StringData field) {
+    auto applyChildClosure = [=, &element, &immutablePaths](const UpdateNode& child,
+                                                            StringData field) {
         applyChild(child,
                    field,
                    &element,
@@ -361,6 +415,8 @@ void UpdateObjectNode::apply(mutablebson::Element element,
                    pathTaken,
                    matchedField,
                    fromReplication,
+                   validateForStorage,
+                   immutablePaths,
                    indexData,
                    logBuilder,
                    indexesAffected,

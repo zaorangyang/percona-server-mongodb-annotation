@@ -68,12 +68,7 @@ struct SSLPeerInfo;
 extern const int portSendFlags;
 extern const int portRecvFlags;
 
-const int SOCK_FAMILY_UNKNOWN_ERROR = 13078;
-
 void disableNagle(int sock);
-
-// Generate a string representation for getaddrinfo return codes
-std::string getAddrInfoStrError(int code);
 
 #if !defined(_WIN32)
 
@@ -102,6 +97,10 @@ std::string getHostName();
  * will be stale */
 std::string getHostNameCached();
 
+/** Returns getHostNameCached():<port>. */
+std::string getHostNameCachedAndPort();
+
+/** Returns getHostNameCached(), or getHostNameCached():<port> if running on a non-default port. */
 std::string prettyHostName();
 
 /**

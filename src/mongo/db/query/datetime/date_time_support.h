@@ -64,13 +64,57 @@ public:
         int millisecond;
     };
 
+    /**
+     * A struct with member variables describing the different parts of the ISO8601 date.
+     */
+    struct Iso8601DateParts {
+        Iso8601DateParts(const timelib_time&, Date_t);
+
+        int year;
+        int weekOfYear;
+        int dayOfWeek;
+        int hour;
+        int minute;
+        int second;
+        int millisecond;
+    };
+
+    /**
+     * A custom-deleter which destructs a timelib_time* when it goes out of scope.
+     */
+    struct TimelibTimeDeleter {
+        TimelibTimeDeleter() = default;
+        void operator()(timelib_time* time);
+    };
+
     explicit TimeZone(timelib_tzinfo* tzInfo);
     TimeZone() = default;
 
     /**
+     * Returns a Date_t populated with the argument values for the current timezone.
+     */
+    Date_t createFromDateParts(
+        int year, int month, int day, int hour, int minute, int second, int millisecond) const;
+
+    /**
+     * Returns a Date_t populated with the argument values for the current timezone.
+     */
+    Date_t createFromIso8601DateParts(int isoYear,
+                                      int isoWeekYear,
+                                      int isoDayOfWeek,
+                                      int hour,
+                                      int minute,
+                                      int second,
+                                      int millisecond) const;
+    /**
      * Returns a struct with members for each piece of the date.
      */
     DateParts dateParts(Date_t) const;
+
+    /**
+     * Returns a struct with members for each piece of the ISO8601 date.
+     */
+    Iso8601DateParts dateIso8601Parts(Date_t) const;
 
     /**
      * Returns the year according to the ISO 8601 standard. For example, Dec 31, 2014 is considered
@@ -104,6 +148,11 @@ public:
      * with the week (Monday through Sunday) that contains the year’s first Thursday.
      */
     int isoWeek(Date_t) const;
+
+    /**
+     * Returns the number of seconds offset from UTC.
+     */
+    Seconds utcOffset(Date_t) const;
 
     /**
      * Converts a date object to a string according to 'format'. 'format' can be any string literal,
@@ -179,6 +228,17 @@ public:
                 case 'u':  // Iso day of week
                     insertPadded(os, isoDayOfWeek(date), 1);
                     break;
+                case 'z':  // UTC offset as ±hhmm.
+                {
+                    auto offset = utcOffset(date);
+                    os << ((offset.count() < 0) ? "-" : "+");                            // sign
+                    insertPadded(os, std::abs(durationCount<Hours>(offset)), 2);         // hh
+                    insertPadded(os, std::abs(durationCount<Minutes>(offset)) % 60, 2);  // mm
+                    break;
+                }
+                case 'Z':  // UTC offset in minutes.
+                    os << durationCount<Minutes>(utcOffset(date));
+                    break;
                 default:
                     // Should never happen as format is pre-validated
                     invariant(false);
@@ -193,7 +253,7 @@ public:
     static void validateFormat(StringData format);
 
 private:
-    timelib_time getTimelibTime(Date_t) const;
+    std::unique_ptr<timelib_time, TimelibTimeDeleter> getTimelibTime(Date_t) const;
 
     /**
      * Only works with 1 <= spaces <= 4 and 0 <= number <= 9999. If spaces is less than the digit
@@ -262,6 +322,12 @@ public:
      * Returns a TimeZone object representing the UTC time zone.
      */
     static TimeZone utcZone();
+
+    /**
+     * Returns a TimeZone object representing the zone given by 'timeZoneId', or boost::none if it
+     * was not a recognized time zone.
+     */
+    TimeZone getTimeZone(StringData timeZoneId) const;
 
     /**
      * Creates a TimeZoneDatabase object with time zone data loaded from timelib's built-in timezone

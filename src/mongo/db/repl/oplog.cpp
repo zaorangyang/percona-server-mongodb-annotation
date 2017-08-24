@@ -54,6 +54,7 @@
 #include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -79,6 +80,7 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/snapshot_thread.h"
 #include "mongo/db/repl/sync_tail.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
@@ -258,7 +260,8 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
                             bool fromMigrate,
                             OpTime optime,
                             long long hashNew,
-                            Date_t wallTime) {
+                            Date_t wallTime,
+                            StmtId statementId) {
     BSONObjBuilder b(256);
 
     b.append("ts", optime.getTimestamp());
@@ -275,8 +278,14 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
     if (o2)
         b.append("o2", *o2);
 
-    if (wallTime != Date_t{}) {
-        b.appendDate("wt", wallTime);
+    if (wallTime != Date_t{} &&
+        serverGlobalParams.featureCompatibility.version.load() !=
+            ServerGlobalParams::FeatureCompatibility::Version::k34) {
+        b.appendDate("wall", wallTime);
+    }
+
+    if (statementId != kUninitializedStmtId) {
+        // TODO: SERVER-28912 append stmtId to oplog entry
     }
 
     return OplogDocWriter(OplogDocWriter(b.obj(), obj));
@@ -394,20 +403,29 @@ OpTime logOp(OperationContext* opCtx,
     OplogSlot slot;
     getNextOpTime(opCtx, oplog, replCoord, replMode, 1, &slot);
 
-    auto writer = _logOpWriter(
-        opCtx, opstr, nss, uuid, obj, o2, fromMigrate, slot.opTime, slot.hash, Date_t::now());
+    // TODO: SERVER-28912 Include statementId for other ops
+    auto writer = _logOpWriter(opCtx,
+                               opstr,
+                               nss,
+                               uuid,
+                               obj,
+                               o2,
+                               fromMigrate,
+                               slot.opTime,
+                               slot.hash,
+                               Date_t::now(),
+                               kUninitializedStmtId);
     const DocWriter* basePtr = &writer;
     _logOpsInner(opCtx, nss, &basePtr, 1, oplog, replMode, slot.opTime);
     return slot.opTime;
 }
 
-void logOps(OperationContext* opCtx,
-            const char* opstr,
-            const NamespaceString& nss,
-            OptionalCollectionUUID uuid,
-            std::vector<BSONObj>::const_iterator begin,
-            std::vector<BSONObj>::const_iterator end,
-            bool fromMigrate) {
+void logInsertOps(OperationContext* opCtx,
+                  const NamespaceString& nss,
+                  OptionalCollectionUUID uuid,
+                  std::vector<InsertStatement>::const_iterator begin,
+                  std::vector<InsertStatement>::const_iterator end,
+                  bool fromMigrate) {
     invariant(begin != end);
 
     auto replCoord = ReplicationCoordinator::get(opCtx);
@@ -426,16 +444,18 @@ void logOps(OperationContext* opCtx,
     getNextOpTime(opCtx, oplog, replCoord, replMode, count, slots.get());
     auto wallTime = Date_t::now();
     for (size_t i = 0; i < count; i++) {
+        auto insertStatement = begin[i];
         writers.emplace_back(_logOpWriter(opCtx,
-                                          opstr,
+                                          "i",
                                           nss,
                                           uuid,
-                                          begin[i],
+                                          insertStatement.doc,
                                           NULL,
                                           fromMigrate,
                                           slots[i].opTime,
                                           slots[i].hash,
-                                          wallTime));
+                                          wallTime,
+                                          insertStatement.stmtId));
     }
 
     std::unique_ptr<DocWriter const* []> basePtrs(new DocWriter const*[count]);
@@ -530,14 +550,13 @@ void createOplog(OperationContext* opCtx, const std::string& oplogCollectionName
     options.cappedSize = sz;
     options.autoIndexId = CollectionOptions::NO;
 
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
+    writeConflictRetry(opCtx, "createCollection", oplogCollectionName, [&] {
         WriteUnitOfWork uow(opCtx);
         invariant(ctx.db()->createCollection(opCtx, oplogCollectionName, options));
         if (!isReplSet)
             getGlobalServiceContext()->getOpObserver()->onOpMessage(opCtx, BSONObj());
         uow.commit();
-    }
-    MONGO_WRITE_CONFLICT_RETRY_LOOP_END(opCtx, "createCollection", oplogCollectionName);
+    });
 
     /* sync here so we don't get any surprising lag later when we try to sync */
     StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
@@ -564,8 +583,72 @@ NamespaceString parseNs(const string& ns, const BSONObj& cmdObj) {
     return NamespaceString(NamespaceString(ns).db().toString(), coll);
 }
 
-using OpApplyFn = stdx::function<Status(
-    OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime)>;
+NamespaceString parseUUID(OperationContext* opCtx, const BSONElement& ui) {
+    auto statusWithUUID = UUID::parse(ui);
+    uassertStatusOK(statusWithUUID);
+    auto uuid = statusWithUUID.getValue();
+    auto& catalog = UUIDCatalog::get(opCtx);
+    auto nss = catalog.lookupNSSByUUID(uuid);
+    uassert(
+        ErrorCodes::NamespaceNotFound, "No namespace with UUID " + uuid.toString(), !nss.isEmpty());
+    return nss;
+}
+
+NamespaceString parseUUIDorNs(OperationContext* opCtx,
+                              const char* ns,
+                              const BSONElement& ui,
+                              BSONObj& cmd) {
+    return ui.ok() ? parseUUID(opCtx, ui) : parseNs(ns, cmd);
+}
+
+void createIndexForApplyOps(OperationContext* opCtx,
+                            const BSONObj& indexSpec,
+                            const NamespaceString& indexNss,
+                            IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
+    // Check if collection exists.
+    Database* db = dbHolder().get(opCtx, indexNss.ns());
+    auto indexCollection = db ? db->getCollection(opCtx, indexNss) : nullptr;
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Failed to create index due to missing collection: " << indexNss.ns(),
+            indexCollection);
+
+    OpCounters* opCounters = opCtx->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
+    opCounters->gotInsert();
+
+    bool relaxIndexConstraints =
+        ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, indexNss);
+    if (indexSpec["background"].trueValue()) {
+        Lock::TempRelease release(opCtx->lockState());
+        if (opCtx->lockState()->isLocked()) {
+            // If TempRelease fails, background index build will deadlock.
+            LOG(3) << "apply op: building background index " << indexSpec
+                   << " in the foreground because temp release failed";
+            IndexBuilder builder(indexSpec, relaxIndexConstraints);
+            Status status = builder.buildInForeground(opCtx, db);
+            uassertStatusOK(status);
+        } else {
+            IndexBuilder* builder = new IndexBuilder(indexSpec, relaxIndexConstraints);
+            // This spawns a new thread and returns immediately.
+            builder->go();
+            // Wait for thread to start and register itself
+            IndexBuilder::waitForBgIndexStarting();
+        }
+        opCtx->recoveryUnit()->abandonSnapshot();
+    } else {
+        IndexBuilder builder(indexSpec, relaxIndexConstraints);
+        Status status = builder.buildInForeground(opCtx, db);
+        uassertStatusOK(status);
+    }
+    if (incrementOpsAppliedStats) {
+        incrementOpsAppliedStats();
+    }
+}
+
+using OpApplyFn = stdx::function<Status(OperationContext* opCtx,
+                                        const char* ns,
+                                        const BSONElement& ui,
+                                        BSONObj& cmd,
+                                        const OpTime& opTime)>;
 
 struct ApplyOpMetadata {
     OpApplyFn applyFunc;
@@ -583,13 +666,17 @@ struct ApplyOpMetadata {
 
 std::map<std::string, ApplyOpMetadata> opsMap = {
     {"create",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
           const NamespaceString nss(parseNs(ns, cmd));
           if (auto idIndexElem = cmd["idIndex"]) {
               // Remove "idIndex" field from command.
               auto cmdWithoutIdIndex = cmd.removeField("idIndex");
-              return createCollection(
-                  opCtx, nss.db().toString(), cmdWithoutIdIndex, idIndexElem.Obj());
+              return createCollectionForApplyOps(
+                  opCtx, nss.db().toString(), ui, cmdWithoutIdIndex, idIndexElem.Obj());
           }
 
           // No _id index spec was provided, so we should build a v:1 _id index.
@@ -599,83 +686,139 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
           idIndexSpecBuilder.append(IndexDescriptor::kIndexNameFieldName, "_id_");
           idIndexSpecBuilder.append(IndexDescriptor::kNamespaceFieldName, nss.ns());
           idIndexSpecBuilder.append(IndexDescriptor::kKeyPatternFieldName, BSON("_id" << 1));
-          return createCollection(opCtx, nss.db().toString(), cmd, idIndexSpecBuilder.done());
+          return createCollectionForApplyOps(
+              opCtx, nss.db().toString(), ui, cmd, idIndexSpecBuilder.done());
       },
       {ErrorCodes::NamespaceExists}}},
+    {"createIndexes",
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
+          const NamespaceString nss(parseUUID(opCtx, ui));
+          BSONElement first = cmd.firstElement();
+          invariant(first.fieldNameStringData() == "createIndexes");
+          uassert(ErrorCodes::InvalidNamespace,
+                  "createIndexes value must be a string",
+                  first.type() == mongo::String);
+          BSONObj indexSpec = cmd.removeField("createIndexes");
+          // The UUID determines the collection to build the index on, so create new 'ns' field.
+          BSONObj nsObj = BSON("ns" << nss.ns());
+          indexSpec = indexSpec.addField(nsObj.firstElement());
+
+          createIndexForApplyOps(opCtx, indexSpec, nss, {});
+          return Status::OK();
+      },
+      {ErrorCodes::IndexAlreadyExists}}},
     {"collMod",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
-          return collMod(opCtx, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+          return collMod(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
     {"dropDatabase",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
           return dropDatabase(opCtx, NamespaceString(ns).db().toString());
       },
       {ErrorCodes::NamespaceNotFound}}},
     {"drop",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
-          return dropCollection(opCtx, parseNs(ns, cmd), resultWeDontCareAbout, opTime);
+          return dropCollection(opCtx,
+                                parseUUIDorNs(opCtx, ns, ui, cmd),
+                                resultWeDontCareAbout,
+                                opTime,
+                                DropCollectionSystemCollectionMode::kAllowSystemCollectionDrops);
       },
-      // IllegalOperation is necessary because in 3.0 we replicate drops of system.profile
-      // TODO(dannenberg) remove IllegalOperation once we no longer need 3.0 compatibility
-      {ErrorCodes::NamespaceNotFound, ErrorCodes::IllegalOperation}}},
+      {ErrorCodes::NamespaceNotFound}}},
     // deleteIndex(es) is deprecated but still works as of April 10, 2015
     {"deleteIndex",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
-          return dropIndexes(opCtx, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+          return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"deleteIndexes",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
-          return dropIndexes(opCtx, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+          return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"dropIndex",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
-          return dropIndexes(opCtx, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+          return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"dropIndexes",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
-          return dropIndexes(opCtx, parseNs(ns, cmd), cmd, &resultWeDontCareAbout);
+          return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"renameCollection",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
-          const auto sourceNsElt = cmd.firstElement();
-          const auto targetNsElt = cmd["to"];
-          uassert(ErrorCodes::TypeMismatch,
-                  "'renameCollection' must be of type String",
-                  sourceNsElt.type() == BSONType::String);
-          uassert(ErrorCodes::TypeMismatch,
-                  "'to' must be of type String",
-                  targetNsElt.type() == BSONType::String);
-          return renameCollection(opCtx,
-                                  NamespaceString(sourceNsElt.valueStringData()),
-                                  NamespaceString(targetNsElt.valueStringData()),
-                                  cmd["dropTarget"].trueValue(),
-                                  cmd["stayTemp"].trueValue());
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
+          return renameCollectionForApplyOps(opCtx, nsToDatabase(ns), ui, cmd);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::NamespaceExists}}},
     {"applyOps",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return applyOps(opCtx, nsToDatabase(ns), cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::UnknownError}}},
     {"convertToCapped",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
-         return convertToCapped(opCtx, parseNs(ns, cmd), cmd["size"].number());
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
+         return convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
      }}},
     {"emptycapped",
-     {[](OperationContext* opCtx, const char* ns, BSONObj& cmd, const OpTime& opTime) -> Status {
-         return emptyCapped(opCtx, parseNs(ns, cmd));
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime) -> Status {
+         return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
      }}},
 };
 
@@ -731,24 +874,54 @@ Status applyOperation_inlock(OperationContext* opCtx,
 
     OpCounters* opCounters = opCtx->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
 
-    const char* names[] = {"o", "ns", "op", "b", "o2"};
-    BSONElement fields[5];
-    op.getFields(5, names, fields);
+    std::array<StringData, 6> names = {"o", "ui", "ns", "op", "b", "o2"};
+    std::array<BSONElement, 6> fields;
+    op.getFields(names, &fields);
     BSONElement& fieldO = fields[0];
-    BSONElement& fieldNs = fields[1];
-    BSONElement& fieldOp = fields[2];
-    BSONElement& fieldB = fields[3];
-    BSONElement& fieldO2 = fields[4];
+    BSONElement& fieldUI = fields[1];
+    BSONElement& fieldNs = fields[2];
+    BSONElement& fieldOp = fields[3];
+    BSONElement& fieldB = fields[4];
+    BSONElement& fieldO2 = fields[5];
 
     BSONObj o;
     if (fieldO.isABSONObj())
         o = fieldO.embeddedObject();
 
-    uassert(ErrorCodes::InvalidNamespace,
-            "'ns' must be of type String",
-            fieldNs.type() == BSONType::String);
-    const StringData ns = fieldNs.valueStringData();
-    NamespaceString requestNss{ns};
+    // operation type -- see logOp() comments for types
+    const char* opType = fieldOp.valuestrsafe();
+
+    NamespaceString requestNss;
+    Collection* collection = nullptr;
+    if (fieldUI) {
+        UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
+        auto uuid = UUID::parse(fieldUI);
+        uassertStatusOK(uuid);
+        collection = catalog.lookupCollectionByUUID(uuid.getValue());
+        if (collection) {
+            requestNss = collection->ns();
+            dassert(opCtx->lockState()->isCollectionLockedForMode(
+                requestNss.ns(), supportsDocLocking() ? MODE_IX : MODE_X));
+        }
+    } else {
+        uassert(ErrorCodes::InvalidNamespace,
+                "'ns' must be of type String",
+                fieldNs.type() == BSONType::String);
+        const StringData ns = fieldNs.valueStringData();
+        requestNss = NamespaceString(ns);
+        if (nsIsFull(ns)) {
+            if (supportsDocLocking()) {
+                // WiredTiger, and others requires MODE_IX since the applier threads driving
+                // this allow writes to the same collection on any thread.
+                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_IX));
+            } else {
+                // mmapV1 ensures that all operations to the same collection are executed from
+                // the same worker thread, so it takes an exclusive lock (MODE_X)
+                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_X));
+            }
+        }
+        collection = db->getCollection(opCtx, requestNss);
+    }
 
     BSONObj o2;
     if (fieldO2.isABSONObj())
@@ -756,27 +929,11 @@ Status applyOperation_inlock(OperationContext* opCtx,
 
     bool valueB = fieldB.booleanSafe();
 
-    if (nsIsFull(ns)) {
-        if (supportsDocLocking()) {
-            // WiredTiger, and others requires MODE_IX since the applier threads driving
-            // this allow writes to the same collection on any thread.
-            dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_IX));
-        } else {
-            // mmapV1 ensures that all operations to the same collection are executed from
-            // the same worker thread, so it takes an exclusive lock (MODE_X)
-            dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_X));
-        }
-    }
-    Collection* collection = db->getCollection(opCtx, requestNss);
     IndexCatalog* indexCatalog = collection == nullptr ? nullptr : collection->getIndexCatalog();
     const bool haveWrappingWriteUnitOfWork = opCtx->lockState()->inAWriteUnitOfWork();
     uassert(ErrorCodes::CommandNotSupportedOnView,
-            str::stream() << "applyOps not supported on view: " << ns,
-            collection || !db->getViewCatalog()->lookup(opCtx, ns));
-
-    // operation type -- see logOp() comments for types
-    const char* opType = fieldOp.valuestrsafe();
-    invariant(*opType != 'c');  // commands are processed in applyCommand_inlock()
+            str::stream() << "applyOps not supported on view: " << requestNss.ns(),
+            collection || !db->getViewCatalog()->lookup(opCtx, requestNss.ns()));
 
     if (*opType == 'i') {
         if (requestNss.isSystemDotIndexes()) {
@@ -784,44 +941,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             NamespaceString indexNss;
             std::tie(indexSpec, indexNss) =
                 repl::prepForApplyOpsIndexInsert(fieldO, op, requestNss);
-
-            // Check if collection exists.
-            auto indexCollection = db->getCollection(opCtx, indexNss);
-            uassert(ErrorCodes::NamespaceNotFound,
-                    str::stream() << "Failed to create index due to missing collection: "
-                                  << op.toString(),
-                    indexCollection);
-
-            opCounters->gotInsert();
-
-            bool relaxIndexConstraints =
-                ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, indexNss);
-            if (indexSpec["background"].trueValue()) {
-                Lock::TempRelease release(opCtx->lockState());
-                if (opCtx->lockState()->isLocked()) {
-                    // If TempRelease fails, background index build will deadlock.
-                    LOG(3) << "apply op: building background index " << indexSpec
-                           << " in the foreground because temp release failed";
-                    IndexBuilder builder(indexSpec, relaxIndexConstraints);
-                    Status status = builder.buildInForeground(opCtx, db);
-                    uassertStatusOK(status);
-                } else {
-                    IndexBuilder* builder = new IndexBuilder(indexSpec, relaxIndexConstraints);
-                    // This spawns a new thread and returns immediately.
-                    builder->go();
-                    // Wait for thread to start and register itself
-                    IndexBuilder::waitForBgIndexStarting();
-                }
-                opCtx->recoveryUnit()->abandonSnapshot();
-            } else {
-                IndexBuilder builder(indexSpec, relaxIndexConstraints);
-                Status status = builder.buildInForeground(opCtx, db);
-                uassertStatusOK(status);
-            }
-            // Since this is an index operation we can return without falling through.
-            if (incrementOpsAppliedStats) {
-                incrementOpsAppliedStats();
-            }
+            createIndexForApplyOps(opCtx, indexSpec, indexNss, incrementOpsAppliedStats);
             return Status::OK();
         }
         uassert(ErrorCodes::NamespaceNotFound,
@@ -831,9 +951,11 @@ Status applyOperation_inlock(OperationContext* opCtx,
 
         if (fieldO.type() == Array) {
             // Batched inserts.
-            std::vector<BSONObj> insertObjs;
+            std::vector<InsertStatement> insertObjs;
             for (auto elem : fieldO.Obj()) {
-                insertObjs.push_back(elem.Obj());
+                // Note: we don't care about statement ids here since the secondaries don't create
+                // their own oplog entries.
+                insertObjs.emplace_back(elem.Obj());
             }
             uassert(ErrorCodes::OperationFailed,
                     str::stream() << "Failed to apply insert due to empty array element: "
@@ -879,7 +1001,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 WriteUnitOfWork wuow(opCtx);
                 try {
                     OpDebug* const nullOpDebug = nullptr;
-                    status = collection->insertDocument(opCtx, o, nullOpDebug, true);
+                    status =
+                        collection->insertDocument(opCtx, InsertStatement(o), nullOpDebug, true);
                 } catch (DBException dbe) {
                     status = dbe.toStatus();
                 }
@@ -945,7 +1068,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     // was a simple { _id : ... } update criteria
                     string msg = str::stream() << "failed to apply update: " << redact(op);
                     error() << msg;
-                    return Status(ErrorCodes::OperationFailed, msg);
+                    return Status(ErrorCodes::UpdateOperationFailed, msg);
                 }
                 // Need to check to see if it isn't present so we can exit early with a
                 // failure. Note that adds some overhead for this extra check in some cases,
@@ -961,7 +1084,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                      Helpers::findOne(opCtx, collection, updateCriteria, false).isNull())) {
                     string msg = str::stream() << "couldn't find doc: " << redact(op);
                     error() << msg;
-                    return Status(ErrorCodes::OperationFailed, msg);
+                    return Status(ErrorCodes::UpdateOperationFailed, msg);
                 }
 
                 // Otherwise, it's present; zero objects were updated because of additional
@@ -973,7 +1096,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 if (!upsert) {
                     string msg = str::stream() << "update of non-mod failed: " << redact(op);
                     error() << msg;
-                    return Status(ErrorCodes::OperationFailed, msg);
+                    return Status(ErrorCodes::UpdateOperationFailed, msg);
                 }
             }
         }
@@ -1000,6 +1123,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             incrementOpsAppliedStats();
         }
     } else {
+        invariant(*opType != 'c');  // commands are processed in applyCommand_inlock()
         throw MsgAssertionException(
             14825, str::stream() << "error in applyOperation : unknown opType " << *opType);
     }
@@ -1010,12 +1134,13 @@ Status applyOperation_inlock(OperationContext* opCtx,
 Status applyCommand_inlock(OperationContext* opCtx,
                            const BSONObj& op,
                            bool inSteadyStateReplication) {
-    const char* names[] = {"o", "ns", "op"};
-    BSONElement fields[3];
-    op.getFields(3, names, fields);
+    std::array<StringData, 4> names = {"o", "ui", "ns", "op"};
+    std::array<BSONElement, 4> fields;
+    op.getFields(names, &fields);
     BSONElement& fieldO = fields[0];
-    BSONElement& fieldNs = fields[1];
-    BSONElement& fieldOp = fields[2];
+    BSONElement& fieldUI = fields[1];
+    BSONElement& fieldNs = fields[2];
+    BSONElement& fieldOp = fields[3];
 
     const char* opType = fieldOp.valuestrsafe();
     invariant(*opType == 'c');  // only commands are processed here
@@ -1079,7 +1204,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
         ApplyOpMetadata curOpToApply = op->second;
         Status status = Status::OK();
         try {
-            status = curOpToApply.applyFunc(opCtx, nss.ns().c_str(), o, opTime);
+            status = curOpToApply.applyFunc(opCtx, nss.ns().c_str(), fieldUI, o, opTime);
         } catch (...) {
             status = exceptionToStatus();
         }

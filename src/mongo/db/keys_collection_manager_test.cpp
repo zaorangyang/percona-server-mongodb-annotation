@@ -37,6 +37,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
 #include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/config_server_test_fixture.h"
 #include "mongo/s/grid.h"
@@ -56,6 +57,10 @@ public:
 protected:
     void setUp() override {
         ConfigServerTestFixture::setUp();
+
+        serverGlobalParams.featureCompatibility.version.store(
+            ServerGlobalParams::FeatureCompatibility::Version::k36);
+        serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.store(true);
 
         auto clockSource = stdx::make_unique<ClockSourceMock>();
         operationContext()->getServiceContext()->setFastClockSource(std::move(clockSource));
@@ -312,6 +317,73 @@ TEST_F(KeysManagerTest, ShouldStillBeAbleToUpdateCacheEvenIfItCantCreateKeys) {
     ASSERT_EQ(1, key.getKeyId());
     ASSERT_EQ(origKey1.getKey(), key.getKey());
     ASSERT_EQ(Timestamp(105, 0), key.getExpiresAt().asTimestamp());
+}
+
+TEST_F(KeysManagerTest, ShouldNotCreateKeysWithDisableKeyGenerationFailPoint) {
+    const LogicalTime currentTime(Timestamp(100, 0));
+    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+
+    {
+        FailPointEnableBlock failKeyGenerationBlock("disableKeyGeneration");
+        keyManager()->startMonitoring(getServiceContext());
+        keyManager()->enableKeyGenerator(operationContext(), true);
+
+        keyManager()->refreshNow(operationContext());
+        auto keyStatus = keyManager()->getKeyForValidation(
+            operationContext(), 1, LogicalTime(Timestamp(100, 0)));
+        ASSERT_EQ(ErrorCodes::KeyNotFound, keyStatus.getStatus());
+    }
+
+    // Once the failpoint is disabled, the generator can make keys again.
+    keyManager()->refreshNow(operationContext());
+    auto keyStatus = keyManager()->getKeyForSigning(LogicalTime(Timestamp(100, 0)));
+    ASSERT_OK(keyStatus.getStatus());
+}
+
+TEST_F(KeysManagerTest, HasSeenKeysIsFalseUntilKeysAreFound) {
+    const LogicalTime currentTime(Timestamp(100, 0));
+    LogicalClock::get(operationContext())->setClusterTimeFromTrustedSource(currentTime);
+
+    ASSERT_EQ(false, keyManager()->hasSeenKeys());
+
+    {
+        FailPointEnableBlock failKeyGenerationBlock("disableKeyGeneration");
+        keyManager()->startMonitoring(getServiceContext());
+        keyManager()->enableKeyGenerator(operationContext(), true);
+
+        keyManager()->refreshNow(operationContext());
+        auto keyStatus = keyManager()->getKeyForValidation(
+            operationContext(), 1, LogicalTime(Timestamp(100, 0)));
+        ASSERT_EQ(ErrorCodes::KeyNotFound, keyStatus.getStatus());
+
+        ASSERT_EQ(false, keyManager()->hasSeenKeys());
+    }
+
+    // Once the failpoint is disabled, the generator can make keys again.
+    keyManager()->refreshNow(operationContext());
+    auto keyStatus = keyManager()->getKeyForSigning(LogicalTime(Timestamp(100, 0)));
+    ASSERT_OK(keyStatus.getStatus());
+
+    ASSERT_EQ(true, keyManager()->hasSeenKeys());
+}
+
+TEST_F(KeysManagerTest, ShouldNotReturnKeysInFeatureCompatibilityVersion34) {
+    serverGlobalParams.featureCompatibility.version.store(
+        ServerGlobalParams::FeatureCompatibility::Version::k34);
+
+    keyManager()->startMonitoring(getServiceContext());
+    keyManager()->enableKeyGenerator(operationContext(), true);
+
+    KeysCollectionDocument origKey(
+        1, "dummy", TimeProofService::generateRandomKey(), LogicalTime(Timestamp(105, 0)));
+    ASSERT_OK(insertToConfigCollection(
+        operationContext(), NamespaceString(KeysCollectionDocument::ConfigNS), origKey.toBSON()));
+
+    keyManager()->refreshNow(operationContext());
+
+    auto keyStatus =
+        keyManager()->getKeyForValidation(operationContext(), 1, LogicalTime(Timestamp(100, 0)));
+    ASSERT_EQ(ErrorCodes::KeyNotFound, keyStatus.getStatus());
 }
 
 }  // namespace mongo

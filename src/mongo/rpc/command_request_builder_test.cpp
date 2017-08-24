@@ -49,27 +49,20 @@ TEST(CommandRequestBuilder, RoundTrip) {
     commandArgsBob.append(commandName, "baz");
     auto commandArgs = commandArgsBob.done();
 
-    BSONObjBuilder inputDoc1Bob{};
-    inputDoc1Bob.append("z", "t");
-    auto inputDoc1 = inputDoc1Bob.done();
+    auto request = OpMsgRequest::fromDBAndBody(databaseName, commandArgs, metadata);
+    request.sequences.push_back({"sequence", {BSON("a" << 1), BSON("b" << 2)}});
+    auto msg = rpc::opCommandRequestFromOpMsgRequest(request);
 
-    BSONObjBuilder inputDoc2Bob{};
-    inputDoc2Bob.append("h", "j");
-    auto inputDoc2 = inputDoc2Bob.done();
-
-    BSONObjBuilder inputDoc3Bob{};
-    inputDoc3Bob.append("g", "p");
-    auto inputDoc3 = inputDoc3Bob.done();
-
-    auto msg = rpc::opCommandRequestFromOpMsgRequest(
-        OpMsgRequest::fromDBAndBody(databaseName, commandArgs, metadata));
+    auto bodyAndSequence = BSONObjBuilder(commandArgs)
+                               .append("sequence", BSON_ARRAY(BSON("a" << 1) << BSON("b" << 2)))
+                               .obj();
 
     auto parsed = mongo::rpc::ParsedOpCommand::parse(msg);
 
     ASSERT_EQUALS(parsed.database, databaseName);
     ASSERT_EQUALS(StringData(parsed.body.firstElementFieldName()), commandName);
     ASSERT_BSONOBJ_EQ(parsed.metadata, metadata);
-    ASSERT_BSONOBJ_EQ(parsed.body, commandArgs);
+    ASSERT_BSONOBJ_EQ(parsed.body, bodyAndSequence);
 }
 
 TEST(CommandRequestBuilder, DownconvertSecondaryReadPreferenceToSSM) {

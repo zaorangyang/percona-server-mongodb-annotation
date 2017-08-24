@@ -11,7 +11,10 @@
     // Verifies causal consistency is either enabled or disabled for each given command name.
     function checkCausalConsistencySupportForCommandNames(cmdNames, isEnabled) {
         cmdNames.forEach(function(cmdName) {
-            assert.eq(testDB.getMongo().isCausalConsistencyEnabled(cmdName, {}),
+            var cmd = {};
+            cmd[cmdName] = 1;
+
+            assert.eq(testDB.getMongo().isCausalConsistencyEnabled(cmd),
                       isEnabled,
                       "expected causal consistency support for command, " + cmdName + ", to be " +
                           isEnabled);
@@ -50,7 +53,7 @@
     function commandReturnsExpectedResult(cmdObj, db, resCallback) {
         const mongo = db.getMongo();
 
-        // Use the latest logical time returned as a new operationTime and run command.
+        // Use the latest cluster time returned as a new operationTime and run command.
         const clusterTimeObj = mongo.getClusterTime();
         mongo.setOperationTime(clusterTimeObj.clusterTime);
         const res = assert.commandWorked(testDB.runCommand(cmdObj));
@@ -106,11 +109,8 @@
 
     // Start the sharding test and add the majority readConcern enabled replica set.
     const name = "causal_consistency_shell_support";
-    const st = new ShardingTest({
-        name: name,
-        shards: 1,
-        manualAddShard: true,
-    });
+    const st =
+        new ShardingTest({name: name, shards: 1, manualAddShard: true, mongosWaitsForKeys: true});
     assert.commandWorked(st.s.adminCommand({addShard: rst.getURL()}));
 
     const testDB = st.s.getDB("test");
@@ -136,8 +136,8 @@
     checkCausalConsistencySupportForCommandNames(supportedCommandNames, false);
     checkCausalConsistencySupportForCommandNames(unsupportedCommandNames, false);
 
-    // Verify logical times are tracked even before causal consistency is set (so the first
-    // operation with causal consistency set can use valid logical times).
+    // Verify cluster times are tracked even before causal consistency is set (so the first
+    // operation with causal consistency set can use valid cluster times).
     mongo._operationTime = null;
     mongo._clusterTime = null;
 
@@ -157,7 +157,7 @@
     runCommandAndCheckLogicalTimes(
         {update: "foo", updates: [{q: {x: 2}, u: {$set: {x: 3}}}]}, testDB, true);
 
-    // Test that each supported command works as expected and the shell's logical times are properly
+    // Test that each supported command works as expected and the shell's cluster times are properly
     // forwarded to the server and updated based on the response.
     mongo.setCausalConsistency(true);
 

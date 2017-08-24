@@ -2032,6 +2032,35 @@ TEST_F(TopoCoordTest, BecomeCandidateWhenBecomingSecondaryInSingleNodeSet) {
     ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
 }
 
+TEST_F(TopoCoordTest, DoNotBecomeCandidateWhenBecomingSecondaryInSingleNodeSetIfInMaintenanceMode) {
+    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version"
+                      << 1
+                      << "members"
+                      << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                               << "hself"))),
+                 0);
+    ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
+
+    // If we are the only node and we are in maintenance mode, we should not become a candidate when
+    // we transition to SECONDARY.
+    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    getTopoCoord().adjustMaintenanceCountBy(1);
+    getTopoCoord().setFollowerMode(MemberState::RS_SECONDARY);
+    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+
+    // getMemberState() returns RS_RECOVERING while we are in maintenance mode even though
+    // _memberState is set to RS_SECONDARY.
+    ASSERT_EQUALS(MemberState::RS_RECOVERING, getTopoCoord().getMemberState().s);
+
+    // Once we are no longer in maintenance mode, getMemberState() should return RS_SECONDARY.
+    getTopoCoord().adjustMaintenanceCountBy(-1);
+    ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
+}
+
 TEST_F(TopoCoordTest, BecomeCandidateWhenReconfigToBeElectableInSingleNodeSet) {
     ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
@@ -2065,6 +2094,42 @@ TEST_F(TopoCoordTest, BecomeCandidateWhenReconfigToBeElectableInSingleNodeSet) {
                                                << "hself"))),
                  0);
     ASSERT_TRUE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+}
+
+TEST_F(TopoCoordTest,
+       DoNotBecomeCandidateWhenReconfigToBeElectableInSingleNodeSetIfInMaintenanceMode) {
+    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
+    ReplSetConfig cfg;
+    ASSERT_OK(cfg.initialize(BSON("_id"
+                                  << "rs0"
+                                  << "version"
+                                  << 1
+                                  << "members"
+                                  << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                           << "hself"
+                                                           << "priority"
+                                                           << 0)))));
+    getTopoCoord().updateConfig(cfg, 0, now()++);
+    ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
+
+    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    getTopoCoord().setFollowerMode(MemberState::RS_SECONDARY);
+    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
+
+    // We should not become a candidate when we reconfig to become electable if we are currently in
+    // maintenance mode.
+    getTopoCoord().adjustMaintenanceCountBy(1);
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version"
+                      << 1
+                      << "members"
+                      << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                               << "hself"))),
+                 0);
+    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
 }
 
 TEST_F(TopoCoordTest, NodeDoesNotBecomeCandidateWhenBecomingSecondaryInSingleNodeSetIfUnelectable) {
@@ -3762,6 +3827,76 @@ TEST_F(HeartbeatResponseTestV1, UpdateHeartbeatDataTermPreventsPriorityTakeover)
         HostAndPort("host1"), "rs0", MemberState::RS_SECONDARY, election, election);
     ASSERT_EQUALS(HeartbeatResponseAction::NoAction, nextAction.getAction());
     ASSERT_EQUALS(2, getCurrentPrimaryIndex());
+}
+
+TEST_F(HeartbeatResponseTestV1,
+       ScheduleACatchupTakeoverWhenElectableAndReceiveHeartbeatFromPrimaryInCatchup) {
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version"
+                      << 5
+                      << "members"
+                      << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                               << "host1:27017")
+                                    << BSON("_id" << 1 << "host"
+                                                  << "host2:27017")
+                                    << BSON("_id" << 6 << "host"
+                                                  << "host7:27017"))
+                      << "protocolVersion"
+                      << 1
+                      << "settings"
+
+                      << BSON("heartbeatTimeoutSecs" << 5)),
+                 0);
+
+    setSelfMemberState(MemberState::RS_SECONDARY);
+
+    OpTime election = OpTime();
+    OpTime lastOpTimeAppliedSecondary = OpTime(Timestamp(300, 0), 0);
+    OpTime lastOpTimeAppliedPrimary = OpTime(Timestamp(200, 0), 0);
+
+    ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
+    getTopoCoord().getMyMemberData()->setLastAppliedOpTime(lastOpTimeAppliedSecondary, Date_t());
+    HeartbeatResponseAction nextAction = receiveUpHeartbeat(
+        HostAndPort("host2"), "rs0", MemberState::RS_PRIMARY, election, lastOpTimeAppliedPrimary);
+    ASSERT_EQUALS(HeartbeatResponseAction::CatchupTakeover, nextAction.getAction());
+    ASSERT_EQUALS(1, getCurrentPrimaryIndex());
+}
+
+TEST_F(HeartbeatResponseTestV1,
+       ScheduleACatchupTakeoverWhenBothCatchupAndPriorityTakeoverPossible) {
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version"
+                      << 5
+                      << "members"
+                      << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                               << "host0:27017"
+                                               << "priority"
+                                               << 2)
+                                    << BSON("_id" << 1 << "host"
+                                                  << "host2:27017")
+                                    << BSON("_id" << 6 << "host"
+                                                  << "host7:27017"))
+                      << "protocolVersion"
+                      << 1
+                      << "settings"
+
+                      << BSON("heartbeatTimeoutSecs" << 5)),
+                 0);
+
+    setSelfMemberState(MemberState::RS_SECONDARY);
+
+    OpTime election = OpTime();
+    OpTime lastOpTimeAppliedSecondary = OpTime(Timestamp(300, 0), 0);
+    OpTime lastOpTimeAppliedPrimary = OpTime(Timestamp(200, 0), 0);
+
+    ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
+    getTopoCoord().getMyMemberData()->setLastAppliedOpTime(lastOpTimeAppliedSecondary, Date_t());
+    HeartbeatResponseAction nextAction = receiveUpHeartbeat(
+        HostAndPort("host2"), "rs0", MemberState::RS_PRIMARY, election, lastOpTimeAppliedPrimary);
+    ASSERT_EQUALS(HeartbeatResponseAction::CatchupTakeover, nextAction.getAction());
+    ASSERT_EQUALS(1, getCurrentPrimaryIndex());
 }
 
 TEST_F(HeartbeatResponseTestV1,

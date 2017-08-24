@@ -33,12 +33,16 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/server_options.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
 
 namespace {
+
+MONGO_FP_DECLARE(disableKeyGeneration);
 
 /**
  * Inserts a new key to the keys collection.
@@ -77,6 +81,15 @@ KeysCollectionCacheReaderAndUpdater::KeysCollectionCacheReaderAndUpdater(
 
 StatusWith<KeysCollectionDocument> KeysCollectionCacheReaderAndUpdater::refresh(
     OperationContext* opCtx) {
+
+    if (MONGO_FAIL_POINT(disableKeyGeneration)) {
+        return {ErrorCodes::FailPointEnabled, "key generation disabled"};
+    }
+
+    if (serverGlobalParams.featureCompatibility.version.load() ==
+        ServerGlobalParams::FeatureCompatibility::Version::k34) {
+        return KeysCollectionCacheReader::refresh(opCtx);
+    }
 
     auto currentTime = LogicalClock::get(opCtx)->getClusterTime();
     auto keyStatus = _catalogClient->getNewKeys(

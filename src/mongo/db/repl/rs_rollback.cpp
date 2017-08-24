@@ -50,12 +50,14 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -65,6 +67,7 @@
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -83,10 +86,6 @@ using std::string;
 using std::pair;
 
 namespace repl {
-
-// Failpoint which causes rollback to hang before finishing.
-MONGO_FP_DECLARE(rollbackHangBeforeFinish);
-MONGO_FP_DECLARE(rollbackHangThenFailAfterWritingMinValid);
 
 using namespace rollback_internal;
 
@@ -133,173 +132,203 @@ void FixUpInfo::removeRedundantOperations() {
 Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInfo,
                                                              const BSONObj& ourObj) {
 
-    const char* op = ourObj.getStringField("op");
-
-    if (*op == 'n')
-        return Status::OK();
-
     // Checks that the oplog entry is smaller than 512 MB. We do not roll back if the
     // oplog entry is larger than 512 MB.
     if (ourObj.objsize() > 512 * 1024 * 1024)
         throw RSFatalException(str::stream() << "Rollback too large, oplog size: "
                                              << ourObj.objsize());
 
-    DocID doc;
-    doc.ownedObj = ourObj.getOwned();
-    doc.ns = doc.ownedObj.getStringField("ns");
+    auto oplogEntry = OplogEntry(ourObj);
+    NamespaceString nss = oplogEntry.getNamespace();
+    auto uuid = oplogEntry.getUuid();
 
-    if (*doc.ns == '\0') {
+    if (oplogEntry.getOpType() == OpTypeEnum::kNoop)
+        return Status::OK();
+
+    DocID doc;
+    doc.ownedObj = oplogEntry.raw;
+    doc.ns = oplogEntry.raw.getStringField("ns");
+
+    if (oplogEntry.getNamespace().isEmpty()) {
         throw RSFatalException(str::stream() << "Local op on rollback has no ns: "
-                                             << redact(doc.ownedObj));
+                                             << redact(oplogEntry.toBSON()));
     }
 
-    BSONObj obj = doc.ownedObj.getObjectField(*op == 'u' ? "o2" : "o");
+    BSONObj obj =
+        oplogEntry.raw.getObjectField(oplogEntry.getOpType() == OpTypeEnum::kUpdate ? "o2" : "o");
 
     if (obj.isEmpty()) {
         throw RSFatalException(str::stream() << "Local op on rollback has no object field: "
-                                             << redact(doc.ownedObj));
+                                             << redact(oplogEntry.toBSON()));
     }
 
-    if (*op == 'c') {
+    // If the operation being rolled back has a txnNumber, then the corresponding entry in the
+    // session transaction table needs to be refetched.
+    auto operationSessionInfo = oplogEntry.getOperationSessionInfo();
+    auto txnNumber = operationSessionInfo.getTxnNumber();
+    if (txnNumber) {
+        auto sessionId = operationSessionInfo.getSessionId();
+        invariant(sessionId);
+        invariant(oplogEntry.getStatementId());
+
+        DocID txnDoc;
+        BSONObjBuilder txnBob;
+        txnBob.append("_id", sessionId->toBSON());
+        txnDoc.ownedObj = txnBob.obj();
+        txnDoc._id = txnDoc.ownedObj.firstElement();
+        // TODO: SERVER-29667
+        // Once collection uuids replace namespace strings for rollback, this will need to be
+        // changed to the uuid of the session transaction table collection.
+        txnDoc.ns = NamespaceString::kSessionTransactionsTableNamespace.ns().c_str();
+
+        fixUpInfo.docsToRefetch.insert(txnDoc);
+        fixUpInfo.refetchTransactionDocs = true;
+    }
+
+    if (oplogEntry.getOpType() == OpTypeEnum::kCommand) {
 
         // The first element of the object is the name of the command
         // and the collection it is acting on, e.x. {renameCollection: "test.x"}.
         BSONElement first = obj.firstElement();
 
-        // Retrieves the namespace string.
-        NamespaceString nss(doc.ns);  // foo.$cmd
+        switch (oplogEntry.getCommandType()) {
+            case OplogEntry::CommandType::kCreate: {
+                // Create collection operation
+                // {
+                //     ts: ...,
+                //     h: ...,
+                //     op: "c",
+                //     ns: "foo.$cmd",
+                //     o: {
+                //            create: "abc", ...
+                //        }
+                //     ...
+                // }
 
-        // Retrieves the command name, so out of {renameCollection: "test.x"} it returns
-        // "renameCollection".
-        string cmdname = first.fieldName();
-        Command* cmd = Command::findCommand(cmdname.c_str());
-        if (cmd == NULL) {
-            severe() << "Rollback no such command " << first.fieldName();
-            return Status(ErrorCodes::UnrecoverableRollbackError,
-                          str::stream() << "Rollback no such command " << first.fieldName(),
-                          18751);
-        }
-        if (cmdname == "create") {
-            // Create collection operation
-            // {
-            //     ts: ...,
-            //     h: ...,
-            //     op: "c",
-            //     ns: "foo.$cmd",
-            //     o: {
-            //            create: "abc", ...
-            //        }
-            //     ...
-            // }
-
-            string ns = nss.db().toString() + '.' + first.valuestr();  // -> foo.abc
-            fixUpInfo.collectionsToDrop.insert(ns);
-            return Status::OK();
-        } else if (cmdname == "drop") {
-            // Drop collection operation
-            // {
-            //     ts: ...,
-            //     h: ...,
-            //     op: "c",
-            //     ns: "foo.$cmd",
-            //     o: {
-            //            drop: "abc"
-            //        }
-            //     ...
-            // }
-            string ns = nss.db().toString() + '.' + first.valuestr();  // -> foo.abc
-            fixUpInfo.collectionsToResyncData.insert(ns);
-            return Status::OK();
-        } else if (cmdname == "dropIndexes" || cmdname == "deleteIndexes") {
-            // TODO: This is bad.  We simply full resync the collection here,
-            //       which could be very slow.
-            warning() << "Rollback of dropIndexes is slow in this version of "
-                      << "mongod.";
-            string ns = nss.db().toString() + '.' + first.valuestr();
-            fixUpInfo.collectionsToResyncData.insert(ns);
-            return Status::OK();
-        } else if (cmdname == "renameCollection") {
-            // TODO: Slow.
-            warning() << "Rollback of renameCollection is slow in this version of "
-                      << "mongod.";
-            string from = first.valuestr();
-            string to = obj["to"].String();
-            fixUpInfo.collectionsToResyncData.insert(from);
-            fixUpInfo.collectionsToResyncData.insert(to);
-            return Status::OK();
-        } else if (cmdname == "dropDatabase") {
-            string message = "Can't roll back drop database. Full resync will be required.";
-            severe() << message << redact(obj);
-            throw RSFatalException(message);
-        } else if (cmdname == "collMod") {
-            const auto ns = NamespaceString(cmd->parseNs(nss.db().toString(), obj));
-            for (auto field : obj) {
-                // Example collMod obj
-                // o:{
-                //       collMod : "x",
-                //       validationLevel : "off",
-                //       index: {
-                //                  name: "indexName_1",
-                //                  expireAfterSeconds: 600
-                //              }
-                //    }
-
-                const auto modification = field.fieldNameStringData();
-                if (modification == cmdname) {
-                    continue;  // Skips the command name. The first field in the obj will be the
-                               // command name.
-                }
-
-                if (modification == "validator" || modification == "validationAction" ||
-                    modification == "validationLevel" || modification == "usePowerOf2Sizes" ||
-                    modification == "noPadding") {
-                    fixUpInfo.collectionsToResyncMetadata.insert(ns.ns());
-                    continue;
-                }
-                // Some collMod fields cannot be rolled back, such as the index field.
-                string message = "Cannot roll back a collMod command: ";
-                severe() << message << redact(obj);
-                throw RSFatalException(message);
+                string ns = nss.db().toString() + '.' + first.valuestr();  // -> foo.abc
+                fixUpInfo.collectionsToDrop.insert(ns);
+                return Status::OK();
             }
-            return Status::OK();
-        } else if (cmdname == "applyOps") {
-
-            if (first.type() != Array) {
-                std::string message = str::stream()
-                    << "Expected applyOps argument to be an array; found " << redact(first);
-                severe() << message;
-                return Status(ErrorCodes::UnrecoverableRollbackError, message);
+            case OplogEntry::CommandType::kDrop: {
+                // Drop collection operation
+                // {
+                //     ts: ...,
+                //     h: ...,
+                //     op: "c",
+                //     ns: "foo.$cmd",
+                //     o: {
+                //            drop: "abc"
+                //        }
+                //     ...
+                // }
+                // TODO: Delete this when UUIDs are enabled. (SERVER-29815)
+                if (!uuid) {
+                    string ns = nss.db().toString() + '.' + first.valuestr();
+                    fixUpInfo.collectionsToResyncData.insert(ns);
+                    return Status::OK();
+                }
+                string collName = first.valuestr();
+                fixUpInfo.collectionsToRollBackPendingDrop.emplace(
+                    *uuid, std::make_pair(oplogEntry.getOpTime(), collName));
+                return Status::OK();
             }
-            for (const auto& subopElement : first.Array()) {
-                if (subopElement.type() != Object) {
+            case OplogEntry::CommandType::kDropIndexes: {
+                // TODO: This is bad.  We simply full resync the collection here,
+                //       which could be very slow.
+                warning() << "Rollback of dropIndexes is slow in this version of "
+                          << "mongod.";
+                string ns = nss.db().toString() + '.' + first.valuestr();
+                fixUpInfo.collectionsToResyncData.insert(ns);
+                return Status::OK();
+            }
+            case OplogEntry::CommandType::kRenameCollection: {
+                // TODO: Slow.
+                warning() << "Rollback of renameCollection is slow in this version of "
+                          << "mongod.";
+                string from = first.valuestr();
+                string to = obj["to"].String();
+                fixUpInfo.collectionsToResyncData.insert(from);
+                fixUpInfo.collectionsToResyncData.insert(to);
+                return Status::OK();
+            }
+            case OplogEntry::CommandType::kDropDatabase: {
+                // Since we wait for all internal collection drops to be committed before recording
+                // a 'dropDatabase' oplog entry, this will always create an empty database.
+                // Creating an empty database doesn't mean anything, so we do nothing.
+                return Status::OK();
+            }
+            case OplogEntry::CommandType::kCollMod: {
+                const auto ns = nss.db().toString() + '.' + first.valuestr();  // -> foo.abc
+                for (auto field : obj) {
+                    // Example collMod obj
+                    // o:{
+                    //       collMod : "x",
+                    //       validationLevel : "off",
+                    //       index: {
+                    //                  name: "indexName_1",
+                    //                  expireAfterSeconds: 600
+                    //              }
+                    //    }
+
+                    const auto modification = field.fieldNameStringData();
+                    if (modification == "collMod") {
+                        continue;  // Skips the command name. The first field in the obj will be the
+                                   // command name.
+                    }
+
+                    if (modification == "validator" || modification == "validationAction" ||
+                        modification == "validationLevel" || modification == "usePowerOf2Sizes" ||
+                        modification == "noPadding") {
+                        fixUpInfo.collectionsToResyncMetadata.insert(ns);
+                        continue;
+                    }
+                    // Some collMod fields cannot be rolled back, such as the index field.
+                    string message = "Cannot roll back a collMod command: ";
+                    severe() << message << redact(obj);
+                    throw RSFatalException(message);
+                }
+                return Status::OK();
+            }
+            case OplogEntry::CommandType::kApplyOps: {
+                if (first.type() != Array) {
                     std::string message = str::stream()
-                        << "Expected applyOps operations to be of Object type, but found "
-                        << redact(subopElement);
+                        << "Expected applyOps argument to be an array; found " << redact(first);
                     severe() << message;
                     return Status(ErrorCodes::UnrecoverableRollbackError, message);
                 }
-                // In applyOps, the object contains an array of different oplog entries, we call
-                // updateFixUpInfoFromLocalOplogEntry here in order to record the information
-                // needed for rollback that is contained within the applyOps, creating a nested
-                // call.
-                auto subStatus = updateFixUpInfoFromLocalOplogEntry(fixUpInfo, subopElement.Obj());
-                if (!subStatus.isOK()) {
-                    return subStatus;
+                for (const auto& subopElement : first.Array()) {
+                    if (subopElement.type() != Object) {
+                        std::string message = str::stream()
+                            << "Expected applyOps operations to be of Object type, but found "
+                            << redact(subopElement);
+                        severe() << message;
+                        return Status(ErrorCodes::UnrecoverableRollbackError, message);
+                    }
+                    // In applyOps, the object contains an array of different oplog entries, we call
+                    // updateFixUpInfoFromLocalOplogEntry here in order to record the information
+                    // needed for rollback that is contained within the applyOps, creating a nested
+                    // call.
+                    auto subStatus =
+                        updateFixUpInfoFromLocalOplogEntry(fixUpInfo, subopElement.Obj());
+                    if (!subStatus.isOK()) {
+                        return subStatus;
+                    }
                 }
+                return Status::OK();
             }
-            return Status::OK();
-        } else {
-            std::string message = str::stream() << "Can't roll back this command yet: "
-                                                << " cmdname = " << cmdname;
-            severe() << message << " document: " << redact(obj);
-            throw RSFatalException(message);
+            default: {
+                std::string message = str::stream() << "Can't roll back this command yet: "
+                                                    << " cmdname = " << first.fieldName();
+                severe() << message << " document: " << redact(obj);
+                throw RSFatalException(message);
+            }
         }
     }
 
-    NamespaceString nss(doc.ns);
     if (nss.isSystemDotIndexes()) {
-        if (*op != 'i') {
-            std::string message = str::stream() << "Unexpected operation type '" << *op
+        if (oplogEntry.getOpType() != OpTypeEnum::kInsert) {
+            std::string message = str::stream() << "Unexpected operation type '"
+                                                << oplogEntry.raw.getStringField("op")
                                                 << "' on system.indexes operation, "
                                                 << "document: ";
             severe() << message << redact(doc.ownedObj);
@@ -339,10 +368,10 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
         return Status::OK();
     }
 
-    doc._id = obj["_id"];
+    doc._id = oplogEntry.getIdElement();
     if (doc._id.eoo()) {
         std::string message = str::stream() << "Cannot roll back op with no _id. ns: " << doc.ns;
-        severe() << message << ", document: " << redact(doc.ownedObj);
+        severe() << message << ", document: " << redact(oplogEntry.toBSON());
         throw RSFatalException(message);
     }
 
@@ -368,18 +397,18 @@ void checkRbidAndUpdateMinValid(OperationContext* opCtx,
     // 3. Sets our minValid to the previously fetched OpTime of the top of their oplog.
     const auto newMinValidDoc = rollbackSource.getLastOperation();
     if (newMinValidDoc.isEmpty()) {
-        uasserted(40361, "rollback error newest oplog entry on source is missing or empty");
+        uasserted(40500, "rollback error newest oplog entry on source is missing or empty");
     }
     if (rbid != rollbackSource.getRollbackId()) {
         // Our source rolled back so the data we received is not necessarily consistent.
-        uasserted(40365, "rollback rbid on source changed during rollback, canceling this attempt");
+        uasserted(40508, "rollback rbid on source changed during rollback, canceling this attempt");
     }
 
     // We have items we are writing that aren't from a point-in-time. Thus, it is best not to come
     // online until we get to that point in freshness. In other words, we do not transition from
     // RECOVERING state to SECONDARY state until we have reached the minValid oplog entry.
 
-    OpTime minValid = fassertStatusOK(28774, OpTime::parseFromOplogEntry(newMinValidDoc));
+    OpTime minValid = fassertStatusOK(40492, OpTime::parseFromOplogEntry(newMinValidDoc));
     log() << "Setting minvalid to " << minValid;
     replicationProcess->getConsistencyMarkers()->setAppliedThrough(opCtx, {});  // Use top of oplog.
     replicationProcess->getConsistencyMarkers()->setMinValid(opCtx, minValid);
@@ -393,7 +422,7 @@ void checkRbidAndUpdateMinValid(OperationContext* opCtx,
             invariant(!globalInShutdownDeprecated());  // It is an error to shutdown while enabled.
             mongo::sleepsecs(1);
         }
-        uasserted(40378,
+        uasserted(40502,
                   "failing rollback due to rollbackHangThenFailAfterWritingMinValid fail point");
     }
 }
@@ -455,6 +484,17 @@ void syncFixUp(OperationContext* opCtx,
 
     invariant(!fixUpInfo.commonPointOurDiskloc.isNull());
 
+    log() << "Rolling back any collections pending being dropped";
+
+    // Roll back any drop-pending collections. This must be done first so that the collection
+    // exists when we attempt to resync its metadata or insert documents into it.
+    for (const auto& collPair : fixUpInfo.collectionsToRollBackPendingDrop) {
+        const auto& optime = collPair.second.first;
+        const auto& collName = collPair.second.second;
+        DropPendingCollectionReaper::get(opCtx)->rollBackDropPendingCollection(
+            opCtx, optime, collName);
+    }
+
     // Full collection data and metadata resync.
     if (!fixUpInfo.collectionsToResyncData.empty() ||
         !fixUpInfo.collectionsToResyncMetadata.empty()) {
@@ -474,7 +514,7 @@ void syncFixUp(OperationContext* opCtx,
                 Database* db = dbHolder().openDb(opCtx, nss.db().toString());
                 invariant(db);
                 WriteUnitOfWork wunit(opCtx);
-                fassertStatusOK(40359, db->dropCollectionEvenIfSystem(opCtx, nss));
+                fassertStatusOK(40505, db->dropCollectionEvenIfSystem(opCtx, nss));
                 wunit.commit();
             }
 
@@ -622,7 +662,7 @@ void syncFixUp(OperationContext* opCtx,
             }
 
             WriteUnitOfWork wunit(opCtx);
-            fassertStatusOK(40360, db->dropCollectionEvenIfSystem(opCtx, nss));
+            fassertStatusOK(40504, db->dropCollectionEvenIfSystem(opCtx, nss));
             wunit.commit();
         }
     }
@@ -762,13 +802,12 @@ void syncFixUp(OperationContext* opCtx,
                                     } catch (const DBException& e) {
                                         if (e.getCode() == 13415) {
                                             // hack: need to just make cappedTruncate do this...
-                                            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-                                                WriteUnitOfWork wunit(opCtx);
-                                                uassertStatusOK(collection->truncate(opCtx));
-                                                wunit.commit();
-                                            }
-                                            MONGO_WRITE_CONFLICT_RETRY_LOOP_END(
-                                                opCtx, "truncate", collection->ns().ns());
+                                            writeConflictRetry(
+                                                opCtx, "truncate", collection->ns().ns(), [&] {
+                                                    WriteUnitOfWork wunit(opCtx);
+                                                    uassertStatusOK(collection->truncate(opCtx));
+                                                    wunit.commit();
+                                                });
                                         } else {
                                             throw e;
                                         }
@@ -830,7 +869,7 @@ void syncFixUp(OperationContext* opCtx,
         OldClientContext ctx(opCtx, rsOplogName);
         Collection* oplogCollection = ctx.db()->getCollection(opCtx, oplogNss);
         if (!oplogCollection) {
-            fassertFailedWithStatusNoTrace(13423,
+            fassertFailedWithStatusNoTrace(40495,
                                            Status(ErrorCodes::UnrecoverableRollbackError,
                                                   str::stream() << "Can't find " << rsOplogName));
         }
@@ -841,7 +880,12 @@ void syncFixUp(OperationContext* opCtx,
     Status status = getGlobalAuthorizationManager()->initialize(opCtx);
     if (!status.isOK()) {
         severe() << "Failed to reinitialize auth data after rollback: " << redact(status);
-        fassertFailedNoTrace(40366);
+        fassertFailedNoTrace(40496);
+    }
+
+    // If necessary, clear the in-memory session transaction table.
+    if (fixUpInfo.refetchTransactionDocs) {
+        SessionCatalog::get(opCtx)->clearTransactionTable();
     }
 
     // Reload the lastAppliedOpTime and lastDurableOpTime value in the replcoord and the
@@ -861,7 +905,7 @@ Status _syncRollback(OperationContext* opCtx,
     log() << "Starting rollback. Sync source: " << rollbackSource.getSource() << rsLog;
     how.rbid = rollbackSource.getRollbackId();
     uassert(
-        40362, "Upstream node rolled back. Need to retry our rollback.", how.rbid == requiredRBID);
+        40506, "Upstream node rolled back. Need to retry our rollback.", how.rbid == requiredRBID);
 
     log() << "Finding the Common Point";
     try {
@@ -901,7 +945,7 @@ Status _syncRollback(OperationContext* opCtx,
     try {
         ON_BLOCK_EXIT([&] {
             auto status = replicationProcess->incrementRollbackID(opCtx);
-            fassertStatusOK(40425, status);
+            fassertStatusOK(40497, status);
         });
         syncFixUp(opCtx, how, rollbackSource, replCoord, replicationProcess);
     } catch (const RSFatalException& e) {
@@ -964,9 +1008,10 @@ void rollback(OperationContext* opCtx,
 
     {
         Lock::GlobalWrite globalWrite(opCtx);
-        if (!replCoord->setFollowerMode(MemberState::RS_ROLLBACK)) {
+        auto status = replCoord->setFollowerMode(MemberState::RS_ROLLBACK);
+        if (!status.isOK()) {
             log() << "Cannot transition from " << replCoord->getMemberState().toString() << " to "
-                  << MemberState(MemberState::RS_ROLLBACK).toString();
+                  << MemberState(MemberState::RS_ROLLBACK).toString() << causedBy(status);
             return;
         }
     }
@@ -981,7 +1026,7 @@ void rollback(OperationContext* opCtx,
         if (ErrorCodes::UnrecoverableRollbackError == status.code()) {
             severe() << "Unable to complete rollback. A full resync may be needed: "
                      << redact(status);
-            fassertFailedNoTrace(28723);
+            fassertFailedNoTrace(40507);
         }
 
         // In other cases, we log the message contained in the error status and retry later.
@@ -1018,14 +1063,15 @@ void rollback(OperationContext* opCtx,
         severe() << "shardIdentity document rollback detected.  Shutting down to clear "
                     "in-memory sharding state.  Restarting this process should safely return it "
                     "to a healthy state";
-        fassertFailedNoTrace(40276);
+        fassertFailedNoTrace(40498);
     }
 
-    if (!replCoord->setFollowerMode(MemberState::RS_RECOVERING)) {
+    auto status = replCoord->setFollowerMode(MemberState::RS_RECOVERING);
+    if (!status.isOK()) {
         severe() << "Failed to transition into " << MemberState(MemberState::RS_RECOVERING)
                  << "; expected to be in state " << MemberState(MemberState::RS_ROLLBACK)
-                 << " but found self in " << replCoord->getMemberState();
-        fassertFailedNoTrace(40364);
+                 << "; found self in " << replCoord->getMemberState() << causedBy(status);
+        fassertFailedNoTrace(40499);
     }
 }
 

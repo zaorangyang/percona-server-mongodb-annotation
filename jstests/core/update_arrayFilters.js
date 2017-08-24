@@ -287,30 +287,39 @@
     assert.eq(coll.findOne({_id: 0}), {_id: 0, a: [3, 6, 3, 6]});
 
     // $rename.
-    // TODO SERVER-28774: $rename should use the new update implementation. These tests should then
-    // fail because you cannot rename fields through arrays.
     coll.drop();
+    assert.writeOK(coll.insert({_id: 0, a: [1, 2, 3, 4]}));
     if (db.getMongo().writeMode() === "commands") {
         res = coll.update({_id: 0}, {$rename: {"a.$[i]": "b"}}, {arrayFilters: [{i: 0}]});
-        assert.writeErrorWithCode(res, ErrorCodes.InvalidOptions);
+        assert.writeErrorWithCode(res, ErrorCodes.BadValue);
+        assert.neq(-1,
+                   res.getWriteError().errmsg.indexOf(
+                       "The source field for $rename may not be dynamic: a.$[i]"),
+                   "update failed for a reason other than using $[] syntax in $rename path");
+        res = coll.update({id: 0}, {$rename: {"a": "b"}}, {arrayFilters: [{i: 0}]});
+        assert.writeErrorWithCode(res, ErrorCodes.FailedToParse);
         assert.neq(
             -1,
-            res.getWriteError().errmsg.indexOf("Cannot use array filters with modifier $rename"),
-            "update failed for a reason other than using array filters with $rename");
+            res.getWriteError().errmsg.indexOf(
+                "The array filter for identifier 'i' was not used in the update { $rename: { a: \"b\" } }"),
+            "updated failed for reason other than unused array filter");
     }
-    assert.writeOK(coll.insert({_id: 0, a: [0], b: [0]}));
+    coll.drop();
+    assert.writeOK(coll.insert({_id: 0, a: [0], b: [1]}));
     res = coll.update({_id: 0}, {$rename: {"a.$[]": "b"}});
-    assert.writeErrorWithCode(res, 16837);
+    assert.writeErrorWithCode(res, ErrorCodes.BadValue);
     assert.neq(-1,
                res.getWriteError().errmsg.indexOf(
-                   "cannot use the part (a of a.$[]) to traverse the element ({a: [ 0.0 ]})"),
+                   "The source field for $rename may not be dynamic: a.$[]"),
                "update failed for a reason other than using array updates with $rename");
     res = coll.update({_id: 0}, {$rename: {"a": "b.$[]"}});
-    assert.writeErrorWithCode(res, 16837);
+    assert.writeErrorWithCode(res, ErrorCodes.BadValue);
     assert.neq(-1,
                res.getWriteError().errmsg.indexOf(
-                   "cannot use the part (b of b.$[]) to traverse the element ({b: [ 0.0 ]})"),
+                   "The destination field for $rename may not be dynamic: b.$[]"),
                "update failed for a reason other than using array updates with $rename");
+    assert.writeOK(coll.update({_id: 0}, {$rename: {"a": "b"}}));
+    assert.eq(coll.findOne({_id: 0}), {_id: 0, b: [0]});
 
     // $setOnInsert.
     // TODO SERVER-28773: $setOnInsert should use the new update implementation.
@@ -388,42 +397,28 @@
                "update failed for a reason other than using array updates with $currentDate");
 
     // $addToSet.
-    // TODO SERVER-28764: $addToSet should use the new update implementation.
     coll.drop();
     if (db.getMongo().writeMode() === "commands") {
-        res = coll.update({_id: 0}, {$addToSet: {"a.$[i]": ["elem"]}}, {arrayFilters: [{i: 0}]});
-        assert.writeErrorWithCode(res, ErrorCodes.InvalidOptions);
-        assert.neq(
-            -1,
-            res.getWriteError().errmsg.indexOf("Cannot use array filters with modifier $addToSet"),
-            "update failed for a reason other than using array filters with $addToSet");
+        assert.writeOK(coll.insert({_id: 0, a: [[0], [1]]}));
+        assert.writeOK(coll.update({_id: 0}, {$addToSet: {"a.$[i]": 2}}, {arrayFilters: [{i: 0}]}));
+        assert.eq(coll.findOne({_id: 0}), {_id: 0, a: [[0, 2], [1]]});
     }
-    assert.writeOK(coll.insert({_id: 0, a: [[]]}));
-    res = coll.update({_id: 0}, {$addToSet: {"a.$[]": ["elem"]}});
-    assert.writeErrorWithCode(res, 16837);
-    assert.neq(-1,
-               res.getWriteError().errmsg.indexOf(
-                   "cannot use the part (a of a.$[]) to traverse the element ({a: [ [] ]})"),
-               "update failed for a reason other than using array updates with $addToSet");
+    coll.drop();
+    assert.writeOK(coll.insert({_id: 0, a: [[0], [1]]}));
+    assert.writeOK(coll.update({_id: 0}, {$addToSet: {"a.$[]": 2}}));
+    assert.eq(coll.findOne({_id: 0}), {_id: 0, a: [[0, 2], [1, 2]]});
 
     // $pop.
-    // TODO SERVER-28769: $pop should use the new update implementation.
     coll.drop();
+    assert.writeOK(coll.insert({_id: 0, a: [[0, 1], [1, 2]]}));
     if (db.getMongo().writeMode() === "commands") {
-        res = coll.update({_id: 0}, {$pop: {"a.$[i]": 1}}, {arrayFilters: [{i: 0}]});
-        assert.writeErrorWithCode(res, ErrorCodes.InvalidOptions);
-        assert.neq(
-            -1,
-            res.getWriteError().errmsg.indexOf("Cannot use array filters with modifier $pop"),
-            "update failed for a reason other than using array filters with $pop");
+        assert.writeOK(coll.update({_id: 0}, {$pop: {"a.$[i]": 1}}, {arrayFilters: [{i: 0}]}));
+        assert.eq({_id: 0, a: [[0], [1, 2]]}, coll.findOne());
     }
+    assert.writeOK(coll.remove({}));
     assert.writeOK(coll.insert({_id: 0, a: [[0]]}));
-    res = coll.update({_id: 0}, {$pop: {"a.$[]": 1}});
-    assert.writeErrorWithCode(res, 16837);
-    assert.neq(-1,
-               res.getWriteError().errmsg.indexOf(
-                   "cannot use the part (a of a.$[]) to traverse the element ({a: [ [ 0.0 ] ]})"),
-               "update failed for a reason other than using array updates with $pop");
+    assert.writeOK(coll.update({_id: 0}, {$pop: {"a.$[]": 1}}));
+    assert.eq({_id: 0, a: [[]]}, coll.findOne());
 
     // $pullAll.
     // TODO SERVER-28771: $pullAll should use the new update implementation.
@@ -502,24 +497,17 @@
                "update failed for a reason other than using array updates with $push");
 
     // $bit.
-    // TODO SERVER-28765: $bit should use the new update implementation.
     coll.drop();
+    assert.writeOK(coll.insert({_id: 0, a: [NumberInt(0), NumberInt(2)]}));
     if (db.getMongo().writeMode() === "commands") {
-        res = coll.update(
-            {_id: 0}, {$bit: {"a.$[i]": {or: NumberInt(10)}}}, {arrayFilters: [{i: 0}]});
-        assert.writeErrorWithCode(res, ErrorCodes.InvalidOptions);
-        assert.neq(
-            -1,
-            res.getWriteError().errmsg.indexOf("Cannot use array filters with modifier $bit"),
-            "update failed for a reason other than using array filters with $bit");
+        assert.writeOK(coll.update(
+            {_id: 0}, {$bit: {"a.$[i]": {or: NumberInt(10)}}}, {arrayFilters: [{i: 0}]}));
+        assert.eq({_id: 0, a: [NumberInt(10), NumberInt(2)]}, coll.findOne());
     }
-    assert.writeOK(coll.insert({_id: 0, a: [0]}));
-    res = coll.update({_id: 0}, {$bit: {"a.$[]": {or: NumberInt(10)}}});
-    assert.writeErrorWithCode(res, 16837);
-    assert.neq(-1,
-               res.getWriteError().errmsg.indexOf(
-                   "cannot use the part (a of a.$[]) to traverse the element ({a: [ 0.0 ]})"),
-               "update failed for a reason other than using array updates with $bit");
+    assert.writeOK(coll.remove({}));
+    assert.writeOK(coll.insert({_id: 0, a: [NumberInt(0), NumberInt(2)]}));
+    assert.writeOK(coll.update({_id: 0}, {$bit: {"a.$[]": {or: NumberInt(10)}}}));
+    assert.eq({_id: 0, a: [NumberInt(10), NumberInt(10)]}, coll.findOne());
 
     //
     // Multi update tests.

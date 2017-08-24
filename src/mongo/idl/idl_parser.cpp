@@ -26,12 +26,14 @@
  * then also delete it in the license file.
  */
 
+#include <algorithm>
 #include <stack>
 #include <string>
 
 #include "mongo/idl/idl_parser.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/commands.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -58,6 +60,9 @@ std::string toCommaDelimitedList(const std::vector<BSONType>& types) {
 
 }  // namespace
 
+constexpr StringData IDLParserErrorContext::kOpMsgDollarDBDefault;
+constexpr StringData IDLParserErrorContext::kOpMsgDollarDB;
+
 bool IDLParserErrorContext::checkAndAssertType(const BSONElement& element, BSONType type) const {
     auto elementType = element.type();
 
@@ -68,7 +73,7 @@ bool IDLParserErrorContext::checkAndAssertType(const BSONElement& element, BSONT
         }
 
         std::string path = getElementPath(element);
-        uasserted(40410,
+        uasserted(ErrorCodes::TypeMismatch,
                   str::stream() << "BSON field '" << path << "' is the wrong type '"
                                 << typeName(element.type())
                                 << "', expected type '"
@@ -88,7 +93,7 @@ bool IDLParserErrorContext::checkAndAssertBinDataType(const BSONElement& element
 
     if (element.binDataType() != type) {
         std::string path = getElementPath(element);
-        uasserted(40411,
+        uasserted(ErrorCodes::TypeMismatch,
                   str::stream() << "BSON field '" << path << "' is the wrong bindData type '"
                                 << typeName(element.binDataType())
                                 << "', expected type '"
@@ -112,7 +117,7 @@ bool IDLParserErrorContext::checkAndAssertTypes(const BSONElement& element,
 
         std::string path = getElementPath(element);
         std::string type_str = toCommaDelimitedList(types);
-        uasserted(40412,
+        uasserted(ErrorCodes::TypeMismatch,
                   str::stream() << "BSON field '" << path << "' is the wrong type '"
                                 << typeName(element.type())
                                 << "', expected types '["
@@ -169,9 +174,13 @@ std::string IDLParserErrorContext::getElementPath(StringData fieldName) const {
     }
 }
 
-void IDLParserErrorContext::throwDuplicateField(const BSONElement& element) const {
-    std::string path = getElementPath(element);
+void IDLParserErrorContext::throwDuplicateField(StringData fieldName) const {
+    std::string path = getElementPath(fieldName);
     uasserted(40413, str::stream() << "BSON field '" << path << "' is a duplicate field");
+}
+
+void IDLParserErrorContext::throwDuplicateField(const BSONElement& element) const {
+    throwDuplicateField(element.fieldNameStringData());
 }
 
 void IDLParserErrorContext::throwMissingField(StringData fieldName) const {
@@ -205,14 +214,14 @@ void IDLParserErrorContext::throwBadArrayFieldNumberSequence(std::uint32_t actua
 
 void IDLParserErrorContext::throwBadEnumValue(int enumValue) const {
     std::string path = getElementPath(StringData());
-    uasserted(40440,
+    uasserted(ErrorCodes::BadValue,
               str::stream() << "Enumeration value '" << enumValue << "' for field '" << path
                             << "' is not a valid value.");
 }
 
 void IDLParserErrorContext::throwBadEnumValue(StringData enumValue) const {
     std::string path = getElementPath(StringData());
-    uasserted(40441,
+    uasserted(ErrorCodes::BadValue,
               str::stream() << "Enumeration value '" << enumValue << "' for field '" << path
                             << "' is not a valid value.");
 }
@@ -230,6 +239,22 @@ NamespaceString IDLParserErrorContext::parseNSCollectionRequired(StringData dbNa
             nss.isValid());
 
     return nss;
+}
+
+void IDLParserErrorContext::appendGenericCommandArguments(
+    const BSONObj& commandPassthroughFields,
+    const std::vector<StringData>& knownFields,
+    BSONObjBuilder* builder) {
+
+    for (const auto& element : commandPassthroughFields) {
+
+        StringData name = element.fieldNameStringData();
+        // Include a passthrough field as long the IDL class has not defined it.
+        if (Command::isGenericArgument(name) &&
+            std::find(knownFields.begin(), knownFields.end(), name) == knownFields.end()) {
+            builder->append(element);
+        }
+    }
 }
 
 std::vector<StringData> transformVector(const std::vector<std::string>& input) {

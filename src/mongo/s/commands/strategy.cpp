@@ -126,20 +126,24 @@ Status processCommandMetadata(OperationContext* opCtx, const BSONObj& cmdObj) {
  * Append required fields to command response.
  */
 void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* responseBuilder) {
-    // Add $logicalTime.
     auto validator = LogicalTimeValidator::get(opCtx);
-    auto currentTime =
-        validator->signLogicalTime(opCtx, LogicalClock::get(opCtx)->getClusterTime());
-    rpc::LogicalTimeMetadata(currentTime).writeToMetadata(responseBuilder);
+    if (validator->shouldGossipLogicalTime()) {
+        // Add $clusterTime.
+        auto currentTime =
+            validator->signLogicalTime(opCtx, LogicalClock::get(opCtx)->getClusterTime());
+        rpc::LogicalTimeMetadata(currentTime).writeToMetadata(responseBuilder);
 
-    // Add operationTime.
-    if (auto tracker = OperationTimeTracker::get(opCtx)) {
-        auto operationTime = OperationTimeTracker::get(opCtx)->getMaxOperationTime();
-        responseBuilder->append(kOperationTime, operationTime.asTimestamp());
-    } else if (currentTime.getTime() != LogicalTime::kUninitialized) {
-        // If we don't know the actual operation time, use the cluster time instead. This is safe
-        // but not optimal because we can always return a later operation time than actual.
-        responseBuilder->append(kOperationTime, currentTime.getTime().asTimestamp());
+        // Add operationTime.
+        if (auto tracker = OperationTimeTracker::get(opCtx)) {
+            auto operationTime = OperationTimeTracker::get(opCtx)->getMaxOperationTime();
+            if (operationTime != LogicalTime::kUninitialized) {
+                responseBuilder->append(kOperationTime, operationTime.asTimestamp());
+            }
+        } else if (currentTime.getTime() != LogicalTime::kUninitialized) {
+            // If we don't know the actual operation time, use the cluster time instead. This is
+            // safe but not optimal because we can always return a later operation time than actual.
+            responseBuilder->append(kOperationTime, currentTime.getTime().asTimestamp());
+        }
     }
 }
 
@@ -215,9 +219,9 @@ void execCommandClient(OperationContext* opCtx,
         return;
     }
 
-    std::string errmsg;
-    bool ok = false;
     try {
+        std::string errmsg;
+        bool ok = false;
         if (!supportsWriteConcern) {
             ok = c->enhancedRun(opCtx, request, errmsg, result);
         } else {
@@ -228,6 +232,10 @@ void execCommandClient(OperationContext* opCtx,
 
             ok = c->enhancedRun(opCtx, request, errmsg, result);
         }
+        if (!ok) {
+            c->incrementCommandsFailed();
+        }
+        Command::appendCommandStatus(result, ok, errmsg);
     } catch (const DBException& e) {
         result.resetToEmpty();
         const int code = e.getCode();
@@ -237,15 +245,9 @@ void execCommandClient(OperationContext* opCtx,
             throw;
         }
 
-        errmsg = e.what();
-        result.append("code", code);
-    }
-
-    if (!ok) {
         c->incrementCommandsFailed();
+        Command::appendCommandStatus(result, e.toStatus());
     }
-
-    Command::appendCommandStatus(result, ok, errmsg);
 }
 
 void runAgainstRegistered(OperationContext* opCtx,
@@ -265,6 +267,8 @@ void runAgainstRegistered(OperationContext* opCtx,
 }
 
 void runCommand(OperationContext* opCtx, const OpMsgRequest& request, BSONObjBuilder&& builder) {
+    initializeOperationSessionInfo(opCtx, request.body);
+
     // Handle command option maxTimeMS.
     uassert(ErrorCodes::InvalidOptions,
             "no such command option $maxTimeMs; use maxTimeMS instead",

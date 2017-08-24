@@ -253,7 +253,7 @@ def _bind_struct_common(ctxt, parsed_spec, struct, ast_struct):
 
         for chained_type in struct.chained_types:
             ast_field = _bind_chained_type(ctxt, parsed_spec, ast_struct, chained_type)
-            if ast_field and not _is_duplicate_field(ctxt, chained_type, ast_struct.fields,
+            if ast_field and not _is_duplicate_field(ctxt, chained_type.name, ast_struct.fields,
                                                      ast_field):
                 ast_struct.fields.append(ast_field)
 
@@ -264,9 +264,14 @@ def _bind_struct_common(ctxt, parsed_spec, struct, ast_struct):
     # Parse the fields last so that they are serialized after chained stuff.
     for field in struct.fields or []:
         ast_field = _bind_field(ctxt, parsed_spec, field)
-        if ast_field and not _is_duplicate_field(ctxt, ast_struct.name, ast_struct.fields,
-                                                 ast_field):
-            ast_struct.fields.append(ast_field)
+        if ast_field:
+            if ast_field.supports_doc_sequence and not isinstance(ast_struct, ast.Command):
+                # Doc sequences are only supported in commands at the moment
+                ctxt.add_bad_struct_field_as_doc_sequence_error(ast_struct, ast_struct.name,
+                                                                ast_field.name)
+
+            if not _is_duplicate_field(ctxt, ast_struct.name, ast_struct.fields, ast_field):
+                ast_struct.fields.append(ast_field)
 
 
 def _bind_struct(ctxt, parsed_spec, struct):
@@ -285,6 +290,25 @@ def _bind_struct(ctxt, parsed_spec, struct):
     return ast_struct
 
 
+def _inject_hidden_command_fields(command):
+    # type: (syntax.Command) -> None
+    """Inject hidden fields to aid deserialization/serialization for OpMsg parsing of commands."""
+
+    # Inject a "$db" which we can decode during command parsing
+    db_field = syntax.Field(command.file_name, command.line, command.column)
+    db_field.name = "$db"
+    db_field.type = "string"  # This comes from basic_types.idl
+    db_field.default = 'IDLParserErrorContext::kOpMsgDollarDBDefault.toString()'  # Default to admin database
+    db_field.cpp_name = "dbName"
+    db_field.serialize_op_msg_request_only = True
+
+    # Commands that require namespaces do not need to have db defaulted in the constructor
+    if command.namespace == common.COMMAND_NAMESPACE_CONCATENATE_WITH_DB:
+        db_field.constructed = True
+
+    command.fields.append(db_field)
+
+
 def _bind_command(ctxt, parsed_spec, command):
     # type: (errors.ParserContext, syntax.IDLSpec, syntax.Command) -> ast.Command
     """
@@ -296,9 +320,15 @@ def _bind_command(ctxt, parsed_spec, command):
 
     ast_command = ast.Command(command.file_name, command.line, command.column)
 
+    # Inject special fields used for command parsing
+    _inject_hidden_command_fields(command)
+
     _bind_struct_common(ctxt, parsed_spec, command, ast_command)
 
     ast_command.namespace = command.namespace
+
+    if [field for field in ast_command.fields if field.name == ast_command.name]:
+        ctxt.add_bad_command_name_duplicates_field(ast_command, ast_command.name)
 
     return ast_command
 
@@ -326,6 +356,41 @@ def _validate_field_of_type_enum(ctxt, field):
         ctxt.add_enum_field_must_be_empty_error(field, field.name, "default")
 
 
+def _validate_array_type(ctxt, syntax_symbol, field):
+    # type: (errors.ParserContext, Union[syntax.Command, syntax.Enum, syntax.Struct, syntax.Type], syntax.Field) -> None
+    """Validate this an array of plain objects or a struct."""
+    if isinstance(syntax_symbol, syntax.Enum):
+        ctxt.add_array_enum_error(field, field.name)
+
+    if field.default or (isinstance(syntax_symbol, syntax.Type) and syntax_symbol.default):
+        ctxt.add_array_no_default_error(field, field.name)
+
+
+def _validate_field_properties(ctxt, ast_field):
+    # type: (errors.ParserContext, ast.Field) -> None
+    """Validate field specific rules."""
+
+    if ast_field.default and ast_field.optional:
+        ctxt.add_bad_field_default_and_optional(ast_field, ast_field.name)
+
+    # A "chain" type should never appear as a field.
+    if ast_field.bson_serialization_type == ['chain']:
+        ctxt.add_bad_array_of_chain(ast_field, ast_field.name)
+
+
+def _validate_doc_sequence_field(ctxt, ast_field):
+    # type: (errors.ParserContext, ast.Field) -> None
+    """Validate the doc_sequence is an array of plain objects."""
+    if not ast_field.supports_doc_sequence:
+        return
+
+    assert ast_field.array
+
+    # The only allowed BSON type for a doc_sequence field is "object"
+    if ast_field.bson_serialization_type != ['object']:
+        ctxt.add_bad_non_object_as_doc_sequence_error(ast_field, ast_field.name)
+
+
 def _bind_field(ctxt, parsed_spec, field):
     # type: (errors.ParserContext, syntax.IDLSpec, syntax.Field) -> ast.Field
     """
@@ -334,10 +399,14 @@ def _bind_field(ctxt, parsed_spec, field):
     - Create the idl.ast version from the idl.syntax tree.
     - Validate the resulting type is correct.
     """
+    # pylint: disable=too-many-branches,too-many-statements
     ast_field = ast.Field(field.file_name, field.line, field.column)
     ast_field.name = field.name
     ast_field.description = field.description
     ast_field.optional = field.optional
+    ast_field.supports_doc_sequence = field.supports_doc_sequence
+    ast_field.serialize_op_msg_request_only = field.serialize_op_msg_request_only
+    ast_field.constructed = field.constructed
 
     ast_field.cpp_name = field.name
     if field.cpp_name:
@@ -364,17 +433,19 @@ def _bind_field(ctxt, parsed_spec, field):
     if syntax.parse_array_type(field.type):
         ast_field.array = True
 
-        if isinstance(syntax_symbol, syntax.Enum):
-            ctxt.add_array_enum_error(ast_field, ast_field.name)
-
-        if field.default or (isinstance(syntax_symbol, syntax.Type) and syntax_symbol.default):
-            ctxt.add_array_no_default_error(field, field.name)
+        _validate_array_type(ctxt, syntax_symbol, field)
+    elif field.supports_doc_sequence:
+        # Doc sequences are only supported for arrays
+        ctxt.add_bad_non_array_as_doc_sequence_error(syntax_symbol, syntax_symbol.name,
+                                                     ast_field.name)
+        return None
 
     # Copy over only the needed information if this a struct or a type
     if isinstance(syntax_symbol, syntax.Struct):
         struct = cast(syntax.Struct, syntax_symbol)
         ast_field.struct_type = struct.name
         ast_field.bson_serialization_type = ["object"]
+
         _validate_field_of_type_struct(ctxt, field)
     elif isinstance(syntax_symbol, syntax.Enum):
         enum_type_info = enum_types.get_type_info(cast(syntax.Enum, syntax_symbol))
@@ -404,31 +475,37 @@ def _bind_field(ctxt, parsed_spec, field):
         # Validate merged type
         _validate_type_properties(ctxt, ast_field, "field")
 
+        # Validate merged type
+        _validate_field_properties(ctxt, ast_field)
+
+        # Validation doc_sequence types
+        _validate_doc_sequence_field(ctxt, ast_field)
+
     return ast_field
 
 
 def _bind_chained_type(ctxt, parsed_spec, location, chained_type):
-    # type: (errors.ParserContext, syntax.IDLSpec, common.SourceLocation, unicode) -> ast.Field
+    # type: (errors.ParserContext, syntax.IDLSpec, common.SourceLocation, syntax.ChainedType) -> ast.Field
     """Bind the specified chained type."""
-    syntax_symbol = parsed_spec.symbols.resolve_field_type(ctxt, location, chained_type,
-                                                           chained_type)
+    syntax_symbol = parsed_spec.symbols.resolve_field_type(ctxt, location, chained_type.name,
+                                                           chained_type.name)
     if not syntax_symbol:
         return None
 
     if not isinstance(syntax_symbol, syntax.Type):
-        ctxt.add_chained_type_not_found_error(location, chained_type)
+        ctxt.add_chained_type_not_found_error(location, chained_type.name)
         return None
 
     idltype = cast(syntax.Type, syntax_symbol)
 
     if len(idltype.bson_serialization_type) != 1 or idltype.bson_serialization_type[0] != 'chain':
-        ctxt.add_chained_type_wrong_type_error(location, chained_type,
+        ctxt.add_chained_type_wrong_type_error(location, chained_type.name,
                                                idltype.bson_serialization_type[0])
         return None
 
     ast_field = ast.Field(location.file_name, location.line, location.column)
     ast_field.name = idltype.name
-    ast_field.cpp_name = idltype.name
+    ast_field.cpp_name = chained_type.cpp_name
     ast_field.description = idltype.description
     ast_field.chained = True
 
@@ -441,37 +518,39 @@ def _bind_chained_type(ctxt, parsed_spec, location, chained_type):
 
 
 def _bind_chained_struct(ctxt, parsed_spec, ast_struct, chained_struct):
-    # type: (errors.ParserContext, syntax.IDLSpec, ast.Struct, unicode) -> None
+    # type: (errors.ParserContext, syntax.IDLSpec, ast.Struct, syntax.ChainedStruct) -> None
     """Bind the specified chained struct."""
-    syntax_symbol = parsed_spec.symbols.resolve_field_type(ctxt, ast_struct, chained_struct,
-                                                           chained_struct)
+    syntax_symbol = parsed_spec.symbols.resolve_field_type(ctxt, ast_struct, chained_struct.name,
+                                                           chained_struct.name)
 
     if not syntax_symbol:
         return None
 
     if not isinstance(syntax_symbol, syntax.Struct) or isinstance(syntax_symbol, syntax.Command):
-        ctxt.add_chained_struct_not_found_error(ast_struct, chained_struct)
+        ctxt.add_chained_struct_not_found_error(ast_struct, chained_struct.name)
         return None
 
     struct = cast(syntax.Struct, syntax_symbol)
 
     if struct.strict:
-        ctxt.add_chained_nested_struct_no_strict_error(ast_struct, ast_struct.name, chained_struct)
+        ctxt.add_chained_nested_struct_no_strict_error(ast_struct, ast_struct.name,
+                                                       chained_struct.name)
 
     if struct.chained_types or struct.chained_structs:
-        ctxt.add_chained_nested_struct_no_nested_error(ast_struct, ast_struct.name, chained_struct)
+        ctxt.add_chained_nested_struct_no_nested_error(ast_struct, ast_struct.name,
+                                                       chained_struct.name)
 
     # Configure a field for the chained struct.
     ast_field = ast.Field(ast_struct.file_name, ast_struct.line, ast_struct.column)
     ast_field.name = struct.name
-    ast_field.cpp_name = struct.name
+    ast_field.cpp_name = chained_struct.cpp_name
     ast_field.description = struct.description
     ast_field.struct_type = struct.name
     ast_field.bson_serialization_type = ["object"]
 
     ast_field.chained = True
 
-    if not _is_duplicate_field(ctxt, chained_struct, ast_struct.fields, ast_field):
+    if not _is_duplicate_field(ctxt, chained_struct.name, ast_struct.fields, ast_field):
         ast_struct.fields.append(ast_field)
     else:
         return
@@ -479,7 +558,7 @@ def _bind_chained_struct(ctxt, parsed_spec, ast_struct, chained_struct):
     # Merge all the fields from resolved struct into this ast struct as 'ignored'.
     for field in struct.fields or []:
         ast_field = _bind_field(ctxt, parsed_spec, field)
-        if ast_field and not _is_duplicate_field(ctxt, chained_struct, ast_struct.fields,
+        if ast_field and not _is_duplicate_field(ctxt, chained_struct.name, ast_struct.fields,
                                                  ast_field):
             ast_field.ignore = True
             ast_struct.fields.append(ast_field)

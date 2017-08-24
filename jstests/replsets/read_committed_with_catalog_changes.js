@@ -68,6 +68,10 @@ load("jstests/replsets/rslib.js");       // For startSetIfSupportsReadMajority.
         dropDB: {
             prepare: function(db) {
                 assert.writeOK(db.coll.insert({_id: 1}));
+                // Drop collection explicitly during the preparation phase while we are still able
+                // to write to a majority. Otherwise, dropDatabase() will drop the collection
+                // and wait for the collection drop to be replicated to a majority of the nodes.
+                assert(db.coll.drop());
             },
             performOp: function(db) {
                 assert.commandWorked(db.dropDatabase());
@@ -90,6 +94,10 @@ load("jstests/replsets/rslib.js");       // For startSetIfSupportsReadMajority.
         dropAndRecreateDB: {
             prepare: function(db) {
                 assert.writeOK(db.coll.insert({_id: 1}));
+                // Drop collection explicitly during the preparation phase while we are still able
+                // to write to a majority. Otherwise, dropDatabase() will drop the collection
+                // and wait for the collection drop to be replicated to a majority of the nodes.
+                assert(db.coll.drop());
             },
             performOp: function(db) {
                 assert.commandWorked(db.dropDatabase());

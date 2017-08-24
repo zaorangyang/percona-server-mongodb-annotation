@@ -47,8 +47,8 @@ public:
     void onInserts(OperationContext* opCtx,
                    const NamespaceString& nss,
                    OptionalCollectionUUID uuid,
-                   std::vector<BSONObj>::const_iterator begin,
-                   std::vector<BSONObj>::const_iterator end,
+                   std::vector<InsertStatement>::const_iterator begin,
+                   std::vector<InsertStatement>::const_iterator end,
                    bool fromMigrate) override;
     void onUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) override;
     CollectionShardingState::DeleteState aboutToDelete(OperationContext* opCtx,
@@ -94,10 +94,6 @@ public:
     void onEmptyCapped(OperationContext* opCtx,
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid);
-    void onConvertToCapped(OperationContext* opCtx,
-                           const NamespaceString& collectionName,
-                           OptionalCollectionUUID uuid,
-                           double size) override;
 };
 
 }  // namespace mongo

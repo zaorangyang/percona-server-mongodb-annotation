@@ -40,6 +40,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/rollback_impl_listener.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -135,12 +136,14 @@ void RollbackImpl::_transitionToRollbackCallback(
     {
         Lock::GlobalWrite globalWrite(opCtx.get());
 
-        if (!_replicationCoordinator->setFollowerMode(MemberState::RS_ROLLBACK)) {
+        status = _replicationCoordinator->setFollowerMode(MemberState::RS_ROLLBACK);
+        if (!status.isOK()) {
             std::string msg = str::stream()
                 << "Cannot transition from " << _replicationCoordinator->getMemberState().toString()
-                << " to " << MemberState(MemberState::RS_ROLLBACK).toString();
+                << " to " << MemberState(MemberState::RS_ROLLBACK).toString()
+                << causedBy(status.reason());
             log() << msg;
-            status = Status(ErrorCodes::NotSecondary, msg);
+            status = Status(status.code(), msg);
         }
     }
     if (!status.isOK()) {
@@ -180,6 +183,11 @@ void RollbackImpl::_checkShardIdentityRollback(OperationContext* opCtx) {
     }
 }
 
+void RollbackImpl::_clearSessionTransactionTable(OperationContext* opCtx) {
+    invariant(opCtx);
+    SessionCatalog::get(opCtx)->clearTransactionTable();
+}
+
 void RollbackImpl::_transitionFromRollbackToSecondary(OperationContext* opCtx) {
     invariant(opCtx);
 
@@ -192,10 +200,12 @@ void RollbackImpl::_transitionFromRollbackToSecondary(OperationContext* opCtx) {
         return;
     }
 
-    if (!_replicationCoordinator->setFollowerMode(MemberState::RS_SECONDARY)) {
+    auto status = _replicationCoordinator->setFollowerMode(MemberState::RS_SECONDARY);
+    if (!status.isOK()) {
         severe() << "Failed to transition into " << MemberState(MemberState::RS_SECONDARY)
                  << "; expected to be in state " << MemberState(MemberState::RS_ROLLBACK)
-                 << " but found self in " << _replicationCoordinator->getMemberState();
+                 << "; found self in " << _replicationCoordinator->getMemberState()
+                 << causedBy(status);
         fassertFailedNoTrace(40408);
     }
 }
@@ -204,6 +214,7 @@ void RollbackImpl::_tearDown(OperationContext* opCtx) {
     invariant(opCtx);
 
     _checkShardIdentityRollback(opCtx);
+    _clearSessionTransactionTable(opCtx);
     _transitionFromRollbackToSecondary(opCtx);
 }
 

@@ -52,12 +52,20 @@ Mongo.prototype.setCausalConsistency = function(value) {
     this._isCausal = value;
 };
 
-Mongo.prototype.isCausalConsistencyEnabled = function(cmdName, cmdObj) {
+Mongo.prototype.isCausalConsistencyEnabled = function(cmdObj) {
+    var cmdName = (() => {
+        for (var name in cmdObj) {
+            return name;
+        }
+        doassert("empty cmdObj");
+    })();
+
     if (!this._isCausal) {
         return false;
     }
 
-    // Currently, read concern afterClusterTime is only supported for read concern level majority.
+    // Currently, read concern afterClusterTime is only supported for commands that support read
+    // concern level majority.
     var commandsThatSupportMajorityReadConcern = [
         "count",
         "distinct",
@@ -137,13 +145,13 @@ Mongo.prototype._injectAfterClusterTime = function(cmdObj) {
         const readConcern = Object.assign({}, cmdObj.readConcern);
         // Currently server supports afterClusterTime only with level:majority. Going forward it
         // will be relaxed for any level of readConcern.
-        if (!readConcern.hasOwnProperty("level") || readConcern.level === "majority") {
-            if (!readConcern.hasOwnProperty("afterClusterTime")) {
-                readConcern.afterClusterTime = operationTime;
-            }
-            readConcern.level = "majority";
-            cmdObj.readConcern = readConcern;
+        if (!readConcern.hasOwnProperty("afterClusterTime")) {
+            readConcern.afterClusterTime = operationTime;
         }
+        if (!readConcern.hasOwnProperty("level")) {
+            readConcern.level = "local";
+        }
+        cmdObj.readConcern = readConcern;
     }
     return cmdObj;
 };
@@ -152,7 +160,7 @@ Mongo.prototype._gossipLogicalTime = function(obj) {
     obj = Object.assign({}, obj);
     const clusterTime = this.getClusterTime();
     if (clusterTime) {
-        obj["$logicalTime"] = clusterTime;
+        obj["$clusterTime"] = clusterTime;
     }
     return obj;
 };
@@ -165,8 +173,8 @@ Mongo.prototype._setLogicalTimeFromReply = function(res) {
     if (res.hasOwnProperty("operationTime")) {
         this.setOperationTime(res["operationTime"]);
     }
-    if (res.hasOwnProperty("$logicalTime")) {
-        this.setClusterTime(res["$logicalTime"]);
+    if (res.hasOwnProperty("$clusterTime")) {
+        this.setClusterTime(res["$clusterTime"]);
     }
 };
 
@@ -175,14 +183,14 @@ Mongo.prototype._setLogicalTimeFromReply = function(res) {
  */
 (function(original) {
     Mongo.prototype.runCommandWithMetadata = function runCommandWithMetadata(
-        dbName, cmdName, metadata, cmdObj) {
-        if (this.isCausalConsistencyEnabled(cmdName, cmdObj) && cmdObj) {
+        dbName, metadata, cmdObj) {
+        if (this.isCausalConsistencyEnabled(cmdObj) && cmdObj) {
             cmdObj = this._injectAfterClusterTime(cmdObj);
         }
         if (this._isCausal) {
             metadata = this._gossipLogicalTime(metadata);
         }
-        const res = original.call(this, dbName, cmdName, metadata, cmdObj);
+        const res = original.call(this, dbName, metadata, cmdObj);
         this._setLogicalTimeFromReply(res);
         return res;
     };
@@ -193,9 +201,7 @@ Mongo.prototype._setLogicalTimeFromReply = function(res) {
  */
 (function(original) {
     Mongo.prototype.runCommand = function runCommand(dbName, cmdObj, options) {
-        const cmdName = Object.keys(cmdObj)[0];
-
-        if (this.isCausalConsistencyEnabled(cmdName, cmdObj) && cmdObj) {
+        if (this.isCausalConsistencyEnabled(cmdObj) && cmdObj) {
             cmdObj = this._injectAfterClusterTime(cmdObj);
         }
         if (this._isCausal) {
@@ -528,6 +534,9 @@ Mongo.prototype.unsetWriteConcern = function() {
  * Sets the operationTime.
  */
 Mongo.prototype.setOperationTime = function(operationTime) {
+    if (operationTime === Timestamp(0, 0)) {
+        throw Error("Attempt to set an uninitiated operationTime");
+    }
     if (this._operationTime === undefined || this._operationTime === null ||
         (typeof operationTime === "object" &&
          bsonWoCompare(operationTime, this._operationTime) === 1)) {

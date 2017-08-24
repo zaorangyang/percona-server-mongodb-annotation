@@ -31,18 +31,18 @@
 #include "mongo/db/pipeline/document_source_current_op.h"
 
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/server_options.h"
-#include "mongo/util/net/sock.h"
 
 namespace mongo {
 
 namespace {
 const StringData kAllUsersFieldName = "allUsers"_sd;
 const StringData kIdleConnectionsFieldName = "idleConnections"_sd;
+const StringData kTruncateOpsFieldName = "truncateOps"_sd;
 
 const StringData kOpIdFieldName = "opid"_sd;
 const StringData kClientFieldName = "client"_sd;
 const StringData kMongosClientFieldName = "client_s"_sd;
+const StringData kShardFieldName = "shard"_sd;
 }  // namespace
 
 using boost::intrusive_ptr;
@@ -61,7 +61,8 @@ DocumentSource::InitialSourceType DocumentSourceCurrentOp::getInitialSourceType(
 
 DocumentSource::GetNextResult DocumentSourceCurrentOp::getNext() {
     if (_ops.empty()) {
-        _ops = _mongod->getCurrentOps(_includeIdleConnections, _includeOpsFromAllUsers);
+        _ops =
+            _mongod->getCurrentOps(_includeIdleConnections, _includeOpsFromAllUsers, _truncateOps);
 
         _opsIter = _ops.begin();
 
@@ -85,6 +86,9 @@ DocumentSource::GetNextResult DocumentSourceCurrentOp::getNext() {
 
         const BSONObj& op = *_opsIter++;
         MutableDocument doc;
+
+        // Add the shard name to the output document.
+        doc.addField(kShardFieldName, Value(_shardName));
 
         // For operations on a shard, we change the opid from the raw numeric form to
         // 'shardname:opid'. We also change the fieldname 'client' to 'client_s' to indicate
@@ -130,6 +134,7 @@ intrusive_ptr<DocumentSource> DocumentSourceCurrentOp::createFromBson(
 
     ConnMode includeIdleConnections = ConnMode::kExcludeIdle;
     UserMode includeOpsFromAllUsers = UserMode::kExcludeOthers;
+    TruncationMode truncateOps = TruncationMode::kNoTruncation;
 
     for (auto&& elem : spec.embeddedObject()) {
         const auto fieldName = elem.fieldNameStringData();
@@ -150,6 +155,14 @@ intrusive_ptr<DocumentSource> DocumentSourceCurrentOp::createFromBson(
                     elem.type() == BSONType::Bool);
             includeOpsFromAllUsers =
                 (elem.Bool() ? UserMode::kIncludeAll : UserMode::kExcludeOthers);
+        } else if (fieldName == kTruncateOpsFieldName) {
+            uassert(ErrorCodes::FailedToParse,
+                    str::stream() << "The 'truncateOps' parameter of the $currentOp stage must be "
+                                     "a boolean value, but found: "
+                                  << typeName(elem.type()),
+                    elem.type() == BSONType::Bool);
+            truncateOps =
+                (elem.Bool() ? TruncationMode::kTruncateOps : TruncationMode::kNoTruncation);
         } else {
             uasserted(ErrorCodes::FailedToParse,
                       str::stream() << "Unrecognized option '" << fieldName
@@ -157,22 +170,24 @@ intrusive_ptr<DocumentSource> DocumentSourceCurrentOp::createFromBson(
         }
     }
 
-    return intrusive_ptr<DocumentSourceCurrentOp>(
-        new DocumentSourceCurrentOp(pExpCtx, includeIdleConnections, includeOpsFromAllUsers));
+    return intrusive_ptr<DocumentSourceCurrentOp>(new DocumentSourceCurrentOp(
+        pExpCtx, includeIdleConnections, includeOpsFromAllUsers, truncateOps));
 }
 
 intrusive_ptr<DocumentSourceCurrentOp> DocumentSourceCurrentOp::create(
     const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
     ConnMode includeIdleConnections,
-    UserMode includeOpsFromAllUsers) {
-    return intrusive_ptr<DocumentSourceCurrentOp>(
-        new DocumentSourceCurrentOp(pExpCtx, includeIdleConnections, includeOpsFromAllUsers));
+    UserMode includeOpsFromAllUsers,
+    TruncationMode truncateOps) {
+    return intrusive_ptr<DocumentSourceCurrentOp>(new DocumentSourceCurrentOp(
+        pExpCtx, includeIdleConnections, includeOpsFromAllUsers, truncateOps));
 }
 
 Value DocumentSourceCurrentOp::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
     return Value(Document{
         {getSourceName(),
          Document{{kIdleConnectionsFieldName, (_includeIdleConnections == ConnMode::kIncludeIdle)},
-                  {kAllUsersFieldName, (_includeOpsFromAllUsers == UserMode::kIncludeAll)}}}});
+                  {kAllUsersFieldName, (_includeOpsFromAllUsers == UserMode::kIncludeAll)},
+                  {kTruncateOpsFieldName, (_truncateOps == TruncationMode::kTruncateOps)}}}});
 }
 }  // namespace mongo

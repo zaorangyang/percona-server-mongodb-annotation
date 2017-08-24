@@ -40,6 +40,9 @@
 
 namespace mongo {
 
+// How long to wait before starting cleanup of an emigrated chunk range.
+extern AtomicInt32 orphanCleanupDelaySecs;
+
 class BSONObj;
 struct ChunkVersion;
 class CollectionMetadata;
@@ -118,27 +121,32 @@ public:
     void markNotShardedAtStepdown();
 
     /**
-     * Schedules any documents in the range for immediate cleanup iff no running queries can depend
-     * on them, and adds the range to the list of pending ranges. Otherwise, returns false.  Does
-     * not block.  Call get() on the return value to wait for the deletion to complete or fail.
-     * After that, call waitForClean to ensure no other deletions are pending for the range.
+     * Schedules any documents in `range` for immediate cleanup iff no running queries can depend
+     * on them, and adds the range to the list of pending ranges. Otherwise, returns a notification
+     * that yields bad status immediately.  Does not block.  Call waitStatus(opCtx) on the result
+     * to wait for the deletion to complete or fail.  After that, call waitForClean to ensure no
+     * other deletions are pending for the range.
      */
     auto beginReceive(ChunkRange const& range) -> CleanupNotification;
 
     /*
-     * Removes the range from the list of pending ranges, and schedules any documents in the range
-     * for immediate cleanup.  Does not block.
+     * Removes `range` from the list of pending ranges, and schedules any documents in the range for
+     * immediate cleanup.  Does not block.
      */
     void forgetReceive(const ChunkRange& range);
 
     /**
-     * Schedules documents in the range for cleanup after any running queries that may depend on
-     * them have terminated.  Does not block. Fails if range overlaps any current local shard chunk.
-     * Call `result->get(opCtx)` on the return value `result` to wait for the deletion to complete
-     * or fail. If that succeeds, call waitForClean to ensure no other deletions are pending for the
-     * range.
+     * Schedules documents in `range` for cleanup after any running queries that may depend on them
+     * have terminated. Does not block. Fails if range overlaps any current local shard chunk.
+     * Passed kDelayed, an additional delay (configured via server parameter orphanCleanupDelaySecs)
+     * is added to permit (most) dependent queries on secondaries to complete, too.
+     *
+     * Call result.waitStatus(opCtx) to wait for the deletion to complete or fail. If that succeeds,
+     * call waitForClean to ensure no other deletions are pending for the range. Call
+     * result.abandon(), instead, to ignore the outcome.
      */
-    auto cleanUpRange(ChunkRange const& range) -> CleanupNotification;
+    enum CleanWhen { kNow, kDelayed };
+    auto cleanUpRange(ChunkRange const& range, CleanWhen) -> CleanupNotification;
 
     /**
      * Returns a vector of ScopedCollectionMetadata objects representing metadata instances in use
@@ -222,34 +230,42 @@ public:
 
 private:
     /**
-     * On shard secondaries, invalidates the catalog cache's in-memory routing table for the
-     * collection specified in the _id field of 'query' if 'update' bumps the refreshSequenceNumber
-     * -- meaning a chunk metadata refresh finished being applied to the collection's locally
-     * persisted metadata store. Invalidating the catalog cache's routing table will provoke a
-     * routing table refresh next time the routing table is requested and the new metadata updates
-     * will be found.
+     * Registers a task on the opCtx -- to run after writes from the oplog are committed and visible
+     * to reads -- to notify the catalog cache loader of a new collection version. The catalog
+     * cache's routing table for the collection will also be invalidated at that time so that the
+     * next caller to the catalog cache for routing information will provoke a routing table
+     * refresh.
+     *
+     * This only runs on secondaries, and only when 'lastRefreshedCollectionVersion' is in 'update',
+     * meaning a chunk metadata refresh finished being applied to the collection's locally persisted
+     * metadata store.
      *
      * query - BSON with an _id that identifies which collections entry is being updated.
-     * update - the $set update being applied to the collections entry.
+     * update - the update being applied to the collections entry.
+     * updatedDoc - the document identified by 'query' with the 'update' applied.
      *
      * The global exclusive lock is expected to be held by the caller.
      */
-    void _onConfigRefreshCompleteInvalidateCachedMetadata(OperationContext* opCtx,
-                                                          const BSONObj& query,
-                                                          const BSONObj& update);
+    void _onConfigRefreshCompleteInvalidateCachedMetadataAndNotify(OperationContext* opCtx,
+                                                                   const BSONObj& query,
+                                                                   const BSONObj& update,
+                                                                   const BSONObj& updatedDoc);
 
     /**
-     * On secondaries, invalidates the catalog cache's in-memory routing table for the collection
-     * specified in the _id field of 'query' because the collection entry has been deleted as part
-     * of dropping the data collection. Invalidating the catalog cache's routing table will provoke
-     * a routing table refresh next time the routing table is requested and the metadata update will
-     * be discovered.
+     * Registers a task on the opCtx -- to run after writes from the oplog are committed and visible
+     * to reads -- to notify the catalog cache loader of a new collection version. The catalog
+     * cache's routing table for the collection will also be invalidated at that time so that the
+     * next caller to the catalog cache for routing information will provoke a routing table
+     * refresh.
+     *
+     * This only runs on secondaries
      *
      * query - BSON with an _id field that identifies which collections entry is being updated.
      *
      * The global exclusive lock is expected to be held by the caller.
      */
-    void _onConfigDeleteInvalidateCachedMetadata(OperationContext* opCtx, const BSONObj& query);
+    void _onConfigDeleteInvalidateCachedMetadataAndNotify(OperationContext* opCtx,
+                                                          const BSONObj& query);
 
     /**
      * Checks whether the shard version of the operation matches that of the collection.
@@ -285,10 +301,10 @@ private:
     // for access to _metadataManager
     friend auto CollectionRangeDeleter::cleanUpNextRange(OperationContext*,
                                                          NamespaceString const&,
-                                                         CollectionRangeDeleter::Action,
+                                                         OID const& epoch,
                                                          int maxToDelete,
                                                          CollectionRangeDeleter*)
-        -> CollectionRangeDeleter::Action;
+        -> boost::optional<Date_t>;
 };
 
 }  // namespace mongo

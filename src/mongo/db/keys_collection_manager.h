@@ -53,6 +53,8 @@ class ShardingCatalogClient;
  */
 class KeysCollectionManager {
 public:
+    static const Seconds kKeyValidInterval;
+
     KeysCollectionManager(std::string purpose,
                           ShardingCatalogClient* client,
                           Seconds keyValidForInterval);
@@ -97,6 +99,11 @@ public:
      * is the config primary.
      */
     void enableKeyGenerator(OperationContext* opCtx, bool doEnable);
+
+    /**
+     * Returns true if the refresher has ever successfully returned keys from the config server.
+     */
+    bool hasSeenKeys();
 
 private:
     /**
@@ -143,6 +150,11 @@ private:
          */
         void stop();
 
+        /**
+         * Returns true if keys have ever successfully been returned from the config server.
+         */
+        bool hasSeenKeys();
+
     private:
         void _doPeriodicRefresh(ServiceContext* service,
                                 std::string threadName,
@@ -155,6 +167,7 @@ private:
         stdx::thread _backgroundThread;
         std::shared_ptr<RefreshFunc> _doRefresh;
 
+        bool _hasSeenKeys = false;
         bool _inShutdown = false;
     };
 

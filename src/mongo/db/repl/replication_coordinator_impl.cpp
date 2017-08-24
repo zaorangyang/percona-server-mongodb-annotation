@@ -362,6 +362,19 @@ boost::optional<Date_t> ReplicationCoordinatorImpl::getPriorityTakeover_forTest(
     return _priorityTakeoverWhen;
 }
 
+boost::optional<Date_t> ReplicationCoordinatorImpl::getCatchupTakeover_forTest() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    if (!_catchupTakeoverCbh.isValid()) {
+        return boost::none;
+    }
+    return _catchupTakeoverWhen;
+}
+
+executor::TaskExecutor::CallbackHandle ReplicationCoordinatorImpl::getCatchupTakeoverCbh_forTest()
+    const {
+    return _catchupTakeoverCbh;
+}
+
 OpTime ReplicationCoordinatorImpl::getCurrentCommittedSnapshotOpTime() const {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     return _getCurrentCommittedSnapshotOpTime_inlock();
@@ -797,24 +810,27 @@ void ReplicationCoordinatorImpl::clearSyncSourceBlacklist() {
     _topCoord->clearSyncSourceBlacklist();
 }
 
-bool ReplicationCoordinatorImpl::setFollowerMode(const MemberState& newState) {
+Status ReplicationCoordinatorImpl::setFollowerMode(const MemberState& newState) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
     if (newState == _topCoord->getMemberState()) {
-        return true;
+        return Status::OK();
     }
     if (_topCoord->getRole() == TopologyCoordinator::Role::leader) {
-        return false;
+        return Status(ErrorCodes::NotSecondary,
+                      "Cannot set follower mode when node is currently the leader");
     }
 
     if (auto electionFinishedEvent = _cancelElectionIfNeeded_inlock()) {
         // We were a candidate, which means _topCoord believed us to be in state RS_SECONDARY, and
         // we know that newState != RS_SECONDARY because we would have returned early, above if
         // the old and new state were equal. So, try again after the election is over to
-        // finish setting the follower mode.
-        lk.unlock();
-        _replExecutor->waitForEvent(electionFinishedEvent);
-        return setFollowerMode(newState);
+        // finish setting the follower mode.  We cannot wait for the election to finish here as we
+        // may be holding a global X lock, so we return a bad status and rely on the caller to
+        // retry.
+        return Status(ErrorCodes::ElectionInProgress,
+                      str::stream() << "Cannot set follower mode to " << newState.toString()
+                                    << " because we are in the middle of running an election");
     }
 
     _topCoord->setFollowerMode(newState.s);
@@ -823,7 +839,7 @@ bool ReplicationCoordinatorImpl::setFollowerMode(const MemberState& newState) {
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
 
-    return true;
+    return Status::OK();
 }
 
 ReplicationCoordinator::ApplierState ReplicationCoordinatorImpl::getApplierState() {
@@ -1052,9 +1068,12 @@ Status ReplicationCoordinatorImpl::_validateReadConcern(OperationContext* opCtx,
     const bool isMajorityReadConcern =
         readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern;
 
-    if (readConcern.getArgsClusterTime() && !isMajorityReadConcern) {
+    if (readConcern.getArgsClusterTime() &&
+        readConcern.getLevel() != ReadConcernLevel::kMajorityReadConcern &&
+        readConcern.getLevel() != ReadConcernLevel::kLocalReadConcern) {
         return {ErrorCodes::BadValue,
-                "only readConcern level majority is allowed when specifying afterClusterTime"};
+                "Only readConcern level 'majority' or 'local' is allowed when specifying "
+                "afterClusterTime"};
     }
 
     if (isMajorityReadConcern && !getSettings().isMajorityReadConcernEnabled()) {
@@ -1088,57 +1107,15 @@ Status ReplicationCoordinatorImpl::waitUntilOpTimeForRead(OperationContext* opCt
     }
 
     if (readConcern.getArgsClusterTime()) {
-        auto targetTime = *readConcern.getArgsClusterTime();
-
-        if (readConcern.getArgsOpTime()) {
-            auto opTimeStamp = LogicalTime(readConcern.getArgsOpTime()->getTimestamp());
-            if (opTimeStamp > targetTime) {
-                targetTime = opTimeStamp;
-            }
-        }
-        return _waitUntilClusterTimeForRead(opCtx, targetTime);
+        return _waitUntilClusterTimeForRead(opCtx, readConcern);
     } else {
         return _waitUntilOpTimeForReadDeprecated(opCtx, readConcern);
     }
 }
 
-Status ReplicationCoordinatorImpl::_waitUntilClusterTimeForRead(OperationContext* opCtx,
-                                                                LogicalTime clusterTime) {
-    invariant(clusterTime != LogicalTime::kUninitialized);
-
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
-
-    auto currentTime = _getCurrentCommittedLogicalTime_inlock();
-    if (clusterTime > currentTime) {
-        LOG(1) << "waitUntilClusterTime: waiting for clusterTime:" << clusterTime.toString()
-               << " to be in a snapshot -- current snapshot: " << currentTime.toString();
-    }
-
-    while (clusterTime > _getCurrentCommittedLogicalTime_inlock()) {
-        if (_inShutdown) {
-            return {ErrorCodes::ShutdownInProgress, "Shutdown in progress"};
-        }
-
-        LOG(3) << "waitUntilClusterTime: waiting for a new snapshot until " << opCtx->getDeadline();
-
-        auto waitStatus =
-            opCtx->waitForConditionOrInterruptNoAssert(_currentCommittedSnapshotCond, lock);
-        if (!waitStatus.isOK()) {
-            return waitStatus;
-        }
-        LOG(3) << "Got notified of new snapshot: " << _currentCommittedSnapshot->toString();
-    }
-
-    return Status::OK();
-}
-
-Status ReplicationCoordinatorImpl::_waitUntilOpTimeForReadDeprecated(
-    OperationContext* opCtx, const ReadConcernArgs& readConcern) {
-    const bool isMajorityReadConcern =
-        readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern;
-
-    const auto targetOpTime = readConcern.getArgsOpTime().value_or(OpTime());
-
+Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
+                                                    bool isMajorityReadConcern,
+                                                    OpTime targetOpTime) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
 
     if (isMajorityReadConcern && !_externalState->snapshotsEnabled()) {
@@ -1147,9 +1124,8 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTimeForReadDeprecated(
     }
 
     auto getCurrentOpTime = [this, isMajorityReadConcern]() {
-        auto committedOptime =
-            _currentCommittedSnapshot ? _currentCommittedSnapshot->opTime : OpTime();
-        return isMajorityReadConcern ? committedOptime : _getMyLastAppliedOpTime_inlock();
+        return isMajorityReadConcern ? _getCurrentCommittedSnapshotOpTime_inlock()
+                                     : _getMyLastAppliedOpTime_inlock();
     };
 
     if (isMajorityReadConcern && targetOpTime > getCurrentOpTime()) {
@@ -1181,7 +1157,7 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTimeForReadDeprecated(
         ThreadWaiter waiter(targetOpTime, nullptr, &condVar);
         WaiterGuard guard(&_opTimeWaiterList, &waiter);
 
-        LOG(3) << "waituntilOpTime: OpID " << opCtx->getOpID() << " is waiting for OpTime "
+        LOG(3) << "waitUntilOpTime: OpID " << opCtx->getOpID() << " is waiting for OpTime "
                << waiter << " until " << opCtx->getDeadline();
 
         auto waitStatus = opCtx->waitForConditionOrInterruptNoAssert(condVar, lock);
@@ -1191,6 +1167,32 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTimeForReadDeprecated(
     }
 
     return Status::OK();
+}
+
+Status ReplicationCoordinatorImpl::_waitUntilClusterTimeForRead(
+    OperationContext* opCtx, const ReadConcernArgs& readConcern) {
+    auto clusterTime = *readConcern.getArgsClusterTime();
+    invariant(clusterTime != LogicalTime::kUninitialized);
+
+    // convert clusterTime to opTime so it can be used by the _opTimeWaiterList for wait on
+    // readConcern level local.
+    auto targetOpTime = OpTime(clusterTime.asTimestamp(), OpTime::kUninitializedTerm);
+    invariant(!readConcern.getArgsOpTime());
+
+    const bool isMajorityReadConcern =
+        readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern;
+
+    return _waitUntilOpTime(opCtx, isMajorityReadConcern, targetOpTime);
+}
+
+// TODO: remove when SERVER-29729 is done
+Status ReplicationCoordinatorImpl::_waitUntilOpTimeForReadDeprecated(
+    OperationContext* opCtx, const ReadConcernArgs& readConcern) {
+    const bool isMajorityReadConcern =
+        readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern;
+
+    const auto targetOpTime = readConcern.getArgsOpTime().value_or(OpTime());
+    return _waitUntilOpTime(opCtx, isMajorityReadConcern, targetOpTime);
 }
 
 OpTime ReplicationCoordinatorImpl::_getMyLastAppliedOpTime_inlock() const {
@@ -2429,6 +2431,12 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator_inlock() {
         invariant(_uncommittedSnapshots.empty());
     }
 
+    // If we are transitioning from secondary, cancel any scheduled takeovers.
+    if (_memberState.secondary()) {
+        _cancelCatchupTakeover_inlock();
+        _cancelPriorityTakeover_inlock();
+    }
+
     _memberState = newState;
     log() << "transition to " << newState.toString() << rsLog;
 
@@ -2506,6 +2514,15 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
         return;
     }
 
+    auto catchupTimeout = _repl->_rsConfig.getCatchUpTimeoutPeriod();
+
+    // When catchUpTimeoutMillis is 0, we skip doing catchup entirely.
+    if (catchupTimeout == Milliseconds::zero()) {
+        log() << "Skipping primary catchup since the catchup timeout is 0.";
+        abort_inlock();
+        return;
+    }
+
     auto mutex = &_repl->_mutex;
     auto timeoutCB = [this, mutex](const CallbackArgs& cbData) {
         if (!cbData.status.isOK()) {
@@ -2520,13 +2537,12 @@ void ReplicationCoordinatorImpl::CatchupState::start_inlock() {
         abort_inlock();
     };
 
-    // Schedule timeout callback.
-    auto catchupTimeout = _repl->_rsConfig.getCatchUpTimeoutPeriod();
     // Deal with infinity and overflow - no timeout.
     if (catchupTimeout == ReplSetConfig::kInfiniteCatchUpTimeout ||
         Date_t::max() - _repl->_replExecutor->now() <= catchupTimeout) {
         return;
     }
+    // Schedule timeout callback.
     auto timeoutDate = _repl->_replExecutor->now() + catchupTimeout;
     auto status = _repl->_replExecutor->scheduleWorkAt(timeoutDate, timeoutCB);
     if (!status.isOK()) {
@@ -2644,6 +2660,7 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(const ReplSetConfig& newC
         log() << "This node is not a member of the config";
     }
 
+    _cancelCatchupTakeover_inlock();
     _cancelPriorityTakeover_inlock();
     _cancelAndRescheduleElectionTimeout_inlock();
 

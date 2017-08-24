@@ -71,6 +71,7 @@ env.Library(
         'rollback_impl',
         'rollback_source_impl',
         'rs_rollback',
+        'rs_rollback_no_uuid',
         'storage_interface',
         'sync_source_resolver',
         '$BUILD_DIR/mongo/client/connection_pool',
@@ -85,7 +86,6 @@ env.Library(
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
-        '$BUILD_DIR/mongo/util/fail_point',
     ],
 )
 
@@ -204,7 +204,7 @@ env.Library(
     LIBDEPS=[
         'optime',
         'repl_coordinator_impl',
-	'replication_consistency_markers_idl',
+        'replication_consistency_markers_idl',
     ],
 )
 
@@ -384,9 +384,9 @@ env.Library(
 )
 
 env.Library(
-    target='rs_rollback',
+    target='rs_rollback_no_uuid',
     source=[
-        'rs_rollback.cpp',
+        'rs_rollback_no_uuid.cpp',
     ],
     LIBDEPS=[
         'oplog',
@@ -394,6 +394,24 @@ env.Library(
         'roll_back_local_operations',
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/s/sharding',
+        '$BUILD_DIR/mongo/util/fail_point',
+        '$BUILD_DIR/mongo/db/dbhelpers',
+    ],
+)
+
+env.Library(
+    target='rs_rollback',
+    source=[
+        'rs_rollback.cpp',
+    ],
+    LIBDEPS=[
+        'drop_pending_collection_reaper',
+        'oplog',
+        'replication_process',
+        'roll_back_local_operations',
+        '$BUILD_DIR/mongo/db/catalog/database_holder',
+        '$BUILD_DIR/mongo/db/s/sharding',
+        '$BUILD_DIR/mongo/db/sessions',
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/db/dbhelpers',
     ],
@@ -409,7 +427,6 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver',
         '$BUILD_DIR/mongo/db/auth/authcore',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
-        '$BUILD_DIR/mongo/util/net/hostandport',
         '$BUILD_DIR/mongo/util/net/network',
     ],
 )
@@ -434,8 +451,10 @@ env.Library(
         'replication_process',
         'replmocks',
         #'serveronly', # CYCLE
+        'storage_interface_impl',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+        '$BUILD_DIR/mongo/db/sessions',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
     ],
 )
@@ -453,6 +472,19 @@ env.CppUnitTest(
     ],
 )
 
+env.CppUnitTest(
+    target='rs_rollback_no_uuid_test',
+    source=[
+        'rs_rollback_no_uuid_test.cpp',
+    ],
+    LIBDEPS=[
+        'oplog_interface_local',
+        'oplog_interface_mock',
+        'rollback_test_fixture',
+        'rs_rollback_no_uuid',
+    ],
+)
+
 env.Library(
     target='rollback_impl',
     source=[
@@ -467,8 +499,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/s/sharding',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/db/sessions',
         '$BUILD_DIR/mongo/executor/task_executor_interface',
-        '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/util/net/network',
     ],
 )
 
@@ -507,6 +540,7 @@ env.Library(
     LIBDEPS=[
         'optime',
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/logical_session_id',
         '$BUILD_DIR/mongo/idl/idl_parser',
     ],
 )
@@ -783,7 +817,7 @@ env.Library(
         'replication_process',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/decorable',
     ],
 )
@@ -858,7 +892,7 @@ env.Library('replica_set_messages',
                 '$BUILD_DIR/mongo/db/common',
                 '$BUILD_DIR/mongo/db/server_options_core',
                 '$BUILD_DIR/mongo/transport/transport_layer_common',
-                '$BUILD_DIR/mongo/util/net/hostandport',
+                '$BUILD_DIR/mongo/util/net/network',
                 'optime',
                 'read_concern_args',
             ])
@@ -1037,7 +1071,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/executor/task_executor_interface',
         '$BUILD_DIR/mongo/rpc/metadata',
-        '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/util/net/network',
     ],
 )
 
@@ -1050,7 +1084,7 @@ env.Library(
         'optime',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/rpc/metadata',
-        '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/util/net/network',
     ],
 )
 
@@ -1091,6 +1125,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/document_validation',
         '$BUILD_DIR/mongo/executor/task_executor_interface',
         '$BUILD_DIR/mongo/rpc/command_status',
+        '$BUILD_DIR/mongo/s/query/async_results_merger',
         '$BUILD_DIR/mongo/util/progress_meter',
     ],
 )
@@ -1282,7 +1317,7 @@ env.Library(
         'oplog_entry',
         'optime',
         'replica_set_messages',
-        '$BUILD_DIR/mongo/util/net/hostandport',
+        '$BUILD_DIR/mongo/util/net/network',
     ],
 )
 
@@ -1395,6 +1430,7 @@ env.Library(
     LIBDEPS=[
         'optime',
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/fail_point',
     ],
 )
 
@@ -1419,37 +1455,38 @@ env.Library(
         "sync_source_feedback.cpp",
     ],
     LIBDEPS=[
-        'bgsync',
-        'drop_pending_collection_reaper',
-        'rollback_source_impl',
-        'oplog_buffer_collection',
-        'oplog_interface_remote',
-        'optime',
-        'repl_coordinator_interface',
-        'repl_coordinator_impl',
-        'repl_settings',
-        'replication_consistency_markers_impl',
-        'replication_process',
-        'sync_tail',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/clientdriver',
         '$BUILD_DIR/mongo/db/auth/authcore',
+        '$BUILD_DIR/mongo/db/cloner',
         '$BUILD_DIR/mongo/db/commands/dcommands_fcv',
-        '$BUILD_DIR/mongo/db/commands/server_status',
-        '$BUILD_DIR/mongo/db/logical_clock',
-        '$BUILD_DIR/mongo/db/logical_time',
         '$BUILD_DIR/mongo/db/commands/list_collections_filter',
-        '$BUILD_DIR/mongo/rpc/client_metadata',
+        '$BUILD_DIR/mongo/db/commands/server_status',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/curop',
+        '$BUILD_DIR/mongo/db/index_d',
         '$BUILD_DIR/mongo/db/lasterror',
+        '$BUILD_DIR/mongo/db/logical_clock',
+        '$BUILD_DIR/mongo/db/logical_time',
         '$BUILD_DIR/mongo/db/query/query',
+        '$BUILD_DIR/mongo/db/repair_database',
+        '$BUILD_DIR/mongo/db/repl/oplog_buffer_proxy',
         '$BUILD_DIR/mongo/db/s/balancer',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/db/sessions',
         '$BUILD_DIR/mongo/db/stats/counters',
-        '$BUILD_DIR/mongo/db/repl/oplog_buffer_proxy',
-        '$BUILD_DIR/mongo/db/cloner',
-        '$BUILD_DIR/mongo/db/index_d',
-        '$BUILD_DIR/mongo/db/repair_database',
+        '$BUILD_DIR/mongo/rpc/client_metadata',
+        'bgsync',
+        'drop_pending_collection_reaper',
+        'oplog_buffer_collection',
+        'oplog_interface_remote',
+        'optime',
+        'repl_coordinator_impl',
+        'repl_coordinator_interface',
+        'repl_settings',
+        'replication_consistency_markers_impl',
+        'replication_process',
+        'rollback_source_impl',
+        'sync_tail',
     ],
 )

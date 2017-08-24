@@ -56,7 +56,7 @@ ShardLocal::ShardLocal(const ShardId& id) : Shard(id) {
 }
 
 const ConnectionString ShardLocal::getConnString() const {
-    MONGO_UNREACHABLE;
+    return repl::getGlobalReplicationCoordinator()->getConfig().getConnectionString();
 }
 
 std::shared_ptr<RemoteCommandTargeter> ShardLocal::getTargeter() const {
@@ -129,8 +129,8 @@ StatusWith<Shard::CommandResponse> ShardLocal::_runCommand(OperationContext* opC
     try {
         DBDirectClient client(opCtx);
 
-        rpc::UniqueReply commandResponse = client.runCommandWithMetadata(
-            dbName, cmdObj.firstElementFieldName(), rpc::makeEmptyMetadata(), cmdObj);
+        rpc::UniqueReply commandResponse =
+            client.runCommand(OpMsgRequest::fromDBAndBody(dbName, cmdObj));
 
         auto result = commandResponse->getCommandReply().getOwned();
         return Shard::CommandResponse(boost::none,

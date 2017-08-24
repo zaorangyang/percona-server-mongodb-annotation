@@ -30,6 +30,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/dbmain.h"
+
 #include <boost/filesystem/operations.hpp>
 #include <boost/optional.hpp>
 #include <fstream>
@@ -93,6 +95,7 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/s/balancer/balancer.h"
+#include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
@@ -102,6 +105,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
 #include "mongo/db/service_entry_point_mongod.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/startup_warnings_mongod.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/encryption_hooks.h"
@@ -214,7 +218,7 @@ void logStartup(OperationContext* opCtx) {
     invariant(collection);
 
     OpDebug* const nullOpDebug = nullptr;
-    uassertStatusOK(collection->insertDocument(opCtx, o, nullOpDebug, false));
+    uassertStatusOK(collection->insertDocument(opCtx, InsertStatement(o), nullOpDebug, false));
     wunit.commit();
 }
 
@@ -639,6 +643,8 @@ ExitCode _initAndListen(int listenPort) {
               << startupWarningsLog;
     }
 
+    SessionCatalog::create(globalServiceContext);
+
     // This function may take the global lock.
     auto shardingInitialized =
         uassertStatusOK(ShardingState::get(startupOpCtx.get())
@@ -650,7 +656,7 @@ ExitCode _initAndListen(int listenPort) {
     if (!storageGlobalParams.readOnly) {
         logStartup(startupOpCtx.get());
 
-        startFTDC();
+        startMongoDFTDC();
 
         restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
 
@@ -660,6 +666,7 @@ ExitCode _initAndListen(int listenPort) {
                 uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
             }
         } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+            ShardedConnectionInfo::addHook(startupOpCtx->getServiceContext());
             uassertStatusOK(
                 initializeGlobalShardingStateForMongod(startupOpCtx.get(),
                                                        ConnectionString::forLocal(),
@@ -766,45 +773,17 @@ ExitCode initAndListen(int listenPort) {
     }
 }
 
-}  // namespace
-
 #if defined(_WIN32)
 ExitCode initService() {
     return initAndListen(serverGlobalParams.port);
 }
 #endif
 
-}  // namespace mongo
-
-using namespace mongo;
-
-static int mongoDbMain(int argc, char* argv[], char** envp);
-
-#if defined(_WIN32)
-// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
-// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
-// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
-// and makes them available through the argv() and envp() members.  This enables mongoDbMain()
-// to process UTF-8 encoded arguments and environment variables without regard to platform.
-int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
-    WindowsCommandLine wcl(argc, argvW, envpW);
-    int exitCode = mongoDbMain(argc, wcl.argv(), wcl.envp());
-    quickExit(exitCode);
-}
-#else
-int main(int argc, char* argv[], char** envp) {
-    int exitCode = mongoDbMain(argc, argv, envp);
-    quickExit(exitCode);
-}
-#endif
-
-namespace {
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     mongo::forkServerOrDie();
     return Status::OK();
 }
-}  // namespace
 
 /*
  * This function should contain the startup "actions" that we take based on the startup config.  It
@@ -1008,14 +987,16 @@ static void shutdownTask() {
     }
 
 #if __has_feature(address_sanitizer)
-    if (auto sep = checked_cast<ServiceEntryPointImpl*>(serviceContext->getServiceEntryPoint())) {
+    auto sep = checked_cast<ServiceEntryPointImpl*>(serviceContext->getServiceEntryPoint());
+    auto tl = serviceContext->getTransportLayer();
+    if (sep && tl) {
         // When running under address sanitizer, we get false positive leaks due to disorder around
         // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
         // harder to dry up the server from active connections before going on to really shut down.
 
         log(LogComponent::kNetwork)
             << "shutdown: going to close all sockets because ASAN is active...";
-        getGlobalServiceContext()->getTransportLayer()->shutdown();
+        tl->shutdown();
 
         // Close all sockets in a detached thread, and then wait for the number of active
         // connections to reach zero. Give the detached background thread a 10 second deadline. If
@@ -1049,7 +1030,7 @@ static void shutdownTask() {
 #endif
 
     // Shutdown Full-Time Data Capture
-    stopFTDC();
+    stopMongoDFTDC();
 
     if (opCtx) {
         ShardingState::get(opCtx)->shutDown(opCtx);
@@ -1088,7 +1069,9 @@ static void shutdownTask() {
     audit::logShutdown(&cc());
 }
 
-static int mongoDbMain(int argc, char* argv[], char** envp) {
+}  // namespace
+
+int mongoDbMain(int argc, char* argv[], char** envp) {
     registerShutdownTask(shutdownTask);
 
     setupSignalHandlers();
@@ -1123,3 +1106,5 @@ static int mongoDbMain(int argc, char* argv[], char** envp) {
     exitCleanly(exitCode);
     return 0;
 }
+
+}  // namespace mongo

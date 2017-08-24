@@ -334,6 +334,10 @@ const StringMap<BSONObj::MatchType> queryOperatorMap{
     {"bitsAllClear", BSONObj::opBITS_ALL_CLEAR},
     {"bitsAnySet", BSONObj::opBITS_ANY_SET},
     {"bitsAnyClear", BSONObj::opBITS_ANY_CLEAR},
+    {"_internalSchemaMinItems", BSONObj::opINTERNAL_SCHEMA_MIN_ITEMS},
+    {"_internalSchemaMaxItems", BSONObj::opINTERNAL_SCHEMA_MAX_ITEMS},
+    {"_internalSchemaUniqueItems", BSONObj::opINTERNAL_SCHEMA_UNIQUE_ITEMS},
+    {"_internalSchemaObjectMatch", BSONObj::opINTERNAL_SCHEMA_OBJECT_MATCH},
 };
 
 // Compares two string elements using a simple binary compare.
@@ -397,18 +401,17 @@ std::vector<BSONElement> BSONElement::Array() const {
 int BSONElement::woCompare(const BSONElement& e,
                            bool considerFieldName,
                            const StringData::ComparatorInterface* comparator) const {
-    int lt = (int)canonicalType();
-    int rt = (int)e.canonicalType();
-    int x = lt - rt;
-    if (x != 0 && (!isNumber() || !e.isNumber()))
-        return x;
-    if (considerFieldName) {
-        x = strcmp(fieldName(), e.fieldName());
-        if (x != 0)
-            return x;
+    if (type() != e.type()) {
+        int lt = (int)canonicalType();
+        int rt = (int)e.canonicalType();
+        if (int diff = lt - rt)
+            return diff;
     }
-    x = compareElementValues(*this, e, comparator);
-    return x;
+    if (considerFieldName) {
+        if (int diff = strcmp(fieldName(), e.fieldName()))
+            return diff;
+    }
+    return compareElementValues(*this, e, comparator);
 }
 
 bool BSONElement::binaryEqual(const BSONElement& rhs) const {
@@ -477,7 +480,7 @@ BSONObj BSONElement::Obj() const {
     return embeddedObjectUserCheck();
 }
 
-BSONElement BSONElement::operator[](const std::string& field) const {
+BSONElement BSONElement::operator[](StringData field) const {
     BSONObj o = Obj();
     return o[field];
 }

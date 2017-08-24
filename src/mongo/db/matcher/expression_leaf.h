@@ -1,5 +1,3 @@
-// expression_leaf.h
-
 /**
  *    Copyright (C) 2013 10gen Inc.
  *
@@ -33,6 +31,7 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/matcher/expression_path.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/unordered_map.h"
 
@@ -44,38 +43,15 @@ namespace mongo {
 
 class CollatorInterface;
 
-/**
- * This file contains leaves in the parse tree that are not array-based.
- *
- * LeafMatchExpression: REGEX MOD EXISTS MATCH_IN
- * ComparisonMatchExpression: EQ LTE LT GT GTE
- * MatchExpression: TYPE_OPERATOR
- */
-
-/**
- * Many operators subclass from this:
- * REGEX, MOD, EXISTS, IN
- * Everything that inherits from ComparisonMatchExpression.
- */
-class LeafMatchExpression : public MatchExpression {
+class LeafMatchExpression : public PathMatchExpression {
 public:
-    LeafMatchExpression(MatchType matchType) : MatchExpression(matchType) {}
+    LeafMatchExpression(MatchType matchType) : PathMatchExpression(matchType) {}
 
     virtual ~LeafMatchExpression() {}
 
-    virtual bool matches(const MatchableDocument* doc, MatchDetails* details = 0) const;
-
-    virtual bool matchesSingleElement(const BSONElement& e) const = 0;
-
-    virtual const StringData path() const {
-        return _path;
+    MatchCategory getCategory() const final {
+        return MatchCategory::kLeaf;
     }
-
-    Status setPath(StringData path);
-
-private:
-    StringData _path;
-    ElementPath _elementPath;
 };
 
 /**
@@ -134,10 +110,6 @@ protected:
     // Collator used to compare elements. By default, simple binary comparison will be used.
     const CollatorInterface* _collator = nullptr;
 };
-
-//
-// ComparisonMatchExpression inheritors
-//
 
 class EqualityMatchExpression : public ComparisonMatchExpression {
 public:
@@ -208,10 +180,6 @@ public:
         return std::move(e);
     }
 };
-
-//
-// LeafMatchExpression inheritors
-//
 
 class RegexMatchExpression : public LeafMatchExpression {
 public:
@@ -461,10 +429,6 @@ private:
  */
 class BitTestMatchExpression : public LeafMatchExpression {
 public:
-    // Constant used in matchesSingleElement() and MatchExpressionParser::_parseBitTest. Is a
-    // double representation of 2^63.
-    static const double kLongLongMaxPlusOneAsDouble;
-
     BitTestMatchExpression(MatchType type) : LeafMatchExpression(type) {}
     virtual ~BitTestMatchExpression() {}
 
