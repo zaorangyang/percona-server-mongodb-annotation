@@ -838,7 +838,6 @@ Status applyOperation_inlock(OperationContext* txn,
             // 2. If okay, commit
             // 3. If not, do upsert (and commit)
             // 4. If both !Ok, return status
-            Status status{ErrorCodes::NotYetInitialized, ""};
 
             // We cannot rely on a DuplicateKey error if we'repart of a larger transaction, because
             // that would require the transaction to abort. So instead, use upsert in that case.
@@ -846,12 +845,8 @@ Status applyOperation_inlock(OperationContext* txn,
 
             if (!needToDoUpsert) {
                 WriteUnitOfWork wuow(txn);
-                try {
-                    OpDebug* const nullOpDebug = nullptr;
-                    status = collection->insertDocument(txn, o, nullOpDebug, true);
-                } catch (DBException dbe) {
-                    status = dbe.toStatus();
-                }
+                OpDebug* const nullOpDebug = nullptr;
+                auto status = collection->insertDocument(txn, o, nullOpDebug, true);
                 if (status.isOK()) {
                     wuow.commit();
                 } else if (status == ErrorCodes::DuplicateKey) {
@@ -916,7 +911,7 @@ Status applyOperation_inlock(OperationContext* txn,
                     // was a simple { _id : ... } update criteria
                     string msg = str::stream() << "failed to apply update: " << redact(op);
                     error() << msg;
-                    return Status(ErrorCodes::OperationFailed, msg);
+                    return Status(ErrorCodes::UpdateOperationFailed, msg);
                 }
                 // Need to check to see if it isn't present so we can exit early with a
                 // failure. Note that adds some overhead for this extra check in some cases,
@@ -932,7 +927,7 @@ Status applyOperation_inlock(OperationContext* txn,
                      Helpers::findOne(txn, collection, updateCriteria, false).isNull())) {
                     string msg = str::stream() << "couldn't find doc: " << redact(op);
                     error() << msg;
-                    return Status(ErrorCodes::OperationFailed, msg);
+                    return Status(ErrorCodes::UpdateOperationFailed, msg);
                 }
 
                 // Otherwise, it's present; zero objects were updated because of additional
@@ -944,7 +939,7 @@ Status applyOperation_inlock(OperationContext* txn,
                 if (!upsert) {
                     string msg = str::stream() << "update of non-mod failed: " << redact(op);
                     error() << msg;
-                    return Status(ErrorCodes::OperationFailed, msg);
+                    return Status(ErrorCodes::UpdateOperationFailed, msg);
                 }
             }
         }
