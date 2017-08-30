@@ -1,4 +1,4 @@
-// test that enableSharding gets audited
+// test that shardCollection gets audited
 
 if (TestData.testData !== undefined) {
     load(TestData.testData + '/audit/_audit_helpers.js');
@@ -15,7 +15,7 @@ auditTestShard(
         assert.commandWorked(st.s0.adminCommand({shardCollection: jsTestName() + '.foo', key: {a: 1, b: 1}}));
 
         beforeLoad = Date.now();
-        auditColl = loadAuditEventsIntoCollection(st.s0, getDBPath() + '/auditLog-s0.json', testDB.getName(), 'auditEvents');
+        auditColl = loadAuditEventsIntoCollection(st.s0, getDBPath() + '/auditLog-c0.json', testDB.getName(), 'auditEvents');
         assert.eq(1, auditColl.count({
             atype: "shardCollection",
             ts: withinFewSecondsBefore(beforeLoad),

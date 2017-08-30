@@ -102,6 +102,11 @@ var auditTestShard = function(name, fn, serverParams) {
                                         auditDestination: 'file',
                                         auditFormat: 'JSON'
                                     }, mongodOptions(serverParams)),
+                                    configOptions: {
+                                        auditPath: dbpath + '/auditLog-c0.json',
+                                        auditDestination: 'file',
+                                        auditFormat: 'JSON'
+                                    },
                                 },
                               });
     try {
