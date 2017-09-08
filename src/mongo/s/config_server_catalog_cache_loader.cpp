@@ -87,16 +87,13 @@ QueryAndSort createConfigDiffQuery(const NamespaceString& nss, ChunkVersion coll
 /**
  * Blocking method, which returns the chunks which changed since the specified version.
  */
-CollectionAndChangedChunks getChangedChunks(
-    OperationContext* opCtx,
-    const NamespaceString& nss,
-    ChunkVersion sinceVersion,
-    const repl::ReadConcernLevel& readConcern = repl::ReadConcernLevel::kMajorityReadConcern) {
+CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
+                                            const NamespaceString& nss,
+                                            ChunkVersion sinceVersion) {
     const auto catalogClient = Grid::get(opCtx)->catalogClient();
 
     // Decide whether to do a full or partial load based on the state of the collection
-    const auto coll =
-        uassertStatusOK(catalogClient->getCollection(opCtx, nss.ns(), readConcern)).value;
+    const auto coll = uassertStatusOK(catalogClient->getCollection(opCtx, nss.ns())).value;
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "Collection " << nss.ns() << " is dropped.",
             !coll.getDropped());
@@ -156,41 +153,36 @@ void ConfigServerCatalogCacheLoader::onStepUp() {
     MONGO_UNREACHABLE;
 }
 
-void ConfigServerCatalogCacheLoader::notifyOfCollectionVersionUpdate(OperationContext* opCtx,
-                                                                     const NamespaceString& nss,
-                                                                     const ChunkVersion& version) {
+void ConfigServerCatalogCacheLoader::notifyOfCollectionVersionUpdate(const NamespaceString& nss) {
     MONGO_UNREACHABLE;
 }
 
-Status ConfigServerCatalogCacheLoader::waitForCollectionVersion(OperationContext* opCtx,
-                                                                const NamespaceString& nss,
-                                                                const ChunkVersion& version) {
+void ConfigServerCatalogCacheLoader::waitForCollectionFlush(OperationContext* opCtx,
+                                                            const NamespaceString& nss) {
     MONGO_UNREACHABLE;
 }
 
 std::shared_ptr<Notification<void>> ConfigServerCatalogCacheLoader::getChunksSince(
     const NamespaceString& nss,
     ChunkVersion version,
-    stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn,
-    const repl::ReadConcernLevel& readConcern) {
+    stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn) {
 
     auto notify = std::make_shared<Notification<void>>();
 
-    uassertStatusOK(
-        _threadPool.schedule([ this, nss, version, notify, callbackFn, readConcern ]() noexcept {
-            auto opCtx = Client::getCurrent()->makeOperationContext();
+    uassertStatusOK(_threadPool.schedule([ this, nss, version, notify, callbackFn ]() noexcept {
+        auto opCtx = Client::getCurrent()->makeOperationContext();
 
-            auto swCollAndChunks = [&]() -> StatusWith<CollectionAndChangedChunks> {
-                try {
-                    return getChangedChunks(opCtx.get(), nss, version, readConcern);
-                } catch (const DBException& ex) {
-                    return ex.toStatus();
-                }
-            }();
+        auto swCollAndChunks = [&]() -> StatusWith<CollectionAndChangedChunks> {
+            try {
+                return getChangedChunks(opCtx.get(), nss, version);
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+        }();
 
-            callbackFn(opCtx.get(), std::move(swCollAndChunks));
-            notify->set();
-        }));
+        callbackFn(opCtx.get(), std::move(swCollAndChunks));
+        notify->set();
+    }));
 
     return notify;
 }

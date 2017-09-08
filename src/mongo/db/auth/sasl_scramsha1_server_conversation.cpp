@@ -123,7 +123,11 @@ StatusWith<bool> SaslSCRAMSHA1ServerConversation::_firstStep(std::vector<string>
                 << "Incorrect number of arguments for first SCRAM-SHA-1 client message, got "
                 << input.size()
                 << " expected 4");
-    } else if (input[0] != "n") {
+    } else if (str::startsWith(input[0], "p=")) {
+        return StatusWith<bool>(ErrorCodes::BadValue,
+                                mongoutils::str::stream()
+                                    << "Server does not support channel binding");
+    } else if (input[0] != "n" && input[0] != "y") {
         return StatusWith<bool>(ErrorCodes::BadValue,
                                 mongoutils::str::stream()
                                     << "Incorrect SCRAM-SHA-1 client message prefix: "
@@ -164,9 +168,9 @@ StatusWith<bool> SaslSCRAMSHA1ServerConversation::_firstStep(std::vector<string>
 
     // The authentication database is also the source database for the user.
     User* userObj;
-    Status status = _saslAuthSession->getAuthorizationSession()
-                        ->getAuthorizationManager()
-                        .acquireUserForInitialAuth(_saslAuthSession->getOpCtxt(), user, &userObj);
+    Status status =
+        _saslAuthSession->getAuthorizationSession()->getAuthorizationManager().acquireUser(
+            _saslAuthSession->getOpCtxt(), user, &userObj);
 
     if (!status.isOK()) {
         return StatusWith<bool>(status);

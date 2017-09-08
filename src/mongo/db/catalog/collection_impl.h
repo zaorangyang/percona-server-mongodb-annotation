@@ -30,8 +30,12 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 
 namespace mongo {
+class IndexConsistency;
+class IndexObserver;
 class UUIDCatalog;
 class CollectionImpl final : virtual public Collection::Impl,
                              virtual CappedCallback,
@@ -142,13 +146,16 @@ public:
      * 'cappedOK' if true, allows deletes on capped collections (Cloner::copyDB uses this).
      * 'noWarn' if unindexing the record causes an error, if noWarn is true the error
      * will not be logged.
+     * 'storeDeletedDoc' whether to store the document deleted in the oplog.
      */
-    void deleteDocument(OperationContext* opCtx,
-                        StmtId stmtId,
-                        const RecordId& loc,
-                        OpDebug* opDebug,
-                        bool fromMigrate = false,
-                        bool noWarn = false) final;
+    void deleteDocument(
+        OperationContext* opCtx,
+        StmtId stmtId,
+        const RecordId& loc,
+        OpDebug* opDebug,
+        bool fromMigrate = false,
+        bool noWarn = false,
+        Collection::StoreDeletedDoc storeDeletedDoc = Collection::StoreDeletedDoc::Off) final;
 
     /*
      * Inserts all documents inside one WUOW.
@@ -204,14 +211,14 @@ public:
      * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
      * @return the post update location of the doc (may or may not be the same as oldLocation)
      */
-    StatusWith<RecordId> updateDocument(OperationContext* opCtx,
-                                        const RecordId& oldLocation,
-                                        const Snapshotted<BSONObj>& oldDoc,
-                                        const BSONObj& newDoc,
-                                        bool enforceQuota,
-                                        bool indexesAffected,
-                                        OpDebug* opDebug,
-                                        OplogUpdateEntryArgs* args) final;
+    RecordId updateDocument(OperationContext* opCtx,
+                            const RecordId& oldLocation,
+                            const Snapshotted<BSONObj>& oldDoc,
+                            const BSONObj& newDoc,
+                            bool enforceQuota,
+                            bool indexesAffected,
+                            OpDebug* opDebug,
+                            OplogUpdateEntryArgs* args) final;
 
     bool updateWithDamagesSupported() const final;
 
@@ -247,6 +254,8 @@ public:
      */
     Status validate(OperationContext* opCtx,
                     ValidateCmdLevel level,
+                    bool background,
+                    std::unique_ptr<Lock::CollectionLock> collLk,
                     ValidateResults* results,
                     BSONObjBuilder* output) final;
 
@@ -347,6 +356,15 @@ public:
      */
     const CollatorInterface* getDefaultCollator() const final;
 
+    /**
+     * Calls the Inform function in the IndexObserver if it's hooked.
+     */
+    void informIndexObserver(OperationContext* opCtx,
+                             const IndexDescriptor* descriptor,
+                             const IndexKeyEntry& indexEntry,
+                             const ValidationOperation operation) const;
+
+
 private:
     inline DatabaseCatalogEntry* dbce() const final {
         return this->_dbce;
@@ -355,6 +373,16 @@ private:
     inline CollectionCatalogEntry* details() const final {
         return this->_details;
     }
+
+    /**
+     * Hooks the IndexObserver into the collection.
+     */
+    void hookIndexObserver(IndexConsistency* consistency);
+
+    /**
+     * Unhooks the IndexObserver from the collection.
+     */
+    void unhookIndexObserver();
 
     /**
      * Returns a non-ok Status if document does not pass this collection's validator.
@@ -403,6 +431,9 @@ private:
     const bool _needCappedLock;
     CollectionInfoCache _infoCache;
     IndexCatalog _indexCatalog;
+
+    mutable stdx::mutex _indexObserverMutex;
+    mutable std::unique_ptr<IndexObserver> _indexObserver;
 
     // The default collation which is applied to operations and indices which have no collation of
     // their own. The collection's validator will respect this collation.

@@ -836,6 +836,8 @@ __session_reset(WT_SESSION *wt_session)
 
 	WT_TRET(__wt_session_reset_cursors(session, true));
 
+	WT_TRET(__wt_schema_sweep_tables(session));
+
 	/* Release common session resources. */
 	WT_TRET(__wt_session_release_resources(session));
 
@@ -1846,9 +1848,9 @@ __open_session(WT_CONNECTION_IMPL *conn,
 		if (!session_ret->active)
 			break;
 	if (i == conn->session_size)
-		WT_ERR_MSG(session, ENOMEM,
-		    "only configured to support %" PRIu32 " sessions"
-		    " (including %d additional internal sessions)",
+		WT_ERR_MSG(session, WT_ERROR,
+		    "out of sessions, only configured to support %" PRIu32
+		    " sessions (including %d additional internal sessions)",
 		    conn->session_size, WT_EXTRA_INTERNAL_SESSIONS);
 
 	/*

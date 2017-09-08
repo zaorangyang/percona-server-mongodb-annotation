@@ -138,7 +138,7 @@ public:
 
                 uassert(ErrorCodes::IllegalOperation,
                         str::stream() << "Unsupported network op " << request.operation(),
-                        isSupportedNetworkOp(request.operation()));
+                        isSupportedRequestNetworkOp(request.operation()));
 
                 if (request.operation() == dbCompressed) {
                     auto swm = compressorManager.decompressMessage(request);
@@ -149,6 +149,8 @@ public:
                     }
                     request = std::move(swm.getValue());
                 }
+
+                const bool isFireAndForgetCommand = OpMsg::isFlagSet(request, OpMsg::kMoreToCome);
 
                 boost::optional<OpMsgRequest> cmdRequest;
                 if ((request.operation() == dbQuery &&
@@ -170,6 +172,8 @@ public:
                 // The 'request' is consumed by the mongobridge and does not get forwarded to
                 // 'dest'.
                 if (auto status = maybeProcessBridgeCommand(cmdRequest)) {
+                    invariant(!isFireAndForgetCommand);
+
                     auto replyBuilder = rpc::makeReplyBuilder(rpc::protocolForMessage(request));
                     BSONObj metadata;
                     BSONObj reply;
@@ -222,8 +226,9 @@ public:
                 // Send the message we received from '_mp' to 'dest'. 'dest' returns a response for
                 // OP_QUERY, OP_GET_MORE, and OP_COMMAND messages that we respond back to
                 // '_mp' with.
-                if (request.operation() == dbQuery || request.operation() == dbGetMore ||
-                    request.operation() == dbCommand || request.operation() == dbMsg) {
+                if (!isFireAndForgetCommand &&
+                    (request.operation() == dbQuery || request.operation() == dbGetMore ||
+                     request.operation() == dbCommand || request.operation() == dbMsg)) {
                     // TODO dbMsg moreToCome
                     // Forward the message to 'dest' and receive its reply in 'response'.
                     response.reset();

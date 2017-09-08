@@ -66,49 +66,60 @@ TEST_F(DocumentSourceFacetTest, ShouldRejectNonObjectSpec) {
     auto ctx = getExpCtx();
     auto spec = BSON("$facet"
                      << "string");
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 
     spec = BSON("$facet" << 1);
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 
     spec = BSON("$facet" << BSON_ARRAY(1 << 2));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 }
 
 TEST_F(DocumentSourceFacetTest, ShouldRejectEmptyObject) {
     auto ctx = getExpCtx();
     auto spec = BSON("$facet" << BSONObj());
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 }
 
 TEST_F(DocumentSourceFacetTest, ShouldRejectFacetsWithInvalidNames) {
     auto ctx = getExpCtx();
     auto spec = BSON("$facet" << BSON("" << BSON_ARRAY(BSON("$skip" << 4))));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 
     spec = BSON("$facet" << BSON("a.b" << BSON_ARRAY(BSON("$skip" << 4))));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 
     spec = BSON("$facet" << BSON("$a" << BSON_ARRAY(BSON("$skip" << 4))));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 }
 
 TEST_F(DocumentSourceFacetTest, ShouldRejectNonArrayFacets) {
     auto ctx = getExpCtx();
     auto spec = BSON("$facet" << BSON("a" << 1));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 
     spec = BSON("$facet" << BSON("a" << BSON_ARRAY(BSON("$skip" << 4)) << "b" << 2));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 }
 
 TEST_F(DocumentSourceFacetTest, ShouldRejectEmptyPipelines) {
     auto ctx = getExpCtx();
     auto spec = BSON("$facet" << BSON("a" << BSONArray()));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 
     spec = BSON("$facet" << BSON("a" << BSON_ARRAY(BSON("$skip" << 4)) << "b" << BSONArray()));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 }
 
 TEST_F(DocumentSourceFacetTest, ShouldSucceedWhenNamespaceIsCollectionless) {
@@ -124,29 +135,35 @@ TEST_F(DocumentSourceFacetTest, ShouldRejectFacetsContainingAnOutStage) {
     auto ctx = getExpCtx();
     auto spec = BSON("$facet" << BSON("a" << BSON_ARRAY(BSON("$out"
                                                              << "out_collection"))));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 
     spec =
         BSON("$facet" << BSON("a" << BSON_ARRAY(BSON("$skip" << 1) << BSON("$out"
                                                                            << "out_collection"))));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 
     spec = BSON("$facet" << BSON("a" << BSON_ARRAY(BSON("$out"
                                                         << "out_collection")
                                                    << BSON("$skip" << 1))));
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 }
 
 TEST_F(DocumentSourceFacetTest, ShouldRejectFacetsContainingAFacetStage) {
     auto ctx = getExpCtx();
     auto spec = fromjson("{$facet: {a: [{$facet: {a: [{$skip: 2}]}}]}}");
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 
     spec = fromjson("{$facet: {a: [{$skip: 2}, {$facet: {a: [{$skip: 2}]}}]}}");
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 
     spec = fromjson("{$facet: {a: [{$skip: 2}], b: [{$facet: {a: [{$skip: 2}]}}]}}");
-    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx), UserException);
+    ASSERT_THROWS(DocumentSourceFacet::createFromBson(spec.firstElement(), ctx),
+                  AssertionException);
 }
 
 TEST_F(DocumentSourceFacetTest, ShouldAcceptLegalSpecification) {
@@ -599,7 +616,7 @@ TEST_F(DocumentSourceFacetTest, ShouldThrowIfAnyPipelineRequiresTextScoreButItIs
     auto facetStage = DocumentSourceFacet::create(std::move(facets), ctx);
 
     DepsTracker deps(DepsTracker::MetadataAvailable::kNoMetadata);
-    ASSERT_THROWS(facetStage->getDependencies(&deps), UserException);
+    ASSERT_THROWS(facetStage->getDependencies(&deps), AssertionException);
 }
 
 /**
@@ -609,7 +626,7 @@ class DocumentSourceNeedsPrimaryShard final : public DocumentSourcePassthrough {
 public:
     StageConstraints constraints() const final {
         StageConstraints constraints;
-        constraints.mustRunOnPrimaryShardIfSharded = true;
+        constraints.hostRequirement = HostTypeRequirement::kPrimaryShard;
         return constraints;
     }
 
@@ -633,7 +650,8 @@ TEST_F(DocumentSourceFacetTest, ShouldRequirePrimaryShardIfAnyStageRequiresPrima
     facets.emplace_back("needsPrimaryShard", std::move(secondPipeline));
     auto facetStage = DocumentSourceFacet::create(std::move(facets), ctx);
 
-    ASSERT_TRUE(facetStage->constraints().mustRunOnPrimaryShardIfSharded);
+    ASSERT(facetStage->constraints().hostRequirement ==
+           DocumentSource::StageConstraints::HostTypeRequirement::kPrimaryShard);
 }
 
 TEST_F(DocumentSourceFacetTest, ShouldNotRequirePrimaryShardIfNoStagesRequiresPrimaryShard) {
@@ -652,7 +670,8 @@ TEST_F(DocumentSourceFacetTest, ShouldNotRequirePrimaryShardIfNoStagesRequiresPr
     facets.emplace_back("second", std::move(secondPipeline));
     auto facetStage = DocumentSourceFacet::create(std::move(facets), ctx);
 
-    ASSERT_FALSE(facetStage->constraints().mustRunOnPrimaryShardIfSharded);
+    ASSERT(facetStage->constraints().hostRequirement ==
+           DocumentSource::StageConstraints::HostTypeRequirement::kAnyShard);
 }
 
 }  // namespace

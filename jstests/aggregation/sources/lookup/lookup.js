@@ -463,7 +463,7 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
         assert.writeOK(from.insert({_id: 2}));
         assert.writeOK(from.insert({_id: 3}));
 
-        // Basic non-equi theta join.
+        // Basic non-equi theta join via $project.
         pipeline = [
             {
               $lookup: {
@@ -492,6 +492,90 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
                   }
               ]
             }
+        ];
+        testPipeline(pipeline, expectedResults, coll);
+
+        // Basic non-equi theta join via $match.
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$_id"},
+                  pipeline: [
+                      {$match: {_id: {$lt: {$expr: "$$var1"}}}},
+                  ],
+                  from: "from",
+                  as: "c",
+              }
+            },
+        ];
+
+        expectedResults = [
+            {"_id": 1, x: 1, "c": []},
+            {"_id": 2, x: 2, "c": [{"_id": 1}]},
+            {
+              "_id": 3,
+              x: 3,
+              "c": [
+                  {"_id": 1},
+                  {
+                    "_id": 2,
+                  }
+              ]
+            }
+        ];
+        testPipeline(pipeline, expectedResults, coll);
+
+        // Multi-level join using $match.
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$_id"},
+                  pipeline: [
+                      {$match: {_id: {$eq: {$expr: "$$var1"}}}},
+                      {
+                        $lookup: {
+                            let : {var2: "$_id"},
+                            pipeline: [
+                                {$match: {_id: {$gt: {$expr: "$$var2"}}}},
+                            ],
+                            from: "from",
+                            as: "d"
+                        }
+                      },
+                  ],
+                  from: "from",
+                  as: "c",
+              }
+            },
+        ];
+
+        expectedResults = [
+            {"_id": 1, "x": 1, "c": [{"_id": 1, "d": [{"_id": 2}, {"_id": 3}]}]},
+            {"_id": 2, "x": 2, "c": [{"_id": 2, "d": [{"_id": 3}]}]},
+            {"_id": 3, "x": 3, "c": [{"_id": 3, "d": []}]}
+        ];
+        testPipeline(pipeline, expectedResults, coll);
+
+        // Equijoin with $match that can't be delegated to the query subsystem.
+        pipeline = [
+            {
+              $lookup: {
+                  let : {var1: "$x"},
+                  pipeline: [
+                      {$addFields: {newField: 2}},
+                      {$match: {newField: {$expr: "$$var1"}}},
+                      {$project: {newField: 0}}
+                  ],
+                  from: "from",
+                  as: "c",
+              }
+            },
+        ];
+
+        expectedResults = [
+            {"_id": 1, "x": 1, "c": []},
+            {"_id": 2, "x": 2, "c": [{"_id": 1}, {"_id": 2}, {"_id": 3}]},
+            {"_id": 3, "x": 3, "c": []}
         ];
         testPipeline(pipeline, expectedResults, coll);
 
@@ -569,6 +653,62 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
         ];
         testPipeline(pipeline, expectedResults, coll);
 
+        // 'let' defined variables are available to all nested sub-pipelines.
+        pipeline = [
+            {$match: {_id: 1}},
+            {
+              $lookup: {
+                  let : {var1: "ABC", var2: "123"},
+                  pipeline: [
+                      {$match: {_id: 1}},
+                      {
+                        $lookup: {
+                            pipeline: [
+                                {$match: {_id: 2}},
+                                {$addFields: {letVar1: "$$var1"}},
+                                {
+                                  $lookup: {
+                                      let : {var3: "XYZ"},
+                                      pipeline: [{
+                                          $addFields: {
+                                              mergedLetVars:
+                                                  {$concat: ["$$var1", "$$var2", "$$var3"]}
+                                          }
+                                      }],
+                                      from: "from",
+                                      as: "join3"
+                                  }
+                                },
+                            ],
+                            from: "from",
+                            as: "join2"
+                        }
+                      },
+                  ],
+                  from: "from",
+                  as: "join1",
+              }
+            }
+        ];
+
+        expectedResults = [{
+            "_id": 1,
+            "x": 1,
+            "join1": [{
+                "_id": 1,
+                "join2": [{
+                    "_id": 2,
+                    "letVar1": "ABC",
+                    "join3": [
+                        {"_id": 1, "mergedLetVars": "ABC123XYZ"},
+                        {"_id": 2, "mergedLetVars": "ABC123XYZ"},
+                        {"_id": 3, "mergedLetVars": "ABC123XYZ"}
+                    ]
+                }]
+            }]
+        }];
+        testPipeline(pipeline, expectedResults, coll);
+
         // 'let' variable shadowed by foreign pipeline variable.
         pipeline = [
             {$match: {_id: 2}},
@@ -576,7 +716,24 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
               $lookup: {
                   let : {var1: "$_id"},
                   pipeline: [
-                      {$project: {shadowedVar: {$let: {vars: {var1: "$_id"}, in : "$$var1"}}}},
+                      {
+                        $project: {
+                            shadowedVar: {$let: {vars: {var1: "abc"}, in : "$$var1"}},
+                            originalVar: "$$var1"
+                        }
+                      },
+                      {
+                        $lookup: {
+                            pipeline: [{
+                                $project: {
+                                    shadowedVar: {$let: {vars: {var1: "xyz"}, in : "$$var1"}},
+                                    originalVar: "$$var1"
+                                }
+                            }],
+                            from: "from",
+                            as: "d"
+                        }
+                      }
                   ],
                   from: "from",
                   as: "c",
@@ -588,9 +745,36 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
             "_id": 2,
             "x": 2,
             "c": [
-                {"_id": 1, "shadowedVar": 1},
-                {"_id": 2, "shadowedVar": 2},
-                {"_id": 3, "shadowedVar": 3}
+                {
+                  "_id": 1,
+                  "shadowedVar": "abc",
+                  "originalVar": 2,
+                  "d": [
+                      {"_id": 1, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 2, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 3, "shadowedVar": "xyz", "originalVar": 2}
+                  ]
+                },
+                {
+                  "_id": 2,
+                  "shadowedVar": "abc",
+                  "originalVar": 2,
+                  "d": [
+                      {"_id": 1, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 2, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 3, "shadowedVar": "xyz", "originalVar": 2}
+                  ]
+                },
+                {
+                  "_id": 3,
+                  "shadowedVar": "abc",
+                  "originalVar": 2,
+                  "d": [
+                      {"_id": 1, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 2, "shadowedVar": "xyz", "originalVar": 2},
+                      {"_id": 3, "shadowedVar": "xyz", "originalVar": 2}
+                  ]
+                }
             ]
         }];
         testPipeline(pipeline, expectedResults, coll);

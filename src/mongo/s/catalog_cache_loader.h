@@ -33,7 +33,6 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/chunk_version.h"
@@ -103,16 +102,7 @@ public:
     /**
      * Notifies the loader that the persisted collection version for 'nss' has been updated.
      */
-    virtual void notifyOfCollectionVersionUpdate(OperationContext* opCtx,
-                                                 const NamespaceString& nss,
-                                                 const ChunkVersion& version) = 0;
-
-    /**
-     * Waits for the persisted collection version to be GTE to 'version', or an epoch change.
-     */
-    virtual Status waitForCollectionVersion(OperationContext* opCtx,
-                                            const NamespaceString& nss,
-                                            const ChunkVersion& version) = 0;
+    virtual void notifyOfCollectionVersionUpdate(const NamespaceString& nss) = 0;
 
     /**
      * Non-blocking call, which requests the chunks changed since the specified version to be
@@ -129,9 +119,21 @@ public:
     virtual std::shared_ptr<Notification<void>> getChunksSince(
         const NamespaceString& nss,
         ChunkVersion version,
-        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn,
-        const repl::ReadConcernLevel& readConcern =
-            repl::ReadConcernLevel::kMajorityReadConcern) = 0;
+        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)>
+            callbackFn) = 0;
+
+    /**
+     * Waits for any pending changes for the specified collection to be persisted locally (not
+     * necessarily replicated). If newer changes come after this method has started running, they
+     * will not be waited for except if there is a drop.
+     *
+     * May throw if the node steps down from primary or if the operation time is exceeded or due to
+     * any other error condition.
+     *
+     * If the specific loader implementation does not support persistence, this method is undefined
+     * and must fassert.
+     */
+    virtual void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) = 0;
 
     /**
      * Only used for unit-tests, clears a previously-created catalog cache loader from the specified

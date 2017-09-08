@@ -402,7 +402,9 @@ connection_runtime_config = [
             min='0', max='100000'),
         ]),
     Config('compatibility', '', r'''
-        set compatibility version of database''',
+        set compatibility version of database.  Changing the compatibility
+        version requires that there are no active operations for the duration
+        of the call.''',
         type='category', subconfig=[
         Config('release', '', r'''
             compatibility release version string'''),
@@ -560,6 +562,7 @@ connection_runtime_config = [
             'split',
             'temporary',
             'thread_group',
+            'timestamp',
             'transaction',
             'verify',
             'version',
@@ -1146,9 +1149,6 @@ methods = {
     Config('name', '', r'''
         if set, specify a name for the checkpoint (note that checkpoints
         including LSM trees may not be named)'''),
-    Config('read_timestamp', '', r'''
-        if set, create the checkpoint as of the specified timestamp''',
-        undoc=True),
     Config('target', '', r'''
         if non-empty, checkpoint the list of objects''', type='list'),
     Config('use_timestamp', 'true', r'''
@@ -1252,16 +1252,26 @@ methods = {
 ]),
 
 'WT_CONNECTION.set_timestamp' : Method([
+    Config('commit_timestamp', '', r'''
+        reset the maximum commit timestamp tracked by WiredTiger.  This will
+        cause future calls to WT_CONNECTION::query_timestamp to ignore commit
+        timestamps greater than the specified value until the next commit moves
+        the tracked commit timestamp forwards.  This is only intended for use
+        where the application is rolling back locally committed transactions.
+        See @ref transaction_timestamps'''),
     Config('oldest_timestamp', '', r'''
         future commits and queries will be no earlier than the specified
         timestamp. Supplied values must be monotonically increasing.
         See @ref transaction_timestamps'''),
     Config('stable_timestamp', '', r'''
-        future checkpoints will be no later than the specified
-        timestamp. Supplied values must be monotonically increasing.
-        The stable timestamp data stability only applies to tables
-        that are not being logged.  See @ref transaction_timestamps'''),
+        checkpoints will not include commits that are newer than the specified
+        timestamp in tables configured with \c log=(enabled=false).  Supplied
+        values must be monotonically increasing.  The stable timestamp data
+        stability only applies to tables that are not being logged.  See @ref
+        transaction_timestamps'''),
 ]),
+
+'WT_CONNECTION.rollback_to_stable' : Method([]),
 
 'WT_SESSION.reconfigure' : Method(session_config),
 

@@ -97,7 +97,7 @@ public:
     StageConstraints constraints() const final {
         StageConstraints constraints;
         constraints.canSwapWithMatch = true;
-        constraints.mustRunOnPrimaryShardIfSharded = true;
+        constraints.hostRequirement = HostTypeRequirement::kPrimaryShard;
         return constraints;
     }
 
@@ -148,6 +148,14 @@ public:
      */
     bool wasConstructedWithPipelineSyntax() const {
         return !static_cast<bool>(_localField);
+    }
+
+    const Variables& getVariables_forTest() {
+        return _variables;
+    }
+
+    const VariablesParseState& getVariablesParseState_forTest() {
+        return _variablesParseState;
     }
 
 protected:

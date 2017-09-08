@@ -223,6 +223,34 @@ env.CppUnitTest(
 )
 
 env.Library(
+    target='replication_recovery',
+    source=[
+        'replication_recovery.cpp',
+    ],
+    LIBDEPS=[
+    ],
+    LIBDEPS_PRIVATE=[
+        'sync_tail',
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target='replication_recovery_test',
+    source=[
+        'replication_recovery_test.cpp',
+    ],
+    LIBDEPS=[
+    ],
+    LIBDEPS_PRIVATE=[
+        'replmocks',
+        'replication_recovery',
+        'storage_interface_impl',
+        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+    ],
+)
+
+env.Library(
     target='replication_process',
     source=[
         'replication_consistency_markers.cpp',
@@ -595,9 +623,24 @@ env.Library(
     target='idempotency_test_util',
     source=[
         'idempotency_document_structure.cpp',
+        'idempotency_scalar_generator.cpp',
+        'idempotency_update_sequence.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/pipeline/document_value'
+    ],
+)
+
+env.CppUnitTest(
+    target='idempotency_test',
+    source=[
+        'idempotency_test.cpp',
+    ],
+    LIBDEPS=[
+        'idempotency_test_fixture',
+        'idempotency_test_util',
     ],
 )
 
@@ -605,6 +648,16 @@ env.CppUnitTest(
     target='idempotency_document_structure_test',
     source=[
         'idempotency_document_structure_test.cpp',
+    ],
+    LIBDEPS=[
+        'idempotency_test_util',
+    ],
+)
+
+env.CppUnitTest(
+    target='idempotency_update_sequence_test',
+    source=[
+        'idempotency_update_sequence_test.cpp',
     ],
     LIBDEPS=[
         'idempotency_test_util',
@@ -766,6 +819,8 @@ env.CppUnitTest(
     LIBDEPS=[
         'repl_coordinator_impl',
         'replmocks',
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
     ],
 )
@@ -779,6 +834,8 @@ env.CppUnitTest(
         'repl_coordinator_impl',
         'replica_set_messages',
         'replmocks',
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
     ],
 )
@@ -807,6 +864,8 @@ env.CppUnitTest(
         'repl_coordinator_impl',
         'replica_set_messages',
         'replmocks',
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
     ],
 )
@@ -1384,6 +1443,7 @@ env.CppUnitTest(
         'sync_source_selector_mock',
         'task_executor_mock',
         '$BUILD_DIR/mongo/db/query/command_request_response',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
         '$BUILD_DIR/mongo/unittest/concurrency',
     ],
@@ -1515,6 +1575,7 @@ env.Library(
         'repl_settings',
         'replication_consistency_markers_impl',
         'replication_process',
+        'replication_recovery',
         'rollback_source_impl',
         'sync_tail',
     ],

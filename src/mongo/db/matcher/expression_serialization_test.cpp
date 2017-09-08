@@ -797,6 +797,37 @@ TEST(SerializeBasic, ExpressionTypeWithNumberSerializesCorrectly) {
     ASSERT_EQ(original.matches(obj), reserialized.matches(obj));
 }
 
+TEST(SerializeInternalSchema, InternalSchemaTypeExpressionSerializesCorrectly) {
+    Matcher original(
+        fromjson("{x: {$_internalSchemaType: 2}}"), ExtensionsCallbackNoop(), kSimpleCollator);
+    Matcher reserialized(
+        serialize(original.getMatchExpression()), ExtensionsCallbackNoop(), kSimpleCollator);
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), fromjson("{x: {$_internalSchemaType: 2}}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
+
+    BSONObj obj = fromjson("{x: 3}");
+    ASSERT_EQ(original.matches(obj), reserialized.matches(obj));
+
+    obj = fromjson("{x: '3'}");
+    ASSERT_EQ(original.matches(obj), reserialized.matches(obj));
+}
+
+TEST(SerializeInternalSchema, InternalSchemaTypeExpressionWithNumberSerializesCorrectly) {
+    Matcher original(fromjson("{x: {$_internalSchemaType: 'number'}}"),
+                     ExtensionsCallbackNoop(),
+                     kSimpleCollator);
+    Matcher reserialized(
+        serialize(original.getMatchExpression()), ExtensionsCallbackNoop(), kSimpleCollator);
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), fromjson("{x: {$_internalSchemaType: 'number'}}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
+
+    BSONObj obj = fromjson("{x: 3}");
+    ASSERT_EQ(original.matches(obj), reserialized.matches(obj));
+
+    obj = fromjson("{x: '3'}");
+    ASSERT_EQ(original.matches(obj), reserialized.matches(obj));
+}
+
 TEST(SerializeBasic, ExpressionEmptySerializesCorrectly) {
     Matcher original(fromjson("{}"), ExtensionsCallbackNoop(), kSimpleCollator);
     Matcher reserialized(
@@ -970,6 +1001,17 @@ TEST(SerializeBasic, ExpressionAlwaysFalseSerializesCorrectly) {
     ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
 }
 
+TEST(SerializeInternalSchema, ExpressionInternalSchemaAllElemMatchFromIndexSerializesCorrectly) {
+    Matcher original(fromjson("{x: {$_internalSchemaAllElemMatchFromIndex: [2, {y: 1}]}}"),
+                     ExtensionsCallbackDisallowExtensions(),
+                     kSimpleCollator);
+    Matcher reserialized(serialize(original.getMatchExpression()),
+                         ExtensionsCallbackDisallowExtensions(),
+                         kSimpleCollator);
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(),
+                      fromjson("{x: {$_internalSchemaAllElemMatchFromIndex: [2, {y: {$eq: 1}}]}}"));
+}
+
 TEST(SerializeInternalSchema, ExpressionInternalSchemaMinItemsSerializesCorrectly) {
     Matcher original(fromjson("{x: {$_internalSchemaMinItems: 1}}"),
                      ExtensionsCallbackDisallowExtensions(),
@@ -1073,5 +1115,36 @@ TEST(SerializeInternalSchema, ExpressionInternalSchemaMaxPropertiesSerializesCor
     ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
 }
 
+TEST(SerializeInternalSchema, ExpressionInternalSchemaFmodSerializesCorrectly) {
+    Matcher original(
+        fromjson("{a: {$_internalSchemaFmod: [NumberDecimal('2.3'), NumberDecimal('1.1')]}}"),
+        ExtensionsCallbackNoop(),
+        kSimpleCollator);
+    Matcher reserialized(
+        serialize(original.getMatchExpression()), ExtensionsCallbackNoop(), kSimpleCollator);
+
+    ASSERT_BSONOBJ_EQ(
+        *reserialized.getQuery(),
+        fromjson("{a: {$_internalSchemaFmod: [NumberDecimal('2.3'), NumberDecimal('1.1')]}}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
+    BSONObj obj = fromjson("{a: NumberDecimal('1.1')}");
+    ASSERT_EQ(original.matches(obj), reserialized.matches(obj));
+    obj = fromjson("{a: NumberDecimal('2.3')}");
+    ASSERT_EQ(original.matches(obj), reserialized.matches(obj));
+}
+
+TEST(SerializeInternalSchema, ExpressionInternalSchemaMatchArrayIndexSerializesCorrectly) {
+    constexpr CollatorInterface* collator = nullptr;
+    Matcher original(fromjson("{a: {$_internalSchemaMatchArrayIndex:"
+                              "{index: 2, namePlaceholder: 'i', expression: {i: {$lt: 3}}}}}"),
+                     ExtensionsCallbackDisallowExtensions(),
+                     collator);
+    Matcher reserialized(
+        serialize(original.getMatchExpression()), ExtensionsCallbackDisallowExtensions(), collator);
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(),
+                      fromjson("{a: {$_internalSchemaMatchArrayIndex:"
+                               "{index: 2, namePlaceholder: 'i', expression: {i: {$lt: 3}}}}}"));
+    ASSERT_BSONOBJ_EQ(*reserialized.getQuery(), serialize(reserialized.getMatchExpression()));
+}
 }  // namespace
 }  // namespace mongo

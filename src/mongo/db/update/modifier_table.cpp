@@ -55,6 +55,7 @@
 #include "mongo/db/update/pop_node.h"
 #include "mongo/db/update/pull_node.h"
 #include "mongo/db/update/pullall_node.h"
+#include "mongo/db/update/push_node.h"
 #include "mongo/db/update/rename_node.h"
 #include "mongo/db/update/set_node.h"
 #include "mongo/db/update/unset_node.h"
@@ -115,9 +116,6 @@ void init(NameMap* nameMap) {
     ModifierEntry* entryPush = new ModifierEntry("$push", MOD_PUSH);
     nameMap->insert(make_pair(StringData(entryPush->name), entryPush));
 
-    ModifierEntry* entryPushAll = new ModifierEntry("$pushAll", MOD_PUSH_ALL);
-    nameMap->insert(make_pair(StringData(entryPushAll->name), entryPushAll));
-
     ModifierEntry* entrySet = new ModifierEntry("$set", MOD_SET);
     nameMap->insert(make_pair(StringData(entrySet->name), entrySet));
 
@@ -172,9 +170,7 @@ ModifierInterface* makeUpdateMod(ModifierType modType) {
         case MOD_PULL_ALL:
             return new ModifierPullAll;
         case MOD_PUSH:
-            return new ModifierPush(ModifierPush::PUSH_NORMAL);
-        case MOD_PUSH_ALL:
-            return new ModifierPush(ModifierPush::PUSH_ALL);
+            return new ModifierPush;
         case MOD_SET:
             return new ModifierSet(ModifierSet::SET_NORMAL);
         case MOD_SET_ON_INSERT:
@@ -212,6 +208,8 @@ std::unique_ptr<UpdateLeafNode> makeUpdateLeafNode(ModifierType modType) {
             return stdx::make_unique<PullNode>();
         case MOD_PULL_ALL:
             return stdx::make_unique<PullAllNode>();
+        case MOD_PUSH:
+            return stdx::make_unique<PushNode>();
         case MOD_RENAME:
             return stdx::make_unique<RenameNode>();
         case MOD_SET:

@@ -35,6 +35,7 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 
 namespace mongo {
@@ -96,10 +97,31 @@ TEST(EqOp, MatchesElement) {
     ASSERT(eq.equivalent(&eq));
 }
 
+TEST(EqOp, ConstantAggExprMatchesElement) {
+    BSONObj operand = BSON("a" << BSON("$expr"
+                                       << "$$userVar"));
+    BSONObj match = BSON("a" << 5);
+    BSONObj notMatch = BSON("a" << 6);
+
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto varId = expCtx->variablesParseState.defineVariable("userVar");
+    expCtx->variables.setValue(varId, Value(5));
+    auto expr = Expression::parseOperand(
+        expCtx, operand.firstElement()["$expr"], expCtx->variablesParseState);
+    expr = expr->optimize();
+
+    EqualityMatchExpression eq;
+    ASSERT_OK(eq.init("a", expr));
+    ASSERT(eq.matchesSingleElement(match.firstElement()));
+    ASSERT_FALSE(eq.matchesSingleElement(notMatch.firstElement()));
+
+    ASSERT(eq.equivalent(&eq));
+}
+
 TEST(EqOp, InvalidEooOperand) {
     BSONObj operand;
     EqualityMatchExpression eq;
-    ASSERT(!eq.init("", operand.firstElement()).isOK());
+    ASSERT_FALSE(eq.init("", operand.firstElement()).isOK());
 }
 
 TEST(EqOp, MatchesScalar) {
@@ -418,6 +440,27 @@ TEST(LtOp, ElemMatchKey) {
     ASSERT_EQUALS("1", details.elemMatchKey());
 }
 
+TEST(LtOp, ConstantAggExprMatchesElement) {
+    BSONObj operand = BSON("a" << BSON("$lt" << BSON("$expr"
+                                                     << "$$userVar")));
+    BSONObj match = BSON("a" << 5);
+    BSONObj notMatch = BSON("a" << 10);
+
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto varId = expCtx->variablesParseState.defineVariable("userVar");
+    expCtx->variables.setValue(varId, Value(6));
+    auto expr = Expression::parseOperand(
+        expCtx, operand.firstElement()["$lt"]["$expr"], expCtx->variablesParseState);
+    expr = expr->optimize();
+
+    LTMatchExpression lt;
+    ASSERT_OK(lt.init("a", expr));
+    ASSERT(lt.matchesSingleElement(match.firstElement()));
+    ASSERT_FALSE(lt.matchesSingleElement(notMatch.firstElement()));
+
+    ASSERT(lt.equivalent(&lt));
+}
+
 /**
    TEST( LtOp, MatchesIndexKeyScalar ) {
    BSONObj operand = BSON( "$lt" << 6 );
@@ -481,6 +524,27 @@ TEST(LteOp, MatchesElement) {
     ASSERT(lte.matchesSingleElement(equalMatch.firstElement()));
     ASSERT(!lte.matchesSingleElement(notMatch.firstElement()));
     ASSERT(!lte.matchesSingleElement(notMatchWrongType.firstElement()));
+}
+
+TEST(LteOp, ConstantAggExprMatchesElement) {
+    BSONObj operand = BSON("a" << BSON("$lte" << BSON("$expr"
+                                                      << "$$userVar")));
+    BSONObj match = BSON("a" << 5);
+    BSONObj notMatch = BSON("a" << 10);
+
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto varId = expCtx->variablesParseState.defineVariable("userVar");
+    expCtx->variables.setValue(varId, Value(6));
+    auto expr = Expression::parseOperand(
+        expCtx, operand.firstElement()["$lte"]["$expr"], expCtx->variablesParseState);
+    expr = expr->optimize();
+
+    LTEMatchExpression lte;
+    ASSERT_OK(lte.init("a", expr));
+    ASSERT(lte.matchesSingleElement(match.firstElement()));
+    ASSERT_FALSE(lte.matchesSingleElement(notMatch.firstElement()));
+
+    ASSERT(lte.equivalent(&lte));
 }
 
 TEST(LteOp, InvalidEooOperand) {
@@ -737,6 +801,27 @@ TEST(GtOp, ElemMatchKey) {
     ASSERT_EQUALS("1", details.elemMatchKey());
 }
 
+TEST(GtOp, ConstantAggExprMatchesElement) {
+    BSONObj operand = BSON("a" << BSON("$gt" << BSON("$expr"
+                                                     << "$$userVar")));
+    BSONObj match = BSON("a" << 10);
+    BSONObj notMatch = BSON("a" << 0);
+
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto varId = expCtx->variablesParseState.defineVariable("userVar");
+    expCtx->variables.setValue(varId, Value(5));
+    auto expr = Expression::parseOperand(
+        expCtx, operand.firstElement()["$gt"]["$expr"], expCtx->variablesParseState);
+    expr = expr->optimize();
+
+    GTMatchExpression gt;
+    ASSERT_OK(gt.init("a", expr));
+    ASSERT(gt.matchesSingleElement(match.firstElement()));
+    ASSERT_FALSE(gt.matchesSingleElement(notMatch.firstElement()));
+
+    ASSERT(gt.equivalent(&gt));
+}
+
 /**
    TEST( GtOp, MatchesIndexKeyScalar ) {
    BSONObj operand = BSON( "$gt" << 6 );
@@ -895,6 +980,27 @@ TEST(GteOp, ElemMatchKey) {
     ASSERT(gte.matchesBSON(BSON("a" << BSON_ARRAY(2 << 6 << 5)), &details));
     ASSERT(details.hasElemMatchKey());
     ASSERT_EQUALS("1", details.elemMatchKey());
+}
+
+TEST(GteOp, ConstantAggExprMatchesElement) {
+    BSONObj operand = BSON("a" << BSON("$gte" << BSON("$expr"
+                                                      << "$$userVar")));
+    BSONObj match = BSON("a" << 10);
+    BSONObj notMatch = BSON("a" << 0);
+
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto varId = expCtx->variablesParseState.defineVariable("userVar");
+    expCtx->variables.setValue(varId, Value(5));
+    auto expr = Expression::parseOperand(
+        expCtx, operand.firstElement()["$gte"]["$expr"], expCtx->variablesParseState);
+    expr = expr->optimize();
+
+    GTEMatchExpression gte;
+    ASSERT_OK(gte.init("a", expr));
+    ASSERT(gte.matchesSingleElement(match.firstElement()));
+    ASSERT_FALSE(gte.matchesSingleElement(notMatch.firstElement()));
+
+    ASSERT(gte.equivalent(&gte));
 }
 
 TEST(RegexMatchExpression, MatchesElementExact) {
@@ -1320,157 +1426,13 @@ TEST(ExistsMatchExpression, Equivalent) {
     ASSERT(!e1.equivalent(&e2));
 }
 
-TEST(TypeMatchExpression, MatchesElementStringType) {
-    BSONObj match = BSON("a"
-                         << "abc");
-    BSONObj notMatch = BSON("a" << 5);
-    TypeMatchExpression type;
-    ASSERT(type.init("", String).isOK());
-    ASSERT(type.matchesSingleElement(match["a"]));
-    ASSERT(!type.matchesSingleElement(notMatch["a"]));
-}
-
-TEST(TypeMatchExpression, MatchesElementNullType) {
-    BSONObj match = BSON("a" << BSONNULL);
-    BSONObj notMatch = BSON("a"
-                            << "abc");
-    TypeMatchExpression type;
-    ASSERT(type.init("", jstNULL).isOK());
-    ASSERT(type.matchesSingleElement(match["a"]));
-    ASSERT(!type.matchesSingleElement(notMatch["a"]));
-}
-
-TEST(TypeMatchExpression, MatchesElementNumber) {
-    BSONObj match1 = BSON("a" << 1);
-    BSONObj match2 = BSON("a" << 1LL);
-    BSONObj match3 = BSON("a" << 2.5);
-    BSONObj notMatch = BSON("a"
-                            << "abc");
-    ASSERT_EQ(BSONType::NumberInt, match1["a"].type());
-    ASSERT_EQ(BSONType::NumberLong, match2["a"].type());
-    ASSERT_EQ(BSONType::NumberDouble, match3["a"].type());
-
-    TypeMatchExpression typeExpr;
-    TypeMatchExpression::Type type;
-    type.allNumbers = true;
-    ASSERT_OK(typeExpr.init("a", type));
-    ASSERT_EQ("a", typeExpr.path());
-    ASSERT_TRUE(typeExpr.matchesSingleElement(match1["a"]));
-    ASSERT_TRUE(typeExpr.matchesSingleElement(match2["a"]));
-    ASSERT_TRUE(typeExpr.matchesSingleElement(match3["a"]));
-    ASSERT_FALSE(typeExpr.matchesSingleElement(notMatch["a"]));
-}
-
-TEST(TypeMatchExpression, MatchesScalar) {
-    TypeMatchExpression type;
-    ASSERT(type.init("a", Bool).isOK());
-    ASSERT(type.matchesBSON(BSON("a" << true), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << 1), NULL));
-}
-
-TEST(TypeMatchExpression, MatchesArray) {
-    TypeMatchExpression type;
-    ASSERT(type.init("a", NumberInt).isOK());
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(4)), NULL));
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(4 << "a")), NULL));
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY("a" << 4)), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY("a")), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY(BSON_ARRAY(4))), NULL));
-}
-
-TEST(TypeMatchExpression, TypeArrayMatchesOuterAndInnerArray) {
-    TypeMatchExpression type;
-    ASSERT(type.init("a", Array).isOK());
-    ASSERT(type.matchesBSON(BSON("a" << BSONArray()), nullptr));
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(4 << "a")), nullptr));
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(BSONArray() << 2)), nullptr));
-    ASSERT(!type.matchesBSON(BSON("a"
-                                  << "bar"),
-                             nullptr));
-}
-
-TEST(TypeMatchExpression, MatchesObject) {
-    TypeMatchExpression type;
-    ASSERT(type.init("a", Object).isOK());
-    ASSERT(type.matchesBSON(BSON("a" << BSON("b" << 1)), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << 1), NULL));
-}
-
-TEST(TypeMatchExpression, MatchesDotNotationFieldObject) {
-    TypeMatchExpression type;
-    ASSERT(type.init("a.b", Object).isOK());
-    ASSERT(type.matchesBSON(BSON("a" << BSON("b" << BSON("c" << 1))), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON("b" << 1)), NULL));
-}
-
-TEST(TypeMatchExpression, MatchesDotNotationArrayElementArray) {
-    TypeMatchExpression type;
-    ASSERT(type.init("a.0", Array).isOK());
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(BSON_ARRAY(1))), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY("b")), NULL));
-}
-
-TEST(TypeMatchExpression, MatchesDotNotationArrayElementScalar) {
-    TypeMatchExpression type;
-    ASSERT(type.init("a.0", String).isOK());
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY("b")), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY(1)), NULL));
-}
-
-TEST(TypeMatchExpression, MatchesDotNotationArrayElementObject) {
-    TypeMatchExpression type;
-    ASSERT(type.init("a.0", Object).isOK());
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(BSON("b" << 1))), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << BSON_ARRAY(1)), NULL));
-}
-
-TEST(TypeMatchExpression, MatchesNull) {
-    TypeMatchExpression type;
-    ASSERT(type.init("a", jstNULL).isOK());
-    ASSERT(type.matchesBSON(BSON("a" << BSONNULL), NULL));
-    ASSERT(!type.matchesBSON(BSON("a" << 4), NULL));
-    ASSERT(!type.matchesBSON(BSONObj(), NULL));
-}
-
-TEST(TypeMatchExpression, ElemMatchKey) {
-    TypeMatchExpression type;
-    ASSERT(type.init("a.b", String).isOK());
-    MatchDetails details;
-    details.requestElemMatchKey();
-    ASSERT(!type.matchesBSON(BSON("a" << 1), &details));
-    ASSERT(!details.hasElemMatchKey());
-    ASSERT(type.matchesBSON(BSON("a" << BSON("b"
-                                             << "string")),
-                            &details));
-    ASSERT(!details.hasElemMatchKey());
-    ASSERT(type.matchesBSON(BSON("a" << BSON("b" << BSON_ARRAY("string"))), &details));
-    ASSERT(details.hasElemMatchKey());
-    ASSERT_EQUALS("0", details.elemMatchKey());
-    ASSERT(type.matchesBSON(BSON("a" << BSON_ARRAY(2 << BSON("b" << BSON_ARRAY("string")))),
-                            &details));
-    ASSERT(details.hasElemMatchKey());
-    ASSERT_EQUALS("1", details.elemMatchKey());
-}
-
-TEST(TypeMatchExpression, Equivalent) {
-    TypeMatchExpression e1;
-    TypeMatchExpression e2;
-    TypeMatchExpression e3;
-    ASSERT_OK(e1.init("a", BSONType::String));
-    ASSERT_OK(e2.init("a", BSONType::NumberDouble));
-    ASSERT_OK(e3.init("b", BSONType::String));
-
-    ASSERT(e1.equivalent(&e1));
-    ASSERT(!e1.equivalent(&e2));
-    ASSERT(!e1.equivalent(&e3));
-}
-
 TEST(InMatchExpression, MatchesElementSingle) {
     BSONArray operand = BSON_ARRAY(1);
     BSONObj match = BSON("a" << 1);
     BSONObj notMatch = BSON("a" << 2);
     InMatchExpression in;
-    in.addEquality(operand.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities{operand.firstElement()};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
     ASSERT(in.matchesSingleElement(match["a"]));
     ASSERT(!in.matchesSingleElement(notMatch["a"]));
 }
@@ -1488,10 +1450,8 @@ TEST(InMatchExpression, MatchesEmpty) {
 TEST(InMatchExpression, MatchesElementMultiple) {
     BSONObj operand = BSON_ARRAY(1 << "r" << true << 1);
     InMatchExpression in;
-    in.addEquality(operand[0]).transitional_ignore();
-    in.addEquality(operand[1]).transitional_ignore();
-    in.addEquality(operand[2]).transitional_ignore();
-    in.addEquality(operand[3]).transitional_ignore();
+    std::vector<BSONElement> equalities{operand[0], operand[1], operand[2], operand[3]};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
 
     BSONObj matchFirst = BSON("a" << 1);
     BSONObj matchSecond = BSON("a"
@@ -1509,7 +1469,8 @@ TEST(InMatchExpression, MatchesScalar) {
     BSONObj operand = BSON_ARRAY(5);
     InMatchExpression in;
     in.init("a").transitional_ignore();
-    in.addEquality(operand.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities{operand.firstElement()};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
 
     ASSERT(in.matchesBSON(BSON("a" << 5.0), NULL));
     ASSERT(!in.matchesBSON(BSON("a" << 4), NULL));
@@ -1519,7 +1480,8 @@ TEST(InMatchExpression, MatchesArrayValue) {
     BSONObj operand = BSON_ARRAY(5);
     InMatchExpression in;
     in.init("a").transitional_ignore();
-    in.addEquality(operand.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities{operand.firstElement()};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
 
     ASSERT(in.matchesBSON(BSON("a" << BSON_ARRAY(5.0 << 6)), NULL));
     ASSERT(!in.matchesBSON(BSON("a" << BSON_ARRAY(6 << 7)), NULL));
@@ -1531,7 +1493,8 @@ TEST(InMatchExpression, MatchesNull) {
 
     InMatchExpression in;
     in.init("a").transitional_ignore();
-    in.addEquality(operand.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities{operand.firstElement()};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
 
     ASSERT(in.matchesBSON(BSONObj(), NULL));
     ASSERT(in.matchesBSON(BSON("a" << BSONNULL), NULL));
@@ -1545,15 +1508,16 @@ TEST(InMatchExpression, MatchesUndefined) {
 
     InMatchExpression in;
     in.init("a").transitional_ignore();
-    Status s = in.addEquality(operand.firstElement());
-    ASSERT_NOT_OK(s);
+    std::vector<BSONElement> equalities{operand.firstElement()};
+    ASSERT_NOT_OK(in.setEqualities(std::move(equalities)));
 }
 
 TEST(InMatchExpression, MatchesMinKey) {
     BSONObj operand = BSON_ARRAY(MinKey);
     InMatchExpression in;
     in.init("a").transitional_ignore();
-    in.addEquality(operand.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities{operand.firstElement()};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
 
     ASSERT(in.matchesBSON(BSON("a" << MinKey), NULL));
     ASSERT(!in.matchesBSON(BSON("a" << MaxKey), NULL));
@@ -1564,7 +1528,8 @@ TEST(InMatchExpression, MatchesMaxKey) {
     BSONObj operand = BSON_ARRAY(MaxKey);
     InMatchExpression in;
     in.init("a").transitional_ignore();
-    in.addEquality(operand.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities{operand.firstElement()};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
 
     ASSERT(in.matchesBSON(BSON("a" << MaxKey), NULL));
     ASSERT(!in.matchesBSON(BSON("a" << MinKey), NULL));
@@ -1575,9 +1540,8 @@ TEST(InMatchExpression, MatchesFullArray) {
     BSONObj operand = BSON_ARRAY(BSON_ARRAY(1 << 2) << 4 << 5);
     InMatchExpression in;
     in.init("a").transitional_ignore();
-    in.addEquality(operand[0]).transitional_ignore();
-    in.addEquality(operand[1]).transitional_ignore();
-    in.addEquality(operand[2]).transitional_ignore();
+    std::vector<BSONElement> equalities{operand[0], operand[1], operand[2]};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
 
     ASSERT(in.matchesBSON(BSON("a" << BSON_ARRAY(1 << 2)), NULL));
     ASSERT(!in.matchesBSON(BSON("a" << BSON_ARRAY(1 << 2 << 3)), NULL));
@@ -1589,8 +1553,8 @@ TEST(InMatchExpression, ElemMatchKey) {
     BSONObj operand = BSON_ARRAY(5 << 2);
     InMatchExpression in;
     in.init("a").transitional_ignore();
-    in.addEquality(operand[0]).transitional_ignore();
-    in.addEquality(operand[1]).transitional_ignore();
+    std::vector<BSONElement> equalities{operand[0], operand[1]};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
 
     MatchDetails details;
     details.requestElemMatchKey();
@@ -1608,7 +1572,8 @@ TEST(InMatchExpression, InMatchExpressionsWithDifferentNumbersOfElementsAreUnequ
                        << "string");
     InMatchExpression eq1;
     InMatchExpression eq2;
-    eq1.addEquality(obj.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities{obj.firstElement()};
+    ASSERT_OK(eq1.setEqualities(std::move(equalities)));
     ASSERT(!eq1.equivalent(&eq2));
 }
 
@@ -1644,8 +1609,12 @@ TEST(InMatchExpression, InMatchExpressionsWithCollationEquivalentElementsAreEqua
     InMatchExpression eq2;
     eq2.setCollator(&collator2);
 
-    eq1.addEquality(obj1.firstElement()).transitional_ignore();
-    eq2.addEquality(obj2.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities1{obj1.firstElement()};
+    ASSERT_OK(eq1.setEqualities(std::move(equalities1)));
+
+    std::vector<BSONElement> equalities2{obj2.firstElement()};
+    ASSERT_OK(eq2.setEqualities(std::move(equalities2)));
+
     ASSERT(eq1.equivalent(&eq2));
 }
 
@@ -1661,8 +1630,12 @@ TEST(InMatchExpression, InMatchExpressionsWithCollationNonEquivalentElementsAreU
     InMatchExpression eq2;
     eq2.setCollator(&collator2);
 
-    eq1.addEquality(obj1.firstElement()).transitional_ignore();
-    eq2.addEquality(obj2.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities1{obj1.firstElement()};
+    ASSERT_OK(eq1.setEqualities(std::move(equalities1)));
+
+    std::vector<BSONElement> equalities2{obj2.firstElement()};
+    ASSERT_OK(eq2.setEqualities(std::move(equalities2)));
+
     ASSERT(!eq1.equivalent(&eq2));
 }
 
@@ -1671,7 +1644,8 @@ TEST(InMatchExpression, StringMatchingWithNullCollatorUsesBinaryComparison) {
     BSONObj notMatch = BSON("a"
                             << "string2");
     InMatchExpression in;
-    in.addEquality(operand.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities{operand.firstElement()};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
     ASSERT(!in.matchesSingleElement(notMatch["a"]));
 }
 
@@ -1682,7 +1656,8 @@ TEST(InMatchExpression, StringMatchingRespectsCollation) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kAlwaysEqual);
     InMatchExpression in;
     in.setCollator(&collator);
-    in.addEquality(operand.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities{operand.firstElement()};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
     ASSERT(in.matchesSingleElement(match["a"]));
 }
 
@@ -1695,8 +1670,8 @@ TEST(InMatchExpression, ChangingCollationAfterAddingEqualitiesPreservesEqualitie
     CollatorInterfaceMock collatorReverseString(CollatorInterfaceMock::MockType::kReverseString);
     InMatchExpression in;
     in.setCollator(&collatorAlwaysEqual);
-    in.addEquality(obj1.firstElement()).transitional_ignore();
-    in.addEquality(obj2.firstElement()).transitional_ignore();
+    std::vector<BSONElement> equalities{obj1.firstElement(), obj2.firstElement()};
+    ASSERT_OK(in.setEqualities(std::move(equalities)));
     ASSERT(in.getEqualities().size() == 1);
     in.setCollator(&collatorReverseString);
     ASSERT(in.getEqualities().size() == 2);

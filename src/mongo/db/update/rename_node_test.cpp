@@ -41,7 +41,6 @@ namespace mongo {
 namespace {
 
 using RenameNodeTest = UpdateNodeTest;
-using mongo::mutablebson::Document;
 using mongo::mutablebson::Element;
 using mongo::mutablebson::countChildren;
 
@@ -115,7 +114,7 @@ TEST_F(RenameNodeTest, SimpleNumberAtRoot) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: 2}"));
+    mutablebson::Document doc(fromjson("{a: 2}"));
     setPathToCreate("b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()));
@@ -131,7 +130,7 @@ TEST_F(RenameNodeTest, ToExistsAtSameLevel) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: 2, b: 1}"));
+    mutablebson::Document doc(fromjson("{a: 2, b: 1}"));
     setPathTaken("b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["b"]));
@@ -147,7 +146,7 @@ TEST_F(RenameNodeTest, ToAndFromHaveSameValue) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: 2, b: 2}"));
+    mutablebson::Document doc(fromjson("{a: 2, b: 2}"));
     setPathTaken("b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["b"]));
@@ -163,7 +162,7 @@ TEST_F(RenameNodeTest, FromDottedElement) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a.c"], collator));
 
-    Document doc(fromjson("{a: {c: {d: 6}}, b: 1}"));
+    mutablebson::Document doc(fromjson("{a: {c: {d: 6}}, b: 1}"));
     setPathTaken("b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["b"]));
@@ -179,7 +178,7 @@ TEST_F(RenameNodeTest, RenameToExistingNestedFieldDoesNotReorderFields) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["c.d"], collator));
 
-    Document doc(fromjson("{a: {b: {c: 1, d: 2}}, b: 3, c: {d: 4}}"));
+    mutablebson::Document doc(fromjson("{a: {b: {c: 1, d: 2}}, b: 3, c: {d: 4}}"));
     setPathTaken("a.b.c");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]));
@@ -195,7 +194,7 @@ TEST_F(RenameNodeTest, MissingCompleteTo) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: 2, b: 1, c: {}}"));
+    mutablebson::Document doc(fromjson("{a: 2, b: 1, c: {}}"));
     setPathToCreate("r.d");
     setPathTaken("c");
     addIndexedPath("a");
@@ -212,7 +211,7 @@ TEST_F(RenameNodeTest, ToIsCompletelyMissing) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: 2}"));
+    mutablebson::Document doc(fromjson("{a: 2}"));
     setPathToCreate("b.c.d");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()));
@@ -228,7 +227,7 @@ TEST_F(RenameNodeTest, ToMissingDottedField) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: [{a:2, b:1}]}"));
+    mutablebson::Document doc(fromjson("{a: [{a:2, b:1}]}"));
     setPathToCreate("b.c.d");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()));
@@ -244,12 +243,12 @@ TEST_F(RenameNodeTest, MoveIntoArray) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["b"], collator));
 
-    Document doc(fromjson("{_id: 'test_object', a: [1, 2], b: 2}"));
+    mutablebson::Document doc(fromjson("{_id: 'test_object', a: [1, 2], b: 2}"));
     setPathToCreate("2");
     setPathTaken("a");
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::BadValue,
                                 "The destination field cannot be an array element, 'a.2' in doc "
                                 "with _id: \"test_object\" has an array field called 'a'");
@@ -261,12 +260,12 @@ TEST_F(RenameNodeTest, MoveIntoArrayNoId) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["b"], collator));
 
-    Document doc(fromjson("{a: [1, 2], b: 2}"));
+    mutablebson::Document doc(fromjson("{a: [1, 2], b: 2}"));
     setPathToCreate("2");
     setPathTaken("a");
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::BadValue,
                                 "The destination field cannot be an array element, 'a.2' in doc "
                                 "with no id has an array field called 'a'");
@@ -278,11 +277,11 @@ TEST_F(RenameNodeTest, MoveToArrayElement) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["b"], collator));
 
-    Document doc(fromjson("{_id: 'test_object', a: [1, 2], b: 2}"));
+    mutablebson::Document doc(fromjson("{_id: 'test_object', a: [1, 2], b: 2}"));
     setPathTaken("a.1");
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"]["1"])),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::BadValue,
                                 "The destination field cannot be an array element, 'a.1' in doc "
                                 "with _id: \"test_object\" has an array field called 'a'");
@@ -294,11 +293,11 @@ TEST_F(RenameNodeTest, MoveOutOfArray) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a.0"], collator));
 
-    Document doc(fromjson("{_id: 'test_object', a: [1, 2]}"));
+    mutablebson::Document doc(fromjson("{_id: 'test_object', a: [1, 2]}"));
     setPathToCreate("b");
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root())),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::BadValue,
                                 "The source field cannot be an array element, 'a.0' in doc with "
                                 "_id: \"test_object\" has an array field called 'a'");
@@ -310,12 +309,12 @@ TEST_F(RenameNodeTest, MoveNonexistentEmbeddedFieldOut) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a.a"], collator));
 
-    Document doc(fromjson("{a: [{a: 1}, {b: 2}]}"));
+    mutablebson::Document doc(fromjson("{a: [{a: 1}, {b: 2}]}"));
     setPathToCreate("b");
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root())),
-        UserException,
+        AssertionException,
         ErrorCodes::PathNotViable,
         "cannot use the part (a of a.a) to traverse the element ({a: [ { a: 1 }, { b: 2 } ]})");
 }
@@ -326,11 +325,11 @@ TEST_F(RenameNodeTest, MoveEmbeddedFieldOutWithElementNumber) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a.0.a"], collator));
 
-    Document doc(fromjson("{_id: 'test_object', a: [{a: 1}, {b: 2}]}"));
+    mutablebson::Document doc(fromjson("{_id: 'test_object', a: [{a: 1}, {b: 2}]}"));
     setPathToCreate("b");
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root())),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::BadValue,
                                 "The source field cannot be an array element, 'a.0.a' in doc with "
                                 "_id: \"test_object\" has an array field called 'a'");
@@ -342,7 +341,7 @@ TEST_F(RenameNodeTest, ReplaceArrayField) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: 2, b: []}"));
+    mutablebson::Document doc(fromjson("{a: 2, b: []}"));
     setPathTaken("b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["b"]));
@@ -358,7 +357,7 @@ TEST_F(RenameNodeTest, ReplaceWithArrayField) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: [], b: 2}"));
+    mutablebson::Document doc(fromjson("{a: [], b: 2}"));
     setPathTaken("b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["b"]));
@@ -374,7 +373,7 @@ TEST_F(RenameNodeTest, CanRenameFromInvalidFieldName) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["$a"], collator));
 
-    Document doc(fromjson("{$a: 2}"));
+    mutablebson::Document doc(fromjson("{$a: 2}"));
     setPathToCreate("a");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()));
@@ -390,7 +389,7 @@ TEST_F(RenameNodeTest, RenameWithoutLogBuilderOrIndexData) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: 2}"));
+    mutablebson::Document doc(fromjson("{a: 2}"));
     setPathToCreate("b");
     setLogBuilderToNull();
     auto result = node.apply(getApplyParams(doc.root()));
@@ -404,7 +403,7 @@ TEST_F(RenameNodeTest, RenameFromNonExistentPathIsNoOp) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{b: 2}"));
+    mutablebson::Document doc(fromjson("{b: 2}"));
     setPathTaken("b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["b"]));
@@ -420,10 +419,10 @@ TEST_F(RenameNodeTest, ApplyCannotRemoveRequiredPartOfDBRef) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a.$id"], collator));
 
-    Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
+    mutablebson::Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
     setPathToCreate("b");
     ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root())),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::InvalidDBRef,
                                 "The DBRef $ref field must be followed by a $id field");
 }
@@ -434,7 +433,7 @@ TEST_F(RenameNodeTest, ApplyCanRemoveRequiredPartOfDBRefIfValidateForStorageIsFa
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a.$id"], collator));
 
-    Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
+    mutablebson::Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
     setPathToCreate("b");
     addIndexedPath("a");
     setValidateForStorage(false);
@@ -456,14 +455,14 @@ TEST_F(RenameNodeTest, ApplyCannotRemoveImmutablePath) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a.b"], collator));
 
-    Document doc(fromjson("{a: {b: 1}}"));
+    mutablebson::Document doc(fromjson("{a: {b: 1}}"));
     setPathToCreate("c");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root())),
-        UserException,
+        AssertionException,
         ErrorCodes::ImmutableField,
-        "Unsetting the path 'a.b' using $rename would modify the immutable field 'a.b'");
+        "Performing an update on the path 'a.b' would modify the immutable field 'a.b'");
 }
 
 TEST_F(RenameNodeTest, ApplyCannotRemovePrefixOfImmutablePath) {
@@ -472,14 +471,14 @@ TEST_F(RenameNodeTest, ApplyCannotRemovePrefixOfImmutablePath) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: {b: 1}}"));
+    mutablebson::Document doc(fromjson("{a: {b: 1}}"));
     setPathToCreate("c");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root())),
-        UserException,
+        AssertionException,
         ErrorCodes::ImmutableField,
-        "Unsetting the path 'a' using $rename would modify the immutable field 'a.b'");
+        "Performing an update on the path 'a' would modify the immutable field 'a.b'");
 }
 
 TEST_F(RenameNodeTest, ApplyCannotRemoveSuffixOfImmutablePath) {
@@ -488,14 +487,14 @@ TEST_F(RenameNodeTest, ApplyCannotRemoveSuffixOfImmutablePath) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a.b.c"], collator));
 
-    Document doc(fromjson("{a: {b: {c: 1}}}"));
+    mutablebson::Document doc(fromjson("{a: {b: {c: 1}}}"));
     setPathToCreate("d");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root())),
-        UserException,
+        AssertionException,
         ErrorCodes::ImmutableField,
-        "Unsetting the path 'a.b.c' using $rename would modify the immutable field 'a.b'");
+        "Performing an update on the path 'a.b.c' would modify the immutable field 'a.b'");
 }
 
 TEST_F(RenameNodeTest, ApplyCanRemoveImmutablePathIfNoop) {
@@ -504,7 +503,7 @@ TEST_F(RenameNodeTest, ApplyCanRemoveImmutablePathIfNoop) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a.b.c"], collator));
 
-    Document doc(fromjson("{a: {b: {}}}"));
+    mutablebson::Document doc(fromjson("{a: {b: {}}}"));
     setPathToCreate("d");
     addImmutablePath("a.b");
     addIndexedPath("a");
@@ -522,11 +521,11 @@ TEST_F(RenameNodeTest, ApplyCannotCreateDollarPrefixedField) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: 0}"));
+    mutablebson::Document doc(fromjson("{a: 0}"));
     setPathToCreate("$bad");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root())),
-        UserException,
+        AssertionException,
         ErrorCodes::DollarPrefixedFieldName,
         "The dollar ($) prefixed field '$bad' in '$bad' is not valid for storage.");
 }
@@ -537,14 +536,14 @@ TEST_F(RenameNodeTest, ApplyCannotOverwriteImmutablePath) {
     RenameNode node;
     ASSERT_OK(node.init(update["$rename"]["a"], collator));
 
-    Document doc(fromjson("{a: 0, b: 1}"));
+    mutablebson::Document doc(fromjson("{a: 0, b: 1}"));
     setPathTaken("b");
     addImmutablePath("b");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["b"])),
-        UserException,
+        AssertionException,
         ErrorCodes::ImmutableField,
-        "Updating the path 'b' to b: 0 would modify the immutable field 'b'");
+        "Performing an update on the path 'b' would modify the immutable field 'b'");
 }
 
 }  // namespace

@@ -99,7 +99,7 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
                     curOp->isCommand(),
                     curOp->getReadWriteType());
 
-        if (!curOp->debug().exceptionInfo.empty()) {
+        if (!curOp->debug().exceptionInfo.isOK()) {
             LOG(3) << "Caught Assertion in " << redact(logicalOpToString(curOp->getLogicalOp()))
                    << ": " << curOp->debug().exceptionInfo.toString();
         }
@@ -197,27 +197,27 @@ bool handleError(OperationContext* opCtx,
                  const NamespaceString& nss,
                  const write_ops::WriteCommandBase& wholeOp,
                  WriteResult* out) {
-    LastError::get(opCtx->getClient()).setLastError(ex.getCode(), ex.getInfo().msg);
+    LastError::get(opCtx->getClient()).setLastError(ex.code(), ex.reason());
     auto& curOp = *CurOp::get(opCtx);
-    curOp.debug().exceptionInfo = ex.getInfo();
+    curOp.debug().exceptionInfo = ex.toStatus();
 
-    if (ErrorCodes::isInterruption(ErrorCodes::Error(ex.getCode()))) {
+    if (ErrorCodes::isInterruption(ex.code())) {
         throw;  // These have always failed the whole batch.
     }
 
-    if (ErrorCodes::isStaleShardingError(ErrorCodes::Error(ex.getCode()))) {
+    if (ErrorCodes::isStaleShardingError(ex.code())) {
         auto staleConfigException = dynamic_cast<const SendStaleConfigException*>(&ex);
         if (!staleConfigException) {
             // We need to get extra info off of the SCE, but some common patterns can result in the
-            // exception being converted to a Status then rethrown as a UserException, losing the
-            // info we need. It would be a bug if this happens so we want to detect it in testing,
-            // but it isn't severe enough that we should bring down the server if it happens in
-            // production.
+            // exception being converted to a Status then rethrown as a AssertionException, losing
+            // the info we need. It would be a bug if this happens so we want to detect it in
+            // testing, but it isn't severe enough that we should bring down the server if it
+            // happens in production.
             dassert(staleConfigException);
-            msgassertedNoTrace(35475,
-                               str::stream()
-                                   << "Got a StaleConfig error but exception was the wrong type: "
-                                   << demangleName(typeid(ex)));
+            msgasserted(35475,
+                        str::stream()
+                            << "Got a StaleConfig error but exception was the wrong type: "
+                            << demangleName(typeid(ex)));
         }
 
         if (!opCtx->getClient()->isInDirectClient()) {
@@ -485,7 +485,7 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
             globalOpCounters.gotInsert();
             canContinue = handleError(
                 opCtx,
-                UserException(fixedDoc.getStatus().code(), fixedDoc.getStatus().reason()),
+                AssertionException(fixedDoc.getStatus().code(), fixedDoc.getStatus().reason()),
                 wholeOp.getNamespace(),
                 wholeOp.getWriteCommandBase(),
                 &out);

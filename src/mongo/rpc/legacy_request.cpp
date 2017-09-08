@@ -30,6 +30,7 @@
 
 #include <utility>
 
+#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/rpc/legacy_request.h"
 #include "mongo/rpc/metadata.h"
@@ -42,6 +43,14 @@ OpMsgRequest opMsgRequestFromLegacyRequest(const Message& message) {
     DbMessage dbm(message);
     QueryMessage qm(dbm);
     NamespaceString ns(qm.ns);
+
+    if (qm.queryOptions & QueryOption_Exhaust) {
+        uasserted(18527,
+                  str::stream() << "The 'exhaust' OP_QUERY flag is invalid for commands: "
+                                << ns.ns()
+                                << " "
+                                << qm.query.toString());
+    }
 
     uassert(40473,
             str::stream() << "Trying to handle namespace " << qm.ns << " as a command",

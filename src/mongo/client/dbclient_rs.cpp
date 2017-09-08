@@ -367,7 +367,7 @@ void DBClientReplicaSet::_authConnection(DBClientConnection* conn) {
     for (map<string, BSONObj>::const_iterator i = _auths.begin(); i != _auths.end(); ++i) {
         try {
             conn->auth(i->second);
-        } catch (const UserException&) {
+        } catch (const AssertionException&) {
             warning() << "cached auth failed for set: " << _setName
                       << " db: " << i->second[saslCommandUserDBFieldName].str()
                       << " user: " << i->second[saslCommandUserFieldName].str() << endl;
@@ -380,7 +380,7 @@ void DBClientReplicaSet::logoutAll(DBClientConnection* conn) {
         BSONObj response;
         try {
             conn->logout(i->first, response);
-        } catch (const UserException& ex) {
+        } catch (const AssertionException& ex) {
             warning() << "Failed to logout: " << conn->getServerAddress() << " on db: " << i->first
                       << causedBy(redact(ex));
         }
@@ -410,7 +410,7 @@ bool DBClientReplicaSet::connect() {
 }
 
 static bool isAuthenticationException(const DBException& ex) {
-    return ex.getCode() == ErrorCodes::AuthenticationFailed;
+    return ex.code() == ErrorCodes::AuthenticationFailed;
 }
 
 void DBClientReplicaSet::_auth(const BSONObj& params) {
@@ -651,9 +651,9 @@ unique_ptr<DBClientCursor> DBClientReplicaSet::checkSlaveQueryResult(
     BSONElement code = error["code"];
     if (code.isNumber() && code.Int() == ErrorCodes::NotMasterOrSecondary) {
         isntSecondary();
-        throw DBException(str::stream() << "slave " << _lastSlaveOkHost.toString()
-                                        << " is no longer secondary",
-                          14812);
+        throw DBException(14812,
+                          str::stream() << "slave " << _lastSlaveOkHost.toString()
+                                        << " is no longer secondary");
     }
 
     return result;
@@ -899,6 +899,13 @@ void DBClientReplicaSet::checkResponse(const std::vector<BSONObj>& batch,
             }
         }
     }
+}
+
+DBClientBase* DBClientReplicaSet::runFireAndForgetCommand(OpMsgRequest request) {
+    // Assume all fire-and-forget commands should go to the primary node. It is currently used
+    // for writes which need to go to the primary and for killCursors which should be sent to a
+    // specific host rather than through DBClientReplicaSet.
+    return checkMaster()->runFireAndForgetCommand(std::move(request));
 }
 
 std::pair<rpc::UniqueReply, DBClientBase*> DBClientReplicaSet::runCommandWithTarget(

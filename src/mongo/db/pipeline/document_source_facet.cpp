@@ -72,7 +72,7 @@ namespace {
  * Extracts the names of the facets and the vectors of raw BSONObjs representing the stages within
  * that facet's pipeline.
  *
- * Throws a UserException if it fails to parse for any reason.
+ * Throws a AssertionException if it fails to parse for any reason.
  */
 vector<pair<string, vector<BSONObj>>> extractRawPipelines(const BSONElement& elem) {
     uassert(40169,
@@ -243,12 +243,12 @@ DocumentSource::StageConstraints DocumentSourceFacet::constraints() const {
 
     for (auto&& facet : _facets) {
         for (auto&& nestedStage : facet.pipeline->getSources()) {
-            if (nestedStage->constraints().mustRunOnPrimaryShardIfSharded) {
+            if (nestedStage->constraints().hostRequirement == HostTypeRequirement::kPrimaryShard) {
                 // Currently we don't split $facet to have a merger part and a shards part (see
                 // SERVER-24154). This means that if any stage in any of the $facet pipelines
                 // requires the primary shard, then the entire $facet must happen on the merger, and
                 // the merger must be the primary shard.
-                constraints.mustRunOnPrimaryShardIfSharded = true;
+                constraints.hostRequirement = HostTypeRequirement::kPrimaryShard;
             }
         }
     }

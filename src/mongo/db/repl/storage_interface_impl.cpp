@@ -392,7 +392,7 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
         try {
             auto coll = db->createCollection(opCtx, nss.ns(), options);
             invariant(coll);
-        } catch (const UserException& ex) {
+        } catch (const AssertionException& ex) {
             return ex.toStatus();
         }
         wuow.commit();
@@ -894,13 +894,18 @@ StatusWith<StorageInterface::CollectionCount> StorageInterfaceImpl::getCollectio
     return collection->numRecords(opCtx);
 }
 
-void StorageInterfaceImpl::setStableTimestamp(OperationContext* opCtx, SnapshotName snapshotName) {
-    opCtx->getServiceContext()->getGlobalStorageEngine()->setStableTimestamp(snapshotName);
+void StorageInterfaceImpl::setStableTimestamp(ServiceContext* serviceCtx,
+                                              SnapshotName snapshotName) {
+    serviceCtx->getGlobalStorageEngine()->setStableTimestamp(snapshotName);
 }
 
-void StorageInterfaceImpl::setInitialDataTimestamp(OperationContext* opCtx,
+void StorageInterfaceImpl::setInitialDataTimestamp(ServiceContext* serviceCtx,
                                                    SnapshotName snapshotName) {
-    opCtx->getServiceContext()->getGlobalStorageEngine()->setInitialDataTimestamp(snapshotName);
+    serviceCtx->getGlobalStorageEngine()->setInitialDataTimestamp(snapshotName);
+}
+
+Status StorageInterfaceImpl::recoverToStableTimestamp(ServiceContext* serviceCtx) {
+    return serviceCtx->getGlobalStorageEngine()->recoverToStableTimestamp();
 }
 
 Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {

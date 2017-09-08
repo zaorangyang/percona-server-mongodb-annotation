@@ -44,7 +44,9 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/index_consistency.h"
 #include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/index_observer.h"
 #include "mongo/db/catalog/namespace_uuid_cache.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/clientcursor.h"
@@ -544,7 +546,8 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
                                     const RecordId& loc,
                                     OpDebug* opDebug,
                                     bool fromMigrate,
-                                    bool noWarn) {
+                                    bool noWarn,
+                                    Collection::StoreDeletedDoc storeDeletedDoc) {
     if (isCapped()) {
         log() << "failing remove on a capped ns " << _ns;
         uasserted(10089, "cannot remove from a capped collection");
@@ -555,6 +558,11 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
 
     auto deleteState =
         getGlobalServiceContext()->getOpObserver()->aboutToDelete(opCtx, ns(), doc.value());
+
+    boost::optional<BSONObj> deletedDoc;
+    if (storeDeletedDoc == Collection::StoreDeletedDoc::On) {
+        deletedDoc.emplace(doc.value().getOwned());
+    }
 
     /* check if any cursors point to us.  if so, advance them. */
     _cursorManager.invalidateDocument(opCtx, loc, INVALIDATION_DELETION);
@@ -568,31 +576,31 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
     _recordStore->deleteRecord(opCtx, loc);
 
     getGlobalServiceContext()->getOpObserver()->onDelete(
-        opCtx, ns(), uuid(), stmtId, std::move(deleteState), fromMigrate);
+        opCtx, ns(), uuid(), stmtId, std::move(deleteState), fromMigrate, deletedDoc);
 }
 
 Counter64 moveCounter;
 ServerStatusMetricField<Counter64> moveCounterDisplay("record.moves", &moveCounter);
 
-StatusWith<RecordId> CollectionImpl::updateDocument(OperationContext* opCtx,
-                                                    const RecordId& oldLocation,
-                                                    const Snapshotted<BSONObj>& oldDoc,
-                                                    const BSONObj& newDoc,
-                                                    bool enforceQuota,
-                                                    bool indexesAffected,
-                                                    OpDebug* opDebug,
-                                                    OplogUpdateEntryArgs* args) {
+RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
+                                        const RecordId& oldLocation,
+                                        const Snapshotted<BSONObj>& oldDoc,
+                                        const BSONObj& newDoc,
+                                        bool enforceQuota,
+                                        bool indexesAffected,
+                                        OpDebug* opDebug,
+                                        OplogUpdateEntryArgs* args) {
     {
         auto status = checkValidation(opCtx, newDoc);
         if (!status.isOK()) {
             if (_validationLevel == ValidationLevel::STRICT_V) {
-                return status;
+                uassertStatusOK(status);
             }
             // moderate means we have to check the old doc
             auto oldDocStatus = checkValidation(opCtx, oldDoc.value());
             if (oldDocStatus.isOK()) {
                 // transitioning from good -> bad is not ok
-                return status;
+                uassertStatusOK(status);
             }
             // bad -> bad is ok in moderate mode
         }
@@ -614,8 +622,7 @@ StatusWith<RecordId> CollectionImpl::updateDocument(OperationContext* opCtx,
 
     BSONElement oldId = oldDoc.value()["_id"];
     if (!oldId.eoo() && SimpleBSONElementComparator::kInstance.evaluate(oldId != newDoc["_id"]))
-        return StatusWith<RecordId>(
-            ErrorCodes::InternalError, "in Collection::updateDocument _id mismatch", 13596);
+        uasserted(13596, "in Collection::updateDocument _id mismatch");
 
     // The MMAPv1 storage engine implements capped collections in a way that does not allow records
     // to grow beyond their original size. If MMAPv1 part of a replicaset with storage engines that
@@ -626,11 +633,11 @@ StatusWith<RecordId> CollectionImpl::updateDocument(OperationContext* opCtx,
     // all size changes.
     const auto oldSize = oldDoc.value().objsize();
     if (_recordStore->isCapped() && oldSize != newDoc.objsize())
-        return {ErrorCodes::CannotGrowDocumentInCappedNamespace,
-                str::stream() << "Cannot change the size of a document in a capped collection: "
-                              << oldSize
-                              << " != "
-                              << newDoc.objsize()};
+        uasserted(ErrorCodes::CannotGrowDocumentInCappedNamespace,
+                  str::stream() << "Cannot change the size of a document in a capped collection: "
+                                << oldSize
+                                << " != "
+                                << newDoc.objsize());
 
     // At the end of this step, we will have a map of UpdateTickets, one per index, which
     // represent the index updates needed to be done, based on the changes between oldDoc and
@@ -647,28 +654,26 @@ StatusWith<RecordId> CollectionImpl::updateDocument(OperationContext* opCtx,
             IndexCatalog::prepareInsertDeleteOptions(opCtx, descriptor, &options);
             UpdateTicket* updateTicket = new UpdateTicket();
             updateTickets.mutableMap()[descriptor] = updateTicket;
-            Status ret = iam->validateUpdate(opCtx,
-                                             oldDoc.value(),
-                                             newDoc,
-                                             oldLocation,
-                                             options,
-                                             updateTicket,
-                                             entry->getFilterExpression());
-            if (!ret.isOK()) {
-                return StatusWith<RecordId>(ret);
-            }
+            uassertStatusOK(iam->validateUpdate(opCtx,
+                                                oldDoc.value(),
+                                                newDoc,
+                                                oldLocation,
+                                                options,
+                                                updateTicket,
+                                                entry->getFilterExpression()));
         }
     }
+
+    args->preImageDoc = oldDoc.value().getOwned();
 
     Status updateStatus = _recordStore->updateRecord(
         opCtx, oldLocation, newDoc.objdata(), newDoc.objsize(), _enforceQuota(enforceQuota), this);
 
     if (updateStatus == ErrorCodes::NeedsDocumentMove) {
-        return _updateDocumentWithMove(
-            opCtx, oldLocation, oldDoc, newDoc, enforceQuota, opDebug, args, sid);
-    } else if (!updateStatus.isOK()) {
-        return updateStatus;
+        return uassertStatusOK(_updateDocumentWithMove(
+            opCtx, oldLocation, oldDoc, newDoc, enforceQuota, opDebug, args, sid));
     }
+    uassertStatusOK(updateStatus);
 
     // Object did not move.  We update each index with each respective UpdateTicket.
     if (indexesAffected) {
@@ -679,10 +684,8 @@ StatusWith<RecordId> CollectionImpl::updateDocument(OperationContext* opCtx,
 
             int64_t keysInserted;
             int64_t keysDeleted;
-            Status ret = iam->update(
-                opCtx, *updateTickets.mutableMap()[descriptor], &keysInserted, &keysDeleted);
-            if (!ret.isOK())
-                return StatusWith<RecordId>(ret);
+            uassertStatusOK(iam->update(
+                opCtx, *updateTickets.mutableMap()[descriptor], &keysInserted, &keysDeleted));
             if (opDebug) {
                 opDebug->keysInserted += keysInserted;
                 opDebug->keysDeleted += keysDeleted;
@@ -716,6 +719,8 @@ StatusWith<RecordId> CollectionImpl::_updateDocumentWithMove(OperationContext* o
     invariant(newLocation.getValue() != oldLocation);
 
     _cursorManager.invalidateDocument(opCtx, oldLocation, INVALIDATION_DELETION);
+
+    args->preImageDoc = oldDoc.value().getOwned();
 
     // Remove indexes for old record.
     int64_t keysDeleted;
@@ -1000,6 +1005,26 @@ const CollatorInterface* CollectionImpl::getDefaultCollator() const {
     return _collator.get();
 }
 
+void CollectionImpl::informIndexObserver(OperationContext* opCtx,
+                                         const IndexDescriptor* descriptor,
+                                         const IndexKeyEntry& indexEntry,
+                                         const ValidationOperation operation) const {
+    stdx::lock_guard<stdx::mutex> lock(_indexObserverMutex);
+    if (_indexObserver) {
+        _indexObserver->inform(opCtx, descriptor, std::move(indexEntry), operation);
+    }
+}
+
+void CollectionImpl::hookIndexObserver(IndexConsistency* consistency) {
+    stdx::lock_guard<stdx::mutex> lock(_indexObserverMutex);
+    _indexObserver = stdx::make_unique<IndexObserver>(consistency);
+}
+
+void CollectionImpl::unhookIndexObserver() {
+    stdx::lock_guard<stdx::mutex> lock(_indexObserverMutex);
+    _indexObserver.reset();
+}
+
 namespace {
 
 using ValidateResultsMap = std::map<std::string, ValidateResults>;
@@ -1157,6 +1182,8 @@ void _reportValidationResults(OperationContext* opCtx,
 
 Status CollectionImpl::validate(OperationContext* opCtx,
                                 ValidateCmdLevel level,
+                                bool background,
+                                std::unique_ptr<Lock::CollectionLock> collLk,
                                 ValidateResults* results,
                                 BSONObjBuilder* output) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IS));
@@ -1164,14 +1191,16 @@ Status CollectionImpl::validate(OperationContext* opCtx,
     try {
         ValidateResultsMap indexNsResultsMap;
         BSONObjBuilder keysPerIndex;  // not using subObjStart to be exception safe
-        RecordStoreValidateAdaptor indexValidator =
-            RecordStoreValidateAdaptor(opCtx, level, &_indexCatalog, &indexNsResultsMap);
+        IndexConsistency indexConsistency(
+            opCtx, _this, ns(), _recordStore, std::move(collLk), background);
+        RecordStoreValidateAdaptor indexValidator = RecordStoreValidateAdaptor(
+            opCtx, &indexConsistency, level, &_indexCatalog, &indexNsResultsMap);
 
 
         // Validate the record store
         log(LogComponent::kIndex) << "validating collection " << ns().toString() << endl;
         _validateRecordStore(
-            opCtx, _recordStore, level, /*somgarg*/ false, &indexValidator, results, output);
+            opCtx, _recordStore, level, background, &indexValidator, results, output);
 
         // Validate indexes and check for mismatches.
         if (results->valid) {
@@ -1183,11 +1212,7 @@ Status CollectionImpl::validate(OperationContext* opCtx,
                              &indexNsResultsMap,
                              results);
 
-            if (indexValidator.tooFewIndexEntries()) {
-                string msg = "one or more indexes contain invalid index entries.";
-                results->errors.push_back(msg);
-                results->valid = false;
-            } else if (indexValidator.tooManyIndexEntries()) {
+            if (indexConsistency.haveEntryMismatch()) {
                 _markIndexEntriesInvalid(&indexNsResultsMap, results);
             }
         }
@@ -1209,7 +1234,7 @@ Status CollectionImpl::validate(OperationContext* opCtx,
             log(LogComponent::kIndex) << "validated collection " << ns().toString() << endl;
         }
     } catch (DBException& e) {
-        if (ErrorCodes::isInterruption(ErrorCodes::Error(e.getCode()))) {
+        if (ErrorCodes::isInterruption(e.code())) {
             return e.toStatus();
         }
         string err = str::stream() << "exception during index validation: " << e.toString();

@@ -32,8 +32,10 @@
 
 #include "mongo/db/s/metadata_manager.h"
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/range_arithmetic.h"
@@ -276,6 +278,22 @@ ScopedCollectionMetadata::ScopedCollectionMetadata(std::shared_ptr<MetadataManag
     ++_metadata->_tracker.usageCounter;
 }
 
+BSONObj ScopedCollectionMetadata::extractDocumentKey(BSONObj const& doc) const {
+    BSONObj key;
+    if (*this) {  // is sharded
+        auto const& pattern = _metadata->_cm->getShardKeyPattern();
+        key = dotted_path_support::extractElementsBasedOnTemplate(doc, pattern.toBSON());
+        if (pattern.hasId()) {
+            return key;
+        }
+        // else, try to append an _id field from the document.
+    }
+    if (auto id = doc["_id"_sd]) {
+        return key.isEmpty() ? id.wrap() : BSONObjBuilder(std::move(key)).append(id).obj();
+    }
+    return key;
+}
+
 ScopedCollectionMetadata::~ScopedCollectionMetadata() {
     _clear();
 }
@@ -324,6 +342,8 @@ ScopedCollectionMetadata& ScopedCollectionMetadata::operator=(ScopedCollectionMe
 ScopedCollectionMetadata::operator bool() const {
     return _metadata.get();
 }
+
+// Remaining MetadataManager members
 
 void MetadataManager::toBSONPending(BSONArrayBuilder& bb) const {
     for (auto it = _receivingChunks.begin(); it != _receivingChunks.end(); ++it) {

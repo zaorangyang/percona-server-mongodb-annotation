@@ -60,55 +60,6 @@ public:
     ~CatalogCache();
 
     /**
-     * Intializes the catalog cache loader state for primary or secondary depending on 'isPrimary'.
-     *
-     * This can only be called on a shard, and only once during sharding state intiailization!
-     */
-    void initializeReplicaSetRole(bool isPrimary);
-
-    /**
-     * Tells the catalog cache loader that it should be in secondary mode.
-     *
-     * This can only be called on a shard!
-     */
-    void onStepDown();
-
-    /**
-     * Tells the catalog cache loader that it should be in primary mode.
-     *
-     * This can only be called on a shard!
-     */
-    void onStepUp();
-
-    /**
-     * Tells the catalog cache loader that the persisted collection version for 'nss' has been
-     * updated.
-     *
-     * This can only be called on a shard!
-     */
-    void notifyOfCollectionVersionUpdate(OperationContext* opCtx,
-                                         const NamespaceString& nss,
-                                         const ChunkVersion& version);
-
-    /**
-     * Waits for the persisted collection version to be gte to 'version', or an epoch change. Only
-     * call this function if you KNOW that a version gte WILL eventually be persisted.
-     *
-     * This function cannot wait for a version if nothing is persisted because a collection can
-     * become unsharded after we start waiting and 'version' will then never be reached. If 'nss'
-     * has no persisted metadata, even if it will shortly, a NamespaceNotFound error will be
-     * returned.
-     *
-     * A lock must not be held when calling this because it would prevent using the latest snapshot
-     * and actually seeing the change after it arrives.
-     * This function can throw a DBException if the opCtx is interrupted.
-     * This can only be called on a shard!
-     */
-    Status waitForCollectionVersion(OperationContext* opCtx,
-                                    const NamespaceString& nss,
-                                    const ChunkVersion& version);
-
-    /**
      * Retrieves the cached metadata for the specified database. The returned value is still owned
      * by the cache and should not be kept elsewhere. I.e., it should only be used as a local
      * variable. The reason for this is so that if the cache gets invalidated, the caller does not
@@ -125,10 +76,8 @@ public:
      * with the primary shard for the specified database. If an error occurs loading the metadata
      * returns a failed status.
      */
-    StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfo(
-        OperationContext* opCtx,
-        const NamespaceString& nss,
-        const repl::ReadConcernLevel& readConcern = repl::ReadConcernLevel::kMajorityReadConcern);
+    StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfo(OperationContext* opCtx,
+                                                                     const NamespaceString& nss);
     StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfo(OperationContext* opCtx,
                                                                      StringData ns);
 
@@ -157,13 +106,14 @@ public:
     void invalidateShardedCollection(StringData ns);
 
     /**
-     * Blocking method, which removes the entire specified database (including its collections) from
-     * the cache.
+     * Non-blocking method, which removes the entire specified database (including its collections)
+     * from the cache.
      */
     void purgeDatabase(StringData dbName);
 
     /**
-     * Blocking method, which removes all databases (including their collections) from the cache.
+     * Non-blocking method, which removes all databases (including their collections) from the
+     * cache.
      */
     void purgeAllDatabases();
 
@@ -205,21 +155,16 @@ private:
      * Ensures that the specified database is in the cache, loading it if necessary. If the database
      * was not in cache, all the sharded collections will be in the 'needsRefresh' state.
      */
-    std::shared_ptr<DatabaseInfoEntry> _getDatabase(
-        OperationContext* opCtx,
-        StringData dbName,
-        const repl::ReadConcernLevel& readConcern = repl::ReadConcernLevel::kMajorityReadConcern);
+    std::shared_ptr<DatabaseInfoEntry> _getDatabase(OperationContext* opCtx, StringData dbName);
 
     /**
      * Non-blocking call which schedules an asynchronous refresh for the specified namespace. The
      * namespace must be in the 'needRefresh' state.
      */
-    void _scheduleCollectionRefresh_inlock(
-        std::shared_ptr<DatabaseInfoEntry> dbEntry,
-        std::shared_ptr<ChunkManager> existingRoutingInfo,
-        const NamespaceString& nss,
-        int refreshAttempt,
-        const repl::ReadConcernLevel& readConcern = repl::ReadConcernLevel::kMajorityReadConcern);
+    void _scheduleCollectionRefresh_inlock(std::shared_ptr<DatabaseInfoEntry> dbEntry,
+                                           std::shared_ptr<ChunkManager> existingRoutingInfo,
+                                           const NamespaceString& nss,
+                                           int refreshAttempt);
 
     // Interface from which chunks will be retrieved
     CatalogCacheLoader& _cacheLoader;

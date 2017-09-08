@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
 
 #include "mongo/platform/basic.h"
 
@@ -35,7 +35,9 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/util/log.h"
@@ -46,23 +48,36 @@ namespace repl {
 
 RollbackImpl::RollbackImpl(OplogInterface* localOplog,
                            OplogInterface* remoteOplog,
+                           StorageInterface* storageInterface,
+                           ReplicationProcess* replicationProcess,
                            ReplicationCoordinator* replicationCoordinator,
                            Listener* listener)
     : _localOplog(localOplog),
       _remoteOplog(remoteOplog),
+      _storageInterface(storageInterface),
+      _replicationProcess(replicationProcess),
       _replicationCoordinator(replicationCoordinator),
       _listener(listener) {
 
     invariant(localOplog);
     invariant(remoteOplog);
+    invariant(storageInterface);
+    invariant(replicationProcess);
     invariant(replicationCoordinator);
     invariant(listener);
 }
 
 RollbackImpl::RollbackImpl(OplogInterface* localOplog,
                            OplogInterface* remoteOplog,
+                           StorageInterface* storageInterface,
+                           ReplicationProcess* replicationProcess,
                            ReplicationCoordinator* replicationCoordinator)
-    : RollbackImpl(localOplog, remoteOplog, replicationCoordinator, {}) {}
+    : RollbackImpl(localOplog,
+                   remoteOplog,
+                   storageInterface,
+                   replicationProcess,
+                   replicationCoordinator,
+                   {}) {}
 
 RollbackImpl::~RollbackImpl() {
     shutdown();
@@ -79,13 +94,42 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
     if (!commonPointSW.isOK()) {
         return commonPointSW.getStatus();
     }
+
+    // Persist the common point to the 'oplogTruncateAfterPoint' document. We save this value so
+    // that the replication recovery logic knows where to truncate the oplog. Note that it must be
+    // saved *durably* in case a crash occurs after the storage engine recovers to the stable
+    // timestamp. Upon startup after such a crash, the standard replication recovery code will know
+    // where to truncate the oplog by observing the value of the 'oplogTruncateAfterPoint' document.
+    // Note that the storage engine timestamp recovery only restores the database *data* to a stable
+    // timestamp, but does not revert the oplog, which must be done as part of the rollback process.
+    _replicationProcess->getConsistencyMarkers()->setOplogTruncateAfterPoint(
+        opCtx, commonPointSW.getValue());
     _listener->onCommonPointFound(commonPointSW.getValue());
+
+    // Increment the Rollback ID of this node. The Rollback ID is a natural number that it is
+    // incremented by 1 every time a rollback occurs. Note that the Rollback ID must be incremented
+    // before modifying any local data.
+    status = _replicationProcess->incrementRollbackID(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    // Recover to the stable timestamp while holding the global exclusive lock.
+    auto serviceCtx = opCtx->getServiceContext();
+    {
+        Lock::GlobalWrite globalWrite(opCtx);
+        status = _storageInterface->recoverToStableTimestamp(serviceCtx);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
 
     // At this point these functions need to always be called before returning, even on failure.
     // These functions fassert on failure.
     ON_BLOCK_EXIT([this, opCtx] {
         _checkShardIdentityRollback(opCtx);
-        _clearSessionTransactionTable(opCtx);
+        _resetSessions(opCtx);
         _transitionFromRollbackToSecondary(opCtx);
     });
 
@@ -94,7 +138,7 @@ Status RollbackImpl::runRollback(OperationContext* opCtx) {
 }
 
 void RollbackImpl::shutdown() {
-    log() << "Rollback - shutting down";
+    log() << "rollback shutting down";
 
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     _inShutdown = true;
@@ -111,7 +155,7 @@ Status RollbackImpl::_transitionToRollback(OperationContext* opCtx) {
         return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
     }
 
-    log() << "Rollback - transition to ROLLBACK";
+    log() << "transition to ROLLBACK";
     {
         Lock::GlobalWrite globalWrite(opCtx);
 
@@ -133,7 +177,7 @@ StatusWith<Timestamp> RollbackImpl::_findCommonPoint() {
         return Status(ErrorCodes::ShutdownInProgress, "rollback shutting down");
     }
 
-    log() << "Rollback - finding common point";
+    log() << "finding common point";
 
     auto onLocalOplogEntryFn = [](const BSONObj& operation) { return Status::OK(); };
 
@@ -151,7 +195,7 @@ StatusWith<Timestamp> RollbackImpl::_findCommonPoint() {
 void RollbackImpl::_checkShardIdentityRollback(OperationContext* opCtx) {
     invariant(opCtx);
 
-    log() << "Rollback - checking shard identity document for roll back";
+    log() << "checking shard identity document for roll back";
 
     if (ShardIdentityRollbackNotifier::get(opCtx)->didRollbackHappen()) {
         severe() << "shardIdentity document rollback detected.  Shutting down to clear "
@@ -161,19 +205,19 @@ void RollbackImpl::_checkShardIdentityRollback(OperationContext* opCtx) {
     }
 }
 
-void RollbackImpl::_clearSessionTransactionTable(OperationContext* opCtx) {
+void RollbackImpl::_resetSessions(OperationContext* opCtx) {
     invariant(opCtx);
 
-    log() << "Rollback - clearing transaction table";
+    log() << "resetting in-memory state of active sessions";
 
-    SessionCatalog::get(opCtx)->clearTransactionTable();
+    SessionCatalog::get(opCtx)->resetSessions();
 }
 
 void RollbackImpl::_transitionFromRollbackToSecondary(OperationContext* opCtx) {
     invariant(opCtx);
     invariant(_replicationCoordinator->getMemberState() == MemberState(MemberState::RS_ROLLBACK));
 
-    log() << "Rollback - transition to SECONDARY";
+    log() << "transition to SECONDARY";
 
     Lock::GlobalWrite globalWrite(opCtx);
 

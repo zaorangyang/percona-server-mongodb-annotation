@@ -28,10 +28,11 @@ selector:
   - jstests/sharding/logical_time_api.js
   - jstests/sharding/operation_time_api.js
   - jstests/sharding/after_cluster_time.js
-  - jstests/sharding/auth_drop_user_while_logged_in.js
   - jstests/sharding/mongos_does_not_gossip_logical_time_without_keys.js
   - jstests/sharding/key_rotation.js
+  - jstests/sharding/kill_sessions.js
   - jstests/sharding/advance_logical_time_with_valid_signature.js
+  - jstests/sharding/refresh_sessions.js
   - jstests/sharding/safe_secondary_reads_drop_recreate.js
   - jstests/sharding/safe_secondary_reads_single_migration_suspend_range_deletion.js
   - jstests/sharding/safe_secondary_reads_single_migration_waitForDelete.js
@@ -41,6 +42,7 @@ selector:
   - jstests/sharding/retryable_writes.js
   - jstests/sharding/uuid_propagated_to_config_server_on_shardCollection.js
   - jstests/sharding/uuid_propagated_to_recipient_shard_on_recvChunkStart.js
+  - jstests/sharding/uuid_propagated_to_shards_on_setFCV_3_6.js
   # New feature in v3.6 mongo shell.
   - jstests/sharding/causal_consistency_shell_support.js
   - jstests/sharding/keys_rotation_interval_sec.js
@@ -55,6 +57,8 @@ selector:
   - jstests/sharding/read_pref_cmd.js
   # SERVER-30444: Add a maxChunkSize field to the serverStatus command response
   - jstests/sharding/server_status.js
+  # SERVER-20392: Reenable when backported to 3.4 and released as last-stable.
+  - jstests/sharding/shard_existing_coll_chunk_count.js
 
 executor:
   config:

@@ -37,7 +37,7 @@
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document_source_change_notification.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_lookup_change_post_image.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_mock.h"
@@ -48,6 +48,7 @@
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/query_test_service_context.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace PipelineTests {
@@ -57,6 +58,14 @@ using std::string;
 using std::vector;
 
 const NamespaceString kTestNss = NamespaceString("a.collection");
+
+namespace {
+void setMockReplicationCoordinatorOnOpCtx(OperationContext* opCtx) {
+    repl::ReplicationCoordinator::set(
+        opCtx->getServiceContext(),
+        stdx::make_unique<repl::ReplicationCoordinatorMock>(opCtx->getServiceContext()));
+}
+}  // namespace
 
 namespace Optimizations {
 using namespace mongo;
@@ -557,7 +566,8 @@ TEST(PipelineOptimizationTest, LookupDoesNotAbsorbUnwindOnSubfieldOfAsButStillMo
 
 TEST(PipelineOptimizationTest, MatchShouldDuplicateItselfBeforeRedact) {
     string inputPipe = "[{$redact: '$$PRUNE'}, {$match: {a: 1, b:12}}]";
-    string outputPipe = "[{$match: {a: 1, b:12}}, {$redact: '$$PRUNE'}, {$match: {a: 1, b:12}}]";
+    string outputPipe =
+        "[{$match: {a: 1, b:12}}, {$redact: {$const: 'prune'}}, {$match: {a: 1, b:12}}]";
     assertPipelineOptimizesTo(inputPipe, outputPipe);
 }
 
@@ -968,17 +978,18 @@ TEST(PipelineOptimizationTest, MatchOnMaxLengthShouldMoveAcrossRename) {
     assertPipelineOptimizesTo(inputPipe, outputPipe);
 }
 
-TEST(PipelineOptimizationTest, ChangeNotificationLookupSwapsWithIndependentMatch) {
+TEST(PipelineOptimizationTest, ChangeStreamLookupSwapsWithIndependentMatch) {
     QueryTestServiceContext testServiceContext;
     auto opCtx = testServiceContext.makeOperationContext();
 
     intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest(kTestNss));
     expCtx->opCtx = opCtx.get();
+    setMockReplicationCoordinatorOnOpCtx(expCtx->opCtx);
 
-    auto spec = BSON("$changeNotification" << BSON("fullDocument"
-                                                   << "lookup"));
-    auto stages = DocumentSourceChangeNotification::createFromBson(spec.firstElement(), expCtx);
-    ASSERT_EQ(stages.size(), 3UL);
+    auto spec = BSON("$changeStream" << BSON("fullDocument"
+                                             << "updateLookup"));
+    auto stages = DocumentSourceChangeStream::createFromBson(spec.firstElement(), expCtx);
+    ASSERT_EQ(stages.size(), 4UL);
     // Make sure the change lookup is at the end.
     ASSERT(dynamic_cast<DocumentSourceLookupChangePostImage*>(stages.back().get()));
 
@@ -992,17 +1003,18 @@ TEST(PipelineOptimizationTest, ChangeNotificationLookupSwapsWithIndependentMatch
     ASSERT(dynamic_cast<DocumentSourceLookupChangePostImage*>(pipeline->getSources().back().get()));
 }
 
-TEST(PipelineOptimizationTest, ChangeNotificationLookupDoesNotSwapWithMatchOnPostImage) {
+TEST(PipelineOptimizationTest, ChangeStreamLookupDoesNotSwapWithMatchOnPostImage) {
     QueryTestServiceContext testServiceContext;
     auto opCtx = testServiceContext.makeOperationContext();
 
     intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest(kTestNss));
     expCtx->opCtx = opCtx.get();
+    setMockReplicationCoordinatorOnOpCtx(expCtx->opCtx);
 
-    auto spec = BSON("$changeNotification" << BSON("fullDocument"
-                                                   << "lookup"));
-    auto stages = DocumentSourceChangeNotification::createFromBson(spec.firstElement(), expCtx);
-    ASSERT_EQ(stages.size(), 3UL);
+    auto spec = BSON("$changeStream" << BSON("fullDocument"
+                                             << "updateLookup"));
+    auto stages = DocumentSourceChangeStream::createFromBson(spec.firstElement(), expCtx);
+    ASSERT_EQ(stages.size(), 4UL);
     // Make sure the change lookup is at the end.
     ASSERT(dynamic_cast<DocumentSourceLookupChangePostImage*>(stages.back().get()));
 
@@ -1469,32 +1481,33 @@ TEST_F(PipelineInitialSourceNSTest, AggregateOneNSValidForFacetPipelineRegardles
     ASSERT_OK(Pipeline::parseFacetPipeline(rawPipeline, ctx).getStatus());
 }
 
-TEST_F(PipelineInitialSourceNSTest, ChangeNotificationIsValidAsFirstStage) {
-    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeNotification: {}}")};
+TEST_F(PipelineInitialSourceNSTest, ChangeStreamIsValidAsFirstStage) {
+    const std::vector<BSONObj> rawPipeline = {fromjson("{$changeStream: {}}")};
     auto ctx = getExpCtx();
+    setMockReplicationCoordinatorOnOpCtx(ctx->opCtx);
     ctx->ns = NamespaceString("a.collection");
     ASSERT_OK(Pipeline::parse(rawPipeline, ctx).getStatus());
 }
 
-TEST_F(PipelineInitialSourceNSTest, ChangeNotificationIsNotValidIfNotFirstStage) {
+TEST_F(PipelineInitialSourceNSTest, ChangeStreamIsNotValidIfNotFirstStage) {
     const std::vector<BSONObj> rawPipeline = {fromjson("{$match: {custom: 'filter'}}"),
-                                              fromjson("{$changeNotification: {}}")};
+                                              fromjson("{$changeStream: {}}")};
     auto ctx = getExpCtx();
+    setMockReplicationCoordinatorOnOpCtx(ctx->opCtx);
     ctx->ns = NamespaceString("a.collection");
     auto parseStatus = Pipeline::parse(rawPipeline, ctx).getStatus();
-    ASSERT_EQ(parseStatus, ErrorCodes::BadValue);
-    ASSERT_EQ(parseStatus.location(), 40549);
+    ASSERT_EQ(parseStatus, ErrorCodes::fromInt(40602));
 }
 
-TEST_F(PipelineInitialSourceNSTest, ChangeNotificationIsNotValidIfNotFirstStageInFacet) {
+TEST_F(PipelineInitialSourceNSTest, ChangeStreamIsNotValidIfNotFirstStageInFacet) {
     const std::vector<BSONObj> rawPipeline = {fromjson("{$match: {custom: 'filter'}}"),
-                                              fromjson("{$changeNotification: {}}")};
+                                              fromjson("{$changeStream: {}}")};
     auto ctx = getExpCtx();
+    setMockReplicationCoordinatorOnOpCtx(ctx->opCtx);
     ctx->ns = NamespaceString("a.collection");
     auto parseStatus = Pipeline::parseFacetPipeline(rawPipeline, ctx).getStatus();
-    ASSERT_EQ(parseStatus, ErrorCodes::BadValue);
-    ASSERT_EQ(parseStatus.location(), 40550);
-    ASSERT(std::string::npos != parseStatus.reason().find("$changeNotification"));
+    ASSERT_EQ(parseStatus, ErrorCodes::fromInt(40600));
+    ASSERT(std::string::npos != parseStatus.reason().find("$changeStream"));
 }
 
 }  // namespace Namespaces
@@ -1657,7 +1670,7 @@ TEST_F(PipelineDependenciesTest, ShouldThrowIfTextScoreIsNeededButNotPresent) {
     auto pipeline = unittest::assertGet(Pipeline::create({needsText}, ctx));
 
     ASSERT_THROWS(pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata),
-                  UserException);
+                  AssertionException);
 }
 
 TEST_F(PipelineDependenciesTest, ShouldRequireTextScoreIfAvailableAndNoStageReturnsExhaustiveMeta) {

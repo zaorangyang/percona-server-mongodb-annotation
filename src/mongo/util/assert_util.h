@@ -57,24 +57,6 @@ public:
 
 extern AssertionCount assertionCount;
 
-class BSONObjBuilder;
-
-struct ExceptionInfo {
-    ExceptionInfo() : msg(""), code(-1) {}
-    ExceptionInfo(const char* m, int c) : msg(m), code(c) {}
-    ExceptionInfo(const std::string& m, int c) : msg(m), code(c) {}
-    void append(BSONObjBuilder& b, const char* m = "$err", const char* c = "code") const;
-    std::string toString() const;
-    bool empty() const {
-        return msg.empty();
-    }
-    void reset() {
-        msg = "";
-        code = -1;
-    }
-    std::string msg;
-    int code;
-};
 
 class DBException;
 std::string causedBy(const DBException& e);
@@ -83,45 +65,39 @@ std::string causedBy(const std::string& e);
 /** Most mongo exceptions inherit from this; this is commonly caught in most threads */
 class DBException : public std::exception {
 public:
-    DBException(const ExceptionInfo& ei) : _ei(ei) {
+    DBException(const Status& status) : _status(status) {
+        invariant(!status.isOK());
         traceIfNeeded(*this);
     }
-    DBException(const char* msg, int code) : _ei(msg, code) {
-        traceIfNeeded(*this);
-    }
-    DBException(const std::string& msg, int code) : _ei(msg, code) {
-        traceIfNeeded(*this);
-    }
+    DBException(int code, StringData msg)
+        : DBException(Status(code ? ErrorCodes::fromInt(code) : ErrorCodes::UnknownError, msg)) {}
     virtual ~DBException() throw() {}
 
     virtual const char* what() const throw() {
-        return _ei.msg.c_str();
-    }
-    virtual int getCode() const {
-        return _ei.code;
-    }
-    virtual void appendPrefix(std::stringstream& ss) const {}
-    virtual void addContext(const std::string& str) {
-        _ei.msg = str + causedBy(_ei.msg);
+        return reason().c_str();
     }
 
-    // Utilities for the migration to Status objects
-    static ErrorCodes::Error convertExceptionCode(int exCode);
+    virtual void addContext(const std::string& str) {
+        _status = Status(code(), str + causedBy(reason()));
+    }
 
     Status toStatus(const std::string& context) const {
-        return Status(convertExceptionCode(getCode()), context + causedBy(*this));
+        return Status(code(), context + causedBy(*this));
     }
-    Status toStatus() const {
-        return Status(convertExceptionCode(getCode()), this->what());
+    const Status& toStatus() const {
+        return _status;
     }
 
-    // context when applicable. otherwise ""
-    std::string _shard;
+    virtual std::string toString() const {
+        return _status.toString();
+    }
 
-    virtual std::string toString() const;
+    const std::string& reason() const {
+        return _status.reason();
+    }
 
-    const ExceptionInfo& getInfo() const {
-        return _ei;
+    ErrorCodes::Error code() const {
+        return _status.code();
     }
 
 private:
@@ -131,46 +107,15 @@ public:
     static AtomicBool traceExceptions;
 
 protected:
-    ExceptionInfo _ei;
+    Status _status;
 };
 
 class AssertionException : public DBException {
 public:
-    AssertionException(const ExceptionInfo& ei) : DBException(ei) {}
-    AssertionException(const char* msg, int code) : DBException(msg, code) {}
-    AssertionException(const std::string& msg, int code) : DBException(msg, code) {}
+    AssertionException(const Status& status) : DBException(status) {}
+    AssertionException(int code, StringData msg) : DBException(code, msg) {}
 
     virtual ~AssertionException() throw() {}
-
-    virtual bool severe() const {
-        return true;
-    }
-    virtual bool isUserAssertion() const {
-        return false;
-    }
-};
-
-/* UserExceptions are valid errors that a user can cause, like out of disk space or duplicate key */
-class UserException : public AssertionException {
-public:
-    UserException(int c, const std::string& m) : AssertionException(m, c) {}
-    virtual bool severe() const {
-        return false;
-    }
-    virtual bool isUserAssertion() const {
-        return true;
-    }
-    virtual void appendPrefix(std::stringstream& ss) const;
-};
-
-class MsgAssertionException : public AssertionException {
-public:
-    MsgAssertionException(const ExceptionInfo& ei) : AssertionException(ei) {}
-    MsgAssertionException(int c, const std::string& m) : AssertionException(m, c) {}
-    virtual bool severe() const {
-        return false;
-    }
-    virtual void appendPrefix(std::stringstream& ss) const;
 };
 
 MONGO_COMPILER_NORETURN void verifyFailed(const char* expr, const char* file, unsigned line);
@@ -213,50 +158,23 @@ MONGO_COMPILER_NORETURN void fassertFailedWithStatusNoTraceWithLocation(int msgi
     could cause, such as duplicate key, disk full, etc.
 */
 MONGO_COMPILER_NORETURN void uassertedWithLocation(int msgid,
-                                                   const char* msg,
-                                                   const char* file,
-                                                   unsigned line);
-MONGO_COMPILER_NORETURN void uassertedWithLocation(int msgid,
-                                                   const std::string& msg,
+                                                   StringData msg,
                                                    const char* file,
                                                    unsigned line);
 
 /** msgassert and massert are for errors that are internal but have a well defined error text
-    std::string.  a stack trace is logged.
+    std::string.
 */
-
-#define msgassertedNoTrace MONGO_msgassertedNoTrace
-#define MONGO_msgassertedNoTrace(...) \
-    ::mongo::msgassertedNoTraceWithLocation(__VA_ARGS__, __FILE__, __LINE__)
-MONGO_COMPILER_NORETURN void msgassertedNoTraceWithLocation(int msgid,
-                                                            const char* msg,
-                                                            const char* file,
-                                                            unsigned line);
-MONGO_COMPILER_NORETURN void msgassertedNoTraceWithLocation(int msgid,
-                                                            const std::string& msg,
-                                                            const char* file,
-                                                            unsigned line);
-
-#define msgassertedNoTraceWithStatus MONGO_msgassertedNoTraceWithStatus
-#define MONGO_msgassertedNoTraceWithStatus(...) \
-    ::mongo::msgassertedNoTraceWithStatusWithLocation(__VA_ARGS__, __FILE__, __LINE__)
-MONGO_COMPILER_NORETURN void msgassertedNoTraceWithStatusWithLocation(int msgid,
-                                                                      const Status& status,
-                                                                      const char* file,
-                                                                      unsigned line);
 
 #define msgasserted MONGO_msgasserted
 #define MONGO_msgasserted(...) ::mongo::msgassertedWithLocation(__VA_ARGS__, __FILE__, __LINE__)
 MONGO_COMPILER_NORETURN void msgassertedWithLocation(int msgid,
-                                                     const char* msg,
-                                                     const char* file,
-                                                     unsigned line);
-MONGO_COMPILER_NORETURN void msgassertedWithLocation(int msgid,
-                                                     const std::string& msg,
+                                                     StringData msg,
                                                      const char* file,
                                                      unsigned line);
 
 /* convert various types of exceptions to strings */
+std::string causedBy(StringData e);
 std::string causedBy(const char* e);
 std::string causedBy(const DBException& e);
 std::string causedBy(const std::exception& e);
@@ -325,10 +243,7 @@ inline void fassertNoTraceWithLocation(int msgid,
     ::mongo::uassertStatusOKWithLocation(__VA_ARGS__, __FILE__, __LINE__)
 inline void uassertStatusOKWithLocation(const Status& status, const char* file, unsigned line) {
     if (MONGO_unlikely(!status.isOK())) {
-        uassertedWithLocation((status.location() != 0 ? status.location() : status.code()),
-                              status.reason(),
-                              file,
-                              line);
+        uassertedWithLocation(status.code(), status.reason(), file, line);
     }
 }
 
@@ -389,28 +304,7 @@ inline void fassertStatusOKWithLocation(int msgid,
     ::mongo::massertStatusOKWithLocation(__VA_ARGS__, __FILE__, __LINE__)
 inline void massertStatusOKWithLocation(const Status& status, const char* file, unsigned line) {
     if (MONGO_unlikely(!status.isOK())) {
-        msgassertedWithLocation((status.location() != 0 ? status.location() : status.code()),
-                                status.reason(),
-                                file,
-                                line);
-    }
-}
-
-#define massertNoTraceStatusOK MONGO_massertNoTraceStatusOK
-#define MONGO_massertNoTraceStatusOK(...) \
-    ::mongo::massertNoTraceStatusOKWithLocation(__VA_ARGS__, __FILE__, __LINE__)
-inline void massertNoTraceStatusOKWithLocation(const Status& status,
-                                               const char* file,
-                                               unsigned line) {
-    if (MONGO_unlikely(!status.isOK())) {
-        [&]() MONGO_COMPILER_COLD_FUNCTION {
-            msgassertedNoTraceWithLocation(
-                (status.location() != 0 ? status.location() : status.code()),
-                status.reason(),
-                file,
-                line);
-        }();
-        MONGO_COMPILER_UNREACHABLE;
+        msgassertedWithLocation(status.code(), status.reason(), file, line);
     }
 }
 
@@ -440,7 +334,7 @@ inline void massertNoTraceStatusOKWithLocation(const Status& status,
 // some special ids that we want to duplicate
 
 // > 10000 asserts
-// < 10000 UserException
+// < 10000 AssertionException
 
 enum { ASSERT_ID_DUPKEY = 11000 };
 

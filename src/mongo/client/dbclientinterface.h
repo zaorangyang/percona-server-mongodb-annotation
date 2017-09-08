@@ -198,6 +198,14 @@ public:
                const BSONObj* fieldsToReturn = 0,
                int queryOptions = 0);
 
+    /**
+     * @return a single object that matches the filter within the collection specified by the UUID.
+     * If the command fails, an assertion error is thrown. Otherwise, if no document matches
+     * the query, an empty BSONObj is returned.
+     * @throws AssertionException
+     */
+    virtual BSONObj findOneByUUID(const std::string& db, UUID uuid, const BSONObj& filter);
+
     virtual std::string getServerAddress() const = 0;
 
     /** helper function.  run a simple command where the command expression is simply
@@ -285,6 +293,13 @@ public:
     rpc::UniqueReply runCommand(OpMsgRequest request) {
         return runCommandWithTarget(std::move(request)).first;
     }
+
+    /**
+     * Runs the specified command request in fire-and-forget mode and returns the connection that
+     * the command was actually sent on. If the connection doesn't support OP_MSG, the request will
+     * be run as a normal two-way command and the reply will be ignored after parsing.
+     */
+    virtual DBClientBase* runFireAndForgetCommand(OpMsgRequest request);
 
     /** Run a database command.  Database commands are represented as BSON objects.  Common database
         commands have prebuilt helper functions -- see below.  If a helper is not available you can
@@ -572,7 +587,7 @@ public:
     /** Create an index on the collection 'ns' as described by the given keys. If you wish
      *  to specify options, see the more flexible overload of 'createIndex' which takes an
      *  IndexSpec object. Failure to construct the index is reported by throwing a
-     *  UserException.
+     *  AssertionException.
      *
      *  @param ns Namespace on which to create the index
      *  @param keys Document describing keys and index types. You must provide at least one
@@ -584,7 +599,7 @@ public:
 
     /** Create an index on the collection 'ns' as described by the given
      *  descriptor. Failure to construct the index is reported by throwing a
-     *  UserException.
+     *  AssertionException.
      *
      *  @param ns Namespace on which to create the index
      *  @param descriptor Configuration object describing the index to create. The
@@ -748,6 +763,13 @@ public:
 
     virtual bool isMongos() const = 0;
 
+    /**
+     * Parses command replies and runs them through the metadata reader.
+     * This is virtual and non-const to allow subclasses to act on failures.
+     */
+    virtual rpc::UniqueReply parseCommandReplyMessage(const std::string& host,
+                                                      const Message& replyMsg);
+
 protected:
     /** if the result of a command is ok*/
     bool isOk(const BSONObj&);
@@ -863,7 +885,7 @@ public:
     Status connectSocketOnly(const HostAndPort& server);
 
     /** Connect to a Mongo database server.  Exception throwing version.
-        Throws a UserException if cannot connect.
+        Throws a AssertionException if cannot connect.
 
        If autoReconnect is true, you can try to use the DBClientConnection even when
        false was returned -- it will try to connect again.
@@ -901,6 +923,9 @@ public:
 
     using DBClientBase::runCommandWithTarget;
     std::pair<rpc::UniqueReply, DBClientBase*> runCommandWithTarget(OpMsgRequest request) override;
+
+    rpc::UniqueReply parseCommandReplyMessage(const std::string& host,
+                                              const Message& replyMsg) override;
 
     /**
        @return true if this connection is currently in a failed state.  When autoreconnect is on,

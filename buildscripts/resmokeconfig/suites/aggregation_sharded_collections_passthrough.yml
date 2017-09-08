@@ -11,6 +11,7 @@ selector:
   - jstests/aggregation/bugs/server6118.js
   - jstests/aggregation/bugs/server6179.js
   - jstests/aggregation/bugs/server7781.js
+  - jstests/aggregation/mongos_merge.js
   - jstests/aggregation/mongos_slaveok.js
   - jstests/aggregation/shard_targeting.js
   - jstests/aggregation/sources/addFields/use_cases.js
@@ -23,7 +24,7 @@ selector:
   - jstests/aggregation/testshard1.js
   # The following tests start their own ReplSetTest.
   - jstests/aggregation/testSlave.js
-  - jstests/aggregation/sources/changeNotification/*.js
+  - jstests/aggregation/sources/changeStream/*.js
   # The following tests start their own mongod.
   - jstests/aggregation/bugs/cursor_timeout.js
   - jstests/aggregation/bugs/lookup_unwind_getmore.js

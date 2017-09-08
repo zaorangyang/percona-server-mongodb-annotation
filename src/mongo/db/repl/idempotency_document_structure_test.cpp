@@ -28,27 +28,37 @@
 
 #include "mongo/platform/basic.h"
 
+#include <cstddef>
+
 #include "mongo/bson/json.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/repl/idempotency_document_structure.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
 
-std::vector<BSONObj> getEnumeratedDocs(std::set<StringData> fields, size_t depth, size_t length) {
-    DocumentStructureEnumerator enumerator(fields, depth, length);
+std::vector<BSONObj> getEnumeratedDocs(DocumentStructureEnumeratorConfig config) {
+    TrivialScalarGenerator trivialScalarGenerator;
+    DocumentStructureEnumerator enumerator(config, &trivialScalarGenerator);
     return enumerator.getDocs();
 }
 
 TEST(DocGenTest, NumDocsIsCorrect) {
-    std::vector<BSONObj> docs = getEnumeratedDocs({"a", "b"}, 2, 1);
+    std::vector<BSONObj> docs = getEnumeratedDocs({{"a", "b"}, 2, 1, false, false});
     ASSERT_EQUALS(docs.size(), 104U);
+    docs = getEnumeratedDocs({{"a", "b"}, 2, 1, true, false});
+    ASSERT_EQUALS(docs.size(), 36U);
+    docs = getEnumeratedDocs({{"a", "b"}, 2, 1, false, true});
+    ASSERT_EQUALS(docs.size(), 15U);
+    docs = getEnumeratedDocs({{"a", "b"}, 2, 1, true, true});
+    ASSERT_EQUALS(docs.size(), 4U);
 }
 
 TEST(DocGenTest, NoDuplicateDocs) {
-    std::vector<BSONObj> docs = getEnumeratedDocs({"a", "b"}, 2, 1);
-    for (size_t i = 0; i < docs.size(); i++) {
-        for (size_t j = i + 1; j < docs.size(); j++) {
+    std::vector<BSONObj> docs = getEnumeratedDocs({{"a", "b"}, 2, 1});
+    for (std::size_t i = 0; i < docs.size(); i++) {
+        for (std::size_t j = i + 1; j < docs.size(); j++) {
             if (docs[i].binaryEqual(docs[j])) {
                 StringBuilder sb;
                 sb << "outer doc: " << docs[i] << " matches with inner: " << docs[j];
@@ -62,9 +72,10 @@ TEST(DocGenTest, SomePreChosenDocExists) {
     BSONObj specialDoc = BSON("a" << BSON("b" << 0));
 
     std::set<StringData> fields{"a", "b"};
-    size_t depth = 2;
-    size_t length = 1;
-    DocumentStructureEnumerator enumerator(fields, depth, length);
+    std::size_t depth = 2;
+    std::size_t length = 1;
+    TrivialScalarGenerator trivialScalarGenerator;
+    DocumentStructureEnumerator enumerator({fields, depth, length}, &trivialScalarGenerator);
     BSONObj start;
     bool docFound = false;
     for (auto doc : enumerator) {
@@ -84,7 +95,7 @@ TEST(DocGenTest, SomePreChosenDocExists) {
 void testEnumeratedDocsAreCorrect(const std::vector<BSONObj>& enumeratedDocs,
                                   const std::vector<BSONObj>& expectedDocs) {
     auto smallerSize = std::min(enumeratedDocs.size(), expectedDocs.size());
-    for (size_t i = 0; i < smallerSize; i++) {
+    for (std::size_t i = 0; i < smallerSize; i++) {
         if (!expectedDocs[i].binaryEqual(enumeratedDocs[i])) {
             StringBuilder sb;
             sb << "Expected to find " << expectedDocs[i] << " but found " << enumeratedDocs[i];
@@ -106,8 +117,6 @@ void testEnumeratedDocsAreCorrect(const std::vector<BSONObj>& enumeratedDocs,
 }
 
 TEST(DocGenTest, EntireCollectionExistsABDepth2Length0) {
-    // Although I could re-use some of these BSONObj (e.g. doc2 inside doc1), I think maintaining
-    // the order demonstrates something about our enumeration path that is valuable.
     std::vector<BSONObj> expectedDocs;
     expectedDocs.push_back(fromjson("{'a' : 0, 'b' : 0}"));
     expectedDocs.push_back(fromjson("{'a' : 0 }"));
@@ -138,13 +147,65 @@ TEST(DocGenTest, EntireCollectionExistsABDepth2Length0) {
     expectedDocs.push_back(fromjson("{'a' : {'b' : {}}, 'b' : []}"));
     expectedDocs.push_back(fromjson("{'a' : {'b' : {}}, 'b' : {}}"));
 
-    auto enumeratedDocs = getEnumeratedDocs({"a", "b"}, 2, 0);
-    testEnumeratedDocsAreCorrect(expectedDocs, enumeratedDocs);
+    auto enumeratedDocs = getEnumeratedDocs({{"a", "b"}, 2, 0});
+    testEnumeratedDocsAreCorrect(enumeratedDocs, expectedDocs);
+}
+
+TEST(DocGenTest, EntireCollectionExistsABDepth2Length0ArrsDisabled) {
+    std::vector<BSONObj> expectedDocs;
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : 0 }"));
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : {}}"));
+    expectedDocs.push_back(fromjson("{'b' : 0}"));
+    expectedDocs.push_back(fromjson("{}"));
+    expectedDocs.push_back(fromjson("{'b' : {} }"));
+    expectedDocs.push_back(fromjson("{'a' : {'b' : 0}, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : {'b' : 0}}"));
+    expectedDocs.push_back(fromjson("{'a' : {'b' : 0}, 'b' : {}}"));
+    expectedDocs.push_back(fromjson("{'a' : {}, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : {}}"));
+    expectedDocs.push_back(fromjson("{'a' : {}, 'b' : {}}"));
+    expectedDocs.push_back(fromjson("{'a' : {'b' : {}}, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : {'b' : {}}}"));
+    expectedDocs.push_back(fromjson("{'a' : {'b' : {}}, 'b' : {}}"));
+
+    TrivialScalarGenerator trivialScalarGenerator;
+    DocumentStructureEnumerator enumerator({{"a", "b"}, 2, 0, false, true},
+                                           &trivialScalarGenerator);
+    testEnumeratedDocsAreCorrect(enumerator.getDocs(), expectedDocs);
+}
+
+TEST(DocGenTest, EntireCollectionExistsABDepth2Length0DocsDisabled) {
+    std::vector<BSONObj> expectedDocs;
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : 0 }"));
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : []}"));
+    expectedDocs.push_back(fromjson("{'b' : 0}"));
+    expectedDocs.push_back(fromjson("{}"));
+    expectedDocs.push_back(fromjson("{'b' : [] }"));
+    expectedDocs.push_back(fromjson("{'a' : [], 'b' : 0 }"));
+    expectedDocs.push_back(fromjson("{'a' : []}"));
+    expectedDocs.push_back(fromjson("{'a' : [], 'b' : []}"));
+
+    TrivialScalarGenerator trivialScalarGenerator;
+    DocumentStructureEnumerator enumerator({{"a", "b"}, 2, 0, true, false},
+                                           &trivialScalarGenerator);
+    testEnumeratedDocsAreCorrect(enumerator.getDocs(), expectedDocs);
+}
+
+TEST(DocGenTest, EntireCollectionExistsABDepth2Length0BothDisabled) {
+    std::vector<BSONObj> expectedDocs;
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : 0 }"));
+    expectedDocs.push_back(fromjson("{'b' : 0}"));
+    expectedDocs.push_back(fromjson("{}"));
+
+    TrivialScalarGenerator trivialScalarGenerator;
+    DocumentStructureEnumerator enumerator({{"a", "b"}, 2, 0, true, true}, &trivialScalarGenerator);
+    testEnumeratedDocsAreCorrect(enumerator.getDocs(), expectedDocs);
 }
 
 TEST(DocGenTest, EntireCollectionExistsABDepth1Length2) {
-    // Although we could re-use some of these BSONObj (e.g. doc2 inside doc1), we think maintaining
-    // the order demonstrates something about our enumeration order that is valuable.
     std::vector<BSONObj> expectedDocs;
     expectedDocs.push_back(fromjson("{'a' : 0, 'b' : 0}"));
     expectedDocs.push_back(fromjson("{'a' : 0}"));
@@ -189,28 +250,97 @@ TEST(DocGenTest, EntireCollectionExistsABDepth1Length2) {
     expectedDocs.push_back(fromjson("{'a' : {}, 'b' : [0, 0]}"));
     expectedDocs.push_back(fromjson("{'a' : {}, 'b' : {}}"));
 
-    auto enumeratedDocs = getEnumeratedDocs({"a", "b"}, 1, 2);
-    testEnumeratedDocsAreCorrect(expectedDocs, enumeratedDocs);
+    auto enumeratedDocs = getEnumeratedDocs({{"a", "b"}, 1, 2});
+    testEnumeratedDocsAreCorrect(enumeratedDocs, expectedDocs);
+}
+
+TEST(DocGenTest, EntireCollectionExistsABDepth1Length2ArrsDisabled) {
+    std::vector<BSONObj> expectedDocs;
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : {}}"));
+    expectedDocs.push_back(fromjson("{'b' : 0}"));
+    expectedDocs.push_back(fromjson("{}"));
+    expectedDocs.push_back(fromjson("{'b' : {}}"));
+    expectedDocs.push_back(fromjson("{'a' : {'b' : 0}, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : {'b' : 0}}"));
+    expectedDocs.push_back(fromjson("{'a' : {'b' : 0}, 'b' : {}}"));
+    expectedDocs.push_back(fromjson("{'a' : {}, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : {}}"));
+    expectedDocs.push_back(fromjson("{'a' : {}, 'b' : {}}"));
+
+    TrivialScalarGenerator trivialScalarGenerator;
+    DocumentStructureEnumerator enumerator({{"a", "b"}, 1, 2, false, true},
+                                           &trivialScalarGenerator);
+    testEnumeratedDocsAreCorrect(enumerator.getDocs(), expectedDocs);
+}
+
+TEST(DocGenTest, EntireCollectionExistsABDepth1Length2DocsDisabled) {
+    std::vector<BSONObj> expectedDocs;
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : []}"));
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : [0]}"));
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : [0, 0]}"));
+    expectedDocs.push_back(fromjson("{'b' : 0}"));
+    expectedDocs.push_back(fromjson("{}"));
+    expectedDocs.push_back(fromjson("{'b' : []}"));
+    expectedDocs.push_back(fromjson("{'b' : [0]}"));
+    expectedDocs.push_back(fromjson("{'b' : [0, 0]}"));
+    expectedDocs.push_back(fromjson("{'a' : [], 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : []}"));
+    expectedDocs.push_back(fromjson("{'a' : [], 'b' : []}"));
+    expectedDocs.push_back(fromjson("{'a' : [], 'b' : [0]}"));
+    expectedDocs.push_back(fromjson("{'a' : [], 'b' : [0, 0]}"));
+    expectedDocs.push_back(fromjson("{'a' : [0], 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : [0]}"));
+    expectedDocs.push_back(fromjson("{'a' : [0], 'b' : []}"));
+    expectedDocs.push_back(fromjson("{'a' : [0], 'b' : [0]}"));
+    expectedDocs.push_back(fromjson("{'a' : [0], 'b' : [0, 0]}"));
+    expectedDocs.push_back(fromjson("{'a' : [0, 0], 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : [0, 0]}"));
+    expectedDocs.push_back(fromjson("{'a' : [0, 0], 'b' : []}"));
+    expectedDocs.push_back(fromjson("{'a' : [0, 0], 'b' : [0]}"));
+    expectedDocs.push_back(fromjson("{'a' : [0, 0], 'b' : [0, 0]}"));
+
+    TrivialScalarGenerator trivialScalarGenerator;
+    DocumentStructureEnumerator enumerator({{"a", "b"}, 1, 2, true, false},
+                                           &trivialScalarGenerator);
+    testEnumeratedDocsAreCorrect(enumerator.getDocs(), expectedDocs);
+}
+
+TEST(DocGenTest, EntireCollectionExistsABDepth1Length2BothDisabled) {
+    std::vector<BSONObj> expectedDocs;
+    expectedDocs.push_back(fromjson("{'a' : 0, 'b' : 0}"));
+    expectedDocs.push_back(fromjson("{'a' : 0}"));
+    expectedDocs.push_back(fromjson("{'b' : 0}"));
+    expectedDocs.push_back(fromjson("{}"));
+
+    TrivialScalarGenerator trivialScalarGenerator;
+    DocumentStructureEnumerator enumerator({{"a", "b"}, 1, 2, true, true}, &trivialScalarGenerator);
+    testEnumeratedDocsAreCorrect(enumerator.getDocs(), expectedDocs);
 }
 
 TEST(EnumerateArrsTest, NumArrsIsCorrect) {
     std::set<StringData> fields{"a"};
-    size_t depth = 2;
-    size_t length = 2;
-    DocumentStructureEnumerator enumerator(fields, depth, length);
+    std::size_t depth = 2;
+    std::size_t length = 2;
+    TrivialScalarGenerator trivialScalarGenerator;
+    DocumentStructureEnumerator enumerator({fields, depth, length}, &trivialScalarGenerator);
     std::vector<BSONArray> arrs = enumerator.enumerateArrs();
-    ASSERT_EQUALS(arrs.size(), 2365U);
+    ASSERT_EQUALS(arrs.size(), 2414U);
 }
 
 TEST(EnumerateArrsTest, NoDuplicateArrs) {
     std::set<StringData> fields{"a", "b"};
-    size_t depth = 2;
-    size_t length = 2;
-    DocumentStructureEnumerator enumerator(fields, depth, length);
+    std::size_t depth = 2;
+    std::size_t length = 2;
+    TrivialScalarGenerator trivialScalarGenerator;
+    DocumentStructureEnumerator enumerator({fields, depth, length}, &trivialScalarGenerator);
     BSONObj start;
     std::vector<BSONArray> arrs = enumerator.enumerateArrs();
-    for (size_t i = 0; i < arrs.size(); i++) {
-        for (size_t j = i + 1; j < arrs.size(); j++) {
+    for (std::size_t i = 0; i < arrs.size(); i++) {
+        for (std::size_t j = i + 1; j < arrs.size(); j++) {
             if (arrs[i].binaryEqual(arrs[j])) {
                 StringBuilder sb;
                 sb << "outer arr: " << arrs[i] << " matches with inner: " << arrs[j];

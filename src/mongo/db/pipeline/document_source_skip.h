@@ -37,6 +37,13 @@ public:
     // virtuals from DocumentSource
     GetNextResult getNext() final;
     const char* getSourceName() const final;
+
+    StageConstraints constraints() const final {
+        StageConstraints constraints;
+        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
+        return constraints;
+    }
+
     /**
      * Attempts to move a subsequent $limit before the skip, potentially allowing for forther
      * optimizations earlier in the pipeline.
@@ -79,7 +86,7 @@ public:
     /**
      * Parses the user-supplied BSON into a $skip stage.
      *
-     * Throws a UserException if 'elem' is an invalid $skip specification.
+     * Throws a AssertionException if 'elem' is an invalid $skip specification.
      */
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);

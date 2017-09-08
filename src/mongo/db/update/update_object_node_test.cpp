@@ -45,7 +45,6 @@ namespace mongo {
 namespace {
 
 using UpdateObjectNodeTest = UpdateNodeTest;
-using mongo::mutablebson::Document;
 using mongo::mutablebson::Element;
 
 TEST(UpdateObjectNodeTest, InvalidPathFailsToParse) {
@@ -233,6 +232,20 @@ TEST(UpdateObjectNodeTest, ValidSetOnInsertPathParsesSuccessfully) {
                                               foundIdentifiers));
 }
 
+TEST(UpdateObjectNodeTest, ValidPushParsesSuccessfully) {
+    auto update = fromjson("{$push: {'a.b': {$each: [0, 1], $sort: 1, $position: 0, $slice: 10}}}");
+    const CollatorInterface* collator = nullptr;
+    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
+    std::set<std::string> foundIdentifiers;
+    UpdateObjectNode root;
+    ASSERT_OK(UpdateObjectNode::parseAndMerge(&root,
+                                              modifiertable::ModifierType::MOD_PUSH,
+                                              update["$push"]["a.b"],
+                                              collator,
+                                              arrayFilters,
+                                              foundIdentifiers));
+}
+
 TEST(UpdateObjectNodeTest, MultiplePositionalElementsFailToParse) {
     auto update = fromjson("{$set: {'a.$.b.$': 5}}");
     const CollatorInterface* collator = nullptr;
@@ -299,24 +312,6 @@ TEST(UpdateObjectNodeTest, PositionalElementFirstPositionFailsToParse) {
     ASSERT_EQ(result.getStatus().code(), ErrorCodes::BadValue);
     ASSERT_EQ(result.getStatus().reason(),
               "Cannot have positional (i.e. '$') element in the first position in path '$'");
-}
-
-// TODO SERVER-28777: All modifier types should succeed.
-TEST(UpdateObjectNodeTest, PushFailsToParse) {
-    auto update = fromjson("{$push: {a: 5}}");
-    const CollatorInterface* collator = nullptr;
-    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
-    std::set<std::string> foundIdentifiers;
-    UpdateObjectNode root;
-    auto result = UpdateObjectNode::parseAndMerge(&root,
-                                                  modifiertable::ModifierType::MOD_PUSH,
-                                                  update["$push"]["a"],
-                                                  collator,
-                                                  arrayFilters,
-                                                  foundIdentifiers);
-    ASSERT_NOT_OK(result);
-    ASSERT_EQ(result.getStatus().code(), ErrorCodes::FailedToParse);
-    ASSERT_EQ(result.getStatus().reason(), "Cannot construct modifier of type 10");
 }
 
 TEST(UpdateObjectNodeTest, TwoModifiersOnSameFieldFailToParse) {
@@ -1333,7 +1328,7 @@ TEST(UpdateObjectNodeTest, TopLevelConflictFails) {
     std::unique_ptr<UpdateNode> result;
     ASSERT_THROWS_CODE_AND_WHAT(
         result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
-        UserException,
+        AssertionException,
         ErrorCodes::ConflictingUpdateOperators,
         "Update created a conflict at 'root.a'");
 }
@@ -1362,7 +1357,7 @@ TEST(UpdateObjectNodeTest, NestedConflictFails) {
     std::unique_ptr<UpdateNode> result;
     ASSERT_THROWS_CODE_AND_WHAT(
         result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
-        UserException,
+        AssertionException,
         ErrorCodes::ConflictingUpdateOperators,
         "Update created a conflict at 'root.a.b'");
 }
@@ -1391,7 +1386,7 @@ TEST(UpdateObjectNodeTest, LeftPrefixMergeFails) {
     std::unique_ptr<UpdateNode> result;
     ASSERT_THROWS_CODE_AND_WHAT(
         result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
-        UserException,
+        AssertionException,
         ErrorCodes::ConflictingUpdateOperators,
         "Update created a conflict at 'root.a.b'");
 }
@@ -1420,7 +1415,7 @@ TEST(UpdateObjectNodeTest, RightPrefixMergeFails) {
     std::unique_ptr<UpdateNode> result;
     ASSERT_THROWS_CODE_AND_WHAT(
         result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
-        UserException,
+        AssertionException,
         ErrorCodes::ConflictingUpdateOperators,
         "Update created a conflict at 'root.a.b'");
 }
@@ -1449,7 +1444,7 @@ TEST(UpdateObjectNodeTest, LeftPrefixMergeThroughPositionalFails) {
     std::unique_ptr<UpdateNode> result;
     ASSERT_THROWS_CODE_AND_WHAT(
         result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
-        UserException,
+        AssertionException,
         ErrorCodes::ConflictingUpdateOperators,
         "Update created a conflict at 'root.a.$.c'");
 }
@@ -1478,7 +1473,7 @@ TEST(UpdateObjectNodeTest, RightPrefixMergeThroughPositionalFails) {
     std::unique_ptr<UpdateNode> result;
     ASSERT_THROWS_CODE_AND_WHAT(
         result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
-        UserException,
+        AssertionException,
         ErrorCodes::ConflictingUpdateOperators,
         "Update created a conflict at 'root.a.$.c'");
 }
@@ -1507,7 +1502,7 @@ TEST(UpdateObjectNodeTest, MergeWithConflictingPositionalFails) {
     std::unique_ptr<UpdateNode> result;
     ASSERT_THROWS_CODE_AND_WHAT(
         result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
-        UserException,
+        AssertionException,
         ErrorCodes::ConflictingUpdateOperators,
         "Update created a conflict at 'root.a.$'");
 }
@@ -1569,7 +1564,7 @@ TEST(UpdateObjectNodeTest, MergingArrayNodeWithObjectNodeFails) {
     std::unique_ptr<UpdateNode> result;
     ASSERT_THROWS_CODE_AND_WHAT(
         result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
-        UserException,
+        AssertionException,
         ErrorCodes::ConflictingUpdateOperators,
         "Update created a conflict at 'root.a'");
 }
@@ -1600,7 +1595,7 @@ TEST(UpdateObjectNodeTest, MergingArrayNodeWithLeafNodeFails) {
     std::unique_ptr<UpdateNode> result;
     ASSERT_THROWS_CODE_AND_WHAT(
         result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
-        UserException,
+        AssertionException,
         ErrorCodes::ConflictingUpdateOperators,
         "Update created a conflict at 'root.a'");
 }
@@ -1671,7 +1666,7 @@ TEST(UpdateObjectNodeTest, MergeConflictThroughArrayNodesFails) {
     std::unique_ptr<UpdateNode> result;
     ASSERT_THROWS_CODE_AND_WHAT(
         result = UpdateNode::createUpdateNodeByMerging(setRoot1, setRoot2, &fakeFieldRef),
-        UserException,
+        AssertionException,
         ErrorCodes::ConflictingUpdateOperators,
         "Update created a conflict at 'root.a.$[i].b'");
 }
@@ -1733,7 +1728,7 @@ TEST_F(UpdateObjectNodeTest, ApplyCreateField) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: 5}"));
+    mutablebson::Document doc(fromjson("{a: 5}"));
     addIndexedPath("b");
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_TRUE(result.indexesAffected);
@@ -1756,7 +1751,7 @@ TEST_F(UpdateObjectNodeTest, ApplyExistingField) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: 5}"));
+    mutablebson::Document doc(fromjson("{a: 5}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_TRUE(result.indexesAffected);
@@ -1797,7 +1792,7 @@ TEST_F(UpdateObjectNodeTest, ApplyExistingAndNonexistingFields) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: 0, c: 0}"));
+    mutablebson::Document doc(fromjson("{a: 0, c: 0}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_TRUE(result.indexesAffected);
@@ -1838,7 +1833,7 @@ TEST_F(UpdateObjectNodeTest, ApplyExistingNestedPaths) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: {b: 5, c: 5}, b: {d: 5, e: 5}}"));
+    mutablebson::Document doc(fromjson("{a: {b: 5, c: 5}, b: {d: 5, e: 5}}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_TRUE(result.indexesAffected);
@@ -1880,7 +1875,7 @@ TEST_F(UpdateObjectNodeTest, ApplyCreateNestedPaths) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{z: 0}"));
+    mutablebson::Document doc(fromjson("{z: 0}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_TRUE(result.indexesAffected);
@@ -1916,7 +1911,7 @@ TEST_F(UpdateObjectNodeTest, ApplyCreateDeeplyNestedPaths) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{z: 0}"));
+    mutablebson::Document doc(fromjson("{z: 0}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_TRUE(result.indexesAffected);
@@ -1964,7 +1959,7 @@ TEST_F(UpdateObjectNodeTest, ChildrenShouldBeAppliedInAlphabeticalOrder) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{z: 0, a: 0}"));
+    mutablebson::Document doc(fromjson("{z: 0, a: 0}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_TRUE(result.indexesAffected);
@@ -1993,7 +1988,7 @@ TEST_F(UpdateObjectNodeTest, CollatorShouldNotAffectUpdateOrder) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{}"));
+    mutablebson::Document doc(fromjson("{}"));
     addIndexedPath("abc");
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_TRUE(result.indexesAffected);
@@ -2028,7 +2023,7 @@ TEST_F(UpdateObjectNodeTest, ApplyNoop) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: 5, b: 6, c: 7}"));
+    mutablebson::Document doc(fromjson("{a: 5, b: 6, c: 7}"));
     addIndexedPath("a");
     addIndexedPath("b");
     addIndexedPath("c");
@@ -2065,7 +2060,7 @@ TEST_F(UpdateObjectNodeTest, ApplySomeChildrenNoops) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: 5, b: 0, c: 7}"));
+    mutablebson::Document doc(fromjson("{a: 5, b: 0, c: 7}"));
     addIndexedPath("a");
     addIndexedPath("b");
     addIndexedPath("c");
@@ -2090,10 +2085,10 @@ TEST_F(UpdateObjectNodeTest, ApplyBlockingElement) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: 0}"));
+    mutablebson::Document doc(fromjson("{a: 0}"));
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::PathNotViable,
                                 "Cannot create field 'b' in element {a: 0}");
 }
@@ -2117,7 +2112,7 @@ TEST_F(UpdateObjectNodeTest, ApplyBlockingElementFromReplication) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: 0}"));
+    mutablebson::Document doc(fromjson("{a: 0}"));
     addIndexedPath("a");
     setFromReplication(true);
     auto result = root.apply(getApplyParams(doc.root()));
@@ -2141,11 +2136,11 @@ TEST_F(UpdateObjectNodeTest, ApplyPositionalMissingMatchedField) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{}"));
+    mutablebson::Document doc(fromjson("{}"));
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
         root.apply(getApplyParams(doc.root())),
-        UserException,
+        AssertionException,
         ErrorCodes::BadValue,
         "The positional operator did not find the match needed from the query.");
 }
@@ -2169,7 +2164,7 @@ TEST_F(UpdateObjectNodeTest, ApplyMergePositionalChild) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
+    mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
     setMatchedField("0");
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
@@ -2211,7 +2206,7 @@ TEST_F(UpdateObjectNodeTest, ApplyOrderMergedPositionalChild) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{}"));
+    mutablebson::Document doc(fromjson("{}"));
     setMatchedField("1");
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
@@ -2242,11 +2237,11 @@ TEST_F(UpdateObjectNodeTest, ApplyMergeConflictWithPositionalChild) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{}"));
+    mutablebson::Document doc(fromjson("{}"));
     setMatchedField("0");
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::ConflictingUpdateOperators,
                                 "Update created a conflict at 'a.0'");
 }
@@ -2276,7 +2271,7 @@ TEST_F(UpdateObjectNodeTest, ApplyDoNotMergePositionalChild) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{}"));
+    mutablebson::Document doc(fromjson("{}"));
     setMatchedField("1");
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
@@ -2312,7 +2307,7 @@ TEST_F(UpdateObjectNodeTest, ApplyPositionalChildLast) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{}"));
+    mutablebson::Document doc(fromjson("{}"));
     setMatchedField("2");
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
@@ -2342,7 +2337,7 @@ TEST_F(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
+    mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}]}"));
     setMatchedField("0");
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
@@ -2352,7 +2347,7 @@ TEST_F(UpdateObjectNodeTest, ApplyUseStoredMergedPositional) {
     ASSERT_TRUE(doc.isInPlaceModeEnabled());
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.0.c': 6}}"), getLogDoc().getObject());
 
-    Document doc2(fromjson("{a: [{b: 0, c: 0}]}"));
+    mutablebson::Document doc2(fromjson("{a: [{b: 0, c: 0}]}"));
     resetApplyParams();
     setMatchedField("0");
     addIndexedPath("a");
@@ -2389,7 +2384,7 @@ TEST_F(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: [{b: 0, c: 0}, {c: 0, d: 0}]}"));
+    mutablebson::Document doc(fromjson("{a: [{b: 0, c: 0}, {c: 0, d: 0}]}"));
     setMatchedField("0");
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
@@ -2400,7 +2395,7 @@ TEST_F(UpdateObjectNodeTest, ApplyDoNotUseStoredMergedPositional) {
     ASSERT_BSONOBJ_EQ(fromjson("{$set: {'a.0.b': 5, 'a.0.c': 6, 'a.1.d': 7}}"),
                       getLogDoc().getObject());
 
-    Document doc2(fromjson("{a: [{b: 0, c: 0}, {c: 0, d: 0}]}"));
+    mutablebson::Document doc2(fromjson("{a: [{b: 0, c: 0}, {c: 0, d: 0}]}"));
     resetApplyParams();
     setMatchedField("1");
     addIndexedPath("a");
@@ -2431,7 +2426,7 @@ TEST_F(UpdateObjectNodeTest, ApplyToArrayByIndexWithLeadingZero) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: [0, 0, 0, 0, 0]}"));
+    mutablebson::Document doc(fromjson("{a: [0, 0, 0, 0, 0]}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_TRUE(result.indexesAffected);
@@ -2466,7 +2461,7 @@ TEST_F(UpdateObjectNodeTest, ApplyMultipleArrayUpdates) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: []}"));
+    mutablebson::Document doc(fromjson("{a: []}"));
     addIndexedPath("a");
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_TRUE(result.indexesAffected);
@@ -2491,10 +2486,10 @@ TEST_F(UpdateObjectNodeTest, ApplyUpdateToNonViablePathInArray) {
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: [{b: 1}, {b: 2}]}"));
+    mutablebson::Document doc(fromjson("{a: [{b: 1}, {b: 2}]}"));
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(root.apply(getApplyParams(doc.root())),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::PathNotViable,
                                 "Cannot create field 'b' in element {a: [ { b: 1 }, { b: 2 } ]}");
 }
@@ -2518,7 +2513,7 @@ TEST_F(UpdateObjectNodeTest, SetAndPopModifiersWithCommonPrefixApplySuccessfully
                                               arrayFilters,
                                               foundIdentifiers));
 
-    Document doc(fromjson("{a: {b: 3, c: [1, 2, 3, 4]}}"));
+    mutablebson::Document doc(fromjson("{a: {b: 3, c: [1, 2, 3, 4]}}"));
     auto result = root.apply(getApplyParams(doc.root()));
     ASSERT_FALSE(result.indexesAffected);
     ASSERT_FALSE(result.noop);

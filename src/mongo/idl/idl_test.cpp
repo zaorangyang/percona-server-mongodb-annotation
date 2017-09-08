@@ -71,6 +71,56 @@ bool isEquals(const std::vector<std::array<std::uint8_t, 16>>& left,
         left.data(), left.data() + left.size(), right.data(), right.data() + right.size());
 }
 
+/**
+ * Flatten an OpMsgRequest into a BSONObj.
+ */
+BSONObj flatten(const OpMsgRequest& msg) {
+    BSONObjBuilder builder;
+    builder.appendElements(msg.body);
+
+    for (auto&& docSeq : msg.sequences) {
+        builder.append(docSeq.name, docSeq.objs);
+    }
+
+    return builder.obj();
+}
+
+/**
+ * Validate two OpMsgRequests are the same regardless of whether they both use DocumentSequences.
+ */
+void assertOpMsgEquals(const OpMsgRequest& left, const OpMsgRequest& right) {
+    auto flatLeft = flatten(left);
+    auto flatRight = flatten(right);
+
+    ASSERT_BSONOBJ_EQ(flatLeft, flatRight);
+}
+
+/**
+* Validate two OpMsgRequests are the same including their DocumentSequences.
+*/
+void assertOpMsgEqualsExact(const OpMsgRequest& left, const OpMsgRequest& right) {
+
+    ASSERT_BSONOBJ_EQ(left.body, right.body);
+
+    ASSERT_EQUALS(left.sequences.size(), right.sequences.size());
+
+    for (size_t i = 0; i < left.sequences.size(); ++i) {
+        auto leftItem = left.sequences[i];
+        auto rightItem = right.sequences[i];
+
+        ASSERT_TRUE(std::equal(leftItem.objs.begin(),
+                               leftItem.objs.end(),
+                               rightItem.objs.begin(),
+                               rightItem.objs.end(),
+                               [](const BSONObj& leftBson, const BSONObj& rightBson) {
+                                   return SimpleBSONObjComparator::kInstance.compare(
+                                              leftBson, rightBson) == 0;
+                               }));
+        ASSERT_EQUALS(leftItem.name, rightItem.name);
+    }
+}
+
+
 BSONObj appendDB(const BSONObj& obj, StringData dbName) {
     BSONObjBuilder builder;
     builder.appendElements(obj);
@@ -188,7 +238,7 @@ void TestParse(TestT test_value) {
     ASSERT_EQUALS(element.type(), Test_bson_type);
 
     if (Parser_bson_type != Test_bson_type) {
-        ASSERT_THROWS(ParserT::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(ParserT::parse(ctxt, testDoc), AssertionException);
     } else {
         (void)ParserT::parse(ctxt, testDoc);
     }
@@ -269,7 +319,7 @@ TEST(IDLOneTypeTests, TestNamespaceString) {
     {
         auto testBadDoc = BSON("value" << StringData("foo\0bar", 7));
 
-        ASSERT_THROWS(One_namespacestring::parse(ctxt, testBadDoc), UserException);
+        ASSERT_THROWS(One_namespacestring::parse(ctxt, testBadDoc), AssertionException);
     }
 }
 
@@ -356,29 +406,29 @@ TEST(IDLStructTests, TestStrictStruct) {
     // Negative: Missing 1 required field
     {
         auto testDoc = BSON("field2" << 123 << "field3" << 1234);
-        ASSERT_THROWS(RequiredStrictField3::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(RequiredStrictField3::parse(ctxt, testDoc), AssertionException);
     }
     {
         auto testDoc = BSON("field1" << 12 << "field3" << 1234);
-        ASSERT_THROWS(RequiredStrictField3::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(RequiredStrictField3::parse(ctxt, testDoc), AssertionException);
     }
     {
         auto testDoc = BSON("field1" << 12 << "field2" << 123);
-        ASSERT_THROWS(RequiredStrictField3::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(RequiredStrictField3::parse(ctxt, testDoc), AssertionException);
     }
 
     // Negative: Extra field
     {
         auto testDoc =
             BSON("field1" << 12 << "field2" << 123 << "field3" << 1234 << "field4" << 1234);
-        ASSERT_THROWS(RequiredStrictField3::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(RequiredStrictField3::parse(ctxt, testDoc), AssertionException);
     }
 
     // Negative: Duplicate field
     {
         auto testDoc =
             BSON("field1" << 12 << "field2" << 123 << "field3" << 1234 << "field2" << 12345);
-        ASSERT_THROWS(RequiredStrictField3::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(RequiredStrictField3::parse(ctxt, testDoc), AssertionException);
     }
 }
 // Positive: non-strict, ensure extra fields work
@@ -400,15 +450,15 @@ TEST(IDLStructTests, TestNonStrictStruct) {
     // Negative: Missing 1 required field
     {
         auto testDoc = BSON("2" << 123 << "3" << 1234);
-        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), AssertionException);
     }
     {
         auto testDoc = BSON("1" << 12 << "3" << 1234);
-        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), AssertionException);
     }
     {
         auto testDoc = BSON("1" << 12 << "2" << 123);
-        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), AssertionException);
     }
 
     // Positive: Extra field
@@ -420,14 +470,14 @@ TEST(IDLStructTests, TestNonStrictStruct) {
     // Negative: Duplicate field
     {
         auto testDoc = BSON("1" << 12 << "2" << 123 << "3" << 1234 << "2" << 12345);
-        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), AssertionException);
     }
 
     // Negative: Duplicate extra field
     {
         auto testDoc =
             BSON("field4" << 1234 << "1" << 12 << "2" << 123 << "3" << 1234 << "field4" << 1234);
-        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(RequiredNonStrictField3::parse(ctxt, testDoc), AssertionException);
     }
 }
 
@@ -730,14 +780,14 @@ TEST(IDLArrayTests, TestBadArrays) {
     {
         auto testDoc = BSON("field1" << 123);
 
-        ASSERT_THROWS(Simple_int_array::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(Simple_int_array::parse(ctxt, testDoc), AssertionException);
     }
 
     // Negative: Test array with mixed types
     {
         auto testDoc = BSON("field1" << BSON_ARRAY(1.2 << 3.4 << 5.6));
 
-        ASSERT_THROWS(Simple_int_array::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(Simple_int_array::parse(ctxt, testDoc), AssertionException);
     }
 }
 
@@ -773,7 +823,7 @@ TEST(IDLArrayTests, TestBadArrayFieldNames) {
         }
         auto testDoc = builder.obj();
 
-        ASSERT_THROWS(Simple_int_array::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(Simple_int_array::parse(ctxt, testDoc), AssertionException);
     }
 
     // Negative: bad start
@@ -786,7 +836,7 @@ TEST(IDLArrayTests, TestBadArrayFieldNames) {
         }
         auto testDoc = builder.obj();
 
-        ASSERT_THROWS(Simple_int_array::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(Simple_int_array::parse(ctxt, testDoc), AssertionException);
     }
 
     // Negative: non-sequentially increasing
@@ -799,7 +849,7 @@ TEST(IDLArrayTests, TestBadArrayFieldNames) {
         }
         auto testDoc = builder.obj();
 
-        ASSERT_THROWS(Simple_int_array::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(Simple_int_array::parse(ctxt, testDoc), AssertionException);
     }
 }
 
@@ -967,7 +1017,7 @@ TEST(IDLBinData, TestMD5) {
 
         uint8_t testData[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
         auto testDoc = BSON("value" << BSONBinData(testData, 15, MD5Type));
-        ASSERT_THROWS(One_md5::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(One_md5::parse(ctxt, testDoc), AssertionException);
     }
 }
 
@@ -985,7 +1035,7 @@ void TestBinDataParse() {
     ASSERT_EQUALS(element.binDataType(), Test_bindata_type);
 
     if (Parser_bindata_type != Test_bindata_type) {
-        ASSERT_THROWS(ParserT::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(ParserT::parse(ctxt, testDoc), AssertionException);
     } else {
         (void)ParserT::parse(ctxt, testDoc);
     }
@@ -1213,7 +1263,7 @@ TEST(IDLChainedType, TestDuplicateFields) {
                         << "field2"
                         << 123456);
 
-    ASSERT_THROWS(Chained_struct_only::parse(ctxt, testDoc), UserException);
+    ASSERT_THROWS(Chained_struct_only::parse(ctxt, testDoc), AssertionException);
 }
 
 
@@ -1259,7 +1309,7 @@ TEST(IDLChainedType, TestChainedStructWithExtraFields) {
                                     << "pair")
                             << "extraField"
                             << 787);
-        ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), AssertionException);
     }
 
 
@@ -1274,7 +1324,7 @@ TEST(IDLChainedType, TestChainedStructWithExtraFields) {
                                     << "pair")
                             << "anyField"
                             << 787);
-        ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), AssertionException);
     }
 
     // Duplicate object
@@ -1288,7 +1338,7 @@ TEST(IDLChainedType, TestChainedStructWithExtraFields) {
                                           << "objectField"
                                           << BSON("random"
                                                   << "pair"));
-        ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), AssertionException);
     }
 
     // Duplicate field3
@@ -1302,7 +1352,7 @@ TEST(IDLChainedType, TestChainedStructWithExtraFields) {
                                     << "pair")
                             << "field3"
                             << "def");
-        ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(Chained_struct_mixed::parse(ctxt, testDoc), AssertionException);
     }
 }
 
@@ -1406,19 +1456,19 @@ TEST(IDLEnum, TestIntEnumNegative) {
     {
         auto testDoc = BSON("value"
                             << "2");
-        ASSERT_THROWS(One_int_enum::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(One_int_enum::parse(ctxt, testDoc), AssertionException);
     }
 
     // Test a value out of range
     {
         auto testDoc = BSON("value" << 4);
-        ASSERT_THROWS(One_int_enum::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(One_int_enum::parse(ctxt, testDoc), AssertionException);
     }
 
     // Test a negative number
     {
         auto testDoc = BSON("value" << -1);
-        ASSERT_THROWS(One_int_enum::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(One_int_enum::parse(ctxt, testDoc), AssertionException);
     }
 }
 
@@ -1428,14 +1478,14 @@ TEST(IDLEnum, TestStringEnumNegative) {
     //  Test int
     {
         auto testDoc = BSON("value" << 2);
-        ASSERT_THROWS(One_string_enum::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(One_string_enum::parse(ctxt, testDoc), AssertionException);
     }
 
     // Test a value out of range
     {
         auto testDoc = BSON("value"
                             << "foo");
-        ASSERT_THROWS(One_string_enum::parse(ctxt, testDoc), UserException);
+        ASSERT_THROWS(One_string_enum::parse(ctxt, testDoc), AssertionException);
     }
 }
 
@@ -1528,28 +1578,32 @@ TEST(IDLCommand, TestConcatentateWithDbNegative) {
                                                             << 1
                                                             << "field2"
                                                             << "five");
-        ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)), UserException);
+        ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)),
+                      AssertionException);
     }
 
     // Negative -  namespace field wrong order
     {
         auto testDoc = BSON("field1" << 3 << "BasicConcatenateWithDbCommand" << 1 << "field2"
                                      << "five");
-        ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)), UserException);
+        ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)),
+                      AssertionException);
     }
 
     // Negative -  namespace missing
     {
         auto testDoc = BSON("field1" << 3 << "field2"
                                      << "five");
-        ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)), UserException);
+        ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)),
+                      AssertionException);
     }
 
     // Negative - wrong type
     {
         auto testDoc = BSON("BasicConcatenateWithDbCommand" << 1 << "field1" << 3 << "field2"
                                                             << "five");
-        ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)), UserException);
+        ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)),
+                      AssertionException);
     }
 
     // Negative - bad ns with embedded null
@@ -1557,7 +1611,8 @@ TEST(IDLCommand, TestConcatentateWithDbNegative) {
         StringData sd1("db\0foo", 6);
         auto testDoc = BSON("BasicConcatenateWithDbCommand" << sd1 << "field1" << 3 << "field2"
                                                             << "five");
-        ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)), UserException);
+        ASSERT_THROWS(BasicConcatenateWithDbCommand::parse(ctxt, makeOMR(testDoc)),
+                      AssertionException);
     }
 }
 
@@ -1605,21 +1660,21 @@ TEST(IDLCommand, TestIgnoredNegative) {
         auto testDoc = BSON(
             "BasicIgnoredCommand" << 1 << "field1" << 3 << "BasicIgnoredCommand" << 1 << "field2"
                                   << "five");
-        ASSERT_THROWS(BasicIgnoredCommand::parse(ctxt, makeOMR(testDoc)), UserException);
+        ASSERT_THROWS(BasicIgnoredCommand::parse(ctxt, makeOMR(testDoc)), AssertionException);
     }
 
     // Negative -  namespace field wrong order
     {
         auto testDoc = BSON("field1" << 3 << "BasicIgnoredCommand" << 1 << "field2"
                                      << "five");
-        ASSERT_THROWS(BasicIgnoredCommand::parse(ctxt, makeOMR(testDoc)), UserException);
+        ASSERT_THROWS(BasicIgnoredCommand::parse(ctxt, makeOMR(testDoc)), AssertionException);
     }
 
     // Negative -  namespace missing
     {
         auto testDoc = BSON("field1" << 3 << "field2"
                                      << "five");
-        ASSERT_THROWS(BasicIgnoredCommand::parse(ctxt, makeOMR(testDoc)), UserException);
+        ASSERT_THROWS(BasicIgnoredCommand::parse(ctxt, makeOMR(testDoc)), AssertionException);
     }
 }
 
@@ -1633,6 +1688,8 @@ TEST(IDLDocSequence, TestBasic) {
                             << 3
                             << "field2"
                             << "five"
+                            << "$db"
+                            << "db"
                             << "structs"
                             << BSON_ARRAY(BSON("value"
                                                << "hello")
@@ -1641,7 +1698,8 @@ TEST(IDLDocSequence, TestBasic) {
                             << "objects"
                             << BSON_ARRAY(BSON("foo" << 1)));
 
-    OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
+    OpMsgRequest request;
+    request.body = testTempDoc;
 
     auto testStruct = DocSequenceCommand::parse(ctxt, request);
     ASSERT_EQUALS(testStruct.getField1(), 3);
@@ -1654,11 +1712,22 @@ TEST(IDLDocSequence, TestBasic) {
 
     assert_same_types<decltype(testStruct.getNamespace()), const NamespaceString&>();
 
-    // Positive: Test we can roundtrip just the body from the just parsed document
+    // Positive: Test we can round trip to a document sequence from the just parsed document
     {
         OpMsgRequest loopbackRequest = testStruct.serialize(BSONObj());
 
-        ASSERT_BSONOBJ_EQ(request.body, loopbackRequest.body);
+        assertOpMsgEquals(request, loopbackRequest);
+        ASSERT_EQUALS(loopbackRequest.sequences.size(), 2UL);
+    }
+
+    // Positive: Test we can roundtrip just the body from the just parsed document
+    {
+        BSONObjBuilder builder;
+        testStruct.serialize(BSONObj(), &builder);
+
+        auto testTempDocWithoutDB = testTempDoc.removeField("$db");
+
+        ASSERT_BSONOBJ_EQ(testTempDocWithoutDB, builder.obj());
     }
 
     // Positive: Test we can serialize from nothing the same document
@@ -1683,7 +1752,7 @@ TEST(IDLDocSequence, TestBasic) {
 
         OpMsgRequest serializeRequest = one_new.serialize(BSONObj());
 
-        ASSERT_BSONOBJ_EQ(request.body, serializeRequest.body);
+        assertOpMsgEquals(request, serializeRequest);
     }
 }
 
@@ -1706,7 +1775,7 @@ TEST(IDLDocSequence, TestMissingDB) {
     OpMsgRequest request;
     request.body = testTempDoc;
 
-    ASSERT_THROWS(DocSequenceCommand::parse(ctxt, request), UserException);
+    ASSERT_THROWS(DocSequenceCommand::parse(ctxt, request), AssertionException);
 }
 
 // Positive: Test a command read and written to OpMsgRequest with content in DocumentSequence works
@@ -1738,18 +1807,10 @@ void TestDocSequence(StringData name) {
     ASSERT_EQUALS("world", testStruct.getStructs()[1].getValue());
 
     auto opmsg = testStruct.serialize(BSONObj());
+    ASSERT_EQUALS(2UL, opmsg.sequences.size());
 
-    BSONObjBuilder builder;
-    builder.appendElements(testTempDoc);
-    builder.append("structs",
-                   BSON_ARRAY(BSON("value"
-                                   << "hello")
-                              << BSON("value"
-                                      << "world")));
-    builder.append("objects", BSON_ARRAY(BSON("foo" << 1)));
-    auto testCompleteMsg = OpMsgRequest::fromDBAndBody("db", builder.obj());
-
-    ASSERT_BSONOBJ_EQ(opmsg.body, testCompleteMsg.body);
+    assertOpMsgEquals(opmsg, request);
+    assertOpMsgEqualsExact(opmsg, request);
 }
 
 // Positive: Test a command read and written to OpMsgRequest with content in DocumentSequence works
@@ -1779,7 +1840,7 @@ void TestBadDocSequences(StringData name, bool extraFieldAllowed) {
                                            << "world")}});
         request.sequences.push_back({"structs", {BSON("foo" << 1)}});
 
-        ASSERT_THROWS(TestT::parse(ctxt, request), UserException);
+        ASSERT_THROWS(TestT::parse(ctxt, request), AssertionException);
     }
 
     // Negative: Extra field in document sequence
@@ -1794,7 +1855,7 @@ void TestBadDocSequences(StringData name, bool extraFieldAllowed) {
         request.sequences.push_back({"extra", {BSON("foo" << 1)}});
 
         if (!extraFieldAllowed) {
-            ASSERT_THROWS(TestT::parse(ctxt, request), UserException);
+            ASSERT_THROWS(TestT::parse(ctxt, request), AssertionException);
         } else {
             /*void*/ TestT::parse(ctxt, request);
         }
@@ -1805,7 +1866,7 @@ void TestBadDocSequences(StringData name, bool extraFieldAllowed) {
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
         request.sequences.push_back({"objects", {BSON("foo" << 1)}});
 
-        ASSERT_THROWS(TestT::parse(ctxt, request), UserException);
+        ASSERT_THROWS(TestT::parse(ctxt, request), AssertionException);
     }
 
     // Negative: Missing field in both document sequence and body
@@ -1817,7 +1878,7 @@ void TestBadDocSequences(StringData name, bool extraFieldAllowed) {
                                       BSON("value"
                                            << "world")}});
 
-        ASSERT_THROWS(TestT::parse(ctxt, request), UserException);
+        ASSERT_THROWS(TestT::parse(ctxt, request), AssertionException);
     }
 }
 
@@ -1854,7 +1915,7 @@ void TestDuplicateDocSequences(StringData name) {
                                       BSON("value"
                                            << "world")}});
 
-        ASSERT_THROWS(DocSequenceCommand::parse(ctxt, request), UserException);
+        ASSERT_THROWS(DocSequenceCommand::parse(ctxt, request), AssertionException);
     }
 
     // Negative: Duplicate fields in doc sequence and body
@@ -1875,7 +1936,7 @@ void TestDuplicateDocSequences(StringData name) {
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
         request.sequences.push_back({"objects", {BSON("foo" << 1)}});
 
-        ASSERT_THROWS(DocSequenceCommand::parse(ctxt, request), UserException);
+        ASSERT_THROWS(DocSequenceCommand::parse(ctxt, request), AssertionException);
     }
 }
 
@@ -1908,7 +1969,7 @@ TEST(IDLDocSequence, TestEmptySequence) {
         OpMsgRequest request = OpMsgRequest::fromDBAndBody("db", testTempDoc);
         request.sequences.push_back({"structs", {}});
 
-        ASSERT_THROWS(DocSequenceCommand::parse(ctxt, request), UserException);
+        ASSERT_THROWS(DocSequenceCommand::parse(ctxt, request), AssertionException);
     }
 
     // Positive: Empty document sequence
@@ -1997,18 +2058,17 @@ TEST(IDLDocSequence, TestWellKnownFieldsPassthrough) {
                                 << 3
                                 << "field2"
                                 << "five"
+                                << "$db"
+                                << "db"
+                                << knownField
+                                << "extra"
                                 << "structs"
                                 << BSON_ARRAY(BSON("value"
                                                    << "hello")
                                               << BSON("value"
                                                       << "world"))
                                 << "objects"
-                                << BSON_ARRAY(BSON("foo" << 1))
-
-                                << "$db"
-                                << "db"
-                                << knownField
-                                << "extra");
+                                << BSON_ARRAY(BSON("foo" << 1)));
 
         OpMsgRequest request;
         request.body = testTempDoc;
@@ -2016,7 +2076,7 @@ TEST(IDLDocSequence, TestWellKnownFieldsPassthrough) {
         ASSERT_EQUALS(2UL, testStruct.getStructs().size());
 
         auto reply = testStruct.serialize(testTempDoc);
-        ASSERT_BSONOBJ_EQ(request.body, reply.body);
+        assertOpMsgEquals(request, reply);
     }
 }
 

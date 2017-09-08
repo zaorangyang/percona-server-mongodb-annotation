@@ -180,6 +180,13 @@ public:
     virtual bool supportsDocLocking() const = 0;
 
     /**
+     * Returns whether the storage engine supports locking at a database level.
+     */
+    virtual bool supportsDBLocking() const {
+        return true;
+    }
+
+    /**
      * Returns whether the engine supports a journalling concept or not.
      */
     virtual bool isDurable() const = 0;
@@ -321,6 +328,18 @@ public:
      * timestamps are not persisted in the storage layer.
      */
     virtual void setInitialDataTimestamp(SnapshotName snapshotName) {}
+
+    // (CollectionName, IndexName)
+    typedef std::pair<std::string, std::string> CollectionIndexNamePair;
+
+    /**
+     * Drop abandoned idents. In the successful case, returns a list of collection, index name
+     * pairs to rebuild.
+     */
+    virtual StatusWith<std::vector<CollectionIndexNamePair>> reconcileCatalogAndIdents(
+        OperationContext* opCtx) {
+        return std::vector<CollectionIndexNamePair>();
+    };
 
 protected:
     /**

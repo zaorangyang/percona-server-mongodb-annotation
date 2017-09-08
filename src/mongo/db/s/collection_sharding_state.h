@@ -71,16 +71,19 @@ public:
     ~CollectionShardingState();
 
     /**
-     * Holds information used for tracking document removals during chunk migration.
+     * Details of documents being removed from a sharded collection.
      */
     struct DeleteState {
-        // Contains the _id field of the document being deleted.
-        BSONObj idDoc;
+        // Contains the fields of the document that are in the collection's shard key, and "_id".
+        BSONObj documentKey;
 
-        // True if the document being deleted belongs to a chunk which is currently being migrated
-        // out of this shard.
-        bool isMigrating = false;
+        // True if the document being deleted belongs to a chunk which, while still in the shard,
+        // is being migrated out. (Not to be confused with "fromMigrate", which tags operations
+        // that are steps in performing the migration.)
+        bool isMigrating;
     };
+
+    DeleteState makeDeleteState(BSONObj const& doc);
 
     /**
      * Obtains the sharding state for the specified collection. If it does not exist, it will be
@@ -220,7 +223,6 @@ public:
      *
      * The global exclusive lock is expected to be held by the caller of any of these functions.
      */
-    bool isDocumentInMigratingChunk(OperationContext* opCtx, const BSONObj& doc);
     void onInsertOp(OperationContext* opCtx, const BSONObj& insertedDoc);
     void onUpdateOp(OperationContext* opCtx,
                     const BSONObj& query,

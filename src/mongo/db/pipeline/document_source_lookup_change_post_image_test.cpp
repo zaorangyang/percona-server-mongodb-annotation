@@ -37,7 +37,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_source_change_notification.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_lookup_change_post_image.h"
 #include "mongo/db/pipeline/document_source_mock.h"
 #include "mongo/db/pipeline/document_value_test_util.h"
@@ -102,7 +102,7 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfMissingDocumentKeyO
     lookupChangeStage->injectMongodInterface(
         std::make_shared<MockMongodInterface>(deque<DocumentSource::GetNextResult>{}));
 
-    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), UserException, 40578);
+    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40578);
 }
 
 TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfMissingOperationType) {
@@ -123,7 +123,7 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfMissingOperationTyp
     lookupChangeStage->injectMongodInterface(
         std::make_shared<MockMongodInterface>(deque<DocumentSource::GetNextResult>{}));
 
-    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), UserException, 40578);
+    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40578);
 }
 
 TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfMissingNamespace) {
@@ -143,7 +143,7 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfMissingNamespace) {
     lookupChangeStage->injectMongodInterface(
         std::make_shared<MockMongodInterface>(deque<DocumentSource::GetNextResult>{}));
 
-    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), UserException, 40578);
+    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40578);
 }
 
 TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfNsFieldHasWrongType) {
@@ -162,7 +162,7 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfNsFieldHasWrongType
     lookupChangeStage->injectMongodInterface(
         std::make_shared<MockMongodInterface>(deque<DocumentSource::GetNextResult>{}));
 
-    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), UserException, 40578);
+    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40578);
 }
 
 TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfNsFieldDoesNotMatchPipeline) {
@@ -183,7 +183,7 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfNsFieldDoesNotMatch
     lookupChangeStage->injectMongodInterface(
         std::make_shared<MockMongodInterface>(deque<DocumentSource::GetNextResult>{}));
 
-    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), UserException, 40579);
+    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40579);
 }
 
 TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfDocumentKeyIsNotUnique) {
@@ -206,7 +206,7 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldErrorIfDocumentKeyIsNotUni
     lookupChangeStage->injectMongodInterface(
         std::make_shared<MockMongodInterface>(std::move(foreignCollection)));
 
-    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), UserException, 40580);
+    ASSERT_THROWS_CODE(lookupChangeStage->getNext(), AssertionException, 40580);
 }
 
 TEST_F(DocumentSourceLookupChangePostImageTest, ShouldPropagatePauses) {
@@ -219,12 +219,11 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldPropagatePauses) {
     auto mockLocalSource = DocumentSourceMock::create(
         {Document{{"documentKey", Document{{"_id", 0}}},
                   {"operationType", "insert"_sd},
-                  {"fullDocument", Document{{"_id", 0}}},
-                  {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}},
+                  {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}},
+                  {"fullDocument", Document{{"_id", 0}}}},
          DocumentSource::GetNextResult::makePauseExecution(),
          Document{{"documentKey", Document{{"_id", 1}}},
                   {"operationType", "update"_sd},
-                  {"fullDocument", BSONNULL},
                   {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}},
          DocumentSource::GetNextResult::makePauseExecution()});
 
@@ -242,8 +241,8 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldPropagatePauses) {
         next.releaseDocument(),
         (Document{{"documentKey", Document{{"_id", 0}}},
                   {"operationType", "insert"_sd},
-                  {"fullDocument", Document{{"_id", 0}}},
-                  {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}}));
+                  {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}},
+                  {"fullDocument", Document{{"_id", 0}}}}));
 
     ASSERT_TRUE(lookupChangeStage->getNext().isPaused());
 
@@ -253,8 +252,8 @@ TEST_F(DocumentSourceLookupChangePostImageTest, ShouldPropagatePauses) {
         next.releaseDocument(),
         (Document{{"documentKey", Document{{"_id", 1}}},
                   {"operationType", "update"_sd},
-                  {"fullDocument", Document{{"_id", 1}}},
-                  {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}}}));
+                  {"ns", Document{{"db", expCtx->ns.db()}, {"coll", expCtx->ns.coll()}}},
+                  {"fullDocument", Document{{"_id", 1}}}}));
 
     ASSERT_TRUE(lookupChangeStage->getNext().isPaused());
 

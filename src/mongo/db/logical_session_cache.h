@@ -30,6 +30,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/refresh_sessions_gen.h"
 #include "mongo/db/service_liason.h"
 #include "mongo/db/sessions_collection.h"
 #include "mongo/db/time_proof_service.h"
@@ -113,20 +114,9 @@ public:
     /**
      * If the cache contains a record for this LogicalSessionId, promotes that lsid
      * to be the most recently used and updates its lastUse date to be the current
-     * time. Otherwise, returns an error.
-     *
-     * This method does not issue networking calls.
+     * time. Returns an error if the session was not found.
      */
     Status promote(LogicalSessionId lsid);
-
-    /**
-     * If the cache contains a record for this LogicalSessionId, promotes it.
-     * Otherwise, attempts to fetch the record for this LogicalSessionId from the
-     * sessions collection, and returns the record if found. Otherwise, returns an error.
-     *
-     * This method may issue networking calls.
-     */
-    Status fetchAndPromote(OperationContext* opCtx, const LogicalSessionId& lsid);
 
     /**
      * Inserts a new authoritative session record into the cache. This method will
@@ -135,6 +125,13 @@ public:
      * insert records for existing sessions.
      */
     Status startSession(OperationContext* opCtx, LogicalSessionRecord record);
+
+    /**
+     * Refresh the given sessions. Updates the timestamps of these records in
+     * the local cache.
+     */
+    Status refreshSessions(OperationContext* opCtx, const RefreshSessionsCmdFromClient& cmd);
+    Status refreshSessions(OperationContext* opCtx, const RefreshSessionsCmdFromClusterMember& cmd);
 
     /**
      * Removes all local records in this cache. Does not remove the corresponding
@@ -146,19 +143,25 @@ public:
      * Refreshes the cache synchronously. This flushes all pending refreshes and
      * inserts to the sessions collection.
      */
-    void refreshNow(Client* client);
+    Status refreshNow(Client* client);
 
     /**
      * Returns the current time.
      */
     Date_t now();
 
+    /**
+     * Returns the number of session records currently in the cache.
+     */
+    size_t size();
+
 private:
     /**
      * Internal methods to handle scheduling and perform refreshes for active
      * session records contained within the cache.
      */
-    void _refresh(Client* client);
+    void _periodicRefresh(Client* client);
+    Status _refresh(Client* client);
 
     /**
      * Returns true if a record has passed its given expiration.

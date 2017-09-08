@@ -333,7 +333,8 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
                             long long hashNew,
                             Date_t wallTime,
                             StmtId statementId,
-                            const Timestamp& prevTs) {
+                            const Timestamp& prevTs,
+                            const PreAndPostImageTimestamps& preAndPostTs) {
     BSONObjBuilder b(256);
 
     b.append("ts", optime.getTimestamp());
@@ -360,59 +361,17 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
 
     appendSessionInfo(opCtx, &b, statementId, prevTs);
 
+    if (!preAndPostTs.preImageTs.isNull()) {
+        b.append(OplogEntryBase::kPreImageTsFieldName, preAndPostTs.preImageTs);
+    }
+
+    if (!preAndPostTs.postImageTs.isNull()) {
+        b.append(OplogEntryBase::kPostImageTsFieldName, preAndPostTs.postImageTs);
+    }
+
     return OplogDocWriter(OplogDocWriter(b.obj(), obj));
 }
 }  // end anon namespace
-
-// Truncates the oplog after and including the "truncateTimestamp" entry.
-void truncateOplogTo(OperationContext* opCtx, Timestamp truncateTimestamp) {
-    const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
-    AutoGetDb autoDb(opCtx, oplogNss.db(), MODE_IX);
-    Lock::CollectionLock oplogCollectionLoc(opCtx->lockState(), oplogNss.ns(), MODE_X);
-    Collection* oplogCollection = autoDb.getDb()->getCollection(opCtx, oplogNss);
-    if (!oplogCollection) {
-        fassertFailedWithStatusNoTrace(
-            34418,
-            Status(ErrorCodes::NamespaceNotFound,
-                   str::stream() << "Can't find " << NamespaceString::kRsOplogNamespace.ns()));
-    }
-
-    // Scan through oplog in reverse, from latest entry to first, to find the truncateTimestamp.
-    RecordId oldestIDToDelete;  // Non-null if there is something to delete.
-    auto oplogRs = oplogCollection->getRecordStore();
-    auto oplogReverseCursor = oplogRs->getCursor(opCtx, /*forward=*/false);
-    size_t count = 0;
-    while (auto next = oplogReverseCursor->next()) {
-        const BSONObj entry = next->data.releaseToBson();
-        const RecordId id = next->id;
-        count++;
-
-        const auto tsElem = entry["ts"];
-        if (count == 1) {
-            if (tsElem.eoo())
-                LOG(2) << "Oplog tail entry: " << redact(entry);
-            else
-                LOG(2) << "Oplog tail entry ts field: " << tsElem;
-        }
-
-        if (tsElem.timestamp() < truncateTimestamp) {
-            // If count == 1, that means that we have nothing to delete because everything in the
-            // oplog is < truncateTimestamp.
-            if (count != 1) {
-                invariant(!oldestIDToDelete.isNull());
-                oplogCollection->cappedTruncateAfter(opCtx, oldestIDToDelete, /*inclusive=*/true);
-            }
-            return;
-        }
-
-        oldestIDToDelete = id;
-    }
-
-    severe() << "Reached end of oplog looking for oplog entry before "
-             << truncateTimestamp.toStringPretty()
-             << " but couldn't find any after looking through " << count << " entries.";
-    fassertFailedNoTrace(40296);
-}
 
 /* we write to local.oplog.rs:
      { ts : ..., h: ..., v: ..., op: ..., etc }
@@ -464,7 +423,8 @@ OpTime logOp(OperationContext* opCtx,
              const BSONObj& obj,
              const BSONObj* o2,
              bool fromMigrate,
-             StmtId statementId) {
+             StmtId statementId,
+             const PreAndPostImageTimestamps& preAndPostTs) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->isOplogDisabledFor(opCtx, nss)) {
         invariant(statementId == kUninitializedStmtId);
@@ -479,8 +439,8 @@ OpTime logOp(OperationContext* opCtx,
     getNextOpTime(opCtx, oplog, replCoord, replMode, 1, &slot);
 
     Timestamp prevTs;
-    if (auto session = OperationContextSession::get(opCtx)) {
-        prevTs = session->getLastWriteOpTimeTs();
+    if (opCtx->getTxnNumber()) {
+        prevTs = OperationContextSession::get(opCtx)->getLastWriteOpTimeTs();
     }
 
     auto writer = _logOpWriter(opCtx,
@@ -494,7 +454,8 @@ OpTime logOp(OperationContext* opCtx,
                                slot.hash,
                                Date_t::now(),
                                statementId,
-                               prevTs);
+                               prevTs,
+                               preAndPostTs);
     const DocWriter* basePtr = &writer;
     _logOpsInner(opCtx, nss, &basePtr, 1, oplog, replMode, slot.opTime);
     return slot.opTime;
@@ -526,8 +487,8 @@ repl::OpTime logInsertOps(OperationContext* opCtx,
     auto wallTime = Date_t::now();
 
     Timestamp prevTs;
-    if (auto session = OperationContextSession::get(opCtx)) {
-        prevTs = session->getLastWriteOpTimeTs();
+    if (opCtx->getTxnNumber()) {
+        prevTs = OperationContextSession::get(opCtx)->getLastWriteOpTimeTs();
     }
 
     for (size_t i = 0; i < count; i++) {
@@ -543,7 +504,8 @@ repl::OpTime logInsertOps(OperationContext* opCtx,
                                           slots[i].hash,
                                           wallTime,
                                           insertStatement.stmtId,
-                                          prevTs));
+                                          prevTs,
+                                          {}));
         prevTs = slots[i].opTime.getTimestamp();
     }
 
@@ -621,7 +583,7 @@ void createOplog(OperationContext* opCtx, const std::string& oplogCollectionName
                 ss << "cmdline oplogsize (" << n << ") different than existing (" << o
                    << ") see: http://dochub.mongodb.org/core/increase-oplog";
                 log() << ss.str() << endl;
-                throw UserException(13257, ss.str());
+                throw AssertionException(13257, ss.str());
             }
         }
 
@@ -672,6 +634,29 @@ NamespaceString parseNs(const string& ns, const BSONObj& cmdObj) {
     std::string coll = first.valuestr();
     uassert(28635, "no collection name specified", !coll.empty());
     return NamespaceString(NamespaceString(ns).db().toString(), coll);
+}
+
+std::pair<OptionalCollectionUUID, NamespaceString> parseCollModUUIDAndNss(OperationContext* opCtx,
+                                                                          const BSONElement& ui,
+                                                                          const char* ns,
+                                                                          BSONObj& cmd) {
+    if (ui.eoo()) {
+        return std::pair<OptionalCollectionUUID, NamespaceString>(boost::none, parseNs(ns, cmd));
+    }
+    CollectionUUID uuid = uassertStatusOK(UUID::parse(ui));
+    auto& catalog = UUIDCatalog::get(opCtx);
+    if (catalog.lookupCollectionByUUID(uuid)) {
+        return std::pair<OptionalCollectionUUID, NamespaceString>(uuid,
+                                                                  catalog.lookupNSSByUUID(uuid));
+    } else {
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "Failed to apply operation due to missing collection (" << uuid
+                              << "): "
+                              << redact(cmd.toString()),
+                cmd.nFields() == 1);
+        // If cmd is an empty collMod, i.e., nFields is 1, this is a UUID upgrade collMod.
+        return std::pair<OptionalCollectionUUID, NamespaceString>(uuid, parseNs(ns, cmd));
+    }
 }
 
 NamespaceString parseUUID(OperationContext* opCtx, const BSONElement& ui) {
@@ -758,29 +743,16 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
           createIndexForApplyOps(opCtx, indexSpec, nss, {});
           return Status::OK();
       },
-      {ErrorCodes::IndexAlreadyExists}}},
+      {ErrorCodes::IndexAlreadyExists, ErrorCodes::NamespaceNotFound}}},
     {"collMod",
      {[](OperationContext* opCtx,
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime) -> Status {
-          // Get UUID from cmd, if it exists.
           OptionalCollectionUUID uuid;
           NamespaceString nss;
-          if (ui.eoo()) {
-              uuid = boost::none;
-              nss = parseNs(ns, cmd);
-          } else {
-              uuid = uassertStatusOK(UUID::parse(ui));
-              // We need to see whether a collection with UUID ui exists before attempting to do
-              // a collMod on it. This is because we add UUIDs during upgrade to
-              // featureCompatibilityVersion 3.6 with a collMod command, so the collection will
-              // not have a UUID at the time we attempt to look it up by UUID.
-              auto& catalog = UUIDCatalog::get(opCtx);
-              nss = catalog.lookupCollectionByUUID(uuid.get()) ? catalog.lookupNSSByUUID(uuid.get())
-                                                               : parseNs(ns, cmd);
-          }
+          std::tie(uuid, nss) = parseCollModUUIDAndNss(opCtx, ui, ns, cmd);
           return collModForUUIDUpgrade(opCtx, nss, cmd, uuid);
       },
       {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
@@ -854,7 +826,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime) -> Status {
-          return renameCollectionForApplyOps(opCtx, nsToDatabase(ns), ui, cmd);
+          return renameCollectionForApplyOps(opCtx, nsToDatabase(ns), ui, cmd, opTime);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::NamespaceExists}}},
     {"applyOps",
@@ -1184,7 +1156,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
         }
     } else {
         invariant(*opType != 'c');  // commands are processed in applyCommand_inlock()
-        throw MsgAssertionException(
+        throw AssertionException(
             14825, str::stream() << "error in applyOperation : unknown opType " << *opType);
     }
 

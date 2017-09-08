@@ -47,7 +47,6 @@
 namespace mongo {
 namespace {
 
-using mongo::mutablebson::Document;
 using mongoutils::str::stream;
 
 TEST(Parse, Normal) {
@@ -91,7 +90,7 @@ TEST(Parse, EmptyMod) {
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     ASSERT_THROWS_CODE_AND_WHAT(
         driver.parse(fromjson("{$set:{}}"), arrayFilters).transitional_ignore(),
-        UserException,
+        AssertionException,
         ErrorCodes::FailedToParse,
         "'$set' is empty. You must specify a field like so: {$set: {<field>: ...}}");
 }
@@ -102,7 +101,7 @@ TEST(Parse, WrongMod) {
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     ASSERT_THROWS_CODE_AND_WHAT(
         driver.parse(fromjson("{$xyz:{a:1}}"), arrayFilters).transitional_ignore(),
-        UserException,
+        AssertionException,
         ErrorCodes::FailedToParse,
         "Unknown modifier: $xyz");
 }
@@ -113,7 +112,7 @@ TEST(Parse, WrongType) {
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
     ASSERT_THROWS_CODE_AND_WHAT(
         driver.parse(fromjson("{$set:[{a:1}]}"), arrayFilters).transitional_ignore(),
-        UserException,
+        AssertionException,
         ErrorCodes::FailedToParse,
         "Modifiers operate on fields but we found type array instead. For "
         "example: {$mod: {<field>: ...}} not {$set: [ { a: 1 } ]}");
@@ -126,18 +125,9 @@ TEST(Parse, ModsWithLaterObjReplacement) {
     ASSERT_THROWS_CODE_AND_WHAT(
         driver.parse(fromjson("{$set:{a:1}, obj: \"obj replacement\"}"), arrayFilters)
             .transitional_ignore(),
-        UserException,
+        AssertionException,
         ErrorCodes::FailedToParse,
         "Unknown modifier: obj");
-}
-
-TEST(Parse, PushAll) {
-    UpdateDriver::Options opts;
-    UpdateDriver driver(opts);
-    std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
-    ASSERT_OK(driver.parse(fromjson("{$pushAll:{a:[1,2,3]}}"), arrayFilters));
-    ASSERT_EQUALS(driver.numMods(), 1U);
-    ASSERT_FALSE(driver.isDocReplacement());
 }
 
 TEST(Parse, SetOnInsert) {
@@ -163,7 +153,7 @@ TEST(Collator, SetCollationUpdatesModifierInterfaces) {
     const bool validateForStorage = true;
     const FieldRefSet emptyImmutablePaths;
     bool modified = false;
-    Document doc(fromjson("{a: 'cba'}"));
+    mutablebson::Document doc(fromjson("{a: 'cba'}"));
     driver.setCollator(&collator);
     driver
         .update(StringData(),
@@ -195,7 +185,7 @@ public:
         _opCtx = _serviceContext.makeOperationContext();
     }
 
-    Document& doc() {
+    mutablebson::Document& doc() {
         return _doc;
     }
 
@@ -217,7 +207,7 @@ private:
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> _arrayFilters;
     std::unique_ptr<UpdateDriver> _driverOps;
     std::unique_ptr<UpdateDriver> _driverRepl;
-    Document _doc;
+    mutablebson::Document _doc;
 };
 
 // Make name nicer to report

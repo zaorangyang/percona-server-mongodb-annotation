@@ -35,15 +35,17 @@ namespace mongo {
 
 class BSONArrayBuilder;
 class BSONObjBuilder;
+class DBClientBase;
 class OperationContext;
 
 /**
  * An abstract interface describing the entrypoint into the sessions collection.
  *
  * Different server deployments (standalone, replica set, sharded cluster) should
- * implement their own class that fulfill this interface.
+ * implement their own classes that fulfill this interface.
  */
 class SessionsCollection {
+
 public:
     virtual ~SessionsCollection();
 
@@ -52,18 +54,8 @@ public:
     static constexpr StringData kSessionsFullNS = "admin.system.sessions"_sd;
 
     /**
-     * Returns a LogicalSessionRecord for the given session id. This method
-     * may run networking operations on the calling thread.
-     */
-    virtual StatusWith<LogicalSessionRecord> fetchRecord(OperationContext* opCtx,
-                                                         const LogicalSessionId& id) = 0;
-
-    /**
      * Updates the last-use times on the given sessions to be greater than
-     * or equal to the given time.
-     *
-     * Returns a list of sessions for which no authoritative record was found,
-     * and hence were not refreshed. Returns an error if a networking issue occurred.
+     * or equal to the given time. Returns an error if a networking issue occurred.
      */
     virtual Status refreshSessions(OperationContext* opCtx,
                                    const LogicalSessionRecordSet& sessions,
@@ -80,17 +72,26 @@ public:
     virtual Status removeRecords(OperationContext* opCtx, const LogicalSessionIdSet& sessions) = 0;
 
 protected:
+    /**
+     * Makes a send function for the given client.
+     */
     using SendBatchFn = stdx::function<Status(BSONObj batch)>;
+    SendBatchFn makeSendFnForCommand(DBClientBase* client);
+    SendBatchFn makeSendFnForBatchWrite(DBClientBase* client);
 
     /**
      * Formats and sends batches of refreshes for the given set of sessions.
      */
     Status doRefresh(const LogicalSessionRecordSet& sessions, Date_t refreshTime, SendBatchFn send);
+    Status doRefreshExternal(const LogicalSessionRecordSet& sessions,
+                             Date_t refreshTime,
+                             SendBatchFn send);
 
     /**
      * Formats and sends batches of deletes for the given set of sessions.
      */
     Status doRemove(const LogicalSessionIdSet& sessions, SendBatchFn send);
+    Status doRemoveExternal(const LogicalSessionIdSet& sessions, SendBatchFn send);
 };
 
 }  // namespace mongo

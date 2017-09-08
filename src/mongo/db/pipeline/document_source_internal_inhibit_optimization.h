@@ -52,6 +52,12 @@ public:
         return kStageName.rawData();
     }
 
+    StageConstraints constraints() const final {
+        StageConstraints constraints;
+        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
+        return constraints;
+    }
+
     GetNextResult getNext() final;
 
 private:

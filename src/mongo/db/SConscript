@@ -882,6 +882,7 @@ env.Library(
     source=[
         'logical_session_id.cpp',
         env.Idlc('logical_session_id.idl')[0],
+        env.Idlc('refresh_sessions.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -988,6 +989,8 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
         'logical_session_id',
     ],
 )
@@ -1000,6 +1003,22 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/logical_session_id',
+        'sessions_collection',
+    ],
+)
+
+env.Library(
+    target='sessions_collection_rs',
+    source=[
+        'sessions_collection_rs.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/client/remote_command_targeter',
+        '$BUILD_DIR/mongo/db/auth/authcommon',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        'dbdirectclient',
         'sessions_collection',
     ],
 )
@@ -1018,11 +1037,26 @@ env.Library(
 )
 
 env.Library(
+    target='sessions_collection_sharded',
+    source=[
+        'sessions_collection_sharded.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/s/write_ops/cluster_write_op',
+        'logical_session_id',
+        'sessions_collection',
+    ],
+)
+
+env.Library(
     target='logical_session_cache',
     source=[
         'logical_session_cache.cpp',
+        'logical_session_server_status_section.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/commands/server_status',
         'logical_session_id',
         'logical_session_id_helpers',
         'sessions_collection',
@@ -1058,7 +1092,8 @@ envWithAsio.Library(
     LIBDEPS=[
         'logical_session_cache',
         'service_liason_mongod',
-        'sessions_collection_mock', # TODO SERVER-29202, SERVER-29203
+        'sessions_collection_rs',
+        'sessions_collection_sharded',
         'sessions_collection_standalone',
     ],
 )
@@ -1071,7 +1106,7 @@ envWithAsio.Library(
     LIBDEPS=[
         'logical_session_cache',
         'service_liason_mongos',
-        'sessions_collection_mock', # TODO SERVER-29203 replace with sessions_collection_sharded
+        'sessions_collection_sharded',
     ],
 )
 
@@ -1084,6 +1119,34 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         'service_context',
+    ],
+)
+
+env.Library(
+    target='kill_sessions',
+    source=[
+        'kill_sessions.cpp',
+        'kill_sessions_common.cpp',
+        'session_killer.cpp',
+        env.Idlc('kill_sessions.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/authcore',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+)
+
+env.Library(
+    target='kill_sessions_local',
+    source=[
+        'kill_sessions_local.cpp',
+    ],
+    LIBDEPS=[
+        'clientcursor',
+        'kill_sessions',
     ],
 )
 
@@ -1423,6 +1486,7 @@ env.Library(
         'session_catalog.cpp',
         'session_txn_record.cpp',
         'transaction_history_iterator.cpp',
+        env.Idlc('commands/find_and_modify.idl')[0],
         env.Idlc('ops/single_write_result.idl')[0],
         env.Idlc('session_txn_record.idl')[0],
     ],
@@ -1436,6 +1500,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/logical_session_id',
         '$BUILD_DIR/mongo/db/matcher/expressions_mongod_only',
         '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/query/command_request_response',
         '$BUILD_DIR/mongo/db/query/query',
         '$BUILD_DIR/mongo/db/repl/oplog_entry',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_impl',

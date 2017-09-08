@@ -39,6 +39,12 @@ public:
     const char* getSourceName() const final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
+    StageConstraints constraints() const final {
+        StageConstraints constraints;
+        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
+        return constraints;
+    }
+
     GetDepsReturn getDependencies(DepsTracker* deps) const final {
         return SEE_NEXT;
     }

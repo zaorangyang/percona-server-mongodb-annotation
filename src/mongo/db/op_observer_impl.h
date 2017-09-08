@@ -59,7 +59,8 @@ public:
                   OptionalCollectionUUID uuid,
                   StmtId stmtId,
                   CollectionShardingState::DeleteState deleteState,
-                  bool fromMigrate) override;
+                  bool fromMigrate,
+                  const boost::optional<BSONObj>& deletedDoc) override;
     void onOpMessage(OperationContext* opCtx, const BSONObj& msgObj) override;
     void onCreateCollection(OperationContext* opCtx,
                             Collection* coll,
@@ -81,14 +82,14 @@ public:
                      OptionalCollectionUUID uuid,
                      const std::string& indexName,
                      const BSONObj& indexInfo) override;
-    void onRenameCollection(OperationContext* opCtx,
-                            const NamespaceString& fromCollection,
-                            const NamespaceString& toCollection,
-                            OptionalCollectionUUID uuid,
-                            bool dropTarget,
-                            OptionalCollectionUUID dropTargetUUID,
-                            OptionalCollectionUUID dropSourceUUID,
-                            bool stayTemp) override;
+    repl::OpTime onRenameCollection(OperationContext* opCtx,
+                                    const NamespaceString& fromCollection,
+                                    const NamespaceString& toCollection,
+                                    OptionalCollectionUUID uuid,
+                                    bool dropTarget,
+                                    OptionalCollectionUUID dropTargetUUID,
+                                    OptionalCollectionUUID dropSourceUUID,
+                                    bool stayTemp) override;
     void onApplyOps(OperationContext* opCtx,
                     const std::string& dbName,
                     const BSONObj& applyOpCmd) override;

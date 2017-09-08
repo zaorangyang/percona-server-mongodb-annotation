@@ -93,9 +93,10 @@ Status CurrentDateNode::init(BSONElement modExpr, const CollatorInterface* colla
     return Status::OK();
 }
 
-bool CurrentDateNode::updateExistingElement(mutablebson::Element* element) const {
+ModifierNode::ModifyResult CurrentDateNode::updateExistingElement(
+    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
     setValue(element, _typeIsDate);
-    return true;
+    return ModifyResult::kNormalUpdate;
 }
 
 void CurrentDateNode::setValueForNewElement(mutablebson::Element* element) const {

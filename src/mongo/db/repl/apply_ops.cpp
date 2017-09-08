@@ -51,10 +51,17 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 namespace {
+
+const auto kPreconditionFieldName = "preCondition"_sd;
+
+// If enabled, causes loop in _applyOps() to hang after applying current operation.
+MONGO_FP_DECLARE(applyOpsPauseBetweenOperations);
+
 /**
  * Return true iff the applyOpsCmd can be executed in a single WriteUnitOfWork.
  */
@@ -96,8 +103,6 @@ Status _applyOps(OperationContext* opCtx,
                  const BSONObj& applyOpCmd,
                  BSONObjBuilder* result,
                  int* numApplied) {
-    invariant(opCtx->lockState()->isW());
-
     BSONObj ops = applyOpCmd.firstElement().Obj();
 
     // apply
@@ -129,13 +134,14 @@ Status _applyOps(OperationContext* opCtx,
         Status status(ErrorCodes::InternalError, "");
 
         if (haveWrappingWUOW) {
+            invariant(opCtx->lockState()->isW());
             invariant(*opType != 'c');
 
             if (!dbHolder().get(opCtx, ns)) {
                 throw DBException(
+                    ErrorCodes::NamespaceNotFound,
                     "cannot create a database in atomic applyOps mode; will retry without "
-                    "atomicity",
-                    ErrorCodes::NamespaceNotFound);
+                    "atomicity");
             }
 
             OldClientContext ctx(opCtx, ns);
@@ -146,8 +152,11 @@ Status _applyOps(OperationContext* opCtx,
             try {
                 writeConflictRetry(opCtx, "applyOps", ns, [&] {
                     if (*opType == 'c') {
+                        invariant(opCtx->lockState()->isW());
                         status = repl::applyCommand_inlock(opCtx, opObj, true);
                     } else {
+                        Lock::DBLock dbWriteLock(opCtx, nss.db(), MODE_IX);
+                        Lock::CollectionLock lock(opCtx->lockState(), nss.ns(), MODE_IX);
                         OldClientContext ctx(opCtx, ns);
                         const char* names[] = {"o", "ns"};
                         BSONElement fields[2];
@@ -184,9 +193,8 @@ Status _applyOps(OperationContext* opCtx,
             } catch (const DBException& ex) {
                 ab.append(false);
                 result->append("applied", ++(*numApplied));
-                result->append("code", ex.getCode());
-                result->append("codeName",
-                               ErrorCodes::errorString(ErrorCodes::fromInt(ex.getCode())));
+                result->append("code", ex.code());
+                result->append("codeName", ErrorCodes::errorString(ex.code()));
                 result->append("errmsg", ex.what());
                 result->append("results", ab.arr());
                 return Status(ErrorCodes::UnknownError, ex.what());
@@ -200,6 +208,19 @@ Status _applyOps(OperationContext* opCtx,
         }
 
         (*numApplied)++;
+
+        if (MONGO_FAIL_POINT(applyOpsPauseBetweenOperations)) {
+            // While holding a database lock under MMAPv1, we would be implicitly holding the
+            // flush lock here. This would prevent other threads from acquiring the global
+            // lock or any database locks. We release all locks temporarily while the fail
+            // point is enabled to allow other threads to make progress.
+            boost::optional<Lock::TempRelease> release;
+            auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+            if (storageEngine->isMmapV1() && !opCtx->lockState()->isW()) {
+                release.emplace(opCtx->lockState());
+            }
+            MONGO_FAIL_POINT_PAUSE_WHILE_SET(applyOpsPauseBetweenOperations);
+        }
     }
 
     result->append("applied", *numApplied);
@@ -212,51 +233,53 @@ Status _applyOps(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status preconditionOK(OperationContext* opCtx, const BSONObj& applyOpCmd, BSONObjBuilder* result) {
-    dassert(opCtx->lockState()->isLockHeldForMode(
-        ResourceId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL), MODE_X));
+bool _hasPrecondition(const BSONObj& applyOpCmd) {
+    return applyOpCmd[kPreconditionFieldName].type() == Array;
+}
 
-    if (applyOpCmd["preCondition"].type() == Array) {
-        BSONObjIterator i(applyOpCmd["preCondition"].Obj());
-        while (i.more()) {
-            BSONObj preCondition = i.next().Obj();
-            if (preCondition["ns"].type() != BSONType::String) {
-                return {ErrorCodes::InvalidNamespace,
-                        str::stream() << "ns in preCondition must be a string, but found type: "
-                                      << typeName(preCondition["ns"].type())};
-            }
-            const NamespaceString nss(preCondition["ns"].valueStringData());
-            if (!nss.isValid()) {
-                return {ErrorCodes::InvalidNamespace, "invalid ns: " + nss.ns()};
-            }
+Status _checkPrecondition(OperationContext* opCtx,
+                          const BSONObj& applyOpCmd,
+                          BSONObjBuilder* result) {
+    invariant(opCtx->lockState()->isW());
+    invariant(_hasPrecondition(applyOpCmd));
 
-            DBDirectClient db(opCtx);
-            BSONObj realres = db.findOne(nss.ns(), preCondition["q"].Obj());
+    for (auto elem : applyOpCmd[kPreconditionFieldName].Obj()) {
+        auto preCondition = elem.Obj();
+        if (preCondition["ns"].type() != BSONType::String) {
+            return {ErrorCodes::InvalidNamespace,
+                    str::stream() << "ns in preCondition must be a string, but found type: "
+                                  << typeName(preCondition["ns"].type())};
+        }
+        const NamespaceString nss(preCondition["ns"].valueStringData());
+        if (!nss.isValid()) {
+            return {ErrorCodes::InvalidNamespace, "invalid ns: " + nss.ns()};
+        }
 
-            // Get collection default collation.
-            Database* database = dbHolder().get(opCtx, nss.db());
-            if (!database) {
-                return {ErrorCodes::NamespaceNotFound,
-                        "database in ns does not exist: " + nss.ns()};
-            }
-            Collection* collection = database->getCollection(opCtx, nss);
-            if (!collection) {
-                return {ErrorCodes::NamespaceNotFound,
-                        "collection in ns does not exist: " + nss.ns()};
-            }
-            const CollatorInterface* collator = collection->getDefaultCollator();
+        DBDirectClient db(opCtx);
+        BSONObj realres = db.findOne(nss.ns(), preCondition["q"].Obj());
 
-            // Apply-ops would never have a $where/$text matcher. Using the "DisallowExtensions"
-            // callback ensures that parsing will throw an error if $where or $text are found.
-            Matcher matcher(
-                preCondition["res"].Obj(), ExtensionsCallbackDisallowExtensions(), collator);
-            if (!matcher.matches(realres)) {
-                result->append("got", realres);
-                result->append("whatFailed", preCondition);
-                return {ErrorCodes::BadValue, "preCondition failed"};
-            }
+        // Get collection default collation.
+        Database* database = dbHolder().get(opCtx, nss.db());
+        if (!database) {
+            return {ErrorCodes::NamespaceNotFound, "database in ns does not exist: " + nss.ns()};
+        }
+        Collection* collection = database->getCollection(opCtx, nss);
+        if (!collection) {
+            return {ErrorCodes::NamespaceNotFound, "collection in ns does not exist: " + nss.ns()};
+        }
+        const CollatorInterface* collator = collection->getDefaultCollator();
+
+        // Apply-ops would never have a $where/$text matcher. Using the "DisallowExtensions"
+        // callback ensures that parsing will throw an error if $where or $text are found.
+        Matcher matcher(
+            preCondition["res"].Obj(), ExtensionsCallbackDisallowExtensions(), collator);
+        if (!matcher.matches(realres)) {
+            result->append("got", realres);
+            result->append("whatFailed", preCondition);
+            return {ErrorCodes::BadValue, "preCondition failed"};
         }
     }
+
     return Status::OK();
 }
 }  // namespace
@@ -270,8 +293,27 @@ Status applyOps(OperationContext* opCtx,
         bsonExtractBooleanFieldWithDefault(applyOpCmd, "allowAtomic", true, &allowAtomic));
     auto areOpsCrudOnly = _areOpsCrudOnly(applyOpCmd);
     auto isAtomic = allowAtomic && areOpsCrudOnly;
+    auto hasPrecondition = _hasPrecondition(applyOpCmd);
 
-    Lock::GlobalWrite globalWriteLock(opCtx);
+    if (hasPrecondition) {
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot use preCondition with {allowAtomic: false}.",
+                allowAtomic);
+        uassert(ErrorCodes::InvalidOptions,
+                "Cannot use preCondition when operations include commands.",
+                areOpsCrudOnly);
+    }
+
+    boost::optional<Lock::GlobalWrite> globalWriteLock;
+    boost::optional<Lock::DBLock> dbWriteLock;
+
+    // There's only one case where we are allowed to take the database lock instead of the global
+    // lock - no preconditions; only CRUD ops; and non-atomic mode.
+    if (!hasPrecondition && areOpsCrudOnly && !allowAtomic) {
+        dbWriteLock.emplace(opCtx, dbName, MODE_IX);
+    } else {
+        globalWriteLock.emplace(opCtx);
+    }
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
         !repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(opCtx, dbName);
@@ -280,9 +322,12 @@ Status applyOps(OperationContext* opCtx,
         return Status(ErrorCodes::NotMaster,
                       str::stream() << "Not primary while applying ops to database " << dbName);
 
-    Status preconditionStatus = preconditionOK(opCtx, applyOpCmd, result);
-    if (!preconditionStatus.isOK()) {
-        return preconditionStatus;
+    if (hasPrecondition) {
+        invariant(isAtomic);
+        auto status = _checkPrecondition(opCtx, applyOpCmd, result);
+        if (!status.isOK()) {
+            return status;
+        }
     }
 
     int numApplied = 0;
@@ -290,6 +335,7 @@ Status applyOps(OperationContext* opCtx,
         return _applyOps(opCtx, dbName, applyOpCmd, result, &numApplied);
 
     // Perform write ops atomically
+    invariant(globalWriteLock);
     try {
         writeConflictRetry(opCtx, "applyOps", dbName, [&] {
             BSONObjBuilder intermediateResult;
@@ -310,7 +356,7 @@ Status applyOps(OperationContext* opCtx,
 
                 for (auto elem : applyOpCmd) {
                     auto name = elem.fieldNameStringData();
-                    if (name == "preCondition")
+                    if (name == kPreconditionFieldName)
                         continue;
                     if (name == "bypassDocumentValidation")
                         continue;
@@ -327,7 +373,7 @@ Status applyOps(OperationContext* opCtx,
             result->appendElements(intermediateResult.obj());
         });
     } catch (const DBException& ex) {
-        if (ex.getCode() == ErrorCodes::NamespaceNotFound) {
+        if (ex.code() == ErrorCodes::NamespaceNotFound) {
             // Retry in non-atomic mode, since MMAP cannot implicitly create a new database
             // within an active WriteUnitOfWork.
             return _applyOps(opCtx, dbName, applyOpCmd, result, &numApplied);
@@ -337,8 +383,8 @@ Status applyOps(OperationContext* opCtx,
         for (int j = 0; j < numApplied; j++)
             ab.append(false);
         result->append("applied", numApplied);
-        result->append("code", ex.getCode());
-        result->append("codeName", ErrorCodes::errorString(ErrorCodes::fromInt(ex.getCode())));
+        result->append("code", ex.code());
+        result->append("codeName", ErrorCodes::errorString(ex.code()));
         result->append("errmsg", ex.what());
         result->append("results", ab.arr());
         return Status(ErrorCodes::UnknownError, ex.what());

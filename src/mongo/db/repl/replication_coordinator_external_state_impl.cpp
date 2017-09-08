@@ -83,10 +83,11 @@
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/catalog_cache.h"
+#include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/periodic_balancer_settings_refresher.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/thread.h"
@@ -568,89 +569,6 @@ void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(ServiceContext*
     setNewTimestamp(ctx, newTime);
 }
 
-void ReplicationCoordinatorExternalStateImpl::cleanUpLastApplyBatch(OperationContext* opCtx) {
-    if (_replicationProcess->getConsistencyMarkers()->getInitialSyncFlag(opCtx)) {
-        return;  // Initial Sync will take over so no cleanup is needed.
-    }
-
-    const auto truncateAfterPoint =
-        _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx);
-    const auto appliedThrough =
-        _replicationProcess->getConsistencyMarkers()->getAppliedThrough(opCtx);
-
-    const bool needToDeleteEndOfOplog = !truncateAfterPoint.isNull() &&
-        // This version should never have a non-null truncateAfterPoint with a null appliedThrough.
-        // This scenario means that we downgraded after unclean shutdown, then the downgraded node
-        // deleted the ragged end of our oplog, then did a clean shutdown.
-        !appliedThrough.isNull() &&
-        // Similarly we should never have an appliedThrough higher than the truncateAfterPoint. This
-        // means that the downgraded node deleted our ragged end then applied ahead of our
-        // truncateAfterPoint and then had an unclean shutdown before upgrading. We are ok with
-        // applying these ops because older versions wrote to the oplog from a single thread so we
-        // know they are in order.
-        !(appliedThrough.getTimestamp() >= truncateAfterPoint);
-    if (needToDeleteEndOfOplog) {
-        log() << "Removing unapplied entries starting at: " << truncateAfterPoint;
-        truncateOplogTo(opCtx, truncateAfterPoint);
-    }
-    _replicationProcess->getConsistencyMarkers()->setOplogTruncateAfterPoint(
-        opCtx, {});  // clear the truncateAfterPoint
-
-    if (appliedThrough.isNull()) {
-        // No follow-up work to do.
-        return;
-    }
-
-    // Check if we have any unapplied ops in our oplog. It is important that this is done after
-    // deleting the ragged end of the oplog.
-    const auto topOfOplog = fassertStatusOK(40290, loadLastOpTime(opCtx));
-    if (appliedThrough == topOfOplog) {
-        return;  // We've applied all the valid oplog we have.
-    } else if (appliedThrough > topOfOplog) {
-        severe() << "Applied op " << appliedThrough << " not found. Top of oplog is " << topOfOplog
-                 << '.';
-        fassertFailedNoTrace(40313);
-    }
-
-    log() << "Replaying stored operations from " << appliedThrough << " (exclusive) to "
-          << topOfOplog << " (inclusive).";
-
-    DBDirectClient db(opCtx);
-    auto cursor = db.query(NamespaceString::kRsOplogNamespace.ns(),
-                           QUERY("ts" << BSON("$gte" << appliedThrough.getTimestamp())),
-                           /*batchSize*/ 0,
-                           /*skip*/ 0,
-                           /*projection*/ nullptr,
-                           QueryOption_OplogReplay);
-
-    // Check that the first document matches our appliedThrough point then skip it since it's
-    // already been applied.
-    if (!cursor->more()) {
-        // This should really be impossible because we check above that the top of the oplog is
-        // strictly > appliedThrough. If this fails it represents a serious bug in either the
-        // storage engine or query's implementation of OplogReplay.
-        severe() << "Couldn't find any entries in the oplog >= " << appliedThrough
-                 << " which should be impossible.";
-        fassertFailedNoTrace(40293);
-    }
-    auto firstOpTimeFound = fassertStatusOK(40291, OpTime::parseFromOplogEntry(cursor->nextSafe()));
-    if (firstOpTimeFound != appliedThrough) {
-        severe() << "Oplog entry at " << appliedThrough << " is missing; actual entry found is "
-                 << firstOpTimeFound;
-        fassertFailedNoTrace(40292);
-    }
-
-    // Apply remaining ops one at at time, but don't log them because they are already logged.
-    UnreplicatedWritesBlock uwb(opCtx);
-
-    while (cursor->more()) {
-        auto entry = cursor->nextSafe();
-        fassertStatusOK(40294, SyncTail::syncApply(opCtx, entry, true));
-        _replicationProcess->getConsistencyMarkers()->setAppliedThrough(
-            opCtx, fassertStatusOK(40295, OpTime::parseFromOplogEntry(entry)));
-    }
-}
-
 StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
     OperationContext* opCtx) {
     // TODO: handle WriteConflictExceptions below
@@ -713,7 +631,8 @@ void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {
     } else if (ShardingState::get(_service)->enabled()) {
         invariant(serverGlobalParams.clusterRole == ClusterRole::ShardServer);
         ShardingState::get(_service)->interruptChunkSplitter();
-        Grid::get(_service)->catalogCache()->onStepDown();
+        CatalogCacheLoader::get(_service).onStepDown();
+        PeriodicBalancerSettingsRefresher::get(_service)->stop();
     }
 
     ShardingState::get(_service)->markCollectionsNotShardedAtStepdown();
@@ -801,7 +720,8 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
                       << configsvrConnStr << causedBy(status);
         }
 
-        Grid::get(_service)->catalogCache()->onStepUp();
+        CatalogCacheLoader::get(_service).onStepUp();
+        PeriodicBalancerSettingsRefresher::get(_service)->start();
         ShardingState::get(_service)->initiateChunkSplitter();
     }
 

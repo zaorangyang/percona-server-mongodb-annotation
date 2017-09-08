@@ -37,6 +37,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/log.h"
 #include "mongo/util/periodic_runner.h"
@@ -46,6 +47,8 @@ namespace mongo {
 namespace {
 const auto getLogicalSessionCache =
     ServiceContext::declareDecoration<std::unique_ptr<LogicalSessionCache>>();
+
+const auto getLogicalSessionCacheIsRegistered = ServiceContext::declareDecoration<AtomicBool>();
 }  // namespace
 
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(logicalSessionRecordCacheSize,
@@ -60,7 +63,10 @@ constexpr int LogicalSessionCache::kLogicalSessionCacheDefaultCapacity;
 constexpr Minutes LogicalSessionCache::kLogicalSessionDefaultRefresh;
 
 LogicalSessionCache* LogicalSessionCache::get(ServiceContext* service) {
-    return getLogicalSessionCache(service).get();
+    if (getLogicalSessionCacheIsRegistered(service).load()) {
+        return getLogicalSessionCache(service).get();
+    }
+    return nullptr;
 }
 
 LogicalSessionCache* LogicalSessionCache::get(OperationContext* ctx) {
@@ -71,6 +77,7 @@ void LogicalSessionCache::set(ServiceContext* service,
                               std::unique_ptr<LogicalSessionCache> sessionCache) {
     auto& cache = getLogicalSessionCache(service);
     cache = std::move(sessionCache);
+    getLogicalSessionCacheIsRegistered(service).store(true);
 }
 
 LogicalSessionCache::LogicalSessionCache(std::unique_ptr<ServiceLiason> service,
@@ -81,7 +88,7 @@ LogicalSessionCache::LogicalSessionCache(std::unique_ptr<ServiceLiason> service,
       _service(std::move(service)),
       _sessionsColl(std::move(collection)),
       _cache(options.capacity) {
-    PeriodicRunner::PeriodicJob job{[this](Client* client) { _refresh(client); },
+    PeriodicRunner::PeriodicJob job{[this](Client* client) { _periodicRefresh(client); },
                                     duration_cast<Milliseconds>(_refreshInterval)};
     _service->scheduleJob(std::move(job));
 }
@@ -96,33 +103,6 @@ LogicalSessionCache::~LogicalSessionCache() {
     }
 }
 
-// TODO: fetch should attempt to update user info, if it is not in the found record.
-
-Status LogicalSessionCache::fetchAndPromote(OperationContext* opCtx, const LogicalSessionId& lsid) {
-    // Search our local cache first
-    auto promoteRes = promote(lsid);
-    if (promoteRes.isOK()) {
-        return promoteRes;
-    }
-
-    // Cache miss, must fetch from the sessions collection.
-    auto res = _sessionsColl->fetchRecord(opCtx, lsid);
-
-    // If we got a valid record, add it to our cache.
-    if (res.isOK()) {
-        auto& record = res.getValue();
-        record.setLastUse(now());
-
-        // Any duplicate records here are actually the same record with different
-        // lastUse times, ignore them.
-        auto oldRecord = _addToCache(record);
-        return Status::OK();
-    }
-
-    // If we could not get a valid record, return the error.
-    return res.getStatus();
-}
-
 Status LogicalSessionCache::promote(LogicalSessionId lsid) {
     stdx::unique_lock<stdx::mutex> lk(_cacheMutex);
     auto it = _cache.find(lsid);
@@ -130,36 +110,52 @@ Status LogicalSessionCache::promote(LogicalSessionId lsid) {
         return {ErrorCodes::NoSuchSession, "no matching session record found in the cache"};
     }
 
-    // Do not use records if they have expired.
-    auto time = now();
-    if (_isDead(it->second, time)) {
-        return {ErrorCodes::NoSuchSession, "no matching session record found in the cache"};
-    }
-
     // Update the last use time before returning.
-    it->second.setLastUse(time);
+    it->second.setLastUse(now());
     return Status::OK();
 }
 
 Status LogicalSessionCache::startSession(OperationContext* opCtx, LogicalSessionRecord record) {
     // Add the new record to our local cache. We will insert it into the sessions collection
-    // the next time _refresh is called.
+    // the next time _refresh is called. If there is already a record in the cache for this
+    // session, we'll just write over it with our newer, more recent one.
+    _addToCache(record);
+    return Status::OK();
+}
 
-    // If we get a conflict here, then an interloper may have ended this session
-    // and then created a new one with the same id. In this case, return a failure.
-    auto oldRecord = _addToCache(record);
-    if (oldRecord) {
-        if (*oldRecord != record) {
-            if (!_isDead(*oldRecord, now())) {
-                return {ErrorCodes::DuplicateSession, "session with this id already exists"};
-            }
+Status LogicalSessionCache::refreshSessions(OperationContext* opCtx,
+                                            const RefreshSessionsCmdFromClient& cmd) {
+    // Update the timestamps of all these records in our cache.
+    auto sessions = makeLogicalSessionIds(cmd.getRefreshSessions(), opCtx);
+    for (auto& lsid : sessions) {
+        if (!promote(lsid).isOK()) {
+            // This is a new record, insert it.
+            _addToCache(makeLogicalSessionRecord(opCtx, lsid, now()));
         }
     }
 
     return Status::OK();
 }
 
-void LogicalSessionCache::refreshNow(Client* client) {
+Status LogicalSessionCache::refreshSessions(OperationContext* opCtx,
+                                            const RefreshSessionsCmdFromClusterMember& cmd) {
+    LogicalSessionRecordSet toRefresh{};
+
+    // Update the timestamps of all these records in our cache.
+    auto records = cmd.getRefreshSessionsInternal();
+    for (auto& record : records) {
+        if (!promote(record.getId()).isOK()) {
+            // This is a new record, insert it.
+            _addToCache(record);
+        }
+        toRefresh.insert(record);
+    }
+
+    // Write to the sessions collection now.
+    return _sessionsColl->refreshSessions(opCtx, toRefresh, now());
+}
+
+Status LogicalSessionCache::refreshNow(Client* client) {
     return _refresh(client);
 }
 
@@ -167,7 +163,21 @@ Date_t LogicalSessionCache::now() {
     return _service->now();
 }
 
-void LogicalSessionCache::_refresh(Client* client) {
+size_t LogicalSessionCache::size() {
+    stdx::lock_guard<stdx::mutex> lock(_cacheMutex);
+    return _cache.size();
+}
+
+void LogicalSessionCache::_periodicRefresh(Client* client) {
+    auto res = _refresh(client);
+    if (!res.isOK()) {
+        log() << "Failed to refresh session cache: " << res;
+    }
+
+    return;
+}
+
+Status LogicalSessionCache::_refresh(Client* client) {
     LogicalSessionRecordSet activeSessions;
     LogicalSessionRecordSet deadSessions;
 
@@ -226,11 +236,20 @@ void LogicalSessionCache::_refresh(Client* client) {
     // failed to refresh, it means their authoritative records were removed, and
     // we should remove such records from our cache as well.
     {
-        auto opCtx = client->makeOperationContext();
-        auto res = _sessionsColl->refreshSessions(opCtx.get(), std::move(activeSessions), time);
+        boost::optional<ServiceContext::UniqueOperationContext> uniqueCtx;
+        auto* const opCtx = [&client, &uniqueCtx] {
+            if (client->getOperationContext()) {
+                return client->getOperationContext();
+            }
+
+            uniqueCtx.emplace(client->makeOperationContext());
+            return uniqueCtx->get();
+        }();
+
+        auto res = _sessionsColl->refreshSessions(opCtx, std::move(activeSessions), time);
         if (!res.isOK()) {
             // TODO SERVER-29709: handle network errors here.
-            return;
+            return res;
         }
     }
 
@@ -242,6 +261,8 @@ void LogicalSessionCache::_refresh(Client* client) {
     {
         // TODO SERVER-29709: handle expiration separately from failure to refresh.
     }
+
+    return Status::OK();
 }
 
 bool LogicalSessionCache::_isDead(const LogicalSessionRecord& record, Date_t now) const {

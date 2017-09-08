@@ -53,6 +53,34 @@ using std::vector;
 // This provides access to getExpCtx(), but we'll use a different name for this test suite.
 using DocumentSourceLookUpTest = AggregationContextFixture;
 
+
+// A 'let' variable defined in a $lookup stage is expected to be available to all sub-pipelines. For
+// sub-pipelines below the immediate one, they are passed to via ExpressionContext. This test
+// confirms that variables defined in the ExpressionContext are captured by the $lookup stage.
+TEST_F(DocumentSourceLookUpTest, PreservesParentPipelineLetVariables) {
+    auto expCtx = getExpCtx();
+    NamespaceString fromNs("test", "coll");
+    expCtx->setResolvedNamespace(fromNs, {fromNs, std::vector<BSONObj>{}});
+
+    auto varId = expCtx->variablesParseState.defineVariable("foo");
+    expCtx->variables.setValue(varId, Value(123));
+
+    auto docSource = DocumentSourceLookUp::createFromBson(
+        BSON("$lookup" << BSON("from"
+                               << "coll"
+                               << "pipeline"
+                               << BSON_ARRAY(BSON("$match" << BSON("x" << 1)))
+                               << "as"
+                               << "as"))
+            .firstElement(),
+        expCtx);
+    auto lookupStage = static_cast<DocumentSourceLookUp*>(docSource.get());
+    ASSERT(lookupStage);
+
+    ASSERT_EQ(varId, lookupStage->getVariablesParseState_forTest().getVariable("foo"));
+    ASSERT_VALUE_EQ(Value(123), lookupStage->getVariables_forTest().getValue(varId, Document()));
+}
+
 TEST_F(DocumentSourceLookUpTest, ShouldTruncateOutputSortOnAsField) {
     auto expCtx = getExpCtx();
     NamespaceString fromNs("test", "a");
@@ -195,8 +223,8 @@ TEST_F(DocumentSourceLookUpTest, RejectsLocalFieldForeignFieldWhenPipelineIsSpec
              << "Expected creation of the "
              << lookupStage->getSourceName()
              << " stage to uassert on mix of localField/foreignField and pipeline options");
-    } catch (const UserException& ex) {
-        ASSERT_EQ(ErrorCodes::FailedToParse, ex.getCode());
+    } catch (const AssertionException& ex) {
+        ASSERT_EQ(ErrorCodes::FailedToParse, ex.code());
     }
 }
 
@@ -218,7 +246,7 @@ TEST_F(DocumentSourceLookUpTest, RejectsLocalFieldForeignFieldWhenLetIsSpecified
                                                                                    << "as"))
                                                                 .firstElement(),
                                                             expCtx),
-                       UserException,
+                       AssertionException,
                        ErrorCodes::FailedToParse);
 }
 
@@ -239,7 +267,7 @@ TEST_F(DocumentSourceLookUpTest, RejectsInvalidLetVariableName) {
                                                   << "as"))
                                .firstElement(),
                            expCtx),
-                       UserException,
+                       AssertionException,
                        16866);
 
     ASSERT_THROWS_CODE(DocumentSourceLookUp::createFromBson(
@@ -254,7 +282,7 @@ TEST_F(DocumentSourceLookUpTest, RejectsInvalidLetVariableName) {
                                                   << "as"))
                                .firstElement(),
                            expCtx),
-                       UserException,
+                       AssertionException,
                        16867);
 
     ASSERT_THROWS_CODE(DocumentSourceLookUp::createFromBson(
@@ -269,7 +297,7 @@ TEST_F(DocumentSourceLookUpTest, RejectsInvalidLetVariableName) {
                                                   << "as"))
                                .firstElement(),
                            expCtx),
-                       UserException,
+                       AssertionException,
                        16868);
 }
 

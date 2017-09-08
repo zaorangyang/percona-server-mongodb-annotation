@@ -80,10 +80,10 @@ BSONObj Command::appendPassthroughFields(const BSONObj& cmdObjWithPassthroughFie
                                          const BSONObj& request) {
     BSONObjBuilder b;
     b.appendElements(request);
-    for (const auto& elem : cmdObjWithPassthroughFields) {
+    for (const auto& elem :
+         Command::filterCommandRequestForPassthrough(cmdObjWithPassthroughFields)) {
         const auto name = elem.fieldNameStringData();
-        // $db is one of the generic arguments, but is implicitly contained in request
-        if (Command::isGenericArgument(name) && !request.hasField(name) && name != "$db") {
+        if (Command::isGenericArgument(name) && !request.hasField(name)) {
             b.append(elem);
         }
     }
@@ -189,7 +189,7 @@ BSONObj Command::runCommandDirectly(OperationContext* opCtx, const OpMsgRequest&
 
     BSONObjBuilder out;
     try {
-        bool ok = command->enhancedRun(opCtx, request, out);
+        bool ok = command->publicRun(opCtx, request, out);
         appendCommandStatus(out, ok);
     } catch (const StaleConfigException& ex) {
         // These exceptions are intended to be handled at a higher level and cannot losslessly
@@ -244,10 +244,6 @@ void Command::appendCommandWCStatus(BSONObjBuilder& result,
         }
         result.append("writeConcernError", wcError.toBSON());
     }
-}
-
-void Command::appendOperationTime(BSONObjBuilder& result, LogicalTime operationTime) {
-    result.append("operationTime", operationTime.asTimestamp());
 }
 
 Status BasicCommand::checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) {
@@ -323,6 +319,20 @@ Status Command::checkAuthorization(Command* c,
     }
     audit::logCommandAuthzCheck(opCtx->getClient(), request, c, status.code());
     return status;
+}
+
+bool Command::publicRun(OperationContext* opCtx,
+                        const OpMsgRequest& request,
+                        BSONObjBuilder& result) {
+    try {
+        return enhancedRun(opCtx, request, result);
+    } catch (const DBException& e) {
+        if (e.code() == ErrorCodes::Unauthorized) {
+            audit::logCommandAuthzCheck(
+                opCtx->getClient(), request, this, ErrorCodes::Unauthorized);
+        }
+        throw;
+    }
 }
 
 bool Command::isHelpRequest(const BSONElement& helpElem) {
@@ -402,7 +412,8 @@ BSONObj Command::filterCommandRequestForPassthrough(const BSONObj& cmdObj) {
                    name == "$queryOptions" ||            //
                    name == "maxTimeMS" ||                //
                    name == "readConcern" ||              //
-                   name == "writeConcern") {
+                   name == "writeConcern" ||
+                   name == "lsid" || name == "txnNumber") {
             // This is the whitelist of generic arguments that commands can be trusted to blindly
             // forward to the shards.
             bob.append(elem);

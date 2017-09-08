@@ -31,6 +31,7 @@
 #include <map>
 #include <string>
 
+#include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/kv/kv_catalog.h"
@@ -92,6 +93,10 @@ public:
         return _supportsDocLocking;
     }
 
+    virtual bool supportsDBLocking() const {
+        return _supportsDBLocking;
+    }
+
     virtual Status closeDatabase(OperationContext* opCtx, StringData db);
 
     virtual Status dropDatabase(OperationContext* opCtx, StringData db);
@@ -136,6 +141,12 @@ public:
         return _catalog.get();
     }
 
+    /**
+     * Drop abandoned idents. Returns a parallel list of index name, index spec pairs to rebuild.
+     */
+    StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> reconcileCatalogAndIdents(
+        OperationContext* opCtx) override;
+
 private:
     class RemoveDBChange;
 
@@ -147,6 +158,7 @@ private:
     std::unique_ptr<KVEngine> _engine;
 
     const bool _supportsDocLocking;
+    const bool _supportsDBLocking;
 
     std::unique_ptr<RecordStore> _catalogRecordStore;
     std::unique_ptr<KVCatalog> _catalog;

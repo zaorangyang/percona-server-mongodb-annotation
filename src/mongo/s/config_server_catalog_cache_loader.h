@@ -44,19 +44,14 @@ public:
     void initializeReplicaSetRole(bool isPrimary) override;
     void onStepDown() override;
     void onStepUp() override;
-    void notifyOfCollectionVersionUpdate(OperationContext* opCtx,
-                                         const NamespaceString& nss,
-                                         const ChunkVersion& version) override;
-    Status waitForCollectionVersion(OperationContext* opCtx,
-                                    const NamespaceString& nss,
-                                    const ChunkVersion& version) override;
+    void notifyOfCollectionVersionUpdate(const NamespaceString& nss) override;
+    void waitForCollectionFlush(OperationContext* opCtx, const NamespaceString& nss) override;
 
     std::shared_ptr<Notification<void>> getChunksSince(
         const NamespaceString& nss,
         ChunkVersion version,
-        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn,
-        const repl::ReadConcernLevel& readConcern =
-            repl::ReadConcernLevel::kMajorityReadConcern) override;
+        stdx::function<void(OperationContext*, StatusWith<CollectionAndChangedChunks>)> callbackFn)
+        override;
 
 private:
     // Thread pool to be used to perform metadata load

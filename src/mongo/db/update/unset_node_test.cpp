@@ -41,7 +41,6 @@ namespace mongo {
 namespace {
 
 using UnsetNodeTest = UpdateNodeTest;
-using mongo::mutablebson::Document;
 using mongo::mutablebson::Element;
 using mongo::mutablebson::countChildren;
 
@@ -52,13 +51,13 @@ DEATH_TEST(UnsetNodeTest, InitFailsForEmptyElement, "Invariant failure modExpr.o
     node.init(update["$unset"].embeddedObject().firstElement(), collator).transitional_ignore();
 }
 
-DEATH_TEST_F(UnsetNodeTest, ApplyToRootFails, "Invariant failure parent.ok()") {
+DEATH_TEST_F(UnsetNodeTest, ApplyToRootFails, "Invariant failure !applyParams.pathTaken->empty()") {
     auto update = fromjson("{$unset: {}}");
     const CollatorInterface* collator = nullptr;
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"], collator));
 
-    Document doc(fromjson("{a: 5}"));
+    mutablebson::Document doc(fromjson("{a: 5}"));
     node.apply(getApplyParams(doc.root()));
 }
 
@@ -76,7 +75,7 @@ TEST_F(UnsetNodeTest, UnsetNoOp) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a"], collator));
 
-    Document doc(fromjson("{b: 5}"));
+    mutablebson::Document doc(fromjson("{b: 5}"));
     setPathToCreate("a");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()));
@@ -93,7 +92,7 @@ TEST_F(UnsetNodeTest, UnsetNoOpDottedPath) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.b"], collator));
 
-    Document doc(fromjson("{a: 5}"));
+    mutablebson::Document doc(fromjson("{a: 5}"));
     setPathToCreate("b");
     setPathTaken("a");
     addIndexedPath("a");
@@ -111,7 +110,7 @@ TEST_F(UnsetNodeTest, UnsetNoOpThroughArray) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.b"], collator));
 
-    Document doc(fromjson("{a:[{b:1}]}"));
+    mutablebson::Document doc(fromjson("{a:[{b:1}]}"));
     setPathToCreate("b");
     setPathTaken("a");
     addIndexedPath("a");
@@ -129,7 +128,7 @@ TEST_F(UnsetNodeTest, UnsetNoOpEmptyDoc) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a"], collator));
 
-    Document doc(fromjson("{}"));
+    mutablebson::Document doc(fromjson("{}"));
     setPathToCreate("a");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()));
@@ -146,7 +145,7 @@ TEST_F(UnsetNodeTest, UnsetTopLevelPath) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a"], collator));
 
-    Document doc(fromjson("{a: 5}"));
+    mutablebson::Document doc(fromjson("{a: 5}"));
     setPathTaken("a");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]));
@@ -163,7 +162,7 @@ TEST_F(UnsetNodeTest, UnsetNestedPath) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.b.c"], collator));
 
-    Document doc(fromjson("{a: {b: {c: 6}}}}"));
+    mutablebson::Document doc(fromjson("{a: {b: {c: 6}}}}"));
     setPathTaken("a.b.c");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]["c"]));
@@ -180,7 +179,7 @@ TEST_F(UnsetNodeTest, UnsetObject) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.b"], collator));
 
-    Document doc(fromjson("{a: {b: {c: 6}}}}"));
+    mutablebson::Document doc(fromjson("{a: {b: {c: 6}}}}"));
     setPathTaken("a.b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
@@ -197,7 +196,7 @@ TEST_F(UnsetNodeTest, UnsetArrayElement) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.0"], collator));
 
-    Document doc(fromjson("{a:[1], b:1}"));
+    mutablebson::Document doc(fromjson("{a:[1], b:1}"));
     setPathTaken("a.0");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["0"]));
@@ -214,7 +213,7 @@ TEST_F(UnsetNodeTest, UnsetPositional) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.$"], collator));
 
-    Document doc(fromjson("{a: [0, 1, 2]}"));
+    mutablebson::Document doc(fromjson("{a: [0, 1, 2]}"));
     setPathTaken("a.1");
     setMatchedField("1");
     addIndexedPath("a");
@@ -232,7 +231,7 @@ TEST_F(UnsetNodeTest, UnsetEntireArray) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a"], collator));
 
-    Document doc(fromjson("{a: [0, 1, 2]}"));
+    mutablebson::Document doc(fromjson("{a: [0, 1, 2]}"));
     setPathTaken("a");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]));
@@ -249,7 +248,7 @@ TEST_F(UnsetNodeTest, UnsetFromObjectInArray) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.0.b"], collator));
 
-    Document doc(fromjson("{a: [{b: 1}]}"));
+    mutablebson::Document doc(fromjson("{a: [{b: 1}]}"));
     setPathTaken("a.0.b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["0"]["b"]));
@@ -266,7 +265,7 @@ TEST_F(UnsetNodeTest, CanUnsetInvalidField) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.$.$b"], collator));
 
-    Document doc(fromjson("{b: 1, a: [{$b: 1}]}"));
+    mutablebson::Document doc(fromjson("{b: 1, a: [{$b: 1}]}"));
     setPathTaken("a.0.$b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["0"]["$b"]));
@@ -283,7 +282,7 @@ TEST_F(UnsetNodeTest, ApplyNoIndexDataNoLogBuilder) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a"], collator));
 
-    Document doc(fromjson("{a: 5}"));
+    mutablebson::Document doc(fromjson("{a: 5}"));
     setPathTaken("a");
     setLogBuilderToNull();
     auto result = node.apply(getApplyParams(doc.root()["a"]));
@@ -299,7 +298,7 @@ TEST_F(UnsetNodeTest, ApplyDoesNotAffectIndexes) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a"], collator));
 
-    Document doc(fromjson("{a: 5}"));
+    mutablebson::Document doc(fromjson("{a: 5}"));
     setPathTaken("a");
     addIndexedPath("b");
     auto result = node.apply(getApplyParams(doc.root()["a"]));
@@ -316,7 +315,7 @@ TEST_F(UnsetNodeTest, ApplyFieldWithDot) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.b"], collator));
 
-    Document doc(fromjson("{'a.b':4, a: {b: 2}}"));
+    mutablebson::Document doc(fromjson("{'a.b':4, a: {b: 2}}"));
     setPathTaken("a.b");
     addIndexedPath("a");
     auto result = node.apply(getApplyParams(doc.root()["a"]["b"]));
@@ -333,10 +332,10 @@ TEST_F(UnsetNodeTest, ApplyCannotRemoveRequiredPartOfDBRef) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.$id"], collator));
 
-    Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
+    mutablebson::Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
     setPathTaken("a.$id");
     ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"]["$id"])),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::InvalidDBRef,
                                 "The DBRef $ref field must be followed by a $id field");
 }
@@ -347,7 +346,7 @@ TEST_F(UnsetNodeTest, ApplyCanRemoveRequiredPartOfDBRefIfValidateForStorageIsFal
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.$id"], collator));
 
-    Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
+    mutablebson::Document doc(fromjson("{a: {$ref: 'c', $id: 0}}"));
     setPathTaken("a.$id");
     addIndexedPath("a");
     setValidateForStorage(false);
@@ -367,13 +366,14 @@ TEST_F(UnsetNodeTest, ApplyCannotRemoveImmutablePath) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.b"], collator));
 
-    Document doc(fromjson("{a: {b: 1}}"));
+    mutablebson::Document doc(fromjson("{a: {b: 1}}"));
     setPathTaken("a.b");
     addImmutablePath("a.b");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"]["b"])),
-                                UserException,
-                                ErrorCodes::ImmutableField,
-                                "Unsetting the path 'a.b' would modify the immutable field 'a.b'");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"]["b"])),
+        AssertionException,
+        ErrorCodes::ImmutableField,
+        "Performing an update on the path 'a.b' would modify the immutable field 'a.b'");
 }
 
 TEST_F(UnsetNodeTest, ApplyCannotRemovePrefixOfImmutablePath) {
@@ -382,13 +382,14 @@ TEST_F(UnsetNodeTest, ApplyCannotRemovePrefixOfImmutablePath) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a"], collator));
 
-    Document doc(fromjson("{a: {b: 1}}"));
+    mutablebson::Document doc(fromjson("{a: {b: 1}}"));
     setPathTaken("a");
     addImmutablePath("a.b");
-    ASSERT_THROWS_CODE_AND_WHAT(node.apply(getApplyParams(doc.root()["a"])),
-                                UserException,
-                                ErrorCodes::ImmutableField,
-                                "Unsetting the path 'a' would modify the immutable field 'a.b'");
+    ASSERT_THROWS_CODE_AND_WHAT(
+        node.apply(getApplyParams(doc.root()["a"])),
+        AssertionException,
+        ErrorCodes::ImmutableField,
+        "Performing an update on the path 'a' would modify the immutable field 'a.b'");
 }
 
 TEST_F(UnsetNodeTest, ApplyCannotRemoveSuffixOfImmutablePath) {
@@ -397,14 +398,14 @@ TEST_F(UnsetNodeTest, ApplyCannotRemoveSuffixOfImmutablePath) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.b.c"], collator));
 
-    Document doc(fromjson("{a: {b: {c: 1}}}"));
+    mutablebson::Document doc(fromjson("{a: {b: {c: 1}}}"));
     setPathTaken("a.b.c");
     addImmutablePath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
         node.apply(getApplyParams(doc.root()["a"]["b"]["c"])),
-        UserException,
+        AssertionException,
         ErrorCodes::ImmutableField,
-        "Unsetting the path 'a.b.c' would modify the immutable field 'a.b'");
+        "Performing an update on the path 'a.b.c' would modify the immutable field 'a.b'");
 }
 
 TEST_F(UnsetNodeTest, ApplyCanRemoveImmutablePathIfNoop) {
@@ -413,7 +414,7 @@ TEST_F(UnsetNodeTest, ApplyCanRemoveImmutablePathIfNoop) {
     UnsetNode node;
     ASSERT_OK(node.init(update["$unset"]["a.b.c"], collator));
 
-    Document doc(fromjson("{a: {b: 1}}"));
+    mutablebson::Document doc(fromjson("{a: {b: 1}}"));
     setPathToCreate("c");
     setPathTaken("a.b");
     addImmutablePath("a.b");

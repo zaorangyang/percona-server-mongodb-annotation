@@ -348,10 +348,14 @@ Status SyncTail::syncApply(OperationContext* opCtx,
             }
             Lock::CollectionLock collLock(opCtx->lockState(), actualNss.ns(), MODE_IX);
 
+            // Need to throw instead of returning a status for it to be properly ignored.
             Database* db = dbHolder().get(opCtx, actualNss.db());
-            if (!db)
-                return Status(ErrorCodes::NamespaceNotFound,
-                              "cannot apply operation on missing database " + actualNss.db());
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "Failed to apply operation due to missing database ("
+                                  << actualNss.db()
+                                  << "): "
+                                  << redact(op.toString()),
+                    db);
 
             OldClientContext ctx(opCtx, actualNss.ns(), db, /*justCreated*/ false);
             return applyOp(ctx.db());
@@ -1280,7 +1284,7 @@ Status multiInitialSyncApply_noAbort(OperationContext* opCtx,
         } catch (const DBException& e) {
             // SERVER-24927 If we have a NamespaceNotFound exception, then this document will be
             // dropped before initial sync ends anyways and we should ignore it.
-            if (e.getCode() == ErrorCodes::NamespaceNotFound && entry.isCrudOpType()) {
+            if (e.code() == ErrorCodes::NamespaceNotFound && entry.isCrudOpType()) {
                 continue;
             }
 

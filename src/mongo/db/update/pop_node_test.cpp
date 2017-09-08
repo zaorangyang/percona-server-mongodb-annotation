@@ -162,7 +162,7 @@ TEST_F(PopNodeTest, ThrowsWhenPathIsBlockedByAScalar) {
     addIndexedPath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
         popNode.apply(getApplyParams(doc.root()["a"])),
-        UserException,
+        AssertionException,
         ErrorCodes::PathNotViable,
         "Cannot use the part (b) of (a.b) to traverse the element ({a: \"foo\"})");
 }
@@ -191,7 +191,7 @@ TEST_F(PopNodeTest, ThrowsWhenPathExistsButDoesNotContainAnArray) {
     setPathTaken("a.b");
     addIndexedPath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(popNode.apply(getApplyParams(doc.root()["a"]["b"])),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::TypeMismatch,
                                 "Path 'a.b' contains an element of non-array type 'string'");
 }
@@ -342,9 +342,9 @@ TEST_F(PopNodeTest, ThrowsWhenPathIsImmutable) {
     addIndexedPath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
         popNode.apply(getApplyParams(doc.root()["a"]["b"])),
-        UserException,
+        AssertionException,
         ErrorCodes::ImmutableField,
-        "Performing a $pop on the path 'a.b' would modify the immutable field 'a.b'");
+        "Performing an update on the path 'a.b' would modify the immutable field 'a.b'");
 }
 
 TEST_F(PopNodeTest, ThrowsWhenPathIsPrefixOfImmutable) {
@@ -364,9 +364,9 @@ TEST_F(PopNodeTest, ThrowsWhenPathIsPrefixOfImmutable) {
     addIndexedPath("a");
     ASSERT_THROWS_CODE_AND_WHAT(
         popNode.apply(getApplyParams(doc.root()["a"])),
-        UserException,
+        AssertionException,
         ErrorCodes::ImmutableField,
-        "Performing a $pop on the path 'a' would modify the immutable field 'a.0'");
+        "Performing an update on the path 'a' would modify the immutable field 'a.0'");
 }
 
 TEST_F(PopNodeTest, ThrowsWhenPathIsSuffixOfImmutable) {
@@ -381,9 +381,9 @@ TEST_F(PopNodeTest, ThrowsWhenPathIsSuffixOfImmutable) {
     addIndexedPath("a.b");
     ASSERT_THROWS_CODE_AND_WHAT(
         popNode.apply(getApplyParams(doc.root()["a"]["b"])),
-        UserException,
+        AssertionException,
         ErrorCodes::ImmutableField,
-        "Performing a $pop on the path 'a.b' would modify the immutable field 'a'");
+        "Performing an update on the path 'a.b' would modify the immutable field 'a'");
 }
 
 TEST_F(PopNodeTest, NoopOnImmutablePathSucceeds) {

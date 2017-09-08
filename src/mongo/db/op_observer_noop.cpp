@@ -60,7 +60,8 @@ void OpObserverNoop::onDelete(OperationContext*,
                               OptionalCollectionUUID,
                               StmtId stmtId,
                               CollectionShardingState::DeleteState,
-                              bool) {}
+                              bool fromMigrate,
+                              const boost::optional<BSONObj>& deletedDoc) {}
 
 void OpObserverNoop::onOpMessage(OperationContext*, const BSONObj&) {}
 
@@ -109,14 +110,14 @@ void OpObserverNoop::onDropIndex(OperationContext*,
                                  const std::string&,
                                  const BSONObj&) {}
 
-void OpObserverNoop::onRenameCollection(OperationContext* opCtx,
-                                        const NamespaceString& fromCollection,
-                                        const NamespaceString& toCollection,
-                                        OptionalCollectionUUID uuid,
-                                        bool dropTarget,
-                                        OptionalCollectionUUID dropTargetUUID,
-                                        OptionalCollectionUUID dropSourceUUID,
-                                        bool stayTemp) {
+repl::OpTime OpObserverNoop::onRenameCollection(OperationContext* opCtx,
+                                                const NamespaceString& fromCollection,
+                                                const NamespaceString& toCollection,
+                                                OptionalCollectionUUID uuid,
+                                                bool dropTarget,
+                                                OptionalCollectionUUID dropTargetUUID,
+                                                OptionalCollectionUUID dropSourceUUID,
+                                                bool stayTemp) {
     // Evict namespace entry from the namespace/uuid cache if it exists.
     NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
     cache.evictNamespace(fromCollection);
@@ -132,6 +133,8 @@ void OpObserverNoop::onRenameCollection(OperationContext* opCtx,
         UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
         catalog.onRenameCollection(opCtx, newColl, uuid.get());
     }
+
+    return {};
 }
 
 void OpObserverNoop::onApplyOps(OperationContext*, const std::string&, const BSONObj&) {}

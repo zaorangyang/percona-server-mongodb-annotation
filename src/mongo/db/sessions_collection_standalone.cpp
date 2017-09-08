@@ -44,48 +44,17 @@ BSONObj lsidQuery(const LogicalSessionId& lsid) {
 }
 }  // namespace
 
-StatusWith<LogicalSessionRecord> SessionsCollectionStandalone::fetchRecord(
-    OperationContext* opCtx, const LogicalSessionId& lsid) {
-    DBDirectClient client(opCtx);
-    auto cursor = client.query(kSessionsFullNS.toString(), lsidQuery(lsid), 1);
-    if (!cursor->more()) {
-        return {ErrorCodes::NoSuchSession, "No matching record in the sessions collection"};
-    }
-
-    try {
-        IDLParserErrorContext ctx("LogicalSessionRecord");
-        return LogicalSessionRecord::parse(ctx, cursor->next());
-    } catch (...) {
-        return exceptionToStatus();
-    }
-}
-
 Status SessionsCollectionStandalone::refreshSessions(OperationContext* opCtx,
                                                      const LogicalSessionRecordSet& sessions,
                                                      Date_t refreshTime) {
     DBDirectClient client(opCtx);
-    return doRefresh(sessions, refreshTime, makeSendFn(&client));
+    return doRefresh(sessions, refreshTime, makeSendFnForBatchWrite(&client));
 }
 
 Status SessionsCollectionStandalone::removeRecords(OperationContext* opCtx,
                                                    const LogicalSessionIdSet& sessions) {
     DBDirectClient client(opCtx);
-    return doRemove(sessions, makeSendFn(&client));
+    return doRemove(sessions, makeSendFnForBatchWrite(&client));
 }
-
-SessionsCollection::SendBatchFn SessionsCollectionStandalone::makeSendFn(DBDirectClient* client) {
-    auto send = [client](BSONObj batch) -> Status {
-        BSONObj res;
-        auto ok = client->runCommand(SessionsCollection::kSessionsDb.toString(), batch, res);
-        if (!ok) {
-            return {ErrorCodes::UnknownError,
-                    client->getLastError(SessionsCollection::kSessionsDb.toString())};
-        }
-        return Status::OK();
-    };
-
-    return send;
-}
-
 
 }  // namespace mongo

@@ -47,7 +47,7 @@ public:
     /**
      * Constructs a LiteParsedPipeline from the raw BSON stages given in 'request'.
      *
-     * May throw a UserException if there is an invalid stage specification, although full
+     * May throw a AssertionException if there is an invalid stage specification, although full
      * validation happens later, during Pipeline construction.
      */
     LiteParsedPipeline(const AggregationRequest& request) {
@@ -92,13 +92,13 @@ public:
     }
 
     /**
-     * Returns true if the pipeline has a $changeNotification stage.
+     * Returns true if the pipeline has a $changeStream stage.
      *
-     * TODO SERVER-29506 Require $changeNotification to be the first stage.
+     * TODO SERVER-29506 Require $changeStream to be the first stage.
      */
-    bool hasChangeNotification() const {
+    bool hasChangeStream() const {
         return std::any_of(_stageSpecs.begin(), _stageSpecs.end(), [](auto&& spec) {
-            return spec->isChangeNotification();
+            return spec->isChangeStream();
         });
     }
 
