@@ -37,10 +37,10 @@
 #include "mongo/db/field_ref.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
-#include "mongo/db/ops/modifier_object_replace.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/update/log_builder.h"
 #include "mongo/db/update/modifier_table.h"
+#include "mongo/db/update/object_replace_node.h"
 #include "mongo/db/update/path_support.h"
 #include "mongo/db/update/storage_validation.h"
 #include "mongo/util/embedded_builder.h"
@@ -90,7 +90,7 @@ StatusWith<bool> parseUpdateExpression(
     BSONObj updateExpr,
     UpdateObjectNode* root,
     const CollatorInterface* collator,
-    const std::map<StringData, std::unique_ptr<ArrayFilter>>& arrayFilters) {
+    const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters) {
     bool positional = false;
     std::set<std::string> foundIdentifiers;
     for (auto&& mod : updateExpr) {
@@ -144,9 +144,10 @@ UpdateDriver::~UpdateDriver() {
     clear();
 }
 
-Status UpdateDriver::parse(const BSONObj& updateExpr,
-                           const std::map<StringData, std::unique_ptr<ArrayFilter>>& arrayFilters,
-                           const bool multi) {
+Status UpdateDriver::parse(
+    const BSONObj& updateExpr,
+    const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>>& arrayFilters,
+    const bool multi) {
     clear();
 
     // Check if the update expression is a full object replacement.
@@ -155,18 +156,7 @@ Status UpdateDriver::parse(const BSONObj& updateExpr,
             return Status(ErrorCodes::FailedToParse, "multi update only works with $ operators");
         }
 
-        // Modifiers expect BSONElements as input. But the input to object replace is, by
-        // definition, an object. We wrap the 'updateExpr' as the mod is expecting. Note
-        // that the wrapper is temporary so the object replace mod should make a copy of
-        // the object.
-        unique_ptr<ModifierObjectReplace> mod(new ModifierObjectReplace);
-        BSONObj wrapper = BSON("dummy" << updateExpr);
-        Status status = mod->init(wrapper.firstElement(), _modOptions);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        _mods.push_back(mod.release());
+        _root = stdx::make_unique<ObjectReplaceNode>(updateExpr);
 
         // Register the fact that this driver will only do full object replacements.
         _replacementMode = true;
@@ -183,14 +173,14 @@ Status UpdateDriver::parse(const BSONObj& updateExpr,
     if (serverGlobalParams.featureCompatibility.version.load() ==
             ServerGlobalParams::FeatureCompatibility::Version::k36 &&
         !_modOptions.fromReplication) {
-        _root = stdx::make_unique<UpdateObjectNode>();
+        auto root = stdx::make_unique<UpdateObjectNode>();
         auto statusWithPositional =
-            parseUpdateExpression(updateExpr, _root.get(), _modOptions.collator, arrayFilters);
+            parseUpdateExpression(updateExpr, root.get(), _modOptions.collator, arrayFilters);
         if (statusWithPositional.isOK()) {
             _positional = statusWithPositional.getValue();
+            _root = std::move(root);
             return Status::OK();
         }
-        _root.reset();
     }
 
     // TODO SERVER-28777: This can be an else case, since we will not fall back to the old parsing
@@ -299,27 +289,22 @@ Status UpdateDriver::update(StringData matchedField,
     if (_root) {
 
         // We parsed using the new UpdateNode implementation.
-        FieldRef pathToCreate;
-        FieldRef pathTaken;
-        bool indexesAffected = false;
-        bool noop = false;
-        _root->apply(doc->root(),
-                     &pathToCreate,
-                     &pathTaken,
-                     matchedField,
-                     _modOptions.fromReplication,
-                     validateForStorage,
-                     immutablePaths,
-                     _indexedFields,
-                     (_logOp && logOpRec) ? &logBuilder : nullptr,
-                     &indexesAffected,
-                     &noop);
-        if (indexesAffected) {
+        UpdateNode::ApplyParams applyParams(doc->root(), immutablePaths);
+        applyParams.matchedField = matchedField;
+        applyParams.insert = _insert;
+        applyParams.fromReplication = _modOptions.fromReplication;
+        applyParams.validateForStorage = validateForStorage;
+        applyParams.indexData = _indexedFields;
+        if (_logOp && logOpRec) {
+            applyParams.logBuilder = &logBuilder;
+        }
+        auto applyResult = _root->apply(applyParams);
+        if (applyResult.indexesAffected) {
             _affectIndices = true;
             doc->disableInPlaceUpdates();
         }
         if (docWasModified) {
-            *docWasModified = !noop;
+            *docWasModified = !applyResult.noop;
         }
 
     } else {
@@ -336,15 +321,7 @@ Status UpdateDriver::update(StringData matchedField,
                 return status;
             }
 
-            // If a mod wants to be applied only if this is an upsert (or only if this is a
-            // strict update), we should respect that. If a mod doesn't care, it would state
-            // it is fine with ANY update context.
-            const bool validContext =
-                (execInfo.context == ModifierInterface::ExecInfo::ANY_CONTEXT ||
-                 execInfo.context == _context);
-
-            // Nothing to do if not in a valid context.
-            if (!validContext) {
+            if (execInfo.context == ModifierInterface::ExecInfo::INSERT_CONTEXT && !_insert) {
                 continue;
             }
 
@@ -402,41 +379,35 @@ Status UpdateDriver::update(StringData matchedField,
 
         // Check for BSON depth and DBRef constraint violations.
         if (validateForStorage) {
-            if (updatedPaths.empty()) {
+            for (auto path = updatedPaths.begin(); path != updatedPaths.end(); ++path) {
 
-                // In the case of full document replacement, check the whole document.
-                storage_validation::storageValid(*doc);
-            } else {
-                for (auto path = updatedPaths.begin(); path != updatedPaths.end(); ++path) {
-
-                    // Find the updated field in the updated document.
-                    auto newElem = doc->root();
-                    for (size_t i = 0; i < (*path)->numParts(); ++i) {
-                        newElem = newElem[(*path)->getPart(i)];
-                        if (!newElem.ok()) {
-                            break;
-                        }
+                // Find the updated field in the updated document.
+                auto newElem = doc->root();
+                for (size_t i = 0; i < (*path)->numParts(); ++i) {
+                    newElem = newElem[(*path)->getPart(i)];
+                    if (!newElem.ok()) {
+                        break;
                     }
+                }
 
-                    // newElem might be missing if $unset/$renamed-away.
-                    if (newElem.ok()) {
+                // newElem might be missing if $unset/$renamed-away.
+                if (newElem.ok()) {
 
-                        // Check parents.
-                        const std::uint32_t recursionLevel = 0;
-                        auto parentsDepth =
-                            storage_validation::storageValidParents(newElem, recursionLevel);
+                    // Check parents.
+                    const std::uint32_t recursionLevel = 0;
+                    auto parentsDepth =
+                        storage_validation::storageValidParents(newElem, recursionLevel);
 
-                        // Check element and its children.
-                        const bool doRecursiveCheck = true;
-                        storage_validation::storageValid(newElem, doRecursiveCheck, parentsDepth);
-                    }
+                    // Check element and its children.
+                    const bool doRecursiveCheck = true;
+                    storage_validation::storageValid(newElem, doRecursiveCheck, parentsDepth);
                 }
             }
         }
 
         for (auto path = immutablePaths.begin(); path != immutablePaths.end(); ++path) {
 
-            if (!updatedPaths.empty() && !updatedPaths.findConflicts(*path, nullptr)) {
+            if (!updatedPaths.findConflicts(*path, nullptr)) {
                 continue;
             }
 
@@ -523,14 +494,6 @@ void UpdateDriver::setCollator(const CollatorInterface* collator) {
     }
 
     _modOptions.collator = collator;
-}
-
-ModifierInterface::ExecInfo::UpdateContext UpdateDriver::context() const {
-    return _context;
-}
-
-void UpdateDriver::setContext(ModifierInterface::ExecInfo::UpdateContext context) {
-    _context = context;
 }
 
 BSONObj UpdateDriver::makeOplogEntryQuery(const BSONObj& doc, bool multi) const {

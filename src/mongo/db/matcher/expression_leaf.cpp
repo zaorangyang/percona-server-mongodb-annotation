@@ -89,7 +89,8 @@ Status ComparisonMatchExpression::init(StringData path, const BSONElement& rhs) 
 }
 
 
-bool ComparisonMatchExpression::matchesSingleElement(const BSONElement& e) const {
+bool ComparisonMatchExpression::matchesSingleElement(const BSONElement& e,
+                                                     MatchDetails* details) const {
 
     if (e.canonicalType() != _rhs.canonicalType()) {
         // some special cases
@@ -268,7 +269,7 @@ Status RegexMatchExpression::init(StringData path, StringData regex, StringData 
     return setPath(path);
 }
 
-bool RegexMatchExpression::matchesSingleElement(const BSONElement& e) const {
+bool RegexMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
     switch (e.type()) {
         case String:
         case Symbol: {
@@ -326,7 +327,7 @@ Status ModMatchExpression::init(StringData path, int divisor, int remainder) {
     return setPath(path);
 }
 
-bool ModMatchExpression::matchesSingleElement(const BSONElement& e) const {
+bool ModMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
     if (!e.isNumber())
         return false;
     return e.numberLong() % _divisor == _remainder;
@@ -363,7 +364,8 @@ Status ExistsMatchExpression::init(StringData path) {
     return setPath(path);
 }
 
-bool ExistsMatchExpression::matchesSingleElement(const BSONElement& e) const {
+bool ExistsMatchExpression::matchesSingleElement(const BSONElement& e,
+                                                 MatchDetails* details) const {
     return !e.eoo();
 }
 
@@ -418,27 +420,17 @@ const stdx::unordered_map<std::string, BSONType> TypeMatchExpression::typeAliasM
     {typeName(MaxKey), MaxKey},
     {typeName(MinKey), MinKey}};
 
-Status TypeMatchExpression::initWithBSONType(StringData path, int type) {
-    if (!isValidBSONType(type)) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "Invalid numerical $type code: " << type);
-    }
-
-    _type = static_cast<BSONType>(type);
+Status TypeMatchExpression::init(StringData path, Type type) {
+    _type = std::move(type);
     return setPath(path);
 }
 
-Status TypeMatchExpression::initAsMatchingAllNumbers(StringData path) {
-    _matchesAllNumbers = true;
-    return setPath(path);
-}
-
-bool TypeMatchExpression::matchesSingleElement(const BSONElement& e) const {
-    if (_matchesAllNumbers) {
+bool TypeMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
+    if (_type.allNumbers) {
         return e.isNumber();
     }
 
-    return e.type() == _type;
+    return e.type() == _type.bsonType;
 }
 
 void TypeMatchExpression::debugString(StringBuilder& debug, int level) const {
@@ -447,7 +439,7 @@ void TypeMatchExpression::debugString(StringBuilder& debug, int level) const {
     if (matchesAllNumbers()) {
         debug << kMatchesAllNumbersAlias;
     } else {
-        debug << _type;
+        debug << _type.bsonType;
     }
 
     MatchExpression::TagData* td = getTag();
@@ -462,7 +454,7 @@ void TypeMatchExpression::serialize(BSONObjBuilder* out) const {
     if (matchesAllNumbers()) {
         out->append(path(), BSON("$type" << kMatchesAllNumbersAlias));
     } else {
-        out->append(path(), BSON("$type" << _type));
+        out->append(path(), BSON("$type" << _type.bsonType));
     }
 }
 
@@ -476,11 +468,11 @@ bool TypeMatchExpression::equivalent(const MatchExpression* other) const {
         return false;
     }
 
-    if (_matchesAllNumbers) {
-        return realOther->_matchesAllNumbers;
+    if (_type.allNumbers) {
+        return realOther->_type.allNumbers;
     }
 
-    return _type == realOther->_type;
+    return _type.bsonType == realOther->_type.bsonType;
 }
 
 
@@ -509,7 +501,7 @@ std::unique_ptr<MatchExpression> InMatchExpression::shallowClone() const {
     return std::move(next);
 }
 
-bool InMatchExpression::matchesSingleElement(const BSONElement& e) const {
+bool InMatchExpression::matchesSingleElement(const BSONElement& e, MatchDetails* details) const {
     if (_hasNull && e.eoo()) {
         return true;
     }
@@ -517,7 +509,7 @@ bool InMatchExpression::matchesSingleElement(const BSONElement& e) const {
         return true;
     }
     for (auto&& regex : _regexes) {
-        if (regex->matchesSingleElement(e)) {
+        if (regex->matchesSingleElement(e, details)) {
             return true;
         }
     }
@@ -746,7 +738,8 @@ bool BitTestMatchExpression::performBitTest(const char* eBinary, uint32_t eBinar
     return mt == BITS_ALL_SET || mt == BITS_ALL_CLEAR;
 }
 
-bool BitTestMatchExpression::matchesSingleElement(const BSONElement& e) const {
+bool BitTestMatchExpression::matchesSingleElement(const BSONElement& e,
+                                                  MatchDetails* details) const {
     // Validate 'e' is a number or a BinData.
     if (!e.isNumber() && e.type() != BSONType::BinData) {
         return false;

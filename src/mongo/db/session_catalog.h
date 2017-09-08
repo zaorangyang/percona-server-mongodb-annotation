@@ -129,7 +129,7 @@ private:
 
     using SessionRuntimeInfoMap = stdx::unordered_map<LogicalSessionId,
                                                       std::shared_ptr<SessionRuntimeInfo>,
-                                                      LogicalSessionId::Hash>;
+                                                      LogicalSessionIdHash>;
 
     /**
      * Returns a session, previously clecked out through 'checkoutSession', available again.
@@ -151,7 +151,9 @@ class ScopedSession {
 
 public:
     ScopedSession(OperationContext* opCtx, std::shared_ptr<SessionCatalog::SessionRuntimeInfo> sri)
-        : _opCtx(opCtx), _sri(std::move(sri)) {}
+        : _opCtx(opCtx), _sri(std::move(sri)) {
+        invariant(_sri);
+    }
 
     ScopedSession(ScopedSession&&) = default;
 

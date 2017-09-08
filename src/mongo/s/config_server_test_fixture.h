@@ -38,8 +38,6 @@ struct ChunkVersion;
 class KeysCollectionDocument;
 class NamespaceString;
 class Shard;
-class ShardingCatalogClient;
-class ShardingCatalogManager;
 class ShardId;
 class ShardRegistry;
 class ShardType;
@@ -138,8 +136,9 @@ protected:
      * Sets this node up as a mongod with sharding components for ClusterRole::ConfigServer.
      */
     void setUp() override;
+    void tearDown() override;
 
-    std::unique_ptr<DistLockCatalog> makeDistLockCatalog(ShardRegistry* shardRegistry) override;
+    std::unique_ptr<DistLockCatalog> makeDistLockCatalog() override;
 
     std::unique_ptr<DistLockManager> makeDistLockManager(
         std::unique_ptr<DistLockCatalog> distLockCatalog) override;
@@ -147,13 +146,7 @@ protected:
     std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
         std::unique_ptr<DistLockManager> distLockManager) override;
 
-    std::unique_ptr<ShardingCatalogManager> makeShardingCatalogManager(
-        ShardingCatalogClient* catalogClient) override;
-
-    std::unique_ptr<CatalogCacheLoader> makeCatalogCacheLoader() override;
-
-    std::unique_ptr<CatalogCache> makeCatalogCache(
-        std::unique_ptr<CatalogCacheLoader> catalogCacheLoader) override;
+    std::unique_ptr<CatalogCache> makeCatalogCache() override;
 
     std::unique_ptr<ClusterCursorManager> makeClusterCursorManager() override;
 

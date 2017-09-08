@@ -47,9 +47,9 @@
 namespace mongo {
 namespace {
 
-class ClusterCountCmd : public Command {
+class ClusterCountCmd : public ErrmsgCommandDeprecated {
 public:
-    ClusterCountCmd() : Command("count") {}
+    ClusterCountCmd() : ErrmsgCommandDeprecated("count") {}
 
     bool slaveOk() const override {
         return true;
@@ -71,11 +71,11 @@ public:
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
 
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             std::string& errmsg,
-             BSONObjBuilder& result) override {
+    bool errmsgRun(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   std::string& errmsg,
+                   BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
@@ -150,6 +150,7 @@ public:
                                               filter,
                                               collation,
                                               true,  // do shard versioning
+                                              true,  // retry on stale shard version
                                               &viewDefinition);
 
         if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == swShardResponses.getStatus()) {
@@ -184,12 +185,11 @@ public:
                 resolvedView.asExpandedViewAggregation(aggRequestOnView.getValue());
             auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
 
-            BSONObjBuilder aggResult;
-            Command::findCommand("aggregate")
-                ->run(opCtx, dbname, resolvedAggCmd, errmsg, aggResult);
+            BSONObj aggResult = Command::runCommandDirectly(
+                opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(resolvedAggCmd)));
 
             result.resetToEmpty();
-            ViewResponseFormatter formatter(aggResult.obj());
+            ViewResponseFormatter formatter(aggResult);
             auto formatStatus = formatter.appendAsCountResponse(&result);
             if (!formatStatus.isOK()) {
                 return appendCommandStatus(result, formatStatus);
@@ -280,6 +280,7 @@ public:
                                               targetingQuery,
                                               targetingCollation,
                                               true,  // do shard versioning
+                                              true,  // retry on stale shard version
                                               &viewDefinition);
 
         long long millisElapsed = timer.millis();

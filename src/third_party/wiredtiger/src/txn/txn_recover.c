@@ -121,6 +121,25 @@ __txn_op_apply(
 	end = *pp + opsize;
 
 	switch (optype) {
+	case WT_LOGOP_COL_MODIFY:
+		WT_ERR(__wt_logop_col_modify_unpack(session, pp, end,
+		    &fileid, &recno, &value));
+		GET_RECOVERY_CURSOR(session, r, lsnp, fileid, &cursor);
+		cursor->set_key(cursor, recno);
+		if ((ret = cursor->search(cursor)) != 0)
+			WT_ERR_NOTFOUND_OK(ret);
+		else {
+			/*
+			 * Build/insert a complete value during recovery rather
+			 * than using cursor modify to create a partial update
+			 * (for no particular reason than simplicity).
+			 */
+			WT_ERR(__wt_modify_apply(
+			    session, &cursor->value, value.data));
+			WT_ERR(cursor->insert(cursor));
+		}
+		break;
+
 	case WT_LOGOP_COL_PUT:
 		WT_ERR(__wt_logop_col_put_unpack(session, pp, end,
 		    &fileid, &recno, &value));
@@ -168,6 +187,25 @@ __txn_op_apply(
 		if (stop != NULL && stop != cursor)
 			WT_TRET(stop->close(stop));
 		WT_ERR(ret);
+		break;
+
+	case WT_LOGOP_ROW_MODIFY:
+		WT_ERR(__wt_logop_row_modify_unpack(session, pp, end,
+		    &fileid, &key, &value));
+		GET_RECOVERY_CURSOR(session, r, lsnp, fileid, &cursor);
+		__wt_cursor_set_raw_key(cursor, &key);
+		if ((ret = cursor->search(cursor)) != 0)
+			WT_ERR_NOTFOUND_OK(ret);
+		else {
+			/*
+			 * Build/insert a complete value during recovery rather
+			 * than using cursor modify to create a partial update
+			 * (for no particular reason than simplicity).
+			 */
+			WT_ERR(__wt_modify_apply(
+			    session, &cursor->value, value.data));
+			WT_ERR(cursor->insert(cursor));
+		}
 		break;
 
 	case WT_LOGOP_ROW_PUT:
@@ -235,8 +273,8 @@ __txn_op_apply(
 	return (0);
 
 err:	__wt_err(session, ret,
-	    "operation apply failed during recovery: operation type %d "
-	    "at LSN %" PRIu32 "/%" PRIu32,
+	    "operation apply failed during recovery: operation type %"
+	    PRIu32 " at LSN %" PRIu32 "/%" PRIu32,
 	    optype, lsnp->l.file, lsnp->l.offset);
 	return (ret);
 }
@@ -588,7 +626,6 @@ __wt_txn_recover(WT_SESSION_IMPL *session)
 	 * LSN and archiving.
 	 */
 ckpt:	WT_ERR(session->iface.checkpoint(&session->iface, "force=1"));
-
 done:	FLD_SET(conn->log_flags, WT_CONN_LOG_RECOVER_DONE);
 err:	WT_TRET(__recovery_free(&r));
 	__wt_free(session, config);

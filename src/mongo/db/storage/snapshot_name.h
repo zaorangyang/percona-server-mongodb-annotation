@@ -29,15 +29,17 @@
 #pragma once
 
 #include <cstdint>
+#include <iostream>
 #include <limits>
 
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/bson/timestamp.h"
 
 namespace mongo {
 
 class SnapshotName {
 public:
     explicit SnapshotName(uint64_t value) : _value(value) {}
+    explicit SnapshotName(Timestamp ts) : SnapshotName(ts.asULL()) {}
 
     /**
      * Returns a SnapshotName guaranteed to compare < all names of actual snapshots.
@@ -61,8 +63,11 @@ public:
     }
 
     std::string toString() const {
-        return (str::stream() << _value);
+        std::stringstream str;
+        str << std::hex << _value;
+        return str.str();
     }
+
     bool operator==(const SnapshotName& rhs) const {
         return _value == rhs._value;
     }
@@ -80,6 +85,10 @@ public:
     }
     bool operator>=(const SnapshotName& rhs) const {
         return _value >= rhs._value;
+    }
+
+    friend std::ostream& operator<<(std::ostream& out, const SnapshotName& snapshotName) {
+        return out << snapshotName.toString();
     }
 
 private:

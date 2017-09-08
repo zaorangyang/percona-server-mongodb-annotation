@@ -34,40 +34,31 @@
 
 namespace mongo {
 
-class InsertOp : public write_ops::Insert {
+class InsertOp {
 public:
-    using Insert::Insert;
-
-    static InsertOp parse(const OpMsgRequest& request);
-    static InsertOp parseLegacy(const Message& msg);
-
-private:
-    InsertOp(Insert&& other) : Insert(other) {}
+    static write_ops::Insert parse(const OpMsgRequest& request);
+    static write_ops::Insert parseLegacy(const Message& msg);
 };
 
-class UpdateOp : public write_ops::Update {
+class UpdateOp {
 public:
-    using Update::Update;
-
-    static UpdateOp parse(const OpMsgRequest& request);
-    static UpdateOp parseLegacy(const Message& msg);
-
-private:
-    UpdateOp(Update&& other) : Update(other) {}
+    static write_ops::Update parse(const OpMsgRequest& request);
+    static write_ops::Update parseLegacy(const Message& msg);
 };
 
-class DeleteOp : public write_ops::Delete {
+class DeleteOp {
 public:
-    using Delete::Delete;
-
-    static DeleteOp parse(const OpMsgRequest& request);
-    static DeleteOp parseLegacy(const Message& msg);
-
-private:
-    DeleteOp(Delete&& other) : Delete(other) {}
+    static write_ops::Delete parse(const OpMsgRequest& request);
+    static write_ops::Delete parseLegacy(const Message& msg);
 };
 
 namespace write_ops {
+
+// Limit of the number of operations that can be included in a single write command. This is an
+// attempt to avoid a large number of errors resulting in a reply that exceeds 16MB. It doesn't
+// fully ensure that goal, but it reduces the probability of it happening. This limit should not be
+// used if the protocol changes to avoid the 16MB limit on reply size.
+const size_t kMaxWriteBatchSize{1000};
 
 /**
  * Retrieves the statement id for the write at the specified position in the write batch entries
@@ -79,6 +70,12 @@ template <class T>
 int32_t getStmtIdForWriteAt(const T& op, size_t writePos) {
     return getStmtIdForWriteAt(op.getWriteCommandBase(), writePos);
 }
+
+/**
+ * Must only be called if the insert is for the "system.indexes" namespace. Returns the actual
+ * namespace for which the index is being created.
+ */
+NamespaceString extractIndexedNamespace(const Insert& insertOp);
 
 // TODO: Delete this getter once IDL supports defaults for object and array fields
 template <class T>

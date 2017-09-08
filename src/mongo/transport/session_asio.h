@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <utility>
+
 #include "mongo/base/system_error.h"
 #include "mongo/config.h"
 #include "mongo/transport/asio_utils.h"
@@ -36,8 +38,6 @@
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_types.h"
 #endif
-
-#include "boost/optional.hpp"
 
 #include "asio.hpp"
 #ifdef MONGO_CONFIG_SSL
@@ -57,8 +57,13 @@ public:
         : _socket(std::move(socket)), _tl(tl) {}
 
     virtual ~ASIOSession() {
-        if (_sessionsListIterator) {
-            _tl->eraseSession(*_sessionsListIterator);
+        if (_didPostAcceptSetup) {
+            // This is incremented in TransportLayerASIO::_acceptConnection if there are less than
+            // maxConns connections already established. A call to postAcceptSetup means that the
+            // session is valid and will be handed off to the ServiceEntryPoint.
+            //
+            // We decrement this here to keep the counters in the TL accurate.
+            _tl->_currentConnections.subtractAndFetch(1);
         }
     }
 
@@ -85,6 +90,7 @@ public:
 
     void shutdown() {
         std::error_code ec;
+        getSocket().cancel();
         getSocket().shutdown(GenericSocket::shutdown_both, ec);
         if (ec) {
             error() << "Error closing socket: " << ec.message();
@@ -99,7 +105,7 @@ public:
 #endif
     }
 
-    void postAcceptSetup(bool async, TransportLayerASIO::SessionsListIterator listIt) {
+    void postAcceptSetup(bool async) {
         std::error_code ec;
         _socket.non_blocking(async, ec);
         fassert(40490, ec.value() == 0);
@@ -143,17 +149,19 @@ public:
         if (ec) {
             LOG(3) << "Unable to get remote endpoint address: " << ec.message();
         }
-        _sessionsListIterator.emplace(std::move(listIt));
+
+        _didPostAcceptSetup = true;
     }
 
     template <typename MutableBufferSequence, typename CompleteHandler>
     void read(bool sync, const MutableBufferSequence& buffers, CompleteHandler&& handler) {
 #ifdef MONGO_CONFIG_SSL
         if (_sslSocket) {
-            return opportunisticRead(sync, *_sslSocket, buffers, std::move(handler));
+            return opportunisticRead(
+                sync, *_sslSocket, buffers, std::forward<CompleteHandler>(handler));
         } else if (!_ranHandshake) {
             invariant(asio::buffer_size(buffers) >= sizeof(MSGHEADER::Value));
-            auto postHandshakeCb = [this, sync, &buffers, handler](Status status, bool needsRead) {
+            auto postHandshakeCb = [this, sync, buffers, handler](Status status, bool needsRead) {
                 if (status.isOK()) {
                     if (needsRead) {
                         read(sync, buffers, handler);
@@ -167,22 +175,22 @@ public:
             };
 
             auto handshakeRecvCb =
-                [ this, postHandshakeCb = std::move(postHandshakeCb), sync, &buffers, handler ](
+                [ this, postHandshakeCb = std::move(postHandshakeCb), sync, buffers ](
                     const std::error_code& ec, size_t size) {
                 _ranHandshake = true;
                 if (ec) {
-                    handler(ec, size);
+                    postHandshakeCb(errorCodeToStatus(ec), size);
                     return;
                 }
 
-                maybeHandshakeSSL(sync, buffers, postHandshakeCb);
+                maybeHandshakeSSL(sync, buffers, std::move(postHandshakeCb));
             };
 
             opportunisticRead(sync, _socket, buffers, std::move(handshakeRecvCb));
         } else {
 
 #endif
-            opportunisticRead(sync, _socket, buffers, handler);
+            opportunisticRead(sync, _socket, buffers, std::forward<CompleteHandler>(handler));
 #ifdef MONGO_CONFIG_SSL
         }
 #endif
@@ -192,10 +200,10 @@ public:
     void write(bool sync, const ConstBufferSequence& buffers, CompleteHandler&& handler) {
 #ifdef MONGO_CONFIG_SSL
         if (_sslSocket) {
-            opportunisticWrite(sync, *_sslSocket, buffers, handler);
+            opportunisticWrite(sync, *_sslSocket, buffers, std::forward<CompleteHandler>(handler));
         } else {
 #endif
-            opportunisticWrite(sync, _socket, buffers, handler);
+            opportunisticWrite(sync, _socket, buffers, std::forward<CompleteHandler>(handler));
 #ifdef MONGO_CONFIG_SSL
         }
 #endif
@@ -210,7 +218,14 @@ private:
         std::error_code ec;
         auto size = asio::read(stream, buffers, ec);
         if ((ec == asio::error::would_block || ec == asio::error::try_again) && !sync) {
-            asio::async_read(stream, buffers, std::move(handler));
+            // asio::read is a loop internally, so some of buffers may have been read into already.
+            // So we need to adjust the buffers passed into async_read to be offset by size, if
+            // size is > 0.
+            MutableBufferSequence asyncBuffers(buffers);
+            if (size > 0) {
+                asyncBuffers += size;
+            }
+            asio::async_read(stream, asyncBuffers, std::forward<CompleteHandler>(handler));
         } else {
             handler(ec, size);
         }
@@ -224,7 +239,14 @@ private:
         std::error_code ec;
         auto size = asio::write(stream, buffers, ec);
         if ((ec == asio::error::would_block || ec == asio::error::try_again) && !sync) {
-            asio::async_write(stream, buffers, std::move(handler));
+            // asio::write is a loop internally, so some of buffers may have been read into already.
+            // So we need to adjust the buffers passed into async_write to be offset by size, if
+            // size is > 0.
+            ConstBufferSequence asyncBuffers(buffers);
+            if (size > 0) {
+                asyncBuffers += size;
+            }
+            asio::async_write(stream, asyncBuffers, std::forward<CompleteHandler>(handler));
         } else {
             handler(ec, size);
         }
@@ -254,7 +276,8 @@ private:
 
             _sslSocket.emplace(std::move(_socket), *_tl->_sslContext);
 
-            auto handshakeCompleteCb = [&](const std::error_code& ec, size_t size) {
+            auto handshakeCompleteCb = [ this, onComplete = std::move(onComplete) ](
+                const std::error_code& ec, size_t size) {
                 auto& sslPeerInfo = SSLPeerInfo::forSession(shared_from_this());
 
                 if (!ec && sslPeerInfo.subjectName.empty()) {
@@ -318,7 +341,7 @@ private:
 #endif
 
     TransportLayerASIO* const _tl;
-    boost::optional<TransportLayerASIO::SessionsListIterator> _sessionsListIterator;
+    bool _didPostAcceptSetup = false;
 };
 
 }  // namespace transport

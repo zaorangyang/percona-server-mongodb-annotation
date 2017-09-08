@@ -50,9 +50,9 @@ namespace mongo {
 using std::string;
 using std::stringstream;
 
-class CmdReplSetResizeOplog : public Command {
+class CmdReplSetResizeOplog : public BasicCommand {
 public:
-    CmdReplSetResizeOplog() : Command("replSetResizeOplog") {}
+    CmdReplSetResizeOplog() : BasicCommand("replSetResizeOplog") {}
 
     virtual bool slaveOk() const final {
         return true;
@@ -84,7 +84,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& jsobj,
-             string& errmsg,
              BSONObjBuilder& result) {
         const NamespaceString nss("local", "oplog.rs");
         Lock::GlobalWrite global(opCtx);

@@ -33,7 +33,7 @@
 #endif
 
 void
-key_len_setup(void)
+key_init(void)
 {
 	size_t i;
 	uint32_t max;
@@ -61,7 +61,7 @@ key_len_setup(void)
 }
 
 void
-key_gen_setup(WT_ITEM *key)
+key_gen_init(WT_ITEM *key)
 {
 	size_t i, len;
 	char *p;
@@ -75,6 +75,13 @@ key_gen_setup(WT_ITEM *key)
 	key->memsize = len;
 	key->data = key->mem;
 	key->size = 0;
+}
+
+void
+key_gen_teardown(WT_ITEM *key)
+{
+	free(key->mem);
+	memset(key, 0, sizeof(*key));
 }
 
 static void
@@ -134,10 +141,12 @@ key_gen_insert(WT_RAND_STATE *rnd, WT_ITEM *key, uint64_t keyno)
 	    "11", "12", "13", "14", "15"
 	};
 
-	key_gen_common(key, keyno, suffix[mmrand(rnd, 1, 15) - 1]);
+	key_gen_common(key, keyno, suffix[mmrand(rnd, 0, 14)]);
 }
 
-static uint32_t val_dup_data_len;	/* Length of duplicate data items */
+static char	*val_base;		/* Base/original value */
+static uint32_t  val_dup_data_len;	/* Length of duplicate data items */
+static uint32_t  val_len;		/* Length of data items */
 
 static inline uint32_t
 value_len(WT_RAND_STATE *rnd, uint64_t keyno, uint32_t min, uint32_t max)
@@ -157,12 +166,9 @@ value_len(WT_RAND_STATE *rnd, uint64_t keyno, uint32_t min, uint32_t max)
 }
 
 void
-val_gen_setup(WT_RAND_STATE *rnd, WT_ITEM *value)
+val_init(void)
 {
-	size_t i, len;
-	char *p;
-
-	memset(value, 0, sizeof(WT_ITEM));
+	size_t i;
 
 	/*
 	 * Set initial buffer contents to recognizable text.
@@ -171,18 +177,37 @@ val_gen_setup(WT_RAND_STATE *rnd, WT_ITEM *value)
 	 * into the buffer by a few extra bytes, used to generate different
 	 * data for column-store run-length encoded files.
 	 */
-	len = MAX(KILOBYTE(100), g.c_value_max) + 20;
-	p = dmalloc(len);
-	for (i = 0; i < len; ++i)
-		p[i] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[i % 26];
+	val_len = MAX(KILOBYTE(100), g.c_value_max) + 20;
+	val_base = dmalloc(val_len);
+	for (i = 0; i < val_len; ++i)
+		val_base[i] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[i % 26];
 
-	value->mem = p;
-	value->memsize = len;
+	val_dup_data_len = value_len(NULL,
+	    (uint64_t)mmrand(NULL, 1, 20), g.c_value_min, g.c_value_max);
+}
+
+void
+val_teardown(void)
+{
+	free(val_base);
+	val_base = NULL;
+	val_dup_data_len = val_len = 0;
+}
+
+void
+val_gen_init(WT_ITEM *value)
+{
+	value->mem = dmalloc(val_len);
+	value->memsize = val_len;
 	value->data = value->mem;
 	value->size = 0;
+}
 
-	val_dup_data_len = value_len(rnd,
-	    (uint64_t)mmrand(rnd, 1, 20), g.c_value_min, g.c_value_max);
+void
+val_gen_teardown(WT_ITEM *value)
+{
+	free(value->mem);
+	memset(value, 0, sizeof(*value));
 }
 
 void
@@ -227,14 +252,16 @@ val_gen(WT_RAND_STATE *rnd, WT_ITEM *value, uint64_t keyno)
 	 * variable-length column-stores use a duplicate data value to test RLE.
 	 */
 	if (g.type == VAR && mmrand(rnd, 1, 100) < g.c_repeat_data_pct) {
+		value->size = val_dup_data_len;
+		memcpy(p, val_base, value->size);
 		(void)strcpy(p, "DUPLICATEV");
 		p[10] = '/';
-		value->size = val_dup_data_len;
 	} else {
-		u64_to_string_zf(keyno, p, 11);
-		p[10] = '/';
 		value->size =
 		    value_len(rnd, keyno, g.c_value_min, g.c_value_max);
+		memcpy(p, val_base, value->size);
+		u64_to_string_zf(keyno, p, 11);
+		p[10] = '/';
 	}
 }
 
@@ -408,8 +435,9 @@ path_setup(const char *home)
 uint32_t
 rng(WT_RAND_STATE *rnd)
 {
-	char buf[64];
-	uint32_t r;
+	u_long ulv;
+	uint32_t v;
+	char *endptr, buf[64];
 
 	/*
 	 * Threaded operations have their own RNG information, otherwise we
@@ -439,16 +467,19 @@ rng(WT_RAND_STATE *rnd)
 			testutil_die(errno, "random number log");
 		}
 
-		return ((uint32_t)strtoul(buf, NULL, 10));
+		errno = 0;
+		ulv = strtoul(buf, &endptr, 10);
+		testutil_assert(errno == 0 && endptr[0] == '\n');
+		return ((uint32_t)ulv);
 	}
 
-	r = __wt_random(rnd);
+	v = __wt_random(rnd);
 
 	/* Save and flush the random number so we're up-to-date on error. */
-	(void)fprintf(g.randfp, "%" PRIu32 "\n", r);
+	(void)fprintf(g.randfp, "%" PRIu32 "\n", v);
 	(void)fflush(g.randfp);
 
-	return (r);
+	return (v);
 }
 
 /*
@@ -476,6 +507,7 @@ WT_THREAD_RET
 alter(void *arg)
 {
 	WT_CONNECTION *conn;
+	WT_DECL_RET;
 	WT_SESSION *session;
 	u_int period;
 	bool access_value;
@@ -501,8 +533,12 @@ alter(void *arg)
 		    "access_pattern_hint=%s",
 		    access_value ? "random" : "none"));
 		access_value = !access_value;
-		if (session->alter(session, g.uri, buf) != 0)
-			break;
+		/*
+		 * Alter can return EBUSY if concurrent with other operations.
+		 */
+		while ((ret = session->alter(session, g.uri, buf)) != 0 &&
+		    ret != EBUSY)
+			testutil_die(ret, "session.alter");
 		while (period > 0 && !g.workers_finished) {
 			--period;
 			sleep(1);
@@ -511,4 +547,82 @@ alter(void *arg)
 
 	testutil_check(session->close(session, NULL));
 	return (WT_THREAD_RET_VALUE);
+}
+
+#define	COMPATSTR_V1	"compatibility=(release=2.6)"
+#define	COMPATSTR_V2	"compatibility=(release=3.0)"
+
+/*
+ * compat --
+ *	Periodically reconfigure the compatibility option.
+ */
+WT_THREAD_RET
+compat(void *arg)
+{
+	WT_CONNECTION *conn;
+	WT_DECL_RET;
+	u_int count, period;
+	const char *str;
+
+	(void)(arg);
+
+	conn = g.wts_conn;
+	str = NULL;
+	/*
+	 * Perform compatibility swaps at somewhere under 10 seconds (so we
+	 * get at least one done), and then at 7 second intervals.
+	 */
+	for (period = mmrand(NULL, 1, 10), count = 0;; ++count, period = 7) {
+		if (count % 2 == 0)
+			str = COMPATSTR_V1;
+		else
+			str = COMPATSTR_V2;
+		if ((ret = conn->reconfigure(conn, str)) != 0)
+			testutil_die(ret, "conn.reconfigure");
+
+		/* Sleep for short periods so we don't make the run wait. */
+		while (period > 0 && !g.workers_finished) {
+			--period;
+			sleep(1);
+		}
+		if (g.workers_finished)
+			break;
+	}
+	return (WT_THREAD_RET_VALUE);
+}
+
+/*
+ * print_item_data --
+ *	Display a single data/size pair, with a tag.
+ */
+void
+print_item_data(const char *tag, const uint8_t *data, size_t size)
+{
+	static const char hex[] = "0123456789abcdef";
+	u_char ch;
+
+	fprintf(stderr, "\t%s {", tag);
+	if (g.type == FIX)
+		fprintf(stderr, "0x%02x", data[0]);
+	else
+		for (; size > 0; --size, ++data) {
+			ch = data[0];
+			if (__wt_isprint(ch))
+				fprintf(stderr, "%c", (int)ch);
+			else
+				fprintf(stderr, "%x%x",
+				    (u_int)hex[(data[0] & 0xf0) >> 4],
+				    (u_int)hex[data[0] & 0x0f]);
+		}
+	fprintf(stderr, "}\n");
+}
+
+/*
+ * print_item --
+ *	Display a single data/size pair, with a tag.
+ */
+void
+print_item(const char *tag, WT_ITEM *item)
+{
+	print_item_data(tag, item->data, item->size);
 }

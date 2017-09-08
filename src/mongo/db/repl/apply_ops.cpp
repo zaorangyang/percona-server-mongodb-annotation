@@ -58,7 +58,7 @@ namespace {
 /**
  * Return true iff the applyOpsCmd can be executed in a single WriteUnitOfWork.
  */
-bool canBeAtomic(const BSONObj& applyOpCmd) {
+bool _areOpsCrudOnly(const BSONObj& applyOpCmd) {
     for (const auto& elem : applyOpCmd.firstElement().Obj()) {
         const char* names[] = {"ns", "op"};
         BSONElement fields[2];
@@ -96,8 +96,7 @@ Status _applyOps(OperationContext* opCtx,
                  const BSONObj& applyOpCmd,
                  BSONObjBuilder* result,
                  int* numApplied) {
-    dassert(opCtx->lockState()->isLockHeldForMode(
-        ResourceId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL), MODE_X));
+    invariant(opCtx->lockState()->isW());
 
     BSONObj ops = applyOpCmd.firstElement().Obj();
 
@@ -261,12 +260,17 @@ Status preconditionOK(OperationContext* opCtx, const BSONObj& applyOpCmd, BSONOb
     return Status::OK();
 }
 }  // namespace
-}  // namespace mongo
 
-mongo::Status mongo::applyOps(OperationContext* opCtx,
-                              const std::string& dbName,
-                              const BSONObj& applyOpCmd,
-                              BSONObjBuilder* result) {
+Status applyOps(OperationContext* opCtx,
+                const std::string& dbName,
+                const BSONObj& applyOpCmd,
+                BSONObjBuilder* result) {
+    bool allowAtomic = false;
+    uassertStatusOK(
+        bsonExtractBooleanFieldWithDefault(applyOpCmd, "allowAtomic", true, &allowAtomic));
+    auto areOpsCrudOnly = _areOpsCrudOnly(applyOpCmd);
+    auto isAtomic = allowAtomic && areOpsCrudOnly;
+
     Lock::GlobalWrite globalWriteLock(opCtx);
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
@@ -282,7 +286,7 @@ mongo::Status mongo::applyOps(OperationContext* opCtx,
     }
 
     int numApplied = 0;
-    if (!canBeAtomic(applyOpCmd))
+    if (!isAtomic)
         return _applyOps(opCtx, dbName, applyOpCmd, result, &numApplied);
 
     // Perform write ops atomically
@@ -342,3 +346,5 @@ mongo::Status mongo::applyOps(OperationContext* opCtx,
 
     return Status::OK();
 }
+
+}  // namespace mongo

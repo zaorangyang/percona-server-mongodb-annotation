@@ -119,6 +119,10 @@ public:
     // and ownership of the user stays with the AuthorizationManager
     User* lookupUser(const UserName& name);
 
+    // Returns the single user on this auth session. If no user is authenticated, or if
+    // multiple users are authenticated, this method will throw an exception.
+    User* getSingleUser();
+
     // Gets an iterator over the names of all authenticated users stored in this manager.
     UserNameIterator getAuthenticatedUserNames();
 
@@ -311,20 +315,6 @@ private:
     // we should even be doing authorization checks in general.  Note: this may acquire a read
     // lock on the admin database (to update out-of-date user privilege information).
     bool _isAuthorizedForPrivilege(const Privilege& privilege);
-
-    // Helper for recursively checking for privileges in an aggregation pipeline.
-    Status _addPrivilegesForPipeline(const NamespaceString& nss,
-                                     const BSONElement& pipelineElem,
-                                     bool bypassDocumentValidation,
-                                     bool isMongos,
-                                     PrivilegeVector* requiredPrivileges);
-
-    // Helper for recursively checking for privileges in an aggregation stage.
-    Status _addPrivilegesForStage(StringData db,
-                                  BSONObj stageSpec,
-                                  bool bypassDocumentValidation,
-                                  bool isMongos,
-                                  PrivilegeVector* requiredPrivileges);
 
     std::unique_ptr<AuthzSessionExternalState> _externalState;
 

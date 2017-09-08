@@ -99,6 +99,7 @@ StatusWith<std::vector<AsyncRequestsSender::Response>> scatterGather(
     const boost::optional<BSONObj> query = boost::none,
     const boost::optional<BSONObj> collation = boost::none,
     const bool appendShardVersion = true,
+    const bool retryOnStaleShardVersion = true,
     BSONObj* viewDefinition = nullptr);
 
 /**
@@ -135,8 +136,10 @@ bool appendEmptyResultSet(BSONObjBuilder& result, Status status, const std::stri
  *
  * Throws exception on errors.
  */
-std::vector<NamespaceString> getAllShardedCollectionsForDb(OperationContext* opCtx,
-                                                           StringData dbName);
+std::vector<NamespaceString> getAllShardedCollectionsForDb(
+    OperationContext* opCtx,
+    StringData dbName,
+    const repl::ReadConcernLevel& readConcern = repl::ReadConcernLevel::kMajorityReadConcern);
 
 /**
  * Abstracts the common pattern of refreshing a collection and checking if it is sharded used across

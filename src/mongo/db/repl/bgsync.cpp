@@ -44,6 +44,7 @@
 #include "mongo/db/repl/data_replicator_external_state_impl.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_interface_local.h"
+#include "mongo/db/repl/oplog_interface_remote.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_process.h"
@@ -78,7 +79,7 @@ const auto defaultBatchSize = (16 * 1024 * 1024) / 12 * 10;
 // Valid arguments to the rollbackMethod server parameter.
 constexpr StringData kRollbackViaRefetchNoUUID = "rollbackViaRefetchNoUUID"_sd;
 constexpr StringData kRollbackViaRefetch = "rollbackViaRefetch"_sd;
-constexpr StringData kRollbackToCheckpoint = "rollbackToCheckpoint"_sd;
+constexpr StringData kRollbackToCheckpoint = "default"_sd;
 
 // Set this to force rollback to use a particular implementation.
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(rollbackMethod,
@@ -451,7 +452,7 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
             _replicationCoordinatorExternalState->getTaskExecutor(),
             OpTimeWithHash(lastHashFetched, lastOpTimeFetched),
             source,
-            NamespaceString(rsOplogName),
+            NamespaceString::kRsOplogNamespace,
             _replCoord->getConfig(),
             _replicationCoordinatorExternalState->getOplogFetcherMaxFetcherRestarts(),
             syncSourceResp.rbid,
@@ -644,109 +645,8 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
         }
     }
 
-    OplogInterfaceLocal localOplog(opCtx, rsOplogName);
+    OplogInterfaceLocal localOplog(opCtx, NamespaceString::kRsOplogNamespace.ns());
 
-    // TODO: We will have to check what storage engine is being used eventually, since
-    // "rollback to a checkpoint" only works on certain storage engines that have this
-    // functionality enabled.
-    bool checkpointEnabled = false;
-
-    // If the featureCompatibilityVersion (FCV) of the server is 3.4, but the user
-    // attempts to set the server parameter to "rollback via refetch" with UUIDs or
-    // "rollback to a checkpoint," we default to using "rollback via refetch" without UUIDs,
-    // since in FCV 3.4, oplogs with UUIDs and storage engines that support "rollback to a
-    // checkpoint" are not supported.
-
-    if (rollbackMethod == kRollbackViaRefetchNoUUID ||
-        (serverGlobalParams.featureCompatibility.version.load() ==
-         ServerGlobalParams::FeatureCompatibility::Version::k34)) {
-
-        if ((rollbackMethod == kRollbackViaRefetch) || (rollbackMethod == kRollbackToCheckpoint)) {
-            log() << "Rollback falling back onto \"rollback via refetch\" without UUID support. "
-                  << rollbackMethod
-                  << " is not feature compatible with featureCompatabilityVersion 3.4.";
-        } else {
-            log()
-                << "Rollback falling back on \"rollback via refetch\" without UUID support due to "
-                   "startup server parameter.";
-        }
-        _fallBackOnRollbackViaRefetch(opCtx, source, requiredRBID, &localOplog, false);
-    } else if (!checkpointEnabled || rollbackMethod == kRollbackViaRefetch) {
-        // In this block, we are guaranteed to be in FCV 3.6. If we are not running on a storage
-        // engine that supports "rollback to a checkpoint," if the rollback server parameter was set
-        // to "rollback to a checkpoint," we default to "rollback via refetch" instead.
-
-        if (rollbackMethod == kRollbackToCheckpoint) {
-            log() << "Rollback falling back on \"rollback via refetch\" because this storage "
-                     "engine does not support \"rollback to a checkpoint\".";
-        } else {
-            log() << "Rollback falling back on \"rollback via refetch\" due to startup "
-                     "server parameter.";
-        }
-        _fallBackOnRollbackViaRefetch(opCtx, source, requiredRBID, &localOplog, true);
-    } else {
-        // If we are running on a storage engine that does support "rollback to a
-        // checkpoint" and are in FCV 3.6, then we default to the "rollback to a
-        // checkpoint" algorithm.
-
-        AbstractAsyncComponent* rollback;
-        StatusWith<OpTime> onRollbackShutdownResult =
-            Status(ErrorCodes::InternalError, "Rollback failed but didn’t return an error message");
-        try {
-            auto executor = _replicationCoordinatorExternalState->getTaskExecutor();
-            auto onRollbackShutdownCallbackFn = [&onRollbackShutdownResult](
-                const StatusWith<OpTime>& lastApplied) noexcept {
-                onRollbackShutdownResult = lastApplied;
-            };
-
-            stdx::lock_guard<stdx::mutex> lock(_mutex);
-            if (_state != ProducerState::Running) {
-                return;
-            }
-            _rollback = stdx::make_unique<RollbackImpl>(
-                executor,
-                &localOplog,
-                source,
-                NamespaceString(rsOplogName),
-                _replicationCoordinatorExternalState->getOplogFetcherMaxFetcherRestarts(),
-                requiredRBID,
-                _replCoord,
-                storageInterface,
-                onRollbackShutdownCallbackFn);
-            rollback = _rollback.get();
-        } catch (...) {
-            fassertFailedWithStatus(40401, exceptionToStatus());
-        }
-
-        log() << "Scheduling rollback (sync source: " << source << ")";
-        auto scheduleStatus = rollback->startup();
-        if (!scheduleStatus.isOK()) {
-            warning() << "Unable to schedule rollback: " << scheduleStatus;
-        } else {
-            rollback->join();
-            auto status = onRollbackShutdownResult.getStatus();
-            if (status.isOK()) {
-                log() << "Rollback successful. Last applied optime: "
-                      << onRollbackShutdownResult.getValue();
-            } else if (ErrorCodes::IncompatibleRollbackAlgorithm == status) {
-                log() << "Rollback falling back on \"rollback via refetch\" due to " << status;
-                _fallBackOnRollbackViaRefetch(opCtx, source, requiredRBID, &localOplog, true);
-            } else {
-                warning() << "Rollback failed with error: " << status;
-            }
-        }
-    }
-
-    // Reset the producer to clear the sync source and the last optime fetched.
-    stop(true);
-    startProducerIfStopped();
-}
-
-void BackgroundSync::_fallBackOnRollbackViaRefetch(OperationContext* opCtx,
-                                                   const HostAndPort& source,
-                                                   int requiredRBID,
-                                                   OplogInterface* localOplog,
-                                                   bool useUUID) {
     const int messagingPortTags = 0;
     ConnectionPool connectionPool(messagingPortTags);
     std::unique_ptr<ConnectionPool::ConnectionPtr> connection;
@@ -758,7 +658,99 @@ void BackgroundSync::_fallBackOnRollbackViaRefetch(OperationContext* opCtx,
         return connection->get();
     };
 
-    RollbackSourceImpl rollbackSource(getConnection, source, rsOplogName);
+    StorageEngine* engine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    bool supportsCheckpointRollback = engine->supportsRecoverToStableTimestamp();
+    if (supportsCheckpointRollback && rollbackMethod == kRollbackToCheckpoint) {
+        // If we are running on a storage engine that supports "roll back to a checkpoint" then
+        // we use the "roll back to a checkpoint" algorithm, regardless of the feature
+        // compatibility version (FCV). If the user specifies a different rollback method,
+        // we will fall back to that.
+        log() << "Rollback using 'roll back to a checkpoint' algorithm.";
+        _runRollbackViaRecoverToCheckpoint(
+            opCtx, source, &localOplog, storageInterface, getConnection);
+
+    } else if (rollbackMethod != kRollbackViaRefetchNoUUID &&
+               (serverGlobalParams.featureCompatibility.version.load() ==
+                ServerGlobalParams::FeatureCompatibility::Version::k36)) {
+        // If the user is in FCV 3.6 and the user did not specify to fall back on "roll back via
+        // refetch" without UUID support, then we use "roll back via refetch" with UUIDs.
+
+        if (rollbackMethod == kRollbackToCheckpoint) {
+            invariant(!supportsCheckpointRollback);
+            log() << "Rollback falling back on 'rollback via refetch' because this storage "
+                     "engine does not support 'roll back to a checkpoint'.";
+        } else {
+            invariant(rollbackMethod == kRollbackViaRefetch);
+            log() << "Rollback falling back on 'rollback via refetch' due to startup "
+                     "server parameter.";
+        }
+        _fallBackOnRollbackViaRefetch(
+            opCtx, source, requiredRBID, &localOplog, true, getConnection);
+    } else {
+        if (rollbackMethod == kRollbackToCheckpoint) {
+            invariant(!supportsCheckpointRollback);
+            invariant(serverGlobalParams.featureCompatibility.version.load() ==
+                      ServerGlobalParams::FeatureCompatibility::Version::k34);
+            log() << "Rollback falling back on 'rollback via refetch' without UUID support "
+                     "because this storage engine does not support 'roll back to a checkpoint' and "
+                     "we are in featureCompatibilityVersion 3.4.";
+        } else if (rollbackMethod == kRollbackViaRefetch) {
+            invariant(serverGlobalParams.featureCompatibility.version.load() ==
+                      ServerGlobalParams::FeatureCompatibility::Version::k34);
+            log() << "Rollback falling back on 'rollback via refetch' without UUID support. "
+                     "'Rollback via refetch' with UUID support is not feature compatible with "
+                     "featureCompatabilityVersion 3.4.";
+        } else {
+            invariant(rollbackMethod == kRollbackViaRefetchNoUUID);
+            log() << "Rollback falling back on 'rollback via refetch' without UUID support due to "
+                     "startup server parameter.";
+        }
+        _fallBackOnRollbackViaRefetch(
+            opCtx, source, requiredRBID, &localOplog, false, getConnection);
+    }
+
+    // Reset the producer to clear the sync source and the last optime fetched.
+    stop(true);
+    startProducerIfStopped();
+}
+
+void BackgroundSync::_runRollbackViaRecoverToCheckpoint(
+    OperationContext* opCtx,
+    const HostAndPort& source,
+    OplogInterface* localOplog,
+    StorageInterface* storageInterface,
+    OplogInterfaceRemote::GetConnectionFn getConnection) {
+
+    OplogInterfaceRemote remoteOplog(getConnection, NamespaceString::kRsOplogNamespace.ns());
+
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        if (_state != ProducerState::Running) {
+            return;
+        }
+    }
+
+    _rollback = stdx::make_unique<RollbackImpl>(localOplog, &remoteOplog, _replCoord);
+
+    log() << "Scheduling rollback (sync source: " << source << ")";
+    auto status = _rollback->runRollback(opCtx);
+    if (status.isOK()) {
+        log() << "Rollback successful.";
+    } else {
+        warning() << "Rollback failed with error: " << status;
+    }
+}
+
+void BackgroundSync::_fallBackOnRollbackViaRefetch(
+    OperationContext* opCtx,
+    const HostAndPort& source,
+    int requiredRBID,
+    OplogInterface* localOplog,
+    bool useUUID,
+    OplogInterfaceRemote::GetConnectionFn getConnection) {
+
+    RollbackSourceImpl rollbackSource(
+        getConnection, source, NamespaceString::kRsOplogNamespace.ns());
 
     if (useUUID) {
         rollback(opCtx, *localOplog, rollbackSource, requiredRBID, _replCoord, _replicationProcess);
@@ -837,10 +829,12 @@ void BackgroundSync::clearBuffer(OperationContext* opCtx) {
 OpTimeWithHash BackgroundSync::_readLastAppliedOpTimeWithHash(OperationContext* opCtx) {
     BSONObj oplogEntry;
     try {
-        bool success = writeConflictRetry(opCtx, "readLastAppliedHash", rsOplogName, [&] {
-            Lock::DBLock lk(opCtx, "local", MODE_X);
-            return Helpers::getLast(opCtx, rsOplogName.c_str(), oplogEntry);
-        });
+        bool success = writeConflictRetry(
+            opCtx, "readLastAppliedHash", NamespaceString::kRsOplogNamespace.ns(), [&] {
+                Lock::DBLock lk(opCtx, "local", MODE_X);
+                return Helpers::getLast(
+                    opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
+            });
 
         if (!success) {
             // This can happen when we are to do an initial sync.  lastHash will be set
@@ -848,15 +842,16 @@ OpTimeWithHash BackgroundSync::_readLastAppliedOpTimeWithHash(OperationContext* 
             return OpTimeWithHash(0);
         }
     } catch (const DBException& ex) {
-        severe() << "Problem reading " << rsOplogName << ": " << redact(ex);
+        severe() << "Problem reading " << NamespaceString::kRsOplogNamespace.ns() << ": "
+                 << redact(ex);
         fassertFailed(18904);
     }
     long long hash;
     auto status = bsonExtractIntegerField(oplogEntry, kHashFieldName, &hash);
     if (!status.isOK()) {
-        severe() << "Most recent entry in " << rsOplogName << " is missing or has invalid \""
-                 << kHashFieldName << "\" field. Oplog entry: " << redact(oplogEntry) << ": "
-                 << redact(status);
+        severe() << "Most recent entry in " << NamespaceString::kRsOplogNamespace.ns()
+                 << " is missing or has invalid \"" << kHashFieldName
+                 << "\" field. Oplog entry: " << redact(oplogEntry) << ": " << redact(status);
         fassertFailed(18902);
     }
     OplogEntry parsedEntry(oplogEntry);

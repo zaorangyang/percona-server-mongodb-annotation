@@ -546,15 +546,14 @@ namespace audit {
     }
 
     void logCommandAuthzCheck(Client* client,
-                              const std::string& dbname,
-                              const BSONObj& cmdObj,
+                              const OpMsgRequest& cmdObj,
                               CommandInterface* command,
                               ErrorCodes::Error result) {
         if (!_auditLog) {
             return;
         }
 
-        _auditAuthz(client, command->parseNs(dbname, cmdObj), cmdObj.firstElement().fieldName(), cmdObj, result);
+        _auditAuthz(client, command->parseNs(cmdObj.getDatabase().toString(), cmdObj.body), cmdObj.body.firstElement().fieldName(), cmdObj.body, result);
     }
 
 
@@ -809,7 +808,8 @@ namespace audit {
                        const UserName& username,
                        bool password,
                        const BSONObj* customData,
-                       const std::vector<RoleName>& roles) {
+                       const std::vector<RoleName>& roles,
+                       const boost::optional<BSONArray>& restrictions) {
         if (!_auditLog) {
             return;
         }
@@ -847,7 +847,8 @@ namespace audit {
                        const UserName& username,
                        bool password,
                        const BSONObj* customData,
-                       const std::vector<RoleName>* roles) {
+                       const std::vector<RoleName>* roles,
+                       const boost::optional<BSONArray>& restrictions) {
         if (!_auditLog) {
             return;
         }
@@ -895,7 +896,8 @@ namespace audit {
     void logCreateRole(Client* client,
                        const RoleName& role,
                        const std::vector<RoleName>& roles,
-                       const PrivilegeVector& privileges) {
+                       const PrivilegeVector& privileges,
+                       const boost::optional<BSONArray>& restrictions) {
         if (!_auditLog) {
             return;
         }
@@ -911,7 +913,8 @@ namespace audit {
     void logUpdateRole(Client* client,
                        const RoleName& role,
                        const std::vector<RoleName>* roles,
-                       const PrivilegeVector* privileges) {
+                       const PrivilegeVector* privileges,
+                       const boost::optional<BSONArray>& restrictions) {
         if (!_auditLog) {
             return;
         }

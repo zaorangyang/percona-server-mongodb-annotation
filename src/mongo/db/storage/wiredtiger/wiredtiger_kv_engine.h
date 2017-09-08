@@ -162,6 +162,12 @@ public:
 
     void setJournalListener(JournalListener* jl) final;
 
+    virtual void setStableTimestamp(SnapshotName stableTimestamp) override;
+
+    virtual void setInitialDataTimestamp(SnapshotName initialDataTimestamp) override;
+
+    virtual bool supportsRecoverToStableTimestamp() const override;
+
     // wiredtiger specific
     // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
     // held by this class
@@ -215,6 +221,7 @@ private:
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
     std::string _canonicalName;
     std::string _path;
+    std::string _wtOpenConfig;
 
     std::unique_ptr<WiredTigerSizeStorer> _sizeStorer;
     std::string _sizeStorerUri;

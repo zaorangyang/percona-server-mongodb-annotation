@@ -22,7 +22,7 @@ auditTestShard(
         } while (removeRet.state != 'completed');
 
         beforeLoad = Date.now();
-        auditColl = loadAuditEventsIntoCollection(st.s0, getDBPath() + '/auditLog-s0.json', jsTestName(), 'auditEvents');
+        auditColl = loadAuditEventsIntoCollection(st.s0, getDBPath() + '/auditLog-c0.json', jsTestName(), 'auditEvents');
         assert.eq(1, auditColl.count({
             atype: "removeShard",
             ts: withinFewSecondsBefore(beforeLoad),

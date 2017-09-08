@@ -197,6 +197,7 @@ env.Library(
         "index_catalog_impl.cpp",
         "index_catalog_entry_impl.cpp",
         "index_create_impl.cpp",
+        "private/record_store_validate_adaptor.cpp",
     ],
     LIBDEPS=[
         'collection',
@@ -247,7 +248,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/db_raii',
-        '$BUILD_DIR/mongo/db/ops/write_ops',
+        '$BUILD_DIR/mongo/db/write_ops',
         '$BUILD_DIR/mongo/db/views/views',
     ],
 )

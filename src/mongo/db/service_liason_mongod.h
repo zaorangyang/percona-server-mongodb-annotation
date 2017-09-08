@@ -57,6 +57,12 @@ public:
     void join() override;
 
     Date_t now() const override;
+
+protected:
+    /**
+     * Returns the service context.
+     */
+    ServiceContext* _context() override;
 };
 
 }  // namespace mongo

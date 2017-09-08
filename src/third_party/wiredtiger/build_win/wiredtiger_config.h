@@ -79,6 +79,9 @@
 /* Define to 1 if you have the <memory.h> header file. */
 /* #undef HAVE_MEMORY_H */
 
+/* Define to 1 if pthread condition variables support monotonic clocks. */
+/* #undef HAVE_PTHREAD_COND_MONOTONIC */
+
 /* Define to 1 if you have the `posix_fadvise' function. */
 /* #undef HAVE_POSIX_FADVISE */
 
@@ -150,9 +153,6 @@
 
 /* Default alignment of buffers used for I/O */
 #define WT_BUFFER_ALIGNMENT_DEFAULT 0
-
-/* Size of a transaction timestamp in bytes */
-#define WT_TIMESTAMP_SIZE 8
 
 /* Enable large inode numbers on Mac OS X 10.5.  */
 /* #ifndef _DARWIN_USE_64_BIT_INODE */

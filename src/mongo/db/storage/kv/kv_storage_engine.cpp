@@ -304,4 +304,17 @@ Status KVStorageEngine::repairRecordStore(OperationContext* opCtx, const std::st
 void KVStorageEngine::setJournalListener(JournalListener* jl) {
     _engine->setJournalListener(jl);
 }
+
+void KVStorageEngine::setStableTimestamp(SnapshotName stableTimestamp) {
+    _engine->setStableTimestamp(stableTimestamp);
+}
+
+void KVStorageEngine::setInitialDataTimestamp(SnapshotName initialDataTimestamp) {
+    _engine->setInitialDataTimestamp(initialDataTimestamp);
+}
+
+bool KVStorageEngine::supportsRecoverToStableTimestamp() const {
+    return _engine->supportsRecoverToStableTimestamp();
+}
+
 }  // namespace mongo

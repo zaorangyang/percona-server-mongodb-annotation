@@ -44,6 +44,9 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/rename_collection.h"
+#include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -112,21 +115,113 @@ void FixUpInfo::removeAllDocsToRefetchFor(const std::string& collection) {
                         docsToRefetch.upper_bound(DocID::maxFor(collection.c_str())));
 }
 
+// TODO: This function will not be fully functional until the entire
+// rollback via refetch for non-WT project is complete. See SERVER-30171.
 void FixUpInfo::removeRedundantOperations() {
     // These loops and their bodies can be done in any order. The final result of the FixUpInfo
     // members will be the same.
-    for (const auto& collection : collectionsToDrop) {
-        removeAllDocsToRefetchFor(collection);
-        indexesToDrop.erase(collection);
-        collectionsToResyncMetadata.erase(collection);
-    }
+
+    //    for (const auto& collection : collectionsToDrop) {
+    //        removeAllDocsToRefetchFor(collection);
+    //        indexesToDrop.erase(collection);
+    //        collectionsToResyncMetadata.erase(collection);
+    //    }
 
     for (const auto& collection : collectionsToResyncData) {
         removeAllDocsToRefetchFor(collection);
-        indexesToDrop.erase(collection);
-        collectionsToResyncMetadata.erase(collection);
-        collectionsToDrop.erase(collection);
+        // indexesToDrop.erase(collection);
+        // collectionsToResyncMetadata.erase(collection);
+        // collectionsToDrop.erase(collection);
     }
+}
+
+bool FixUpInfo::removeRedundantIndexCommands(UUID uuid, std::string indexName) {
+    auto indexes = indexesToCreate.find(uuid);
+    if (indexes != indexesToCreate.end()) {
+        invariant(indexesToCreate.count(uuid) == 1);
+        invariant((*indexes).second.count(indexName) == 1);
+        (*indexes).second.erase(indexName);
+        if ((*indexes).second.empty()) {
+            indexesToCreate.erase(uuid);
+        }
+        log() << "Rollback: Index " << indexName
+              << " was previously dropped. The createIndexes command is canceled out.";
+        return true;
+    }
+    return false;
+}
+
+void FixUpInfo::recordRollingBackDrop(const NamespaceString& nss, OpTime opTime, UUID uuid) {
+
+    // Records the collection that needs to be removed from the drop-pending collections
+    // list in the DropPendingCollectionReaper.
+    collectionsToRemoveFromDropPendingCollections.emplace(uuid, std::make_pair(opTime, nss));
+
+    // Records the collection drop as a rename from the drop pending
+    // namespace to its namespace before it was dropped.
+    RenameCollectionInfo info;
+    info.renameTo = nss;
+    info.renameFrom = nss.makeDropPendingNamespace(opTime);
+
+    // We do not need to check if there is already an entry in collectionsToRename
+    // for this collection because it is not possible that a renameCollection occurs
+    // on the same collection after it has been dropped. Thus, we know that this
+    // will be the first RenameCollectionInfo entry for this collection and do not
+    // need to change the renameFrom entry to account for multiple renames.
+    collectionsToRename[uuid] = info;
+}
+
+Status FixUpInfo::recordDropTargetInfo(const BSONElement& dropTarget,
+                                       const BSONObj& obj,
+                                       OpTime opTime) {
+    StatusWith<UUID> dropTargetUUIDStatus = UUID::parse(dropTarget);
+    if (!dropTargetUUIDStatus.isOK()) {
+        std::string message = str::stream() << "Unable to roll back renameCollection. Cannot parse "
+                                               "dropTarget UUID. Returned status: "
+                                            << redact(dropTargetUUIDStatus.getStatus())
+                                            << ", oplog entry: " << redact(obj);
+        error() << message;
+        return dropTargetUUIDStatus.getStatus();
+    }
+    UUID dropTargetUUID = dropTargetUUIDStatus.getValue();
+
+    // The namespace of the collection that was dropped is the same namespace
+    // that we are trying to rename the collection to.
+    NamespaceString droppedNs(obj.getStringField("to"));
+
+    // Records the information necessary for undoing the dropTarget.
+    recordRollingBackDrop(droppedNs, opTime, dropTargetUUID);
+
+    return Status::OK();
+}
+
+Status FixUpInfo::recordCrossDatabaseRenameRollbackInfo(const BSONElement& dropSource,
+                                                        const BSONObj& obj,
+                                                        const NamespaceString& nss,
+                                                        UUID uuid,
+                                                        OpTime opTime) {
+
+    StatusWith<UUID> uuidWithStatus = UUID::parse(dropSource);
+    if (!uuidWithStatus.isOK()) {
+        std::string message = str::stream()
+            << "Unable to roll back cross database renameCollection. Cannot parse "
+            << "dropSource UUID. Returned status: " << redact(uuidWithStatus.getStatus())
+            << ", oplog entry: " << redact(obj);
+        error() << message;
+        return uuidWithStatus.getStatus();
+    }
+    UUID dropSourceUUID = uuidWithStatus.getValue();
+
+    // If a cross-database rename has occurred, we record it as separate
+    // createCollection and dropCollection commands. First, we record the
+    // necessary information for the source collection to be un-dropped.
+    recordRollingBackDrop(nss, opTime, dropSourceUUID);
+
+    // Next, we need to drop the new collection that was created due to the rename.
+    // Dropping this collection will effectively drop all the documents inserted into
+    // the collection, rolling back the copy portion of the renameCollection command.
+    collectionsToDrop.insert(uuid);
+    return Status::OK();
 }
 
 Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInfo,
@@ -193,72 +288,202 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
 
         switch (oplogEntry.getCommandType()) {
             case OplogEntry::CommandType::kCreate: {
-                // Create collection operation
+                // Example create collection oplog entry
                 // {
                 //     ts: ...,
                 //     h: ...,
                 //     op: "c",
                 //     ns: "foo.$cmd",
+                //     ui: BinData(...),
                 //     o: {
                 //            create: "abc", ...
                 //        }
                 //     ...
                 // }
 
-                string ns = nss.db().toString() + '.' + first.valuestr();  // -> foo.abc
-                fixUpInfo.collectionsToDrop.insert(ns);
+                fixUpInfo.collectionsToDrop.insert(*uuid);
                 return Status::OK();
             }
             case OplogEntry::CommandType::kDrop: {
-                // Drop collection operation
+                // Example drop collection oplog entry
                 // {
                 //     ts: ...,
                 //     h: ...,
                 //     op: "c",
                 //     ns: "foo.$cmd",
+                //     ui: BinData(...),
                 //     o: {
                 //            drop: "abc"
                 //        }
                 //     ...
                 // }
-                // TODO: Delete this when UUIDs are enabled. (SERVER-29815)
-                if (!uuid) {
-                    string ns = nss.db().toString() + '.' + first.valuestr();
-                    fixUpInfo.collectionsToResyncData.insert(ns);
-                    return Status::OK();
-                }
-                string collName = first.valuestr();
-                fixUpInfo.collectionsToRollBackPendingDrop.emplace(
-                    *uuid, std::make_pair(oplogEntry.getOpTime(), collName));
+                NamespaceString collectionNamespace(nss.getSisterNS(first.valuestr()));
+
+                // Registers the collection to be removed from the drop pending collection
+                // reaper and to be renamed from its drop pending namespace to original namespace.
+                fixUpInfo.recordRollingBackDrop(collectionNamespace, oplogEntry.getOpTime(), *uuid);
+
                 return Status::OK();
             }
             case OplogEntry::CommandType::kDropIndexes: {
-                // TODO: This is bad.  We simply full resync the collection here,
-                //       which could be very slow.
-                warning() << "Rollback of dropIndexes is slow in this version of "
-                          << "mongod.";
+                // Example drop indexes objects
+                //     o: {
+                //            dropIndexes: "x",
+                //            index: "x_1"
+                //        }
+                //     o2:{
+                //            v: 2,
+                //            key: { x: 1 },
+                //            name: "x_1",
+                //            ns: "foo.x"
+                //        }
+
                 string ns = nss.db().toString() + '.' + first.valuestr();
-                fixUpInfo.collectionsToResyncData.insert(ns);
+
+                string indexName;
+                auto status = bsonExtractStringField(obj, "index", &indexName);
+                if (!status.isOK()) {
+                    severe()
+                        << "Missing index name in dropIndexes operation on rollback, document: "
+                        << redact(doc.ownedObj);
+                    throw RSFatalException(
+                        "Missing index name in dropIndexes operation on rollback.");
+                }
+
+                BSONObj obj2 = *(oplogEntry.getObject2());
+
+                // Inserts the index name and the index spec of the index to be created into the map
+                // of index name and index specs that need to be created for the given collection.
+                fixUpInfo.indexesToCreate[*uuid].insert(
+                    std::pair<std::string, BSONObj>(indexName, obj2));
+
+                return Status::OK();
+            }
+            case OplogEntry::CommandType::kCreateIndexes: {
+                // Example create indexes obj
+                // o:{
+                //       createIndex: x,
+                //       v: 2,
+                //       key: { x: 1 },
+                //       name: "x_1",
+                //   }
+
+                string indexName;
+                auto status = bsonExtractStringField(obj, "name", &indexName);
+                if (!status.isOK()) {
+                    severe()
+                        << "Missing index name in createIndexes operation on rollback, document: "
+                        << redact(doc.ownedObj);
+                    throw RSFatalException(
+                        "Missing index name in createIndexes operation on rollback.");
+                }
+
+                // Checks if a drop was previously done on this index. If so, we remove it from the
+                // indexesToCreate because a dropIndex and createIndex operation on the same
+                // collection for the same index cancel each other out. We do not record the
+                // createIndexes command in the fixUpInfo struct since applying both of these
+                // commands will lead to the same final state as not applying either of the
+                // commands. We only cancel out in the direction of [create] -> [drop] indexes
+                // because it is possible that in the [drop] -> [create] direction, when we create
+                // an index with the same name it may have a different index spec from that index
+                // that was previously dropped.
+                if (fixUpInfo.removeRedundantIndexCommands(*uuid, indexName)) {
+                    return Status::OK();
+                }
+
+                // Inserts the index name to be dropped into the set of indexes that
+                // need to be dropped for the collection.
+                fixUpInfo.indexesToDrop[*uuid].insert(indexName);
+
                 return Status::OK();
             }
             case OplogEntry::CommandType::kRenameCollection: {
-                // TODO: Slow.
-                warning() << "Rollback of renameCollection is slow in this version of "
-                          << "mongod.";
-                string from = first.valuestr();
-                string to = obj["to"].String();
-                fixUpInfo.collectionsToResyncData.insert(from);
-                fixUpInfo.collectionsToResyncData.insert(to);
+                // Example rename collection obj
+                // o:{
+                //        renameCollection: "foo.x",
+                //        to: "foo.y",
+                //        stayTemp: false,
+                //        dropTarget: BinData(...),
+                //        dropSource: BinData(...),
+                //   }
+
+                // dropTarget will be false if no collection is dropped during the rename.
+                // dropSource is only present during a cross-database rename, and contains
+                // the UUID of the collection that is being renamed over. The ui field will
+                // contain the UUID of the new collection that is created.
+
+                BSONObj cmd = obj;
+
+                std::string ns = first.valuestrsafe();
+                if (ns.empty()) {
+                    std::string message = str::stream()
+                        << "Collection name missing from oplog entry: " << redact(obj);
+                    log() << message;
+                    return Status(ErrorCodes::UnrecoverableRollbackError, message);
+                }
+
+                // Checks if dropTarget is false. If it has a UUID value, we need to
+                // make sure to un-drop the collection that was dropped in the process
+                // of renaming.
+                auto dropTarget = obj.getField("dropTarget");
+                if (dropTarget.type() != Bool) {
+                    auto status =
+                        fixUpInfo.recordDropTargetInfo(dropTarget, obj, oplogEntry.getOpTime());
+                    if (!status.isOK()) {
+                        return status;
+                    }
+                }
+
+                // Checks if the renameColl ection is a cross-database rename. If the dropSource
+                // field is present in the oplog entry then the renameCollection must be a
+                // cross-database rename. The field will be absent in renames in the same
+                // database.
+                auto dropSource = obj.getField("dropSource");
+                if (!dropSource.eoo()) {
+                    return fixUpInfo.recordCrossDatabaseRenameRollbackInfo(
+                        dropSource, obj, nss, *uuid, oplogEntry.getOpTime());
+                }
+
+                RenameCollectionInfo info;
+                info.renameTo = NamespaceString(ns);
+                info.renameFrom = NamespaceString(obj.getStringField("to"));
+
+                // Checks if this collection has been renamed before within the same database.
+                // If it has been, update the renameFrom field of the RenameCollectionInfo
+                // that we will use to create the oplog entry necessary to rename the
+                // collection back to its original state.
+                auto collToRename = fixUpInfo.collectionsToRename.find(*uuid);
+                if (collToRename != fixUpInfo.collectionsToRename.end()) {
+                    info.renameFrom = (*collToRename).second.renameFrom;
+                }
+                fixUpInfo.collectionsToRename[*uuid] = info;
+
+                // Because of the stayTemp field, we add any collections that have been renamed
+                // to collectionsToResyncMetadata to ensure that the collection is properly set
+                // as either a temporary or permanent collection.
+                fixUpInfo.collectionsToResyncMetadata.insert(*uuid);
+
                 return Status::OK();
             }
             case OplogEntry::CommandType::kDropDatabase: {
+                // Example drop database oplog entry
+                // {
+                //     ts: ...,
+                //     h: ...,
+                //     op: "c",
+                //     ns: "foo.$cmd",
+                //     o:{
+                //            "dropDatabase": 1
+                //        }
+                //     ...
+                // }
+
                 // Since we wait for all internal collection drops to be committed before recording
                 // a 'dropDatabase' oplog entry, this will always create an empty database.
                 // Creating an empty database doesn't mean anything, so we do nothing.
                 return Status::OK();
             }
             case OplogEntry::CommandType::kCollMod: {
-                const auto ns = nss.db().toString() + '.' + first.valuestr();  // -> foo.abc
                 for (auto field : obj) {
                     // Example collMod obj
                     // o:{
@@ -279,7 +504,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
                     if (modification == "validator" || modification == "validationAction" ||
                         modification == "validationLevel" || modification == "usePowerOf2Sizes" ||
                         modification == "noPadding") {
-                        fixUpInfo.collectionsToResyncMetadata.insert(ns);
+                        fixUpInfo.collectionsToResyncMetadata.insert(*uuid);
                         continue;
                     }
                     // Some collMod fields cannot be rolled back, such as the index field.
@@ -290,6 +515,25 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
                 return Status::OK();
             }
             case OplogEntry::CommandType::kApplyOps: {
+                // Example Apply Ops oplog entry
+                //{
+                //    op : "c",
+                //    ns : admin.$cmd,
+                //    o : {
+                //             applyOps : [ {
+                //                            op : "u", // must be idempotent!
+                //                            ns : "test.x",
+                //                            ui : BinData(...),
+                //                            o2 : {
+                //                                _id : 1
+                //                            },
+                //                            o : {
+                //                                _id : 2
+                //                            }
+                //                        }]
+                //         }
+                // }
+
                 if (first.type() != Array) {
                     std::string message = str::stream()
                         << "Expected applyOps argument to be an array; found " << redact(first);
@@ -323,49 +567,6 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
                 throw RSFatalException(message);
             }
         }
-    }
-
-    if (nss.isSystemDotIndexes()) {
-        if (oplogEntry.getOpType() != OpTypeEnum::kInsert) {
-            std::string message = str::stream() << "Unexpected operation type '"
-                                                << oplogEntry.raw.getStringField("op")
-                                                << "' on system.indexes operation, "
-                                                << "document: ";
-            severe() << message << redact(doc.ownedObj);
-            throw RSFatalException(message);
-        }
-        string objNs;
-        auto status = bsonExtractStringField(obj, "ns", &objNs);
-        if (!status.isOK()) {
-            severe() << "Missing collection namespace in system.indexes operation, document: "
-                     << redact(doc.ownedObj);
-            throw RSFatalException("Missing collection namespace in system.indexes operation.");
-        }
-        NamespaceString objNss(objNs);
-        if (!objNss.isValid()) {
-            severe() << "Invalid collection namespace in system.indexes operation, document: "
-                     << redact(doc.ownedObj);
-            throw RSFatalException(
-                str::stream()
-                << "Invalid collection namespace in system.indexes operation, namespace: "
-                << doc.ns);
-        }
-        string indexName;
-        status = bsonExtractStringField(obj, "name", &indexName);
-        if (!status.isOK()) {
-            severe() << "Missing index name in system.indexes operation, document: "
-                     << redact(doc.ownedObj);
-            throw RSFatalException("Missing index name in system.indexes operation.");
-        }
-        using ValueType = multimap<string, string>::value_type;
-        ValueType pairToInsert = std::make_pair(objNs, indexName);
-        auto lowerBound = fixUpInfo.indexesToDrop.lower_bound(objNs);
-        auto upperBound = fixUpInfo.indexesToDrop.upper_bound(objNs);
-        auto matcher = [pairToInsert](const ValueType& pair) { return pair == pairToInsert; };
-        if (!std::count_if(lowerBound, upperBound, matcher)) {
-            fixUpInfo.indexesToDrop.insert(pairToInsert);
-        }
-        return Status::OK();
     }
 
     doc._id = oplogEntry.getIdElement();
@@ -427,6 +628,251 @@ void checkRbidAndUpdateMinValid(OperationContext* opCtx,
     }
 }
 
+/**
+ * Drops an index from the collection based on its name by removing it from the indexCatalog of the
+ * collection.
+ */
+void dropIndex(OperationContext* opCtx,
+               IndexCatalog* indexCatalog,
+               const string& indexName,
+               NamespaceString& nss) {
+    bool includeUnfinishedIndexes = false;
+    auto indexDescriptor =
+        indexCatalog->findIndexByName(opCtx, indexName, includeUnfinishedIndexes);
+    if (!indexDescriptor) {
+        warning() << "Rollback failed to drop index " << indexName << " in " << nss.toString()
+                  << ": index not found.";
+        return;
+    }
+    WriteUnitOfWork wunit(opCtx);
+    auto status = indexCatalog->dropIndex(opCtx, indexDescriptor);
+    if (!status.isOK()) {
+        severe() << "Rollback failed to drop index " << indexName << " in " << nss.toString()
+                 << ": " << redact(status);
+    }
+    wunit.commit();
+}
+
+/**
+ * Rolls back all createIndexes operations for the collection by dropping the
+ * created indexes.
+ */
+void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::string> indexNames) {
+
+    Collection* collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+    NamespaceString nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(uuid);
+
+    // If we cannot find the collection, we skip over dropping the index.
+    if (!collection) {
+        LOG(2) << "Cannot find the collection with uuid: " << uuid.toString()
+               << " in UUID catalog during roll back of a createIndexes command.";
+        return;
+    }
+
+    Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
+
+    // If we cannot find the index catalog, we skip over dropping the index.
+    auto indexCatalog = collection->getIndexCatalog();
+    if (!indexCatalog) {
+        LOG(2) << "Cannot find the index catalog in collection with uuid: " << uuid.toString()
+               << " during roll back of a createIndexes command.";
+        return;
+    }
+
+    for (auto itIndex = indexNames.begin(); itIndex != indexNames.end(); itIndex++) {
+        const string& indexName = *itIndex;
+
+        dropIndex(opCtx, indexCatalog, indexName, nss);
+        log() << "Dropped index in rollback: collection = " << nss.toString()
+              << ", index = " << indexName;
+    }
+}
+
+/**
+ * Rolls back all the dropIndexes operations for the collection by re-creating
+ * the indexes that were dropped.
+ */
+void rollbackDropIndexes(OperationContext* opCtx,
+                         UUID uuid,
+                         std::map<std::string, BSONObj> indexNames) {
+
+    Collection* collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+    NamespaceString nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(uuid);
+
+    // If we cannot find the collection, we skip over dropping the index.
+    if (!collection) {
+        LOG(2) << "Cannot find the collection with uuid: " << uuid.toString()
+               << "in UUID catalog during roll back of a dropIndexes command.";
+        return;
+    }
+
+    Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
+
+    for (auto itIndex = indexNames.begin(); itIndex != indexNames.end(); itIndex++) {
+        const string indexName = itIndex->first;
+        BSONObj indexSpec = itIndex->second;
+
+        // We replace the namespace field because it is possible that a
+        // renameCollection command has occurred, changing the namespace of the
+        // collection from what it initially was during the creation of this index.
+        BSONObjBuilder updatedNss;
+        updatedNss.append("ns", nss.ns());
+        indexSpec.addField(updatedNss.obj().firstElement());
+
+        createIndexForApplyOps(opCtx, indexSpec, nss, {});
+
+        log() << "Created index in rollback: collection = " << nss.toString()
+              << ", index = " << indexName;
+    }
+}
+
+/**
+ * Drops the given collection from the database.
+ */
+void dropCollection(OperationContext* opCtx,
+                    NamespaceString nss,
+                    Collection* collection,
+                    Database* db) {
+    Helpers::RemoveSaver removeSaver("rollback", "", nss.ns());
+
+    // Performs a collection scan and writes all documents in the collection to disk
+    // in order to keep an archive of items that were rolled back.
+    auto exec = InternalPlanner::collectionScan(
+        opCtx, nss.toString(), collection, PlanExecutor::YIELD_AUTO);
+    BSONObj curObj;
+    PlanExecutor::ExecState execState;
+    while (PlanExecutor::ADVANCED == (execState = exec->getNext(&curObj, NULL))) {
+        auto status = removeSaver.goingToDelete(curObj);
+        if (!status.isOK()) {
+            severe() << "Rolling back createCollection on " << nss
+                     << " failed to write document to remove saver file: " << redact(status);
+            throw RSFatalException(
+                "Rolling back createCollection. Failed to write document to remove saver "
+                "file.");
+        }
+    }
+
+    // If we exited the above for loop with any other execState than IS_EOF, this means that
+    // a FAILURE or DEAD state was returned. If a DEAD state occurred, the collection or
+    // database that we are attempting to save may no longer be valid. If a FAILURE state
+    // was returned, either an unrecoverable error was thrown by exec, or we attempted to
+    // retrieve data that could not be provided by the PlanExecutor. In both of these cases
+    // it is necessary for a full resync of the server.
+
+    if (execState != PlanExecutor::IS_EOF) {
+        if (execState == PlanExecutor::FAILURE &&
+            WorkingSetCommon::isValidStatusMemberObject(curObj)) {
+            Status errorStatus = WorkingSetCommon::getMemberObjectStatus(curObj);
+            severe() << "Rolling back createCollection on " << nss << " failed with "
+                     << redact(errorStatus) << ". A full resync is necessary.";
+            throw RSFatalException(
+                "Rolling back createCollection failed. A full resync is necessary.");
+        } else {
+            severe() << "Rolling back createCollection on " << nss
+                     << " failed. A full resync is necessary.";
+            throw RSFatalException(
+                "Rolling back createCollection failed. A full resync is necessary.");
+        }
+    }
+
+    WriteUnitOfWork wunit(opCtx);
+
+    // We permanently drop the collection rather than 2-phase drop the collection
+    // here. By not passing in an opTime to dropCollectionEvenIfSystem() the collection
+    // is immediately dropped.
+    fassertStatusOK(40504, db->dropCollectionEvenIfSystem(opCtx, nss));
+    wunit.commit();
+}
+
+/**
+ * Renames a collection out of the way when another collection during rollback
+ * is attempting to use the same namespace.
+ */
+void renameOutOfTheWay(OperationContext* opCtx, RenameCollectionInfo info, Database* db) {
+
+    // Finds the UUID of the collection that we are renaming out of the way.
+    auto collection = db->getCollection(opCtx, info.renameTo);
+    invariant(collection);
+    BSONObj tempRenameCollUUID = collection->uuid().get().toBSON();
+
+    // Creates the oplog entry to temporarily rename the collection that is
+    // preventing the renameCollection command from rolling back to a unique
+    // namespace.
+    auto tmpNameResult = db->makeUniqueCollectionNamespace(opCtx, "system.tmp%%%%%");
+    if (!tmpNameResult.isOK()) {
+        severe() << "Unable to generate temporary namespace to rename collection " << info.renameTo
+                 << " out of the way. " << tmpNameResult.getStatus().reason();
+        throw RSFatalException(
+            "Unable to generate temporary namespace to rename collection out of the way.");
+    }
+    const auto& tempNss = tmpNameResult.getValue();
+
+    LOG(2) << "Attempted to rename collection from " << info.renameFrom << " to " << info.renameTo
+           << " but " << info.renameTo << " exists already. Temporarily renaming collection "
+           << info.renameTo << " out of the way to " << tempNss;
+
+    BSONObjBuilder tempRenameCmd;
+    tempRenameCmd.append("renameCollection", info.renameTo.ns());
+    tempRenameCmd.append("to", tempNss.ns());
+    tempRenameCmd.append("dropTarget", false);
+
+    // Renaming the collection that was clashing with the attempted rename
+    // operation to a different collection name.
+    auto renameStatus = renameCollectionForApplyOps(
+        opCtx, db->name(), tempRenameCollUUID.getField("uuid"), tempRenameCmd.obj());
+
+    if (!renameStatus.isOK()) {
+        severe() << "Unable to rename collection " << info.renameTo << " out of the way to "
+                 << tempNss;
+        throw RSFatalException("Unable to rename collection out of the way");
+    }
+}
+
+/**
+ * Rolls back a renameCollection operation on the given collection.
+ */
+void rollbackRenameCollection(OperationContext* opCtx, UUID uuid, RenameCollectionInfo info) {
+
+    std::string dbName = info.renameFrom.db().toString();
+    BSONObj ui = uuid.toBSON();
+
+    Lock::DBLock dbLock(opCtx, dbName, MODE_X);
+    auto db = dbHolder().openDb(opCtx, dbName);
+    invariant(db);
+
+    BSONObjBuilder cmd;
+    cmd.append("renameCollection", info.renameFrom.ns());
+    cmd.append("to", info.renameTo.ns());
+    cmd.append("dropTarget", false);
+    BSONObj obj = cmd.obj();
+
+    auto status = renameCollectionForApplyOps(opCtx, dbName, ui.getField("uuid"), obj);
+
+    // If we try to roll back a collection to a collection name that currently exists
+    // because another collection was renamed or created with the same collection name,
+    // we temporarily rename the conflicting collection.
+    if (status == ErrorCodes::NamespaceExists) {
+
+        renameOutOfTheWay(opCtx, info, db);
+
+        // Retrying to renameCollection command again now that the conflicting
+        // collection has been renamed out of the way.
+        status = renameCollectionForApplyOps(opCtx, dbName, ui.getField("uuid"), obj);
+
+        if (!status.isOK()) {
+            severe() << "Rename collection failed to roll back twice. We were unable to rename "
+                     << "collection " << info.renameFrom << " to " << info.renameTo << ". "
+                     << status.toString();
+            throw RSFatalException(
+                "Rename collection failed to roll back twice. We were unable to rename "
+                "the collection.");
+        }
+    } else if (!status.isOK()) {
+        severe() << "Unable to roll back renameCollection command: " << status.toString();
+        throw RSFatalException("Unable to rollback renameCollection command");
+    }
+}
+
 void syncFixUp(OperationContext* opCtx,
                const FixUpInfo& fixUpInfo,
                const RollbackSource& rollbackSource,
@@ -484,15 +930,50 @@ void syncFixUp(OperationContext* opCtx,
 
     invariant(!fixUpInfo.commonPointOurDiskloc.isNull());
 
-    log() << "Rolling back any collections pending being dropped";
+    log() << "Dropping collections to roll back create operations";
+
+    // Drops collections before updating individual documents. We drop these collections before
+    // rolling back any other commands to prevent namespace collisions that may occur
+    // when undoing renameCollection operations.
+    for (auto uuid : fixUpInfo.collectionsToDrop) {
+
+        // TODO: This invariant will be uncommented once the rollback via refetch for non-WT
+        // project is complete. See SERVER-30171.
+        // invariant(!fixUpInfo.indexesToDrop.count(uuid));
+
+        Collection* collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+        NamespaceString nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(uuid);
+
+        AutoGetDb dbLock(opCtx, nss.db(), MODE_X);
+        Database* db = dbLock.getDb();
+        if (db) {
+            dropCollection(opCtx, nss, collection, db);
+            log() << "Dropped collection with UUID: " << uuid << " and nss: " << nss;
+        }
+    }
+
+    // Rolling back renameCollection commands.
+    log() << "Rolling back renameCollection commands and collection drop commands.";
+
+    for (auto it = fixUpInfo.collectionsToRename.begin(); it != fixUpInfo.collectionsToRename.end();
+         it++) {
+
+        UUID uuid = it->first;
+        RenameCollectionInfo info = it->second;
+
+        rollbackRenameCollection(opCtx, uuid, info);
+    }
+
+    log() << "Rolling back collections pending being dropped: Removing them from the list of "
+             "drop-pending collections in the DropPendingCollectionReaper.";
 
     // Roll back any drop-pending collections. This must be done first so that the collection
     // exists when we attempt to resync its metadata or insert documents into it.
-    for (const auto& collPair : fixUpInfo.collectionsToRollBackPendingDrop) {
+    for (const auto& collPair : fixUpInfo.collectionsToRemoveFromDropPendingCollections) {
         const auto& optime = collPair.second.first;
-        const auto& collName = collPair.second.second;
+        const auto& collectionNamespace = collPair.second.second;
         DropPendingCollectionReaper::get(opCtx)->rollBackDropPendingCollection(
-            opCtx, optime, collName);
+            opCtx, optime, collectionNamespace);
     }
 
     // Full collection data and metadata resync.
@@ -504,8 +985,10 @@ void syncFixUp(OperationContext* opCtx,
         for (const string& ns : fixUpInfo.collectionsToResyncData) {
             log() << "Resyncing collection, namespace: " << ns;
 
-            invariant(!fixUpInfo.indexesToDrop.count(ns));
-            invariant(!fixUpInfo.collectionsToResyncMetadata.count(ns));
+            // TODO: This invariant will be uncommented once the
+            // rollback via refetch for non-WT project is complete. See SERVER-30171.
+            // invariant(!fixUpInfo.indexesToDrop.count(ns));
+            // invariant(!fixUpInfo.collectionsToResyncMetadata.count(ns));
 
             const NamespaceString nss(ns);
 
@@ -521,20 +1004,26 @@ void syncFixUp(OperationContext* opCtx,
             rollbackSource.copyCollectionFromRemote(opCtx, nss);
         }
 
-        // Retrieves collections from the sync source in order to obtain
-        // the collection flags needed to roll back collMod operations.
-        for (const string& ns : fixUpInfo.collectionsToResyncMetadata) {
-            log() << "Resyncing collection metadata, namespace: " << ns;
+        // Retrieves collections from the sync source in order to obtain the collection
+        // flags needed to roll back collMod operations. We roll back collMod operations
+        // after create/renameCollection/drop commands in order to ensure that the
+        // collections that we want to change actually exist. For example, if a collMod
+        // occurs and then the collection is dropped. If we do not first re-create the
+        // collection, we will not be able to retrieve the collection's catalog entries.
+        for (auto uuid : fixUpInfo.collectionsToResyncMetadata) {
+            log() << "Resyncing collection metadata, uuid: " << uuid;
 
-            const NamespaceString nss(ns);
+            Collection* collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(uuid);
+            invariant(collection);
+            NamespaceString nss = collection->ns();
+
             Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
             auto db = dbHolder().openDb(opCtx, nss.db().toString());
             invariant(db);
-            auto collection = db->getCollection(opCtx, nss);
-            invariant(collection);
+
             auto cce = collection->getCatalogEntry();
 
-            auto infoResult = rollbackSource.getCollectionInfo(nss);
+            auto infoResult = rollbackSource.getCollectionInfoByUUID(nss.db().toString(), uuid);
 
             if (!infoResult.isOK()) {
                 // The collection was dropped by the sync source so we can't correctly change it
@@ -542,8 +1031,8 @@ void syncFixUp(OperationContext* opCtx,
                 // is rolled back upstream and we restart, we expect to still have the
                 // collection.
 
-                log() << ns << " not found on remote host, so we do not roll back collmod "
-                               "operation. Instead, we will drop the collection soon.";
+                log() << nss.ns() << " not found on remote host, so we do not roll back collmod "
+                                     "operation. Instead, we will drop the collection soon.";
                 continue;
             }
 
@@ -559,18 +1048,29 @@ void syncFixUp(OperationContext* opCtx,
                                                          << typeName(optionsField.type()));
                 }
 
-                auto status = options.parse(optionsField.Obj(), CollectionOptions::parseForCommand);
+                // Removes the option.uuid field. We do not allow the options.uuid field
+                // to be parsed while in parseForCommand mode in order to ensure that the
+                // user cannot set the UUID of a collection.
+                BSONObj optionsFieldObj = optionsField.Obj();
+                optionsFieldObj = optionsFieldObj.removeField("uuid");
+
+                auto status = options.parse(optionsFieldObj, CollectionOptions::parseForCommand);
                 if (!status.isOK()) {
                     throw RSFatalException(str::stream() << "Failed to parse options " << info
                                                          << ": "
                                                          << status.toString());
                 }
                 // TODO(SERVER-27992): Set options.uuid.
+
             } else {
                 // Use default options.
             }
 
             WriteUnitOfWork wuow(opCtx);
+
+            // TODO: Reset options.temp. If the collection is temporary, we set the
+            // temp field to true. Otherwise, we do not add the the temp field.
+            // See SERVER-30413.
 
             // Resets collection user flags such as noPadding and usePowerOf2Sizes.
             if (options.flagsSet || cce->getCollectionOptions(opCtx).flagsSet) {
@@ -604,110 +1104,30 @@ void syncFixUp(OperationContext* opCtx,
         checkRbidAndUpdateMinValid(opCtx, fixUpInfo.rbid, rollbackSource, replicationProcess);
     }
 
-    log() << "Dropping collections to roll back create operations";
+    // Rolls back createIndexes commands by dropping the indexes that were created. It is
+    // necessary to roll back createIndexes commands before dropIndexes commands because
+    // it is possible that we previously dropped an index with the same name but a different
+    // index spec. If we attempt to re-create an index that has the same name as an existing
+    // index, the operation will fail. Thus, we roll back createIndexes commands first in
+    // order to ensure that no collisions will occur when we re-create previously dropped
+    // indexes.
+    log() << "Rolling back createIndexes commands.";
+    for (auto it = fixUpInfo.indexesToDrop.begin(); it != fixUpInfo.indexesToDrop.end(); it++) {
 
-    // Drops collections before updating individual documents.
-    for (set<string>::iterator it = fixUpInfo.collectionsToDrop.begin();
-         it != fixUpInfo.collectionsToDrop.end();
-         it++) {
-        log() << "Dropping collection: " << *it;
+        UUID uuid = it->first;
+        auto indexNames = it->second;
 
-        invariant(!fixUpInfo.indexesToDrop.count(*it));
-
-        const NamespaceString nss(*it);
-        Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
-        Database* db = dbHolder().get(opCtx, nsToDatabaseSubstring(*it));
-        if (db) {
-            Helpers::RemoveSaver removeSaver("rollback", "", *it);
-
-            // Performs a collection scan and writes all documents in the collection to disk
-            // in order to keep an archive of items that were rolled back.
-            auto exec = InternalPlanner::collectionScan(
-                opCtx, *it, db->getCollection(opCtx, *it), PlanExecutor::YIELD_AUTO);
-            BSONObj curObj;
-            PlanExecutor::ExecState execState;
-            while (PlanExecutor::ADVANCED == (execState = exec->getNext(&curObj, NULL))) {
-                auto status = removeSaver.goingToDelete(curObj);
-                if (!status.isOK()) {
-                    severe() << "Rolling back createCollection on " << *it
-                             << " failed to write document to remove saver file: "
-                             << redact(status);
-                    throw RSFatalException(
-                        "Rolling back createCollection. Failed to write document to remove saver "
-                        "file.");
-                }
-            }
-
-            // If we exited the above for loop with any other execState than IS_EOF, this means that
-            // a FAILURE or DEAD state was returned. If a DEAD state occurred, the collection or
-            // database that we are attempting to save may no longer be valid. If a FAILURE state
-            // was returned, either an unrecoverable error was thrown by exec, or we attempted to
-            // retrieve data that could not be provided by the PlanExecutor. In both of these cases
-            // it is necessary for a full resync of the server.
-
-            if (execState != PlanExecutor::IS_EOF) {
-                if (execState == PlanExecutor::FAILURE &&
-                    WorkingSetCommon::isValidStatusMemberObject(curObj)) {
-                    Status errorStatus = WorkingSetCommon::getMemberObjectStatus(curObj);
-                    severe() << "Rolling back createCollection on " << *it << " failed with "
-                             << redact(errorStatus) << ". A full resync is necessary.";
-                    throw RSFatalException(
-                        "Rolling back createCollection failed. A full resync is necessary.");
-                } else {
-                    severe() << "Rolling back createCollection on " << *it
-                             << " failed. A full resync is necessary.";
-                    throw RSFatalException(
-                        "Rolling back createCollection failed. A full resync is necessary.");
-                }
-            }
-
-            WriteUnitOfWork wunit(opCtx);
-            fassertStatusOK(40504, db->dropCollectionEvenIfSystem(opCtx, nss));
-            wunit.commit();
-        }
+        rollbackCreateIndexes(opCtx, uuid, indexNames);
     }
 
-    // Drops indexes.
-    for (auto it = fixUpInfo.indexesToDrop.begin(); it != fixUpInfo.indexesToDrop.end(); it++) {
-        const NamespaceString nss(it->first);
-        const string& indexName = it->second;
-        log() << "Dropping index: collection = " << nss.toString() << ". index = " << indexName;
+    // Rolls back dropIndexes commands by re-creating the indexes that were dropped.
+    log() << "Rolling back dropIndexes commands.";
+    for (auto it = fixUpInfo.indexesToCreate.begin(); it != fixUpInfo.indexesToCreate.end(); it++) {
 
-        Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
-        auto db = dbHolder().get(opCtx, nss.db());
+        UUID uuid = it->first;
+        auto indexNames = it->second;
 
-        // If the db is null, we skip over dropping the index.
-        if (!db) {
-            continue;
-        }
-        auto collection = db->getCollection(opCtx, nss);
-
-        // If the collection is null, we skip over dropping the index.
-        if (!collection) {
-            continue;
-        }
-        auto indexCatalog = collection->getIndexCatalog();
-        if (!indexCatalog) {
-            continue;
-        }
-        bool includeUnfinishedIndexes = false;
-        auto indexDescriptor =
-            indexCatalog->findIndexByName(opCtx, indexName, includeUnfinishedIndexes);
-        if (!indexDescriptor) {
-            warning() << "Rollback failed to drop index " << indexName << " in " << nss.toString()
-                      << ": index not found.";
-            continue;
-        }
-        WriteUnitOfWork wunit(opCtx);
-        auto status = indexCatalog->dropIndex(opCtx, indexDescriptor);
-        if (!status.isOK()) {
-            severe() << "Rollback failed to drop index " << indexName << " in " << nss.toString()
-                     << ": " << redact(status);
-            throw RSFatalException(str::stream() << "Rollback failed to drop index " << indexName
-                                                 << " in "
-                                                 << nss.toString());
-        }
-        wunit.commit();
+        rollbackDropIndexes(opCtx, uuid, indexNames);
     }
 
     log() << "Deleting and updating documents to roll back insert, update and remove "
@@ -722,7 +1142,10 @@ void syncFixUp(OperationContext* opCtx,
         // while rolling back createCollection operations.
         const auto& ns = nsAndGoodVersionsByDocID.first;
         unique_ptr<Helpers::RemoveSaver> removeSaver;
-        invariant(!fixUpInfo.collectionsToDrop.count(ns));
+
+        // TODO: This invariant will be uncommented once the
+        // rollback via refetch for non-WT project is complete. See SERVER-30171
+        // invariant(!fixUpInfo.collectionsToDrop.count(ns));
         removeSaver.reset(new Helpers::RemoveSaver("rollback", "", ns));
 
         const auto& goodVersionsByDocID = nsAndGoodVersionsByDocID.second;
@@ -863,15 +1286,16 @@ void syncFixUp(OperationContext* opCtx,
 
     // Cleans up the oplog.
     {
-        const NamespaceString oplogNss(rsOplogName);
+        const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
         Lock::DBLock oplogDbLock(opCtx, oplogNss.db(), MODE_IX);
         Lock::CollectionLock oplogCollectionLoc(opCtx->lockState(), oplogNss.ns(), MODE_X);
-        OldClientContext ctx(opCtx, rsOplogName);
+        OldClientContext ctx(opCtx, oplogNss.ns());
         Collection* oplogCollection = ctx.db()->getCollection(opCtx, oplogNss);
         if (!oplogCollection) {
-            fassertFailedWithStatusNoTrace(40495,
-                                           Status(ErrorCodes::UnrecoverableRollbackError,
-                                                  str::stream() << "Can't find " << rsOplogName));
+            fassertFailedWithStatusNoTrace(
+                40495,
+                Status(ErrorCodes::UnrecoverableRollbackError,
+                       str::stream() << "Can't find " << NamespaceString::kRsOplogNamespace.ns()));
         }
         // TODO: fatal error if this throws?
         oplogCollection->cappedTruncateAfter(opCtx, fixUpInfo.commonPointOurDiskloc, false);

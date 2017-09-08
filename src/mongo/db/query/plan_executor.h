@@ -58,6 +58,16 @@ class WorkingSet;
 extern const OperationContext::Decoration<bool> shouldWaitForInserts;
 
 /**
+ * If a getMore command specified a lastKnownCommittedOpTime (as secondaries do), we want to stop
+ * waiting for new data as soon as the committed op time changes.
+ *
+ * 'clientsLastKnownCommittedOpTime' represents the time passed to the getMore command.
+ * If the replication coordinator ever reports a higher committed op time, we should stop waiting
+ * for inserts and return immediately to speed up the propagation of commit level changes.
+ */
+extern const OperationContext::Decoration<repl::OpTime> clientsLastKnownCommittedOpTime;
+
+/**
  * A PlanExecutor is the abstraction that knows how to crank a tree of stages into execution.
  * The executor is usually part of a larger abstraction that is interacting with the cache
  * and/or the query optimizer.

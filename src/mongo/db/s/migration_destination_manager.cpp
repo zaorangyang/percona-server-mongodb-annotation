@@ -145,10 +145,14 @@ bool opReplicatedEnough(OperationContext* opCtx,
                         const repl::OpTime& lastOpApplied,
                         const WriteConcernOptions& writeConcern) {
     WriteConcernResult writeConcernResult;
+    writeConcernResult.wTimedOut = false;
 
-    Status waitForMajorityWriteConcernStatus =
+    Status majorityStatus =
         waitForWriteConcern(opCtx, lastOpApplied, kMajorityWriteConcern, &writeConcernResult);
-    if (!waitForMajorityWriteConcernStatus.isOK()) {
+    if (!majorityStatus.isOK()) {
+        if (!writeConcernResult.wTimedOut) {
+            uassertStatusOK(majorityStatus);
+        }
         return false;
     }
 
@@ -156,13 +160,16 @@ bool opReplicatedEnough(OperationContext* opCtx,
     // write concerns in case the user's write concern is stronger than majority
     WriteConcernOptions userWriteConcern(writeConcern);
     userWriteConcern.wTimeout = -1;
+    writeConcernResult.wTimedOut = false;
 
-    Status waitForUserWriteConcernStatus =
+    Status userStatus =
         waitForWriteConcern(opCtx, lastOpApplied, userWriteConcern, &writeConcernResult);
-    if (!waitForUserWriteConcernStatus.isOK()) {
+    if (!userStatus.isOK()) {
+        if (!writeConcernResult.wTimedOut) {
+            uassertStatusOK(userStatus);
+        }
         return false;
     }
-
     return true;
 }
 
@@ -508,12 +515,53 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
             std::list<BSONObj> infos =
                 conn->getCollectionInfos(_nss.db().toString(), BSON("name" << _nss.coll()));
 
+            if (infos.size() != 1) {
+                setStateFailWarn(str::stream()
+                                 << "expected listCollections against the donor shard for "
+                                 << _nss.ns()
+                                 << " to return 1 entry, but got "
+                                 << infos.size()
+                                 << " entries");
+                return;
+            }
+
+            BSONObj entry = infos.front();
+
             BSONObj options;
-            if (infos.size() > 0) {
-                BSONObj entry = infos.front();
-                if (entry["options"].isABSONObj()) {
-                    options = entry["options"].Obj();
+
+            BSONObj optionsWithoutUUID;
+            if (entry["options"].isABSONObj()) {
+                optionsWithoutUUID = entry["options"].Obj();
+            }
+
+            BSONObj info;
+            if (entry["info"].isABSONObj()) {
+                info = entry["info"].Obj();
+            }
+
+            // If in featureCompatibilityVersion >= 3.6, require the donor to return the
+            // collection's UUID.
+            if (serverGlobalParams.featureCompatibility.version.load() >=
+                ServerGlobalParams::FeatureCompatibility::Version::k36) {
+                if (info["uuid"].eoo()) {
+                    setStateFailWarn(str::stream()
+                                     << "The donor shard did not return a UUID for collection "
+                                     << _nss.ns()
+                                     << " as part of its listCollections response: "
+                                     << entry
+                                     << ", but this node expects to see a UUID since its "
+                                        "feature compatibility version is 3.6. Please follow "
+                                        "the online documentation to set the same feature "
+                                        "compatibility version across the cluster.");
+                    return;
                 }
+
+                BSONObjBuilder optionsBob;
+                optionsBob.appendElements(optionsWithoutUUID);
+                optionsBob.append(info["uuid"]);
+                options = optionsBob.obj();
+            } else {
+                options = optionsWithoutUUID.getOwned();
             }
 
             WriteUnitOfWork wuow(opCtx);
@@ -522,7 +570,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
                                          db,
                                          _nss.ns(),
                                          options,
-                                         CollectionOptions::parseForCommand,
+                                         CollectionOptions::parseForStorage,
                                          createDefaultIndexes,
                                          idIndexSpec);
             if (!status.isOK()) {

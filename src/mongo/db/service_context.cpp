@@ -176,15 +176,6 @@ PeriodicRunner* ServiceContext::getPeriodicRunner() const {
     return _runner.get();
 }
 
-void ServiceContext::setLogicalSessionCache(std::unique_ptr<LogicalSessionCache> cache)& {
-    invariant(!_sessionCache);
-    _sessionCache = std::move(cache);
-}
-
-LogicalSessionCache* ServiceContext::getLogicalSessionCache() const& {
-    return _sessionCache.get();
-}
-
 transport::TransportLayer* ServiceContext::getTransportLayer() const {
     return _transportLayer.get();
 }
@@ -192,6 +183,11 @@ transport::TransportLayer* ServiceContext::getTransportLayer() const {
 ServiceEntryPoint* ServiceContext::getServiceEntryPoint() const {
     return _serviceEntryPoint.get();
 }
+
+transport::ServiceExecutor* ServiceContext::getServiceExecutor() const {
+    return _serviceExecutor.get();
+}
+
 
 TickSource* ServiceContext::getTickSource() const {
     return _tickSource.get();
@@ -223,6 +219,10 @@ void ServiceContext::setServiceEntryPoint(std::unique_ptr<ServiceEntryPoint> sep
 
 void ServiceContext::setTransportLayer(std::unique_ptr<transport::TransportLayer> tl) {
     _transportLayer = std::move(tl);
+}
+
+void ServiceContext::setServiceExecutor(std::unique_ptr<transport::ServiceExecutor> exec) {
+    _serviceExecutor = std::move(exec);
 }
 
 void ServiceContext::ClientDeleter::operator()(Client* client) const {

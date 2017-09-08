@@ -29,15 +29,99 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/address_restriction.h"
+#include "mongo/db/auth/address_restriction_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/stdx/memory.h"
 
-namespace mongo {
-namespace address_restriction_detail {
+constexpr mongo::StringData mongo::address_restriction_detail::ClientSource::label;
+constexpr mongo::StringData mongo::address_restriction_detail::ClientSource::field;
 
-constexpr StringData ClientSource::label;
-constexpr StringData ClientSource::field;
+constexpr mongo::StringData mongo::address_restriction_detail::ServerAddress::label;
+constexpr mongo::StringData mongo::address_restriction_detail::ServerAddress::field;
 
-constexpr StringData ServerAddress::label;
-constexpr StringData ServerAddress::field;
+mongo::StatusWith<mongo::RestrictionSet<>> mongo::parseAddressRestrictionSet(
+    const BSONObj& obj) try {
+    IDLParserErrorContext ctx("address restriction");
+    const auto ar = Address_restriction::parse(ctx, obj);
+    std::vector<std::unique_ptr<NamedRestriction>> vec;
 
-}  // address_restriction_detail
-}  // mongo
+    const boost::optional<std::vector<StringData>>& client = ar.getClientSource();
+    if (client) {
+        vec.push_back(stdx::make_unique<ClientSourceRestriction>(client.get()));
+    }
+
+    const boost::optional<std::vector<StringData>>& server = ar.getServerAddress();
+    if (server) {
+        vec.push_back(stdx::make_unique<ServerAddressRestriction>(server.get()));
+    }
+
+    if (vec.empty()) {
+        return Status(ErrorCodes::CollectionIsEmpty,
+                      "At least one of 'clientSource' or 'serverAddress' must be set");
+    }
+    return RestrictionSet<>(std::move(vec));
+} catch (const DBException& e) {
+    return Status(ErrorCodes::BadValue, e.what());
+}
+
+mongo::StatusWith<mongo::SharedRestrictionDocument> mongo::parseAuthenticationRestriction(
+    const BSONArray& arr) {
+    static_assert(
+        std::is_same<std::shared_ptr<RestrictionDocument<>>, SharedRestrictionDocument>::value,
+        "SharedRestrictionDocument expected to be a shared_ptr to a RestrictionDocument<>");
+    using document_type = SharedRestrictionDocument::element_type;
+    static_assert(std::is_same<document_type::pointer_type,
+                               std::unique_ptr<document_type::element_type>>::value,
+                  "SharedRestrictionDocument expected to contain a sequence of unique_ptrs");
+
+    document_type::sequence_type doc;
+    for (const auto& elem : arr) {
+        if (elem.type() != Object) {
+            return Status(ErrorCodes::UnsupportedFormat,
+                          "restriction array sub-documents must be address restriction objects");
+        }
+
+        auto restriction = parseAddressRestrictionSet(elem.Obj());
+        if (!restriction.isOK()) {
+            return restriction.getStatus();
+        }
+
+        doc.emplace_back(
+            stdx::make_unique<document_type::element_type>(std::move(restriction.getValue())));
+    }
+
+    return std::make_shared<document_type>(std::move(doc));
+}
+
+mongo::StatusWith<mongo::BSONArray> mongo::getRawAuthenticationRestrictions(
+    const BSONArray& arr) noexcept try {
+    BSONArrayBuilder builder;
+
+    for (auto const& elem : arr) {
+        if (elem.type() != Object) {
+            return Status(ErrorCodes::UnsupportedFormat,
+                          "'authenticationRestrictions' array sub-documents must be address "
+                          "restriction objects");
+        }
+        IDLParserErrorContext ctx("address restriction");
+        auto const ar = Address_restriction::parse(ctx, elem.Obj());
+        if (auto const&& client = ar.getClientSource()) {
+            // Validate
+            ClientSourceRestriction(client.get());
+        }
+        if (auto const&& server = ar.getServerAddress()) {
+            // Validate
+            ServerAddressRestriction(server.get());
+        }
+        if (!ar.getClientSource() && !ar.getServerAddress()) {
+            return Status(ErrorCodes::CollectionIsEmpty,
+                          "At least one of 'clientSource' and/or 'serverAddress' must be set");
+        }
+        builder.append(ar.toBSON());
+    }
+    return builder.arr();
+} catch (const DBException& e) {
+    return Status(ErrorCodes::BadValue, e.what());
+} catch (const std::exception& e) {
+    return Status(ErrorCodes::InternalError, e.what());
+}

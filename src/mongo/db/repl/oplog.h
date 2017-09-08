@@ -67,21 +67,20 @@ void createOplog(OperationContext* opCtx, const std::string& oplogCollectionName
  */
 void createOplog(OperationContext* opCtx);
 
-extern std::string rsOplogName;
 extern std::string masterSlaveOplogName;
 
 extern int OPLOG_VERSION;
 
-/* Log operation(s) to the local oplog
- *
+/**
+ * Log insert(s) to the local oplog.
+ * Returns the OpTime of the last insert.
  */
-
-void logInsertOps(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  OptionalCollectionUUID uuid,
-                  std::vector<InsertStatement>::const_iterator begin,
-                  std::vector<InsertStatement>::const_iterator end,
-                  bool fromMigrate);
+OpTime logInsertOps(OperationContext* opCtx,
+                    const NamespaceString& nss,
+                    OptionalCollectionUUID uuid,
+                    std::vector<InsertStatement>::const_iterator begin,
+                    std::vector<InsertStatement>::const_iterator end,
+                    bool fromMigrate);
 
 /**
  * @param opstr
@@ -103,7 +102,8 @@ OpTime logOp(OperationContext* opCtx,
              OptionalCollectionUUID uuid,
              const BSONObj& obj,
              const BSONObj* o2,
-             bool fromMigrate);
+             bool fromMigrate,
+             StmtId stmtId);
 
 // Flush out the cached pointers to the local database and oplog.
 // Used by the closeDatabase command to ensure we don't cache closed things.
@@ -162,6 +162,14 @@ void setOplogCollectionName();
  * Signal any waiting AwaitData queries on the oplog that there is new data or metadata available.
  */
 void signalOplogWaiters();
+
+/**
+ * Creates a new index in the given namespace.
+ */
+void createIndexForApplyOps(OperationContext* opCtx,
+                            const BSONObj& indexSpec,
+                            const NamespaceString& indexNss,
+                            IncrementOpsAppliedStatsFn incrementOpsAppliedStats);
 
 }  // namespace repl
 }  // namespace mongo

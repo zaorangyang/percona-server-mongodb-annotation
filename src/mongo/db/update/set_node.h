@@ -38,6 +38,8 @@ namespace mongo {
  */
 class SetNode : public PathCreatingNode {
 public:
+    explicit SetNode(Context context = Context::kAll) : PathCreatingNode(context) {}
+
     Status init(BSONElement modExpr, const CollatorInterface* collator) final;
 
     std::unique_ptr<UpdateNode> clone() const final {
@@ -47,7 +49,7 @@ public:
     void setCollator(const CollatorInterface* collator) final {}
 
 protected:
-    void updateExistingElement(mutablebson::Element* element, bool* noop) const final;
+    bool updateExistingElement(mutablebson::Element* element) const final;
     void setValueForNewElement(mutablebson::Element* element) const final;
 
 private:

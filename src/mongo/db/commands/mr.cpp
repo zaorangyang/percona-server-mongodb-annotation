@@ -1325,9 +1325,9 @@ BSONObj _bailFromJS(const BSONObj& args, void* data) {
 /**
  * This class represents a map/reduce command executed on a single server
  */
-class MapReduceCommand : public Command {
+class MapReduceCommand : public ErrmsgCommandDeprecated {
 public:
-    MapReduceCommand() : Command("mapReduce", "mapreduce") {}
+    MapReduceCommand() : ErrmsgCommandDeprecated("mapReduce", "mapreduce") {}
 
     virtual bool slaveOk() const {
         return repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
@@ -1359,11 +1359,11 @@ public:
         addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
     }
 
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmd,
-             string& errmsg,
-             BSONObjBuilder& result) {
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& cmd,
+                   string& errmsg,
+                   BSONObjBuilder& result) {
         Timer t;
 
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
@@ -1654,12 +1654,12 @@ public:
 /**
  * This class represents a map/reduce command executed on the output server of a sharded env
  */
-class MapReduceFinishCommand : public Command {
+class MapReduceFinishCommand : public BasicCommand {
 public:
     void help(stringstream& h) const {
         h << "internal";
     }
-    MapReduceFinishCommand() : Command("mapreduce.shardedfinish") {}
+    MapReduceFinishCommand() : BasicCommand("mapreduce.shardedfinish") {}
     virtual bool slaveOk() const {
         return repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
             repl::ReplicationCoordinator::modeReplSet;
@@ -1680,7 +1680,6 @@ public:
     bool run(OperationContext* opCtx,
              const string& dbname,
              const BSONObj& cmdObj,
-             string& errmsg,
              BSONObjBuilder& result) {
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             return appendCommandStatus(

@@ -423,6 +423,11 @@ class _CppHeaderFileWriter(_CppFileWriterBase):
                 self._writer.write_template(
                     'const ${param_type} get${method_name}() const& { ${body} }')
                 self._writer.write_template('void get${method_name}() && = delete;')
+            elif field.struct_type:
+                # Support mutable accessors
+                self._writer.write_template(
+                    'const ${param_type} get${method_name}() const { ${body} }')
+                self._writer.write_template('${param_type} get${method_name}() { ${body} }')
             else:
                 self._writer.write_template(
                     '${const_type}${param_type} get${method_name}() const { ${body} }')
@@ -834,13 +839,19 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
         initializers = ['_%s(std::move(%s))' % (arg.name, arg.name) for arg in constructor.args]
 
+        initializes_db_name = False
         if [arg for arg in constructor.args if arg.name == 'nss']:
-            initializers += ['_dbName(nss.db().toString())']
+            initializers.append('_dbName(nss.db().toString())')
+            initializes_db_name = True
 
         initializers += [
             '%s(false)' % _get_has_field_member_name(field) for field in struct.fields
-            if _is_required_serializer_field(field)
+            if _is_required_serializer_field(field) and not (field.name == "$db" and
+                                                             initializes_db_name)
         ]
+
+        if initializes_db_name:
+            initializers.append('_hasDbName(true)')
 
         initializers_str = ''
         if initializers:
@@ -1002,6 +1013,10 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
                         with self._predicate(field_predicate, not first_field):
                             field_usage_check.add(field, "sequence.name")
+
+                            if _is_required_serializer_field(field):
+                                self._writer.write_line('%s = true;' %
+                                                        (_get_has_field_member_name(field)))
 
                             self.gen_doc_sequence_deserializer(field)
 

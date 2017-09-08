@@ -45,6 +45,7 @@
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/record_fetcher.h"
 #include "mongo/stdx/memory.h"
@@ -61,6 +62,8 @@ using std::vector;
 
 const OperationContext::Decoration<bool> shouldWaitForInserts =
     OperationContext::declareDecoration<bool>();
+const OperationContext::Decoration<repl::OpTime> clientsLastKnownCommittedOpTime =
+    OperationContext::declareDecoration<repl::OpTime>();
 
 namespace {
 
@@ -322,7 +325,7 @@ void PlanExecutor::saveState() {
 bool PlanExecutor::restoreState() {
     try {
         return restoreStateWithoutRetrying();
-    } catch (const WriteConflictException& wce) {
+    } catch (const WriteConflictException&) {
         if (!_yieldPolicy->canAutoYield())
             throw;
 
@@ -390,8 +393,17 @@ PlanExecutor::ExecState PlanExecutor::getNextSnapshotted(Snapshotted<BSONObj>* o
 bool PlanExecutor::shouldWaitForInserts() {
     // If this is an awaitData-respecting operation and we have time left and we're not interrupted,
     // we should wait for inserts.
-    return mongo::shouldWaitForInserts(_opCtx) && _opCtx->checkForInterruptNoAssert().isOK() &&
-        _opCtx->getRemainingMaxTimeMicros() > Microseconds::zero();
+    if (mongo::shouldWaitForInserts(_opCtx) && _opCtx->checkForInterruptNoAssert().isOK() &&
+        _opCtx->getRemainingMaxTimeMicros() > Microseconds::zero()) {
+        // For operations with a last committed opTime, we should not wait if the replication
+        // coordinator's lastCommittedOpTime has changed.
+        if (!clientsLastKnownCommittedOpTime(_opCtx).isNull()) {
+            auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
+            return clientsLastKnownCommittedOpTime(_opCtx) == replCoord->getLastCommittedOpTime();
+        }
+        return true;
+    }
+    return false;
 }
 
 bool PlanExecutor::waitForInserts() {

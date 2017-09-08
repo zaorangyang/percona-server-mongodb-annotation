@@ -30,18 +30,22 @@
 
 #include "mongo/scripting/mozjs/mongo.h"
 
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/native_sasl_client_session.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/client/sasl_client_session.h"
+#include "mongo/db/logical_session_id.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/mozjs/cursor.h"
 #include "mongo/scripting/mozjs/implscope.h"
 #include "mongo/scripting/mozjs/objectwrapper.h"
+#include "mongo/scripting/mozjs/session.h"
 #include "mongo/scripting/mozjs/valuereader.h"
 #include "mongo/scripting/mozjs/valuewriter.h"
 #include "mongo/scripting/mozjs/wrapconstrainedmethod.h"
@@ -80,6 +84,9 @@ const JSFunctionSpec MongoBase::methods[] = {
         getMinWireVersion, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
         getMaxWireVersion, MongoLocalInfo, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getClusterTime, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(setClusterTime, MongoExternalInfo),
+    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_startSession, MongoLocalInfo, MongoExternalInfo),
     JS_FS_END,
 };
 
@@ -93,6 +100,16 @@ const JSFunctionSpec MongoExternalInfo::freeFunctions[4] = {
 };
 
 namespace {
+
+/**
+ * Mutex and storage for global cluster time via set/getClusterTime.
+ *
+ * We need this to be global so that we can gossip times seen on one connection across to other
+ * connections within the same cluster.
+ */
+stdx::mutex logicalTimeMutex;
+BSONObj latestlogicalTime;
+
 DBClientBase* getConnection(JS::CallArgs& args) {
     auto ret =
         static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()))
@@ -115,18 +132,21 @@ void setCursor(MozJSImplScope* scope,
 
 void setCursorHandle(MozJSImplScope* scope,
                      JS::HandleObject target,
+                     NamespaceString ns,
                      long long cursorId,
                      JS::CallArgs& args) {
     auto client =
         static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
 
     // Copy the client shared pointer to up the refcount.
-    JS_SetPrivate(target, scope->trackedNew<CursorHandleInfo::CursorTracker>(cursorId, *client));
+    JS_SetPrivate(
+        target,
+        scope->trackedNew<CursorHandleInfo::CursorTracker>(std::move(ns), cursorId, *client));
 }
 
 void setHiddenMongo(JSContext* cx,
-                    DBClientWithCommands* resPtr,
-                    DBClientWithCommands* origConn,
+                    DBClientBase* resPtr,
+                    DBClientBase* origConn,
                     JS::CallArgs& args) {
     ObjectWrapper o(cx, args.rval());
     // If the connection that ran the command is the same as conn, then we set a hidden "_mongo"
@@ -168,6 +188,20 @@ void setHiddenMongo(JSContext* cx,
     }
 }
 }  // namespace
+
+BSONObj MongoBase::getClusterTime() {
+    stdx::lock_guard<stdx::mutex> lk(logicalTimeMutex);
+    return latestlogicalTime;
+}
+
+void MongoBase::setClusterTime(const BSONObj& newTime) {
+    stdx::lock_guard<stdx::mutex> lk(logicalTimeMutex);
+    if (latestlogicalTime.isEmpty() ||
+        SimpleBSONElementComparator::kInstance.evaluate(latestlogicalTime["clusterTime"] <
+                                                        newTime["clusterTime"])) {
+        latestlogicalTime = newTime.getOwned();
+    }
+}
 
 void MongoBase::finalize(JSFreeOp* fop, JSObject* obj) {
     auto conn = static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(obj));
@@ -286,6 +320,9 @@ void MongoBase::Functions::find::call(JSContext* cx, JS::CallArgs args) {
     int batchSize = ValueWriter(cx, args.get(5)).toInt32();
     int options = ValueWriter(cx, args.get(6)).toInt32();
 
+    // The shell only calls this method when it wants to test OP_QUERY.
+    options |= DBClientCursor::QueryOptionLocal_forceOpQuery;
+
     std::unique_ptr<DBClientCursor> cursor(
         conn->query(ns, q, nToReturn, nToSkip, haveFields ? &fields : NULL, options, batchSize));
     if (!cursor.get()) {
@@ -337,6 +374,7 @@ void MongoBase::Functions::insert::call(JSContext* cx, JS::CallArgs args) {
         return ValueWriter(cx, value).toBSON();
     };
 
+    Message toSend;
     if (args.get(1).isObject()) {
         bool isArray;
 
@@ -366,13 +404,16 @@ void MongoBase::Functions::insert::call(JSContext* cx, JS::CallArgs args) {
             if (!foundElement)
                 uasserted(ErrorCodes::BadValue, "attempted to insert an empty array");
 
-            conn->insert(ns, bos, flags);
+            toSend = makeInsertMessage(ns, bos.data(), bos.size(), flags);
         } else {
-            conn->insert(ns, addId(args.get(1)));
+            toSend = makeInsertMessage(ns, addId(args.get(1)));
         }
     } else {
-        conn->insert(ns, addId(args.get(1)));
+        toSend = makeInsertMessage(ns, addId(args.get(1)));
     }
+
+    invariant(!toSend.empty());
+    conn->say(toSend);
 
     args.rval().setUndefined();
 }
@@ -399,7 +440,8 @@ void MongoBase::Functions::remove::call(JSContext* cx, JS::CallArgs args) {
         justOne = args.get(2).toBoolean();
     }
 
-    conn->remove(ns, bson, justOne);
+    auto toSend = makeRemoveMessage(ns, bson, justOne ? RemoveOption_JustOne : 0);
+    conn->say(toSend);
     args.rval().setUndefined();
 }
 
@@ -427,35 +469,18 @@ void MongoBase::Functions::update::call(JSContext* cx, JS::CallArgs args) {
     bool upsert = args.length() > 3 && args.get(3).isBoolean() && args.get(3).toBoolean();
     bool multi = args.length() > 4 && args.get(4).isBoolean() && args.get(4).toBoolean();
 
-    conn->update(ns, q1, o1, upsert, multi);
+    auto toSend = makeUpdateMessage(
+        ns, q1, o1, (upsert ? UpdateOption_Upsert : 0) | (multi ? UpdateOption_Multi : 0));
+    conn->say(toSend);
     args.rval().setUndefined();
 }
 
 void MongoBase::Functions::auth::call(JSContext* cx, JS::CallArgs args) {
     auto conn = getConnection(args);
-    if (!conn)
-        uasserted(ErrorCodes::BadValue, "no connection");
+    uassert(ErrorCodes::BadValue, "no connection", conn);
+    uassert(ErrorCodes::BadValue, "mongoAuth takes exactly 1 object argument", args.length() == 1);
 
-    BSONObj params;
-    switch (args.length()) {
-        case 1:
-            params = ValueWriter(cx, args.get(0)).toBSON();
-            break;
-        case 3:
-            params =
-                BSON(saslCommandMechanismFieldName << "MONGODB-CR" << saslCommandUserDBFieldName
-                                                   << ValueWriter(cx, args[0]).toString()
-                                                   << saslCommandUserFieldName
-                                                   << ValueWriter(cx, args[1]).toString()
-                                                   << saslCommandPasswordFieldName
-                                                   << ValueWriter(cx, args[2]).toString());
-            break;
-        default:
-            uasserted(ErrorCodes::BadValue, "mongoAuth takes 1 object or 3 string arguments");
-    }
-
-    conn->auth(params);
-
+    conn->auth(ValueWriter(cx, args.get(0)).toBSON());
     args.rval().setBoolean(true);
 }
 
@@ -495,7 +520,9 @@ void MongoBase::Functions::cursorFromId::call(JSContext* cx, JS::CallArgs args) 
 
     long long cursorId = NumberLongInfo::ToNumberLong(cx, args.get(1));
 
-    auto cursor = stdx::make_unique<DBClientCursor>(conn, ns, cursorId, 0, 0);
+    // The shell only calls this method when it wants to test OP_GETMORE.
+    auto cursor = stdx::make_unique<DBClientCursor>(
+        conn, ns, cursorId, 0, DBClientCursor::QueryOptionLocal_forceOpQuery);
 
     if (args.get(2).isNumber())
         cursor->setBatchSize(ValueWriter(cx, args.get(2)).toInt32());
@@ -511,19 +538,21 @@ void MongoBase::Functions::cursorFromId::call(JSContext* cx, JS::CallArgs args) 
 void MongoBase::Functions::cursorHandleFromId::call(JSContext* cx, JS::CallArgs args) {
     auto scope = getScope(cx);
 
-    if (args.length() != 1) {
-        uasserted(ErrorCodes::BadValue, "cursorHandleFromId needs 1 arg");
-    }
-    if (!scope->getProto<NumberLongInfo>().instanceOf(args.get(0))) {
-        uasserted(ErrorCodes::BadValue, "1st arg must be a NumberLong");
+    if (args.length() != 2) {
+        uasserted(ErrorCodes::BadValue, "cursorHandleFromId needs 2 args");
     }
 
-    long long cursorId = NumberLongInfo::ToNumberLong(cx, args.get(0));
+    if (!scope->getProto<NumberLongInfo>().instanceOf(args.get(1))) {
+        uasserted(ErrorCodes::BadValue, "2nd arg must be a NumberLong");
+    }
+
+    std::string ns = ValueWriter(cx, args.get(0)).toString();
+    long long cursorId = NumberLongInfo::ToNumberLong(cx, args.get(1));
 
     JS::RootedObject c(cx);
     scope->getProto<CursorHandleInfo>().newObject(&c);
 
-    setCursorHandle(scope, c, cursorId, args);
+    setCursorHandle(scope, c, NamespaceString(ns), cursorId, args);
 
     args.rval().setObjectOrNull(c);
 }
@@ -545,7 +574,7 @@ void MongoBase::Functions::copyDatabaseWithSCRAM::call(JSContext* cx, JS::CallAr
     std::string password = ValueWriter(cx, args.get(4)).toString();
     bool slaveOk = ValueWriter(cx, args.get(5)).toBoolean();
 
-    std::string hashedPwd = DBClientWithCommands::createPasswordDigest(user, password);
+    std::string hashedPwd = DBClientBase::createPasswordDigest(user, password);
 
     std::unique_ptr<SaslClientSession> session(new NativeSaslClientSession());
 
@@ -735,6 +764,38 @@ void MongoBase::Functions::getMaxWireVersion::call(JSContext* cx, JS::CallArgs a
     auto conn = getConnection(args);
 
     args.rval().setInt32(conn->getMaxWireVersion());
+}
+
+void MongoBase::Functions::getClusterTime::call(JSContext* cx, JS::CallArgs args) {
+    auto ct = MongoBase::getClusterTime();
+
+    if (!ct.isEmpty()) {
+        ValueReader(cx, args.rval()).fromBSON(MongoBase::getClusterTime(), nullptr, true);
+        return;
+    }
+
+    args.rval().setUndefined();
+}
+
+void MongoBase::Functions::setClusterTime::call(JSContext* cx, JS::CallArgs args) {
+    auto newTime = ObjectWrapper(cx, args.get(0)).toBSON();
+
+    MongoBase::setClusterTime(newTime);
+
+    args.rval().setUndefined();
+}
+
+void MongoBase::Functions::_startSession::call(JSContext* cx, JS::CallArgs args) {
+    auto client =
+        static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(args.thisv().toObjectOrNull()));
+
+    LogicalSessionIdToClient id;
+    id.setId(UUID::gen());
+
+    JS::RootedObject obj(cx);
+    SessionInfo::make(cx, &obj, *client, id.toBSON());
+
+    args.rval().setObjectOrNull(obj.get());
 }
 
 void MongoExternalInfo::Functions::load::call(JSContext* cx, JS::CallArgs args) {

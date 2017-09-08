@@ -34,7 +34,6 @@
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard.h"
-#include "mongo/s/config_server_catalog_cache_loader.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/notification.h"
@@ -57,13 +56,7 @@ class CatalogCache {
     MONGO_DISALLOW_COPYING(CatalogCache);
 
 public:
-    /**
-     * Defaults to instantiating a ConfigServerCatalogCacheLoader.
-     */
-    CatalogCache();
-
-    CatalogCache(std::unique_ptr<CatalogCacheLoader> cacheLoader);
-
+    CatalogCache(CatalogCacheLoader& cacheLoader);
     ~CatalogCache();
 
     /**
@@ -98,6 +91,24 @@ public:
                                          const ChunkVersion& version);
 
     /**
+     * Waits for the persisted collection version to be gte to 'version', or an epoch change. Only
+     * call this function if you KNOW that a version gte WILL eventually be persisted.
+     *
+     * This function cannot wait for a version if nothing is persisted because a collection can
+     * become unsharded after we start waiting and 'version' will then never be reached. If 'nss'
+     * has no persisted metadata, even if it will shortly, a NamespaceNotFound error will be
+     * returned.
+     *
+     * A lock must not be held when calling this because it would prevent using the latest snapshot
+     * and actually seeing the change after it arrives.
+     * This function can throw a DBException if the opCtx is interrupted.
+     * This can only be called on a shard!
+     */
+    Status waitForCollectionVersion(OperationContext* opCtx,
+                                    const NamespaceString& nss,
+                                    const ChunkVersion& version);
+
+    /**
      * Retrieves the cached metadata for the specified database. The returned value is still owned
      * by the cache and should not be kept elsewhere. I.e., it should only be used as a local
      * variable. The reason for this is so that if the cache gets invalidated, the caller does not
@@ -114,8 +125,10 @@ public:
      * with the primary shard for the specified database. If an error occurs loading the metadata
      * returns a failed status.
      */
-    StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfo(OperationContext* opCtx,
-                                                                     const NamespaceString& nss);
+    StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfo(
+        OperationContext* opCtx,
+        const NamespaceString& nss,
+        const repl::ReadConcernLevel& readConcern = repl::ReadConcernLevel::kMajorityReadConcern);
     StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfo(OperationContext* opCtx,
                                                                      StringData ns);
 
@@ -192,19 +205,24 @@ private:
      * Ensures that the specified database is in the cache, loading it if necessary. If the database
      * was not in cache, all the sharded collections will be in the 'needsRefresh' state.
      */
-    std::shared_ptr<DatabaseInfoEntry> _getDatabase(OperationContext* opCtx, StringData dbName);
+    std::shared_ptr<DatabaseInfoEntry> _getDatabase(
+        OperationContext* opCtx,
+        StringData dbName,
+        const repl::ReadConcernLevel& readConcern = repl::ReadConcernLevel::kMajorityReadConcern);
 
     /**
      * Non-blocking call which schedules an asynchronous refresh for the specified namespace. The
      * namespace must be in the 'needRefresh' state.
      */
-    void _scheduleCollectionRefresh_inlock(std::shared_ptr<DatabaseInfoEntry> dbEntry,
-                                           std::shared_ptr<ChunkManager> existingRoutingInfo,
-                                           const NamespaceString& nss,
-                                           int refreshAttempt);
+    void _scheduleCollectionRefresh_inlock(
+        std::shared_ptr<DatabaseInfoEntry> dbEntry,
+        std::shared_ptr<ChunkManager> existingRoutingInfo,
+        const NamespaceString& nss,
+        int refreshAttempt,
+        const repl::ReadConcernLevel& readConcern = repl::ReadConcernLevel::kMajorityReadConcern);
 
     // Interface from which chunks will be retrieved
-    const std::unique_ptr<CatalogCacheLoader> _cacheLoader;
+    CatalogCacheLoader& _cacheLoader;
 
     // Mutex to serialize access to the structures below
     stdx::mutex _mutex;

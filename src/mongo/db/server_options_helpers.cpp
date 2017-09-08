@@ -211,6 +211,14 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
         .setDefault(moe::Value("asio"));
 
     options
+        ->addOptionChaining("net.serviceExecutor",
+                            "serviceExecutor",
+                            moe::String,
+                            "sets the service executor implementation")
+        .hidden()
+        .setDefault(moe::Value("synchronous"));
+
+    options
         ->addOptionChaining(
             "logpath",
             "logpath",
@@ -804,6 +812,25 @@ Status storeServerOptions(const moe::Environment& params) {
             return {ErrorCodes::BadValue,
                     "Unsupported value for transportLayer. Must be \"asio\" or \"legacy\""};
         }
+    }
+
+    if (params.count("net.serviceExecutor")) {
+        auto value = params["net.serviceExecutor"].as<std::string>();
+        if (serverGlobalParams.transportLayer == "legacy") {
+            if (value != "synchronous"_sd) {
+                return {ErrorCodes::BadValue,
+                        "Unsupported value for serviceExecutor with the legacy transportLayer, "
+                        "must be \"synchronous\""};
+            }
+        } else {
+            const auto valid = {"synchronous"_sd, "adaptive"_sd};
+            if (std::find(valid.begin(), valid.end(), value) == valid.end()) {
+                return {ErrorCodes::BadValue, "Unsupported value for serviceExecutor"};
+            }
+        }
+        serverGlobalParams.serviceExecutor = value;
+    } else {
+        serverGlobalParams.serviceExecutor = "synchronous";
     }
 
     if (params.count("security.transitionToAuth")) {

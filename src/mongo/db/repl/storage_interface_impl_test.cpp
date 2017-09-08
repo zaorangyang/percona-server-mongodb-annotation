@@ -131,7 +131,7 @@ int64_t getIndexKeyCount(OperationContext* opCtx, IndexCatalog* cat, IndexDescri
     auto idx = cat->getIndex(desc);
     int64_t numKeys;
     ValidateResults fullRes;
-    idx->validate(opCtx, &numKeys, &fullRes).transitional_ignore();
+    idx->validate(opCtx, &numKeys, &fullRes);
     return numKeys;
 }
 
@@ -1844,7 +1844,7 @@ TEST_F(StorageInterfaceImplTest,
     // Checks that we can update collections with namespaces not considered "legal client system"
     // namespaces.
     NamespaceString nss("local.system.rollback.docs");
-    ASSERT_FALSE(legalClientSystemNS(nss.ns()));
+    ASSERT_FALSE(nss.isLegalClientSystemNS());
 
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;
@@ -2088,7 +2088,7 @@ TEST_F(StorageInterfaceImplTest, DeleteByFilterRemovesDocumentsInIllegalClientSy
     // Checks that we can remove documents from collections with namespaces not considered "legal
     // client system" namespaces.
     NamespaceString nss("local.system.rollback.docs");
-    ASSERT_FALSE(legalClientSystemNS(nss.ns()));
+    ASSERT_FALSE(nss.isLegalClientSystemNS());
 
     auto opCtx = getOperationContext();
     StorageInterfaceImpl storage;

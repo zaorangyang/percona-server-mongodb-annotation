@@ -38,6 +38,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/fsync.h"
+#include "mongo/db/concurrency/global_lock_acquisition_tracker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/curop_metrics.h"
 #include "mongo/db/cursor_manager.h"
@@ -48,11 +49,13 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/read_concern.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/operation_sharding_state.h"
@@ -151,6 +154,7 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
 }
 
 void registerError(OperationContext* opCtx, const DBException& exception) {
+    LastError::get(opCtx->getClient()).setLastError(exception.getCode(), exception.getInfo().msg);
     CurOp::get(opCtx)->debug().exceptionInfo = exception.getInfo();
 }
 
@@ -307,13 +311,21 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(const BSONObj& cmdObj,
 
 void _waitForWriteConcernAndAddToCommandResponse(OperationContext* opCtx,
                                                  const std::string& commandName,
+                                                 const repl::OpTime& lastOpBeforeRun,
                                                  BSONObjBuilder* commandResponseBuilder) {
+    auto lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+
+    // Ensures that if we tried to do a write, we wait for write concern, even if that write was
+    // a noop.
+    if ((lastOpAfterRun == lastOpBeforeRun) &&
+        GlobalLockAcquisitionTracker::get(opCtx).getGlobalExclusiveLockTaken()) {
+        repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+        lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    }
+
     WriteConcernResult res;
     auto waitForWCStatus =
-        waitForWriteConcern(opCtx,
-                            repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
-                            opCtx->getWriteConcern(),
-                            &res);
+        waitForWriteConcern(opCtx, lastOpAfterRun, opCtx->getWriteConcern(), &res);
     Command::appendCommandWCStatus(*commandResponseBuilder, waitForWCStatus, res);
 
     // SERVER-22421: This code is to ensure error response backwards compatibility with the
@@ -425,7 +437,6 @@ bool runCommandImpl(OperationContext* opCtx,
         return result;
     }
 
-    std::string errmsg;
     bool result;
     if (!command->supportsWriteConcern(cmd)) {
         if (commandSpecifiesWriteConcern(cmd)) {
@@ -437,7 +448,7 @@ bool runCommandImpl(OperationContext* opCtx,
             return result;
         }
 
-        result = command->enhancedRun(opCtx, request, errmsg, inPlaceReplyBob);
+        result = command->enhancedRun(opCtx, request, inPlaceReplyBob);
     } else {
         auto wcResult = extractWriteConcern(opCtx, cmd, db);
         if (!wcResult.isOK()) {
@@ -447,16 +458,18 @@ bool runCommandImpl(OperationContext* opCtx,
             return result;
         }
 
+        auto lastOpBeforeRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+
         // Change the write concern while running the command.
         const auto oldWC = opCtx->getWriteConcern();
         ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
         opCtx->setWriteConcern(wcResult.getValue());
         ON_BLOCK_EXIT([&] {
             _waitForWriteConcernAndAddToCommandResponse(
-                opCtx, command->getName(), &inPlaceReplyBob);
+                opCtx, command->getName(), lastOpBeforeRun, &inPlaceReplyBob);
         });
 
-        result = command->enhancedRun(opCtx, request, errmsg, inPlaceReplyBob);
+        result = command->enhancedRun(opCtx, request, inPlaceReplyBob);
 
         // Nothing in run() should change the writeConcern.
         dassert(SimpleBSONObjComparator::kInstance.evaluate(opCtx->getWriteConcern().toBSON() ==
@@ -481,7 +494,7 @@ bool runCommandImpl(OperationContext* opCtx,
         }
     }
 
-    Command::appendCommandStatus(inPlaceReplyBob, result, errmsg);
+    Command::appendCommandStatus(inPlaceReplyBob, result);
 
     auto operationTime = computeOperationTime(
         opCtx, startOperationTime, readConcernArgsStatus.getValue().getLevel());
@@ -527,7 +540,7 @@ void execCommandDatabase(OperationContext* opCtx,
         rpc::readRequestMetadata(opCtx, request.body);
         rpc::TrackingMetadata::get(opCtx).initWithOperName(command->getName());
 
-        initializeOperationSessionInfo(opCtx, request.body);
+        initializeOperationSessionInfo(opCtx, request.body, command->requiresAuth());
 
         std::string dbname = request.getDatabase().toString();
         uassert(
@@ -574,13 +587,13 @@ void execCommandDatabase(OperationContext* opCtx,
         OperationContextSession sessionTxnState(opCtx);
 
         ImpersonationSessionGuard guard(opCtx);
-        uassertStatusOK(Command::checkAuthorization(command, opCtx, dbname, request.body));
+        uassertStatusOK(Command::checkAuthorization(command, opCtx, request));
 
         repl::ReplicationCoordinator* replCoord =
             repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
         const bool iAmPrimary = replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbname);
 
-        {
+        if (!opCtx->getClient()->isInDirectClient()) {
             bool commandCanRunOnSecondary = command->slaveOk();
 
             bool commandIsOverriddenToRunOnSecondary =
@@ -642,9 +655,8 @@ void execCommandDatabase(OperationContext* opCtx,
             opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
         }
 
-        // Operations are only versioned against the primary. We also make sure not to redo shard
-        // version handling if this command was issued via the direct client.
-        if (iAmPrimary && !opCtx->getClient()->isInDirectClient()) {
+        // We do not redo shard version handling if this command was issued via the direct client.
+        if (!opCtx->getClient()->isInDirectClient()) {
             // Handle a shard version that may have been sent along with the command.
             auto commandNS = NamespaceString(command->parseNs(dbname, request.body));
             auto& oss = OperationShardingState::get(opCtx);
@@ -803,61 +815,6 @@ DbResponse runCommands(OperationContext* opCtx, const Message& message) {
 
     // TODO exhaust
     return DbResponse{std::move(response)};
-}
-
-// In SERVER-7775 we reimplemented the pseudo-commands fsyncUnlock, inProg, and killOp
-// as ordinary commands. To support old clients for another release, this helper serves
-// to execute the real command from the legacy pseudo-command codepath.
-// TODO: remove after MongoDB 3.2 is released
-DbResponse receivedPseudoCommand(OperationContext* opCtx,
-                                 Client& client,
-                                 const Message& message,
-                                 StringData realCommandName) {
-    DbMessage originalDbm(message);
-
-    auto originalNToSkip = originalDbm.pullInt();
-
-    uassert(ErrorCodes::InvalidOptions,
-            str::stream() << "invalid nToSkip - expected 0, but got " << originalNToSkip,
-            originalNToSkip == 0);
-
-    auto originalNToReturn = originalDbm.pullInt();
-
-    uassert(ErrorCodes::InvalidOptions,
-            str::stream() << "invalid nToReturn - expected -1 or 1, but got " << originalNToSkip,
-            originalNToReturn == -1 || originalNToReturn == 1);
-
-    auto cmdParams = originalDbm.nextJsObj();
-
-    Message interposed;
-    // HACK:
-    // legacy pseudo-commands could run on any database. The command replacements
-    // can only run on 'admin'. To avoid breaking old shells and a multitude
-    // of third-party tools, we rewrite the namespace. As auth is checked
-    // later in Command::_checkAuthorizationImpl, we will still properly
-    // reject the request if the client is not authorized.
-    NamespaceString interposedNss("admin", "$cmd");
-
-    BSONObjBuilder cmdBob;
-    cmdBob.append(realCommandName, 1);
-    cmdBob.appendElements(cmdParams);
-    auto cmd = cmdBob.done();
-
-    BufBuilder cmdMsgBuf;
-
-    int32_t flags = DataView(message.header().data()).read<LittleEndian<int32_t>>();
-    cmdMsgBuf.appendNum(flags);
-
-    cmdMsgBuf.appendStr(interposedNss.db(), false);  // not including null byte
-    cmdMsgBuf.appendStr(".$cmd");
-    cmdMsgBuf.appendNum(0);  // ntoskip
-    cmdMsgBuf.appendNum(1);  // ntoreturn
-    cmdMsgBuf.appendBuf(cmd.objdata(), cmd.objsize());
-
-    interposed.setData(dbQuery, cmdMsgBuf.buf(), cmdMsgBuf.len());
-    interposed.header().setId(message.header().getId());
-
-    return runCommands(opCtx, interposed);
 }
 
 DbResponse receivedQuery(OperationContext* opCtx,
@@ -1075,20 +1032,6 @@ DbResponse ServiceEntryPointMongod::handleRequest(OperationContext* opCtx, const
         if (nsString.isCommand()) {
             isCommand = true;
             opwrite(m);
-        }
-        // TODO: remove this entire code path after 3.2. Refs SERVER-7775
-        else if (nsString.isSpecialCommand()) {
-            opwrite(m);
-
-            if (nsString.coll() == "$cmd.sys.inprog") {
-                return receivedPseudoCommand(opCtx, c, m, "currentOp");
-            }
-            if (nsString.coll() == "$cmd.sys.killop") {
-                return receivedPseudoCommand(opCtx, c, m, "killOp");
-            }
-            if (nsString.coll() == "$cmd.sys.unlock") {
-                return receivedPseudoCommand(opCtx, c, m, "fsyncUnlock");
-            }
         } else {
             opread(m);
         }

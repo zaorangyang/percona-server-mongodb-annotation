@@ -83,6 +83,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
@@ -109,7 +110,6 @@ using std::vector;
 using IndexVersion = IndexDescriptor::IndexVersion;
 
 namespace repl {
-std::string rsOplogName = "local.oplog.rs";
 std::string masterSlaveOplogName = "local.oplog.$main";
 
 MONGO_FP_DECLARE(disableSnapshotting);
@@ -145,11 +145,6 @@ struct OplogSlot {
  * Allocates an optime for a new entry in the oplog, and updates the replication coordinator to
  * reflect that new optime.  Returns the new optime and the correct value of the "h" field for
  * the new oplog entry.
- *
- * NOTE: From the time this function returns to the time that the new oplog entry is written
- * to the storage system, all errors must be considered fatal.  This is because the this
- * function registers the new optime with the storage system and the replication coordinator,
- * and provides no facility to revert those registrations on rollback.
  */
 void getNextOpTime(OperationContext* opCtx,
                    Collection* oplog,
@@ -228,9 +223,52 @@ private:
 void setOplogCollectionName() {
     if (getGlobalReplicationCoordinator()->getReplicationMode() ==
         ReplicationCoordinator::modeReplSet) {
-        _oplogCollectionName = rsOplogName;
+        _oplogCollectionName = NamespaceString::kRsOplogNamespace.ns();
     } else {
         _oplogCollectionName = masterSlaveOplogName;
+    }
+}
+
+void createIndexForApplyOps(OperationContext* opCtx,
+                            const BSONObj& indexSpec,
+                            const NamespaceString& indexNss,
+                            IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
+    // Check if collection exists.
+    Database* db = dbHolder().get(opCtx, indexNss.ns());
+    auto indexCollection = db ? db->getCollection(opCtx, indexNss) : nullptr;
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "Failed to create index due to missing collection: " << indexNss.ns(),
+            indexCollection);
+
+    OpCounters* opCounters = opCtx->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
+    opCounters->gotInsert();
+
+    bool relaxIndexConstraints =
+        ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, indexNss);
+    if (indexSpec["background"].trueValue()) {
+        Lock::TempRelease release(opCtx->lockState());
+        if (opCtx->lockState()->isLocked()) {
+            // If TempRelease fails, background index build will deadlock.
+            LOG(3) << "apply op: building background index " << indexSpec
+                   << " in the foreground because temp release failed";
+            IndexBuilder builder(indexSpec, relaxIndexConstraints);
+            Status status = builder.buildInForeground(opCtx, db);
+            uassertStatusOK(status);
+        } else {
+            IndexBuilder* builder = new IndexBuilder(indexSpec, relaxIndexConstraints);
+            // This spawns a new thread and returns immediately.
+            builder->go();
+            // Wait for thread to start and register itself
+            IndexBuilder::waitForBgIndexStarting();
+        }
+        opCtx->recoveryUnit()->abandonSnapshot();
+    } else {
+        IndexBuilder builder(indexSpec, relaxIndexConstraints);
+        Status status = builder.buildInForeground(opCtx, db);
+        uassertStatusOK(status);
+    }
+    if (incrementOpsAppliedStats) {
+        incrementOpsAppliedStats();
     }
 }
 
@@ -251,6 +289,39 @@ Collection* getLocalOplogCollection(OperationContext* opCtx,
     return _localOplogCollection;
 }
 
+/**
+ * Attaches the session information of a write to an oplog entry if it exists.
+ */
+void appendSessionInfo(OperationContext* opCtx,
+                       BSONObjBuilder* builder,
+                       StmtId statementId,
+                       const Timestamp& prevTs) {
+    auto txnNum = opCtx->getTxnNumber();
+
+    if (!txnNum) {
+        return;
+    }
+
+    auto logicalSessionId = opCtx->getLogicalSessionId();
+    invariant(logicalSessionId);
+
+    // Note: certain operations, like implicit collection creation will not have a stmtId.
+    if (statementId == kUninitializedStmtId) {
+        return;
+    }
+
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setSessionId(*logicalSessionId);
+    sessionInfo.setTxnNumber(txnNum);
+    sessionInfo.serialize(builder);
+
+    builder->append(OplogEntryBase::kStatementIdFieldName, statementId);
+
+    auto session = OperationContextSession::get(opCtx);
+    invariant(session);
+    builder->append(OplogEntryBase::kPrevWriteTsInTransactionFieldName, prevTs);
+}
+
 OplogDocWriter _logOpWriter(OperationContext* opCtx,
                             const char* opstr,
                             const NamespaceString& nss,
@@ -261,7 +332,8 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
                             OpTime optime,
                             long long hashNew,
                             Date_t wallTime,
-                            StmtId statementId) {
+                            StmtId statementId,
+                            const Timestamp& prevTs) {
     BSONObjBuilder b(256);
 
     b.append("ts", optime.getTimestamp());
@@ -271,7 +343,9 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
     b.append("v", OplogEntry::kOplogVersion);
     b.append("op", opstr);
     b.append("ns", nss.ns());
-    if (uuid)
+    if (uuid &&
+        repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+            repl::ReplicationCoordinator::modeMasterSlave)
         uuid->appendToBuilder(&b, "ui");
     if (fromMigrate)
         b.appendBool("fromMigrate", true);
@@ -284,9 +358,7 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
         b.appendDate("wall", wallTime);
     }
 
-    if (statementId != kUninitializedStmtId) {
-        // TODO: SERVER-28912 append stmtId to oplog entry
-    }
+    appendSessionInfo(opCtx, &b, statementId, prevTs);
 
     return OplogDocWriter(OplogDocWriter(b.obj(), obj));
 }
@@ -294,14 +366,15 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
 
 // Truncates the oplog after and including the "truncateTimestamp" entry.
 void truncateOplogTo(OperationContext* opCtx, Timestamp truncateTimestamp) {
-    const NamespaceString oplogNss(rsOplogName);
+    const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
     AutoGetDb autoDb(opCtx, oplogNss.db(), MODE_IX);
     Lock::CollectionLock oplogCollectionLoc(opCtx->lockState(), oplogNss.ns(), MODE_X);
     Collection* oplogCollection = autoDb.getDb()->getCollection(opCtx, oplogNss);
     if (!oplogCollection) {
         fassertFailedWithStatusNoTrace(
             34418,
-            Status(ErrorCodes::NamespaceNotFound, str::stream() << "Can't find " << rsOplogName));
+            Status(ErrorCodes::NamespaceNotFound,
+                   str::stream() << "Can't find " << NamespaceString::kRsOplogNamespace.ns()));
     }
 
     // Scan through oplog in reverse, from latest entry to first, to find the truncateTimestamp.
@@ -390,9 +463,11 @@ OpTime logOp(OperationContext* opCtx,
              OptionalCollectionUUID uuid,
              const BSONObj& obj,
              const BSONObj* o2,
-             bool fromMigrate) {
+             bool fromMigrate,
+             StmtId statementId) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->isOplogDisabledFor(opCtx, nss)) {
+        invariant(statementId == kUninitializedStmtId);
         return {};
     }
 
@@ -403,7 +478,11 @@ OpTime logOp(OperationContext* opCtx,
     OplogSlot slot;
     getNextOpTime(opCtx, oplog, replCoord, replMode, 1, &slot);
 
-    // TODO: SERVER-28912 Include statementId for other ops
+    Timestamp prevTs;
+    if (auto session = OperationContextSession::get(opCtx)) {
+        prevTs = session->getLastWriteOpTimeTs();
+    }
+
     auto writer = _logOpWriter(opCtx,
                                opstr,
                                nss,
@@ -414,23 +493,25 @@ OpTime logOp(OperationContext* opCtx,
                                slot.opTime,
                                slot.hash,
                                Date_t::now(),
-                               kUninitializedStmtId);
+                               statementId,
+                               prevTs);
     const DocWriter* basePtr = &writer;
     _logOpsInner(opCtx, nss, &basePtr, 1, oplog, replMode, slot.opTime);
     return slot.opTime;
 }
 
-void logInsertOps(OperationContext* opCtx,
-                  const NamespaceString& nss,
-                  OptionalCollectionUUID uuid,
-                  std::vector<InsertStatement>::const_iterator begin,
-                  std::vector<InsertStatement>::const_iterator end,
-                  bool fromMigrate) {
+repl::OpTime logInsertOps(OperationContext* opCtx,
+                          const NamespaceString& nss,
+                          OptionalCollectionUUID uuid,
+                          std::vector<InsertStatement>::const_iterator begin,
+                          std::vector<InsertStatement>::const_iterator end,
+                          bool fromMigrate) {
     invariant(begin != end);
 
     auto replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->isOplogDisabledFor(opCtx, nss)) {
-        return;
+        invariant(begin->stmtId == kUninitializedStmtId);
+        return {};
     }
 
     const size_t count = end - begin;
@@ -443,6 +524,12 @@ void logInsertOps(OperationContext* opCtx,
     auto replMode = replCoord->getReplicationMode();
     getNextOpTime(opCtx, oplog, replCoord, replMode, count, slots.get());
     auto wallTime = Date_t::now();
+
+    Timestamp prevTs;
+    if (auto session = OperationContextSession::get(opCtx)) {
+        prevTs = session->getLastWriteOpTimeTs();
+    }
+
     for (size_t i = 0; i < count; i++) {
         auto insertStatement = begin[i];
         writers.emplace_back(_logOpWriter(opCtx,
@@ -455,7 +542,9 @@ void logInsertOps(OperationContext* opCtx,
                                           slots[i].opTime,
                                           slots[i].hash,
                                           wallTime,
-                                          insertStatement.stmtId));
+                                          insertStatement.stmtId,
+                                          prevTs));
+        prevTs = slots[i].opTime.getTimestamp();
     }
 
     std::unique_ptr<DocWriter const* []> basePtrs(new DocWriter const*[count]);
@@ -463,6 +552,8 @@ void logInsertOps(OperationContext* opCtx,
         basePtrs[i] = &writers[i];
     }
     _logOpsInner(opCtx, nss, basePtrs.get(), count, oplog, replMode, slots[count - 1].opTime);
+
+    return slots[count - 1].opTime;
 }
 
 namespace {
@@ -601,49 +692,6 @@ NamespaceString parseUUIDorNs(OperationContext* opCtx,
     return ui.ok() ? parseUUID(opCtx, ui) : parseNs(ns, cmd);
 }
 
-void createIndexForApplyOps(OperationContext* opCtx,
-                            const BSONObj& indexSpec,
-                            const NamespaceString& indexNss,
-                            IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
-    // Check if collection exists.
-    Database* db = dbHolder().get(opCtx, indexNss.ns());
-    auto indexCollection = db ? db->getCollection(opCtx, indexNss) : nullptr;
-    uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "Failed to create index due to missing collection: " << indexNss.ns(),
-            indexCollection);
-
-    OpCounters* opCounters = opCtx->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
-    opCounters->gotInsert();
-
-    bool relaxIndexConstraints =
-        ReplicationCoordinator::get(opCtx)->shouldRelaxIndexConstraints(opCtx, indexNss);
-    if (indexSpec["background"].trueValue()) {
-        Lock::TempRelease release(opCtx->lockState());
-        if (opCtx->lockState()->isLocked()) {
-            // If TempRelease fails, background index build will deadlock.
-            LOG(3) << "apply op: building background index " << indexSpec
-                   << " in the foreground because temp release failed";
-            IndexBuilder builder(indexSpec, relaxIndexConstraints);
-            Status status = builder.buildInForeground(opCtx, db);
-            uassertStatusOK(status);
-        } else {
-            IndexBuilder* builder = new IndexBuilder(indexSpec, relaxIndexConstraints);
-            // This spawns a new thread and returns immediately.
-            builder->go();
-            // Wait for thread to start and register itself
-            IndexBuilder::waitForBgIndexStarting();
-        }
-        opCtx->recoveryUnit()->abandonSnapshot();
-    } else {
-        IndexBuilder builder(indexSpec, relaxIndexConstraints);
-        Status status = builder.buildInForeground(opCtx, db);
-        uassertStatusOK(status);
-    }
-    if (incrementOpsAppliedStats) {
-        incrementOpsAppliedStats();
-    }
-}
-
 using OpApplyFn = stdx::function<Status(OperationContext* opCtx,
                                         const char* ns,
                                         const BSONElement& ui,
@@ -717,8 +765,23 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime) -> Status {
-          BSONObjBuilder resultWeDontCareAbout;
-          return collMod(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
+          // Get UUID from cmd, if it exists.
+          OptionalCollectionUUID uuid;
+          NamespaceString nss;
+          if (ui.eoo()) {
+              uuid = boost::none;
+              nss = parseNs(ns, cmd);
+          } else {
+              uuid = uassertStatusOK(UUID::parse(ui));
+              // We need to see whether a collection with UUID ui exists before attempting to do
+              // a collMod on it. This is because we add UUIDs during upgrade to
+              // featureCompatibilityVersion 3.6 with a collMod command, so the collection will
+              // not have a UUID at the time we attempt to look it up by UUID.
+              auto& catalog = UUIDCatalog::get(opCtx);
+              nss = catalog.lookupCollectionByUUID(uuid.get()) ? catalog.lookupNSSByUUID(uuid.get())
+                                                               : parseNs(ns, cmd);
+          }
+          return collModForUUIDUpgrade(opCtx, nss, cmd, uuid);
       },
       {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
     {"dropDatabase",
@@ -895,14 +958,16 @@ Status applyOperation_inlock(OperationContext* opCtx,
     Collection* collection = nullptr;
     if (fieldUI) {
         UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
-        auto uuid = UUID::parse(fieldUI);
-        uassertStatusOK(uuid);
-        collection = catalog.lookupCollectionByUUID(uuid.getValue());
-        if (collection) {
-            requestNss = collection->ns();
-            dassert(opCtx->lockState()->isCollectionLockedForMode(
-                requestNss.ns(), supportsDocLocking() ? MODE_IX : MODE_X));
-        }
+        auto uuid = uassertStatusOK(UUID::parse(fieldUI));
+        collection = catalog.lookupCollectionByUUID(uuid);
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "Failed to apply operation due to missing collection (" << uuid
+                              << "): "
+                              << redact(op.toString()),
+                collection);
+        requestNss = collection->ns();
+        dassert(opCtx->lockState()->isCollectionLockedForMode(
+            requestNss.ns(), supportsDocLocking() ? MODE_IX : MODE_X));
     } else {
         uassert(ErrorCodes::InvalidNamespace,
                 "'ns' must be of type String",
@@ -991,7 +1056,6 @@ Status applyOperation_inlock(OperationContext* opCtx,
             // 2. If okay, commit
             // 3. If not, do upsert (and commit)
             // 4. If both !Ok, return status
-            Status status{ErrorCodes::NotYetInitialized, ""};
 
             // We cannot rely on a DuplicateKey error if we'repart of a larger transaction, because
             // that would require the transaction to abort. So instead, use upsert in that case.
@@ -999,13 +1063,9 @@ Status applyOperation_inlock(OperationContext* opCtx,
 
             if (!needToDoUpsert) {
                 WriteUnitOfWork wuow(opCtx);
-                try {
-                    OpDebug* const nullOpDebug = nullptr;
-                    status =
-                        collection->insertDocument(opCtx, InsertStatement(o), nullOpDebug, true);
-                } catch (DBException dbe) {
-                    status = dbe.toStatus();
-                }
+                OpDebug* const nullOpDebug = nullptr;
+                auto status =
+                    collection->insertDocument(opCtx, InsertStatement(o), nullOpDebug, true);
                 if (status.isOK()) {
                     wuow.commit();
                 } else if (status == ErrorCodes::DuplicateKey) {
@@ -1397,7 +1457,8 @@ void SnapshotThread::run() {
 
             auto opTimeOfSnapshot = OpTime();
             {
-                AutoGetCollectionForReadCommand oplog(opCtx.get(), NamespaceString(rsOplogName));
+                AutoGetCollectionForReadCommand oplog(opCtx.get(),
+                                                      NamespaceString::kRsOplogNamespace);
                 invariant(oplog.getCollection());
                 // Read the latest op from the oplog.
                 auto cursor = oplog.getCollection()->getCursor(opCtx.get(), /*forward*/ false);

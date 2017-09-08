@@ -43,9 +43,9 @@
 namespace mongo {
 namespace {
 
-class GetShardVersion : public Command {
+class GetShardVersion : public BasicCommand {
 public:
-    GetShardVersion() : Command("getShardVersion", "getshardversion") {}
+    GetShardVersion() : BasicCommand("getShardVersion", "getshardversion") {}
 
     bool slaveOk() const override {
         return true;
@@ -82,7 +82,6 @@ public:
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
-             std::string& errmsg,
              BSONObjBuilder& result) override {
         const NamespaceString nss(parseNs(dbname, cmdObj));
 

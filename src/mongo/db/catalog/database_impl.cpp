@@ -44,6 +44,7 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/namespace_uuid_cache.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/clientcursor.h"
@@ -66,6 +67,8 @@
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/system_index.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/platform/random.h"
+#include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
@@ -218,8 +221,19 @@ Collection* DatabaseImpl::_getOrCreateCollectionInstance(OperationContext* opCtx
     invariant(rs.get());  // if cce exists, so should this
 
     // Not registering AddCollectionChange since this is for collections that already exist.
-    Collection* c = new Collection(opCtx, nss.ns(), uuid, cce.release(), rs.release(), _dbEntry);
-    return c;
+    Collection* coll = new Collection(opCtx, nss.ns(), uuid, cce.release(), rs.release(), _dbEntry);
+    if (uuid) {
+        // We are not in a WUOW only when we are called from Database::init(). There is no need
+        // to rollback UUIDCatalog changes because we are initializing existing collections.
+        auto&& uuidCatalog = UUIDCatalog::get(opCtx);
+        if (!opCtx->lockState()->inAWriteUnitOfWork()) {
+            uuidCatalog.registerUUIDCatalogEntry(uuid.get(), coll);
+        } else {
+            uuidCatalog.onCreateCollection(opCtx, coll, uuid.get());
+        }
+    }
+
+    return coll;
 }
 
 DatabaseImpl::DatabaseImpl(Database* const this_,
@@ -515,18 +529,36 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 
     // MMAPv1 requires that index namespaces are subject to the same length constraints as indexes
     // in collections that are not in a drop-pending state. Therefore, we check if the drop-pending
-    // namespace is too long for the index names in the collection.
+    // namespace is too long for any index names in the collection.
     if (opCtx->getServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
-        auto status = dpns.checkLengthForRename(
-            collection->getIndexCatalog()->getLongestIndexNameLength(opCtx));
-        if (!status.isOK()) {
-            log() << "dropCollection: " << fullns
-                  << " - cannot proceed with collection rename for pending-drop: " << status
-                  << ". Dropping collection immediately.";
-            fassertStatusOK(40463, _finishDropCollection(opCtx, fullns, collection));
-            return Status::OK();
+
+        // Compile a list of any indexes that would become too long following the drop-pending
+        // rename. In the case that this collection drop gets rolled back, this will incur a
+        // performance hit, since those indexes will have to be rebuilt from scratch, but data
+        // integrity is maintained.
+        std::vector<IndexDescriptor*> indexesToDrop;
+        auto indexIter = collection->getIndexCatalog()->getIndexIterator(opCtx, true);
+
+        // Determine which index names are too long.
+        while (indexIter.more()) {
+            auto index = indexIter.next();
+            auto status = dpns.checkLengthForRename(index->indexName().size());
+            if (!status.isOK()) {
+                indexesToDrop.push_back(index);
+            }
+        }
+
+        // Drop the offending indexes.
+        for (auto&& index : indexesToDrop) {
+            log() << "dropCollection: " << fullns << " - index namespace '"
+                  << index->indexNamespace()
+                  << "' would be too long after drop-pending rename. Dropping index immediately.";
+            fassertStatusOK(40463, collection->getIndexCatalog()->dropIndex(opCtx, index));
+            opObserver->onDropIndex(
+                opCtx, fullns, collection->uuid(), index->indexName(), index->infoObj());
         }
     }
+
 
     // Rename collection using drop-pending namespace generated from drop optime.
     const bool stayTemp = true;
@@ -651,7 +683,10 @@ Collection* DatabaseImpl::getOrCreateCollection(OperationContext* opCtx,
 void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
                                              const NamespaceString& nss,
                                              const CollectionOptions& options) {
-    massert(17399, "collection already exists", getCollection(opCtx, nss) == nullptr);
+    massert(17399,
+            str::stream() << "Cannot create collection " << nss.ns()
+                          << " - collection already exists.",
+            getCollection(opCtx, nss) == nullptr);
     massertNamespaceNotIndex(nss.ns(), "createCollection");
 
     uassert(14037,
@@ -701,8 +736,10 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     invariant(!options.isView());
 
     CollectionOptions optionsWithUUID = options;
-    if (enableCollectionUUIDs && !optionsWithUUID.uuid)
+    if (enableCollectionUUIDs && !optionsWithUUID.uuid &&
+        serverGlobalParams.featureCompatibility.isSchemaVersion36.load() == true) {
         optionsWithUUID.uuid.emplace(CollectionUUID::gen());
+    }
 
     NamespaceString nss(ns);
     _checkCanCreateCollection(opCtx, nss, optionsWithUUID);
@@ -761,10 +798,8 @@ void DatabaseImpl::dropDatabase(OperationContext* opCtx, Database* db) {
 
     audit::logDropDatabase(opCtx->getClient(), name);
 
-    UUIDCatalog::get(opCtx).onCloseDatabase(db);
     for (auto&& coll : *db) {
         Top::get(opCtx->getClient()->getServiceContext()).collectionDropped(coll->ns().ns(), true);
-        NamespaceUUIDCache::get(opCtx).evictNamespace(coll->ns());
     }
 
     dbHolder().close(opCtx, name, "database dropped");
@@ -775,6 +810,69 @@ void DatabaseImpl::dropDatabase(OperationContext* opCtx, Database* db) {
             ->dropDatabase(opCtx, name)
             .transitional_ignore();
     });
+}
+
+StatusWith<NamespaceString> DatabaseImpl::makeUniqueCollectionNamespace(
+    OperationContext* opCtx, StringData collectionNameModel) {
+    invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_X));
+
+    // There must be at least one percent sign within the first MaxNsCollectionLen characters of the
+    // generated namespace after accounting for the database name prefix and dot separator:
+    //     <db>.<truncated collection model name>
+    auto maxModelLength = NamespaceString::MaxNsCollectionLen - (_name.length() + 1);
+    auto model = collectionNameModel.substr(0, maxModelLength);
+    auto numPercentSign = std::count(model.begin(), model.end(), '%');
+    if (numPercentSign == 0) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Cannot generate collection name for temporary collection: "
+                                       "model for collection name "
+                                    << collectionNameModel
+                                    << " must contain at least one percent sign within first "
+                                    << maxModelLength
+                                    << " characters.");
+    }
+
+    if (!_uniqueCollectionNamespacePseudoRandom) {
+        Timestamp ts;
+        _uniqueCollectionNamespacePseudoRandom =
+            stdx::make_unique<PseudoRandom>(Date_t::now().asInt64());
+    }
+
+    const auto charsToChooseFrom =
+        "0123456789"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"_sd;
+    invariant((10U + 26U * 2) == charsToChooseFrom.size());
+
+    auto replacePercentSign = [&, this](const auto& c) {
+        if (c != '%') {
+            return c;
+        }
+        auto i = _uniqueCollectionNamespacePseudoRandom->nextInt32(charsToChooseFrom.size());
+        return charsToChooseFrom[i];
+    };
+
+    auto numGenerationAttempts = numPercentSign * charsToChooseFrom.size() * 100U;
+    for (decltype(numGenerationAttempts) i = 0; i < numGenerationAttempts; ++i) {
+        auto collectionName = model.toString();
+        std::transform(collectionName.begin(),
+                       collectionName.end(),
+                       collectionName.begin(),
+                       replacePercentSign);
+
+        NamespaceString nss(_name, collectionName);
+        if (!getCollection(opCtx, nss)) {
+            return nss;
+        }
+    }
+
+    return Status(
+        ErrorCodes::NamespaceExists,
+        str::stream() << "Cannot generate collection name for temporary collection with model "
+                      << collectionNameModel
+                      << " after "
+                      << numGenerationAttempts
+                      << " attempts due to namespace conflicts with existing collections.");
 }
 
 namespace {

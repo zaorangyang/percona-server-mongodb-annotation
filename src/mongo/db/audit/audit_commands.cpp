@@ -40,9 +40,9 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 namespace mongo {
 
-    class AuditCommand : public Command {
+    class AuditCommand : public ErrmsgCommandDeprecated {
     public:
-        AuditCommand(const char *name, const char *oldName=NULL) : Command(name, oldName) {}
+        AuditCommand(const char *name, const char *oldName=NULL) : ErrmsgCommandDeprecated(name, oldName) {}
         virtual ~AuditCommand() {}
         // TODO: Investigate if any other Command class virtual
         // methods need to be overridden.
@@ -74,7 +74,7 @@ namespace mongo {
             out->push_back(Privilege(ResourcePattern::forAnyNormalResource(), actions));
         }
 
-        bool run(OperationContext* txn, const std::string& dbname, const BSONObj& jsobj, std::string& errmsg, BSONObjBuilder& result) override {
+        bool errmsgRun(OperationContext* txn, const std::string& dbname, const BSONObj& jsobj, std::string& errmsg, BSONObjBuilder& result) override {
             bool ok = true;
             const BSONElement &e = jsobj["logApplicationMessage"];
 
@@ -103,7 +103,7 @@ namespace mongo {
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) { }
 
-        bool run(OperationContext* txn, const std::string& dbname, const BSONObj& jsobj, std::string& errmsg, BSONObjBuilder& result) override {
+        bool errmsgRun(OperationContext* txn, const std::string& dbname, const BSONObj& jsobj, std::string& errmsg, BSONObjBuilder& result) override {
             result.appendElements(auditOptions.toBSON());
             return true;
         }

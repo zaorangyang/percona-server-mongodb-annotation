@@ -14,7 +14,7 @@ function showExtUsersRun(){
 
   var findtest=0
 
-  db.getSiblingDB( '$external' ).system.users.find().forEach(
+  db.getSiblingDB( '$external' ).getUsers().forEach(
     function(u) {
       printjson(u);
       findtest++;

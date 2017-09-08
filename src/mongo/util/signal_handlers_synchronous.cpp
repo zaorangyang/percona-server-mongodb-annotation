@@ -48,7 +48,6 @@
 #include "mongo/platform/compiler.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/concurrency/thread_name.h"
-#include "mongo/util/concurrency/threadlocal.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/debugger.h"
 #include "mongo/util/exception_filter_win32.h"
@@ -156,12 +155,12 @@ public:
 
 private:
     static stdx::mutex _streamMutex;
-    static MONGO_TRIVIALLY_CONSTRUCTIBLE_THREAD_LOCAL int terminateDepth;
+    static thread_local int terminateDepth;
     stdx::unique_lock<stdx::mutex> _lk;
 };
+
 stdx::mutex MallocFreeOStreamGuard::_streamMutex;
-MONGO_TRIVIALLY_CONSTRUCTIBLE_THREAD_LOCAL
-int MallocFreeOStreamGuard::terminateDepth = 0;
+thread_local int MallocFreeOStreamGuard::terminateDepth = 0;
 
 // must hold MallocFreeOStreamGuard to call
 void writeMallocFreeStreamToLog() {
@@ -283,6 +282,10 @@ void abruptQuitWithAddrSignal(int signalNum, siginfo_t* siginfo, void*) {
 
 }  // namespace
 
+#if !defined(__has_feature)
+#define __has_feature(x) 0
+#endif
+
 void setupSynchronousSignalHandlers() {
     std::set_terminate(myTerminate);
     std::set_new_handler(reportOutOfMemoryErrorAndExit);
@@ -311,7 +314,28 @@ void setupSynchronousSignalHandlers() {
 
         // ^\ is the stronger ^C. Log and quit hard without waiting for cleanup.
         invariant(sigaction(SIGQUIT, &plainSignals, nullptr) == 0);
+
+#if __has_feature(address_sanitizer)
+        // Sanitizers may be configured to call abort(). If so, we should omit our signal handler.
+        bool shouldRegister = true;
+        constexpr std::array<StringData, 5> sanitizerConfigVariable{"ASAN_OPTIONS"_sd,
+                                                                    "TSAN_OPTIONS"_sd,
+                                                                    "MSAN_OPTIONS"_sd,
+                                                                    "UBSAN_OPTIONS"_sd,
+                                                                    "LSAN_OPTIONS"_sd};
+        for (const StringData& option : sanitizerConfigVariable) {
+            StringData configString(getenv(option.rawData()));
+            if (configString.find("abort_on_error=1") != std::string::npos ||
+                configString.find("abort_on_error=true") != std::string::npos) {
+                shouldRegister = false;
+            }
+        }
+        if (shouldRegister) {
+            invariant(sigaction(SIGABRT, &plainSignals, nullptr) == 0);
+        }
+#else
         invariant(sigaction(SIGABRT, &plainSignals, nullptr) == 0);
+#endif
     }
     {
         struct sigaction addrSignals;

@@ -30,6 +30,7 @@
 #include "config.h"
 
 static void	   config_checksum(void);
+static void	   config_compatibility(void);
 static void	   config_compression(const char *);
 static void	   config_encryption(void);
 static const char *config_file_type(u_int);
@@ -40,6 +41,7 @@ static int	   config_is_perm(const char *);
 static void	   config_isolation(void);
 static void	   config_lrt(void);
 static void	   config_map_checksum(const char *, u_int *);
+static void	   config_map_compatibility(const char *, u_int *);
 static void	   config_map_compression(const char *, u_int *);
 static void	   config_map_encryption(const char *, u_int *);
 static void	   config_map_file_type(const char *, u_int *);
@@ -72,8 +74,11 @@ config_setup(void)
 		else
 			switch (mmrand(NULL, 1, 10)) {
 			case 1:					/* 10% */
-				config_single("file_type=fix", 0);
-				break;
+				if (!config_is_perm("modify_pct")) {
+					config_single("file_type=fix", 0);
+					break;
+				}
+				/* FALLTHROUGH */
 			case 2: case 3: case 4:			/* 30% */
 				config_single("file_type=var", 0);
 				break;				/* 60% */
@@ -158,6 +163,7 @@ config_setup(void)
 		g.c_threads = 1;
 
 	config_checksum();
+	config_compatibility();
 	config_compression("compression");
 	config_compression("logging_compression");
 	config_encryption();
@@ -308,6 +314,36 @@ config_compression(const char *conf_name)
 }
 
 /*
+ * config_compatibility --
+ *	Compatibility configuration.
+ */
+static void
+config_compatibility(void)
+{
+	/*
+	 * Compatibility is only relevant if logging is enabled.
+	 * Skip it no matter what if we're not logging.
+	 */
+	if (g.c_logging == 0) {
+		config_single("compatibility=none", 0);
+		return;
+	}
+	/* Choose a compatibility mode if nothing was specified. */
+	if (!config_is_perm("compatibility"))
+		switch (mmrand(NULL, 1, 10)) {
+		case 1:					/* 10% */
+			config_single("compatibility=v1", 0);
+			break;
+		case 2:					/* 10% */
+			config_single("compatibility=v2", 0);
+			break;
+		default:				/* 80% */
+			config_single("compatibility=none", 0);
+			break;
+		}
+}
+
+/*
  * config_encryption --
  *	Encryption configuration.
  */
@@ -381,10 +417,14 @@ config_in_memory_check(void)
 		return;
 
 	/* Turn off a lot of stuff. */
+	if (!config_is_perm("alter"))
+		config_single("alter=off", 0);
 	if (!config_is_perm("backups"))
 		config_single("backups=off", 0);
 	if (!config_is_perm("checkpoints"))
 		config_single("checkpoints=off", 0);
+	if (!config_is_perm("compatibility"))
+		config_single("compatibility=none", 0);
 	if (!config_is_perm("compression"))
 		config_single("compression=none", 0);
 	if (!config_is_perm("logging"))
@@ -508,16 +548,33 @@ config_pct(void)
 			list[i].order = mmrand(NULL, 1, 1000);
 	if (pct > 100)
 		testutil_die(EINVAL,
-		    "operation percentages total to more than 100%%");
+		    "operation percentages do not total to 100%%");
 
 	/* Cursor modify isn't possible for fixed-length column store. */
 	if (g.type == FIX) {
 		if (config_is_perm("modify_pct"))
 			testutil_die(EINVAL,
 			    "WT_CURSOR.modify not supported by fixed-length "
-			    "column store or LSM");
+			    "column store");
 		list[CONFIG_MODIFY_ENTRY].order = 0;
 		*list[CONFIG_MODIFY_ENTRY].vp = 0;
+	}
+
+	/*
+	 * Cursor modify isn't possible for read-uncommitted transactions.
+	 * If both forced, it's an error, else, prefer the forced one, else,
+	 * prefer modify operations.
+	 */
+	if (g.c_isolation_flag == ISOLATION_READ_UNCOMMITTED) {
+		if (config_is_perm("isolation")) {
+			if (config_is_perm("modify_pct"))
+				testutil_die(EINVAL,
+				    "WT_CURSOR.modify not supported with "
+				    "read-uncommitted transactions");
+			list[CONFIG_MODIFY_ENTRY].order = 0;
+			*list[CONFIG_MODIFY_ENTRY].vp = 0;
+		} else
+			config_single("isolation=random", 0);
 	}
 
 	/*
@@ -732,6 +789,10 @@ config_single(const char *s, int perm)
 			config_map_checksum(ep, &g.c_checksum_flag);
 			*cp->vstr = dstrdup(ep);
 		} else if (strncmp(
+		    s, "compatibility", strlen("compatibility")) == 0) {
+			config_map_compatibility(ep, &g.c_compat_flag);
+			*cp->vstr = dstrdup(ep);
+		} else if (strncmp(
 		    s, "compression", strlen("compression")) == 0) {
 			config_map_compression(ep, &g.c_compression_flag);
 			*cp->vstr = dstrdup(ep);
@@ -824,6 +885,24 @@ config_map_checksum(const char *s, u_int *vp)
 		*vp = CHECKSUM_UNCOMPRESSED;
 	else
 		testutil_die(EINVAL, "illegal checksum configuration: %s", s);
+}
+
+/*
+ * config_map_compatibility --
+ *	Map a compatibility configuration to a flag.
+ */
+static void
+config_map_compatibility(const char *s, u_int *vp)
+{
+	if (strcmp(s, "none") == 0)
+		*vp = COMPAT_NONE;
+	else if (strcmp(s, "v1") == 0)
+		*vp = COMPAT_V1;
+	else if (strcmp(s, "v2") == 0)
+		*vp = COMPAT_V2;
+	else
+		testutil_die(EINVAL,
+		    "illegal compatibility configuration: %s", s);
 }
 
 /*

@@ -1314,6 +1314,101 @@ void ExpressionDateFromParts::addDependencies(DepsTracker* deps) const {
     }
 }
 
+/* ---------------------- ExpressionDateFromString --------------------- */
+
+REGISTER_EXPRESSION(dateFromString, ExpressionDateFromString::parse);
+intrusive_ptr<Expression> ExpressionDateFromString::parse(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    BSONElement expr,
+    const VariablesParseState& vps) {
+
+    uassert(40540,
+            str::stream() << "$dateFromString only supports an object as an argument, found: "
+                          << typeName(expr.type()),
+            expr.type() == BSONType::Object);
+
+    BSONElement dateStringElem;
+    BSONElement timeZoneElem;
+
+    const BSONObj args = expr.embeddedObject();
+    for (auto&& arg : args) {
+        auto field = arg.fieldNameStringData();
+
+        if (field == "dateString"_sd) {
+            dateStringElem = arg;
+        } else if (field == "timezone"_sd) {
+            timeZoneElem = arg;
+        } else {
+            uasserted(40541,
+                      str::stream() << "Unrecognized argument to $dateFromString: "
+                                    << arg.fieldName());
+        }
+    }
+
+    uassert(40542, "Missing 'dateString' parameter to $dateFromString", dateStringElem);
+
+    return new ExpressionDateFromString(expCtx,
+                                        parseOperand(expCtx, dateStringElem, vps),
+                                        timeZoneElem ? parseOperand(expCtx, timeZoneElem, vps)
+                                                     : nullptr);
+}
+
+ExpressionDateFromString::ExpressionDateFromString(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    intrusive_ptr<Expression> dateString,
+    intrusive_ptr<Expression> timeZone)
+    : Expression(expCtx), _dateString(dateString), _timeZone(timeZone) {}
+
+intrusive_ptr<Expression> ExpressionDateFromString::optimize() {
+    _dateString = _dateString->optimize();
+    if (_timeZone) {
+        _timeZone = _timeZone->optimize();
+    }
+
+    if (ExpressionConstant::allNullOrConstant({_dateString, _timeZone})) {
+        // Everything is a constant, so we can turn into a constant.
+        return ExpressionConstant::create(getExpressionContext(), evaluate(Document{}));
+    }
+    return this;
+}
+
+Value ExpressionDateFromString::serialize(bool explain) const {
+    return Value(
+        Document{{"$dateFromString",
+                  Document{{"dateString", _dateString->serialize(explain)},
+                           {"timezone", _timeZone ? _timeZone->serialize(explain) : Value()}}}});
+}
+
+Value ExpressionDateFromString::evaluate(const Document& root) const {
+    const Value dateString = _dateString->evaluate(root);
+
+    auto timeZone = makeTimeZone(
+        TimeZoneDatabase::get(getExpressionContext()->opCtx->getServiceContext()), root, _timeZone);
+
+    if (!timeZone || dateString.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(40543,
+            str::stream() << "$dateFromString requires that 'dateString' be a string, found: "
+                          << typeName(dateString.getType())
+                          << " with value "
+                          << dateString.toString(),
+            dateString.getType() == BSONType::String);
+    const std::string& dateTimeString = dateString.getString();
+
+    auto tzdb = TimeZoneDatabase::get(getExpressionContext()->opCtx->getServiceContext());
+
+    return Value(tzdb->fromString(dateTimeString, timeZone));
+}
+
+void ExpressionDateFromString::addDependencies(DepsTracker* deps) const {
+    _dateString->addDependencies(deps);
+    if (_timeZone) {
+        _timeZone->addDependencies(deps);
+    }
+}
+
 /* ---------------------- ExpressionDateToParts ----------------------- */
 
 REGISTER_EXPRESSION(dateToParts, ExpressionDateToParts::parse);

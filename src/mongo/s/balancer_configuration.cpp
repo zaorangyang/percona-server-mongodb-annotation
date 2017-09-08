@@ -79,7 +79,7 @@ BalancerSettingsType::BalancerMode BalancerConfiguration::getBalancerMode() cons
 
 Status BalancerConfiguration::setBalancerMode(OperationContext* opCtx,
                                               BalancerSettingsType::BalancerMode mode) {
-    auto updateStatus = Grid::get(opCtx)->catalogClient(opCtx)->updateConfigDocument(
+    auto updateStatus = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
         opCtx,
         kSettingsNamespace.ns(),
         BSON("_id" << BalancerSettingsType::kKey),
@@ -131,9 +131,10 @@ bool BalancerConfiguration::waitForDelete() const {
     return _balancerSettings.waitForDelete();
 }
 
-Status BalancerConfiguration::refreshAndCheck(OperationContext* opCtx) {
+Status BalancerConfiguration::refreshAndCheck(OperationContext* opCtx,
+                                              const repl::ReadConcernLevel& readConcern) {
     // Balancer configuration
-    Status balancerSettingsStatus = _refreshBalancerSettings(opCtx);
+    Status balancerSettingsStatus = _refreshBalancerSettings(opCtx, readConcern);
     if (!balancerSettingsStatus.isOK()) {
         return {balancerSettingsStatus.code(),
                 str::stream() << "Failed to refresh the balancer settings due to "
@@ -159,11 +160,12 @@ Status BalancerConfiguration::refreshAndCheck(OperationContext* opCtx) {
     return Status::OK();
 }
 
-Status BalancerConfiguration::_refreshBalancerSettings(OperationContext* opCtx) {
+Status BalancerConfiguration::_refreshBalancerSettings(OperationContext* opCtx,
+                                                       const repl::ReadConcernLevel& readConcern) {
     BalancerSettingsType settings = BalancerSettingsType::createDefault();
 
-    auto settingsObjStatus = Grid::get(opCtx)->catalogClient(opCtx)->getGlobalSettings(
-        opCtx, BalancerSettingsType::kKey);
+    auto settingsObjStatus = Grid::get(opCtx)->catalogClient()->getGlobalSettings(
+        opCtx, BalancerSettingsType::kKey, readConcern);
     if (settingsObjStatus.isOK()) {
         auto settingsStatus = BalancerSettingsType::fromBSON(settingsObjStatus.getValue());
         if (!settingsStatus.isOK()) {
@@ -185,7 +187,7 @@ Status BalancerConfiguration::_refreshChunkSizeSettings(OperationContext* opCtx)
     ChunkSizeSettingsType settings = ChunkSizeSettingsType::createDefault();
 
     auto settingsObjStatus =
-        grid.catalogClient(opCtx)->getGlobalSettings(opCtx, ChunkSizeSettingsType::kKey);
+        grid.catalogClient()->getGlobalSettings(opCtx, ChunkSizeSettingsType::kKey);
     if (settingsObjStatus.isOK()) {
         auto settingsStatus = ChunkSizeSettingsType::fromBSON(settingsObjStatus.getValue());
         if (!settingsStatus.isOK()) {
@@ -211,7 +213,7 @@ Status BalancerConfiguration::_refreshAutoSplitSettings(OperationContext* opCtx)
     AutoSplitSettingsType settings = AutoSplitSettingsType::createDefault();
 
     auto settingsObjStatus =
-        grid.catalogClient(opCtx)->getGlobalSettings(opCtx, AutoSplitSettingsType::kKey);
+        grid.catalogClient()->getGlobalSettings(opCtx, AutoSplitSettingsType::kKey);
     if (settingsObjStatus.isOK()) {
         auto settingsStatus = AutoSplitSettingsType::fromBSON(settingsObjStatus.getValue());
         if (!settingsStatus.isOK()) {
