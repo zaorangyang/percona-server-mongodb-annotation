@@ -45,6 +45,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_consistency_markers_mock.h"
 #include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/replication_recovery_mock.h"
 #include "mongo/db/repl/reporter.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
@@ -285,7 +286,9 @@ protected:
         launchExecutorThread();
 
         _replicationProcess = stdx::make_unique<ReplicationProcess>(
-            _storageInterface.get(), stdx::make_unique<ReplicationConsistencyMarkersMock>());
+            _storageInterface.get(),
+            stdx::make_unique<ReplicationConsistencyMarkersMock>(),
+            stdx::make_unique<ReplicationRecoveryMock>());
 
         _executorProxy = stdx::make_unique<TaskExecutorMock>(&getExecutor());
 
@@ -539,7 +542,7 @@ TEST_F(InitialSyncerTest, InvalidConstruction) {
                                                   _storageInterface.get(),
                                                   _replicationProcess.get(),
                                                   callback),
-                                    UserException,
+                                    AssertionException,
                                     ErrorCodes::BadValue,
                                     "task executor cannot be null");
     }
@@ -553,7 +556,7 @@ TEST_F(InitialSyncerTest, InvalidConstruction) {
                                                   _storageInterface.get(),
                                                   _replicationProcess.get(),
                                                   InitialSyncer::OnCompletionFn()),
-                                    UserException,
+                                    AssertionException,
                                     ErrorCodes::BadValue,
                                     "callback function cannot be null");
     }
@@ -624,8 +627,9 @@ TEST_F(InitialSyncerTest, StartupSetsInitialDataTimestampAndStableTimestampOnSuc
     auto opCtx = makeOpCtx();
 
     // Set initial data timestamp forward first.
-    _storageInterface->setInitialDataTimestamp(opCtx.get(), SnapshotName(Timestamp(5, 5)));
-    _storageInterface->setStableTimestamp(opCtx.get(), SnapshotName(Timestamp(6, 6)));
+    auto serviceCtx = opCtx.get()->getServiceContext();
+    _storageInterface->setInitialDataTimestamp(serviceCtx, SnapshotName(Timestamp(5, 5)));
+    _storageInterface->setStableTimestamp(serviceCtx, SnapshotName(Timestamp(6, 6)));
 
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
     ASSERT_TRUE(initialSyncer->isActive());

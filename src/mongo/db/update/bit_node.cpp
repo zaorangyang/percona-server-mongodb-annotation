@@ -89,7 +89,8 @@ Status BitNode::init(BSONElement modExpr, const CollatorInterface* collator) {
     return Status::OK();
 }
 
-bool BitNode::updateExistingElement(mutablebson::Element* element) const {
+ModifierNode::ModifyResult BitNode::updateExistingElement(
+    mutablebson::Element* element, std::shared_ptr<FieldRef> elementPath) const {
     if (!element->isIntegral()) {
         mutablebson::Element idElem =
             mutablebson::findFirstChildNamed(element->getDocument().root(), "_id");
@@ -106,9 +107,9 @@ bool BitNode::updateExistingElement(mutablebson::Element* element) const {
 
     if (!value.isIdentical(element->getValueSafeNum())) {
         invariantOK(element->setValueSafeNum(value));
-        return true;
+        return ModifyResult::kNormalUpdate;
     } else {
-        return false;
+        return ModifyResult::kNoOp;
     }
 }
 

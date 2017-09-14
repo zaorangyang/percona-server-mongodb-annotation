@@ -40,6 +40,20 @@ env.Library(
 )
 
 env.Library(
+    target='health_log',
+    source=[
+        "health_log.cpp",
+        env.Idlc("health_log.idl")[0],
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/concurrency/deferred_writer",
+        "$BUILD_DIR/mongo/db/service_context",
+        "$BUILD_DIR/mongo/idl/idl_parser",
+    ],
+);
+
+env.Library(
     target='index_key_validate',
     source=[
         "index_key_validate.cpp",
@@ -179,12 +193,13 @@ env.CppUnitTest(
     target='uuid_catalog_test',
     source=[
         'uuid_catalog_test.cpp',
-        ],
+    ],
     LIBDEPS=[
         'uuid_catalog',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/service_context',
-        ]
-    )
+    ],
+)
 
 env.Library(
     target='catalog',
@@ -196,7 +211,9 @@ env.Library(
         "database_holder_impl.cpp",
         "index_catalog_impl.cpp",
         "index_catalog_entry_impl.cpp",
+        "index_consistency.cpp",
         "index_create_impl.cpp",
+        "index_observer.cpp",
         "private/record_store_validate_adaptor.cpp",
     ],
     LIBDEPS=[
@@ -205,6 +222,7 @@ env.Library(
         'collection_options',
         'database',
         'database_holder',
+        'health_log',
         'index_catalog',
         'index_catalog_entry',
         'index_create',
@@ -250,6 +268,22 @@ env.Library(
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/write_ops',
         '$BUILD_DIR/mongo/db/views/views',
+    ],
+)
+
+env.CppUnitTest(
+    target='rename_collection_test',
+    source=[
+        'rename_collection_test.cpp',
+    ],
+    LIBDEPS=[
+        'catalog_helpers',
+        '$BUILD_DIR/mongo/db/db_raii',
+        '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/repl/optime',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
     ],
 )
 

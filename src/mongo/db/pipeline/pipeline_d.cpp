@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
@@ -64,7 +65,6 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/fill_locker_info.h"
@@ -280,6 +280,11 @@ public:
                     infoBuilder.append("killPending", true);
                 }
 
+                if (clientOpCtx->getLogicalSessionId()) {
+                    BSONObjBuilder bob(infoBuilder.subobjStart("lsid"));
+                    clientOpCtx->getLogicalSessionId()->serialize(&bob);
+                }
+
                 CurOp::get(clientOpCtx)
                     ->reportState(&infoBuilder,
                                   (truncateMode == CurrentOpTruncateMode::kTruncateOps));
@@ -420,7 +425,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
 
     const ExtensionsCallbackReal extensionsCallback(pExpCtx->opCtx, &nss);
 
-    auto cq = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
+    auto cq = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback, pExpCtx);
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of

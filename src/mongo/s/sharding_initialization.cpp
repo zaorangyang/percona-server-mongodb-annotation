@@ -65,6 +65,7 @@
 #include "mongo/s/client/sharding_network_connection_hook.h"
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/periodic_balancer_settings_refresher.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/exit.h"
@@ -79,7 +80,14 @@ MONGO_EXPORT_STARTUP_SERVER_PARAMETER(ShardingTaskExecutorPoolHostTimeoutMS,
                                       int,
                                       ConnectionPool::kDefaultHostTimeout.count());
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(ShardingTaskExecutorPoolMaxSize, int, -1);
-MONGO_EXPORT_STARTUP_SERVER_PARAMETER(ShardingTaskExecutorPoolMaxConnecting, int, -1);
+
+// By default, limit us to two concurrent pending connection attempts
+// in any one pool. Since pools are currently per-cpu, we still may
+// have something like 64 concurrent total connection attempts on a
+// modestly sized system. We could set it to one, but that seems too
+// restrictive.
+MONGO_EXPORT_STARTUP_SERVER_PARAMETER(ShardingTaskExecutorPoolMaxConnecting, int, 2);
+
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(ShardingTaskExecutorPoolMinSize,
                                       int,
                                       static_cast<int>(ConnectionPool::kDefaultMinConns));
@@ -225,6 +233,16 @@ Status initializeGlobalShardingState(OperationContext* opCtx,
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
         replCoord->getMemberState().primary()) {
         LogicalTimeValidator::get(opCtx)->enableKeyGenerator(opCtx, true);
+    } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        // Determine primary/secondary/standalone state in order to properly set up the refresher.
+        bool isReplSet =
+            replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+        bool isStandaloneOrPrimary =
+            !isReplSet || (repl::ReplicationCoordinator::get(opCtx)->getMemberState() ==
+                           repl::MemberState::RS_PRIMARY);
+
+        PeriodicBalancerSettingsRefresher::create(opCtx->getServiceContext(),
+                                                  isStandaloneOrPrimary);
     }
 
     return Status::OK();

@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
@@ -125,16 +126,14 @@ public:
         BSONObj oldDoc = _coll->getRecordStore()->dataFor(&_opCtx, oldrecordId).releaseToBson();
         OplogUpdateEntryArgs args;
         args.nss = _coll->ns();
-        _coll
-            ->updateDocument(&_opCtx,
-                             oldrecordId,
-                             Snapshotted<BSONObj>(_opCtx.recoveryUnit()->getSnapshotId(), oldDoc),
-                             newDoc,
-                             false,
-                             true,
-                             NULL,
-                             &args)
-            .status_with_transitional_ignore();
+        _coll->updateDocument(&_opCtx,
+                              oldrecordId,
+                              Snapshotted<BSONObj>(_opCtx.recoveryUnit()->getSnapshotId(), oldDoc),
+                              newDoc,
+                              false,
+                              true,
+                              NULL,
+                              &args);
         wunit.commit();
     }
 

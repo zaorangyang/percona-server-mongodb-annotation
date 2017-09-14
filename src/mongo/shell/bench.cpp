@@ -631,7 +631,7 @@ void doNothing(const BSONObj&) {}
  * single object in the query result set (or the empty object, if the result set is empty).
  * If 'qr' doesn't have these options set, then nullptr must be passed for 'objOut'.
  *
- * On error, throws a UserException.
+ * On error, throws a AssertionException.
  */
 int runQueryWithReadCommands(DBClientBase* conn,
                              unique_ptr<QueryRequest> qr,
@@ -954,9 +954,9 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
 
                             if (!result["err"].eoo() && result["err"].type() == String &&
                                 (_config->throwGLE || op.throwGLE))
-                                throw DBException((string) "From benchRun GLE" +
-                                                      causedBy(result["err"].String()),
-                                                  result["code"].eoo() ? 0 : result["code"].Int());
+                                throw DBException(result["code"].eoo() ? 0 : result["code"].Int(),
+                                                  (string) "From benchRun GLE" +
+                                                      causedBy(result["err"].String()));
                         }
                     } break;
                     case OpType::INSERT: {
@@ -1023,9 +1023,9 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
 
                             if (!result["err"].eoo() && result["err"].type() == String &&
                                 (_config->throwGLE || op.throwGLE))
-                                throw DBException((string) "From benchRun GLE" +
-                                                      causedBy(result["err"].String()),
-                                                  result["code"].eoo() ? 0 : result["code"].Int());
+                                throw DBException(result["code"].eoo() ? 0 : result["code"].Int(),
+                                                  (string) "From benchRun GLE" +
+                                                      causedBy(result["err"].String()));
                         }
                     } break;
                     case OpType::REMOVE: {
@@ -1072,9 +1072,9 @@ void BenchRunWorker::generateLoadOnConnection(DBClientBase* conn) {
 
                             if (!result["err"].eoo() && result["err"].type() == String &&
                                 (_config->throwGLE || op.throwGLE))
-                                throw DBException((string) "From benchRun GLE " +
-                                                      causedBy(result["err"].String()),
-                                                  result["code"].eoo() ? 0 : result["code"].Int());
+                                throw DBException(result["code"].eoo() ? 0 : result["code"].Int(),
+                                                  (string) "From benchRun GLE " +
+                                                      causedBy(result["err"].String()));
                         }
                     } break;
                     case OpType::CREATEINDEX:

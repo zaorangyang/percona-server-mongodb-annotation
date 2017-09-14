@@ -122,8 +122,9 @@ void applyChild(const UpdateNode& child,
         applyParams->pathTaken->appendPart(field);
     } else {
         // We are traversing path components that do not exist in our document. Any update modifier
-        // that creates new path components (i.e., any PathCreatingNode update nodes) will need to
-        // create this component, so we append it to the 'pathToCreate' FieldRef.
+        // that creates new path components (i.e., any modifiers that return true for
+        // allowCreation()) will need to create this component, so we append it to the
+        // 'pathToCreate' FieldRef.
         childElement = applyParams->element;
         applyParams->pathToCreate->appendPart(field);
     }
@@ -239,15 +240,9 @@ StatusWith<bool> UpdateObjectNode::parseAndMerge(
                 << "'");
     }
 
-    // Construct the leaf node.
-    // TODO SERVER-28777: This should never fail because all modifiers are implemented.
+    // Construct and initialize the leaf node.
     auto leaf = modifiertable::makeUpdateLeafNode(type);
-    if (!leaf) {
-        return Status(ErrorCodes::FailedToParse,
-                      str::stream() << "Cannot construct modifier of type " << type);
-    }
-
-    // Initialize the leaf node.
+    invariant(leaf);
     status = leaf->init(modExpr, collator);
     if (!status.isOK()) {
         return status;

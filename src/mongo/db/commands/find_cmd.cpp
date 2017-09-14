@@ -94,7 +94,7 @@ public:
         return false;
     }
 
-    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         return true;
     }
 
@@ -184,7 +184,7 @@ public:
                 return runAggregate(
                     opCtx, nss, aggRequest.getValue(), viewAggregationCommand.getValue(), *out);
             } catch (DBException& error) {
-                if (error.getCode() == ErrorCodes::InvalidPipelineOperator) {
+                if (error.code() == ErrorCodes::InvalidPipelineOperator) {
                     return {ErrorCodes::InvalidPipelineOperator,
                             str::stream() << "Unsupported in view pipeline: " << error.what()};
                 }

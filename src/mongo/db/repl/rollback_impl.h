@@ -30,6 +30,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/db/repl/rollback.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/stdx/functional.h"
 
 namespace mongo {
@@ -40,6 +41,7 @@ namespace repl {
 
 class OplogInterface;
 class ReplicationCoordinator;
+class ReplicationProcess;
 
 /**
  * During steady state replication, it is possible to find the local server in a state where it
@@ -110,6 +112,8 @@ public:
      */
     RollbackImpl(OplogInterface* localOplog,
                  OplogInterface* remoteOplog,
+                 StorageInterface* storageInterface,
+                 ReplicationProcess* replicationProcess,
                  ReplicationCoordinator* replicationCoordinator,
                  Listener* listener);
 
@@ -118,6 +122,8 @@ public:
      */
     RollbackImpl(OplogInterface* localOplog,
                  OplogInterface* remoteOplog,
+                 StorageInterface* storageInterface,
+                 ReplicationProcess* replicationProcess,
                  ReplicationCoordinator* replicationCoordinator);
 
     virtual ~RollbackImpl();
@@ -162,12 +168,12 @@ private:
     void _checkShardIdentityRollback(OperationContext* opCtx);
 
     /**
-     * The in-memory session transaction table needs to be cleared after rollback, so it is forced
-     * to refetch from storage.
+     * In-memory sessions need to be reset after rollback, so they are forced to refetch from the
+     * transactions collection.
      *
      * 'opCtx' cannot be null.
      */
-    void _clearSessionTransactionTable(OperationContext* opCtx);
+    void _resetSessions(OperationContext* opCtx);
 
     /**
      * Transitions the current member state from ROLLBACK to SECONDARY.
@@ -195,6 +201,14 @@ private:
 
     // This is used to read oplog entries from the remote oplog to find the common point.
     OplogInterface* const _remoteOplog;  // (R)
+
+    // The StorageInterface associated with this Rollback instance. Used to execute operations
+    // at the storage layer e.g. recovering to a timestamp.
+    StorageInterface* _storageInterface;  // (R)
+
+    // The ReplicationProcess associated with this Rollback instance. Used to update and persist
+    // various pieces of replication state related to the rollback process.
+    ReplicationProcess* _replicationProcess;  // (R)
 
     // This is used to read and update global replication settings. This includes:
     // - update transition member states;

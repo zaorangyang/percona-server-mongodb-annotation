@@ -40,7 +40,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_time.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/rpc/reply_builder_interface.h"
@@ -50,9 +49,6 @@
 
 namespace mongo {
 
-class BSONObj;
-class BSONObjBuilder;
-class Client;
 class OperationContext;
 class Timer;
 
@@ -94,18 +90,6 @@ public:
      * their replies.
      */
     virtual std::size_t reserveBytesForReply() const = 0;
-
-    /**
-     * Runs the command.
-     *
-     * The default implementation verifies that request has no document sections then forwards to
-     * BasicCommand::run().
-     *
-     * For now commands should only implement if they need access to OP_MSG-specific functionality.
-     */
-    virtual bool enhancedRun(OperationContext* opCtx,
-                             const OpMsgRequest& request,
-                             BSONObjBuilder& result) = 0;
 
     /**
      * supportsWriteConcern returns true if this command should be parsed for a writeConcern
@@ -207,20 +191,21 @@ public:
     virtual bool maintenanceOk() const = 0;
 
     /**
-     * Returns true if this Command supports the readConcern argument. Takes the command object and
-     * the name of the database on which it was invoked as arguments, so that readConcern can be
-     * conditionally rejected based on the command's parameters and/or namespace.
+     * Returns true if this Command supports the non-local readConcern:level field value. Takes the
+     * command object and the name of the database on which it was invoked as arguments, so that
+     * readConcern can be conditionally rejected based on the command's parameters and/or namespace.
      *
-     * If the readConcern argument is sent to a command that returns false the command processor
-     * will reject the command, returning an appropriate error message. For commands that support
-     * the argument, the command processor will instruct the RecoveryUnit to only return
-     * "committed" data, failing if this isn't supported by the storage engine.
+     * If the readConcern non-local level argument is sent to a command that returns false the
+     * command processor will reject the command, returning an appropriate error message. For
+     * commands that support the argument, the command processor will instruct the RecoveryUnit to
+     * only return "committed" data, failing if this isn't supported by the storage engine.
      *
      * Note that this is never called on mongos. Sharded commands are responsible for forwarding
      * the option to the shards as needed. We rely on the shards to fail the commands in the
      * cases where it isn't supported.
      */
-    virtual bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const = 0;
+    virtual bool supportsNonLocalReadConcern(const std::string& dbName,
+                                             const BSONObj& cmdObj) const = 0;
 
     /**
      * Returns LogicalOp for this command.
@@ -264,7 +249,7 @@ public:
                                          const std::string& dbname,
                                          const BSONObj& cmdObj);
 
-    typedef StringMap<Command*> CommandMap;
+    using CommandMap = StringMap<Command*>;
 
     /**
      * Constructs a new command and causes it to be registered with the global commands list. It is
@@ -331,7 +316,8 @@ public:
         return true; /* assumed true prior to commit */
     }
 
-    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const override {
+    bool supportsNonLocalReadConcern(const std::string& dbName,
+                                     const BSONObj& cmdObj) const override {
         return false;
     }
 
@@ -351,13 +337,19 @@ public:
         _commandsFailed.increment();
     }
 
-protected:
-    static CommandMap* _commands;
-    static CommandMap* _commandsByBestName;
+    /**
+     * Runs the command.
+     *
+     * Forwards to enhancedRun, but additionally runs audit checks if run throws unauthorized.
+     */
+    bool publicRun(OperationContext* opCtx, const OpMsgRequest& request, BSONObjBuilder& result);
 
-public:
-    static const CommandMap* commandsByBestName() {
-        return _commandsByBestName;
+    static const CommandMap& allCommands() {
+        return *_commands;
+    }
+
+    static const CommandMap& allCommandsByBestName() {
+        return *_commandsByBestName;
     }
 
     // Counter for unknown commands
@@ -379,11 +371,6 @@ public:
 
     // @return s.isOK()
     static bool appendCommandStatus(BSONObjBuilder& result, const Status& status);
-
-    /**
-     * Appends "operationTime" field to the command result object as a Timestamp type.
-     */
-    static void appendOperationTime(BSONObjBuilder& result, LogicalTime operationTime);
 
     /**
      * Helper for setting a writeConcernError field in the command result object if
@@ -519,6 +506,21 @@ public:
     static BSONObj filterCommandReplyForPassthrough(const BSONObj& reply);
 
 private:
+    static CommandMap* _commands;
+    static CommandMap* _commandsByBestName;
+
+    /**
+     * Runs the command.
+     *
+     * The default implementation verifies that request has no document sections then forwards to
+     * BasicCommand::run().
+     *
+     * For now commands should only implement if they need access to OP_MSG-specific functionality.
+     */
+    virtual bool enhancedRun(OperationContext* opCtx,
+                             const OpMsgRequest& request,
+                             BSONObjBuilder& result) = 0;
+
     // Counters for how many times this command has been executed and failed
     Counter64 _commandsExecuted;
     Counter64 _commandsFailed;

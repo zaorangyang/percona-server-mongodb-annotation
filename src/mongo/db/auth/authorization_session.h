@@ -70,6 +70,27 @@ class AuthorizationSession {
 
 public:
     /**
+     * Provides a way to swap out impersonate data for the duration of the ScopedImpersonate's
+     * lifetime.
+     */
+    class ScopedImpersonate {
+    public:
+        ScopedImpersonate(AuthorizationSession* authSession,
+                          std::vector<UserName>* users,
+                          std::vector<RoleName>* roles);
+        ~ScopedImpersonate();
+
+    private:
+        void swap();
+
+        AuthorizationSession& _authSession;
+        std::vector<UserName>& _users;
+        std::vector<RoleName>& _roles;
+    };
+
+    friend class ScopedImpersonate;
+
+    /**
      * Gets the AuthorizationSession associated with the given "client", or nullptr.
      *
      * The "client" object continues to own the returned AuthorizationSession.
@@ -305,11 +326,8 @@ protected:
 private:
     // If any users authenticated on this session are marked as invalid this updates them with
     // up-to-date information. May require a read lock on the "admin" db to read the user data.
-    //
-    // When refreshing a user document, we will use the current user's id to confirm that our
-    // user is of the same generation as the refreshed user document. If the generations don't
-    // match we will remove the outdated user document from the cache.
     void _refreshUserInfoAsNeeded(OperationContext* opCtx);
+
 
     // Checks if this connection is authorized for the given Privilege, ignoring whether or not
     // we should even be doing authorization checks in general.  Note: this may acquire a read

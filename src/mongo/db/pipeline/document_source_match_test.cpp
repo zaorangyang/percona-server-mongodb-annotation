@@ -116,6 +116,18 @@ TEST_F(DocumentSourceMatchTest, RedactSafePortion) {
 
     assertExpectedRedactSafePortion("{a: {$_internalSchemaMaxLength: 1}}", "{}");
 
+    assertExpectedRedactSafePortion("{a: {$_internalSchemaFmod: [4.5, 2.3]}}", "{}");
+
+    assertExpectedRedactSafePortion(
+        "{a: {$_internalSchemaMatchArrayIndex:"
+        "{index: 0, namePlaceholder: 'i', expression: {i: {$gt: 0}}}}}",
+        "{}");
+
+    assertExpectedRedactSafePortion(
+        "{a: {$_internalSchemaAllElemMatchFromIndex: [3, {a: {$lt: 4}}]}}", "{}");
+
+    assertExpectedRedactSafePortion("{a: {$_internalSchemaType: 2}}", "{}");
+
     // Combinations
     assertExpectedRedactSafePortion("{a:1, b: 'asdf'}", "{a:1, b: 'asdf'}");
 

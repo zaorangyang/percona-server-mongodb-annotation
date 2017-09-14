@@ -120,9 +120,7 @@ void ShardRemote::updateReplSetMonitor(const HostAndPort& remoteHost,
     if (remoteCommandStatus.isOK())
         return;
 
-    if (ErrorCodes::isNotMasterError(remoteCommandStatus.code()) ||
-        (remoteCommandStatus == ErrorCodes::InterruptedDueToReplStateChange) ||
-        (remoteCommandStatus == ErrorCodes::PrimarySteppedDown)) {
+    if (ErrorCodes::isNotMasterError(remoteCommandStatus.code())) {
         _targeter->markHostNotMaster(remoteHost, remoteCommandStatus);
     } else if (ErrorCodes::isNetworkError(remoteCommandStatus.code())) {
         _targeter->markHostUnreachable(remoteHost, remoteCommandStatus);
@@ -336,7 +334,7 @@ StatusWith<Shard::QueryResponse> ShardRemote::_exhaustiveFindOnConfig(
     updateReplSetMonitor(host.getValue(), status);
 
     if (!status.isOK()) {
-        if (status.compareCode(ErrorCodes::ExceededTimeLimit)) {
+        if (status == ErrorCodes::ExceededTimeLimit) {
             LOG(0) << "Operation timed out " << causedBy(status);
         }
         return status;

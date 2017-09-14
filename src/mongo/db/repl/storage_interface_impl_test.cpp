@@ -315,8 +315,7 @@ TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfDocumentHasBadFi
 
     auto badDoc = {BSON("_id" << StorageInterfaceImpl::kRollbackIdDocumentId << "bad field" << 3)};
     ASSERT_OK(storage.insertDocuments(opCtx, nss, transformInserts(badDoc)));
-    ASSERT_EQUALS(mongo::AssertionException::convertExceptionCode(40415),
-                  storage.getRollbackID(opCtx).getStatus());
+    ASSERT_EQUALS(ErrorCodes::fromInt(40415), storage.getRollbackID(opCtx).getStatus());
 }
 
 TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfRollbackIDIsNotInt) {
@@ -1909,7 +1908,7 @@ TEST_F(StorageInterfaceImplTest,
                                                 BSON("" << 1).firstElement(),
                                                 BSON("$unknownUpdateOp" << BSON("x" << 1000)))
                                     .transitional_ignore(),
-                                UserException,
+                                AssertionException,
                                 ErrorCodes::FailedToParse,
                                 "Unknown modifier: $unknownUpdateOp");
 }

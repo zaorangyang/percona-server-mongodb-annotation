@@ -117,6 +117,23 @@ using UserHolder = std::unique_ptr<User, UserReleaser>;
 
 }  // namespace
 
+AuthorizationSession::ScopedImpersonate::ScopedImpersonate(AuthorizationSession* authSession,
+                                                           std::vector<UserName>* users,
+                                                           std::vector<RoleName>* roles)
+    : _authSession(*authSession), _users(*users), _roles(*roles) {
+    swap();
+}
+
+AuthorizationSession::ScopedImpersonate::~ScopedImpersonate() {
+    swap();
+}
+
+void AuthorizationSession::ScopedImpersonate::swap() {
+    using std::swap;
+    swap(_authSession._impersonatedUserNames, _users);
+    swap(_authSession._impersonatedRoleNames, _roles);
+}
+
 AuthorizationSession::AuthorizationSession(std::unique_ptr<AuthzSessionExternalState> externalState)
     : _externalState(std::move(externalState)), _impersonationFlag(false) {}
 
@@ -140,7 +157,7 @@ Status AuthorizationSession::addAndAuthorizeUser(OperationContext* opCtx,
                                                  const UserName& userName) {
     User* user;
     AuthorizationManager* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
-    Status status = authzManager->acquireUserForInitialAuth(opCtx, userName, &user);
+    Status status = authzManager->acquireUser(opCtx, userName, &user);
     if (!status.isOK()) {
         return status;
     }
@@ -797,9 +814,7 @@ void AuthorizationSession::_refreshUserInfoAsNeeded(OperationContext* opCtx) {
             UserName name = user->getName();
             User* updatedUser;
 
-            Status status =
-                authMan.acquireUserToRefreshSessionCache(opCtx, name, user->getID(), &updatedUser);
-
+            Status status = authMan.acquireUser(opCtx, name, &updatedUser);
             switch (status.code()) {
                 case ErrorCodes::OK: {
 

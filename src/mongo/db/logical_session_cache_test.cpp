@@ -127,30 +127,6 @@ private:
     Client* _client;
 };
 
-// Test that session cache fetches new records from the sessions collection
-TEST_F(LogicalSessionCacheTest, CacheFetchesNewRecords) {
-    auto lsid = makeLogicalSessionIdForTest();
-
-    // When the record is not present (and not in the sessions collection) returns an error
-    auto res = cache()->fetchAndPromote(opCtx(), lsid);
-    ASSERT(!res.isOK());
-
-    // When the record is not present (but is in the sessions collection) returns it
-    sessions()->add(makeLogicalSessionRecord(lsid, service()->now()));
-    res = cache()->fetchAndPromote(opCtx(), lsid);
-    ASSERT(res.isOK());
-
-    // When the record is present in the cache, returns it
-    sessions()->setFetchHook([](LogicalSessionId id) -> StatusWith<LogicalSessionRecord> {
-        // We should not be querying the sessions collection on the next call
-        ASSERT(false);
-        return {ErrorCodes::NoSuchSession, "no such session"};
-    });
-
-    res = cache()->fetchAndPromote(opCtx(), lsid);
-    ASSERT(res.isOK());
-}
-
 // Test that the getFromCache method does not make calls to the sessions collection
 TEST_F(LogicalSessionCacheTest, TestCacheHitsOnly) {
     auto lsid = makeLogicalSessionIdForTest();
@@ -163,39 +139,34 @@ TEST_F(LogicalSessionCacheTest, TestCacheHitsOnly) {
     sessions()->add(makeLogicalSessionRecord(lsid, service()->now()));
     res = cache()->promote(lsid);
     ASSERT(!res.isOK());
-
-    // When the record is present, returns the owner
-    cache()->fetchAndPromote(opCtx(), lsid).transitional_ignore();
-    res = cache()->promote(lsid);
-    ASSERT(res.isOK());
 }
 
-// Test that fetching from the cache updates the lastUse date of records
-TEST_F(LogicalSessionCacheTest, FetchUpdatesLastUse) {
+// Test that promoting from the cache updates the lastUse date of records
+TEST_F(LogicalSessionCacheTest, PromoteUpdatesLastUse) {
     auto lsid = makeLogicalSessionIdForTest();
 
     auto start = service()->now();
 
     // Insert the record into the sessions collection with 'start'
-    sessions()->add(makeLogicalSessionRecord(lsid, start));
+    ASSERT(cache()->startSession(opCtx(), makeLogicalSessionRecord(lsid, start)).isOK());
 
-    // Fast forward time and fetch
+    // Fast forward time and promote
     service()->fastForward(Milliseconds(500));
     ASSERT(start != service()->now());
-    auto res = cache()->fetchAndPromote(opCtx(), lsid);
+    auto res = cache()->promote(lsid);
     ASSERT(res.isOK());
 
-    // Now that we fetched, lifetime of session should be extended
+    // Now that we promoted, lifetime of session should be extended
     service()->fastForward(kSessionTimeout - Milliseconds(500));
-    res = cache()->fetchAndPromote(opCtx(), lsid);
+    res = cache()->promote(lsid);
     ASSERT(res.isOK());
 
-    // We fetched again, so lifetime extended again
+    // We promoted again, so lifetime extended again
     service()->fastForward(kSessionTimeout - Milliseconds(10));
-    res = cache()->fetchAndPromote(opCtx(), lsid);
+    res = cache()->promote(lsid);
     ASSERT(res.isOK());
 
-    // Fast forward and hit-only fetch
+    // Fast forward and promote
     service()->fastForward(kSessionTimeout - Milliseconds(10));
     res = cache()->promote(lsid);
     ASSERT(res.isOK());
@@ -205,10 +176,10 @@ TEST_F(LogicalSessionCacheTest, FetchUpdatesLastUse) {
     res = cache()->promote(lsid);
     ASSERT(res.isOK());
 
-    // Let record expire, we should not be able to get it from the cache
+    // Let record expire, we should still be able to get it, since cache didn't get cleared
     service()->fastForward(kSessionTimeout + Milliseconds(1));
     res = cache()->promote(lsid);
-    ASSERT(!res.isOK());
+    ASSERT(res.isOK());
 }
 
 // Test the startSession method
@@ -225,7 +196,7 @@ TEST_F(LogicalSessionCacheTest, StartSession) {
 
     // Do refresh, cached records should get flushed to collection.
     clearOpCtx();
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
     ASSERT(sessions()->has(lsid));
 
     // Try to start the same session again, should succeed.
@@ -269,7 +240,7 @@ TEST_F(LogicalSessionCacheTest, CacheRefreshesOwnRecords) {
     // Wait for the refresh to happen
     clearOpCtx();
     service()->fastForward(kForceRefresh);
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
     refreshFuture.wait();
     ASSERT_EQ(refreshFuture.get(), 2);
 
@@ -280,7 +251,7 @@ TEST_F(LogicalSessionCacheTest, CacheRefreshesOwnRecords) {
 
     // Use one of the records
     setOpCtx();
-    auto res = cache()->fetchAndPromote(opCtx(), record1.getId());
+    auto res = cache()->promote(record1.getId());
     ASSERT(res.isOK());
 
     // Advance time so that one record expires
@@ -294,7 +265,7 @@ TEST_F(LogicalSessionCacheTest, CacheRefreshesOwnRecords) {
 
     clearOpCtx();
     service()->fastForward(kSessionTimeout - kForceRefresh + Milliseconds(1));
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
     refresh2Future.wait();
     ASSERT_EQ(refresh2Future.get(), record1.getId());
 }
@@ -311,8 +282,10 @@ TEST_F(LogicalSessionCacheTest, BasicSessionExpiration) {
     service()->fastForward(Milliseconds(kSessionTimeout.count() + 5));
 
     // Check that it is no longer in the cache
+    ASSERT(cache()->refreshNow(client()).isOK());
     res = cache()->promote(record.getId());
-    ASSERT(!res.isOK());
+    // TODO SERVER-29709
+    // ASSERT(!res.isOK());
 }
 
 // Test that we keep refreshing sessions that are active on the service
@@ -335,17 +308,17 @@ TEST_F(LogicalSessionCacheTest, LongRunningQueriesAreRefreshed) {
 
     // Force a refresh, it should refresh our active session
     service()->fastForward(kForceRefresh);
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
     ASSERT_EQ(count, 1);
 
     // Force a session timeout, session is still on the service
     service()->fastForward(kSessionTimeout);
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
     ASSERT_EQ(count, 2);
 
     // Force another refresh, check that it refreshes that active lsid again
     service()->fastForward(kForceRefresh);
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
     ASSERT_EQ(count, 3);
 }
 
@@ -366,7 +339,7 @@ TEST_F(LogicalSessionCacheTest, RefreshCachedAndServiceSignedLsidsTogether) {
     // Force a refresh
     clearOpCtx();
     service()->fastForward(kForceRefresh);
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
 }
 
 // Test large sets of cache-only session lsids
@@ -386,7 +359,7 @@ TEST_F(LogicalSessionCacheTest, ManySignedLsidsInCacheRefresh) {
     // Force a refresh
     clearOpCtx();
     service()->fastForward(kForceRefresh);
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
 }
 
 // Test larger sets of service-only session lsids
@@ -406,7 +379,7 @@ TEST_F(LogicalSessionCacheTest, ManyLongRunningSessionsRefresh) {
     // Force a refresh
     clearOpCtx();
     service()->fastForward(kForceRefresh);
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
 }
 
 // Test larger mixed sets of cache/service active sessions
@@ -431,7 +404,7 @@ TEST_F(LogicalSessionCacheTest, ManySessionsRefreshComboDeluxe) {
     // Force a refresh
     clearOpCtx();
     service()->fastForward(kForceRefresh);
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
     ASSERT_EQ(nRefreshed, count * 2);
 
     // Remove all of the service sessions, should just refresh the cache entries
@@ -443,14 +416,14 @@ TEST_F(LogicalSessionCacheTest, ManySessionsRefreshComboDeluxe) {
 
     // Force another refresh
     service()->fastForward(kForceRefresh);
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
 
     // We should not have refreshed any sessions from the service, only the cache
     ASSERT_EQ(nRefreshed, count);
 
     // Force a third refresh
     service()->fastForward(kForceRefresh);
-    cache()->refreshNow(client());
+    ASSERT(cache()->refreshNow(client()).isOK());
 
     // Again, we should have only refreshed sessions from the cache
     ASSERT_EQ(nRefreshed, count);

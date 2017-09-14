@@ -43,13 +43,6 @@ class OperationContext;
 class SessionsCollectionStandalone : public SessionsCollection {
 public:
     /**
-     * Returns a LogicalSessionRecord for the given session id, or an error if
-     * no such record was found.
-     */
-    StatusWith<LogicalSessionRecord> fetchRecord(OperationContext* opCtx,
-                                                 const LogicalSessionId& lsid) override;
-
-    /**
      * Updates the last-use times on the given sessions to be greater than
      * or equal to the current time.
      */
@@ -61,9 +54,6 @@ public:
      * Removes the authoritative records for the specified sessions.
      */
     Status removeRecords(OperationContext* opCtx, const LogicalSessionIdSet& sessions) override;
-
-private:
-    SessionsCollection::SendBatchFn makeSendFn(DBDirectClient* client);
 };
 
 }  // namespace mongo

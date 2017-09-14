@@ -532,10 +532,9 @@ string OpDebug::report(Client* client,
         s << " writeConflicts:" << writeConflicts;
     }
 
-    if (!exceptionInfo.empty()) {
-        s << " exception: " << redact(exceptionInfo.msg);
-        if (exceptionInfo.code)
-            s << " code:" << exceptionInfo.code;
+    if (!exceptionInfo.isOK()) {
+        s << " exception: " << redact(exceptionInfo.reason());
+        s << " code:" << exceptionInfo.code();
     }
 
     s << " numYields:" << curop.numYields();
@@ -630,8 +629,9 @@ void OpDebug::append(const CurOp& curop,
         lockStats.report(&locks);
     }
 
-    if (!exceptionInfo.empty()) {
-        exceptionInfo.append(b, "exception", "exceptionCode");
+    if (!exceptionInfo.isOK()) {
+        b.append("exception", exceptionInfo.reason());
+        b.append("exceptionCode", exceptionInfo.code());
     }
 
     OPDEBUG_APPEND_NUMBER(nreturned);

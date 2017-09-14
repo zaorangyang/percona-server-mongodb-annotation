@@ -43,6 +43,7 @@
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/pipeline/close_change_stream_exception.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/find_common.h"
@@ -51,7 +52,6 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
@@ -65,8 +65,12 @@
 namespace mongo {
 
 namespace {
+
 MONGO_FP_DECLARE(rsStopGetMoreCmd);
-}  // namespace
+
+// Failpoint for making getMore not wait for an awaitdata cursor. Allows us to avoid waiting during
+// tests.
+MONGO_FP_DECLARE(disableAwaitDataForGetMoreCmd);
 
 /**
  * A command for running getMore() against an existing cursor registered with a CursorManager.
@@ -98,7 +102,7 @@ public:
         return false;
     }
 
-    bool supportsReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
         // Uses the readConcern setting from whatever created the cursor.
         return false;
     }
@@ -281,6 +285,8 @@ public:
 
         const bool hasOwnMaxTime = opCtx->hasDeadline();
 
+        const bool disableAwaitDataFailpointActive =
+            MONGO_FAIL_POINT(disableAwaitDataForGetMoreCmd);
         // We assume that cursors created through a DBDirectClient are always used from their
         // original OperationContext, so we do not need to move time to and from the cursor.
         if (!hasOwnMaxTime && !opCtx->getClient()->isInDirectClient()) {
@@ -288,7 +294,7 @@ public:
             // awaitData, then we supply a default time of one second. Otherwise we roll over
             // any leftover time from the maxTimeMS of the operation that spawned this cursor,
             // applying it to this getMore.
-            if (isCursorAwaitData(cursor)) {
+            if (isCursorAwaitData(cursor) && !disableAwaitDataFailpointActive) {
                 opCtx->setDeadlineAfterNowBy(Seconds{1});
             } else if (cursor->getLeftoverMaxTimeMicros() < Microseconds::max()) {
                 opCtx->setDeadlineAfterNowBy(cursor->getLeftoverMaxTimeMicros());
@@ -329,7 +335,7 @@ public:
         Explain::getSummaryStats(*exec, &preExecutionStats);
 
         // Mark this as an AwaitData operation if appropriate.
-        if (isCursorAwaitData(cursor)) {
+        if (isCursorAwaitData(cursor) && !disableAwaitDataFailpointActive) {
             if (request.lastKnownCommittedOpTime)
                 clientsLastKnownCommittedOpTime(opCtx) = request.lastKnownCommittedOpTime.get();
             shouldWaitForInserts(opCtx) = true;
@@ -441,8 +447,12 @@ public:
                 nextBatch->append(obj);
                 (*numResults)++;
             }
-        } catch (const UserException& except) {
-            if (isAwaitData && except.getCode() == ErrorCodes::ExceededTimeLimit) {
+        } catch (const CloseChangeStreamException& ex) {
+            // FAILURE state will make getMore command close the cursor even if it's tailable.
+            *state = PlanExecutor::FAILURE;
+            return Status::OK();
+        } catch (const AssertionException& except) {
+            if (isAwaitData && except.code() == ErrorCodes::ExceededTimeLimit) {
                 // We ignore exceptions from interrupt points due to max time expiry for
                 // awaitData cursors.
             } else {
@@ -472,4 +482,5 @@ public:
 
 } getMoreCmd;
 
+}  // namespace
 }  // namespace mongo

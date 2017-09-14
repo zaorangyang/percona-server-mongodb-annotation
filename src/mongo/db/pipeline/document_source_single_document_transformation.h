@@ -57,7 +57,7 @@ public:
             kInclusionProjection,
             kComputedProjection,
             kReplaceRoot,
-            kChangeNotificationTransformation,
+            kChangeStreamTransformation,
         };
         virtual ~TransformerInterface() = default;
         virtual Document applyTransformation(const Document& input) = 0;
@@ -103,6 +103,7 @@ public:
 
     StageConstraints constraints() const final {
         StageConstraints constraints;
+        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
         constraints.canSwapWithMatch = true;
         return constraints;
     }

@@ -44,7 +44,7 @@
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/move_timing_helper.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/s/catalog_cache.h"
+#include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/migration_secondary_throttle_options.h"
@@ -242,34 +242,19 @@ private:
         auto nss = moveChunkRequest.getNss();
         const auto range = ChunkRange(moveChunkRequest.getMinKey(), moveChunkRequest.getMaxKey());
 
-        // Wait for the metadata update to be persisted before scheduling the range deletion.
-        //
-        // This is necessary to prevent a race on the secondary because both metadata persistence
-        // and range deletion is done asynchronously and we must prevent the data deletion from
-        // being propagated before the metadata update.
-        ChunkVersion collectionVersion = [&]() {
+        // Wait for the metadata update to be persisted in order to avoid orphaned documents from
+        // starting to get deleted before the metadata changes have propagated to the secondaries.
+        auto notification = [&] {
+            CatalogCacheLoader::get(opCtx).waitForCollectionFlush(opCtx, nss);
+
+            auto const whenToClean = moveChunkRequest.getWaitForDelete()
+                ? CollectionShardingState::kNow
+                : CollectionShardingState::kDelayed;
+
             AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-            auto metadata = CollectionShardingState::get(opCtx, nss)->getMetadata();
-            uassert(ErrorCodes::NamespaceNotSharded,
-                    str::stream() << "Chunk move failed because collection '" << nss.ns()
-                                  << "' is no longer sharded.",
-                    metadata);
-            return metadata->getCollVersion();
+
+            return CollectionShardingState::get(opCtx, nss)->cleanUpRange(range, whenToClean);
         }();
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->waitForCollectionVersion(
-            opCtx, nss, collectionVersion));
-
-        // Now schedule the range deletion clean up.
-        CollectionShardingState::CleanupNotification notification;
-        {
-            AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-
-            auto const now = CollectionShardingState::kNow,
-                       later = CollectionShardingState::kDelayed;
-            auto whenToClean = moveChunkRequest.getWaitForDelete() ? now : later;
-            notification =
-                CollectionShardingState::get(opCtx, nss)->cleanUpRange(range, whenToClean);
-        }
 
         // Check for immediate failure on scheduling range deletion.
         if (notification.ready() && !notification.waitStatus(opCtx).isOK()) {

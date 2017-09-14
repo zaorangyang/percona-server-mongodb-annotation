@@ -31,6 +31,7 @@
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/db_raii.h"
@@ -287,7 +288,7 @@ public:
         // has been killed due to the collection being dropped.
         BSONObj objOut;
         ASSERT_THROWS_CODE(
-            outerExec->getNext(&objOut, nullptr), UserException, ErrorCodes::QueryPlanKilled);
+            outerExec->getNext(&objOut, nullptr), AssertionException, ErrorCodes::QueryPlanKilled);
     }
 };
 

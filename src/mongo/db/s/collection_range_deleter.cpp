@@ -36,6 +36,7 @@
 #include <utility>
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
@@ -159,7 +160,7 @@ auto CollectionRangeDeleter::cleanUpNextRange(OperationContext* opCtx,
                 } catch (DBException const& e) {
                     stdx::lock_guard<stdx::mutex> scopedLock(css->_metadataManager->_managerLock);
                     css->_metadataManager->_clearAllCleanups(
-                        {ErrorCodes::fromInt(e.getCode()),
+                        {e.code(),
                          str::stream() << "cannot push startRangeDeletion record to Op Log,"
                                           " abandoning scheduled range deletions: " << e.what()});
                     return boost::none;

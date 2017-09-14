@@ -34,6 +34,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
@@ -338,8 +339,7 @@ void MigrationChunkClonerSourceLegacy::cancelClone(OperationContext* opCtx) {
     }
 }
 
-bool MigrationChunkClonerSourceLegacy::isDocumentInMigratingChunk(OperationContext* opCtx,
-                                                                  const BSONObj& doc) {
+bool MigrationChunkClonerSourceLegacy::isDocumentInMigratingChunk(const BSONObj& doc) {
     return isInRange(doc, _args.getMinKey(), _args.getMaxKey(), _shardKeyPattern);
 }
 

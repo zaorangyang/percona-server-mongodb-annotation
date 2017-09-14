@@ -1527,7 +1527,7 @@ elif env.TargetOSIs('windows'):
     #     object called lock on the stack.
     env.Append( CCFLAGS=["/we4013", "/we4099", "/we4930"] )
 
-    env.Append( CPPDEFINES=["_CONSOLE","_CRT_SECURE_NO_WARNINGS"] )
+    env.Append( CPPDEFINES=["_CONSOLE","_CRT_SECURE_NO_WARNINGS", "_SCL_SECURE_NO_WARNINGS"] )
 
     # this would be for pre-compiled headers, could play with it later
     #env.Append( CCFLAGS=['/Yu"pch.h"'] )
@@ -2803,6 +2803,27 @@ def doConfigure(myenv):
                 #include <openssl/asn1.h>
             """):
             conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_ASN1_ANY_DEFINITIONS')
+
+
+        def CheckOpenSSL_EC_DH(context):
+            compile_test_body = textwrap.dedent("""
+            #include <openssl/ssl.h>
+
+            int main() {
+                SSL_CTX_set_ecdh_auto(0, 0);
+                SSL_set_ecdh_auto(0, 0);
+                return 0;
+            }
+            """)
+
+            context.Message("Checking if SSL_[CTX_]_set_ecdh_auto is supported... ")
+            result = context.TryCompile(compile_test_body, ".cpp")
+            context.Result(result)
+            return result
+
+        conf.AddTest("CheckOpenSSL_EC_DH", CheckOpenSSL_EC_DH)
+        if conf.CheckOpenSSL_EC_DH():
+            conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAS_SSL_SET_ECDH_AUTO')
 
     else:
         env.Append( MONGO_CRYPTO=["tom"] )

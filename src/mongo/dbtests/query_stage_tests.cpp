@@ -31,6 +31,7 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -227,7 +228,7 @@ public:
         params.bounds.boundInclusion = BoundInclusion::kIncludeBothStartAndEndKeys;
         params.direction = 1;
 
-        ASSERT_THROWS(countResults(params, BSON("baz" << 25)), MsgAssertionException);
+        ASSERT_THROWS(countResults(params, BSON("baz" << 25)), AssertionException);
     }
 };
 

@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -148,8 +149,17 @@ bool operator==(const CollectionState& lhs, const CollectionState& rhs) {
     return collectionOptionsEqual && indexSpecsEqual && dataHashEqual && existsEqual;
 }
 
+bool operator!=(const CollectionState& lhs, const CollectionState& rhs) {
+    return !(lhs == rhs);
+}
+
 std::ostream& operator<<(std::ostream& stream, const CollectionState& state) {
     return stream << state.toString();
+}
+
+StringBuilderImpl<SharedBufferAllocator>& operator<<(StringBuilderImpl<SharedBufferAllocator>& sb,
+                                                     const CollectionState& state) {
+    return sb << state.toString();
 }
 
 const auto kCollectionDoesNotExist = CollectionState();
@@ -225,7 +235,7 @@ Status IdempotencyTest::runOp(const OplogEntry& op) {
     return runOps({op});
 }
 
-Status IdempotencyTest::runOps(std::initializer_list<OplogEntry> ops) {
+Status IdempotencyTest::runOps(std::vector<OplogEntry> ops) {
     SyncTail syncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr);
     MultiApplier::OperationPtrs opsPtrs;
     for (auto& op : ops) {
@@ -235,15 +245,53 @@ Status IdempotencyTest::runOps(std::initializer_list<OplogEntry> ops) {
     return multiInitialSyncApply_noAbort(_opCtx.get(), &opsPtrs, &syncTail, &fetchCount);
 }
 
-void IdempotencyTest::testOpsAreIdempotent(std::initializer_list<OplogEntry> ops) {
+Status IdempotencyTest::resetState() {
+    return Status::OK();
+}
+
+void IdempotencyTest::testOpsAreIdempotent(std::vector<OplogEntry> ops, SequenceType sequenceType) {
+    ASSERT_OK(resetState());
     ASSERT_OK(runOps(ops));
-    auto state = validate();
-    ASSERT_OK(runOps(ops));
-    ASSERT_EQUALS(state, validate());
+    auto state1 = validate();
+    auto iterations = sequenceType == SequenceType::kEntireSequence ? 1 : ops.size();
+
+    for (std::size_t i = 0; i < iterations; i++) {
+        ASSERT_OK(resetState());
+        std::vector<OplogEntry> fullSequence;
+
+        if (sequenceType == SequenceType::kEntireSequence) {
+            ASSERT_OK(runOps(ops));
+            fullSequence.insert(fullSequence.end(), ops.begin(), ops.end());
+        } else if (sequenceType == SequenceType::kAnyPrefix ||
+                   sequenceType == SequenceType::kAnyPrefixOrSuffix) {
+            std::vector<OplogEntry> prefix(ops.begin(), ops.begin() + i + 1);
+            ASSERT_OK(runOps(prefix));
+            fullSequence.insert(fullSequence.end(), prefix.begin(), prefix.end());
+        }
+
+        ASSERT_OK(runOps(ops));
+        fullSequence.insert(fullSequence.end(), ops.begin(), ops.end());
+
+        if (sequenceType == SequenceType::kAnySuffix ||
+            sequenceType == SequenceType::kAnyPrefixOrSuffix) {
+            std::vector<OplogEntry> suffix(ops.begin() + i, ops.end());
+            ASSERT_OK(runOps(suffix));
+            fullSequence.insert(fullSequence.end(), suffix.begin(), suffix.end());
+        }
+
+        auto state2 = validate();
+        if (state1 != state2) {
+            FAIL(getStateString(state1, state2, fullSequence));
+        }
+    }
 }
 
 OplogEntry IdempotencyTest::createCollection(CollectionUUID uuid) {
     return makeCreateCollectionOplogEntry(nextOpTime(), nss, BSON("uuid" << uuid));
+}
+
+OplogEntry IdempotencyTest::dropCollection() {
+    return makeCommandOplogEntry(nextOpTime(), nss, BSON("drop" << nss.coll()));
 }
 
 OplogEntry IdempotencyTest::insert(const BSONObj& obj) {
@@ -270,21 +318,7 @@ OplogEntry IdempotencyTest::dropIndex(const std::string& indexName) {
     return makeCommandOplogEntry(nextOpTime(), nss, cmd);
 }
 
-CollectionState IdempotencyTest::validate() {
-    AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
-    auto collection = autoColl.getCollection();
-
-    if (!collection) {
-        // Return a mostly default initialized CollectionState struct with exists set to false to
-        // indicate an unfound Collection (or a view).
-        return kCollectionDoesNotExist;
-    }
-    ValidateResults validateResults;
-    BSONObjBuilder bob;
-
-    ASSERT_OK(collection->validate(_opCtx.get(), kValidateFull, &validateResults, &bob));
-    ASSERT_TRUE(validateResults.valid);
-
+std::string IdempotencyTest::computeDataHash(Collection* collection) {
     IndexDescriptor* desc = collection->getIndexCatalog()->findIdIndex(_opCtx.get());
     ASSERT_TRUE(desc);
     auto exec = InternalPlanner::indexScan(_opCtx.get(),
@@ -301,14 +335,36 @@ CollectionState IdempotencyTest::validate() {
     md5_init(&st);
 
     PlanExecutor::ExecState state;
-    BSONObj c;
-    while (PlanExecutor::ADVANCED == (state = exec->getNext(&c, NULL))) {
-        md5_append(&st, (const md5_byte_t*)c.objdata(), c.objsize());
+    BSONObj obj;
+    while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+        obj = this->canonicalizeDocumentForDataHash(obj);
+        md5_append(&st, (const md5_byte_t*)obj.objdata(), obj.objsize());
     }
     ASSERT_EQUALS(PlanExecutor::IS_EOF, state);
     md5digest d;
     md5_finish(&st, d);
-    std::string dataHash = digestToString(d);
+    return digestToString(d);
+}
+
+CollectionState IdempotencyTest::validate() {
+    AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
+    auto collection = autoColl.getCollection();
+
+    if (!collection) {
+        // Return a mostly default initialized CollectionState struct with exists set to false to
+        // indicate an unfound Collection (or a view).
+        return kCollectionDoesNotExist;
+    }
+    ValidateResults validateResults;
+    BSONObjBuilder bob;
+
+    Lock::DBLock lk(_opCtx.get(), nss.db(), MODE_IX);
+    auto lock = stdx::make_unique<Lock::CollectionLock>(_opCtx->lockState(), nss.ns(), MODE_X);
+    ASSERT_OK(collection->validate(
+        _opCtx.get(), kValidateFull, false, std::move(lock), &validateResults, &bob));
+    ASSERT_TRUE(validateResults.valid);
+
+    std::string dataHash = computeDataHash(collection);
 
     auto collectionCatalog = collection->getCatalogEntry();
     auto collectionOptions = collectionCatalog->getCollectionOptions(_opCtx.get());
@@ -323,6 +379,15 @@ CollectionState IdempotencyTest::validate() {
     CollectionState collectionState(collectionOptions, indexSpecs, dataHash);
 
     return collectionState;
+}
+
+std::string IdempotencyTest::getStateString(const CollectionState& state1,
+                                            const CollectionState& state2,
+                                            const std::vector<OplogEntry>& ops) {
+    StringBuilder sb;
+    sb << "The state: " << state1 << " does not match with the state: " << state2
+       << " found after applying the operations a second time, therefore breaking idempotency.";
+    return sb.str();
 }
 
 template OplogEntry IdempotencyTest::update<int>(int _id, const BSONObj& obj);

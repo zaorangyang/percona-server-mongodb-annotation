@@ -133,7 +133,8 @@ public:
                         const RecordId& loc,
                         OpDebug* opDebug,
                         bool fromMigrate,
-                        bool noWarn) {
+                        bool noWarn,
+                        Collection::StoreDeletedDoc storeDeletedDoc) {
         std::abort();
     }
 
@@ -167,14 +168,14 @@ public:
         std::abort();
     }
 
-    StatusWith<RecordId> updateDocument(OperationContext* opCtx,
-                                        const RecordId& oldLocation,
-                                        const Snapshotted<BSONObj>& oldDoc,
-                                        const BSONObj& newDoc,
-                                        bool enforceQuota,
-                                        bool indexesAffected,
-                                        OpDebug* opDebug,
-                                        OplogUpdateEntryArgs* args) {
+    RecordId updateDocument(OperationContext* opCtx,
+                            const RecordId& oldLocation,
+                            const Snapshotted<BSONObj>& oldDoc,
+                            const BSONObj& newDoc,
+                            bool enforceQuota,
+                            bool indexesAffected,
+                            OpDebug* opDebug,
+                            OplogUpdateEntryArgs* args) {
         std::abort();
     }
 
@@ -200,6 +201,8 @@ public:
 
     Status validate(OperationContext* opCtx,
                     ValidateCmdLevel level,
+                    bool background,
+                    std::unique_ptr<Lock::CollectionLock> collLk,
                     ValidateResults* results,
                     BSONObjBuilder* output) {
         std::abort();
@@ -271,6 +274,13 @@ public:
     }
 
     const CollatorInterface* getDefaultCollator() const {
+        std::abort();
+    }
+
+    void informIndexObserver(OperationContext* opCtx,
+                             const IndexDescriptor* descriptor,
+                             const IndexKeyEntry& indexEntry,
+                             const ValidationOperation operation) const {
         std::abort();
     }
 

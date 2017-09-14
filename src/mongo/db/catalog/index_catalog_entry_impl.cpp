@@ -36,6 +36,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
+#include "mongo/db/catalog/collection_info_cache_impl.h"
 #include "mongo/db/catalog/head_manager.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -276,7 +277,14 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
         // snapshot isolation.
         {
             StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
-            RecoveryUnitSwap ruSwap(opCtx, storageEngine->newRecoveryUnit());
+
+            // This ensures that the recovery unit is not swapped for engines that do not support
+            // database level locking.
+            std::unique_ptr<RecoveryUnitSwap> ruSwap;
+            if (storageEngine->supportsDBLocking()) {
+                ruSwap =
+                    stdx::make_unique<RecoveryUnitSwap>(opCtx, storageEngine->newRecoveryUnit());
+            }
 
             WriteUnitOfWork wuow(opCtx);
 

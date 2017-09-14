@@ -42,11 +42,6 @@
 
 namespace mongo {
 
-class CIDRException : public DBException {
-public:
-    CIDRException(const StringData& w, int code) : DBException(w.toString(), code) {}
-};
-
 /**
  * CIDR (Classless Inter-Domain Routing)
  */

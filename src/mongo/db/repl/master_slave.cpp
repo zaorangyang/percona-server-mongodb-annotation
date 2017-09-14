@@ -438,7 +438,7 @@ void ReplSource::forceResync(OperationContext* opCtx, const char* requester) {
         if (!_connect(&oplogReader,
                       HostAndPort(hostName),
                       getGlobalReplicationCoordinator()->getMyRID())) {
-            msgassertedNoTrace(14051, "unable to connect to resync");
+            msgasserted(14051, "unable to connect to resync");
         }
         bool ok = oplogReader.conn()->runCommand(
             "admin", BSON("listDatabases" << 1), info, QueryOption_SlaveOk);
@@ -646,7 +646,7 @@ void ReplSource::applyCommand(OperationContext* opCtx, const BSONObj& op) {
     try {
         Status status = applyCommand_inlock(opCtx, op, true);
         uassert(28639, "Failure applying initial sync command", status.isOK());
-    } catch (UserException& e) {
+    } catch (AssertionException& e) {
         log() << "sync: caught user assertion " << redact(e) << " while applying op: " << redact(op)
               << endl;
         ;
@@ -673,7 +673,7 @@ void ReplSource::applyOperation(OperationContext* opCtx, Database* db, const BSO
             sync.setHostname(hostName);
             sync.fetchAndInsertMissingDocument(opCtx, op);
         }
-    } catch (UserException& e) {
+    } catch (AssertionException& e) {
         log() << "sync: caught user assertion " << redact(e) << " while applying op: " << redact(op)
               << endl;
         ;
@@ -1209,14 +1209,6 @@ int _replMain(OperationContext* opCtx, ReplSource::SourceVector& sources, int& n
         } catch (const SyncException&) {
             log() << "caught SyncException" << endl;
             return 10;
-        } catch (AssertionException& e) {
-            if (e.severe()) {
-                log() << "replMain AssertionException " << redact(e) << endl;
-                return 60;
-            } else {
-                log() << "AssertionException " << redact(e) << endl;
-            }
-            replInfo = "replMain caught AssertionException";
         } catch (const DBException& e) {
             log() << "DBException " << redact(e) << endl;
             replInfo = "replMain caught DBException";

@@ -29,8 +29,8 @@
 #pragma once
 
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/matcher/expression_type.h"
 
 namespace mongo {
 
@@ -41,21 +41,6 @@ public:
      * tree. Returns a non-OK status if the schema is invalid or cannot be parsed.
      */
     static StatusWithMatchExpression parse(BSONObj schema);
-
-private:
-    // Parses 'schema' to the semantically equivalent match expression. If the schema has an
-    // associated path, e.g. if we are parsing the nested schema for property "myProp" in
-    //
-    //    {properties: {myProp: <nested-schema>}}
-    //
-    // then this is passed in 'path'. In this example, the value of 'path' is "myProp". If there is
-    // no path, e.g. for top-level schemas, then 'path' is empty.
-    static StatusWithMatchExpression _parse(StringData path, BSONObj schema);
-
-    // Parser for the JSON Schema 'properties' keyword.
-    static StatusWithMatchExpression _parseProperties(StringData path,
-                                                      BSONElement propertiesElt,
-                                                      TypeMatchExpression* typeExpr);
 };
 
 }  // namespace mongo

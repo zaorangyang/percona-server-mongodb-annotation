@@ -32,8 +32,10 @@
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/invalidation_type.h"
+#include "mongo/db/kill_sessions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/session_killer.h"
 #include "mongo/platform/unordered_map.h"
 #include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/unordered_set.h"
@@ -84,6 +86,12 @@ public:
      * all collection-level cursor managers to the given set of lsids.
      */
     static void appendAllActiveSessions(OperationContext* opCtx, LogicalSessionIdSet* lsids);
+
+    /**
+     * Kills cursors with matching logical sessions.
+     */
+    static Status killCursorsWithMatchingSessions(OperationContext* opCtx,
+                                                  const SessionKiller::Matcher& matcher);
 
     CursorManager(NamespaceString nss);
 
@@ -147,9 +155,9 @@ public:
      * Returns ErrorCodes::CursorNotFound if the cursor does not exist or
      * ErrorCodes::QueryPlanKilled if the cursor was killed in between uses.
      *
-     * Throws a UserException if the cursor is already pinned. Callers need not specially handle
-     * this error, as it should only happen if a misbehaving client attempts to simultaneously issue
-     * two operations against the same cursor id.
+     * Throws a AssertionException if the cursor is already pinned. Callers need not specially
+     * handle this error, as it should only happen if a misbehaving client attempts to
+     * simultaneously issue two operations against the same cursor id.
      */
     StatusWith<ClientCursorPin> pinCursor(OperationContext* opCtx, CursorId id);
 

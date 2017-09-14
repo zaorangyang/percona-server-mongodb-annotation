@@ -244,13 +244,17 @@ public:
         return 0;
     }
 
-    void setStableTimestamp(OperationContext* opCtx, SnapshotName snapshotName) override;
+    void setStableTimestamp(ServiceContext* serviceCtx, SnapshotName snapshotName) override;
 
-    void setInitialDataTimestamp(OperationContext* opCtx, SnapshotName snapshotName) override;
+    void setInitialDataTimestamp(ServiceContext* serviceCtx, SnapshotName snapshotName) override;
 
     SnapshotName getStableTimestamp() const;
 
     SnapshotName getInitialDataTimestamp() const;
+
+    Status recoverToStableTimestamp(ServiceContext* serviceCtx) override {
+        return Status{ErrorCodes::IllegalOperation, "recoverToStableTimestamp not implemented."};
+    }
 
     Status isAdminDbValid(OperationContext* opCtx) override {
         return isAdminDbValidFn(opCtx);

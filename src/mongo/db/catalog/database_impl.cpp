@@ -45,6 +45,7 @@
 #include "mongo/db/catalog/database_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/drop_indexes.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/namespace_uuid_cache.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/clientcursor.h"
@@ -745,9 +746,8 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     _checkCanCreateCollection(opCtx, nss, optionsWithUUID);
     audit::logCreateCollection(&cc(), ns);
 
-    Status status =
-        _dbEntry->createCollection(opCtx, ns, optionsWithUUID, true /*allocateDefaultSpace*/);
-    massertNoTraceStatusOK(status);
+    massertStatusOK(
+        _dbEntry->createCollection(opCtx, ns, optionsWithUUID, true /*allocateDefaultSpace*/));
 
     opCtx->recoveryUnit()->registerChange(new AddCollectionChange(opCtx, this, ns));
     Collection* collection = _getOrCreateCollectionInstance(opCtx, nss);

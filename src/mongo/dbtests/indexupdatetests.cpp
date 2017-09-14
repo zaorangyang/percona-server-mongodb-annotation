@@ -84,7 +84,7 @@ protected:
             indexer.commit();
             wunit.commit();
         } catch (const DBException& e) {
-            if (ErrorCodes::isInterruption(ErrorCodes::Error(e.getCode())))
+            if (ErrorCodes::isInterruption(e.code()))
                 return true;
 
             throw;
@@ -774,8 +774,9 @@ public:
         IndexSpec indexSpec;
         indexSpec.addKey("a").addOptions(BSON("collation" << BSON("locale"
                                                                   << "fr")));
-        ASSERT_THROWS_CODE(
-            client.createIndex(_ns, indexSpec), UserException, ErrorCodes::CannotBuildIndexKeys);
+        ASSERT_THROWS_CODE(client.createIndex(_ns, indexSpec),
+                           AssertionException,
+                           ErrorCodes::CannotBuildIndexKeys);
     }
 };
 

@@ -67,6 +67,7 @@
         _configsvrCommitChunkMigration: {skip: isAnInternalCommand},
         _configsvrCommitChunkSplit: {skip: isAnInternalCommand},
         _configsvrCreateDatabase: {skip: isAnInternalCommand},
+        _configsvrDropCollection: {skip: isAnInternalCommand},
         _configsvrEnableSharding: {skip: isAnInternalCommand},
         _configsvrMoveChunk: {skip: isAnInternalCommand},
         _configsvrMovePrimary: {skip: isAnInternalCommand},
@@ -326,6 +327,9 @@
             }
         },
         killOp: {skip: isUnrelated},
+        killSessions: {skip: isUnrelated},
+        killAllSessions: {skip: isUnrelated},
+        killAllSessionsByPattern: {skip: isUnrelated},
         listCollections: {skip: "tested in views/views_creation.js"},
         listCommands: {skip: isUnrelated},
         listDatabases: {skip: isUnrelated},
@@ -357,6 +361,7 @@
             expectedErrorCode: ErrorCodes.NamespaceNotSharded,
         },
         movePrimary: {skip: "Tested in sharding/movePrimary1.js"},
+        multicast: {skip: isUnrelated},
         netstat: {skip: isAnInternalCommand},
         parallelCollectionScan: {command: {parallelCollectionScan: "view"}, expectFailure: true},
         ping: {command: {ping: 1}},
@@ -459,7 +464,7 @@
                 max: {x: 0},
                 keyPattern: {x: 1},
                 splitKeys: [{x: -2}, {x: -1}],
-                shardVersion: [1, 2]
+                shardVersion: [ObjectId(), 2]
             },
             skipSharded: true,
             expectFailure: true,
@@ -476,6 +481,9 @@
         },
         stageDebug: {skip: isAnInternalCommand},
         startSession: {skip: isAnInternalCommand},
+        refreshLogicalSessionCacheNow: {skip: isAnInternalCommand},
+        refreshSessions: {skip: isUnrelated},
+        refreshSessionsInternal: {skip: isAnInternalCommand},
         top: {skip: "tested in views/views_stats.js"},
         touch: {
             command: {touch: "view", data: true},

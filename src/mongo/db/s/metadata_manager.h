@@ -51,6 +51,7 @@ class MetadataManager {
 
 public:
     using CleanupNotification = CollectionRangeDeleter::DeleteNotification;
+    using Deletion = CollectionRangeDeleter::Deletion;
 
     MetadataManager(ServiceContext*, NamespaceString nss, executor::TaskExecutor* rangeDeleter);
     ~MetadataManager();
@@ -138,8 +139,6 @@ public:
     boost::optional<CleanupNotification> trackOrphanedDataCleanup(ChunkRange const& orphans);
 
     boost::optional<KeyRange> getNextOrphanRange(BSONObj const& from);
-
-    using Deletion = CollectionRangeDeleter::Deletion;
 
 private:
     // All of the following functions must be called while holding _managerLock.
@@ -262,6 +261,12 @@ public:
     CollectionMetadata* getMetadata() const;
 
     /**
+     * Returns just the shard key fields, if collection is sharded, and the _id field, from `doc`.
+     * Does not alter any field values (e.g. by hashing); values are copied verbatim.
+     */
+    BSONObj extractDocumentKey(BSONObj const& doc) const;
+
+    /**
      * True if the ScopedCollectionMetadata stores a metadata (is not empty) and the collection is
      * sharded.
      */
@@ -276,7 +281,6 @@ public:
     bool operator!=(ScopedCollectionMetadata const& other) const {
         return _metadata != other._metadata;
     }
-
 
 private:
     /**

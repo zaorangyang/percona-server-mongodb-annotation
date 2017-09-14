@@ -221,13 +221,8 @@ mongo::Status mongo::cloneCollectionAsCapped(OperationContext* opCtx,
 
             WriteUnitOfWork wunit(opCtx);
             OpDebug* const nullOpDebug = nullptr;
-            toCollection
-                ->insertDocument(opCtx,
-                                 InsertStatement(objToClone.value()),
-                                 nullOpDebug,
-                                 true,
-                                 opCtx->writesAreReplicated())
-                .transitional_ignore();
+            uassertStatusOK(toCollection->insertDocument(
+                opCtx, InsertStatement(objToClone.value()), nullOpDebug, true));
             wunit.commit();
 
             // Go to the next document
@@ -294,6 +289,8 @@ mongo::Status mongo::convertToCapped(OperationContext* opCtx,
             return status;
     }
 
-    return renameCollection(
-        opCtx, longTmpName, collectionName, /*dropTarget*/ true, /*stayTemp*/ false);
+    RenameCollectionOptions options;
+    options.dropTarget = true;
+    options.stayTemp = false;
+    return renameCollection(opCtx, longTmpName, collectionName, options);
 }

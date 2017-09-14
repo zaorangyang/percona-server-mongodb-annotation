@@ -171,15 +171,6 @@ intrusive_ptr<Expression> Expression::parseOperand(
 namespace {
 /**
  * UTF-8 multi-byte code points consist of one leading byte of the form 11xxxxxx, and potentially
- * many continuation bytes of the form 10xxxxxx. This method checks whether 'charByte' is a
- * continuation byte.
- */
-bool isContinuationByte(char charByte) {
-    return (charByte & 0xc0) == 0x80;
-}
-
-/**
- * UTF-8 multi-byte code points consist of one leading byte of the form 11xxxxxx, and potentially
  * many continuation bytes of the form 10xxxxxx. This method checks whether 'charByte' is a leading
  * byte.
  */
@@ -1015,7 +1006,7 @@ intrusive_ptr<Expression> ExpressionDateFromParts::parse(
     BSONElement hourElem;
     BSONElement minuteElem;
     BSONElement secondElem;
-    BSONElement millisecondsElem;
+    BSONElement millisecondElem;
     BSONElement isoYearElem;
     BSONElement isoWeekYearElem;
     BSONElement isoDayOfWeekElem;
@@ -1037,8 +1028,8 @@ intrusive_ptr<Expression> ExpressionDateFromParts::parse(
             minuteElem = arg;
         } else if (field == "second"_sd) {
             secondElem = arg;
-        } else if (field == "milliseconds"_sd) {
-            millisecondsElem = arg;
+        } else if (field == "millisecond"_sd) {
+            millisecondElem = arg;
         } else if (field == "isoYear"_sd) {
             isoYearElem = arg;
         } else if (field == "isoWeekYear"_sd) {
@@ -1074,7 +1065,7 @@ intrusive_ptr<Expression> ExpressionDateFromParts::parse(
         hourElem ? parseOperand(expCtx, hourElem, vps) : nullptr,
         minuteElem ? parseOperand(expCtx, minuteElem, vps) : nullptr,
         secondElem ? parseOperand(expCtx, secondElem, vps) : nullptr,
-        millisecondsElem ? parseOperand(expCtx, millisecondsElem, vps) : nullptr,
+        millisecondElem ? parseOperand(expCtx, millisecondElem, vps) : nullptr,
         isoYearElem ? parseOperand(expCtx, isoYearElem, vps) : nullptr,
         isoWeekYearElem ? parseOperand(expCtx, isoWeekYearElem, vps) : nullptr,
         isoDayOfWeekElem ? parseOperand(expCtx, isoDayOfWeekElem, vps) : nullptr,
@@ -1089,7 +1080,7 @@ ExpressionDateFromParts::ExpressionDateFromParts(
     intrusive_ptr<Expression> hour,
     intrusive_ptr<Expression> minute,
     intrusive_ptr<Expression> second,
-    intrusive_ptr<Expression> milliseconds,
+    intrusive_ptr<Expression> millisecond,
     intrusive_ptr<Expression> isoYear,
     intrusive_ptr<Expression> isoWeekYear,
     intrusive_ptr<Expression> isoDayOfWeek,
@@ -1101,7 +1092,7 @@ ExpressionDateFromParts::ExpressionDateFromParts(
       _hour(hour),
       _minute(minute),
       _second(second),
-      _milliseconds(milliseconds),
+      _millisecond(millisecond),
       _isoYear(isoYear),
       _isoWeekYear(isoWeekYear),
       _isoDayOfWeek(isoDayOfWeek),
@@ -1126,8 +1117,8 @@ intrusive_ptr<Expression> ExpressionDateFromParts::optimize() {
     if (_second) {
         _second = _second->optimize();
     }
-    if (_milliseconds) {
-        _milliseconds = _milliseconds->optimize();
+    if (_millisecond) {
+        _millisecond = _millisecond->optimize();
     }
     if (_isoYear) {
         _isoYear = _isoYear->optimize();
@@ -1148,7 +1139,7 @@ intrusive_ptr<Expression> ExpressionDateFromParts::optimize() {
                                                _hour,
                                                _minute,
                                                _second,
-                                               _milliseconds,
+                                               _millisecond,
                                                _isoYear,
                                                _isoWeekYear,
                                                _isoDayOfWeek,
@@ -1169,7 +1160,7 @@ Value ExpressionDateFromParts::serialize(bool explain) const {
                   {"hour", _hour ? _hour->serialize(explain) : Value()},
                   {"minute", _minute ? _minute->serialize(explain) : Value()},
                   {"second", _second ? _second->serialize(explain) : Value()},
-                  {"milliseconds", _milliseconds ? _milliseconds->serialize(explain) : Value()},
+                  {"millisecond", _millisecond ? _millisecond->serialize(explain) : Value()},
                   {"isoYear", _isoYear ? _isoYear->serialize(explain) : Value()},
                   {"isoWeekYear", _isoWeekYear ? _isoWeekYear->serialize(explain) : Value()},
                   {"isoDayOfWeek", _isoDayOfWeek ? _isoDayOfWeek->serialize(explain) : Value()},
@@ -1230,13 +1221,12 @@ bool ExpressionDateFromParts::evaluateNumberWithinRange(const Document& root,
 }
 
 Value ExpressionDateFromParts::evaluate(const Document& root) const {
-    int hour, minute, second, milliseconds;
+    int hour, minute, second, millisecond;
 
     if (!evaluateNumberWithinRange(root, _hour, "hour"_sd, 0, 0, 24, &hour) ||
         !evaluateNumberWithinRange(root, _minute, "minute"_sd, 0, 0, 59, &minute) ||
         !evaluateNumberWithinRange(root, _second, "second"_sd, 0, 0, 59, &second) ||
-        !evaluateNumberWithinRange(
-            root, _milliseconds, "milliseconds"_sd, 0, 0, 999, &milliseconds)) {
+        !evaluateNumberWithinRange(root, _millisecond, "millisecond"_sd, 0, 0, 999, &millisecond)) {
         return Value(BSONNULL);
     }
 
@@ -1257,7 +1247,7 @@ Value ExpressionDateFromParts::evaluate(const Document& root) const {
         }
 
         return Value(
-            timeZone->createFromDateParts(year, month, day, hour, minute, second, milliseconds));
+            timeZone->createFromDateParts(year, month, day, hour, minute, second, millisecond));
     }
 
     if (_isoYear) {
@@ -1272,7 +1262,7 @@ Value ExpressionDateFromParts::evaluate(const Document& root) const {
         }
 
         return Value(timeZone->createFromIso8601DateParts(
-            isoYear, isoWeekYear, isoDayOfWeek, hour, minute, second, milliseconds));
+            isoYear, isoWeekYear, isoDayOfWeek, hour, minute, second, millisecond));
     }
 
     MONGO_UNREACHABLE;
@@ -1297,8 +1287,8 @@ void ExpressionDateFromParts::addDependencies(DepsTracker* deps) const {
     if (_second) {
         _second->addDependencies(deps);
     }
-    if (_milliseconds) {
-        _milliseconds->addDependencies(deps);
+    if (_millisecond) {
+        _millisecond->addDependencies(deps);
     }
     if (_isoYear) {
         _isoYear->addDependencies(deps);
@@ -1831,6 +1821,14 @@ intrusive_ptr<Expression> ExpressionFieldPath::optimize() {
     if (_variable == Variables::kRemoveId) {
         // The REMOVE system variable optimizes to a constant missing value.
         return ExpressionConstant::create(getExpressionContext(), Value());
+    }
+
+    if (Variables::isUserDefinedVariable(_variable) &&
+        getExpressionContext()->variables.hasUserDefinedValue(_variable)) {
+        const auto val = getExpressionContext()->variables.getUserDefinedValue(_variable);
+        if (!val.missing()) {
+            return ExpressionConstant::create(getExpressionContext(), val);
+        }
     }
 
     return intrusive_ptr<Expression>(this);
@@ -2685,8 +2683,9 @@ Value ExpressionIndexOfCP::evaluate(const Document& root) const {
             startByteIndex = byteIx;
         }
 
-        uassert(
-            40095, "$indexOfCP found bad UTF-8 in the input", !isContinuationByte(input[byteIx]));
+        uassert(40095,
+                "$indexOfCP found bad UTF-8 in the input",
+                !str::isUTF8ContinuationByte(input[byteIx]));
         byteIx += getCodePointLength(input[byteIx]);
     }
 
@@ -3875,7 +3874,7 @@ Value ExpressionSubstrBytes::evaluate(const Document& root) const {
     uassert(28656,
             str::stream() << getOpName()
                           << ":  Invalid range, starting index is a UTF-8 continuation byte.",
-            (lower >= str.length() || !isContinuationByte(str[lower])));
+            (lower >= str.length() || !str::isUTF8ContinuationByte(str[lower])));
 
     // Check the byte after the last character we'd return. If it is a continuation byte, that
     // means we're in the middle of a UTF-8 character.
@@ -3883,7 +3882,7 @@ Value ExpressionSubstrBytes::evaluate(const Document& root) const {
         28657,
         str::stream() << getOpName()
                       << ":  Invalid range, ending index is in the middle of a UTF-8 character.",
-        (lower + length >= str.length() || !isContinuationByte(str[lower + length])));
+        (lower + length >= str.length() || !str::isUTF8ContinuationByte(str[lower + length])));
 
     if (lower >= str.length()) {
         // If lower > str.length() then string::substr() will throw out_of_range, so return an
@@ -3948,7 +3947,7 @@ Value ExpressionSubstrCP::evaluate(const Document& root) const {
         }
         uassert(34456,
                 str::stream() << getOpName() << ": invalid UTF-8 string",
-                !isContinuationByte(str[startIndexBytes]));
+                !str::isUTF8ContinuationByte(str[startIndexBytes]));
         size_t codePointLength = getCodePointLength(str[startIndexBytes]);
         uassert(
             34457, str::stream() << getOpName() << ": invalid UTF-8 string", codePointLength <= 4);
@@ -3960,7 +3959,7 @@ Value ExpressionSubstrCP::evaluate(const Document& root) const {
     for (int i = 0; i < length && endIndexBytes < str.size(); i++) {
         uassert(34458,
                 str::stream() << getOpName() << ": invalid UTF-8 string",
-                !isContinuationByte(str[endIndexBytes]));
+                !str::isUTF8ContinuationByte(str[endIndexBytes]));
         size_t codePointLength = getCodePointLength(str[endIndexBytes]);
         uassert(
             34459, str::stream() << getOpName() << ": invalid UTF-8 string", codePointLength <= 4);
@@ -4009,11 +4008,7 @@ Value ExpressionStrLenCP::evaluate(const Document& root) const {
             val.getType() == String);
 
     std::string stringVal = val.getString();
-
-    size_t strLen = 0;
-    for (char byte : stringVal) {
-        strLen += !isContinuationByte(byte);
-    }
+    size_t strLen = str::lengthInUTF8CodePoints(stringVal);
 
     uassert(34472,
             "string length could not be represented as an int.",

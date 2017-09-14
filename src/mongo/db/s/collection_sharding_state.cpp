@@ -55,6 +55,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_shard_collection.h"
 #include "mongo/s/catalog_cache.h"
+#include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/grid.h"
@@ -94,14 +95,12 @@ private:
  */
 class CollectionVersionLogOpHandler final : public RecoveryUnit::Change {
 public:
-    CollectionVersionLogOpHandler(OperationContext* opCtx,
-                                  const NamespaceString& nss,
-                                  const ChunkVersion& updatedVersion)
-        : _opCtx(opCtx), _nss(nss), _updatedVersion(updatedVersion) {}
+    CollectionVersionLogOpHandler(OperationContext* opCtx, const NamespaceString& nss)
+        : _opCtx(opCtx), _nss(nss) {}
 
     void commit() override {
-        Grid::get(_opCtx)->catalogCache()->notifyOfCollectionVersionUpdate(
-            _opCtx, _nss, _updatedVersion);
+        Grid::get(_opCtx)->catalogCache()->invalidateShardedCollection(_nss);
+        CatalogCacheLoader::get(_opCtx).notifyOfCollectionVersionUpdate(_nss);
     }
 
     void rollback() override {}
@@ -109,7 +108,6 @@ public:
 private:
     OperationContext* _opCtx;
     const NamespaceString _nss;
-    const ChunkVersion _updatedVersion;
 };
 
 }  // unnamed namespace
@@ -269,17 +267,6 @@ boost::optional<KeyRange> CollectionShardingState::getNextOrphanRange(BSONObj co
     return _metadataManager->getNextOrphanRange(from);
 }
 
-bool CollectionShardingState::isDocumentInMigratingChunk(OperationContext* opCtx,
-                                                         const BSONObj& doc) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IX));
-
-    if (_sourceMgr) {
-        return _sourceMgr->getCloner()->isDocumentInMigratingChunk(opCtx, doc);
-    }
-
-    return false;
-}
-
 void CollectionShardingState::onInsertOp(OperationContext* opCtx, const BSONObj& insertedDoc) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IX));
 
@@ -332,17 +319,24 @@ void CollectionShardingState::onUpdateOp(OperationContext* opCtx,
     }
 }
 
+auto CollectionShardingState::makeDeleteState(BSONObj const& doc) -> DeleteState {
+    BSONObj documentKey = getMetadata().extractDocumentKey(doc).getOwned();
+    invariant(documentKey.hasField("_id"_sd));
+    return {std::move(documentKey),
+            _sourceMgr && _sourceMgr->getCloner()->isDocumentInMigratingChunk(doc)};
+}
+
 void CollectionShardingState::onDeleteOp(OperationContext* opCtx,
                                          const CollectionShardingState::DeleteState& deleteState) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IX));
 
     if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
         if (_nss == NamespaceString::kShardConfigCollectionsCollectionName) {
-            _onConfigDeleteInvalidateCachedMetadataAndNotify(opCtx, deleteState.idDoc);
+            _onConfigDeleteInvalidateCachedMetadataAndNotify(opCtx, deleteState.documentKey);
         }
 
         if (_nss == NamespaceString::kServerConfigurationNamespace) {
-            if (auto idElem = deleteState.idDoc["_id"]) {
+            if (auto idElem = deleteState.documentKey["_id"]) {
                 auto idStr = idElem.str();
                 if (idStr == ShardIdentityType::IdName) {
                     if (!repl::ReplicationCoordinator::get(opCtx)->getMemberState().rollback()) {
@@ -374,7 +368,7 @@ void CollectionShardingState::onDeleteOp(OperationContext* opCtx,
     checkShardVersionOrThrow(opCtx);
 
     if (_sourceMgr && deleteState.isMigrating) {
-        _sourceMgr->getCloner()->onDeleteOp(opCtx, deleteState.idDoc);
+        _sourceMgr->getCloner()->onDeleteOp(opCtx, deleteState.documentKey);
     }
 }
 
@@ -432,22 +426,8 @@ void CollectionShardingState::_onConfigRefreshCompleteInvalidateCachedMetadataAn
     // If 'lastRefreshedCollectionVersion' is present, then a refresh completed and the catalog
     // cache must be invalidated and the catalog cache loader notified of the new version.
     if (setField.hasField(ShardCollectionType::lastRefreshedCollectionVersion.name())) {
-        // Get the version epoch from the 'updatedDoc', since it didn't get updated and won't be
-        // in 'update'.
-        BSONElement oidElem;
-        fassert(40513,
-                bsonExtractTypedField(
-                    updatedDoc, ShardCollectionType::epoch(), BSONType::jstOID, &oidElem));
-
-        // Get the new collection version.
-        auto statusWithLastRefreshedChunkVersion = ChunkVersion::parseFromBSONWithFieldAndSetEpoch(
-            updatedDoc, ShardCollectionType::lastRefreshedCollectionVersion(), oidElem.OID());
-        fassert(40514, statusWithLastRefreshedChunkVersion.isOK());
-
         opCtx->recoveryUnit()->registerChange(
-            new CollectionVersionLogOpHandler(opCtx,
-                                              NamespaceString(refreshCollection),
-                                              statusWithLastRefreshedChunkVersion.getValue()));
+            new CollectionVersionLogOpHandler(opCtx, NamespaceString(refreshCollection)));
     }
 }
 
@@ -461,8 +441,8 @@ void CollectionShardingState::_onConfigDeleteInvalidateCachedMetadataAndNotify(
     fassertStatusOK(
         40479, bsonExtractStringField(query, ShardCollectionType::uuid.name(), &deletedCollection));
 
-    opCtx->recoveryUnit()->registerChange(new CollectionVersionLogOpHandler(
-        opCtx, NamespaceString(deletedCollection), ChunkVersion::UNSHARDED()));
+    opCtx->recoveryUnit()->registerChange(
+        new CollectionVersionLogOpHandler(opCtx, NamespaceString(deletedCollection)));
 }
 
 bool CollectionShardingState::_checkShardVersionOk(OperationContext* opCtx,
