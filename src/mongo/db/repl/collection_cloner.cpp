@@ -221,8 +221,7 @@ void CollectionCloner::shutdown() {
 void CollectionCloner::_cancelRemainingWork_inlock() {
     if (_arm) {
         Client::initThreadIfNotAlready();
-        auto opCtx = cc().getOperationContext();
-        _killArmHandle = _arm->kill(opCtx);
+        _killArmHandle = _arm->kill(cc().getOperationContext());
     }
     _countScheduler.shutdown();
     _listIndexesFetcher.shutdown();
@@ -577,7 +576,9 @@ void CollectionCloner::_establishCollectionCursorsCallback(const RemoteCommandCa
     _clusterClientCursorParams =
         stdx::make_unique<ClusterClientCursorParams>(_sourceNss, UserNameIterator());
     _clusterClientCursorParams->remotes = std::move(remoteCursors);
-    _arm = stdx::make_unique<AsyncResultsMerger>(_executor, _clusterClientCursorParams.get());
+    Client::initThreadIfNotAlready();
+    _arm = stdx::make_unique<AsyncResultsMerger>(
+        cc().getOperationContext(), _executor, _clusterClientCursorParams.get());
 
     // This completion guard invokes _finishCallback on destruction.
     auto cancelRemainingWorkInLock = [this]() { _cancelRemainingWork_inlock(); };
@@ -590,6 +591,7 @@ void CollectionCloner::_establishCollectionCursorsCallback(const RemoteCommandCa
     // outside the mutex. This is a necessary condition to invoke _finishCallback.
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     Status scheduleStatus = _scheduleNextARMResultsCallback(onCompletionGuard);
+    _arm->detachFromOperationContext();
     if (!scheduleStatus.isOK()) {
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, scheduleStatus);
         return;
@@ -612,7 +614,10 @@ StatusWith<std::vector<BSONElement>> CollectionCloner::_parseParallelCollectionS
     }
 }
 
-Status CollectionCloner::_bufferNextBatchFromArm() {
+Status CollectionCloner::_bufferNextBatchFromArm(WithLock lock) {
+    Client::initThreadIfNotAlready();
+    auto opCtx = cc().getOperationContext();
+    _arm->reattachToOperationContext(opCtx);
     while (_arm->ready()) {
         auto armResultStatus = _arm->nextReady();
         if (!armResultStatus.getStatus().isOK()) {
@@ -626,6 +631,7 @@ Status CollectionCloner::_bufferNextBatchFromArm() {
             _documentsToInsert.push_back(std::move(*queryResult));
         }
     }
+    _arm->detachFromOperationContext();
 
     return Status::OK();
 }
@@ -633,8 +639,9 @@ Status CollectionCloner::_bufferNextBatchFromArm() {
 Status CollectionCloner::_scheduleNextARMResultsCallback(
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
     Client::initThreadIfNotAlready();
-    auto opCtx = cc().getOperationContext();
-    auto nextEvent = _arm->nextEvent(opCtx);
+    _arm->reattachToOperationContext(cc().getOperationContext());
+    auto nextEvent = _arm->nextEvent();
+    _arm->detachFromOperationContext();
     if (!nextEvent.isOK()) {
         return nextEvent.getStatus();
     }
@@ -671,13 +678,20 @@ void CollectionCloner::_handleARMResultsCallback(
     }
 
     // Pull the documents from the ARM into a buffer until the entire batch has been processed.
-    auto nextBatchStatus = _bufferNextBatchFromArm();
-    if (!nextBatchStatus.isOK()) {
-        setResultAndCancelRemainingWork(onCompletionGuard, nextBatchStatus);
-        return;
+    bool lastBatch;
+    {
+        UniqueLock lk(_mutex);
+        auto nextBatchStatus = _bufferNextBatchFromArm(lk);
+        if (!nextBatchStatus.isOK()) {
+            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lk, nextBatchStatus);
+            return;
+        }
+
+        // Check if this is the last batch of documents to clone.
+        lastBatch = _arm->remotesExhausted();
     }
 
-    bool lastBatch = _arm->remotesExhausted();
+    // Schedule the next document batch insertion.
     auto&& scheduleResult =
         _scheduleDbWorkFn(stdx::bind(&CollectionCloner::_insertDocumentsCallback,
                                      this,

@@ -266,15 +266,18 @@ DBCollection.prototype.find = function(query, fields, limit, skip, batchSize, op
                              batchSize,
                              options || this.getQueryOptions());
 
-    var connObj = this.getMongo();
-    var readPrefMode = connObj.getReadPrefMode();
-    if (readPrefMode != null) {
-        cursor.readPref(readPrefMode, connObj.getReadPrefTagSet());
-    }
+    {
+        const session = this.getDB().getSession();
 
-    var rc = connObj.getReadConcern();
-    if (rc) {
-        cursor.readConcern(rc);
+        const readPreference = session._serverSession.client.getReadPreference(session);
+        if (readPreference !== null) {
+            cursor.readPref(readPreference.mode, readPreference.tags);
+        }
+
+        const readConcern = session._serverSession.client.getReadConcern(session);
+        if (readConcern !== null) {
+            cursor.readConcern(readConcern.level);
+        }
     }
 
     return cursor;
@@ -771,6 +774,19 @@ DBCollection.prototype.findAndModify = function(args) {
     var cmd = {findandmodify: this.getName()};
     for (var key in args) {
         cmd[key] = args[key];
+    }
+
+    {
+        const kWireVersionSupportingRetryableWrites = 6;
+        const serverSupportsRetryableWrites =
+            this.getMongo().getMinWireVersion() <= kWireVersionSupportingRetryableWrites &&
+            kWireVersionSupportingRetryableWrites <= this.getMongo().getMaxWireVersion();
+
+        const session = this.getDB().getSession();
+        if (serverSupportsRetryableWrites && session.getOptions().shouldRetryWrites() &&
+            session._serverSession.canRetryWrites(cmd)) {
+            cmd = session._serverSession.assignTransactionNumber(cmd);
+        }
     }
 
     var ret = this._db.runCommand(cmd);
@@ -1420,7 +1436,7 @@ DBCollection.prototype.getShardDistribution = function() {
         return;
     }
 
-    var config = this.getMongo().getDB("config");
+    var config = this.getDB().getSiblingDB("config");
 
     var numChunks = 0;
 
@@ -1471,7 +1487,7 @@ DBCollection.prototype.getSplitKeysForChunks = function(chunkSize) {
         return;
     }
 
-    var config = this.getMongo().getDB("config");
+    var config = this.getDB().getSiblingDB("config");
 
     if (!chunkSize) {
         chunkSize = config.settings.findOne({_id: "chunksize"}).value;
@@ -1528,7 +1544,7 @@ DBCollection.prototype.getSplitKeysForChunks = function(chunkSize) {
         print("\nMost recent migration activity was on " + migration.ns + " at " + migration.time);
     }
 
-    var admin = this.getMongo().getDB("admin");
+    var admin = this.getDB().getSiblingDB("admin");
     var coll = this;
     var splitFunction = function() {
 

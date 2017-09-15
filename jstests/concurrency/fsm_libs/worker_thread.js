@@ -18,6 +18,7 @@ var workerThread = (function() {
     // args.seed = seed for the random number generator
     // args.globalAssertLevel = the global assertion level to use
     // args.errorLatch = CountDownLatch instance that threads count down when they error
+    // args.sessionOptions = the options to start a session with
     // run = callback that takes a map of workloads to their associated $config
     function main(workloads, args, run) {
         var myDB;
@@ -36,7 +37,21 @@ var workerThread = (function() {
                     gc();
                 }
 
-                myDB = new Mongo(args.host).getDB(args.dbName);
+                if (typeof args.sessionOptions !== 'undefined') {
+                    // TODO SERVER-30912: the shardCollection command hangs when run under a
+                    // session, so for now we don't start a session to enable testing of causal
+                    // consistency.
+                    myDB = new Mongo(args.host).getDB(args.dbName);
+
+                    if (args.sessionOptions.causallyConsistentReads) {
+                        // TODO SERVER-30679: We manually enable causal consistency on the
+                        // connection object so that "afterClusterTime" is injected into the
+                        // readConcern of any command requests through this connection.
+                        myDB.getMongo().setCausalConsistency();
+                    }
+                } else {
+                    myDB = new Mongo(args.host).getDB(args.dbName);
+                }
             }
 
             if (Cluster.isReplication(args.clusterOptions)) {

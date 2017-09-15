@@ -34,8 +34,10 @@
 
 namespace mongo {
 
-RouterStageSkip::RouterStageSkip(std::unique_ptr<RouterExecStage> child, long long skip)
-    : RouterExecStage(std::move(child)), _skip(skip) {
+RouterStageSkip::RouterStageSkip(OperationContext* opCtx,
+                                 std::unique_ptr<RouterExecStage> child,
+                                 long long skip)
+    : RouterExecStage(opCtx, std::move(child)), _skip(skip) {
     invariant(skip > 0);
 }
 
@@ -54,18 +56,6 @@ StatusWith<ClusterQueryResult> RouterStageSkip::next() {
     }
 
     return getChildStage()->next();
-}
-
-void RouterStageSkip::kill(OperationContext* opCtx) {
-    getChildStage()->kill(opCtx);
-}
-
-bool RouterStageSkip::remotesExhausted() {
-    return getChildStage()->remotesExhausted();
-}
-
-Status RouterStageSkip::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
-    return getChildStage()->setAwaitDataTimeout(awaitDataTimeout);
 }
 
 }  // namespace mongo

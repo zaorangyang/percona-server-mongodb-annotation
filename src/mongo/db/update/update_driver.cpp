@@ -34,6 +34,7 @@
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
@@ -154,10 +155,12 @@ Status UpdateDriver::parse(
     // If the featureCompatibilityVersion is 3.4, parse using the ModifierInterfaces.
     if (serverGlobalParams.featureCompatibility.version.load() ==
         ServerGlobalParams::FeatureCompatibility::Version::k34) {
-        uassert(ErrorCodes::InvalidOptions,
-                "The featureCompatibilityVersion must be 3.6 to use arrayFilters. See "
-                "http://dochub.mongodb.org/core/3.6-feature-compatibility.",
-                arrayFilters.empty());
+        uassert(
+            ErrorCodes::InvalidOptions,
+            str::stream() << "The featureCompatibilityVersion must be 3.6 to use arrayFilters. See "
+                          << feature_compatibility_version::kDochubLink
+                          << ".",
+            arrayFilters.empty());
         for (auto&& mod : updateExpr) {
             auto modType = validateMod(mod);
             for (auto&& field : mod.Obj()) {
@@ -214,8 +217,14 @@ Status UpdateDriver::populateDocumentWithQueryFields(OperationContext* opCtx,
     // $where/$text clauses do not make sense, hence empty ExtensionsCallback.
     auto qr = stdx::make_unique<QueryRequest>(NamespaceString(""));
     qr->setFilter(query);
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
-        CanonicalQuery::canonicalize(opCtx, std::move(qr), ExtensionsCallbackNoop());
+        CanonicalQuery::canonicalize(opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     ExtensionsCallbackNoop(),
+                                     MatchExpressionParser::kAllowAllSpecialFeatures &
+                                         ~MatchExpressionParser::AllowedFeatures::kExpr);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }

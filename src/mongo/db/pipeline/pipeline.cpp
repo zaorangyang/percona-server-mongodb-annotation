@@ -272,8 +272,7 @@ void Pipeline::dispose(OperationContext* opCtx) {
         pCtx->opCtx = opCtx;
 
         // Make sure all stages are connected, in case we are being disposed via an error path and
-        // were
-        // not stitched at the time of the error.
+        // were not stitched at the time of the error.
         stitch();
 
         if (!_sources.empty()) {
@@ -332,6 +331,7 @@ void Pipeline::unsplitFromSharded(
     _unsplitSources.reset();
 
     _splitForSharded = false;
+
     stitch();
 }
 
@@ -351,6 +351,8 @@ void Pipeline::Optimizations::Sharded::findSplitPoint(Pipeline* shardPipe, Pipel
             // split this source into Merge and Shard _sources
             intrusive_ptr<DocumentSource> shardSource = splittable->getShardSource();
             intrusive_ptr<DocumentSource> mergeSource = splittable->getMergeSource();
+            invariant(shardSource != mergeSource);
+
             if (shardSource)
                 shardPipe->_sources.push_back(shardSource);
             if (mergeSource)
@@ -372,10 +374,10 @@ void Pipeline::Optimizations::Sharded::moveFinalUnwindFromShardsToMerger(Pipelin
 
 void Pipeline::Optimizations::Sharded::limitFieldsSentFromShardsToMerger(Pipeline* shardPipe,
                                                                          Pipeline* mergePipe) {
-    DepsTracker mergeDeps(
-        mergePipe->getDependencies(DocumentSourceMatch::isTextQuery(shardPipe->getInitialQuery())
-                                       ? DepsTracker::MetadataAvailable::kTextScore
-                                       : DepsTracker::MetadataAvailable::kNoMetadata));
+    auto depsMetadata = DocumentSourceMatch::isTextQuery(shardPipe->getInitialQuery())
+        ? DepsTracker::MetadataAvailable::kTextScore
+        : DepsTracker::MetadataAvailable::kNoMetadata;
+    DepsTracker mergeDeps(mergePipe->getDependencies(depsMetadata));
     if (mergeDeps.needWholeDocument)
         return;  // the merge needs all fields, so nothing we can do.
 
@@ -397,7 +399,7 @@ void Pipeline::Optimizations::Sharded::limitFieldsSentFromShardsToMerger(Pipelin
     // 2) Optimization IS NOT applied immediately following a $project or $group since it would
     //    add an unnecessary project (and therefore a deep-copy).
     for (auto&& source : shardPipe->_sources) {
-        DepsTracker dt;
+        DepsTracker dt(depsMetadata);
         if (source->getDependencies(&dt) & DocumentSource::EXHAUSTIVE_FIELDS)
             return;
     }
@@ -526,6 +528,9 @@ DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAva
             if (localDeps.getNeedTextScore())
                 deps.setNeedTextScore(true);
 
+            if (localDeps.getNeedSortKey())
+                deps.setNeedSortKey(true);
+
             knowAllMeta = status & DocumentSource::EXHAUSTIVE_META;
         }
 
@@ -550,4 +555,13 @@ DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAva
     return deps;
 }
 
+boost::intrusive_ptr<DocumentSource> Pipeline::popFrontStageWithName(StringData targetStageName) {
+    if (_sources.empty() || _sources.front()->getSourceName() != targetStageName) {
+        return nullptr;
+    }
+    auto targetStage = _sources.front();
+    _sources.pop_front();
+    stitch();
+    return targetStage;
+}
 }  // namespace mongo

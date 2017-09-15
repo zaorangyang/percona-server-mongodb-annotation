@@ -17,6 +17,16 @@
      * Returns the last result from the first batch of the aggregation pipeline 'pipeline'.
      */
     function getLastResultFromFirstBatch({collection, pipeline}) {
+        // TODO: SERVER-29126
+        // While change streams still uses read concern level local instead of read concern level
+        // majority, we need to use causal consistency to be able to immediately read our own writes
+        // out of the oplog.  Once change streams read from the majority snapshot, we can remove
+        // these synchronization points from this test.
+        assert.commandWorked(db.runCommand({
+            find: "foo",
+            readConcern: {level: "local", afterClusterTime: db.getMongo().getOperationTime()}
+        }));
+
         const cmdResponse = assert.commandWorked(
             db.runCommand({aggregate: collection.getName(), pipeline: pipeline, cursor: {}}));
         assert.neq(cmdResponse.cursor.firstBatch.length, 0);
@@ -32,7 +42,22 @@
      * document is present.
      */
     function getOneDoc(cursor) {
+        // TODO: SERVER-29126
+        assert.commandWorked(db.runCommand({
+            find: "foo",
+            readConcern: {level: "local", afterClusterTime: db.getMongo().getOperationTime()}
+        }));
         replTest.awaitReplication();
+        // TODO: SERVER-29126
+        // While change streams still uses read concern level local instead of read concern level
+        // majority, we need to use causal consistency to be able to immediately read our own writes
+        // out of the oplog.  Once change streams read from the majority snapshot, we can remove
+        // these synchronization points from this test.
+        assert.commandWorked(db.runCommand({
+            find: "foo",
+            readConcern: {level: "local", afterClusterTime: db.getMongo().getOperationTime()}
+        }));
+
         assert.commandWorked(db.adminCommand(
             {configureFailPoint: "disableAwaitDataForGetMoreCmd", mode: "alwaysOn"}));
         let res = assert.commandWorked(db.runCommand({
@@ -155,28 +180,41 @@
     assert.eq(latestChange.operationType, "update");
     assert(latestChange.hasOwnProperty("fullDocument"));
     assert.eq(latestChange.fullDocument, null);
+    const deleteDocResumePoint = latestChange._id;
 
     // Test that looking up the post image of an update after the collection has been dropped will
-    // result in 'fullDocument' with a value of null.
-    coll.drop();
-    latestChange = getLastResultFromFirstBatch({
-        collection: coll,
+    // result in 'fullDocument' with a value of null.  This must be done using getMore because new
+    // cursors cannot be established after a collection drop.
+    assert.writeOK(coll.insert({_id: "fullDocument is lookup 2"}));
+    assert.writeOK(coll.update({_id: "fullDocument is lookup 2"}, {$set: {updated: true}}));
+    res = assert.commandWorked(db.runCommand({
+        aggregate: coll.getName(),
         pipeline: [
-            {$changeStream: {fullDocument: "updateLookup", resumeAfter: firstChange._id}},
+            {$changeStream: {fullDocument: "updateLookup", resumeAfter: deleteDocResumePoint}},
             {$match: {operationType: "update"}}
-        ]
-    });
+        ],
+        cursor: {batchSize: 0}
+    }));
+    assert.neq(res.cursor.id, 0);
+    coll.drop();
+    latestChange = getOneDoc(res.cursor);
     assert.eq(latestChange.operationType, "update");
     assert(latestChange.hasOwnProperty("fullDocument"));
     assert.eq(latestChange.fullDocument, null);
 
     // Test that invalidate entries don't have 'fullDocument' even if 'updateLookup' is specified.
-    latestChange = getLastResultFromFirstBatch({
-        collection: coll,
-        pipeline: [
-            {$changeStream: {fullDocument: "updateLookup", resumeAfter: firstChange._id}},
-        ]
-    });
+    db.createCollection(db.collInvalidate.getName());
+    res = assert.commandWorked(db.runCommand({
+        aggregate: db.collInvalidate.getName(),
+        pipeline: [{$changeStream: {fullDocument: "updateLookup"}}],
+        cursor: {batchSize: 0}
+    }));
+    db.collInvalidate.insert({_id: "testing invalidate"});
+    assert.neq(res.cursor.id, 0);
+    db.collInvalidate.drop();
+    latestChange = getOneDoc(res.cursor);
+    assert.eq(latestChange.operationType, "insert");
+    latestChange = getOneDoc(res.cursor);
     assert.eq(latestChange.operationType, "invalidate");
     assert(!latestChange.hasOwnProperty("fullDocument"));
 
@@ -187,6 +225,16 @@
     assert.commandWorked(db.createCollection(coll2.getName()));
     assert.writeOK(coll2.insert({_id: "getMoreEnabled"}));
     replTest.awaitReplication();
+    // TODO: SERVER-29126
+    // While change streams still uses read concern level local instead of read concern level
+    // majority, we need to use causal consistency to be able to immediately read our own writes
+    // out of the oplog.  Once change streams read from the majority snapshot, we can remove
+    // these synchronization points from this test.
+    assert.commandWorked(db.runCommand({
+        find: "foo",
+        readConcern: {level: "local", afterClusterTime: db.getMongo().getOperationTime()}
+    }));
+
     res = assert.commandWorked(db.runCommand({
         aggregate: coll2.getName(),
         pipeline: [{$changeStream: {fullDocument: "updateLookup"}}],

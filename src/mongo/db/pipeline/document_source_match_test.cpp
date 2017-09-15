@@ -33,8 +33,6 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
-#include "mongo/db/matcher/extensions_callback_noop.h"
-#include "mongo/db/matcher/matcher.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source_match.h"
@@ -220,10 +218,10 @@ TEST_F(DocumentSourceMatchTest, ShouldAddDependenciesOfAllBranchesOfOrClause) {
 
 TEST_F(DocumentSourceMatchTest, TextSearchShouldRequireWholeDocumentAndTextScore) {
     auto match = DocumentSourceMatch::create(fromjson("{$text: {$search: 'hello'} }"), getExpCtx());
-    DepsTracker dependencies;
-    ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_ALL, match->getDependencies(&dependencies));
+    DepsTracker dependencies(DepsTracker::MetadataAvailable::kTextScore);
+    ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_FIELDS, match->getDependencies(&dependencies));
     ASSERT_EQUALS(true, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
+    ASSERT_EQUALS(true, dependencies.getNeedTextScore());
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldOnlyAddOuterFieldAsDependencyOfImplicitEqualityPredicate) {
@@ -237,15 +235,75 @@ TEST_F(DocumentSourceMatchTest, ShouldOnlyAddOuterFieldAsDependencyOfImplicitEqu
     ASSERT_EQUALS(false, dependencies.getNeedTextScore());
 }
 
-TEST_F(DocumentSourceMatchTest, ShouldAddDependenciesOfClausesWithinElemMatchAsDottedPaths) {
+TEST_F(DocumentSourceMatchTest, ShouldOnlyAddOuterFieldAsDependencyOfClausesWithinElemMatch) {
     auto match =
         DocumentSourceMatch::create(fromjson("{a: {$elemMatch: {c: {$gte: 4}}}}"), getExpCtx());
     DepsTracker dependencies;
     ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
-    ASSERT_EQUALS(1U, dependencies.fields.count("a.c"));
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
-    ASSERT_EQUALS(2U, dependencies.fields.size());
+    ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
+    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
+}
+
+TEST_F(DocumentSourceMatchTest,
+       ShouldOnlyAddOuterFieldAsDependencyOfClausesWithinInternalSchemaObjectMatch) {
+    auto query = fromjson(
+        "    {a: {$_internalSchemaObjectMatch: {"
+        "       b: {$_internalSchemaObjectMatch: {"
+        "           $or: [{c: {$type: 'string'}}, {c: {$gt: 0}}]"
+        "       }}}"
+        "    }}}");
+    auto match = DocumentSourceMatch::create(query, getExpCtx());
+    DepsTracker dependencies;
+    ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+    ASSERT_EQUALS(1U, dependencies.fields.count("a"));
+    ASSERT_EQUALS(1U, dependencies.fields.size());
+    ASSERT_EQUALS(false, dependencies.needWholeDocument);
+    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
+}
+
+TEST_F(DocumentSourceMatchTest,
+       ShouldAddWholeDocumentAsDependencyOfClausesWithinInternalSchemaMinProperties) {
+    auto query = fromjson("{$_internalSchemaMinProperties: 1}");
+    auto match = DocumentSourceMatch::create(query, getExpCtx());
+    DepsTracker dependencies;
+    ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+    ASSERT_EQUALS(0U, dependencies.fields.size());
+    ASSERT_EQUALS(true, dependencies.needWholeDocument);
+    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
+}
+
+TEST_F(DocumentSourceMatchTest,
+       ShouldAddWholeDocumentAsDependencyOfClausesWithinInternalSchemaMaxProperties) {
+    auto query = fromjson("{$_internalSchemaMaxProperties: 1}");
+    auto match = DocumentSourceMatch::create(query, getExpCtx());
+    DepsTracker dependencies1;
+    ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies1));
+    ASSERT_EQUALS(0U, dependencies1.fields.size());
+    ASSERT_EQUALS(true, dependencies1.needWholeDocument);
+    ASSERT_EQUALS(false, dependencies1.getNeedTextScore());
+
+    query = fromjson("{a: {$_internalSchemaObjectMatch: {$_internalSchemaMaxProperties: 1}}}");
+    match = DocumentSourceMatch::create(query, getExpCtx());
+    DepsTracker dependencies2;
+    ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies2));
+    ASSERT_EQUALS(1U, dependencies2.fields.size());
+    ASSERT_EQUALS(1U, dependencies2.fields.count("a"));
+    ASSERT_EQUALS(false, dependencies2.needWholeDocument);
+    ASSERT_EQUALS(false, dependencies2.getNeedTextScore());
+}
+
+TEST_F(DocumentSourceMatchTest,
+       ShouldAddWholeDocumentAsDependencyOfClausesWithinInternalSchemaAllowedProperties) {
+    auto query = fromjson(
+        "{$_internalSchemaAllowedProperties: {properties: ['a', 'b'],"
+        "namePlaceholder: 'i', patternProperties: [], otherwise: {i: 0}}}");
+    auto match = DocumentSourceMatch::create(query, getExpCtx());
+    DepsTracker dependencies;
+    ASSERT_EQUALS(DocumentSource::SEE_NEXT, match->getDependencies(&dependencies));
+    ASSERT_EQUALS(0U, dependencies.fields.size());
+    ASSERT_EQUALS(true, dependencies.needWholeDocument);
     ASSERT_EQUALS(false, dependencies.getNeedTextScore());
 }
 
@@ -381,8 +439,8 @@ DEATH_TEST_F(DocumentSourceMatchTest,
              "Invariant failure expression::isPathPrefixOf") {
     const auto expCtx = getExpCtx();
     const auto matchSpec = BSON("a.b" << 1 << "b.c" << 1);
-    const auto matchExpression = unittest::assertGet(
-        MatchExpressionParser::parse(matchSpec, ExtensionsCallbackNoop(), expCtx->getCollator()));
+    const auto matchExpression =
+        unittest::assertGet(MatchExpressionParser::parse(matchSpec, expCtx->getCollator()));
     DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
 }
 
@@ -391,8 +449,8 @@ DEATH_TEST_F(DocumentSourceMatchTest,
              "Invariant failure node->matchType()") {
     const auto expCtx = getExpCtx();
     const auto matchSpec = BSON("a" << BSON("$elemMatch" << BSON("a.b" << 1)));
-    const auto matchExpression = unittest::assertGet(
-        MatchExpressionParser::parse(matchSpec, ExtensionsCallbackNoop(), expCtx->getCollator()));
+    const auto matchExpression =
+        unittest::assertGet(MatchExpressionParser::parse(matchSpec, expCtx->getCollator()));
     BSONObjBuilder out;
     matchExpression->serialize(&out);
     DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
@@ -406,16 +464,16 @@ DEATH_TEST_F(DocumentSourceMatchTest,
              "Invariant failure") {
     const auto expCtx = getExpCtx();
     const auto matchSpec = BSON("a" << BSON("$elemMatch" << BSON("$gt" << 0)));
-    const auto matchExpression = unittest::assertGet(
-        MatchExpressionParser::parse(matchSpec, ExtensionsCallbackNoop(), expCtx->getCollator()));
+    const auto matchExpression =
+        unittest::assertGet(MatchExpressionParser::parse(matchSpec, expCtx->getCollator()));
     DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);
 }
 
 TEST_F(DocumentSourceMatchTest, ShouldMatchCorrectlyAfterDescendingMatch) {
     const auto expCtx = getExpCtx();
     const auto matchSpec = BSON("a.b" << 1 << "a.c" << 1 << "a.d" << 1);
-    const auto matchExpression = unittest::assertGet(
-        MatchExpressionParser::parse(matchSpec, ExtensionsCallbackNoop(), expCtx->getCollator()));
+    const auto matchExpression =
+        unittest::assertGet(MatchExpressionParser::parse(matchSpec, expCtx->getCollator()));
 
     const auto descendedMatch =
         DocumentSourceMatch::descendMatchOnPath(matchExpression.get(), "a", expCtx);

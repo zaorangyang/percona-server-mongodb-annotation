@@ -180,8 +180,6 @@ Status SubplanStage::planSubqueries() {
         LOG(5) << "Subplanner: index " << i << " is " << ie;
     }
 
-    const ExtensionsCallbackReal extensionsCallback(getOpCtx(), &_collection->ns());
-
     for (size_t i = 0; i < _orExpression->numChildren(); ++i) {
         // We need a place to shove the results from planning this branch.
         _branchResults.push_back(stdx::make_unique<BranchPlanningResult>());
@@ -190,8 +188,7 @@ Status SubplanStage::planSubqueries() {
         MatchExpression* orChild = _orExpression->getChild(i);
 
         // Turn the i-th child into its own query.
-        auto statusWithCQ =
-            CanonicalQuery::canonicalize(getOpCtx(), *_query, orChild, extensionsCallback);
+        auto statusWithCQ = CanonicalQuery::canonicalize(getOpCtx(), *_query, orChild);
         if (!statusWithCQ.isOK()) {
             mongoutils::str::stream ss;
             ss << "Can't canonicalize subchild " << orChild->toString() << " "
@@ -506,9 +503,11 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // Plan each branch of the $or.
     Status subplanningStatus = planSubqueries();
     if (!subplanningStatus.isOK()) {
-        if (subplanningStatus == ErrorCodes::QueryPlanKilled) {
+        if (subplanningStatus == ErrorCodes::QueryPlanKilled ||
+            subplanningStatus == ErrorCodes::ExceededTimeLimit) {
             // Query planning cannot continue if the plan for one of the subqueries was killed
-            // because the collection or a candidate index may have been dropped.
+            // because the collection or a candidate index may have been dropped, or if we've
+            // exceeded the operation's time limit.
             return subplanningStatus;
         }
         return choosePlanWholeQuery(yieldPolicy);
@@ -518,9 +517,11 @@ Status SubplanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
     // the overall winning plan from the resulting index tags.
     Status subplanSelectStat = choosePlanForSubqueries(yieldPolicy);
     if (!subplanSelectStat.isOK()) {
-        if (subplanSelectStat == ErrorCodes::QueryPlanKilled) {
-            // Query planning cannot continue if the plan was killed because the collection or a
-            // candidate index may have been dropped.
+        if (subplanSelectStat == ErrorCodes::QueryPlanKilled ||
+            subplanSelectStat == ErrorCodes::ExceededTimeLimit) {
+            // Query planning cannot continue if the plan for one of the subqueries was killed
+            // because the collection or a candidate index may have been dropped, or if we've
+            // exceeded the operation's time limit.
             return subplanSelectStat;
         }
         return choosePlanWholeQuery(yieldPolicy);

@@ -31,8 +31,11 @@
 #include <pcrecpp.h>
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
@@ -398,6 +401,48 @@ TEST_F(DatabaseTest,
     _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(_opCtx.get(), _nss);
 }
 
+TEST_F(DatabaseTest, RenameCollectionPreservesUuidOfSourceCollectionAndUpdatesUuidCatalog) {
+    auto opCtx = _opCtx.get();
+    auto fromNss = _nss;
+    auto toNss = NamespaceString(fromNss.getSisterNS("bar"));
+    ASSERT_NOT_EQUALS(fromNss, toNss);
+
+    writeConflictRetry(opCtx, "testRenameCollection", fromNss.ns(), [=] {
+        AutoGetOrCreateDb autoDb(opCtx, fromNss.db(), MODE_X);
+        auto db = autoDb.getDb();
+        ASSERT_TRUE(db);
+
+        auto fromUuid = UUID::gen();
+
+        auto&& uuidCatalog = UUIDCatalog::get(opCtx);
+        ASSERT_EQUALS(NamespaceString(), uuidCatalog.lookupNSSByUUID(fromUuid));
+
+        WriteUnitOfWork wuow(opCtx);
+        CollectionOptions fromCollectionOptions;
+        fromCollectionOptions.uuid = fromUuid;
+        ASSERT_TRUE(db->createCollection(opCtx, fromNss.ns(), fromCollectionOptions));
+        ASSERT_EQUALS(fromNss, uuidCatalog.lookupNSSByUUID(fromUuid));
+
+        auto stayTemp = false;
+        ASSERT_OK(db->renameCollection(opCtx, fromNss.ns(), toNss.ns(), stayTemp));
+
+        ASSERT_FALSE(db->getCollection(opCtx, fromNss));
+        auto toCollection = db->getCollection(opCtx, toNss);
+        ASSERT_TRUE(toCollection);
+
+        auto catalogEntry = toCollection->getCatalogEntry();
+        auto toCollectionOptions = catalogEntry->getCollectionOptions(opCtx);
+
+        auto toUuid = toCollectionOptions.uuid;
+        ASSERT_TRUE(toUuid);
+        ASSERT_EQUALS(fromUuid, *toUuid);
+
+        ASSERT_EQUALS(toNss, uuidCatalog.lookupNSSByUUID(*toUuid));
+
+        wuow.commit();
+    });
+}
+
 TEST_F(DatabaseTest,
        MakeUniqueCollectionNamespaceReturnsFailedToParseIfModelDoesNotContainPercentSign) {
     writeConflictRetry(_opCtx.get(), "testMakeUniqueCollectionNamespace", _nss.ns(), [this] {
@@ -492,5 +537,27 @@ TEST_F(
         ASSERT_EQUALS(ErrorCodes::NamespaceExists,
                       db->makeUniqueCollectionNamespace(_opCtx.get(), model));
     });
+}
+
+TEST_F(DatabaseTest, DBLockCanBePassedToAutoGetDb) {
+    NamespaceString nss("test", "coll");
+    Lock::DBLock lock(_opCtx.get(), nss.db(), MODE_X);
+    {
+        AutoGetDb db(_opCtx.get(), nss.db(), std::move(lock));
+        ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+    }
+    // The moved lock should go out of scope here, so the database should no longer be locked.
+    ASSERT_FALSE(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+}
+
+TEST_F(DatabaseTest, DBLockCanBePassedToAutoGetCollectionOrViewForReadCommand) {
+    NamespaceString nss("test", "coll");
+    Lock::DBLock lock(_opCtx.get(), nss.db(), MODE_X);
+    {
+        AutoGetCollectionOrViewForReadCommand coll(_opCtx.get(), nss, std::move(lock));
+        ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
+    }
+    // The moved lock should go out of scope here, so the database should no longer be locked.
+    ASSERT_FALSE(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
 }
 }  // namespace

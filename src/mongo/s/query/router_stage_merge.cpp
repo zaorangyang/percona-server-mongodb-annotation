@@ -36,13 +36,14 @@
 
 namespace mongo {
 
-RouterStageMerge::RouterStageMerge(executor::TaskExecutor* executor,
+RouterStageMerge::RouterStageMerge(OperationContext* opCtx,
+                                   executor::TaskExecutor* executor,
                                    ClusterClientCursorParams* params)
-    : _executor(executor), _arm(executor, params) {}
+    : RouterExecStage(opCtx), _executor(executor), _arm(opCtx, executor, params) {}
 
 StatusWith<ClusterQueryResult> RouterStageMerge::next() {
     while (!_arm.ready()) {
-        auto nextEventStatus = _arm.nextEvent(getOpCtx());
+        auto nextEventStatus = _arm.nextEvent();
         if (!nextEventStatus.isOK()) {
             return nextEventStatus.getStatus();
         }
@@ -68,7 +69,7 @@ bool RouterStageMerge::remotesExhausted() {
     return _arm.remotesExhausted();
 }
 
-Status RouterStageMerge::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
+Status RouterStageMerge::doSetAwaitDataTimeout(Milliseconds awaitDataTimeout) {
     return _arm.setAwaitDataTimeout(awaitDataTimeout);
 }
 

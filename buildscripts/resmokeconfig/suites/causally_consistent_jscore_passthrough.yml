@@ -102,6 +102,8 @@ selector:
   - jstests/core/bypass_doc_validation.js
   - jstests/core/capped_max1.js
   - jstests/core/commands_namespace_parsing.js
+  - jstests/core/tailable_cursor_invalidation.js
+  - jstests/core/tailable_getmore_batch_size.js
   - jstests/core/tailable_skip_limit.js
   - jstests/core/constructors.js
   - jstests/core/index_stats.js
@@ -125,6 +127,8 @@ selector:
   - jstests/core/geo_distinct.js
   - jstests/core/geo_s2ordering.js
   - jstests/core/group1.js
+  - jstests/core/group2.js
+  - jstests/core/maxscan.js
   - jstests/core/nan.js
   - jstests/core/null2.js
   - jstests/core/not2.js
@@ -154,10 +158,6 @@ selector:
   - jstests/core/views/views_stats.js
   - jstests/core/orf.js #explain.executionStats is not CC
   - jstests/core/rename7.js
-  # TODO: SERVER-30497
-  - jstests/core/maxscan.js
-  # TODO: SERVER-30498
-  - jstests/core/group2.js
   # TODO: SERVER-30582
   - jstests/core/agg_hint.js
   - jstests/core/explain_agg_write_concern.js
@@ -170,6 +170,8 @@ selector:
   - jstests/core/views/views_find.js
   # TODO: SERVER-30582
   - jstests/core/explain_multi_plan.js
+  - jstests/core/list_local_sessions.js # SERVER-29628 needs MongoSOnly support
+  - jstests/core/list_all_local_sessions.js # SERVER-29628 needs MongoSOnly support
 
 executor:
   config:
@@ -183,7 +185,6 @@ executor:
   fixture:
     class: ShardedClusterFixture
     mongos_options:
-      bind_ip_all: ''
       set_parameters:
         enableTestCommands: 1
         logComponentVerbosity:
@@ -194,7 +195,6 @@ executor:
             asio: 2
           tracking: 0
     mongod_options:
-      bind_ip_all: ''
       nopreallocj: ''
       enableMajorityReadConcern: ''
       set_parameters:

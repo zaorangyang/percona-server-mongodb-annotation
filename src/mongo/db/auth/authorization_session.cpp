@@ -200,10 +200,10 @@ User* AuthorizationSession::getSingleUser() {
     if (userNameItr.more()) {
         userName = userNameItr.next();
         if (userNameItr.more()) {
-            uasserted(ErrorCodes::Unauthorized, "there are no users authenticated");
+            uasserted(ErrorCodes::Unauthorized, "too many users are authenticated");
         }
     } else {
-        uasserted(ErrorCodes::Unauthorized, "too many users are authenticated");
+        uasserted(ErrorCodes::Unauthorized, "there are no users authenticated");
     }
 
     return lookupUser(userName);
@@ -380,39 +380,11 @@ Status AuthorizationSession::checkAuthForFind(const NamespaceString& ns, bool ha
 Status AuthorizationSession::checkAuthForGetMore(const NamespaceString& ns,
                                                  long long cursorID,
                                                  bool hasTerm) {
-    // "ns" can be in one of several formats: "listCollections" format, "listIndexes" format,
-    // "collectionless aggregation" format, and normal format.
-    if (ns.isListCollectionsCursorNS()) {
-        // "ns" is of the form "<db>.$cmd.listCollections". Check if we can perform the
-        // listCollections action on the database resource for "<db>".
-        if (!isAuthorizedToListCollections(ns.db())) {
-            return Status(ErrorCodes::Unauthorized,
-                          str::stream() << "not authorized for listCollections getMore on "
-                                        << ns.ns());
-        }
-    } else if (ns.isListIndexesCursorNS()) {
-        // "ns" is of the form "<db>.$cmd.listIndexes.<coll>". Check if we can perform the
-        // listIndexes action on the "<db>.<coll>" namespace.
-        NamespaceString targetNS = ns.getTargetNSForListIndexes();
-        if (!isAuthorizedForActionsOnNamespace(targetNS, ActionType::listIndexes)) {
-            return Status(ErrorCodes::Unauthorized,
-                          str::stream() << "not authorized for listIndexes getMore on " << ns.ns());
-        }
-    } else if (ns.isCollectionlessAggregateNS()) {
-        // "ns" is of the form "<db>.$cmd.aggregate". We don't have access to the parameters of the
-        // original command at this point, but since users can only getMore their own cursors we
-        // verify that a user either is authenticated or does not need to be.
-        if (!_externalState->shouldIgnoreAuthChecks() && !getAuthenticatedUserNames().more()) {
-            return Status(ErrorCodes::Unauthorized,
-                          str::stream() << "not authorized for collectionless aggregate getMore on "
-                                        << ns.db());
-        }
-    } else {
-        // "ns" is a regular namespace string.  Check if we can perform the find action on it.
-        if (!isAuthorizedForActionsOnNamespace(ns, ActionType::find)) {
-            return Status(ErrorCodes::Unauthorized,
-                          str::stream() << "not authorized for getMore on " << ns.ns());
-        }
+    // Since users can only getMore their own cursors, we verify that a user either is authenticated
+    // or does not need to be.
+    if (!_externalState->shouldIgnoreAuthChecks() && !getAuthenticatedUserNames().more()) {
+        return Status(ErrorCodes::Unauthorized,
+                      str::stream() << "not authorized for getMore on " << ns.db());
     }
 
     // Only internal clients (such as other nodes in a replica set) are allowed to use
@@ -1003,3 +975,59 @@ bool AuthorizationSession::isImpersonating() const {
 }
 
 }  // namespace mongo
+
+auto mongo::checkCursorSessionPrivilege(OperationContext* const opCtx,
+                                        const boost::optional<LogicalSessionId> cursorSessionId)
+    -> Status {
+    if (!AuthorizationSession::exists(opCtx->getClient())) {
+        return Status::OK();
+    }
+    auto* const authSession = AuthorizationSession::get(opCtx->getClient());
+
+    auto nobodyIsLoggedIn = [authSession] {
+        return !authSession->getAuthenticatedUserNames().more();
+    };
+
+    auto authHasImpersonatePrivilege = [authSession] {
+        return authSession->isAuthorizedForPrivilege(
+            Privilege(ResourcePattern::forClusterResource(), ActionType::impersonate));
+    };
+
+    auto authIsOn = [authSession] {
+        return authSession->getAuthorizationManager().isAuthEnabled();
+    };
+
+    auto sessionIdToStringOrNone =
+        [](const boost::optional<LogicalSessionId>& sessionId) -> std::string {
+        if (sessionId) {
+            return str::stream() << *sessionId;
+        }
+        return "none";
+    };
+
+    // If the cursor has a session then one of the following must be true:
+    // 1: context session id must match cursor session id.
+    // 2: user must be magic special (__system, or background task, etc).
+
+    // We do not check the user's ID against the cursor's notion of a user ID, since higher level
+    // auth checks will check that for us anyhow.
+    if (authIsOn() &&  // If the authorization is not on, then we permit anybody to do anything.
+        cursorSessionId != opCtx->getLogicalSessionId() &&  // If the cursor's session doesn't match
+                                                            // the Operation Context's session, then
+                                                            // we should forbid the operation even
+                                                            // when the cursor has no session.
+        !nobodyIsLoggedIn() &&          // Unless, for some reason a user isn't actually using this
+                                        // Operation Context (which implies a background job
+        !authHasImpersonatePrivilege()  // Or if the user has an impersonation privilege, in which
+                                        // case, the user gets to sidestep certain checks.
+        ) {
+        return Status{ErrorCodes::Unauthorized,
+                      str::stream() << "Cursor session id ("
+                                    << sessionIdToStringOrNone(cursorSessionId)
+                                    << ") is not the same as the operation context's session id ("
+                                    << sessionIdToStringOrNone(opCtx->getLogicalSessionId())
+                                    << ")"};
+    }
+
+    return Status::OK();
+}

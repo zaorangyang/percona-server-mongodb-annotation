@@ -406,6 +406,25 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
     output->appendNumber("indexSize", indexSize / scale);
 
     _dbEntry->appendExtraStats(opCtx, output, scale);
+
+    if (!getGlobalServiceContext()->getGlobalStorageEngine()->isEphemeral()) {
+        boost::filesystem::path dbpath(storageGlobalParams.dbpath);
+        if (storageGlobalParams.directoryperdb) {
+            dbpath /= _name;
+        }
+
+        boost::system::error_code ec;
+        boost::filesystem::space_info spaceInfo = boost::filesystem::space(dbpath, ec);
+        if (!ec) {
+            output->appendNumber("fsUsedSize", (spaceInfo.capacity - spaceInfo.available) / scale);
+            output->appendNumber("fsTotalSize", spaceInfo.capacity / scale);
+        } else {
+            output->appendNumber("fsUsedSize", -1);
+            output->appendNumber("fsTotalSize", -1);
+            log() << "Failed to query filesystem disk stats (code: " << ec.value()
+                  << "): " << ec.message();
+        }
+    }
 }
 
 Status DatabaseImpl::dropView(OperationContext* opCtx, StringData fullns) {
@@ -431,7 +450,7 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
                 if (_profile != 0)
                     return Status(ErrorCodes::IllegalOperation,
                                   "turn off profiling before dropping system.profile collection");
-            } else if (!nss.isSystemDotViews()) {
+            } else if (!(nss.isSystemDotViews() || nss.isHealthlog())) {
                 return Status(ErrorCodes::IllegalOperation,
                               str::stream() << "can't drop system collection " << fullns);
             }
@@ -953,13 +972,16 @@ auto mongo::userCreateNSImpl(OperationContext* opCtx,
         return status;
 
     // Validate the collation, if there is one.
+    std::unique_ptr<CollatorInterface> collator;
     if (!collectionOptions.collation.isEmpty()) {
-        auto collator = CollatorFactoryInterface::get(opCtx->getServiceContext())
-                            ->makeFromBSON(collectionOptions.collation);
+        auto collatorWithStatus = CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                      ->makeFromBSON(collectionOptions.collation);
 
-        if (!collator.isOK()) {
-            return collator.getStatus();
+        if (!collatorWithStatus.isOK()) {
+            return collatorWithStatus.getStatus();
         }
+
+        collator = std::move(collatorWithStatus.getValue());
 
         // If the collator factory returned a non-null collator, set the collation option to the
         // result of serializing the collator's spec back into BSON. We do this in order to fill in
@@ -969,8 +991,32 @@ auto mongo::userCreateNSImpl(OperationContext* opCtx,
         // we simply unset the "collation" from the collection options. This ensures that
         // collections created on versions which do not support the collation feature have the same
         // format for representing the simple collation as collections created on this version.
-        collectionOptions.collation =
-            collator.getValue() ? collator.getValue()->getSpec().toBSON() : BSONObj();
+        collectionOptions.collation = collator ? collator->getSpec().toBSON() : BSONObj();
+    }
+
+    if (!collectionOptions.validator.isEmpty()) {
+        // Pre-parse the validator document to make sure there are no extensions that are not
+        // permitted in collection validators.
+        MatchExpressionParser::AllowedFeatureSet allowedFeatures =
+            MatchExpressionParser::kBanAllSpecialFeatures;
+        if (!serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.load() ||
+            serverGlobalParams.featureCompatibility.version.load() !=
+                ServerGlobalParams::FeatureCompatibility::Version::k34) {
+            // $jsonSchema is only permitted when the feature compatibility version is newer
+            // than 3.4. Note that we don't enforce this feature compatibility check when we are on
+            // the secondary or on a backup instance, as indicated by !validateFeaturesAsMaster.
+            allowedFeatures |= MatchExpressionParser::kJSONSchema;
+        }
+        auto statusWithMatcher = MatchExpressionParser::parse(collectionOptions.validator,
+                                                              collator.get(),
+                                                              nullptr,
+                                                              ExtensionsCallbackNoop(),
+                                                              allowedFeatures);
+
+        // We check the status of the parse to see if there are any banned features, but we don't
+        // actually need the result for now.
+        if (!statusWithMatcher.isOK())
+            return statusWithMatcher.getStatus();
     }
 
     status =

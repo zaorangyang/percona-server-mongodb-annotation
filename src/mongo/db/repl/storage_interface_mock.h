@@ -90,7 +90,7 @@ public:
             const BSONObj idIndexSpec,
             const std::vector<BSONObj>& secondaryIndexSpecs)>;
     using InsertDocumentFn = stdx::function<Status(
-        OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc)>;
+        OperationContext* opCtx, const NamespaceString& nss, const TimestampedBSONObj& doc)>;
     using InsertDocumentsFn = stdx::function<Status(OperationContext* opCtx,
                                                     const NamespaceString& nss,
                                                     const std::vector<InsertStatement>& docs)>;
@@ -135,7 +135,7 @@ public:
 
     Status insertDocument(OperationContext* opCtx,
                           const NamespaceString& nss,
-                          const BSONObj& doc) override {
+                          const TimestampedBSONObj& doc) override {
         return insertDocumentFn(opCtx, nss, doc);
     };
 
@@ -260,6 +260,10 @@ public:
         return isAdminDbValidFn(opCtx);
     };
 
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) override {
+        return;
+    }
+
     // Testing functions.
     CreateCollectionForBulkFn createCollectionForBulkFn =
         [](const NamespaceString& nss,
@@ -270,7 +274,7 @@ public:
         return Status{ErrorCodes::IllegalOperation, "CreateCollectionForBulkFn not implemented."};
     };
     InsertDocumentFn insertDocumentFn =
-        [](OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc) {
+        [](OperationContext* opCtx, const NamespaceString& nss, const TimestampedBSONObj& doc) {
             return Status{ErrorCodes::IllegalOperation, "InsertDocumentFn not implemented."};
         };
     InsertDocumentsFn insertDocumentsFn = [](OperationContext* opCtx,

@@ -55,7 +55,6 @@
 #include "mongo/db/exec/update.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/update_lifecycle.h"
@@ -120,6 +119,7 @@ void filterAllowedIndexEntries(const AllowedIndicesFilter& allowedIndicesFilter,
 namespace {
 // The body is below in the "count hack" section but getExecutor calls it.
 bool turnIxscanIntoCount(QuerySolution* soln);
+
 }  // namespace
 
 
@@ -295,7 +295,7 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
         // document, so we don't support covered projections. However, we might use the
         // simple inclusion fast path.
         if (NULL != canonicalQuery->getProj()) {
-            ProjectionStageParams params(ExtensionsCallbackReal(opCtx, &collection->ns()));
+            ProjectionStageParams params;
             params.projObj = canonicalQuery->getProj()->getProjObj();
             params.collator = canonicalQuery->getCollator();
 
@@ -625,17 +625,17 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind(
     Collection* collection,
     const NamespaceString& nss,
     unique_ptr<CanonicalQuery> canonicalQuery,
-    PlanExecutor::YieldPolicy yieldPolicy) {
+    PlanExecutor::YieldPolicy yieldPolicy,
+    size_t plannerOptions) {
     if (NULL != collection && canonicalQuery->getQueryRequest().isOplogReplay()) {
         return getOplogStartHack(opCtx, collection, std::move(canonicalQuery));
     }
 
-    size_t options = QueryPlannerParams::DEFAULT;
     if (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, nss.ns())) {
-        options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+        plannerOptions |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
     }
     return getExecutor(
-        opCtx, collection, std::move(canonicalQuery), PlanExecutor::YIELD_AUTO, options);
+        opCtx, collection, std::move(canonicalQuery), PlanExecutor::YIELD_AUTO, plannerOptions);
 }
 
 namespace {
@@ -657,8 +657,7 @@ StatusWith<unique_ptr<PlanStage>> applyProjection(OperationContext* opCtx,
     invariant(!proj.isEmpty());
 
     ParsedProjection* rawParsedProj;
-    Status ppStatus = ParsedProjection::make(
-        proj.getOwned(), cq->root(), &rawParsedProj, ExtensionsCallbackDisallowExtensions());
+    Status ppStatus = ParsedProjection::make(proj.getOwned(), cq->root(), &rawParsedProj);
     if (!ppStatus.isOK()) {
         return ppStatus;
     }
@@ -678,7 +677,7 @@ StatusWith<unique_ptr<PlanStage>> applyProjection(OperationContext* opCtx,
                 "Cannot use a $meta sortKey projection in findAndModify commands."};
     }
 
-    ProjectionStageParams params(ExtensionsCallbackReal(opCtx, &nsString));
+    ProjectionStageParams params;
     params.projObj = proj;
     params.collator = cq->getCollator();
     params.fullExpression = cq->root();
@@ -835,7 +834,9 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     UpdateLifecycle* lifecycle = request->getLifecycle();
 
     if (nss.isSystem() && opCtx->lockState()->shouldConflictWithSecondaryBatchApplication()) {
-        uassert(10156, "cannot update a system namespace", nss.isLegalClientSystemNS());
+        uassert(10156,
+                str::stream() << "cannot update a system namespace: " << nss.ns(),
+                nss.isLegalClientSystemNS());
     }
     if (nss.isVirtualized()) {
         log() << "cannot update a virtual collection: " << nss;
@@ -998,7 +999,14 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorGroup(
 
     const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     extensionsCallback,
+                                     MatchExpressionParser::kAllowAllSpecialFeatures &
+                                         ~MatchExpressionParser::AllowedFeatures::kExpr);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }
@@ -1228,12 +1236,16 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCount(
     qr->setHint(request.getHint());
     qr->setExplain(explain);
 
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ = CanonicalQuery::canonicalize(
         opCtx,
         std::move(qr),
+        expCtx,
         collection ? static_cast<const ExtensionsCallback&>(
                          ExtensionsCallbackReal(opCtx, &collection->ns()))
-                   : static_cast<const ExtensionsCallback&>(ExtensionsCallbackNoop()));
+                   : static_cast<const ExtensionsCallback&>(ExtensionsCallbackNoop()),
+        MatchExpressionParser::kAllowAllSpecialFeatures &
+            ~MatchExpressionParser::AllowedFeatures::kExpr);
 
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
@@ -1484,7 +1496,14 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
     auto qr = stdx::make_unique<QueryRequest>(parsedDistinct->getQuery()->getQueryRequest());
     qr->setProj(projection);
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     extensionsCallback,
+                                     MatchExpressionParser::kAllowAllSpecialFeatures &
+                                         ~MatchExpressionParser::AllowedFeatures::kExpr);
     if (!statusWithCQ.isOK()) {
         return statusWithCQ.getStatus();
     }

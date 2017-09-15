@@ -52,6 +52,7 @@
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_merge_cursors.h"
@@ -76,6 +77,7 @@
 #include "mongo/s/chunk_version.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -391,6 +393,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     Collection* collection,
     const NamespaceString& nss,
     const intrusive_ptr<ExpressionContext>& pExpCtx,
+    bool oplogReplay,
     BSONObj queryObj,
     BSONObj projectionObj,
     BSONObj sortObj,
@@ -405,6 +408,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
             qr->setAwaitData(true);
             break;
     }
+    qr->setOplogReplay(oplogReplay);
     qr->setFilter(queryObj);
     qr->setProj(projectionObj);
     qr->setSort(sortObj);
@@ -425,7 +429,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
 
     const ExtensionsCallbackReal extensionsCallback(pExpCtx->opCtx, &nss);
 
-    auto cq = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback, pExpCtx);
+    auto cq = CanonicalQuery::canonicalize(opCtx,
+                                           std::move(qr),
+                                           pExpCtx,
+                                           extensionsCallback,
+                                           MatchExpressionParser::AllowedFeatures::kText |
+                                               MatchExpressionParser::AllowedFeatures::kExpr);
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of
@@ -436,8 +445,15 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
         return {cq.getStatus()};
     }
 
-    return getExecutor(
-        opCtx, collection, std::move(cq.getValue()), PlanExecutor::YIELD_AUTO, plannerOpts);
+    return getExecutorFind(
+        opCtx, collection, nss, std::move(cq.getValue()), PlanExecutor::YIELD_AUTO, plannerOpts);
+}
+
+BSONObj removeSortKeyMetaProjection(BSONObj projectionObj) {
+    if (!projectionObj[Document::metaFieldSortKey]) {
+        return projectionObj;
+    }
+    return projectionObj.removeField(Document::metaFieldSortKey);
 }
 }  // namespace
 
@@ -494,9 +510,12 @@ void PipelineD::prepareCursorSource(Collection* collection,
 
     // Look for an initial match. This works whether we got an initial query or not. If not, it
     // results in a "{}" query, which will be what we want in that case.
+    bool oplogReplay = false;
     const BSONObj queryObj = pipeline->getInitialQuery();
     if (!queryObj.isEmpty()) {
-        if (dynamic_cast<DocumentSourceMatch*>(sources.front().get())) {
+        auto matchStage = dynamic_cast<DocumentSourceMatch*>(sources.front().get());
+        if (matchStage) {
+            oplogReplay = dynamic_cast<DocumentSourceOplogMatch*>(matchStage) != nullptr;
             // If a $match query is pulled into the cursor, the $match is redundant, and can be
             // removed from the pipeline.
             sources.pop_front();
@@ -514,20 +533,18 @@ void PipelineD::prepareCursorSource(Collection* collection,
 
     BSONObj projForQuery = deps.toProjection();
 
-    /*
-      Look for an initial sort; we'll try to add this to the
-      Cursor we create.  If we're successful in doing that (further down),
-      we'll remove the $sort from the pipeline, because the documents
-      will already come sorted in the specified order as a result of the
-      index scan.
-    */
+    // Look for an initial sort; we'll try to add this to the Cursor we create. If we're successful
+    // in doing that, we'll remove the $sort from the pipeline, because the documents will already
+    // come sorted in the specified order as a result of the index scan.
     intrusive_ptr<DocumentSourceSort> sortStage;
     BSONObj sortObj;
     if (!sources.empty()) {
         sortStage = dynamic_cast<DocumentSourceSort*>(sources.front().get());
         if (sortStage) {
-            // build the sort key
-            sortObj = sortStage->serializeSortKey(/*explain*/ false).toBson();
+            sortObj = sortStage
+                          ->sortKeyPattern(
+                              DocumentSourceSort::SortKeySerialization::kForPipelineSerialization)
+                          .toBson();
         }
     }
 
@@ -537,6 +554,7 @@ void PipelineD::prepareCursorSource(Collection* collection,
                                                 nss,
                                                 pipeline,
                                                 expCtx,
+                                                oplogReplay,
                                                 sortStage,
                                                 deps,
                                                 queryObj,
@@ -565,6 +583,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     const NamespaceString& nss,
     Pipeline* pipeline,
     const intrusive_ptr<ExpressionContext>& expCtx,
+    bool oplogReplay,
     const intrusive_ptr<DocumentSourceSort>& sortStage,
     const DepsTracker& deps,
     const BSONObj& queryObj,
@@ -591,37 +610,36 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     // order so we can then apply other optimizations there are tickets for, such as SERVER-4507.
     size_t plannerOpts = QueryPlannerParams::DEFAULT | QueryPlannerParams::NO_BLOCKING_SORT;
 
-    // If we are connecting directly to the shard rather than through a mongos, don't filter out
-    // orphaned documents.
-    if (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, nss.ns())) {
-        plannerOpts |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
-    }
-
     if (deps.hasNoRequirements()) {
         // If we don't need any fields from the input document, performing a count is faster, and
         // will output empty documents, which is okay.
         plannerOpts |= QueryPlannerParams::IS_COUNT;
     }
 
-    // The only way to get a text score is to let the query system handle the projection. In all
-    // other cases, unless the query system can do an index-covered projection and avoid going to
-    // the raw record at all, it is faster to have ParsedDeps filter the fields we need.
-    if (!deps.getNeedTextScore()) {
+    // The only way to get a text score or the sort key is to let the query system handle the
+    // projection. In all other cases, unless the query system can do an index-covered projection
+    // and avoid going to the raw record at all, it is faster to have ParsedDeps filter the fields
+    // we need.
+    if (!deps.getNeedTextScore() && !deps.getNeedSortKey()) {
         plannerOpts |= QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
     }
 
-    BSONObj emptyProjection;
+    const BSONObj emptyProjection;
+    const BSONObj metaSortProjection = BSON("$meta"
+                                            << "sortKey");
     if (sortStage) {
         // See if the query system can provide a non-blocking sort.
-        auto swExecutorSort = attemptToGetExecutor(opCtx,
-                                                   collection,
-                                                   nss,
-                                                   expCtx,
-                                                   queryObj,
-                                                   emptyProjection,
-                                                   *sortObj,
-                                                   aggRequest,
-                                                   plannerOpts);
+        auto swExecutorSort =
+            attemptToGetExecutor(opCtx,
+                                 collection,
+                                 nss,
+                                 expCtx,
+                                 oplogReplay,
+                                 queryObj,
+                                 expCtx->needsMerge ? metaSortProjection : emptyProjection,
+                                 *sortObj,
+                                 aggRequest,
+                                 plannerOpts);
 
         if (swExecutorSort.isOK()) {
             // Success! Now see if the query system can also cover the projection.
@@ -629,6 +647,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                                               collection,
                                                               nss,
                                                               expCtx,
+                                                              oplogReplay,
                                                               queryObj,
                                                               *projectionObj,
                                                               *sortObj,
@@ -672,12 +691,21 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     // Either there was no $sort stage, or the query system could not provide a non-blocking
     // sort.
     dassert(sortObj->isEmpty());
+    *projectionObj = removeSortKeyMetaProjection(*projectionObj);
+    if (deps.getNeedSortKey() && !deps.getNeedTextScore()) {
+        // A sort key requirement would have prevented us from being able to add this parameter
+        // before, but now we know the query system won't cover the sort, so we will be able to
+        // compute the sort key ourselves during the $sort stage, and thus don't need a query
+        // projection to do so.
+        plannerOpts |= QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
+    }
 
     // See if the query system can cover the projection.
     auto swExecutorProj = attemptToGetExecutor(opCtx,
                                                collection,
                                                nss,
                                                expCtx,
+                                               oplogReplay,
                                                queryObj,
                                                *projectionObj,
                                                *sortObj,
@@ -700,6 +728,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                 collection,
                                 nss,
                                 expCtx,
+                                oplogReplay,
                                 queryObj,
                                 *projectionObj,
                                 *sortObj,

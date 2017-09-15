@@ -73,7 +73,7 @@ structs:
                            should return a full document or just changes for an update.
 
 
-  DocumentSourceCheckResumeTokenSpec:
+  DocumentSourceEnsureResumeTokenPresentSpec:
       description: A document used to specify the internal stage which checks the presence of the
                    resume token.
       fields:
@@ -90,6 +90,24 @@ structs:
             type: timestamp
             description: The timestamp of the logical time
 
+  ListSessionsUser:
+    description: "A struct representing a $listSessions/$listLocalSessions User"
+    strict: true
+    fields:
+      user: string
+      db: string
+
+  ListSessionsSpec:
+    description: "$listSessions and $listLocalSessions pipeline spec"
+    strict: true
+    fields:
+      allUsers:
+        type: bool
+        default: false
+      users:
+        type: array<ListSessionsUser>
+        optional: true
+
   ResumeTokenInternal:
       description: The internal format of a resume token.  For use by the ResumeToken class
                    only.
@@ -99,10 +117,10 @@ structs:
               type: ResumeTokenClusterTime
               description: The timestamp of the oplog entry represented by this resume token.
 
-          ns:
-              cpp_name: ns
-              type: string
-              description: The namespace of the oplog entry represented by this resume token.
+          uuid:
+              cpp_name: uuid
+              type: uuid
+              description: The UUID of the oplog entry represented by this resume token.
 
           documentKey:
               cpp_name: documentKey

@@ -30,11 +30,13 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 
 #include <set>
 
 #include "mongo/db/kill_sessions_common.h"
+#include "mongo/db/logical_session_cache.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -280,6 +282,18 @@ StatusWith<ClusterCursorManager::PinnedCursor> ClusterCursorManager::checkOutCur
     std::unique_ptr<ClusterClientCursor> cursor = entry->releaseCursor();
     if (!cursor) {
         return cursorInUseStatus(nss, cursorId);
+    }
+
+    const auto cursorPrivilegeStatus = checkCursorSessionPrivilege(opCtx, cursor->getLsid());
+
+    if (!cursorPrivilegeStatus.isOK()) {
+        return cursorPrivilegeStatus;
+    }
+
+    // We use pinning of a cursor as a proxy for active, user-initiated use of a cursor.  Therefore,
+    // we pass down to the logical session cache and vivify the record (updating last use).
+    if (cursor->getLsid()) {
+        LogicalSessionCache::get(opCtx)->vivify(opCtx, cursor->getLsid().get());
     }
 
     // Note that pinning a cursor transfers ownership of the underlying ClusterClientCursor object

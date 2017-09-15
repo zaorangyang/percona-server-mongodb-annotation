@@ -196,7 +196,7 @@ public:
      * Returns true if this pipeline is the part of a split pipeline which should be targeted to the
      * shards.
      */
-    bool isSplitForSharded() {
+    bool isSplitForSharded() const {
         return _splitForSharded;
     }
 
@@ -204,7 +204,7 @@ public:
      * Returns true if this pipeline is the part of a split pipeline which is responsible for
      * merging the results from the shards.
      */
-    bool isSplitForMerge() {
+    bool isSplitForMerge() const {
         return _splitForMerge;
     }
 
@@ -259,9 +259,15 @@ public:
      */
     DepsTracker getDependencies(DepsTracker::MetadataAvailable metadataAvailable) const;
 
-    const SourceContainer& getSources() {
+    const SourceContainer& getSources() const {
         return _sources;
     }
+
+    /**
+     * Removes and returns the first stage of the pipeline if its name is 'targetStageName'. Returns
+     * nullptr if there is no first stage, or if the stage's name is not 'targetStageName'.
+     */
+    boost::intrusive_ptr<DocumentSource> popFrontStageWithName(StringData targetStageName);
 
     /**
      * PipelineD is a "sister" class that has additional functionality for the Pipeline. It exists

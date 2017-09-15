@@ -57,4 +57,10 @@ Status SessionsCollectionStandalone::removeRecords(OperationContext* opCtx,
     return doRemove(sessions, makeSendFnForBatchWrite(&client));
 }
 
+StatusWith<LogicalSessionIdSet> SessionsCollectionStandalone::findRemovedSessions(
+    OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
+    DBDirectClient client(opCtx);
+    return doFetch(sessions, makeFindFnForCommand(&client));
+}
+
 }  // namespace mongo

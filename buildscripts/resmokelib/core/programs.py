@@ -45,6 +45,12 @@ def mongod_program(logger, executable=None, process_kwargs=None, **kwargs):
     if "shardsvr" in kwargs and "orphanCleanupDelaySecs" not in suite_set_parameters:
         suite_set_parameters["orphanCleanupDelaySecs"] = 0
 
+    # The LogicalSessionCache does automatic background refreshes in the server. This is
+    # race-y for tests, since tests trigger their own immediate refreshes instead. Turn off
+    # background refreshing for tests. Set in the .yml file to override this.
+    if "disableLogicalSessionCacheRefresh" not in suite_set_parameters:
+        suite_set_parameters["disableLogicalSessionCacheRefresh"] = True
+
     _apply_set_parameters(args, suite_set_parameters)
 
     shortcut_opts = {
@@ -129,11 +135,13 @@ def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
     return _process.Process(logger, args, **process_kwargs)
 
 
-def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=None, **kwargs):
+def mongo_shell_program(logger, executable=None, connection_string=None, filename=None,
+                        process_kwargs=None, **kwargs):
     """
-    Returns a Process instance that starts a mongo shell with arguments
-    constructed from 'kwargs'.
+    Returns a Process instance that starts a mongo shell with the given connection string and
+    arguments constructed from 'kwargs'.
     """
+    connection_string = utils.default_if_none(config.SHELL_CONN_STRING, connection_string)
 
     executable = utils.default_if_none(executable, config.DEFAULT_MONGO_EXECUTABLE)
     args = [executable]
@@ -191,7 +199,7 @@ def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=N
         eval_sb.append(str(kwargs.pop("eval")))
 
     # Load this file to allow a callback to validate collections before shutting down mongod.
-    eval_sb.append("load('jstests/libs/override_methods/validate_collections_on_shutdown.js')");
+    eval_sb.append("load('jstests/libs/override_methods/validate_collections_on_shutdown.js');")
 
     eval_str = "; ".join(eval_sb)
     args.append("--eval")
@@ -203,7 +211,7 @@ def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=N
     if config.SHELL_WRITE_MODE is not None:
         kwargs["writeMode"] = config.SHELL_WRITE_MODE
 
-    if config.SHELL_CONN_STRING is not None:
+    if connection_string is not None:
         # The --host and --port options are ignored by the mongo shell when an explicit connection
         # string is specified. We remove these options to avoid any ambiguity with what server the
         # logged mongo shell invocation will connect to.
@@ -216,9 +224,8 @@ def mongo_shell_program(logger, executable=None, filename=None, process_kwargs=N
     # Apply the rest of the command line arguments.
     _apply_kwargs(args, kwargs)
 
-
-    if config.SHELL_CONN_STRING is not None:
-        args.append(config.SHELL_CONN_STRING)
+    if connection_string is not None:
+        args.append(connection_string)
 
     # Have the mongos shell run the specified file.
     args.append(filename)

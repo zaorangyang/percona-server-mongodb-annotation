@@ -44,6 +44,7 @@
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/diag_log.h"
+#include "mongo/db/initialize_operation_session_info.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/lasterror.h"
@@ -56,6 +57,7 @@
 #include "mongo/db/query/find.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/operation_sharding_state.h"
@@ -412,18 +414,8 @@ bool runCommandImpl(OperationContext* opCtx,
     const std::string db = request.getDatabase().toString();
 
     BSONObjBuilder inPlaceReplyBob = replyBuilder->getInPlaceReplyBuilder(bytesToReserve);
-    auto readConcernArgsStatus =
-        _extractReadConcern(cmd, command->supportsNonLocalReadConcern(db, cmd));
 
-    if (!readConcernArgsStatus.isOK()) {
-        auto result =
-            Command::appendCommandStatus(inPlaceReplyBob, readConcernArgsStatus.getStatus());
-        inPlaceReplyBob.doneFast();
-        replyBuilder->setMetadata(rpc::makeEmptyMetadata());
-        return result;
-    }
-
-    Status rcStatus = waitForReadConcern(opCtx, readConcernArgsStatus.getValue());
+    Status rcStatus = waitForReadConcern(opCtx, repl::ReadConcernArgs::get(opCtx));
     if (!rcStatus.isOK()) {
         if (rcStatus == ErrorCodes::ExceededTimeLimit) {
             const int debugLevel =
@@ -481,7 +473,7 @@ bool runCommandImpl(OperationContext* opCtx,
     // When a linearizable read command is passed in, check to make sure we're reading
     // from the primary.
     if (command->supportsNonLocalReadConcern(db, cmd) &&
-        (readConcernArgsStatus.getValue().getLevel() ==
+        (repl::ReadConcernArgs::get(opCtx).getLevel() ==
          repl::ReadConcernLevel::kLinearizableReadConcern) &&
         (request.getCommandName() != "getMore")) {
 
@@ -499,7 +491,7 @@ bool runCommandImpl(OperationContext* opCtx,
     Command::appendCommandStatus(inPlaceReplyBob, result);
 
     auto operationTime = computeOperationTime(
-        opCtx, startOperationTime, readConcernArgsStatus.getValue().getLevel());
+        opCtx, startOperationTime, repl::ReadConcernArgs::get(opCtx).getLevel());
 
     // An uninitialized operation time means the cluster time is not propagated, so the operation
     // time should not be attached to the response.
@@ -663,11 +655,17 @@ void execCommandDatabase(OperationContext* opCtx,
             opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
         }
 
+        repl::ReadConcernArgs::get(opCtx) = uassertStatusOK(_extractReadConcern(
+            request.body,
+            command->supportsNonLocalReadConcern(request.getDatabase().toString(), request.body)));
+
         // We do not redo shard version handling if this command was issued via the direct client.
         if ((serverGlobalParams.featureCompatibility.version.load() ==
                  ServerGlobalParams::FeatureCompatibility::Version::k36 ||
              iAmPrimary) &&
-            !opCtx->getClient()->isInDirectClient()) {
+            !opCtx->getClient()->isInDirectClient() &&
+            repl::ReadConcernArgs::get(opCtx).getLevel() !=
+                repl::ReadConcernLevel::kAvailableReadConcern) {
             // Handle a shard version that may have been sent along with the command.
             auto commandNS = NamespaceString(command->parseNs(dbname, request.body));
             auto& oss = OperationShardingState::get(opCtx);
@@ -719,6 +717,8 @@ void execCommandDatabase(OperationContext* opCtx,
         BSONObjBuilder metadataBob;
         appendReplyMetadata(opCtx, request, &metadataBob);
 
+        // Note: the read concern may not have been successfully or yet placed on the opCtx, so
+        // parsing it separately here.
         const std::string db = request.getDatabase().toString();
         auto readConcernArgsStatus = _extractReadConcern(
             request.body, command->supportsNonLocalReadConcern(db, request.body));
@@ -1039,7 +1039,7 @@ DbResponse ServiceEntryPointMongod::handleRequest(OperationContext* opCtx, const
     if (c.isInDirectClient()) {
         invariant(!opCtx->lockState()->inAWriteUnitOfWork());
     } else {
-        LastError::get(c).startTopLevelRequest();
+        LastError::get(c).startRequest();
         AuthorizationSession::get(c)->startRequest(opCtx);
 
         // We should not be holding any locks at this point

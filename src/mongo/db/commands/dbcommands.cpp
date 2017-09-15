@@ -74,7 +74,6 @@
 #include "mongo/db/json.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
@@ -710,8 +709,7 @@ public:
             qr->setFilter(query);
             qr->setSort(sort);
 
-            auto statusWithCQ = CanonicalQuery::canonicalize(
-                opCtx, std::move(qr), ExtensionsCallbackDisallowExtensions());
+            auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr));
             if (!statusWithCQ.isOK()) {
                 uasserted(17240, "Can't canonicalize query " + query.toString());
                 return false;
@@ -767,7 +765,7 @@ public:
                 }
 
                 // Have the lock again. See if we were killed.
-                if (!exec->restoreState()) {
+                if (!exec->restoreState().isOK()) {
                     if (!partialOk) {
                         uasserted(13281, "File deleted during filemd5 command");
                     }
@@ -1124,6 +1122,10 @@ public:
             result.appendNumber("indexes", 0);
             result.appendNumber("indexSize", 0);
             result.appendNumber("fileSize", 0);
+            if (!getGlobalServiceContext()->getGlobalStorageEngine()->isEphemeral()) {
+                result.appendNumber("fsUsedSize", 0);
+                result.appendNumber("fsTotalSize", 0);
+            }
         } else {
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());

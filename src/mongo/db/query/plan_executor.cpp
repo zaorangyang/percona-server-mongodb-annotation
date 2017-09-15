@@ -44,6 +44,7 @@
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/query/mock_yield_policies.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
@@ -65,11 +66,37 @@ const OperationContext::Decoration<bool> shouldWaitForInserts =
 const OperationContext::Decoration<repl::OpTime> clientsLastKnownCommittedOpTime =
     OperationContext::declareDecoration<repl::OpTime>();
 
-namespace {
+struct CappedInsertNotifierData {
+    shared_ptr<CappedInsertNotifier> notifier;
+    uint64_t lastEOFVersion = ~0;
+};
 
 namespace {
+
 MONGO_FP_DECLARE(planExecutorAlwaysFails);
-}  // namespace
+
+/**
+ * Constructs a PlanYieldPolicy based on 'policy'.
+ */
+std::unique_ptr<PlanYieldPolicy> makeYieldPolicy(PlanExecutor* exec,
+                                                 PlanExecutor::YieldPolicy policy) {
+    switch (policy) {
+        case PlanExecutor::YieldPolicy::YIELD_AUTO:
+        case PlanExecutor::YieldPolicy::YIELD_MANUAL:
+        case PlanExecutor::YieldPolicy::NO_YIELD:
+        case PlanExecutor::YieldPolicy::WRITE_CONFLICT_RETRY_ONLY: {
+            return stdx::make_unique<PlanYieldPolicy>(exec, policy);
+        }
+        case PlanExecutor::YieldPolicy::ALWAYS_TIME_OUT: {
+            return stdx::make_unique<AlwaysTimeOutYieldPolicy>(exec);
+        }
+        case PlanExecutor::YieldPolicy::ALWAYS_MARK_KILLED: {
+            return stdx::make_unique<AlwaysPlanKilledYieldPolicy>(exec);
+        }
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
 
 /**
  * Retrieves the first stage of a given type from the plan tree, or NULL
@@ -90,7 +117,7 @@ PlanStage* getStageByType(PlanStage* root, StageType type) {
 
     return NULL;
 }
-}
+}  // namespace
 
 // static
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PlanExecutor::make(
@@ -197,7 +224,7 @@ PlanExecutor::PlanExecutor(OperationContext* opCtx,
       _root(std::move(rt)),
       _nss(std::move(nss)),
       // There's no point in yielding if the collection doesn't exist.
-      _yieldPolicy(new PlanYieldPolicy(this, collection ? yieldPolicy : NO_YIELD)) {
+      _yieldPolicy(makeYieldPolicy(this, collection ? yieldPolicy : NO_YIELD)) {
     // We may still need to initialize _nss from either collection or _cq.
     if (!_nss.isEmpty()) {
         return;  // We already have an _nss set, so there's nothing more to do.
@@ -322,7 +349,7 @@ void PlanExecutor::saveState() {
     _currentState = kSaved;
 }
 
-bool PlanExecutor::restoreState() {
+Status PlanExecutor::restoreState() {
     try {
         return restoreStateWithoutRetrying();
     } catch (const WriteConflictException&) {
@@ -334,7 +361,7 @@ bool PlanExecutor::restoreState() {
     }
 }
 
-bool PlanExecutor::restoreStateWithoutRetrying() {
+Status PlanExecutor::restoreStateWithoutRetrying() {
     invariant(_currentState == kSaved);
 
     if (!isMarkedAsKilled()) {
@@ -342,7 +369,9 @@ bool PlanExecutor::restoreStateWithoutRetrying() {
     }
 
     _currentState = kUsable;
-    return !isMarkedAsKilled();
+    return isMarkedAsKilled()
+        ? Status{ErrorCodes::QueryPlanKilled, "query killed during yield: " + *_killReason}
+        : Status::OK();
 }
 
 void PlanExecutor::detachFromOperationContext() {
@@ -396,6 +425,9 @@ bool PlanExecutor::shouldWaitForInserts() {
     if (_cq && _cq->getQueryRequest().isTailable() && _cq->getQueryRequest().isAwaitData() &&
         mongo::shouldWaitForInserts(_opCtx) && _opCtx->checkForInterruptNoAssert().isOK() &&
         _opCtx->getRemainingMaxTimeMicros() > Microseconds::zero()) {
+        // We expect awaitData cursors to be yielding.
+        invariant(_yieldPolicy->canReleaseLocksDuringExecution());
+
         // For operations with a last committed opTime, we should not wait if the replication
         // coordinator's lastCommittedOpTime has changed.
         if (!clientsLastKnownCommittedOpTime(_opCtx).isNull()) {
@@ -407,31 +439,45 @@ bool PlanExecutor::shouldWaitForInserts() {
     return false;
 }
 
-bool PlanExecutor::waitForInserts() {
-    // If we cannot yield, we should retry immediately.
-    if (!_yieldPolicy->canReleaseLocksDuringExecution())
-        return true;
+std::shared_ptr<CappedInsertNotifier> PlanExecutor::getCappedInsertNotifier() {
+    // We don't expect to need a capped insert notifier for non-yielding plans.
+    invariant(_yieldPolicy->canReleaseLocksDuringExecution());
 
-    // We can only wait if we have a collection; otherwise retry immediately.
+    // We can only wait if we have a collection; otherwise we should retry immediately when
+    // we hit EOF.
     dassert(_opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_IS));
     auto db = dbHolder().get(_opCtx, _nss.db());
-    if (!db)
-        return true;
+    invariant(db);
     auto collection = db->getCollection(_opCtx, _nss);
-    if (!collection)
-        return true;
+    invariant(collection);
 
-    auto notifier = collection->getCappedInsertNotifier();
-    uint64_t notifierVersion = notifier->getVersion();
+    return collection->getCappedInsertNotifier();
+}
+
+PlanExecutor::ExecState PlanExecutor::waitForInserts(CappedInsertNotifierData* notifierData,
+                                                     Snapshotted<BSONObj>* errorObj) {
+    invariant(notifierData->notifier);
+
+    // The notifier wait() method will not wait unless the version passed to it matches the
+    // current version of the notifier.  Since the version passed to it is the current version
+    // of the notifier at the time of the previous EOF, we require two EOFs in a row with no
+    // notifier version change in order to wait.  This is sufficient to ensure we never wait
+    // when data is available.
     auto curOp = CurOp::get(_opCtx);
     curOp->pauseTimer();
     ON_BLOCK_EXIT([curOp] { curOp->resumeTimer(); });
     auto opCtx = _opCtx;
-    bool yieldResult = _yieldPolicy->yield(nullptr, [opCtx, notifier, notifierVersion] {
+    uint64_t currentNotifierVersion = notifierData->notifier->getVersion();
+    auto yieldResult = _yieldPolicy->yield(nullptr, [opCtx, notifierData] {
         const auto timeout = opCtx->getRemainingMaxTimeMicros();
-        notifier->wait(notifierVersion, timeout);
+        notifierData->notifier->wait(notifierData->lastEOFVersion, timeout);
     });
-    return yieldResult;
+    notifierData->lastEOFVersion = currentNotifierVersion;
+    if (yieldResult.isOK()) {
+        // There may be more results, try to get more data.
+        return ADVANCED;
+    }
+    return swallowTimeoutIfAwaitData(yieldResult, errorObj);
 }
 
 PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, RecordId* dlOut) {
@@ -471,6 +517,13 @@ PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, 
     // Incremented on every writeConflict, reset to 0 on any successful call to _root->work.
     size_t writeConflictsInARow = 0;
 
+    // Capped insert data; declared outside the loop so we hold a shared pointer to the capped
+    // insert notifier the entire time we are in the loop.  Holding a shared pointer to the capped
+    // insert notifier is necessary for the notifierVersion to advance.
+    CappedInsertNotifierData cappedInsertNotifierData;
+    if (shouldWaitForInserts()) {
+        cappedInsertNotifierData.notifier = getCappedInsertNotifier();
+    }
     for (;;) {
         // These are the conditions which can cause us to yield:
         //   1) The yield policy's timer elapsed, or
@@ -478,18 +531,9 @@ PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, 
         //   3) we need to yield and retry due to a WriteConflictException.
         // In all cases, the actual yielding happens here.
         if (_yieldPolicy->shouldYield()) {
-            if (!_yieldPolicy->yield(fetcher.get())) {
-                // A return of false from a yield should only happen if we've been killed during the
-                // yield.
-                invariant(isMarkedAsKilled());
-
-                if (NULL != objOut) {
-                    Status status(ErrorCodes::OperationFailed,
-                                  str::stream() << "Operation aborted because: " << *_killReason);
-                    *objOut = Snapshotted<BSONObj>(
-                        SnapshotId(), WorkingSetCommon::buildMemberStatusObject(status));
-                }
-                return PlanExecutor::DEAD;
+            auto yieldStatus = _yieldPolicy->yield(fetcher.get());
+            if (!yieldStatus.isOK()) {
+                return swallowTimeoutIfAwaitData(yieldStatus, objOut);
             }
         }
 
@@ -562,23 +606,15 @@ PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, 
         } else if (PlanStage::NEED_TIME == code) {
             // Fall through to yield check at end of large conditional.
         } else if (PlanStage::IS_EOF == code) {
-            if (shouldWaitForInserts()) {
-                const bool locksReacquiredAfterYield = waitForInserts();
-                if (locksReacquiredAfterYield) {
-                    // There may be more results, try to get more data.
-                    continue;
-                }
-                invariant(isMarkedAsKilled());
-                if (objOut) {
-                    Status status(ErrorCodes::OperationFailed,
-                                  str::stream() << "Operation aborted because: " << *_killReason);
-                    *objOut = Snapshotted<BSONObj>(
-                        SnapshotId(), WorkingSetCommon::buildMemberStatusObject(status));
-                }
-                return PlanExecutor::DEAD;
-            } else {
+            if (!shouldWaitForInserts()) {
                 return PlanExecutor::IS_EOF;
             }
+            const ExecState waitResult = waitForInserts(&cappedInsertNotifierData, objOut);
+            if (waitResult == PlanExecutor::ADVANCED) {
+                // There may be more results, keep going.
+                continue;
+            }
+            return waitResult;
         } else {
             invariant(PlanStage::DEAD == code || PlanStage::FAILURE == code);
 
@@ -648,6 +684,23 @@ Status PlanExecutor::executePlan() {
 
 void PlanExecutor::enqueue(const BSONObj& obj) {
     _stash.push(obj.getOwned());
+}
+
+PlanExecutor::ExecState PlanExecutor::swallowTimeoutIfAwaitData(
+    Status yieldError, Snapshotted<BSONObj>* errorObj) const {
+    if (yieldError == ErrorCodes::ExceededTimeLimit) {
+        if (_cq && _cq->getQueryRequest().isTailable() && _cq->getQueryRequest().isAwaitData()) {
+            // If the cursor is tailable then exceeding the time limit should not
+            // destroy this PlanExecutor, we should just stop waiting for inserts.
+            return PlanExecutor::IS_EOF;
+        }
+    }
+
+    if (errorObj) {
+        *errorObj = Snapshotted<BSONObj>(SnapshotId(),
+                                         WorkingSetCommon::buildMemberStatusObject(yieldError));
+    }
+    return PlanExecutor::DEAD;
 }
 
 //

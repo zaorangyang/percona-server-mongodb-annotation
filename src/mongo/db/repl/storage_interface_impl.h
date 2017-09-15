@@ -66,7 +66,7 @@ public:
 
     Status insertDocument(OperationContext* opCtx,
                           const NamespaceString& nss,
-                          const BSONObj& doc) override;
+                          const TimestampedBSONObj& doc) override;
 
     Status insertDocuments(OperationContext* opCtx,
                            const NamespaceString& nss,
@@ -144,6 +144,8 @@ public:
      * Checks that the "admin" database contains a supported version of the auth data schema.
      */
     Status isAdminDbValid(OperationContext* opCtx) override;
+
+    void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) override;
 
 private:
     const NamespaceString _rollbackIdNss;

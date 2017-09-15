@@ -29,6 +29,7 @@
 #pragma once
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_sources_gen.h"
 
@@ -60,6 +61,10 @@ public:
         // TODO SERVER-29138: Add required privileges.
         PrivilegeVector requiredPrivileges(bool isMongos) const final {
             return {};
+        }
+
+        bool allowedToForwardFromMongos() const final {
+            return false;
         }
     };
 
@@ -95,6 +100,10 @@ public:
     // The name of the field where the namespace of the change will be located after the
     // transformation.
     static constexpr StringData kNamespaceField = "ns"_sd;
+
+    // The name of the subfield of '_id' where the UUID of the namespace will be located after the
+    // transformation.
+    static constexpr StringData kUuidField = "uuid"_sd;
 
     // The name of the field where the type of the operation will be located after the
     // transformation.
@@ -140,6 +149,25 @@ private:
     // It is illegal to construct a DocumentSourceChangeStream directly, use createFromBson()
     // instead.
     DocumentSourceChangeStream() = default;
+};
+
+/**
+ * A custom subclass of DocumentSourceMatch which does not serialize itself (since it came from an
+ * alias) and requires itself to be the first stage in the pipeline.
+ */
+class DocumentSourceOplogMatch final : public DocumentSourceMatch {
+public:
+    static boost::intrusive_ptr<DocumentSourceOplogMatch> create(
+        BSONObj filter, const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
+    const char* getSourceName() const final;
+
+    StageConstraints constraints() const final;
+
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
+
+private:
+    DocumentSourceOplogMatch(BSONObj filter, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 };
 
 }  // namespace mongo

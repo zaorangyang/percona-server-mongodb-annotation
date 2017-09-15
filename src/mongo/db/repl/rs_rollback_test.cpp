@@ -34,6 +34,7 @@
 #include <utility>
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/index_create.h"
@@ -75,7 +76,9 @@ public:
     BSONObj getLastOperation() const override;
     BSONObj findOne(const NamespaceString& nss, const BSONObj& filter) const override;
 
-    BSONObj findOneByUUID(const std::string& db, UUID uuid, const BSONObj& filter) const override;
+    std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+                                                      UUID uuid,
+                                                      const BSONObj& filter) const override;
 
     void copyCollectionFromRemote(OperationContext* opCtx,
                                   const NamespaceString& nss) const override;
@@ -114,10 +117,10 @@ BSONObj RollbackSourceMock::findOne(const NamespaceString& nss, const BSONObj& f
     return BSONObj();
 }
 
-BSONObj RollbackSourceMock::findOneByUUID(const std::string& db,
-                                          UUID uuid,
-                                          const BSONObj& filter) const {
-    return BSONObj();
+std::pair<BSONObj, NamespaceString> RollbackSourceMock::findOneByUUID(const std::string& db,
+                                                                      UUID uuid,
+                                                                      const BSONObj& filter) const {
+    return {BSONObj(), NamespaceString()};
 }
 
 void RollbackSourceMock::copyCollectionFromRemote(OperationContext* opCtx,
@@ -205,7 +208,6 @@ OplogInterfaceMock::Operation makeRenameCollectionOplogEntry(const NamespaceStri
                                                              const NamespaceString& renameTo,
                                                              const UUID collectionUUID,
                                                              OptionalCollectionUUID dropTarget,
-                                                             OptionalCollectionUUID dropSource,
                                                              const bool stayTemp,
                                                              OpTime opTime) {
     BSONObjBuilder cmd;
@@ -220,10 +222,6 @@ OplogInterfaceMock::Operation makeRenameCollectionOplogEntry(const NamespaceStri
     } else {
         obj = obj.addField(BSON("dropTarget" << false).firstElement());
     }
-    if (dropSource) {
-        obj = obj.addField(BSON("dropSource" << *dropSource).firstElement());
-    }
-
     return std::make_pair(
         BSON("ts" << opTime.getTimestamp() << "t" << opTime.getTerm() << "h" << 1LL << "op"
                   << "c"
@@ -396,9 +394,11 @@ int _testRollbackDelete(OperationContext* opCtx,
             : RollbackSourceMock(std::move(oplog)),
               called(false),
               _documentAtSource(documentAtSource) {}
-        BSONObj findOneByUUID(const std::string& db, UUID uuid, const BSONObj& filter) const {
+        std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+                                                          UUID uuid,
+                                                          const BSONObj& filter) const override {
             called = true;
-            return _documentAtSource;
+            return {_documentAtSource, NamespaceString()};
         }
         mutable bool called;
 
@@ -941,7 +941,6 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionInSameDatabaseCommand) {
                                                                     NamespaceString("test.y"),
                                                                     collectionUUID,
                                                                     boost::none,
-                                                                    boost::none,
                                                                     false,
                                                                     renameTime);
 
@@ -972,55 +971,62 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionInSameDatabaseCommand) {
     }
 }
 
-// TODO: Un-comment this test once options.temp is properly resynced during rollback.
-// See SERVER-30413
+TEST_F(RSRollbackTest,
+       RollingBackRenameCollectionFromTempToPermanentCollectionSetsCollectionOptionToTemp) {
+    createOplog(_opCtx.get());
 
-// TEST_F(RSRollbackTest,
-// RollingBackRenameCollectionFromTempToPermanentCollectionSetsCollectionOptionToTemp) {
-//    createOplog(_opCtx.get());
-//
-//    CollectionOptions options;
-//    options.uuid = UUID::gen();
-//    auto collection = _createCollection(_opCtx.get(), "test.y", options);
-//    auto collectionUUID = collection->uuid().get();
-//
-//    class RollbackSourceLocal : public RollbackSourceMock {
-//    public:
-//        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
-//            : RollbackSourceMock(std::move(oplog)) {}
-//        StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db, const UUID& uuid) const
-//        {
-//            getCollectionInfoCalled = true;
-//            return BSON("info" << BSON("uuid" << uuid) << "options" << BSON("temp" << true)));
-//        }
-//        mutable bool getCollectionInfoCalled = false;
-//    };
-//
-//    auto commonOperation =
-//        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
-//
-//    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.x"),
-//                                                                    NamespaceString("test.y"),
-//                                                                    collectionUUID,
-//                                                                    boost::none,
-//                                                                    boost::none,
-//                                                                    false,
-//                                                                    OpTime(Timestamp(2, 0), 5));
-//
-//    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
-//        commonOperation,
-//    })));
-//
-//    ASSERT_OK(syncRollback(_opCtx.get(),
-//                           OplogInterfaceMock({renameCollectionOperation, commonOperation}),
-//                           rollbackSource,
-//                           {},
-//                           _coordinator,
-//                           _replicationProcess.get()));
-//
-//    ASSERT_TRUE(rollbackSource.getCollectionInfoCalled);
-//    ASSERT_EQUALS(options.temp, true);
-//}
+    auto renameFromNss = NamespaceString("test.renameFrom");
+    auto renameToNss = NamespaceString("test.renameTo");
+
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    ASSERT_FALSE(options.temp);
+
+    // Create the collection and save its UUID.
+    auto collection = _createCollection(_opCtx.get(), renameToNss, options);
+    auto collectionUUID = collection->uuid().get();
+
+    class RollbackSourceLocal : public RollbackSourceMock {
+    public:
+        RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
+            : RollbackSourceMock(std::move(oplog)) {}
+        StatusWith<BSONObj> getCollectionInfoByUUID(const std::string& db, const UUID& uuid) const {
+            getCollectionInfoCalled = true;
+            return BSON("info" << BSON("uuid" << uuid) << "options" << BSON("temp" << true));
+        }
+        mutable bool getCollectionInfoCalled = false;
+    };
+
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+
+    bool stayTemp = false;
+    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString(renameFromNss),
+                                                                    NamespaceString(renameToNss),
+                                                                    collectionUUID,
+                                                                    boost::none,
+                                                                    stayTemp,
+                                                                    OpTime(Timestamp(2, 0), 5));
+
+    RollbackSourceLocal rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
+        commonOperation,
+    })));
+
+    ASSERT_OK(syncRollback(_opCtx.get(),
+                           OplogInterfaceMock({renameCollectionOperation, commonOperation}),
+                           rollbackSource,
+                           {},
+                           _coordinator,
+                           _replicationProcess.get()));
+
+    ASSERT_TRUE(rollbackSource.getCollectionInfoCalled);
+
+    AutoGetCollectionForReadCommand autoColl(_opCtx.get(), NamespaceString(renameFromNss));
+    auto collAfterRollback = autoColl.getCollection();
+    auto collAfterRollbackOptions =
+        collAfterRollback->getCatalogEntry()->getCollectionOptions(_opCtx.get());
+    ASSERT_TRUE(collAfterRollbackOptions.temp);
+}
 
 TEST_F(RSRollbackTest, RollbackRenameCollectionInDatabaseWithDropTargetTrueCommand) {
     createOplog(_opCtx.get());
@@ -1044,7 +1050,6 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionInDatabaseWithDropTargetTrueComma
                                                                     NamespaceString("test.y"),
                                                                     renamedCollectionUUID,
                                                                     droppedCollectionUUID,
-                                                                    boost::none,
                                                                     false,
                                                                     dropTime);
 
@@ -1101,7 +1106,6 @@ TEST_F(RSRollbackTest, RollbackRenamingCollectionsToEachOther) {
                                                                         NamespaceString("test.z"),
                                                                         collection1UUID,
                                                                         boost::none,
-                                                                        boost::none,
                                                                         false,
                                                                         OpTime(Timestamp(2, 0), 5));
 
@@ -1109,14 +1113,12 @@ TEST_F(RSRollbackTest, RollbackRenamingCollectionsToEachOther) {
                                                                         NamespaceString("test.x"),
                                                                         collection2UUID,
                                                                         boost::none,
-                                                                        boost::none,
                                                                         false,
                                                                         OpTime(Timestamp(3, 0), 5));
 
     auto renameCollectionOperationZtoY = makeRenameCollectionOplogEntry(NamespaceString("test.z"),
                                                                         NamespaceString("test.y"),
                                                                         collection1UUID,
-                                                                        boost::none,
                                                                         boost::none,
                                                                         false,
                                                                         OpTime(Timestamp(4, 0), 5));
@@ -1183,7 +1185,6 @@ TEST_F(RSRollbackTest, RollbackDropCollectionThenRenameCollectionToDroppedCollec
                                                                     NamespaceString("test.x"),
                                                                     renamedCollectionUUID,
                                                                     boost::none,
-                                                                    boost::none,
                                                                     false,
                                                                     OpTime(Timestamp(3, 0), 5));
 
@@ -1241,7 +1242,6 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionThenCreateNewCollectionWithOldNam
                                                                     NamespaceString("test.y"),
                                                                     renamedCollectionUUID,
                                                                     boost::none,
-                                                                    boost::none,
                                                                     false,
                                                                     OpTime(Timestamp(2, 0), 5));
 
@@ -1286,162 +1286,6 @@ TEST_F(RSRollbackTest, RollbackRenameCollectionThenCreateNewCollectionWithOldNam
         ASSERT_FALSE(createdColl.getCollection());
     }
 }
-
-TEST_F(RSRollbackTest, RollbackRenameCollectionAcrossDatabases) {
-    createOplog(_opCtx.get());
-    CollectionOptions options;
-    options.uuid = UUID::gen();
-    auto collection = _createCollection(_opCtx.get(), "foo.t", options);
-    auto renamedCollectionUUID = collection->uuid().get();
-
-    OpTime dropTime = OpTime(Timestamp(2, 0), 5);
-    auto dpSourceNs = NamespaceString("test.t").makeDropPendingNamespace(dropTime);
-    CollectionOptions dpSourceOptions;
-    dpSourceOptions.uuid = UUID::gen();
-    auto droppedSource = _createCollection(_opCtx.get(), dpSourceNs, dpSourceOptions);
-    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpSourceNs);
-    auto droppedSourceUUID = droppedSource->uuid().get();
-
-    auto dpTargetNs = NamespaceString("foo.t").makeDropPendingNamespace(dropTime);
-    CollectionOptions dpTargetOptions;
-    dpTargetOptions.uuid = UUID::gen();
-    auto droppedTarget = _createCollection(_opCtx.get(), dpTargetNs, dpTargetOptions);
-    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpTargetNs);
-    auto droppedTargetUUID = droppedTarget->uuid().get();
-
-    auto commonOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
-
-    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.t"),
-                                                                    NamespaceString("foo.t"),
-                                                                    renamedCollectionUUID,
-                                                                    droppedTargetUUID,
-                                                                    droppedSourceUUID,
-                                                                    false,
-                                                                    dropTime);
-    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
-        commonOperation,
-    })));
-
-    {
-        AutoGetCollectionForReadCommand autoDropSource(_opCtx.get(), dpSourceNs);
-        ASSERT_TRUE(autoDropSource.getCollection());
-        AutoGetCollectionForReadCommand autoDropTarget(_opCtx.get(), dpTargetNs);
-        ASSERT_TRUE(autoDropTarget.getCollection());
-        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("foo.t"));
-        ASSERT_TRUE(renamedColl.getCollection());
-        AutoGetCollectionForReadCommand droppedColl(_opCtx.get(), NamespaceString("test.t"));
-        ASSERT_FALSE(droppedColl.getCollection());
-    }
-    ASSERT_OK(syncRollback(_opCtx.get(),
-                           OplogInterfaceMock({renameCollectionOperation, commonOperation}),
-                           rollbackSource,
-                           {},
-                           _coordinator,
-                           _replicationProcess.get()));
-
-    {
-        AutoGetCollectionForReadCommand autoDropSource(_opCtx.get(), dpSourceNs);
-        ASSERT_FALSE(autoDropSource.getCollection());
-
-        AutoGetCollectionForReadCommand autoDropTarget(_opCtx.get(), dpTargetNs);
-        ASSERT_FALSE(autoDropTarget.getCollection());
-
-        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.t"));
-        ASSERT_TRUE(renamedColl.getCollection());
-        ASSERT_EQUALS(renamedColl.getCollection()->uuid().get(), droppedSourceUUID);
-
-        AutoGetCollectionForReadCommand droppedColl(_opCtx.get(), NamespaceString("foo.t"));
-        ASSERT_TRUE(droppedColl.getCollection());
-        ASSERT_EQUALS(droppedColl.getCollection()->uuid().get(), droppedTargetUUID);
-    }
-}
-
-TEST_F(RSRollbackTest, NewDocumentsInsertedAfterRenamingCollectionAcrossDatabasesShouldBeDropped) {
-    createOplog(_opCtx.get());
-    Collection* collection = nullptr;
-    {
-        AutoGetOrCreateDb autoDb(_opCtx.get(), "foo", MODE_X);
-        mongo::WriteUnitOfWork wuow(_opCtx.get());
-        collection = autoDb.getDb()->getCollection(_opCtx.get(), "foo.t");
-        if (!collection) {
-            CollectionOptions options;
-            options.uuid = UUID::gen();
-            collection = _createCollection(_opCtx.get(), "foo.t", options);
-        }
-        ASSERT(collection);
-        OpDebug* const nullOpDebug = nullptr;
-        ASSERT_OK(collection->insertDocument(
-            _opCtx.get(), InsertStatement(BSON("_id" << 1 << "a" << 1)), nullOpDebug, false));
-        wuow.commit();
-    }
-
-    auto renamedCollectionUUID = collection->uuid().get();
-    ASSERT(collection->numRecords(_opCtx.get()) == 1);
-
-    OpTime dropTime = OpTime(Timestamp(2, 0), 5);
-    auto dpns = NamespaceString("test.t").makeDropPendingNamespace(dropTime);
-
-    CollectionOptions droppedCollOptions;
-    droppedCollOptions.uuid = UUID::gen();
-    auto droppedColl = _createCollection(_opCtx.get(), dpns, droppedCollOptions);
-    _dropPendingCollectionReaper->addDropPendingNamespace(dropTime, dpns);
-    auto droppedCollectionUUID = droppedColl->uuid().get();
-
-    auto commonOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
-
-    auto renameCollectionOperation = makeRenameCollectionOplogEntry(NamespaceString("test.t"),
-                                                                    NamespaceString("foo.t"),
-                                                                    renamedCollectionUUID,
-                                                                    boost::none,
-                                                                    droppedCollectionUUID,
-                                                                    false,
-                                                                    OpTime(Timestamp(2, 0), 5));
-
-    auto insertDocumentOperation =
-        std::make_pair(BSON("ts" << Timestamp(Seconds(3), 0) << "h" << 1LL << "op"
-                                 << "i"
-                                 << "ui"
-                                 << renamedCollectionUUID
-                                 << "ns"
-                                 << "foo.t"
-                                 << "o"
-                                 << BSON("_id" << 1 << "a" << 1)),
-                       RecordId(3));
-
-    RollbackSourceMock rollbackSource(std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
-        commonOperation,
-    })));
-
-    {
-        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
-        ASSERT_TRUE(autoCollDropPending.getCollection());
-        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("foo.t"));
-        ASSERT_TRUE(renamedColl.getCollection());
-        AutoGetCollectionForReadCommand droppedColl(_opCtx.get(), NamespaceString("test.t"));
-        ASSERT_FALSE(droppedColl.getCollection());
-    }
-    ASSERT_OK(syncRollback(
-        _opCtx.get(),
-        OplogInterfaceMock({insertDocumentOperation, renameCollectionOperation, commonOperation}),
-        rollbackSource,
-        {},
-        _coordinator,
-        _replicationProcess.get()));
-
-    {
-        AutoGetCollectionForReadCommand autoCollDropPending(_opCtx.get(), dpns);
-        ASSERT_FALSE(autoCollDropPending.getCollection());
-        AutoGetCollectionForReadCommand renamedColl(_opCtx.get(), NamespaceString("test.t"));
-        ASSERT_TRUE(renamedColl.getCollection());
-        ASSERT_EQUALS(renamedColl.getCollection()->uuid().get(), droppedCollectionUUID);
-        ASSERT(renamedColl.getCollection()->numRecords(_opCtx.get()) == 0);
-        AutoGetCollectionForReadCommand droppedColl(_opCtx.get(), NamespaceString("foo.t"));
-        ASSERT_FALSE(droppedColl.getCollection());
-    }
-}
-
 
 TEST_F(RSRollbackTest, RollbackCollModCommandFailsIfRBIDChangesWhileSyncingCollectionMetadata) {
     createOplog(_opCtx.get());
@@ -1643,9 +1487,9 @@ TEST_F(RSRollbackTest, RollbackApplyOpsCommand) {
         RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
             : RollbackSourceMock(std::move(oplog)) {}
 
-        BSONObj findOneByUUID(const std::string& db,
-                              UUID uuid,
-                              const BSONObj& filter) const override {
+        std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
+                                                          UUID uuid,
+                                                          const BSONObj& filter) const override {
             int numFields = 0;
             for (const auto element : filter) {
                 ++numFields;
@@ -1655,11 +1499,11 @@ TEST_F(RSRollbackTest, RollbackApplyOpsCommand) {
             searchedIds.insert(filter.firstElement().numberInt());
             switch (filter.firstElement().numberInt()) {
                 case 1:
-                    return BSON("_id" << 1 << "v" << 1);
+                    return {BSON("_id" << 1 << "v" << 1), NamespaceString()};
                 case 2:
-                    return BSON("_id" << 2 << "v" << 3);
+                    return {BSON("_id" << 2 << "v" << 3), NamespaceString()};
                 case 3:
-                    return BSON("_id" << 3 << "v" << 5);
+                    return {BSON("_id" << 3 << "v" << 5), NamespaceString()};
                 case 4:
                     return {};
             }
@@ -2046,6 +1890,92 @@ TEST_F(RSRollbackTest, LocalEntryWithTxnNumberAddsTransactionTableDocToBeRefetch
     auto expectedObj = BSON("_id" << lsid.toBSON());
     DocID expectedTxnDoc(expectedObj, expectedObj.firstElement(), transactionTableUUID);
     ASSERT_TRUE(fui.docsToRefetch.find(expectedTxnDoc) != fui.docsToRefetch.end());
+}
+
+TEST_F(RSRollbackTest, RollbackFailsIfTransactionDocumentRefetchReturnsDifferentNamespace) {
+    createOplog(_opCtx.get());
+
+    // Create a valid FixUpInfo struct for rolling back a single CRUD operation that has a
+    // transaction number and session id.
+    FixUpInfo fui;
+
+    auto entryWithTxnNumber =
+        BSON("ts" << Timestamp(Seconds(2), 0) << "t" << 1LL << "h" << 1LL << "op"
+                  << "i"
+                  << "ui"
+                  << UUID::gen()
+                  << "ns"
+                  << "test.t"
+                  << "o"
+                  << BSON("_id" << 1 << "a" << 1)
+                  << "txnNumber"
+                  << 1LL
+                  << "stmtId"
+                  << 1
+                  << "lsid"
+                  << makeLogicalSessionIdForTest().toBSON());
+
+    UUID transactionTableUUID = UUID::gen();
+    fui.transactionTableUUID = transactionTableUUID;
+
+    auto commonOperation =
+        std::make_pair(BSON("ts" << Timestamp(Seconds(1), 0) << "h" << 1LL), RecordId(1));
+    fui.commonPoint = OpTime(Timestamp(Seconds(1), 0), 1LL);
+    fui.commonPointOurDiskloc = RecordId(1);
+
+    fui.rbid = 1;
+
+    // The FixUpInfo will have an extra doc to refetch: the corresponding transaction table entry.
+    ASSERT_OK(updateFixUpInfoFromLocalOplogEntry(fui, entryWithTxnNumber));
+    ASSERT_EQ(fui.docsToRefetch.size(), 2U);
+
+    {
+        class RollbackSourceLocal : public RollbackSourceMock {
+        public:
+            RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
+                : RollbackSourceMock(std::move(oplog)) {}
+            std::pair<BSONObj, NamespaceString> findOneByUUID(
+                const std::string& db, UUID uuid, const BSONObj& filter) const override {
+                return {BSONObj(), NamespaceString::kSessionTransactionsTableNamespace};
+            }
+            int getRollbackId() const override {
+                return 1;
+            }
+        };
+
+        // Should not throw, since findOneByUUID will return the expected namespace.
+        syncFixUp(_opCtx.get(),
+                  fui,
+                  RollbackSourceLocal(
+                      std::unique_ptr<OplogInterface>(new OplogInterfaceMock({commonOperation}))),
+                  _coordinator,
+                  _replicationProcess.get());
+    }
+
+    {
+        class RollbackSourceLocal : public RollbackSourceMock {
+        public:
+            RollbackSourceLocal(std::unique_ptr<OplogInterface> oplog)
+                : RollbackSourceMock(std::move(oplog)) {}
+            std::pair<BSONObj, NamespaceString> findOneByUUID(
+                const std::string& db, UUID uuid, const BSONObj& filter) const override {
+                return {BSONObj(), NamespaceString("foo.bar")};
+            }
+            int getRollbackId() const override {
+                return 1;
+            }
+        };
+
+        // The returned namespace will not be the expected one, implying a rename/drop of the
+        // transactions collection across this node and the sync source, so rollback should fail.
+        ASSERT_THROWS(syncFixUp(_opCtx.get(),
+                                fui,
+                                RollbackSourceLocal(std::unique_ptr<OplogInterface>(
+                                    new OplogInterfaceMock({commonOperation}))),
+                                _coordinator,
+                                _replicationProcess.get()),
+                      RSFatalException);
+    }
 }
 
 TEST_F(RSRollbackTest, RollbackReturnsImmediatelyOnFailureToTransitionToRollback) {

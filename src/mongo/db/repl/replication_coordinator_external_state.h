@@ -59,6 +59,31 @@ class LastVote;
 class ReplSettings;
 class ReplicationCoordinator;
 
+struct SnapshotInfo {
+    OpTime opTime;
+    SnapshotName name;
+
+    bool operator==(const SnapshotInfo& other) const {
+        return std::tie(opTime, name) == std::tie(other.opTime, other.name);
+    }
+    bool operator!=(const SnapshotInfo& other) const {
+        return std::tie(opTime, name) != std::tie(other.opTime, other.name);
+    }
+    bool operator<(const SnapshotInfo& other) const {
+        return std::tie(opTime, name) < std::tie(other.opTime, other.name);
+    }
+    bool operator<=(const SnapshotInfo& other) const {
+        return std::tie(opTime, name) <= std::tie(other.opTime, other.name);
+    }
+    bool operator>(const SnapshotInfo& other) const {
+        return std::tie(opTime, name) > std::tie(other.opTime, other.name);
+    }
+    bool operator>=(const SnapshotInfo& other) const {
+        return std::tie(opTime, name) >= std::tie(other.opTime, other.name);
+    }
+    std::string toString() const;
+};
+
 /**
  * This class represents the interface the ReplicationCoordinator uses to interact with the
  * rest of the system.  All functionality of the ReplicationCoordinatorImpl that would introduce
@@ -128,6 +153,13 @@ public:
      * Creates the oplog, writes the first entry and stores the replica set config document.
      */
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config) = 0;
+
+    /**
+     * Waits for all committed writes to be visible in the oplog.  Committed writes will be hidden
+     * if there are uncommitted writes ahead of them, and some operations require that all committed
+     * writes are visible before proceeding.
+     */
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) = 0;
 
     /**
      * Called when a node on way to becoming a primary is ready to leave drain mode. It is called
@@ -254,7 +286,7 @@ public:
      *
      * It is illegal to call with a newCommitPoint that does not name an existing snapshot.
      */
-    virtual void updateCommittedSnapshot(SnapshotName newCommitPoint) = 0;
+    virtual void updateCommittedSnapshot(SnapshotInfo newCommitPoint) = 0;
 
     /**
      * Creates a new snapshot.

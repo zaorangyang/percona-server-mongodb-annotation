@@ -126,7 +126,8 @@ Status StorageInterfaceImpl::initializeRollbackID(OperationContext* opCtx) {
 
     BSONObjBuilder bob;
     rbid.serialize(&bob);
-    return insertDocument(opCtx, _rollbackIdNss, bob.done());
+    SnapshotName noTimestamp;  // This write is not replicated.
+    return insertDocument(opCtx, _rollbackIdNss, TimestampedBSONObj{bob.done(), noTimestamp});
 }
 
 Status StorageInterfaceImpl::incrementRollbackID(OperationContext* opCtx) {
@@ -263,8 +264,8 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
 
 Status StorageInterfaceImpl::insertDocument(OperationContext* opCtx,
                                             const NamespaceString& nss,
-                                            const BSONObj& doc) {
-    return insertDocuments(opCtx, nss, {InsertStatement(doc)});
+                                            const TimestampedBSONObj& doc) {
+    return insertDocuments(opCtx, nss, {InsertStatement(doc.obj, doc.timestamp)});
 }
 
 namespace {
@@ -448,7 +449,8 @@ Status StorageInterfaceImpl::renameCollection(OperationContext* opCtx,
 
         auto newColl = autoDB.getDb()->getCollection(opCtx, toNS);
         if (newColl->uuid()) {
-            UUIDCatalog::get(opCtx).onRenameCollection(opCtx, newColl, newColl->uuid().get());
+            UUIDCatalog::get(opCtx).onRenameCollection(
+                opCtx, [newColl] { return newColl; }, newColl->uuid().get());
         }
         wunit.commit();
         return status;
@@ -963,6 +965,11 @@ Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
     }
 
     return Status::OK();
+}
+
+void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) {
+    AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
+    oplog.getCollection()->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
 }
 
 }  // namespace repl

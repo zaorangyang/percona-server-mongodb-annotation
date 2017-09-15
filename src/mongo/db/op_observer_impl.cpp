@@ -490,7 +490,6 @@ repl::OpTime OpObserverImpl::onRenameCollection(OperationContext* opCtx,
                                                 OptionalCollectionUUID uuid,
                                                 bool dropTarget,
                                                 OptionalCollectionUUID dropTargetUUID,
-                                                OptionalCollectionUUID dropSourceUUID,
                                                 bool stayTemp) {
     const NamespaceString cmdNss = fromCollection.getCommandNS();
     BSONObjBuilder builder;
@@ -501,9 +500,6 @@ repl::OpTime OpObserverImpl::onRenameCollection(OperationContext* opCtx,
         dropTargetUUID->appendToBuilder(&builder, "dropTarget");
     } else {
         builder.append("dropTarget", dropTarget);
-    }
-    if (dropSourceUUID && enableCollectionUUIDs && !isMasterSlave()) {
-        dropSourceUUID->appendToBuilder(&builder, "dropSource");
     }
     BSONObj cmdObj = builder.done();
 
@@ -527,11 +523,14 @@ repl::OpTime OpObserverImpl::onRenameCollection(OperationContext* opCtx,
 
     // Finally update the UUID Catalog.
     if (uuid) {
-        auto db = dbHolder().get(opCtx, toCollection.db());
-        auto newColl = db->getCollection(opCtx, toCollection);
-        invariant(newColl);
+        auto getNewCollection = [opCtx, toCollection] {
+            auto db = dbHolder().get(opCtx, toCollection.db());
+            auto newColl = db->getCollection(opCtx, toCollection);
+            invariant(newColl);
+            return newColl;
+        };
         UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
-        catalog.onRenameCollection(opCtx, newColl, uuid.get());
+        catalog.onRenameCollection(opCtx, getNewCollection, uuid.get());
     }
 
     return renameOpTime;
