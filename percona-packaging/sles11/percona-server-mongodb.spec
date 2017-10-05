@@ -100,7 +100,6 @@ Conflicts: Percona-Server-MongoDB-tools Percona-Server-MongoDB-32-tools mongodb-
 
 export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
-export PORTABLE=1
 export PSM_TARGETS="mongod mongos mongo"
 export INSTALLDIR=$RPM_BUILD_DIR/install
 export TOOLS_TAGS="ssl sasl"
