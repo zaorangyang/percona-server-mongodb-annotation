@@ -102,8 +102,12 @@ public:
     explicit InsertStatement(BSONObj toInsert) : doc(toInsert) {}
 
     InsertStatement(StmtId statementId, BSONObj toInsert) : stmtId(statementId), doc(toInsert) {}
+    InsertStatement(StmtId statementId, BSONObj toInsert, SnapshotName ts)
+        : stmtId(statementId), timestamp(ts), doc(toInsert) {}
+    InsertStatement(BSONObj toInsert, SnapshotName ts) : timestamp(ts), doc(toInsert) {}
 
     StmtId stmtId = kUninitializedStmtId;
+    SnapshotName timestamp = SnapshotName();
     BSONObj doc;
 };
 
@@ -265,6 +269,7 @@ public:
 
         virtual Status insertDocumentsForOplog(OperationContext* opCtx,
                                                const DocWriter* const* docs,
+                                               Timestamp* timestamps,
                                                size_t nDocs) = 0;
 
         virtual Status insertDocument(OperationContext* opCtx,
@@ -310,7 +315,9 @@ public:
 
         virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) = 0;
 
-        virtual StatusWithMatchExpression parseValidator(const BSONObj& validator) const = 0;
+        virtual StatusWithMatchExpression parseValidator(
+            const BSONObj& validator,
+            MatchExpressionParser::AllowedFeatureSet allowedFeatures) const = 0;
 
         virtual Status setValidator(OperationContext* opCtx, BSONObj validator) = 0;
 
@@ -518,8 +525,9 @@ public:
      */
     inline Status insertDocumentsForOplog(OperationContext* const opCtx,
                                           const DocWriter* const* const docs,
+                                          Timestamp* timestamps,
                                           const size_t nDocs) {
-        return this->_impl().insertDocumentsForOplog(opCtx, docs, nDocs);
+        return this->_impl().insertDocumentsForOplog(opCtx, docs, timestamps, nDocs);
     }
 
     /**
@@ -632,8 +640,9 @@ public:
     /**
      * Returns a non-ok Status if validator is not legal for this collection.
      */
-    inline StatusWithMatchExpression parseValidator(const BSONObj& validator) const {
-        return this->_impl().parseValidator(validator);
+    inline StatusWithMatchExpression parseValidator(
+        const BSONObj& validator, MatchExpressionParser::AllowedFeatureSet allowedFeatures) const {
+        return this->_impl().parseValidator(validator, allowedFeatures);
     }
 
     static StatusWith<ValidationLevel> parseValidationLevel(StringData);

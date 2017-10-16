@@ -37,7 +37,8 @@
     assert.commandWorked(db.createCollection(collName, {validator: {a: {$exists: true}}}));
 
     // Verify some invalid match statements can't be passed to collMod.
-    assert.commandFailed(db.runCommand({"collMod": collName, "validator": {$text: "bob"}}));
+    assert.commandFailed(
+        db.runCommand({"collMod": collName, "validator": {$text: {$search: "bob"}}}));
     assert.commandFailed(
         db.runCommand({"collMod": collName, "validator": {$where: "this.a == this.b"}}));
     assert.commandFailed(
@@ -46,6 +47,9 @@
         db.runCommand({"collMod": collName, "validator": {$geoNear: {place: "holder"}}}));
     assert.commandFailed(
         db.runCommand({"collMod": collName, "validator": {$nearSphere: {place: "holder"}}}));
+
+    assert.commandFailed(
+        db.runCommand({"collMod": collName, "validator": {$expr: {$eq: ["$a", 5]}}}));
 
     coll.drop();
 

@@ -190,6 +190,7 @@ public:
      */
     Status insertDocumentsForOplog(OperationContext* opCtx,
                                    const DocWriter* const* docs,
+                                   Timestamp* timestamps,
                                    size_t nDocs) final;
 
     /**
@@ -282,7 +283,9 @@ public:
     /**
      * Returns a non-ok Status if validator is not legal for this collection.
      */
-    StatusWithMatchExpression parseValidator(const BSONObj& validator) const final;
+    StatusWithMatchExpression parseValidator(
+        const BSONObj& validator,
+        MatchExpressionParser::AllowedFeatureSet allowedFeatures) const final;
 
     static StatusWith<ValidationLevel> parseValidationLevel(StringData);
     static StatusWith<ValidationAction> parseValidationAction(StringData);

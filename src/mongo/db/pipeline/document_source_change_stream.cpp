@@ -31,11 +31,12 @@
 #include "mongo/db/pipeline/document_source_change_stream.h"
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
+#include "mongo/db/bson/bson_helper.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/pipeline/close_change_stream_exception.h"
 #include "mongo/db/pipeline/document_source_check_resume_token.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_lookup_change_post_image.h"
-#include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
@@ -65,6 +66,7 @@ constexpr StringData DocumentSourceChangeStream::kDocumentKeyField;
 constexpr StringData DocumentSourceChangeStream::kFullDocumentField;
 constexpr StringData DocumentSourceChangeStream::kIdField;
 constexpr StringData DocumentSourceChangeStream::kNamespaceField;
+constexpr StringData DocumentSourceChangeStream::kUuidField;
 constexpr StringData DocumentSourceChangeStream::kOperationTypeField;
 constexpr StringData DocumentSourceChangeStream::kStageName;
 constexpr StringData DocumentSourceChangeStream::kTimestampField;
@@ -79,45 +81,40 @@ namespace {
 
 static constexpr StringData kOplogMatchExplainName = "$_internalOplogMatch"_sd;
 
+}  // namespace
+
+intrusive_ptr<DocumentSourceOplogMatch> DocumentSourceOplogMatch::create(
+    BSONObj filter, const intrusive_ptr<ExpressionContext>& expCtx) {
+    return new DocumentSourceOplogMatch(std::move(filter), expCtx);
+}
+
+const char* DocumentSourceOplogMatch::getSourceName() const {
+    // This is used in error reporting, particularly if we find this stage in a position other
+    // than first, so report the name as $changeStream.
+    return DocumentSourceChangeStream::kStageName.rawData();
+}
+
+DocumentSource::StageConstraints DocumentSourceOplogMatch::constraints() const {
+    StageConstraints constraints;
+    constraints.requiredPosition = PositionRequirement::kFirst;
+    constraints.isAllowedInsideFacetStage = false;
+    return constraints;
+}
+
 /**
- * A custom subclass of DocumentSourceMatch which does not serialize itself (since it came from an
- * alias) and requires itself to be the first stage in the pipeline.
+ * Only serialize this stage for explain purposes, otherwise keep it hidden so that we can
+ * properly alias.
  */
-class DocumentSourceOplogMatch final : public DocumentSourceMatch {
-public:
-    static intrusive_ptr<DocumentSourceOplogMatch> create(
-        BSONObj filter, const intrusive_ptr<ExpressionContext>& expCtx) {
-        return new DocumentSourceOplogMatch(std::move(filter), expCtx);
+Value DocumentSourceOplogMatch::serialize(optional<ExplainOptions::Verbosity> explain) const {
+    if (explain) {
+        return Value(Document{{kOplogMatchExplainName, Document{}}});
     }
+    return Value();
+}
 
-    const char* getSourceName() const final {
-        // This is used in error reporting, particularly if we find this stage in a position other
-        // than first, so report the name as $changeStream.
-        return DocumentSourceChangeStream::kStageName.rawData();
-    }
-
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.requiredPosition = PositionRequirement::kFirst;
-        constraints.isAllowedInsideFacetStage = false;
-        return constraints;
-    }
-
-    /**
-     * Only serialize this stage for explain purposes, otherwise keep it hidden so that we can
-     * properly alias.
-     */
-    Value serialize(optional<ExplainOptions::Verbosity> explain) const final {
-        if (explain) {
-            return Value(Document{{kOplogMatchExplainName, Document{}}});
-        }
-        return Value();
-    }
-
-private:
-    DocumentSourceOplogMatch(BSONObj filter, const intrusive_ptr<ExpressionContext>& expCtx)
-        : DocumentSourceMatch(std::move(filter), expCtx) {}
-};
+DocumentSourceOplogMatch::DocumentSourceOplogMatch(BSONObj filter,
+                                                   const intrusive_ptr<ExpressionContext>& expCtx)
+    : DocumentSourceMatch(std::move(filter), expCtx) {}
 
 void checkValueType(const Value v, const StringData filedName, BSONType expectedType) {
     uassert(40532,
@@ -128,6 +125,7 @@ void checkValueType(const Value v, const StringData filedName, BSONType expected
             (v.getType() == expectedType));
 }
 
+namespace {
 /**
  * This stage is used internally for change notifications to close cursor after returning
  * "invalidate" entries.
@@ -155,7 +153,7 @@ public:
 
 private:
     /**
-     * Use the create static method to create a DocumentSourceCheckResumeToken.
+     * Use the create static method to create a DocumentSourceCloseCursor.
      */
     DocumentSourceCloseCursor(const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : DocumentSource(expCtx) {}
@@ -199,28 +197,24 @@ BSONObj DocumentSourceChangeStream::buildMatchFilter(const NamespaceString& nss,
     auto dropDatabase = BSON("o.dropDatabase" << 1);
     auto dropCollection = BSON("o.drop" << nss.coll());
     auto renameCollection = BSON("o.renameCollection" << target);
-    // Commands that are on target db and one of the above.
+    // 1.1) Commands that are on target db and one of the above.
     auto commandsOnTargetDb =
-        BSON("ns" << nss.getCommandNS().ns() << "$or"
-                  << BSON_ARRAY(dropDatabase << dropCollection << renameCollection));
-
-    // 2) Supported commands that have arbitrary db namespaces in "ns" field.
+        BSON("ns" << nss.getCommandNS().ns() << OR(dropDatabase, dropCollection, renameCollection));
+    // 1.2) Supported commands that have arbitrary db namespaces in "ns" field.
     auto renameDropTarget = BSON("o.to" << target);
+    // All supported commands that are either (1.1) or (1.2).
+    BSONObj commandMatch = BSON("op"
+                                << "c"
+                                << OR(commandsOnTargetDb, renameDropTarget));
 
-    // 3) All supported commands that are either (1) or (2).
-    auto commandMatch = BSON("op"
-                             << "c"
-                             << "$or"
-                             << BSON_ARRAY(commandsOnTargetDb << renameDropTarget));
-
-    // 4) Normal CRUD ops on the target collection.
+    // 2) Normal CRUD ops on the target collection.
     auto opMatch = BSON("ns" << target);
 
-    // Match oplog entries after "start" and are either (3) supported commands or (4) CRUD ops,
+    // Match oplog entries after "start" and are either (1) supported commands or (2) CRUD ops,
     // excepting those tagged "fromMigrate".
     // Include the resume token, if resuming, so we can verify it was still present in the oplog.
     return BSON("$and" << BSON_ARRAY(BSON("ts" << (isResume ? GTE : GT) << startFrom)
-                                     << BSON("$or" << BSON_ARRAY(opMatch << commandMatch))
+                                     << BSON(OR(opMatch, commandMatch))
                                      << BSON("fromMigrate" << NE << true)));
 }
 
@@ -228,24 +222,37 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
     // TODO: Add sharding support here (SERVER-29141).
     uassert(
-        40470, "The $changeStream stage is not supported on sharded systems.", !expCtx->inRouter);
+        40470, "The $changeStream stage is not supported on sharded systems.", !expCtx->inMongos);
     uassert(40471,
             "Only default collation is allowed when using a $changeStream stage.",
             !expCtx->getCollator());
 
     auto replCoord = repl::ReplicationCoordinator::get(expCtx->opCtx);
-    uassert(40573, "The $changeStream stage is only supported on replica sets", replCoord);
-    Timestamp startFrom = replCoord->getLastCommittedOpTime().getTimestamp();
+    uassert(40573,
+            "The $changeStream stage is only supported on replica sets",
+            replCoord &&
+                replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet);
+    Timestamp startFrom = replCoord->getMyLastAppliedOpTime().getTimestamp();
 
-    intrusive_ptr<DocumentSourceCheckResumeToken> resumeStage = nullptr;
+    intrusive_ptr<DocumentSource> resumeStage = nullptr;
     auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserErrorContext("$changeStream"),
                                                       elem.embeddedObject());
     if (auto resumeAfter = spec.getResumeAfter()) {
         ResumeToken token = resumeAfter.get();
+        auto resumeNamespace = UUIDCatalog::get(expCtx->opCtx).lookupNSSByUUID(token.getUuid());
+        uassert(40615,
+                "The resume token UUID does not exist. Has the collection been dropped?",
+                !resumeNamespace.isEmpty());
         startFrom = token.getTimestamp();
-        DocumentSourceCheckResumeTokenSpec spec;
-        spec.setResumeToken(std::move(token));
-        resumeStage = DocumentSourceCheckResumeToken::create(expCtx, std::move(spec));
+        if (expCtx->needsMerge) {
+            DocumentSourceShardCheckResumabilitySpec spec;
+            spec.setResumeToken(std::move(token));
+            resumeStage = DocumentSourceShardCheckResumability::create(expCtx, std::move(spec));
+        } else {
+            DocumentSourceEnsureResumeTokenPresentSpec spec;
+            spec.setResumeToken(std::move(token));
+            resumeStage = DocumentSourceEnsureResumeTokenPresent::create(expCtx, std::move(spec));
+        }
     }
     const bool changeStreamIsResuming = resumeStage != nullptr;
 
@@ -291,6 +298,9 @@ Document DocumentSourceChangeStream::Transformation::applyTransformation(const D
     Value ts = input[repl::OplogEntry::kTimestampFieldName];
     Value ns = input[repl::OplogEntry::kNamespaceFieldName];
     checkValueType(ns, repl::OplogEntry::kNamespaceFieldName, BSONType::String);
+    Value uuid = input[repl::OplogEntry::kUuidFieldName];
+    if (!uuid.missing())
+        checkValueType(uuid, repl::OplogEntry::kUuidFieldName, BSONType::BinData);
     NamespaceString nss(ns.getString());
     Value id = input.getNestedField("o._id");
     // Non-replace updates have the _id in field "o2".
@@ -347,6 +357,9 @@ Document DocumentSourceChangeStream::Transformation::applyTransformation(const D
         default: { MONGO_UNREACHABLE; }
     }
 
+    // UUID should always be present except for invalidate entries.
+    invariant(operationType == kInvalidateOpType || !uuid.missing());
+
     // Construct the result document.
     Value documentKey;
     if (!documentId.missing()) {
@@ -354,7 +367,7 @@ Document DocumentSourceChangeStream::Transformation::applyTransformation(const D
     }
     // Note that 'documentKey' might be missing, in which case it will not appear in the output.
     Document resumeToken{{kClusterTimeField, Document{{kTimestampField, ts}}},
-                         {kNamespaceField, ns},
+                         {kUuidField, uuid},
                          {kDocumentKeyField, documentKey}};
     doc.addField(kIdField, Value(resumeToken));
     doc.addField(kOperationTypeField, Value(operationType));
@@ -384,6 +397,7 @@ DocumentSource::GetDepsReturn DocumentSourceChangeStream::Transformation::addDep
     deps->fields.insert(repl::OplogEntry::kOpTypeFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kTimestampFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kNamespaceFieldName.toString());
+    deps->fields.insert(repl::OplogEntry::kUuidFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kObjectFieldName.toString());
     deps->fields.insert(repl::OplogEntry::kObject2FieldName.toString());
     return DocumentSource::GetDepsReturn::EXHAUSTIVE_ALL;

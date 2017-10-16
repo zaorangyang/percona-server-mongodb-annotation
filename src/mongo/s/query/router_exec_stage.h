@@ -52,8 +52,9 @@ class OperationContext;
  */
 class RouterExecStage {
 public:
-    RouterExecStage() = default;
-    RouterExecStage(std::unique_ptr<RouterExecStage> child) : _child(std::move(child)) {}
+    RouterExecStage(OperationContext* opCtx) : _opCtx(opCtx) {}
+    RouterExecStage(OperationContext* opCtx, std::unique_ptr<RouterExecStage> child)
+        : _opCtx(opCtx), _child(std::move(child)) {}
 
     virtual ~RouterExecStage() = default;
 
@@ -71,13 +72,23 @@ public:
     /**
      * Must be called before destruction to abandon a not-yet-exhausted plan. May block waiting for
      * responses from remote hosts.
+     *
+     * Note that 'opCtx' may or may not be the same as the operation context to which this cursor is
+     * currently attached. This is so that a killing thread may call this method with its own
+     * operation context.
      */
-    virtual void kill(OperationContext* opCtx) = 0;
+    virtual void kill(OperationContext* opCtx) {
+        invariant(_child);  // The default implementation forwards to the child stage.
+        _child->kill(opCtx);
+    }
 
     /**
      * Returns whether or not all the remote cursors are exhausted.
      */
-    virtual bool remotesExhausted() = 0;
+    virtual bool remotesExhausted() {
+        invariant(_child);  // The default implementation forwards to the child stage.
+        return _child->remotesExhausted();
+    }
 
     /**
      * Sets the maxTimeMS value that the cursor should forward with any internally issued getMore
@@ -86,7 +97,15 @@ public:
      * Returns a non-OK status if this cursor type does not support maxTimeMS on getMore (i.e. if
      * the cursor is not tailable + awaitData).
      */
-    virtual Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) = 0;
+    Status setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
+        if (_child) {
+            auto childStatus = _child->setAwaitDataTimeout(awaitDataTimeout);
+            if (!childStatus.isOK()) {
+                return childStatus;
+            }
+        }
+        return doSetAwaitDataTimeout(awaitDataTimeout);
+    }
 
     /**
      * Sets the current operation context to be used by the router stage.
@@ -130,6 +149,13 @@ protected:
     virtual void doDetachFromOperationContext() {}
 
     /**
+     * Performs any stage-specific await data timeout actions.
+     */
+    virtual Status doSetAwaitDataTimeout(Milliseconds awaitDataTimeout) {
+        return Status::OK();
+    }
+
+    /**
      * Returns an unowned pointer to the child stage, or nullptr if there is no child.
      */
     RouterExecStage* getChildStage() {
@@ -144,8 +170,8 @@ protected:
     }
 
 private:
-    std::unique_ptr<RouterExecStage> _child;
     OperationContext* _opCtx = nullptr;
+    std::unique_ptr<RouterExecStage> _child;
 };
 
 }  // namespace mongo

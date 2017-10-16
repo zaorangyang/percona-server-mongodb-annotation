@@ -84,6 +84,9 @@ Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(Operati
     return storeLocalConfigDocument(opCtx, config);
 }
 
+void ReplicationCoordinatorExternalStateMock::waitForAllEarlierOplogWritesToBeVisible(
+    OperationContext* opCtx) {}
+
 void ReplicationCoordinatorExternalStateMock::shutdown(OperationContext*) {}
 
 executor::TaskExecutor* ReplicationCoordinatorExternalStateMock::getTaskExecutor() const {
@@ -211,7 +214,7 @@ void ReplicationCoordinatorExternalStateMock::startProducerIfStopped() {}
 
 void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
 
-void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(SnapshotName newCommitPoint) {
+void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(SnapshotInfo newCommitPoint) {
 }
 
 void ReplicationCoordinatorExternalStateMock::createSnapshot(OperationContext* opCtx,

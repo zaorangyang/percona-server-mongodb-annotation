@@ -139,6 +139,7 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotMasterError) {
                                output))
             << output;
         ON_BLOCK_EXIT([&] {
+            uassertStatusOK(conn.connect(host, "integration_test-cleanup"));
             ASSERT(conn.runCommand("admin",
                                    fromjson(R"({
                                           configureFailPoint:

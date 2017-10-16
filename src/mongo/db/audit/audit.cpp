@@ -48,7 +48,6 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/server_parameters.h"
@@ -96,7 +95,7 @@ namespace audit {
     class WritableAuditLog : public logger::AuditLog {
     public:
         WritableAuditLog(const BSONObj &filter)
-            : _matcher(filter.getOwned(), ExtensionsCallbackDisallowExtensions(), nullptr) {
+            : _matcher(filter.getOwned(), nullptr) {
         }
         virtual ~WritableAuditLog() {}
 

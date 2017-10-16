@@ -32,10 +32,6 @@
 #include "mongo/platform/process_id.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 
-// TODO(SERVER-29687) Remove this include. A bunch of places assume they can call
-// getHostName()/getHostNameCached() by including server_options.h.
-#include "mongo/util/net/sock.h"
-
 namespace mongo {
 
 const int DEFAULT_UNIX_PERMS = 0700;
@@ -57,6 +53,8 @@ struct ServerGlobalParams {
     std::string bind_ip;  // --bind_ip
     bool enableIPv6 = false;
     bool rest = false;  // --rest
+
+    int listenBacklog = 0;  // --listenBacklog, real default is SOMAXCONN
 
     bool indexBuildRetry = true;  // --noIndexBuildRetry
 
@@ -189,7 +187,21 @@ struct ServerGlobalParams {
         // "3.2" feature compatibility mode.
         AtomicWord<bool> validateFeaturesAsMaster{true};
     } featureCompatibility;
+
+    std::vector<std::string> disabledSecureAllocatorDomains;
 };
 
 extern ServerGlobalParams serverGlobalParams;
+
+template <typename NameTrait>
+struct TraitNamedDomain {
+    static bool peg() {
+        const auto& dsmd = serverGlobalParams.disabledSecureAllocatorDomains;
+        const auto contains = [&](StringData dt) {
+            return std::find(dsmd.begin(), dsmd.end(), dt) != dsmd.end();
+        };
+        static const bool ret = !(contains("*"_sd) || contains(NameTrait::DomainType));
+        return ret;
+    }
+};
 }

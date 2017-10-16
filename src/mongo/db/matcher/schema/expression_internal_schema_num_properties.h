@@ -64,6 +64,10 @@ protected:
         return _numProperties;
     }
 
+    void _doAddDependencies(DepsTracker* deps) const final {
+        deps->needWholeDocument = true;
+    }
+
 private:
     long long _numProperties;
     std::string _name;

@@ -53,7 +53,6 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
-#include "mongo/db/matcher/matcher.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/find_common.h"
@@ -317,7 +316,7 @@ Config::Config(const string& _dbname, const BSONObj& cmdObj) {
         // scope and code
 
         if (cmdObj["scope"].type() == Object)
-            scopeSetup = cmdObj["scope"].embeddedObjectUserCheck();
+            scopeSetup = cmdObj["scope"].embeddedObjectUserCheck().getOwned();
 
         mapper.reset(new JSMapper(cmdObj["map"]));
         reducer.reset(new JSReducer(cmdObj["reduce"]));
@@ -325,7 +324,7 @@ Config::Config(const string& _dbname, const BSONObj& cmdObj) {
             finalizer.reset(new JSFinalizer(cmdObj["finalize"]));
 
         if (cmdObj["mapparams"].type() == Array) {
-            mapParams = cmdObj["mapparams"].embeddedObjectUserCheck();
+            mapParams = cmdObj["mapparams"].embeddedObjectUserCheck().getOwned();
         }
     }
 
@@ -837,6 +836,7 @@ void State::init() {
     const string userToken =
         AuthorizationSession::get(Client::getCurrent())->getAuthenticatedUserNamesToken();
     _scope.reset(getGlobalScriptEngine()->newScopeForCurrentThread());
+    _scope->requireOwnedObjects();
     _scope->registerOperation(_opCtx);
     _scope->setLocalDB(_config.dbname);
     _scope->loadStored(_opCtx, true);
@@ -1096,7 +1096,14 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp, ProgressMeterHold
     auto qr = stdx::make_unique<QueryRequest>(_config.incLong);
     qr->setSort(sortKey);
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     extensionsCallback,
+                                     MatchExpressionParser::kAllowAllSpecialFeatures &
+                                         ~MatchExpressionParser::AllowedFeatures::kExpr);
     verify(statusWithCQ.isOK());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -1143,11 +1150,8 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp, ProgressMeterHold
         prev = o;
         all.push_back(o);
 
-        if (!exec->restoreState()) {
-            uasserted(34375, "Plan executor killed during mapReduce final reduce");
-        }
-
         _opCtx->checkForInterrupt();
+        uassertStatusOK(exec->restoreState());
     }
 
     uassert(34428,
@@ -1464,8 +1468,14 @@ public:
 
                 const ExtensionsCallbackReal extensionsCallback(opCtx, &config.nss);
 
-                auto statusWithCQ =
-                    CanonicalQuery::canonicalize(opCtx, std::move(qr), extensionsCallback);
+                const boost::intrusive_ptr<ExpressionContext> expCtx;
+                auto statusWithCQ = CanonicalQuery::canonicalize(
+                    opCtx,
+                    std::move(qr),
+                    expCtx,
+                    extensionsCallback,
+                    MatchExpressionParser::kAllowAllSpecialFeatures &
+                        ~MatchExpressionParser::AllowedFeatures::kExpr);
                 if (!statusWithCQ.isOK()) {
                     uasserted(17238, "Can't canonicalize query " + config.filter.toString());
                     return 0;
@@ -1493,6 +1503,7 @@ public:
                 BSONObj o;
                 PlanExecutor::ExecState execState;
                 while (PlanExecutor::ADVANCED == (execState = exec->getNext(&o, NULL))) {
+                    o = o.getOwned();  // we will be accessing outside of the lock
                     // check to see if this is a new object we don't own yet
                     // because of a chunk migration
                     if (collMetadata) {
@@ -1528,12 +1539,9 @@ public:
 
                         scopedAutoDb.reset(new AutoGetDb(opCtx, config.nss.db(), MODE_S));
 
-                        if (!exec->restoreState()) {
-                            return appendCommandStatus(
-                                result,
-                                Status(ErrorCodes::OperationFailed,
-                                       str::stream()
-                                           << "Executor killed during mapReduce command"));
+                        auto restoreStatus = exec->restoreState();
+                        if (!restoreStatus.isOK()) {
+                            return appendCommandStatus(result, restoreStatus);
                         }
 
                         reduceTime += t.micros();

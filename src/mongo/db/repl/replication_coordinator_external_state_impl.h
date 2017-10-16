@@ -81,6 +81,7 @@ public:
     virtual OldThreadPool* getDbWorkThreadPool() const override;
     virtual Status runRepairOnLocalDB(OperationContext* opCtx) override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
+    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx);
     void onDrainComplete(OperationContext* opCtx) override;
     OpTime onTransitionToPrimary(OperationContext* opCtx, bool isV1ElectionProtocol) override;
     virtual void forwardSlaveProgress();
@@ -100,7 +101,7 @@ public:
     virtual void stopProducer();
     virtual void startProducerIfStopped();
     void dropAllSnapshots() final;
-    void updateCommittedSnapshot(SnapshotName newCommitPoint) final;
+    void updateCommittedSnapshot(SnapshotInfo newCommitPoint) final;
     void createSnapshot(OperationContext* opCtx, SnapshotName name) final;
     void forceSnapshotCreation() final;
     virtual bool snapshotsEnabled() const;

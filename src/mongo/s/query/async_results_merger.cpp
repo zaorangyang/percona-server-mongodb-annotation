@@ -52,14 +52,18 @@ const int kMaxNumFailedHostRetryAttempts = 3;
 
 }  // namespace
 
-AsyncResultsMerger::AsyncResultsMerger(executor::TaskExecutor* executor,
+AsyncResultsMerger::AsyncResultsMerger(OperationContext* opCtx,
+                                       executor::TaskExecutor* executor,
                                        ClusterClientCursorParams* params)
-    : _executor(executor),
+    : _opCtx(opCtx),
+      _executor(executor),
       _params(params),
       _mergeQueue(MergingComparator(_remotes, _params->sort)) {
     size_t remoteIndex = 0;
     for (const auto& remote : _params->remotes) {
-        _remotes.emplace_back(remote.hostAndPort, remote.cursorResponse.getCursorId());
+        _remotes.emplace_back(remote.hostAndPort,
+                              remote.cursorResponse.getNSS(),
+                              remote.cursorResponse.getCursorId());
 
         // We don't check the return value of addBatchToBuffer here; if there was an error,
         // it will be stored in the remote and the first call to ready() will return true.
@@ -112,14 +116,28 @@ bool AsyncResultsMerger::ready() {
     return ready_inlock();
 }
 
+void AsyncResultsMerger::detachFromOperationContext() {
+    _opCtx = nullptr;
+    // If we were about ready to return a boost::none because a tailable cursor reached the end of
+    // the batch, that should no longer apply to the next use - when we are reattached to a
+    // different OperationContext, it signals that the caller is ready for a new batch, and wants us
+    // to request a new batch from the tailable cursor.
+    _eofNext = false;
+}
+
+void AsyncResultsMerger::reattachToOperationContext(OperationContext* opCtx) {
+    invariant(!_opCtx);
+    _opCtx = opCtx;
+}
+
 bool AsyncResultsMerger::ready_inlock() {
     if (_lifecycleState != kAlive) {
         return true;
     }
 
     if (_eofNext) {
-        // We are ready to return boost::none due to reaching the end of a batch of results from a
-        // tailable cursor.
+        // Mark this operation as ready to return boost::none due to reaching the end of a batch of
+        // results from a tailable cursor.
         return true;
     }
 
@@ -239,7 +257,7 @@ ClusterQueryResult AsyncResultsMerger::nextReadyUnsorted() {
     return {};
 }
 
-Status AsyncResultsMerger::askForNextBatch_inlock(OperationContext* opCtx, size_t remoteIndex) {
+Status AsyncResultsMerger::askForNextBatch_inlock(size_t remoteIndex) {
     auto& remote = _remotes[remoteIndex];
 
     invariant(!remote.cbHandle.isValid());
@@ -253,7 +271,7 @@ Status AsyncResultsMerger::askForNextBatch_inlock(OperationContext* opCtx, size_
         adjustedBatchSize = *_params->batchSize - remote.fetchedCount;
     }
 
-    BSONObj cmdObj = GetMoreRequest(_params->nsString,
+    BSONObj cmdObj = GetMoreRequest(remote.cursorNss,
                                     remote.cursorId,
                                     adjustedBatchSize,
                                     _awaitDataTimeout,
@@ -262,15 +280,12 @@ Status AsyncResultsMerger::askForNextBatch_inlock(OperationContext* opCtx, size_
                          .toBSON();
 
     executor::RemoteCommandRequest request(
-        remote.getTargetHost(), _params->nsString.db().toString(), cmdObj, _metadataObj, opCtx);
+        remote.getTargetHost(), _params->nsString.db().toString(), cmdObj, _metadataObj, _opCtx);
 
-    auto callbackStatus =
-        _executor->scheduleRemoteCommand(request,
-                                         stdx::bind(&AsyncResultsMerger::handleBatchResponse,
-                                                    this,
-                                                    stdx::placeholders::_1,
-                                                    opCtx,
-                                                    remoteIndex));
+    auto callbackStatus = _executor->scheduleRemoteCommand(
+        request,
+        stdx::bind(
+            &AsyncResultsMerger::handleBatchResponse, this, stdx::placeholders::_1, remoteIndex));
     if (!callbackStatus.isOK()) {
         return callbackStatus.getStatus();
     }
@@ -287,8 +302,7 @@ Status AsyncResultsMerger::askForNextBatch_inlock(OperationContext* opCtx, size_
  * 2. Remotes that already has some result will have a non-empty buffer.
  * 3. Remotes that reached maximum retries will be in 'exhausted' state.
  */
-StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent(
-    OperationContext* opCtx) {
+StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     if (_lifecycleState != kAlive) {
@@ -315,7 +329,7 @@ StatusWith<executor::TaskExecutor::EventHandle> AsyncResultsMerger::nextEvent(
         if (!remote.hasNext() && !remote.exhausted() && !remote.cbHandle.isValid()) {
             // If this remote is not exhausted and there is no outstanding request for it, schedule
             // work to retrieve the next batch.
-            auto nextBatchStatus = askForNextBatch_inlock(opCtx, i);
+            auto nextBatchStatus = askForNextBatch_inlock(i);
             if (!nextBatchStatus.isOK()) {
                 return nextBatchStatus;
             }
@@ -358,9 +372,7 @@ StatusWith<CursorResponse> AsyncResultsMerger::parseCursorResponse(const BSONObj
 }
 
 void AsyncResultsMerger::handleBatchResponse(
-    const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData,
-    OperationContext* opCtx,
-    size_t remoteIndex) {
+    const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData, size_t remoteIndex) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
     auto& remote = _remotes[remoteIndex];
@@ -385,7 +397,7 @@ void AsyncResultsMerger::handleBatchResponse(
             // If the event handle is invalid, then the executor is in the middle of shutting down,
             // and we can't schedule any more work for it to complete.
             if (_killCursorsScheduledEvent.isValid()) {
-                scheduleKillCursors_inlock(opCtx);
+                scheduleKillCursors_inlock(_opCtx);
                 _executor->signalEvent(_killCursorsScheduledEvent);
             }
 
@@ -442,7 +454,7 @@ void AsyncResultsMerger::handleBatchResponse(
     // We do not ask for the next batch if the cursor is tailable, as batches received from remote
     // tailable cursors should be passed through to the client without asking for more batches.
     if (!_params->isTailable && !remote.hasNext() && !remote.exhausted()) {
-        remote.status = askForNextBatch_inlock(opCtx, remoteIndex);
+        remote.status = askForNextBatch_inlock(remoteIndex);
         if (!remote.status.isOK()) {
             return;
         }
@@ -572,8 +584,11 @@ executor::TaskExecutor::EventHandle AsyncResultsMerger::kill(OperationContext* o
 //
 
 AsyncResultsMerger::RemoteCursorData::RemoteCursorData(HostAndPort hostAndPort,
+                                                       NamespaceString cursorNss,
                                                        CursorId establishedCursorId)
-    : cursorId(establishedCursorId), shardHostAndPort(std::move(hostAndPort)) {}
+    : cursorId(establishedCursorId),
+      cursorNss(std::move(cursorNss)),
+      shardHostAndPort(std::move(hostAndPort)) {}
 
 const HostAndPort& AsyncResultsMerger::RemoteCursorData::getTargetHost() const {
     return shardHostAndPort;

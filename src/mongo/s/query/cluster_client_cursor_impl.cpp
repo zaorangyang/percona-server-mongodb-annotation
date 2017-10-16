@@ -26,17 +26,18 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 
-#include "mongo/s/query/router_stage_aggregation_merge.h"
+#include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/pipeline/document_source_skip.h"
+#include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/s/query/router_stage_limit.h"
 #include "mongo/s/query/router_stage_merge.h"
 #include "mongo/s/query/router_stage_mock.h"
-#include "mongo/s/query/router_stage_remove_sortkey.h"
+#include "mongo/s/query/router_stage_pipeline.h"
+#include "mongo/s/query/router_stage_remove_metadata_fields.h"
 #include "mongo/s/query/router_stage_skip.h"
 #include "mongo/stdx/memory.h"
 
@@ -63,15 +64,16 @@ std::unique_ptr<ClusterClientCursor> ClusterClientCursorGuard::releaseCursor() {
 ClusterClientCursorGuard ClusterClientCursorImpl::make(OperationContext* opCtx,
                                                        executor::TaskExecutor* executor,
                                                        ClusterClientCursorParams&& params) {
-    std::unique_ptr<ClusterClientCursor> cursor(
-        new ClusterClientCursorImpl(executor, std::move(params), opCtx->getLogicalSessionId()));
+    std::unique_ptr<ClusterClientCursor> cursor(new ClusterClientCursorImpl(
+        opCtx, executor, std::move(params), opCtx->getLogicalSessionId()));
     return ClusterClientCursorGuard(opCtx, std::move(cursor));
 }
 
-ClusterClientCursorImpl::ClusterClientCursorImpl(executor::TaskExecutor* executor,
+ClusterClientCursorImpl::ClusterClientCursorImpl(OperationContext* opCtx,
+                                                 executor::TaskExecutor* executor,
                                                  ClusterClientCursorParams&& params,
                                                  boost::optional<LogicalSessionId> lsid)
-    : _params(std::move(params)), _root(buildMergerPlan(executor, &_params)), _lsid(lsid) {}
+    : _params(std::move(params)), _root(buildMergerPlan(opCtx, executor, &_params)), _lsid(lsid) {}
 
 ClusterClientCursorImpl::ClusterClientCursorImpl(std::unique_ptr<RouterStageMock> root,
                                                  ClusterClientCursorParams&& params,
@@ -139,32 +141,107 @@ boost::optional<LogicalSessionId> ClusterClientCursorImpl::getLsid() const {
     return _lsid;
 }
 
-std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
-    executor::TaskExecutor* executor, ClusterClientCursorParams* params) {
-    const auto skip = params->skip;
-    const auto limit = params->limit;
-    const bool hasSort = !params->sort.isEmpty();
+namespace {
 
-    // The first stage always merges from the remotes. If 'mergePipeline' has been specified in
-    // ClusterClientCursorParams, then RouterStageAggregationMerge should be the root and only node.
-    // Otherwise, construct a RouterStage pipeline from the remotes, skip, limit, and sort fields in
-    // 'params'.
-    if (params->mergePipeline) {
-        return stdx::make_unique<RouterStageAggregationMerge>(std::move(params->mergePipeline));
+/**
+ * Rips off an initial $sort stage that will be handled by mongos execution machinery. Returns the
+ * sort key pattern of such a $sort stage if there was one, and boost::none otherwise.
+ */
+boost::optional<BSONObj> extractLeadingSort(Pipeline* mergePipeline) {
+    if (auto frontSort = mergePipeline->popFrontStageWithName(DocumentSourceSort::kStageName)) {
+        auto sortStage = static_cast<DocumentSourceSort*>(frontSort.get());
+        if (auto sortLimit = sortStage->getLimitSrc()) {
+            // There was a limit stage absorbed into the sort stage, so we need to preserve that.
+            mergePipeline->addInitialSource(sortLimit);
+        }
+        return sortStage
+            ->sortKeyPattern(DocumentSourceSort::SortKeySerialization::kForSortKeyMerging)
+            .toBson();
+    }
+    return boost::none;
+}
+
+bool isSkipOrLimit(const boost::intrusive_ptr<DocumentSource>& stage) {
+    return (dynamic_cast<DocumentSourceLimit*>(stage.get()) ||
+            dynamic_cast<DocumentSourceSkip*>(stage.get()));
+}
+
+bool isAllLimitsAndSkips(Pipeline* pipeline) {
+    const auto stages = pipeline->getSources();
+    return std::all_of(
+        stages.begin(), stages.end(), [&](const auto& stage) { return isSkipOrLimit(stage); });
+}
+
+std::unique_ptr<RouterExecStage> buildPipelinePlan(executor::TaskExecutor* executor,
+                                                   ClusterClientCursorParams* params) {
+    invariant(params->mergePipeline);
+    invariant(!params->skip);
+    invariant(!params->limit);
+    auto* pipeline = params->mergePipeline.get();
+    auto* opCtx = pipeline->getContext()->opCtx;
+
+    std::unique_ptr<RouterExecStage> root =
+        stdx::make_unique<RouterStageMerge>(opCtx, executor, params);
+    if (!isAllLimitsAndSkips(pipeline)) {
+        return stdx::make_unique<RouterStagePipeline>(std::move(root),
+                                                      std::move(params->mergePipeline));
     }
 
-    std::unique_ptr<RouterExecStage> root = stdx::make_unique<RouterStageMerge>(executor, params);
+    // After extracting an optional leading $sort, the pipeline consisted entirely of $skip and
+    // $limit stages. Avoid creating a RouterStagePipeline (which will go through an expensive
+    // conversion from BSONObj -> Document for each result), and create a RouterExecStage tree
+    // instead.
+    while (!pipeline->getSources().empty()) {
+        invariant(isSkipOrLimit(pipeline->getSources().front()));
+        if (auto skip = pipeline->popFrontStageWithName(DocumentSourceSkip::kStageName)) {
+            root = stdx::make_unique<RouterStageSkip>(
+                opCtx, std::move(root), static_cast<DocumentSourceSkip*>(skip.get())->getSkip());
+        } else if (auto limit = pipeline->popFrontStageWithName(DocumentSourceLimit::kStageName)) {
+            root = stdx::make_unique<RouterStageLimit>(
+                opCtx, std::move(root), static_cast<DocumentSourceLimit*>(limit.get())->getLimit());
+        }
+    }
+    if (!params->sort.isEmpty()) {
+        // We are executing the pipeline without using a Pipeline, so we need to strip out any
+        // Document metadata ourselves. Note we only need this stage if there was a sort, since
+        // otherwise there would be no way for this half of the pipeline to require any metadata
+        // fields.
+        root = stdx::make_unique<RouterStageRemoveMetadataFields>(
+            opCtx, std::move(root), Document::allMetadataFieldNames);
+    }
+    return root;
+}
+}  // namespace
+
+std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
+    OperationContext* opCtx, executor::TaskExecutor* executor, ClusterClientCursorParams* params) {
+    const auto skip = params->skip;
+    const auto limit = params->limit;
+    if (params->mergePipeline) {
+        if (auto sort = extractLeadingSort(params->mergePipeline.get())) {
+            params->sort = *sort;
+        }
+        return buildPipelinePlan(executor, params);
+    }
+
+    std::unique_ptr<RouterExecStage> root =
+        stdx::make_unique<RouterStageMerge>(opCtx, executor, params);
 
     if (skip) {
-        root = stdx::make_unique<RouterStageSkip>(std::move(root), *skip);
+        root = stdx::make_unique<RouterStageSkip>(opCtx, std::move(root), *skip);
     }
 
     if (limit) {
-        root = stdx::make_unique<RouterStageLimit>(std::move(root), *limit);
+        root = stdx::make_unique<RouterStageLimit>(opCtx, std::move(root), *limit);
     }
 
+    const bool hasSort = !params->sort.isEmpty();
     if (hasSort) {
-        root = stdx::make_unique<RouterStageRemoveSortKey>(std::move(root));
+        // Strip out the sort key after sorting.
+        root = stdx::make_unique<RouterStageRemoveMetadataFields>(
+            opCtx,
+            std::move(root),
+            std::vector<StringData>{ClusterClientCursorParams::kSortKeyField});
     }
 
     return root;

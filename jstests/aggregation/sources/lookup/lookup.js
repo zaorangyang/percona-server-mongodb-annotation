@@ -501,7 +501,7 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
               $lookup: {
                   let : {var1: "$_id"},
                   pipeline: [
-                      {$match: {_id: {$lt: {$expr: "$$var1"}}}},
+                      {$match: {$expr: {$lt: ["$_id", "$$var1"]}}},
                   ],
                   from: "from",
                   as: "c",
@@ -531,12 +531,12 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
               $lookup: {
                   let : {var1: "$_id"},
                   pipeline: [
-                      {$match: {_id: {$eq: {$expr: "$$var1"}}}},
+                      {$match: {$expr: {$eq: ["$_id", "$$var1"]}}},
                       {
                         $lookup: {
                             let : {var2: "$_id"},
                             pipeline: [
-                                {$match: {_id: {$gt: {$expr: "$$var2"}}}},
+                                {$match: {$expr: {$gt: ["$_id", "$$var2"]}}},
                             ],
                             from: "from",
                             as: "d"
@@ -563,7 +563,7 @@ load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
                   let : {var1: "$x"},
                   pipeline: [
                       {$addFields: {newField: 2}},
-                      {$match: {newField: {$expr: "$$var1"}}},
+                      {$match: {$expr: {$eq: ["$newField", "$$var1"]}}},
                       {$project: {newField: 0}}
                   ],
                   from: "from",

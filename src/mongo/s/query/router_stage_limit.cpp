@@ -34,8 +34,10 @@
 
 namespace mongo {
 
-RouterStageLimit::RouterStageLimit(std::unique_ptr<RouterExecStage> child, long long limit)
-    : RouterExecStage(std::move(child)), _limit(limit) {
+RouterStageLimit::RouterStageLimit(OperationContext* opCtx,
+                                   std::unique_ptr<RouterExecStage> child,
+                                   long long limit)
+    : RouterExecStage(opCtx, std::move(child)), _limit(limit) {
     invariant(limit > 0);
 }
 
@@ -53,18 +55,6 @@ StatusWith<ClusterQueryResult> RouterStageLimit::next() {
         ++_returnedSoFar;
     }
     return childResult;
-}
-
-void RouterStageLimit::kill(OperationContext* opCtx) {
-    getChildStage()->kill(opCtx);
-}
-
-bool RouterStageLimit::remotesExhausted() {
-    return getChildStage()->remotesExhausted();
-}
-
-Status RouterStageLimit::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
-    return getChildStage()->setAwaitDataTimeout(awaitDataTimeout);
 }
 
 }  // namespace mongo

@@ -185,7 +185,7 @@ BSONObj createCommandForTargetedShards(
     const std::unique_ptr<Pipeline, Pipeline::Deleter>& pipelineForTargetedShards) {
     // Create the command for the shards.
     MutableDocument targetedCmd(request.serializeToCommandObj());
-    targetedCmd[AggregationRequest::kFromRouterName] = Value(true);
+    targetedCmd[AggregationRequest::kFromMongosName] = Value(true);
 
     // If 'pipelineForTargetedShards' is 'nullptr', this is an unsharded direct passthrough.
     if (pipelineForTargetedShards) {
@@ -221,7 +221,7 @@ BSONObj createCommandForMergingShard(
     MutableDocument mergeCmd(request.serializeToCommandObj());
 
     mergeCmd["pipeline"] = Value(pipelineForMerging->serialize());
-    mergeCmd[AggregationRequest::kFromRouterName] = Value(true);
+    mergeCmd[AggregationRequest::kFromMongosName] = Value(true);
     mergeCmd["writeConcern"] = Value(originalCmdObj["writeConcern"]);
 
     // If the user didn't specify a collation already, make sure there's a collation attached to
@@ -331,7 +331,13 @@ BSONObj establishMergingMongosCursor(
 
     params.mergePipeline = std::move(pipelineForMerging);
     params.remotes = std::move(cursors);
-    params.batchSize = request.getBatchSize();
+
+    // A batch size of 0 is legal for the initial aggregate, but not valid for getMores, the batch
+    // size we pass here is used for getMores, so do not specify a batch size if the initial request
+    // had a batch size of 0.
+    params.batchSize = request.getBatchSize() == 0
+        ? boost::none
+        : boost::optional<long long>(request.getBatchSize());
 
     auto ccc = ClusterClientCursorImpl::make(
         opCtx, Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(), std::move(params));
@@ -340,8 +346,6 @@ BSONObj establishMergingMongosCursor(
     BSONObjBuilder cursorResponse;
 
     CursorResponseBuilder responseBuilder(true, &cursorResponse);
-
-    ccc->reattachToOperationContext(opCtx);
 
     for (long long objCount = 0; objCount < request.getBatchSize(); ++objCount) {
         auto next = uassertStatusOK(ccc->next());
@@ -415,10 +419,10 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces;
     LiteParsedPipeline liteParsedPipeline(request);
 
-    // TODO SERVER-29141 support $changeStream on mongos.
+    // TODO SERVER-29141 support forcing pipeline to run on Mongos.
     uassert(40567,
-            "$changeStream is not yet supported on mongos",
-            !liteParsedPipeline.hasChangeStream());
+            "Unable to force mongos-only stage to run on mongos",
+            liteParsedPipeline.allowedToForwardFromMongos());
 
     for (auto&& nss : liteParsedPipeline.getInvolvedNamespaces()) {
         const auto resolvedNsRoutingInfo =
@@ -429,7 +433,8 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     }
 
     // If this aggregation is on an unsharded collection, pass through to the primary shard.
-    if (!executionNsRoutingInfo.cm() && !namespaces.executionNss.isCollectionlessAggregateNS()) {
+    if (!executionNsRoutingInfo.cm() && !namespaces.executionNss.isCollectionlessAggregateNS() &&
+        liteParsedPipeline.allowedToPassthroughFromMongos()) {
         return aggPassthrough(
             opCtx, namespaces, executionNsRoutingInfo.primary()->getId(), request, cmdObj, result);
     }
@@ -446,7 +451,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
 
     boost::intrusive_ptr<ExpressionContext> mergeCtx =
         new ExpressionContext(opCtx, request, std::move(collation), std::move(resolvedNamespaces));
-    mergeCtx->inRouter = true;
+    mergeCtx->inMongos = true;
     // explicitly *not* setting mergeCtx->tempDir
 
     auto pipeline = uassertStatusOK(Pipeline::parse(request.getPipeline(), mergeCtx));
@@ -584,10 +589,6 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     // If we reach here, we have a merge pipeline to dispatch.
     invariant(pipelineForMerging);
 
-    // We need a DocumentSourceMergeCursors regardless of whether we merge on mongoS or on a shard.
-    pipelineForMerging->addInitialSource(
-        DocumentSourceMergeCursors::create(parseCursors(cursors), mergeCtx));
-
     // First, check whether we can merge on the mongoS.
     if (pipelineForMerging->canRunOnMongos() && !internalQueryProhibitMergingOnMongoS.load()) {
         // Register the new mongoS cursor, and retrieve the initial batch of results.
@@ -604,6 +605,8 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     }
 
     // If we cannot merge on mongoS, establish the merge cursor on a shard.
+    pipelineForMerging->addInitialSource(
+        DocumentSourceMergeCursors::create(parseCursors(cursors), mergeCtx));
     auto mergeCmdObj = createCommandForMergingShard(request, mergeCtx, cmdObj, pipelineForMerging);
 
     auto mergeResponse = uassertStatusOK(establishMergingShardCursor(
@@ -675,7 +678,7 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
     }
     auto shard = std::move(swShard.getValue());
 
-    // Format the command for the shard. This adds the 'fromRouter' field, wraps the command as an
+    // Format the command for the shard. This adds the 'fromMongos' field, wraps the command as an
     // explain if necessary, and rewrites the result into a format safe to forward to shards.
     cmdObj = Command::filterCommandRequestForPassthrough(
         createCommandForTargetedShards(aggRequest, cmdObj, nullptr));

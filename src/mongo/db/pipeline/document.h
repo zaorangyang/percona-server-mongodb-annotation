@@ -90,6 +90,12 @@ public:
         const Document& rhs;
     };
 
+    static constexpr StringData metaFieldTextScore = "$textScore"_sd;
+    static constexpr StringData metaFieldRandVal = "$randVal"_sd;
+    static constexpr StringData metaFieldSortKey = "$sortKey"_sd;
+
+    static const std::vector<StringData> allMetadataFieldNames;
+
     /// Empty Document (does no allocation)
     Document() {}
 
@@ -202,7 +208,7 @@ public:
      * Like toBson, but includes metadata at the top-level.
      * Output is parseable by fromBsonWithMetaData
      */
-    BSONObj toBsonWithMetaData() const;
+    BSONObj toBsonWithMetaData(bool includeSortKey = true) const;
 
     /**
      * Like Document(BSONObj) but treats top-level fields with special names as metadata.
@@ -210,6 +216,12 @@ public:
      * with metaField.
      */
     static Document fromBsonWithMetaData(const BSONObj& bson);
+
+    /**
+     * Given a BSON object that may have metadata fields added as part of toBsonWithMetadata(),
+     * returns the same object without any of the metadata fields.
+     */
+    static BSONObj stripMetadataFields(const BSONObj& bsonWithMetadata);
 
     // Support BSONObjBuilder and BSONArrayBuilder "stream" API
     friend BSONObjBuilder& operator<<(BSONObjBuilderValueStream& builder, const Document& d);
@@ -233,7 +245,6 @@ public:
         return Document(storage().clone().get());
     }
 
-    static const StringData metaFieldTextScore;  // "$textScore"
     bool hasTextScore() const {
         return storage().hasTextScore();
     }
@@ -241,12 +252,18 @@ public:
         return storage().getTextScore();
     }
 
-    static const StringData metaFieldRandVal;  // "$randVal"
     bool hasRandMetaField() const {
         return storage().hasRandMetaField();
     }
     double getRandMetaField() const {
         return storage().getRandMetaField();
+    }
+
+    bool hasSortKeyMetaField() const {
+        return storage().hasSortKeyMetaField();
+    }
+    BSONObj getSortKeyMetaField() const {
+        return storage().getSortKeyMetaField();
     }
 
     /// members for Sorter
@@ -491,6 +508,10 @@ public:
 
     void setRandMetaField(double val) {
         storage().setRandMetaField(val);
+    }
+
+    void setSortKeyMetaField(BSONObj sortKey) {
+        storage().setSortKeyMetaField(sortKey);
     }
 
     /** Convert to a read-only document and release reference.

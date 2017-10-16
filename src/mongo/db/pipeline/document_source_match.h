@@ -156,15 +156,13 @@ protected:
                         const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
 private:
-    void addDependencies(DepsTracker* deps) const;
-
     std::unique_ptr<MatchExpression> _expression;
-
-    // Cache the dependencies so that we know what fields we need to serialize to BSON for matching.
-    DepsTracker _dependencies;
 
     BSONObj _predicate;
     const bool _isTextQuery;
+
+    // Cache the dependencies so that we know what fields we need to serialize to BSON for matching.
+    DepsTracker _dependencies;
 };
 
 }  // namespace mongo

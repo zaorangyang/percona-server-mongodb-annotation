@@ -33,6 +33,7 @@
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/service_context.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -66,8 +67,13 @@ public:
 
     /**
      * Combination of onDropCollection and onCreateCollection.
+     * 'getNewCollection' is a function that returns collection to be registered when the current
+     * write unit of work is committed.
      */
-    void onRenameCollection(OperationContext* opCtx, Collection* newColl, CollectionUUID uuid);
+    using GetNewCollectionFunction = stdx::function<Collection*()>;
+    void onRenameCollection(OperationContext* opCtx,
+                            GetNewCollectionFunction getNewCollection,
+                            CollectionUUID uuid);
 
     /**
      * Implies onDropCollection for all collections in db, but is not transactional.
@@ -90,8 +96,33 @@ public:
      */
     NamespaceString lookupNSSByUUID(CollectionUUID uuid) const;
 
+    /**
+     * Return the UUID lexicographically preceding `uuid` in the database named by `db`.
+     *
+     * Return `boost::none` if `uuid` is not found, or is the first UUID in that database.
+     */
+    boost::optional<CollectionUUID> prev(const StringData& db, CollectionUUID uuid);
+
+    /**
+     * Return the UUID lexicographically following `uuid` in the database named by `db`.
+     *
+     * Return `boost::none` if `uuid` is not found, or is the last UUID in that database.
+     */
+    boost::optional<CollectionUUID> next(const StringData& db, CollectionUUID uuid);
+
 private:
+    const std::vector<CollectionUUID>& _getOrdering_inlock(const StringData& db,
+                                                           const stdx::lock_guard<stdx::mutex>&);
+
     mutable mongo::stdx::mutex _catalogLock;
+
+    /**
+     * Map from database names to ordered `vector`s of their UUIDs.
+     *
+     * Works as a cache of such orderings: every ordering in this map is guaranteed to be valid, but
+     * not all databases are guaranteed to have an ordering in it.
+     */
+    StringMap<std::vector<CollectionUUID>> _orderedCollections;
     mongo::stdx::unordered_map<CollectionUUID, Collection*, CollectionUUID::Hash> _catalog;
 };
 

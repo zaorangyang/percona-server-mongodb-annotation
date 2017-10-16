@@ -29,9 +29,12 @@
 #include "mongo/platform/basic.h"
 
 #include <set>
+#include <string>
+#include <vector>
 
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/catalog/index_create.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -49,9 +52,11 @@
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/stringutils.h"
 
 namespace {
 
@@ -64,41 +69,121 @@ using namespace mongo;
  */
 class OpObserverMock : public OpObserverNoop {
 public:
-    void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override;
+    void onCreateIndex(OperationContext* opCtx,
+                       const NamespaceString& nss,
+                       OptionalCollectionUUID uuid,
+                       BSONObj indexDoc,
+                       bool fromMigrate) override;
+
+    void onInserts(OperationContext* opCtx,
+                   const NamespaceString& nss,
+                   OptionalCollectionUUID uuid,
+                   std::vector<InsertStatement>::const_iterator begin,
+                   std::vector<InsertStatement>::const_iterator end,
+                   bool fromMigrate) override;
+
+    void onCreateCollection(OperationContext* opCtx,
+                            Collection* coll,
+                            const NamespaceString& collectionName,
+                            const CollectionOptions& options,
+                            const BSONObj& idIndex) override;
+
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid) override;
 
-    std::set<std::string> droppedDatabaseNames;
-    std::set<NamespaceString> droppedCollectionNames;
-    Database* db = nullptr;
-    bool onDropCollectionThrowsException = false;
+    repl::OpTime onRenameCollection(OperationContext* opCtx,
+                                    const NamespaceString& fromCollection,
+                                    const NamespaceString& toCollection,
+                                    OptionalCollectionUUID uuid,
+                                    bool dropTarget,
+                                    OptionalCollectionUUID dropTargetUUID,
+                                    bool stayTemp) override;
+
+    // Operations written to the oplog. These are operations for which
+    // ReplicationCoordinator::isOplogDisabled() returns false.
+    std::vector<std::string> oplogEntries;
+
+    bool onInsertsThrows = false;
+    bool onInsertsIsGlobalWriteLockExclusive = false;
+
+    bool onRenameCollectionCalled = false;
+    repl::OpTime renameOpTime = {Timestamp(Seconds(100), 1U), 1LL};
+
+private:
+    /**
+     * Pushes 'operationName' into 'oplogEntries' if we can write to the oplog for this namespace.
+     */
+    void _logOp(OperationContext* opCtx,
+                const NamespaceString& nss,
+                const std::string& operationName);
 };
 
-void OpObserverMock::onDropDatabase(OperationContext* opCtx, const std::string& dbName) {
-    ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
-    OpObserverNoop::onDropDatabase(opCtx, dbName);
-    // Do not update 'droppedDatabaseNames' if OpObserverNoop::onDropDatabase() throws.
-    droppedDatabaseNames.insert(dbName);
+void OpObserverMock::onCreateIndex(OperationContext* opCtx,
+                                   const NamespaceString& nss,
+                                   OptionalCollectionUUID uuid,
+                                   BSONObj indexDoc,
+                                   bool fromMigrate) {
+    _logOp(opCtx, nss, "index");
+    OpObserverNoop::onCreateIndex(opCtx, nss, uuid, indexDoc, fromMigrate);
+}
+
+void OpObserverMock::onInserts(OperationContext* opCtx,
+                               const NamespaceString& nss,
+                               OptionalCollectionUUID uuid,
+                               std::vector<InsertStatement>::const_iterator begin,
+                               std::vector<InsertStatement>::const_iterator end,
+                               bool fromMigrate) {
+    if (onInsertsThrows) {
+        uasserted(ErrorCodes::OperationFailed, "insert failed");
+    }
+
+    // Check global lock state.
+    auto lockState = opCtx->lockState();
+    ASSERT_TRUE(lockState->isWriteLocked());
+    onInsertsIsGlobalWriteLockExclusive = lockState->isW();
+
+    _logOp(opCtx, nss, "inserts");
+    OpObserverNoop::onInserts(opCtx, nss, uuid, begin, end, fromMigrate);
+}
+
+void OpObserverMock::onCreateCollection(OperationContext* opCtx,
+                                        Collection* coll,
+                                        const NamespaceString& collectionName,
+                                        const CollectionOptions& options,
+                                        const BSONObj& idIndex) {
+    _logOp(opCtx, collectionName, "create");
+    OpObserverNoop::onCreateCollection(opCtx, coll, collectionName, options, idIndex);
 }
 
 repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
                                               const NamespaceString& collectionName,
                                               OptionalCollectionUUID uuid) {
-    ASSERT_TRUE(opCtx->lockState()->inAWriteUnitOfWork());
-    auto opTime = OpObserverNoop::onDropCollection(opCtx, collectionName, uuid);
-    // Do not update 'droppedCollectionNames' if OpObserverNoop::onDropCollection() throws.
-    droppedCollectionNames.insert(collectionName);
+    _logOp(opCtx, collectionName, "drop");
+    return OpObserverNoop::onDropCollection(opCtx, collectionName, uuid);
+}
 
-    // Check drop-pending flag in Database if provided.
-    if (db) {
-        ASSERT_TRUE(db->isDropPending(opCtx));
+repl::OpTime OpObserverMock::onRenameCollection(OperationContext* opCtx,
+                                                const NamespaceString& fromCollection,
+                                                const NamespaceString& toCollection,
+                                                OptionalCollectionUUID uuid,
+                                                bool dropTarget,
+                                                OptionalCollectionUUID dropTargetUUID,
+                                                bool stayTemp) {
+    _logOp(opCtx, fromCollection, "rename");
+    OpObserverNoop::onRenameCollection(
+        opCtx, fromCollection, toCollection, uuid, dropTarget, dropTargetUUID, stayTemp);
+    onRenameCollectionCalled = true;
+    return renameOpTime;
+}
+
+void OpObserverMock::_logOp(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            const std::string& operationName) {
+    if (repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, nss)) {
+        return;
     }
-
-    uassert(
-        ErrorCodes::OperationFailed, "onDropCollection() failed", !onDropCollectionThrowsException);
-
-    return opTime;
+    oplogEntries.push_back(operationName);
 }
 
 class RenameCollectionTest : public ServiceContextMongoDTest {
@@ -115,6 +200,7 @@ protected:
     OpObserverMock* _opObserver = nullptr;
     NamespaceString _sourceNss;
     NamespaceString _targetNss;
+    NamespaceString _targetNssDifferentDb;
 };
 
 // static
@@ -151,6 +237,7 @@ void RenameCollectionTest::setUp() {
 
     _sourceNss = NamespaceString("test.foo");
     _targetNss = NamespaceString("test.bar");
+    _targetNssDifferentDb = NamespaceString("test2.bar");
 }
 
 void RenameCollectionTest::tearDown() {
@@ -189,10 +276,40 @@ void _createCollection(OperationContext* opCtx,
 }
 
 /**
+ * Returns a collection options with a generated UUID.
+ */
+CollectionOptions _makeCollectionOptionsWithUuid() {
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    return options;
+}
+
+/**
  * Returns true if collection exists.
  */
 bool _collectionExists(OperationContext* opCtx, const NamespaceString& nss) {
     return AutoGetCollectionForRead(opCtx, nss).getCollection() != nullptr;
+}
+
+/**
+ * Returns collection options.
+ */
+CollectionOptions _getCollectionOptions(OperationContext* opCtx, const NamespaceString& nss) {
+    AutoGetCollectionForRead autoColl(opCtx, nss);
+    auto collection = autoColl.getCollection();
+    ASSERT_TRUE(collection) << "Unable to get collections options for " << nss
+                            << " because collection does not exist.";
+    auto catalogEntry = collection->getCatalogEntry();
+    return catalogEntry->getCollectionOptions(opCtx);
+}
+
+/**
+ * Returns UUID of collection.
+ */
+CollectionUUID _getCollectionUuid(OperationContext* opCtx, const NamespaceString& nss) {
+    auto options = _getCollectionOptions(opCtx, nss);
+    ASSERT_TRUE(options.uuid);
+    return *(options.uuid);
 }
 
 /**
@@ -209,15 +326,49 @@ bool _isTempCollection(OperationContext* opCtx, const NamespaceString& nss) {
 }
 
 /**
- * Creates a temporary collection.
+ * Creates an index using the given index name with a bogus key spec.
  */
-void _createTempCollection(OperationContext* opCtx, const NamespaceString& nss) {
-    CollectionOptions options;
-    options.temp = true;
-    _createCollection(opCtx, nss, options);
-    ASSERT_TRUE(_isTempCollection(opCtx, nss)) << "Created collection " << nss
-                                               << " but collection is not temporary per options "
-                                               << options.toBSON();
+void _createIndex(OperationContext* opCtx,
+                  const NamespaceString& nss,
+                  const std::string& indexName) {
+    writeConflictRetry(opCtx, "_createIndex", nss.ns(), [=] {
+        AutoGetCollection autoColl(opCtx, nss, MODE_X);
+        auto collection = autoColl.getCollection();
+        ASSERT_TRUE(collection) << "Cannot create index in collection " << nss
+                                << " because collection " << nss.ns() << " does not exist.";
+
+        auto indexInfoObj = BSON(
+            "v" << int(IndexDescriptor::kLatestIndexVersion) << "key" << BSON("a" << 1) << "name"
+                << indexName
+                << "ns"
+                << nss.ns());
+
+        MultiIndexBlock indexer(opCtx, collection);
+        ASSERT_OK(indexer.init(indexInfoObj).getStatus());
+        WriteUnitOfWork wuow(opCtx);
+        indexer.commit();
+        wuow.commit();
+    });
+
+    ASSERT_TRUE(AutoGetCollectionForRead(opCtx, nss).getCollection());
+}
+
+/**
+ * Inserts a single document into a collection.
+ */
+void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const BSONObj& doc) {
+    writeConflictRetry(opCtx, "_insertDocument", nss.ns(), [=] {
+        AutoGetCollection autoColl(opCtx, nss, MODE_X);
+        auto collection = autoColl.getCollection();
+        ASSERT_TRUE(collection) << "Cannot insert document " << doc << " into collection " << nss
+                                << " because collection " << nss.ns() << " does not exist.";
+
+        WriteUnitOfWork wuow(opCtx);
+        OpDebug* const opDebug = nullptr;
+        bool enforceQuota = true;
+        ASSERT_OK(collection->insertDocument(opCtx, InsertStatement(doc), opDebug, enforceQuota));
+        wuow.commit();
+    });
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionReturnsNamespaceNotFoundIfDatabaseDoesNotExist) {
@@ -235,6 +386,69 @@ TEST_F(RenameCollectionTest, RenameCollectionReturnsNotMasterIfNotPrimary) {
                   renameCollection(_opCtx.get(), _sourceNss, _targetNss, {}));
 }
 
+TEST_F(RenameCollectionTest, IndexNameTooLongForTargetCollection) {
+    ASSERT_GREATER_THAN(_targetNssDifferentDb.size(), _sourceNss.size());
+    std::size_t longestIndexNameAllowedForSource =
+        NamespaceString::MaxNsLen - 2U /*strlen(".$")*/ - _sourceNss.size();
+    ASSERT_OK(_sourceNss.checkLengthForRename(longestIndexNameAllowedForSource));
+    ASSERT_EQUALS(ErrorCodes::InvalidLength,
+                  _targetNssDifferentDb.checkLengthForRename(longestIndexNameAllowedForSource));
+
+    _createCollection(_opCtx.get(), _sourceNss);
+    const std::string indexName(longestIndexNameAllowedForSource, 'a');
+    _createIndex(_opCtx.get(), _sourceNss, indexName);
+    ASSERT_EQUALS(ErrorCodes::InvalidLength,
+                  renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
+}
+
+TEST_F(RenameCollectionTest, IndexNameTooLongForTemporaryCollectionForRenameAcrossDatabase) {
+    ASSERT_GREATER_THAN(_targetNssDifferentDb.size(), _sourceNss.size());
+    std::size_t longestIndexNameAllowedForTarget =
+        NamespaceString::MaxNsLen - 2U /*strlen(".$")*/ - _targetNssDifferentDb.size();
+    ASSERT_OK(_sourceNss.checkLengthForRename(longestIndexNameAllowedForTarget));
+    ASSERT_OK(_targetNssDifferentDb.checkLengthForRename(longestIndexNameAllowedForTarget));
+
+    // Using XXXXX to check namespace length. Each 'X' will be replaced by a random character in
+    // renameCollection().
+    const NamespaceString tempNss(_targetNssDifferentDb.getSisterNS("tmpXXXXX.renameCollection"));
+    ASSERT_EQUALS(ErrorCodes::InvalidLength,
+                  tempNss.checkLengthForRename(longestIndexNameAllowedForTarget));
+
+    _createCollection(_opCtx.get(), _sourceNss);
+    const std::string indexName(longestIndexNameAllowedForTarget, 'a');
+    _createIndex(_opCtx.get(), _sourceNss, indexName);
+    ASSERT_EQUALS(ErrorCodes::InvalidLength,
+                  renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseWithoutUuid) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss));
+    ASSERT_FALSE(_getCollectionOptions(_opCtx.get(), _targetNssDifferentDb).uuid);
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseWithUuid) {
+    auto options = _makeCollectionOptionsWithUuid();
+    _createCollection(_opCtx.get(), _sourceNss, options);
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss));
+    ASSERT_NOT_EQUALS(options.uuid, _getCollectionUuid(_opCtx.get(), _targetNssDifferentDb));
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsAcrossDatabaseWithTargetUuid) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    auto dbName = _sourceNss.db().toString();
+    auto uuid = UUID::gen();
+    auto uuidDoc = BSON("ui" << uuid);
+    auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNssDifferentDb.ns()
+                                       << "dropTarget"
+                                       << true);
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, uuidDoc["ui"], cmd, {}));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss));
+    ASSERT_EQUALS(uuid, _getCollectionUuid(_opCtx.get(), _targetNssDifferentDb));
+}
+
 TEST_F(RenameCollectionTest,
        RenameCollectionReturnsNamespaceExitsIfTargetExistsAndDropTargetIsFalse) {
     _createCollection(_opCtx.get(), _sourceNss);
@@ -245,8 +459,7 @@ TEST_F(RenameCollectionTest,
                   renameCollection(_opCtx.get(), _sourceNss, _targetNss, options));
 }
 
-TEST_F(RenameCollectionTest,
-       RenameCollectionDropsTargetCollectionIfTargetCollectionExistsAndDropTargetIsTrue) {
+TEST_F(RenameCollectionTest, RenameCollectionMakesTargetCollectionDropPendingIfDropTargetIsTrue) {
     _createCollection(_opCtx.get(), _sourceNss);
     _createCollection(_opCtx.get(), _targetNss);
     RenameCollectionOptions options;
@@ -256,30 +469,320 @@ TEST_F(RenameCollectionTest,
         << "source collection " << _sourceNss << " still exists after successful rename";
     ASSERT_TRUE(_collectionExists(_opCtx.get(), _targetNss)) << "target collection " << _targetNss
                                                              << " missing after successful rename";
+
+    ASSERT_TRUE(_opObserver->onRenameCollectionCalled);
+
+    auto renameOpTime = _opObserver->renameOpTime;
+    ASSERT_GREATER_THAN(renameOpTime, repl::OpTime());
+
+    // Confirm that the target collection has been renamed to a drop-pending collection.
+    auto dpns = _targetNss.makeDropPendingNamespace(renameOpTime);
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), dpns))
+        << "target collection " << _targetNss
+        << " not renamed to drop-pending collection after successful rename";
 }
 
-TEST_F(RenameCollectionTest, RenameCollectionMakesTargetNonTemporaryIfStayTempIsFalse) {
-    _createTempCollection(_opCtx.get(), _sourceNss);
+/**
+ * Sets up ReplicationCoordinator for master/slave.
+ */
+void _setUpMasterSlave(ServiceContext* service) {
+    repl::ReplSettings settings;
+    settings.setOplogSizeBytes(10 * 1024 * 1024);
+    settings.setMaster(true);
+    repl::ReplicationCoordinator::set(
+        service, stdx::make_unique<repl::ReplicationCoordinatorMock>(service, settings));
+    auto replCoord = repl::ReplicationCoordinator::get(service);
+    ASSERT_TRUE(repl::ReplicationCoordinator::modeMasterSlave == replCoord->getReplicationMode());
+}
+
+TEST_F(RenameCollectionTest,
+       RenameCollectionDropsTargetCollectionIfDropTargetIsTrueAndReplModeIsMasterSlave) {
+    _setUpMasterSlave(getServiceContext());
+
+    _createCollection(_opCtx.get(), _sourceNss);
+    _createCollection(_opCtx.get(), _targetNss);
     RenameCollectionOptions options;
-    ASSERT_FALSE(options.stayTemp);
+    options.dropTarget = true;
     ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNss, options));
     ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss))
         << "source collection " << _sourceNss << " still exists after successful rename";
-    ASSERT_FALSE(_isTempCollection(_opCtx.get(), _targetNss))
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), _targetNss)) << "target collection " << _targetNss
+                                                             << " missing after successful rename";
+
+    ASSERT_TRUE(_opObserver->onRenameCollectionCalled);
+
+    auto renameOpTime = _opObserver->renameOpTime;
+    ASSERT_GREATER_THAN(renameOpTime, repl::OpTime());
+
+    // Confirm that the target collection is not renamed to a drop-pending collection under
+    // master/slave.
+    auto dpns = _targetNss.makeDropPendingNamespace(renameOpTime);
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), dpns))
         << "target collection " << _targetNss
-        << " is still temporary after rename with stayTemp set to false.";
+        << " renamed to drop-pending collection after successful rename";
 }
 
-TEST_F(RenameCollectionTest, RenameCollectionKeepsTargetAsTemporaryIfStayTempIsTrue) {
-    _createTempCollection(_opCtx.get(), _sourceNss);
-    RenameCollectionOptions options;
-    options.stayTemp = true;
-    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNss, options));
-    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss))
-        << "source collection " << _sourceNss << " still exists after successful rename";
-    ASSERT_TRUE(_isTempCollection(_opCtx.get(), _targetNss))
+TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsRejectsRenameOpTimeIfWritesAreReplicated) {
+    ASSERT_TRUE(_opCtx->writesAreReplicated());
+
+    _createCollection(_opCtx.get(), _sourceNss);
+    auto dbName = _sourceNss.db().toString();
+    auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNss.ns());
+    auto renameOpTime = _opObserver->renameOpTime;
+    ASSERT_EQUALS(ErrorCodes::BadValue,
+                  renameCollectionForApplyOps(_opCtx.get(), dbName, {}, cmd, renameOpTime));
+}
+
+TEST_F(RenameCollectionTest,
+       RenameCollectionForApplyOpsMakesTargetCollectionDropPendingIfDropTargetIsTrue) {
+    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
+    ASSERT_FALSE(_opCtx->writesAreReplicated());
+
+    // OpObserver::onRenameCollection() must return a null OpTime when writes are not replicated.
+    _opObserver->renameOpTime = {};
+
+    _createCollection(_opCtx.get(), _sourceNss);
+    _createCollection(_opCtx.get(), _targetNss);
+    auto dbName = _sourceNss.db().toString();
+    auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNss.ns() << "dropTarget"
+                                       << true);
+
+    repl::OpTime renameOpTime = {Timestamp(Seconds(200), 1U), 1LL};
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, {}, cmd, renameOpTime));
+
+    // Confirm that the target collection has been renamed to a drop-pending collection.
+    auto dpns = _targetNss.makeDropPendingNamespace(renameOpTime);
+    ASSERT_TRUE(_collectionExists(_opCtx.get(), dpns))
         << "target collection " << _targetNss
-        << " is no longer temporary after rename with stayTemp set to true.";
+        << " not renamed to drop-pending collection after successful rename for applyOps";
+}
+
+DEATH_TEST_F(RenameCollectionTest,
+             RenameCollectionForApplyOpsTriggersFatalAssertionIfLogOpReturnsValidOpTime,
+             "unexpected renameCollection oplog entry written to the oplog with optime") {
+    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
+    ASSERT_FALSE(_opCtx->writesAreReplicated());
+
+    _createCollection(_opCtx.get(), _sourceNss);
+    _createCollection(_opCtx.get(), _targetNss);
+    auto dbName = _sourceNss.db().toString();
+    auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNss.ns() << "dropTarget"
+                                       << true);
+
+    repl::OpTime renameOpTime = {Timestamp(Seconds(200), 1U), 1LL};
+    ASSERT_OK(renameCollectionForApplyOps(_opCtx.get(), dbName, {}, cmd, renameOpTime));
+}
+
+void _testRenameCollectionStayTemp(OperationContext* opCtx,
+                                   const NamespaceString& sourceNss,
+                                   const NamespaceString& targetNss,
+                                   bool stayTemp,
+                                   bool isSourceCollectionTemporary) {
+    CollectionOptions collectionOptions;
+    collectionOptions.temp = isSourceCollectionTemporary;
+    _createCollection(opCtx, sourceNss, collectionOptions);
+
+    RenameCollectionOptions options;
+    options.stayTemp = stayTemp;
+    ASSERT_OK(renameCollection(opCtx, sourceNss, targetNss, options));
+    ASSERT_FALSE(_collectionExists(opCtx, sourceNss)) << "source collection " << sourceNss
+                                                      << " still exists after successful rename";
+
+    if (!isSourceCollectionTemporary) {
+        ASSERT_FALSE(_isTempCollection(opCtx, targetNss))
+            << "target collection " << targetNss
+            << " cannot not be temporary after rename if source collection is not temporary.";
+    } else if (stayTemp) {
+        ASSERT_TRUE(_isTempCollection(opCtx, targetNss))
+            << "target collection " << targetNss
+            << " is no longer temporary after rename with stayTemp set to true.";
+    } else {
+        ASSERT_FALSE(_isTempCollection(opCtx, targetNss))
+            << "target collection " << targetNss
+            << " still temporary after rename with stayTemp set to false.";
+    }
+}
+
+TEST_F(RenameCollectionTest, RenameSameDatabaseStayTempFalse) {
+    _testRenameCollectionStayTemp(_opCtx.get(), _sourceNss, _targetNss, false, true);
+}
+
+TEST_F(RenameCollectionTest, RenameSameDatabaseStayTempTrue) {
+    _testRenameCollectionStayTemp(_opCtx.get(), _sourceNss, _targetNss, true, true);
+}
+
+TEST_F(RenameCollectionTest, RenameDifferentDatabaseStayTempFalse) {
+    _testRenameCollectionStayTemp(_opCtx.get(), _sourceNss, _targetNssDifferentDb, false, true);
+}
+
+TEST_F(RenameCollectionTest, RenameDifferentDatabaseStayTempTrue) {
+    _testRenameCollectionStayTemp(_opCtx.get(), _sourceNss, _targetNssDifferentDb, true, true);
+}
+
+TEST_F(RenameCollectionTest, RenameSameDatabaseStayTempFalseSourceNotTemporary) {
+    _testRenameCollectionStayTemp(_opCtx.get(), _sourceNss, _targetNss, false, false);
+}
+
+TEST_F(RenameCollectionTest, RenameSameDatabaseStayTempTrueSourceNotTemporary) {
+    _testRenameCollectionStayTemp(_opCtx.get(), _sourceNss, _targetNss, true, false);
+}
+
+TEST_F(RenameCollectionTest, RenameDifferentDatabaseStayTempFalseSourceNotTemporary) {
+    _testRenameCollectionStayTemp(_opCtx.get(), _sourceNss, _targetNssDifferentDb, false, false);
+}
+
+TEST_F(RenameCollectionTest, RenameDifferentDatabaseStayTempTrueSourceNotTemporary) {
+    _testRenameCollectionStayTemp(_opCtx.get(), _sourceNss, _targetNssDifferentDb, true, false);
+}
+
+/**
+ * Checks oplog entries written by the OpObserver to the oplog.
+ */
+void _checkOplogEntries(const std::vector<std::string>& actualOplogEntries,
+                        const std::vector<std::string>& expectedOplogEntries) {
+    std::string actualOplogEntriesStr;
+    joinStringDelim(actualOplogEntries, &actualOplogEntriesStr, ',');
+    std::string expectedOplogEntriesStr;
+    joinStringDelim(expectedOplogEntries, &expectedOplogEntriesStr, ',');
+    ASSERT_EQUALS(expectedOplogEntries.size(), actualOplogEntries.size())
+        << str::stream()
+        << "Incorrect number of oplog entries written to oplog. Actual: " << actualOplogEntriesStr
+        << ". Expected: " << expectedOplogEntriesStr;
+    std::vector<std::string>::size_type i = 0;
+    for (const auto& actualOplogEntry : actualOplogEntries) {
+        const auto& expectedOplogEntry = expectedOplogEntries[i++];
+        ASSERT_EQUALS(expectedOplogEntry, actualOplogEntry)
+            << str::stream() << "Mismatch in oplog entry at index " << i
+            << ". Actual: " << actualOplogEntriesStr << ". Expected: " << expectedOplogEntriesStr;
+    }
+}
+
+/**
+ * Runs a rename across database operation and checks oplog entries writtent to the oplog.
+ */
+void _testRenameCollectionAcrossDatabaseOplogEntries(
+    OperationContext* opCtx,
+    const NamespaceString& sourceNss,
+    const NamespaceString& targetNss,
+    std::vector<std::string>* oplogEntries,
+    bool forApplyOps,
+    const std::vector<std::string>& expectedOplogEntries) {
+    ASSERT_NOT_EQUALS(sourceNss.db(), targetNss.db());
+    _createCollection(opCtx, sourceNss);
+    _createIndex(opCtx, sourceNss, "a_1");
+    _insertDocument(opCtx, sourceNss, BSON("_id" << 0));
+    oplogEntries->clear();
+    if (forApplyOps) {
+        auto cmd = BSON(
+            "renameCollection" << sourceNss.ns() << "to" << targetNss.ns() << "dropTarget" << true);
+        ASSERT_OK(renameCollectionForApplyOps(opCtx, sourceNss.db().toString(), {}, cmd, {}));
+    } else {
+        RenameCollectionOptions options;
+        options.dropTarget = true;
+        ASSERT_OK(renameCollection(opCtx, sourceNss, targetNss, options));
+    }
+    _checkOplogEntries(*oplogEntries, expectedOplogEntries);
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseOplogEntries) {
+    bool forApplyOps = false;
+    _testRenameCollectionAcrossDatabaseOplogEntries(
+        _opCtx.get(),
+        _sourceNss,
+        _targetNssDifferentDb,
+        &_opObserver->oplogEntries,
+        forApplyOps,
+        {"create", "index", "inserts", "rename", "drop"});
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsAcrossDatabaseOplogEntries) {
+    bool forApplyOps = true;
+    _testRenameCollectionAcrossDatabaseOplogEntries(
+        _opCtx.get(),
+        _sourceNss,
+        _targetNssDifferentDb,
+        &_opObserver->oplogEntries,
+        forApplyOps,
+        {"create", "index", "inserts", "rename", "drop"});
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseOplogEntriesDropTarget) {
+    _createCollection(_opCtx.get(), _targetNssDifferentDb);
+    bool forApplyOps = false;
+    _testRenameCollectionAcrossDatabaseOplogEntries(
+        _opCtx.get(),
+        _sourceNss,
+        _targetNssDifferentDb,
+        &_opObserver->oplogEntries,
+        forApplyOps,
+        {"create", "index", "inserts", "rename", "drop"});
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionForApplyOpsAcrossDatabaseOplogEntriesDropTarget) {
+    _createCollection(_opCtx.get(), _targetNssDifferentDb);
+    bool forApplyOps = true;
+    _testRenameCollectionAcrossDatabaseOplogEntries(
+        _opCtx.get(),
+        _sourceNss,
+        _targetNssDifferentDb,
+        &_opObserver->oplogEntries,
+        forApplyOps,
+        {"create", "index", "inserts", "rename", "drop"});
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseOplogEntriesWritesNotReplicated) {
+    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
+    bool forApplyOps = false;
+    _testRenameCollectionAcrossDatabaseOplogEntries(_opCtx.get(),
+                                                    _sourceNss,
+                                                    _targetNssDifferentDb,
+                                                    &_opObserver->oplogEntries,
+                                                    forApplyOps,
+                                                    {});
+}
+
+TEST_F(RenameCollectionTest,
+       RenameCollectionForApplyOpsAcrossDatabaseOplogEntriesWritesNotReplicated) {
+    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
+    bool forApplyOps = true;
+    _testRenameCollectionAcrossDatabaseOplogEntries(_opCtx.get(),
+                                                    _sourceNss,
+                                                    _targetNssDifferentDb,
+                                                    &_opObserver->oplogEntries,
+                                                    forApplyOps,
+                                                    {});
+}
+
+TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseDropsTemporaryCollectionOnException) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    _createIndex(_opCtx.get(), _sourceNss, "a_1");
+    _insertDocument(_opCtx.get(), _sourceNss, BSON("_id" << 0));
+    _opObserver->onInsertsThrows = true;
+    _opObserver->oplogEntries.clear();
+    ASSERT_THROWS_CODE(
+        renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}).ignore(),
+        AssertionException,
+        ErrorCodes::OperationFailed);
+    _checkOplogEntries(_opObserver->oplogEntries, {"create", "index", "drop"});
+}
+
+TEST_F(RenameCollectionTest,
+       RenameCollectionAcrossDatabaseDowngradesGlobalWriteLockToNonExclusive) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    _insertDocument(_opCtx.get(), _sourceNss, BSON("_id" << 0));
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
+    ASSERT_FALSE(_opObserver->onInsertsIsGlobalWriteLockExclusive);
+}
+
+TEST_F(RenameCollectionTest,
+       RenameCollectionAcrossDatabaseKeepsGlobalWriteLockExclusiveIfCallerHasGlobalWriteLock) {
+    // This simulates the case when renameCollection is called using the applyOps command (different
+    // from secondary oplog application).
+    _createCollection(_opCtx.get(), _sourceNss);
+    _insertDocument(_opCtx.get(), _sourceNss, BSON("_id" << 0));
+    Lock::GlobalWrite globalWrite(_opCtx.get());
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
+    ASSERT_TRUE(_opObserver->onInsertsIsGlobalWriteLockExclusive);
 }
 
 }  // namespace

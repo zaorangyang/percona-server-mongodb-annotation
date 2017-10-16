@@ -31,7 +31,10 @@
 
 #include "mongo/platform/basic.h"
 
+#include <algorithm>
+
 #include "mongo/base/checked_cast.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
@@ -53,7 +56,7 @@ Status WiredTigerSnapshotManager::createSnapshot(OperationContext* opCtx,
     return wtRCToStatus(session->snapshot(session, config.c_str()));
 }
 
-void WiredTigerSnapshotManager::setCommittedSnapshot(const SnapshotName& name) {
+void WiredTigerSnapshotManager::setCommittedSnapshot(const SnapshotName& name, Timestamp ts) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
     invariant(!_committedSnapshot || *_committedSnapshot <= name);
@@ -74,6 +77,7 @@ void WiredTigerSnapshotManager::cleanupUnneededSnapshots() {
 void WiredTigerSnapshotManager::dropAllSnapshots() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     _committedSnapshot = boost::none;
+
     invariantWTOK(_session->snapshot(_session, "drop=(all)"));
 }
 
@@ -104,6 +108,30 @@ SnapshotName WiredTigerSnapshotManager::beginTransactionOnCommittedSnapshot(
     invariantWTOK(session->begin_transaction(session, config.str().c_str()));
 
     return *_committedSnapshot;
+}
+
+void WiredTigerSnapshotManager::beginTransactionOnOplog(WiredTigerOplogManager* oplogManager,
+                                                        WT_SESSION* session) const {
+    size_t retries = 1000;
+    int status;
+    do {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        auto allCommittedTimestamp = oplogManager->getOplogReadTimestamp();
+        char readTSConfigString[15 /* read_timestamp= */ + (8 * 2) /* 16 hexadecimal digits */ +
+                                1 /* trailing null */];
+        auto size = std::snprintf(readTSConfigString,
+                                  sizeof(readTSConfigString),
+                                  "read_timestamp=%llx",
+                                  static_cast<unsigned long long>(allCommittedTimestamp));
+        invariant(static_cast<std::size_t>(size) < sizeof(readTSConfigString));
+
+        status = session->begin_transaction(session, readTSConfigString);
+
+        // If begin_transaction returns EINVAL, we will assume it is due to the oldest_timestamp
+        // racing ahead of the read_timestamp.  Rather than synchronizing for this rare case,
+        // we will retry a number of times before giving up.
+    } while (status == EINVAL && --retries > 0);
+    invariantWTOK(status);
 }
 
 }  // namespace mongo

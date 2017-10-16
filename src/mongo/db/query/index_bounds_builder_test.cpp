@@ -35,7 +35,6 @@
 
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/query/expression_index.h"
 #include "mongo/unittest/unittest.h"
@@ -60,8 +59,7 @@ double NaN = numeric_limits<double>::quiet_NaN();
  */
 MatchExpression* parseMatchExpression(const BSONObj& obj) {
     const CollatorInterface* collator = nullptr;
-    StatusWithMatchExpression status =
-        MatchExpressionParser::parse(obj, ExtensionsCallbackDisallowExtensions(), collator);
+    StatusWithMatchExpression status = MatchExpressionParser::parse(obj, collator);
     ASSERT_TRUE(status.isOK());
     MatchExpression* expr(status.getValue().release());
     return expr;
@@ -2153,6 +2151,61 @@ TEST(IndexBoundsBuilderTest, InWithStringAgainstHashedIndexWithCollatorUsesHashO
     ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
                   oil.intervals[0].compare(Interval(intervalObj, true, true)));
     ASSERT_EQUALS(tightness, IndexBoundsBuilder::INEXACT_FETCH);
+}
+
+TEST(IndexBoundsBuilderTest, TypeArrayWithAdditionalTypesHasOpenBounds) {
+    IndexEntry testIndex = IndexEntry(BSONObj());
+    BSONObj obj = fromjson("{a: {$type: ['array', 'long']}}");
+    unique_ptr<MatchExpression> expr(parseMatchExpression(obj));
+    BSONElement elt = obj.firstElement();
+
+    OrderedIntervalList oil;
+    IndexBoundsBuilder::BoundsTightness tightness;
+    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+
+    ASSERT_EQUALS(oil.name, "a");
+    ASSERT_EQUALS(oil.intervals.size(), 1U);
+    ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
+                  oil.intervals[0].compare(IndexBoundsBuilder::allValues()));
+    ASSERT(tightness == IndexBoundsBuilder::INEXACT_FETCH);
+}
+
+TEST(IndexBoundsBuilderTest, TypeStringOrNumberHasCorrectBounds) {
+    IndexEntry testIndex = IndexEntry(BSONObj());
+    BSONObj obj = fromjson("{a: {$type: ['string', 'number']}}");
+    unique_ptr<MatchExpression> expr(parseMatchExpression(obj));
+    BSONElement elt = obj.firstElement();
+
+    OrderedIntervalList oil;
+    IndexBoundsBuilder::BoundsTightness tightness;
+    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+
+    ASSERT_EQUALS(oil.name, "a");
+    ASSERT_EQUALS(oil.intervals.size(), 2U);
+    ASSERT_EQUALS(
+        Interval::INTERVAL_EQUALS,
+        oil.intervals[0].compare(Interval(fromjson("{'': NaN, '': Infinity}"), true, true)));
+    ASSERT_EQUALS(Interval::INTERVAL_EQUALS,
+                  oil.intervals[1].compare(Interval(fromjson("{'': '', '': {}}"), true, true)));
+    ASSERT(tightness == IndexBoundsBuilder::INEXACT_FETCH);
+}
+
+TEST(IndexBoundsBuilderTest, RedundantTypeNumberHasCorrectBounds) {
+    IndexEntry testIndex = IndexEntry(BSONObj());
+    BSONObj obj = fromjson("{a: {$type: ['number', 'int', 'long', 'double']}}");
+    unique_ptr<MatchExpression> expr(parseMatchExpression(obj));
+    BSONElement elt = obj.firstElement();
+
+    OrderedIntervalList oil;
+    IndexBoundsBuilder::BoundsTightness tightness;
+    IndexBoundsBuilder::translate(expr.get(), elt, testIndex, &oil, &tightness);
+
+    ASSERT_EQUALS(oil.name, "a");
+    ASSERT_EQUALS(oil.intervals.size(), 1U);
+    ASSERT_EQUALS(
+        Interval::INTERVAL_EQUALS,
+        oil.intervals[0].compare(Interval(fromjson("{'': NaN, '': Infinity}"), true, true)));
+    ASSERT(tightness == IndexBoundsBuilder::INEXACT_FETCH);
 }
 
 }  // namespace

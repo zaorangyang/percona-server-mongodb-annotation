@@ -353,9 +353,20 @@ BSONObj OplogFetcher::_makeFindCommandObject(const NamespaceString& nss,
     cmdBob.append("maxTimeMS",
                   durationCount<Milliseconds>(AbstractOplogFetcher::kOplogInitialFindMaxTime));
     cmdBob.append("batchSize", _batchSize);
+
     if (term != OpTime::kUninitializedTerm) {
         cmdBob.append("term", term);
     }
+
+    // TODO(SERVER-30977): Remove the term comparison when this ticket is fixed.
+    if (term == lastOpTimeFetched.getTerm()) {
+        cmdBob.append("readConcern",
+                      serverGlobalParams.featureCompatibility.version.load() ==
+                              ServerGlobalParams::FeatureCompatibility::Version::k34
+                          ? BSON("afterOpTime" << lastOpTimeFetched)
+                          : BSON("afterClusterTime" << lastOpTimeFetched.getTimestamp()));
+    }
+
     return cmdBob.obj();
 }
 

@@ -62,9 +62,6 @@ class JSTestCase(interface.TestCase):
     def configure(self, fixture, num_clients=DEFAULT_CLIENT_NUM, *args, **kwargs):
         interface.TestCase.configure(self, fixture, *args, **kwargs)
 
-        if self.fixture.port is not None:
-            self.shell_options["port"] = self.fixture.port
-
         global_vars = self.shell_options.get("global_vars", {}).copy()
         data_dir = self._get_data_dir(global_vars)
 
@@ -104,6 +101,19 @@ class JSTestCase(interface.TestCase):
         except os.error:
             # Directory already exists.
             pass
+
+        process_kwargs = self.shell_options.get("process_kwargs", {}).copy()
+
+        if "KRB5_CONFIG" in process_kwargs and "KRB5CCNAME" not in process_kwargs:
+            # Use a job-specific credential cache for JavaScript tests involving Kerberos.
+            krb5_dir = os.path.join(data_dir, "krb5")
+            try:
+                os.makedirs(krb5_dir)
+            except os.error:
+                pass
+            process_kwargs["KRB5CCNAME"] = "DIR:" + os.path.join(krb5_dir, ".")
+
+        self.shell_options["process_kwargs"] = process_kwargs
 
     def _get_data_dir(self, global_vars):
         """
@@ -166,10 +176,12 @@ class JSTestCase(interface.TestCase):
         # set to self.logger.
         logger = utils.default_if_none(logger, self.logger)
 
-        return core.programs.mongo_shell_program(logger,
-                                                 executable=self.shell_executable,
-                                                 filename=self.js_filename,
-                                                 **shell_options)
+        return core.programs.mongo_shell_program(
+            logger,
+            executable=self.shell_executable,
+            filename=self.js_filename,
+            connection_string=self.fixture.get_driver_connection_url(),
+            **shell_options)
 
     def _run_test_in_thread(self, thread_id):
         # Make a logger for each thread. When this method gets called self.logger has been

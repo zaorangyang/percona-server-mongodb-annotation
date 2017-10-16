@@ -56,7 +56,6 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/expression_parser.h"
-#include "mongo/db/matcher/extensions_callback_disallow_extensions.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/update_request.h"
@@ -107,28 +106,6 @@ MONGO_INITIALIZER(InitializeParseValidationActionImpl)(InitializerContext* const
 
 // Used below to fail during inserts.
 MONGO_FP_DECLARE(failCollectionInserts);
-
-const auto bannedExpressionsInValidators = std::set<StringData>{
-    "$geoNear", "$near", "$nearSphere", "$text", "$where",
-};
-
-Status checkValidatorForBannedExpressions(const BSONObj& validator) {
-    for (auto field : validator) {
-        const auto name = field.fieldNameStringData();
-        if (name[0] == '$' && bannedExpressionsInValidators.count(name)) {
-            return {ErrorCodes::InvalidOptions,
-                    str::stream() << name << " is not allowed in collection validators"};
-        }
-
-        if (field.type() == Object || field.type() == Array) {
-            auto status = checkValidatorForBannedExpressions(field.Obj());
-            if (!status.isOK())
-                return status;
-        }
-    }
-
-    return Status::OK();
-}
 
 // Uses the collator factory to convert the BSON representation of a collator to a
 // CollatorInterface. Returns null if the BSONObj is empty. We expect the stored collation to be
@@ -182,7 +159,10 @@ CollectionImpl::CollectionImpl(Collection* _this_init,
       _indexCatalog(_this_init, this->getCatalogEntry()->getMaxAllowedIndexes()),
       _collator(parseCollation(opCtx, _ns, _details->getCollectionOptions(opCtx).collation)),
       _validatorDoc(_details->getCollectionOptions(opCtx).validator.getOwned()),
-      _validator(uassertStatusOK(parseValidator(_validatorDoc))),
+      _validator(
+          uassertStatusOK(parseValidator(_validatorDoc,
+                                         MatchExpressionParser::kAllowAllSpecialFeatures &
+                                             ~MatchExpressionParser::AllowedFeatures::kExpr))),
       _validationAction(uassertStatusOK(
           parseValidationAction(_details->getCollectionOptions(opCtx).validationAction))),
       _validationLevel(uassertStatusOK(
@@ -288,7 +268,8 @@ Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& d
     return {ErrorCodes::DocumentValidationFailure, "Document failed validation"};
 }
 
-StatusWithMatchExpression CollectionImpl::parseValidator(const BSONObj& validator) const {
+StatusWithMatchExpression CollectionImpl::parseValidator(
+    const BSONObj& validator, MatchExpressionParser::AllowedFeatureSet allowedFeatures) const {
     if (validator.isEmpty())
         return {nullptr};
 
@@ -305,14 +286,8 @@ StatusWithMatchExpression CollectionImpl::parseValidator(const BSONObj& validato
                               << " database"};
     }
 
-    {
-        auto status = checkValidatorForBannedExpressions(validator);
-        if (!status.isOK())
-            return status;
-    }
-
     auto statusWithMatcher = MatchExpressionParser::parse(
-        validator, ExtensionsCallbackDisallowExtensions(), _collator.get());
+        validator, _collator.get(), nullptr, ExtensionsCallbackNoop(), allowedFeatures);
     if (!statusWithMatcher.isOK())
         return statusWithMatcher.getStatus();
 
@@ -321,6 +296,7 @@ StatusWithMatchExpression CollectionImpl::parseValidator(const BSONObj& validato
 
 Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
                                                const DocWriter* const* docs,
+                                               Timestamp* timestamps,
                                                size_t nDocs) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
 
@@ -331,7 +307,7 @@ Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
     invariant(!_indexCatalog.haveAnyIndexes());
     invariant(!_mustTakeCappedLockOnInsert);
 
-    Status status = _recordStore->insertRecordsWithDocWriter(opCtx, docs, nDocs);
+    Status status = _recordStore->insertRecordsWithDocWriter(opCtx, docs, timestamps, nDocs);
     if (!status.isOK())
         return status;
 
@@ -433,9 +409,10 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
 
     if (_mustTakeCappedLockOnInsert)
         synchronizeOnCappedInFlightResource(opCtx->lockState(), _ns);
-
+    // TODO SERVER-30638: using timestamp 0 for these inserts, which are non-oplog so we don't yet
+    // care about their correct timestamps.
     StatusWith<RecordId> loc = _recordStore->insertRecord(
-        opCtx, doc.objdata(), doc.objsize(), _enforceQuota(enforceQuota));
+        opCtx, doc.objdata(), doc.objsize(), Timestamp(), _enforceQuota(enforceQuota));
 
     if (!loc.isOK())
         return loc.getStatus();
@@ -485,11 +462,17 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
 
     std::vector<Record> records;
     records.reserve(count);
+    std::vector<Timestamp> timestamps;
+    timestamps.reserve(count);
+
     for (auto it = begin; it != end; it++) {
         Record record = {RecordId(), RecordData(it->doc.objdata(), it->doc.objsize())};
         records.push_back(record);
+        Timestamp timestamp = Timestamp(it->timestamp.asU64());
+        timestamps.push_back(timestamp);
     }
-    Status status = _recordStore->insertRecords(opCtx, &records, _enforceQuota(enforceQuota));
+    Status status =
+        _recordStore->insertRecords(opCtx, &records, &timestamps, _enforceQuota(enforceQuota));
     if (!status.isOK())
         return status;
 
@@ -710,8 +693,9 @@ StatusWith<RecordId> CollectionImpl::_updateDocumentWithMove(OperationContext* o
                                                              OplogUpdateEntryArgs* args,
                                                              const SnapshotId& sid) {
     // Insert new record.
+    // TODO SERVER-30638, thread through actual timestamps.
     StatusWith<RecordId> newLocation = _recordStore->insertRecord(
-        opCtx, newDoc.objdata(), newDoc.objsize(), _enforceQuota(enforceQuota));
+        opCtx, newDoc.objdata(), newDoc.objsize(), Timestamp(), _enforceQuota(enforceQuota));
     if (!newLocation.isOK()) {
         return newLocation;
     }
@@ -908,7 +892,11 @@ Status CollectionImpl::setValidator(OperationContext* opCtx, BSONObj validatorDo
     if (!validatorDoc.isOwned())
         validatorDoc = validatorDoc.getOwned();
 
-    auto statusWithMatcher = parseValidator(validatorDoc);
+    // Note that, by the time we reach this, we should have already done a pre-parse that checks for
+    // banned features, so we don't need to include that check again.
+    auto statusWithMatcher = parseValidator(validatorDoc,
+                                            MatchExpressionParser::kAllowAllSpecialFeatures &
+                                                ~MatchExpressionParser::AllowedFeatures::kExpr);
     if (!statusWithMatcher.isOK())
         return statusWithMatcher.getStatus();
 

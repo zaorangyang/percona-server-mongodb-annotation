@@ -39,8 +39,10 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/client.h"
+#include "mongo/db/cursor_server_params.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/kill_sessions_common.h"
+#include "mongo/db/logical_session_cache.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/plan_executor.h"
@@ -53,13 +55,6 @@
 
 namespace mongo {
 using std::vector;
-
-constexpr Minutes CursorManager::kDefaultCursorTimeoutMinutes;
-
-MONGO_EXPORT_SERVER_PARAMETER(
-    cursorTimeoutMillis,
-    int,
-    durationCount<Milliseconds>(CursorManager::kDefaultCursorTimeoutMinutes));
 
 constexpr int CursorManager::kNumPartitions;
 
@@ -450,7 +445,7 @@ bool CursorManager::cursorShouldTimeout_inlock(const ClientCursor* cursor, Date_
     if (cursor->isNoTimeout() || cursor->_isPinned) {
         return false;
     }
-    return (now - cursor->_lastUseDate) >= Milliseconds(cursorTimeoutMillis.load());
+    return (now - cursor->_lastUseDate) >= Milliseconds(getCursorTimeoutMillis());
 }
 
 std::size_t CursorManager::timeoutCursors(OperationContext* opCtx, Date_t now) {
@@ -511,7 +506,21 @@ StatusWith<ClientCursorPin> CursorManager::pinCursor(OperationContext* opCtx, Cu
         delete cursor;
         return error;
     }
+
+    auto cursorPrivilegeStatus = checkCursorSessionPrivilege(opCtx, cursor->getSessionId());
+
+    if (!cursorPrivilegeStatus.isOK()) {
+        return cursorPrivilegeStatus;
+    }
+
     cursor->_isPinned = true;
+
+    // We use pinning of a cursor as a proxy for active, user-initiated use of a cursor.  Therefor,
+    // we pass down to the logical session cache and vivify the record (updating last use).
+    if (cursor->getSessionId()) {
+        LogicalSessionCache::get(opCtx)->vivify(opCtx, cursor->getSessionId().get());
+    }
+
     return ClientCursorPin(opCtx, cursor);
 }
 

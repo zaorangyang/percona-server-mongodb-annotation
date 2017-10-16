@@ -30,6 +30,7 @@
 
 #include "mongo/db/ops/parsed_update.h"
 
+#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/canonical_query.h"
@@ -111,7 +112,14 @@ Status ParsedUpdate::parseQueryToCQ() {
         qr->setLimit(1);
     }
 
-    auto statusWithCQ = CanonicalQuery::canonicalize(_opCtx, std::move(qr), extensionsCallback);
+    const boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ =
+        CanonicalQuery::canonicalize(_opCtx,
+                                     std::move(qr),
+                                     expCtx,
+                                     extensionsCallback,
+                                     MatchExpressionParser::kAllowAllSpecialFeatures &
+                                         ~MatchExpressionParser::AllowedFeatures::kExpr);
     if (statusWithCQ.isOK()) {
         _canonicalQuery = std::move(statusWithCQ.getValue());
     }
@@ -141,8 +149,10 @@ Status ParsedUpdate::parseArrayFilters() {
         serverGlobalParams.featureCompatibility.version.load() ==
             ServerGlobalParams::FeatureCompatibility::Version::k34) {
         return Status(ErrorCodes::InvalidOptions,
-                      "The featureCompatibilityVersion must be 3.6 to use arrayFilters. See "
-                      "http://dochub.mongodb.org/core/3.6-feature-compatibility.");
+                      str::stream()
+                          << "The featureCompatibilityVersion must be 3.6 to use arrayFilters. See "
+                          << feature_compatibility_version::kDochubLink
+                          << ".");
     }
 
     for (auto rawArrayFilter : _request->getArrayFilters()) {
@@ -153,15 +163,20 @@ Status ParsedUpdate::parseArrayFilters() {
                                         << arrayFilterStatus.getStatus().reason());
         }
         auto arrayFilter = std::move(arrayFilterStatus.getValue());
-
-        if (_arrayFilters.find(arrayFilter->getPlaceholder()) != _arrayFilters.end()) {
+        auto fieldName = arrayFilter->getPlaceholder();
+        if (!fieldName) {
+            return Status(
+                ErrorCodes::FailedToParse,
+                "Cannot use an expression without a top-level field name in arrayFilters");
+        }
+        if (_arrayFilters.find(*fieldName) != _arrayFilters.end()) {
             return Status(ErrorCodes::FailedToParse,
                           str::stream()
                               << "Found multiple array filters with the same top-level field name "
-                              << arrayFilter->getPlaceholder());
+                              << *fieldName);
         }
 
-        _arrayFilters[arrayFilter->getPlaceholder()] = std::move(arrayFilter);
+        _arrayFilters[*fieldName] = std::move(arrayFilter);
     }
 
     return Status::OK();

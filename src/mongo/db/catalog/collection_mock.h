@@ -157,6 +157,7 @@ public:
 
     Status insertDocumentsForOplog(OperationContext* opCtx,
                                    const DocWriter* const* docs,
+                                   Timestamp* timestamps,
                                    size_t nDocs) {
         std::abort();
     }
@@ -219,7 +220,8 @@ public:
         std::abort();
     }
 
-    StatusWithMatchExpression parseValidator(const BSONObj& validator) const {
+    StatusWithMatchExpression parseValidator(
+        const BSONObj& validator, MatchExpressionParser::AllowedFeatureSet allowedFeatures) const {
         std::abort();
     }
 

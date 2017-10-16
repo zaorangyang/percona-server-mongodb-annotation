@@ -34,6 +34,7 @@
 #include "mongo/config.h"
 #include "mongo/transport/asio_utils.h"
 #include "mongo/transport/transport_layer_asio.h"
+#include "mongo/util/net/sock.h"
 #ifdef MONGO_CONFIG_SSL
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_types.h"
@@ -54,17 +55,28 @@ class TransportLayerASIO::ASIOSession : public Session {
 
 public:
     ASIOSession(TransportLayerASIO* tl, GenericSocket socket)
-        : _socket(std::move(socket)), _tl(tl) {}
+        : _socket(std::move(socket)), _tl(tl) {
+        std::error_code ec;
+
+        _socket.non_blocking(_tl->_listenerOptions.async, ec);
+        fassert(40490, ec.value() == 0);
+
+        auto family = endpointToSockAddr(_socket.local_endpoint()).getType();
+        if (family == AF_INET || family == AF_INET6) {
+            _socket.set_option(asio::ip::tcp::no_delay(true));
+            _socket.set_option(asio::socket_base::keep_alive(true));
+            setSocketKeepAliveParams(_socket.native_handle());
+        }
+
+        _local = endpointToHostAndPort(_socket.local_endpoint());
+        _remote = endpointToHostAndPort(_socket.remote_endpoint(ec));
+        if (ec) {
+            LOG(3) << "Unable to get remote endpoint address: " << ec.message();
+        }
+    }
 
     virtual ~ASIOSession() {
-        if (_didPostAcceptSetup) {
-            // This is incremented in TransportLayerASIO::_acceptConnection if there are less than
-            // maxConns connections already established. A call to postAcceptSetup means that the
-            // session is valid and will be handed off to the ServiceEntryPoint.
-            //
-            // We decrement this here to keep the counters in the TL accurate.
-            _tl->_currentConnections.subtractAndFetch(1);
-        }
+        _tl->_currentConnections.subtractAndFetch(1);
     }
 
     TransportLayer* getTransportLayer() const override {
@@ -103,54 +115,6 @@ public:
 #else
         return _socket.is_open();
 #endif
-    }
-
-    void postAcceptSetup(bool async) {
-        std::error_code ec;
-        _socket.non_blocking(async, ec);
-        fassert(40490, ec.value() == 0);
-
-        auto family = endpointToSockAddr(_socket.local_endpoint()).getType();
-        if (family == AF_INET || family == AF_INET6) {
-            _socket.set_option(asio::ip::tcp::no_delay(true));
-            _socket.set_option(asio::socket_base::keep_alive(true));
-#ifdef __linux__
-            const auto sock = _socket.native_handle();
-            // On linux the default keep alive value may be very high - say an hour.
-            // Here we set it to a minimum of 5 minutes if the default value was over five minutes.
-            // See SERVER-3604.
-            int val = 1;
-            socklen_t len = sizeof(val);
-            if (getsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (char*)&val, &len))
-                error() << "can't get TCP_KEEPIDLE: " << errnoWithDescription();
-
-            if (val > 300) {
-                val = 300;
-                if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, (char*)&val, sizeof(val))) {
-                    error() << "can't set TCP_KEEPIDLE: " << errnoWithDescription();
-                }
-            }
-
-            len = sizeof(val);  // just in case it changed
-            if (getsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (char*)&val, &len))
-                error() << "can't get TCP_KEEPINTVL: " << errnoWithDescription();
-
-            if (val > 300) {
-                val = 300;
-                if (setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, (char*)&val, sizeof(val))) {
-                    error() << "can't set TCP_KEEPINTVL: " << errnoWithDescription();
-                }
-            }
-#endif
-        }
-
-        _local = endpointToHostAndPort(_socket.local_endpoint());
-        _remote = endpointToHostAndPort(_socket.remote_endpoint(ec));
-        if (ec) {
-            LOG(3) << "Unable to get remote endpoint address: " << ec.message();
-        }
-
-        _didPostAcceptSetup = true;
     }
 
     template <typename MutableBufferSequence, typename CompleteHandler>
@@ -341,7 +305,6 @@ private:
 #endif
 
     TransportLayerASIO* const _tl;
-    bool _didPostAcceptSetup = false;
 };
 
 }  // namespace transport
