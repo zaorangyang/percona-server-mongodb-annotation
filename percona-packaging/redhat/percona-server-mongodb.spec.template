@@ -113,6 +113,8 @@ export CXX=${CXX:-g++}
 export PSM_TARGETS="mongod mongos mongo"
 export INSTALLDIR=$RPM_BUILD_DIR/install
 export TOOLS_TAGS="ssl sasl"
+export PORTABLE=1
+export USE_SSE=1
 export PATH=/usr/local/go/bin:$PATH
 
 # TokuBackup
