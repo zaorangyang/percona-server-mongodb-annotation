@@ -109,7 +109,7 @@ export PATH=/usr/local/go/bin:$PATH
 
 # RocksDB
 pushd $RPM_BUILD_DIR/%{src_dir}/src/third_party/rocksdb
-make -j4 EXTRA_CFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3' EXTRA_CXXFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3' DISABLE_JEMALLOC=1 static_lib
+make -j4 EXTRA_CFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3 -DHAVE_SSE42' EXTRA_CXXFLAGS='-fPIC -DLZ4 -I../lz4-r131 -DSNAPPY -I../snappy-1.1.3 -DHAVE_SSE42' DISABLE_JEMALLOC=1 static_lib
 rm -rf ${INSTALLDIR}
 mkdir -p ${INSTALLDIR}/include
 mkdir -p ${INSTALLDIR}/bin
