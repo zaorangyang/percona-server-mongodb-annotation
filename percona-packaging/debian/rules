@@ -9,7 +9,6 @@ export MONGOTOOLS=bsondump mongostat mongofiles mongoexport mongoimport mongores
 export INSTALLDIR=$(PSMSRC)/install
 export TOOLS_TAGS=ssl sasl
 export PORTABLE=1
-export USE_SSE=1
 export PATH := /usr/local/go/bin:$(PATH)
 CC = gcc-5
 CXX = g++-5
