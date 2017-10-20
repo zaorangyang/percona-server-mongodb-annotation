@@ -1,32 +1,30 @@
 /**
-*    @file rs_rollback.cpp
-*
-*    Copyright (C) 2008-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2008-2017 MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationRollback
 
@@ -80,10 +78,8 @@ namespace mongo {
 
 using std::shared_ptr;
 using std::unique_ptr;
-using std::endl;
 using std::list;
 using std::map;
-using std::multimap;
 using std::set;
 using std::string;
 using std::pair;
@@ -194,7 +190,12 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
         throw RSFatalException(str::stream() << "Rollback too large, oplog size: "
                                              << ourObj.objsize());
 
+    // Parse the oplog entry.
     auto oplogEntry = OplogEntry(ourObj);
+
+    LOG(2) << "Updating rollback FixUpInfo for local oplog entry: " << oplogEntry.toBSON();
+
+    // Extract the op's collection namespace and UUID.
     NamespaceString nss = oplogEntry.getNamespace();
     auto uuid = oplogEntry.getUuid();
 
@@ -879,6 +880,9 @@ Status _syncRollback(OperationContext* opCtx,
     }
 
     log() << "Rollback common point is " << how.commonPoint;
+    invariant(!replCoord->isV1ElectionProtocol() ||
+              how.commonPoint >= replCoord->getLastCommittedOpTime());
+
     try {
         ON_BLOCK_EXIT([&] {
             auto status = replicationProcess->incrementRollbackID(opCtx);
@@ -1117,22 +1121,11 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                 cce->updateFlags(opCtx, options.flags);
             }
 
-            auto status = collection->setValidator(opCtx, options.validator);
-            if (!status.isOK()) {
-                throw RSFatalException(str::stream() << "Failed to set validator: "
-                                                     << status.toString());
-            }
-            status = collection->setValidationAction(opCtx, options.validationAction);
-            if (!status.isOK()) {
-                throw RSFatalException(str::stream() << "Failed to set validationAction: "
-                                                     << status.toString());
-            }
-
-            status = collection->setValidationLevel(opCtx, options.validationLevel);
-            if (!status.isOK()) {
-                throw RSFatalException(str::stream() << "Failed to set validationLevel: "
-                                                     << status.toString());
-            }
+            // Set any document validation options. We update the validator fields without
+            // parsing/validation, since we fetched the options object directly from the sync
+            // source, and we should set our validation options to match it exactly.
+            cce->updateValidator(
+                opCtx, options.validator, options.validationLevel, options.validationAction);
 
             wuow.commit();
         }
@@ -1347,7 +1340,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
     // If necessary, clear the memory of existing sessions.
     if (fixUpInfo.refetchTransactionDocs) {
-        SessionCatalog::get(opCtx)->resetSessions();
+        SessionCatalog::get(opCtx)->invalidateSessions(opCtx, boost::none);
     }
 
     // Reload the lastAppliedOpTime and lastDurableOpTime value in the replcoord and the

@@ -72,11 +72,17 @@ public:
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
                                  const BSONObj& cmdObj) override {
+
+        if (!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36()) {
+            return SessionsCommandFCV34Status(getName());
+        }
+
         AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
         if (!authSession->isAuthorizedForPrivilege(
                 Privilege{ResourcePattern::forClusterResource(), ActionType::killAnySession})) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
+
         return Status::OK();
     }
 
@@ -84,6 +90,11 @@ public:
                      const std::string& db,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
+
+        if (!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36()) {
+            return appendCommandStatus(result, SessionsCommandFCV34Status(getName()));
+        }
+
         IDLParserErrorContext ctx("KillAllSessionsByPatternCmd");
         auto ksc = KillAllSessionsByPatternCmd::parse(ctx, cmdObj);
 

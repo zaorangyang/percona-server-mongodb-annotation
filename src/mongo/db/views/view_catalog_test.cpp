@@ -38,7 +38,12 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/query_test_service_context.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/views/durable_view_catalog.h"
 #include "mongo/db/views/view.h"
@@ -66,6 +71,22 @@ constexpr auto kLargeString =
     "0000000000000000000000000000000000000000000000000000000";
 const auto kOneKiBMatchStage = BSON("$match" << BSON("data" << kLargeString));
 const auto kTinyMatchStage = BSON("$match" << BSONObj());
+
+// Allow tests to temporarily switch to a different FCV.
+class EnsureFCV {
+public:
+    using Version = ServerGlobalParams::FeatureCompatibility::Version;
+    EnsureFCV(Version version)
+        : _origVersion(serverGlobalParams.featureCompatibility.getVersion()) {
+        serverGlobalParams.featureCompatibility.setVersion(version);
+    }
+    ~EnsureFCV() {
+        serverGlobalParams.featureCompatibility.setVersion(_origVersion);
+    }
+
+private:
+    const Version _origVersion;
+};
 
 class DurableViewCatalogDummy final : public DurableViewCatalog {
 public:
@@ -111,11 +132,34 @@ private:
     std::unique_ptr<QueryTestServiceContext> _queryServiceContext;
 
 protected:
+    ServiceContext* getServiceContext() const {
+        return _queryServiceContext->getServiceContext();
+    }
+
     DurableViewCatalogDummy durableViewCatalog;
     ServiceContext::UniqueOperationContext opCtx;
     ViewCatalog viewCatalog;
     const BSONArray emptyPipeline;
     const BSONObj emptyCollation;
+};
+
+// For tests which need to run in a replica set context.
+class ReplViewCatalogFixture : public ViewCatalogFixture {
+public:
+    void setUp() override {
+        auto service = getServiceContext();
+        repl::ReplSettings settings;
+
+        settings.setReplSetString("viewCatalogTestSet/node1:12345");
+        settings.setMajorityReadConcernEnabled(true);
+
+        repl::StorageInterface::set(service, stdx::make_unique<repl::StorageInterfaceMock>());
+        auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service, settings);
+
+        // Ensure that we are primary.
+        ASSERT_OK(replCoord->setFollowerMode(repl::MemberState::RS_PRIMARY));
+        repl::ReplicationCoordinator::set(service, std::move(replCoord));
+    }
 };
 
 TEST_F(ViewCatalogFixture, CreateExistingView) {
@@ -144,6 +188,23 @@ TEST_F(ViewCatalogFixture, CreateViewWithPipelineFailsOnInvalidStageName) {
         viewCatalog.createView(opCtx.get(), viewName, viewOn, invalidPipeline, emptyCollation)
             .transitional_ignore(),
         AssertionException);
+}
+
+TEST_F(ReplViewCatalogFixture, CreateViewWithPipelineFailsOnIneligibleStage) {
+    // Temporarily set the feature version to 3.6 for $changeStream.
+    EnsureFCV ensureFCV(EnsureFCV::Version::k36);
+
+    const NamespaceString viewName("db.view");
+    const NamespaceString viewOn("db.coll");
+
+    // $changeStream cannot be used in a view definition pipeline.
+    auto invalidPipeline = BSON_ARRAY(BSON("$changeStream" << BSONObj()));
+
+    ASSERT_THROWS_CODE(
+        viewCatalog.createView(opCtx.get(), viewName, viewOn, invalidPipeline, emptyCollation)
+            .ignore(),
+        AssertionException,
+        40255);
 }
 
 TEST_F(ViewCatalogFixture, CreateViewOnInvalidCollectionName) {
@@ -305,6 +366,26 @@ TEST_F(ViewCatalogFixture, ModifyViewOnInvalidCollectionName) {
     ASSERT_NOT_OK(viewCatalog.modifyView(opCtx.get(), viewName, viewOn, emptyPipeline));
 }
 
+TEST_F(ReplViewCatalogFixture, ModifyViewWithPipelineFailsOnIneligibleStage) {
+    // Temporarily set the feature version to 3.6 for $changeStream.
+    EnsureFCV ensureFCV(EnsureFCV::Version::k36);
+
+    const NamespaceString viewName("db.view");
+    const NamespaceString viewOn("db.coll");
+
+    auto validPipeline = BSON_ARRAY(BSON("$match" << BSON("_id" << 1)));
+    auto invalidPipeline = BSON_ARRAY(BSON("$changeStream" << BSONObj()));
+
+    // Create the initial, valid view.
+    ASSERT_OK(viewCatalog.createView(opCtx.get(), viewName, viewOn, validPipeline, emptyCollation));
+
+    // Now attempt to replace it with a pipeline containing $changeStream.
+    ASSERT_THROWS_CODE(
+        viewCatalog.modifyView(opCtx.get(), viewName, viewOn, invalidPipeline).ignore(),
+        AssertionException,
+        40255);
+}
+
 TEST_F(ViewCatalogFixture, LookupMissingView) {
     ASSERT(!viewCatalog.lookup(opCtx.get(), "db.view"_sd));
 }
@@ -402,6 +483,42 @@ TEST_F(ViewCatalogFixture, ResolveViewCorrectPipeline) {
     for (uint32_t i = 0; i < expected.size(); i++) {
         ASSERT(SimpleBSONObjComparator::kInstance.evaluate(expected[i] == result[i]));
     }
+}
+
+TEST_F(ViewCatalogFixture, ResolveViewCorrectlyExtractsDefaultCollation) {
+    const NamespaceString view1("db.view1");
+    const NamespaceString view2("db.view2");
+    const NamespaceString viewOn("db.coll");
+    BSONArrayBuilder pipeline1;
+    BSONArrayBuilder pipeline2;
+
+    pipeline1 << BSON("$match" << BSON("foo" << 1));
+    pipeline2 << BSON("$match" << BSON("foo" << 2));
+
+    BSONObj collation = BSON("locale"
+                             << "mock_reverse_string");
+
+    ASSERT_OK(viewCatalog.createView(opCtx.get(), view1, viewOn, pipeline1.arr(), collation));
+    ASSERT_OK(viewCatalog.createView(opCtx.get(), view2, view1, pipeline2.arr(), collation));
+
+    auto resolvedView = viewCatalog.resolveView(opCtx.get(), view2);
+    ASSERT(resolvedView.isOK());
+
+    ASSERT_EQ(resolvedView.getValue().getNamespace(), viewOn);
+
+    std::vector<BSONObj> expected = {BSON("$match" << BSON("foo" << 1)),
+                                     BSON("$match" << BSON("foo" << 2))};
+    std::vector<BSONObj> result = resolvedView.getValue().getPipeline();
+    ASSERT_EQ(expected.size(), result.size());
+    for (uint32_t i = 0; i < expected.size(); i++) {
+        ASSERT(SimpleBSONObjComparator::kInstance.evaluate(expected[i] == result[i]));
+    }
+
+    auto expectedCollation =
+        CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation);
+    ASSERT_OK(expectedCollation.getStatus());
+    ASSERT_BSONOBJ_EQ(resolvedView.getValue().getDefaultCollation(),
+                      expectedCollation.getValue()->getSpec().toBSON());
 }
 
 TEST_F(ViewCatalogFixture, InvalidateThenReload) {

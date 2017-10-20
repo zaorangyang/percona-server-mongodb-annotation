@@ -60,7 +60,7 @@
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/reply_interface.h"
-#include "mongo/s/stale_exception.h"  // for RecvStaleConfigException
+#include "mongo/s/stale_exception.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
@@ -179,10 +179,8 @@ rpc::UniqueReply DBClientBase::parseCommandReplyMessage(const std::string& host,
         uassertStatusOK(_metadataReader(opCtx, commandReply->getMetadata(), host));
     }
 
-    if (ErrorCodes::SendStaleConfig ==
-        getStatusFromCommandResult(commandReply->getCommandReply())) {
-        throw RecvStaleConfigException("stale config in runCommand",
-                                       commandReply->getCommandReply());
+    if (ErrorCodes::StaleConfig == getStatusFromCommandResult(commandReply->getCommandReply())) {
+        throw StaleConfigException("stale config in runCommand", commandReply->getCommandReply());
     }
 
     return rpc::UniqueReply(replyMsg, std::move(commandReply));
@@ -261,6 +259,13 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientBase::runCommandWithTarget(
     return {std::move(commandReply), this};
 }
 
+std::pair<rpc::UniqueReply, std::shared_ptr<DBClientBase>> DBClientBase::runCommandWithTarget(
+    OpMsgRequest request, std::shared_ptr<DBClientBase> me) {
+
+    auto out = runCommandWithTarget(std::move(request));
+    return {std::move(out.first), std::move(me)};
+}
+
 std::tuple<bool, DBClientBase*> DBClientBase::runCommandWithTarget(const string& dbname,
                                                                    BSONObj cmd,
                                                                    BSONObj& info,
@@ -269,6 +274,19 @@ std::tuple<bool, DBClientBase*> DBClientBase::runCommandWithTarget(const string&
     // requestBuilder is a legacyRequest builder. Not sure what the best
     // way to get around that is without breaking the abstraction.
     auto result = runCommandWithTarget(rpc::upconvertRequest(dbname, std::move(cmd), options));
+
+    info = result.first->getCommandReply().getOwned();
+    return std::make_tuple(isOk(info), result.second);
+}
+
+std::tuple<bool, std::shared_ptr<DBClientBase>> DBClientBase::runCommandWithTarget(
+    const string& dbname,
+    BSONObj cmd,
+    BSONObj& info,
+    std::shared_ptr<DBClientBase> me,
+    int options) {
+    auto result =
+        runCommandWithTarget(rpc::upconvertRequest(dbname, std::move(cmd), options), std::move(me));
 
     info = result.first->getCommandReply().getOwned();
     return std::make_tuple(isOk(info), result.second);
@@ -665,7 +683,7 @@ void DBClientBase::findN(vector<BSONObj>& out,
     if (c->hasResultFlag(ResultFlag_ShardConfigStale)) {
         BSONObj error;
         c->peekError(&error);
-        throw RecvStaleConfigException("findN stale config", error);
+        throw StaleConfigException("findN stale config", error);
     }
 
     for (int i = 0; i < nToReturn; i++) {
@@ -965,6 +983,19 @@ void DBClientConnection::logout(const string& dbname, BSONObj& info) {
 std::pair<rpc::UniqueReply, DBClientBase*> DBClientConnection::runCommandWithTarget(
     OpMsgRequest request) {
     auto out = DBClientBase::runCommandWithTarget(std::move(request));
+    if (!_parentReplSetName.empty()) {
+        const auto replyBody = out.first->getCommandReply();
+        if (!isOk(replyBody)) {
+            handleNotMasterResponse(replyBody["errmsg"]);
+        }
+    }
+
+    return out;
+}
+
+std::pair<rpc::UniqueReply, std::shared_ptr<DBClientBase>> DBClientConnection::runCommandWithTarget(
+    OpMsgRequest request, std::shared_ptr<DBClientBase> me) {
+    auto out = DBClientBase::runCommandWithTarget(std::move(request), std::move(me));
     if (!_parentReplSetName.empty()) {
         const auto replyBody = out.first->getCommandReply();
         if (!isOk(replyBody)) {

@@ -33,7 +33,8 @@
 
 namespace mongo {
 
-class DocumentSourceGeoNear : public DocumentSourceNeedsMongod, public SplittableDocumentSource {
+class DocumentSourceGeoNear : public DocumentSourceNeedsMongoProcessInterface,
+                              public SplittableDocumentSource {
 public:
     static const long long kDefaultLimit;
 
@@ -47,11 +48,14 @@ public:
     Pipeline::SourceContainer::iterator doOptimizeAt(Pipeline::SourceContainer::iterator itr,
                                                      Pipeline::SourceContainer* container) final;
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.requiredPosition = PositionRequirement::kFirst;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kFirst,
+                                     HostTypeRequirement::kAnyShard,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed);
+
         constraints.requiresInputDocSource = false;
-        constraints.isAllowedInsideFacetStage = false;
         return constraints;
     }
 
@@ -63,7 +67,7 @@ public:
 
     // Virtuals for SplittableDocumentSource
     boost::intrusive_ptr<DocumentSource> getShardSource() final;
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final;
+    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final;
 
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pCtx);

@@ -74,6 +74,9 @@ void DocumentSourceCursor::loadBatch() {
     BSONObj resultObj;
     {
         AutoGetCollectionForRead autoColl(pExpCtx->opCtx, _exec->nss());
+        uassertStatusOK(repl::ReplicationCoordinator::get(pExpCtx->opCtx)
+                            ->checkCanServeReadsFor(pExpCtx->opCtx, _exec->nss(), true));
+
         uassertStatusOK(_exec->restoreState());
 
         int memUsageBytes = 0;
@@ -100,7 +103,10 @@ void DocumentSourceCursor::loadBatch() {
 
                 // As long as we're waiting for inserts, we shouldn't do any batching at this level
                 // we need the whole pipeline to see each document to see if we should stop waiting.
+                // Furthermore, if we need to return the latest oplog time (in the tailable and
+                // needs-merge case), batching will result in a wrong time.
                 if (shouldWaitForInserts(pExpCtx->opCtx) ||
+                    (pExpCtx->isTailableAwaitData() && pExpCtx->needsMerge) ||
                     memUsageBytes > internalDocumentSourceCursorBatchSizeBytes.load()) {
                     // End this batch and prepare PlanExecutor for yielding.
                     _exec->saveState();
@@ -109,7 +115,7 @@ void DocumentSourceCursor::loadBatch() {
             }
             // Special case for tailable cursor -- EOF doesn't preclude more results, so keep
             // the PlanExecutor alive.
-            if (state == PlanExecutor::IS_EOF && pExpCtx->isTailable()) {
+            if (state == PlanExecutor::IS_EOF && pExpCtx->isTailableAwaitData()) {
                 _exec->saveState();
                 return;
             }

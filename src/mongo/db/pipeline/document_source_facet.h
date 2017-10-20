@@ -55,7 +55,7 @@ class NamespaceString;
  * stage which will produce a document like the following:
  * {facetA: [<all input documents except the first one>], facetB: [<the first document>]}.
  */
-class DocumentSourceFacet final : public DocumentSourceNeedsMongod,
+class DocumentSourceFacet final : public DocumentSourceNeedsMongoProcessInterface,
                                   public SplittableDocumentSource {
 public:
     struct FacetPipeline {
@@ -126,16 +126,16 @@ public:
     boost::intrusive_ptr<DocumentSource> getShardSource() final {
         return nullptr;
     }
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final {
-        return this;
+    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final {
+        return {this};
     }
 
     // The following are overridden just to forward calls to sub-pipelines.
     void addInvolvedCollections(std::vector<NamespaceString>* collections) const final;
-    void doInjectMongodInterface(std::shared_ptr<MongodInterface> mongod) final;
+    void doInjectMongoProcessInterface(std::shared_ptr<MongoProcessInterface>) final;
     void doDetachFromOperationContext() final;
     void doReattachToOperationContext(OperationContext* opCtx) final;
-    StageConstraints constraints() const final;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 
 protected:
     void doDispose() final;

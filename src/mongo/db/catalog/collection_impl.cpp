@@ -159,10 +159,8 @@ CollectionImpl::CollectionImpl(Collection* _this_init,
       _indexCatalog(_this_init, this->getCatalogEntry()->getMaxAllowedIndexes()),
       _collator(parseCollation(opCtx, _ns, _details->getCollectionOptions(opCtx).collation)),
       _validatorDoc(_details->getCollectionOptions(opCtx).validator.getOwned()),
-      _validator(
-          uassertStatusOK(parseValidator(_validatorDoc,
-                                         MatchExpressionParser::kAllowAllSpecialFeatures &
-                                             ~MatchExpressionParser::AllowedFeatures::kExpr))),
+      _validator(uassertStatusOK(
+          parseValidator(opCtx, _validatorDoc, MatchExpressionParser::kAllowAllSpecialFeatures))),
       _validationAction(uassertStatusOK(
           parseValidationAction(_details->getCollectionOptions(opCtx).validationAction))),
       _validationLevel(uassertStatusOK(
@@ -170,7 +168,6 @@ CollectionImpl::CollectionImpl(Collection* _this_init,
       _cursorManager(_ns),
       _cappedNotifier(_recordStore->isCapped() ? stdx::make_unique<CappedInsertNotifier>()
                                                : nullptr),
-      _mustTakeCappedLockOnInsert(isCapped() && !_ns.isSystemDotProfile() && !_ns.isOplog()),
       _this(_this_init) {}
 
 void CollectionImpl::init(OperationContext* opCtx) {
@@ -269,7 +266,9 @@ Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& d
 }
 
 StatusWithMatchExpression CollectionImpl::parseValidator(
-    const BSONObj& validator, MatchExpressionParser::AllowedFeatureSet allowedFeatures) const {
+    OperationContext* opCtx,
+    const BSONObj& validator,
+    MatchExpressionParser::AllowedFeatureSet allowedFeatures) const {
     if (validator.isEmpty())
         return {nullptr};
 
@@ -286,8 +285,9 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
                               << " database"};
     }
 
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, _collator.get()));
     auto statusWithMatcher = MatchExpressionParser::parse(
-        validator, _collator.get(), nullptr, ExtensionsCallbackNoop(), allowedFeatures);
+        validator, std::move(expCtx), ExtensionsCallbackNoop(), allowedFeatures);
     if (!statusWithMatcher.isOK())
         return statusWithMatcher.getStatus();
 
@@ -305,7 +305,6 @@ Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
     // because it would defeat the purpose of using DocWriter.
     invariant(!_validator);
     invariant(!_indexCatalog.haveAnyIndexes());
-    invariant(!_mustTakeCappedLockOnInsert);
 
     Status status = _recordStore->insertRecordsWithDocWriter(opCtx, docs, timestamps, nDocs);
     if (!status.isOK())
@@ -354,9 +353,6 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
     }
 
     const SnapshotId sid = opCtx->recoveryUnit()->getSnapshotId();
-
-    if (_mustTakeCappedLockOnInsert)
-        synchronizeOnCappedInFlightResource(opCtx->lockState(), _ns);
 
     Status status = _insertDocuments(opCtx, begin, end, enforceQuota, opDebug);
     if (!status.isOK())
@@ -407,8 +403,6 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
 
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
 
-    if (_mustTakeCappedLockOnInsert)
-        synchronizeOnCappedInFlightResource(opCtx->lockState(), _ns);
     // TODO SERVER-30638: using timestamp 0 for these inserts, which are non-oplog so we don't yet
     // care about their correct timestamps.
     StatusWith<RecordId> loc = _recordStore->insertRecord(
@@ -425,7 +419,14 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
     }
 
     vector<InsertStatement> inserts;
-    inserts.emplace_back(doc);
+    OplogSlot slot;
+    // Fetch a new optime now, if necessary.
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (!replCoord->isOplogDisabledFor(opCtx, _ns)) {
+        // Populate 'slot' with a new optime.
+        slot = repl::getNextOpTime(opCtx);
+    }
+    inserts.emplace_back(kUninitializedStmtId, doc, slot);
 
     getGlobalServiceContext()->getOpObserver()->onInserts(
         opCtx, ns(), uuid(), inserts.begin(), inserts.end(), false);
@@ -468,7 +469,7 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
     for (auto it = begin; it != end; it++) {
         Record record = {RecordId(), RecordData(it->doc.objdata(), it->doc.objsize())};
         records.push_back(record);
-        Timestamp timestamp = Timestamp(it->timestamp.asU64());
+        Timestamp timestamp = Timestamp(it->oplogSlot.opTime.getTimestamp());
         timestamps.push_back(timestamp);
     }
     Status status =
@@ -894,9 +895,8 @@ Status CollectionImpl::setValidator(OperationContext* opCtx, BSONObj validatorDo
 
     // Note that, by the time we reach this, we should have already done a pre-parse that checks for
     // banned features, so we don't need to include that check again.
-    auto statusWithMatcher = parseValidator(validatorDoc,
-                                            MatchExpressionParser::kAllowAllSpecialFeatures &
-                                                ~MatchExpressionParser::AllowedFeatures::kExpr);
+    auto statusWithMatcher =
+        parseValidator(opCtx, validatorDoc, MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!statusWithMatcher.isOK())
         return statusWithMatcher.getStatus();
 

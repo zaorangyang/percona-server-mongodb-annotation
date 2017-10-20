@@ -47,7 +47,6 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/logical_session_cache.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 
@@ -59,15 +58,12 @@ namespace {
 BSONObj v1SystemUsersKeyPattern;
 BSONObj v3SystemUsersKeyPattern;
 BSONObj v3SystemRolesKeyPattern;
-BSONObj v1SystemSessionsKeyPattern;
 std::string v3SystemUsersIndexName;
 std::string v3SystemRolesIndexName;
-std::string v1SystemSessionsIndexName;
 IndexSpec v3SystemUsersIndexSpec;
 IndexSpec v3SystemRolesIndexSpec;
-IndexSpec v1SystemSessionsIndexSpec;
 
-const NamespaceString sessionCollectionNamespace("admin.system.sessions");
+const NamespaceString sessionCollectionNamespace("config.system.sessions");
 
 MONGO_INITIALIZER(AuthIndexKeyPatterns)(InitializerContext*) {
     v1SystemUsersKeyPattern = BSON("user" << 1 << "userSource" << 1);
@@ -77,7 +73,6 @@ MONGO_INITIALIZER(AuthIndexKeyPatterns)(InitializerContext*) {
     v3SystemRolesKeyPattern = BSON(
         AuthorizationManager::ROLE_NAME_FIELD_NAME << 1 << AuthorizationManager::ROLE_DB_FIELD_NAME
                                                    << 1);
-    v1SystemSessionsKeyPattern = BSON("lastUse" << 1);
     v3SystemUsersIndexName =
         std::string(str::stream() << AuthorizationManager::USER_NAME_FIELD_NAME << "_1_"
                                   << AuthorizationManager::USER_DB_FIELD_NAME
@@ -86,7 +81,6 @@ MONGO_INITIALIZER(AuthIndexKeyPatterns)(InitializerContext*) {
         std::string(str::stream() << AuthorizationManager::ROLE_NAME_FIELD_NAME << "_1_"
                                   << AuthorizationManager::ROLE_DB_FIELD_NAME
                                   << "_1");
-    v1SystemSessionsIndexName = "lastUse_1";
 
     v3SystemUsersIndexSpec.addKeys(v3SystemUsersKeyPattern);
     v3SystemUsersIndexSpec.unique();
@@ -95,11 +89,6 @@ MONGO_INITIALIZER(AuthIndexKeyPatterns)(InitializerContext*) {
     v3SystemRolesIndexSpec.addKeys(v3SystemRolesKeyPattern);
     v3SystemRolesIndexSpec.unique();
     v3SystemRolesIndexSpec.name(v3SystemRolesIndexName);
-
-    v1SystemSessionsIndexSpec.addKeys(v1SystemSessionsKeyPattern);
-    v1SystemSessionsIndexSpec.expireAfterSeconds(
-        durationCount<Seconds>(Minutes(localLogicalSessionTimeoutMinutes)));
-    v1SystemSessionsIndexSpec.name(v1SystemSessionsIndexName);
 
     return Status::OK();
 }
@@ -145,72 +134,57 @@ Status verifySystemIndexes(OperationContext* opCtx) {
     const NamespaceString& systemUsers = AuthorizationManager::usersCollectionNamespace;
     const NamespaceString& systemRoles = AuthorizationManager::rolesCollectionNamespace;
 
-    AutoGetDb autoDb(opCtx, systemUsers.db(), MODE_X);
-    if (!autoDb.getDb()) {
-        return Status::OK();
-    }
-
-    Collection* collection = autoDb.getDb()->getCollection(opCtx, systemUsers);
-    if (collection) {
-        IndexCatalog* indexCatalog = collection->getIndexCatalog();
-        invariant(indexCatalog);
-
-        // Make sure the old unique index from v2.4 on system.users doesn't exist.
-        std::vector<IndexDescriptor*> indexes;
-        indexCatalog->findIndexesByKeyPattern(opCtx, v1SystemUsersKeyPattern, false, &indexes);
-
-        if (!indexes.empty()) {
-            fassert(ErrorCodes::AmbiguousIndexKeyPattern, indexes.size() == 1);
-            return Status(ErrorCodes::AuthSchemaIncompatible,
-                          "Old 2.4 style user index identified. "
-                          "The authentication schema needs to be updated by "
-                          "running authSchemaUpgrade on a 2.6 server.");
+    // Create indexes for collections on the admin db
+    {
+        AutoGetDb autoDb(opCtx, systemUsers.db(), MODE_X);
+        if (!autoDb.getDb()) {
+            return Status::OK();
         }
 
-        // Ensure that system indexes exist for the user collection
-        indexCatalog->findIndexesByKeyPattern(opCtx, v3SystemUsersKeyPattern, false, &indexes);
-        if (indexes.empty()) {
-            try {
-                generateSystemIndexForExistingCollection(
-                    opCtx, collection, systemUsers, v3SystemUsersIndexSpec);
-            } catch (...) {
-                return exceptionToStatus();
+        Collection* collection = autoDb.getDb()->getCollection(opCtx, systemUsers);
+        if (collection) {
+            IndexCatalog* indexCatalog = collection->getIndexCatalog();
+            invariant(indexCatalog);
+
+            // Make sure the old unique index from v2.4 on system.users doesn't exist.
+            std::vector<IndexDescriptor*> indexes;
+            indexCatalog->findIndexesByKeyPattern(opCtx, v1SystemUsersKeyPattern, false, &indexes);
+
+            if (!indexes.empty()) {
+                fassert(ErrorCodes::AmbiguousIndexKeyPattern, indexes.size() == 1);
+                return Status(ErrorCodes::AuthSchemaIncompatible,
+                              "Old 2.4 style user index identified. "
+                              "The authentication schema needs to be updated by "
+                              "running authSchemaUpgrade on a 2.6 server.");
+            }
+
+            // Ensure that system indexes exist for the user collection
+            indexCatalog->findIndexesByKeyPattern(opCtx, v3SystemUsersKeyPattern, false, &indexes);
+            if (indexes.empty()) {
+                try {
+                    generateSystemIndexForExistingCollection(
+                        opCtx, collection, systemUsers, v3SystemUsersIndexSpec);
+                } catch (...) {
+                    return exceptionToStatus();
+                }
             }
         }
-    }
 
-    // Ensure that system indexes exist for the roles collection, if it exists.
-    collection = autoDb.getDb()->getCollection(opCtx, systemRoles);
-    if (collection) {
-        IndexCatalog* indexCatalog = collection->getIndexCatalog();
-        invariant(indexCatalog);
+        // Ensure that system indexes exist for the roles collection, if it exists.
+        collection = autoDb.getDb()->getCollection(opCtx, systemRoles);
+        if (collection) {
+            IndexCatalog* indexCatalog = collection->getIndexCatalog();
+            invariant(indexCatalog);
 
-        std::vector<IndexDescriptor*> indexes;
-        indexCatalog->findIndexesByKeyPattern(opCtx, v3SystemRolesKeyPattern, false, &indexes);
-        if (indexes.empty()) {
-            try {
-                generateSystemIndexForExistingCollection(
-                    opCtx, collection, systemRoles, v3SystemRolesIndexSpec);
-            } catch (...) {
-                return exceptionToStatus();
-            }
-        }
-    }
-
-    // Ensure that system indexes exist for the sessions collection, if it exists.
-    collection = autoDb.getDb()->getCollection(opCtx, sessionCollectionNamespace);
-    if (collection) {
-        IndexCatalog* indexCatalog = collection->getIndexCatalog();
-        invariant(indexCatalog);
-
-        std::vector<IndexDescriptor*> indexes;
-        indexCatalog->findIndexesByKeyPattern(opCtx, v1SystemSessionsKeyPattern, false, &indexes);
-        if (indexes.empty()) {
-            try {
-                generateSystemIndexForExistingCollection(
-                    opCtx, collection, sessionCollectionNamespace, v1SystemSessionsIndexSpec);
-            } catch (...) {
-                return exceptionToStatus();
+            std::vector<IndexDescriptor*> indexes;
+            indexCatalog->findIndexesByKeyPattern(opCtx, v3SystemRolesKeyPattern, false, &indexes);
+            if (indexes.empty()) {
+                try {
+                    generateSystemIndexForExistingCollection(
+                        opCtx, collection, systemRoles, v3SystemRolesIndexSpec);
+                } catch (...) {
+                    return exceptionToStatus();
+                }
             }
         }
     }
@@ -237,14 +211,6 @@ void createSystemIndexes(OperationContext* opCtx, Collection* collection) {
 
         fassertStatusOK(
             40458, collection->getIndexCatalog()->createIndexOnEmptyCollection(opCtx, indexSpec));
-    } else if (ns == sessionCollectionNamespace) {
-        auto indexSpec = fassertStatusOK(
-            40493,
-            index_key_validate::validateIndexSpec(
-                v1SystemSessionsIndexSpec.toBSON(), ns, serverGlobalParams.featureCompatibility));
-
-        fassertStatusOK(
-            40494, collection->getIndexCatalog()->createIndexOnEmptyCollection(opCtx, indexSpec));
     }
 }
 

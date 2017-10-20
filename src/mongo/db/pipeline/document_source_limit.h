@@ -48,6 +48,14 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed};
+    }
+
     GetNextResult getNext() final;
     const char* getSourceName() const final {
         return kStageName.rawData();
@@ -56,12 +64,6 @@ public:
     BSONObjSet getOutputSorts() final {
         return pSource ? pSource->getOutputSorts()
                        : SimpleBSONObjComparator::kInstance.makeBSONObjSet();
-    }
-
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
-        return constraints;
     }
 
     /**
@@ -89,8 +91,8 @@ public:
      * merge pipeline. Unlike the shards source, it is necessary for this stage to run on the
      * merging host in order to produce correct pipeline output.
      */
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final {
-        return DocumentSourceLimit::create(pExpCtx, _limit);
+    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final {
+        return {DocumentSourceLimit::create(pExpCtx, _limit)};
     }
 
     long long getLimit() const {

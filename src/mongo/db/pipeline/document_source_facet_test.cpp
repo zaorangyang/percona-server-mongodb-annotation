@@ -185,10 +185,12 @@ class DocumentSourcePassthrough : public DocumentSourceMock {
 public:
     DocumentSourcePassthrough() : DocumentSourceMock({}) {}
 
-    StageConstraints constraints() const override {
-        StageConstraints constraints;
-        constraints.isAllowedInsideFacetStage = true;
-        return constraints;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const override {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed};
     }
 
     DocumentSource::GetNextResult getNext() final {
@@ -624,10 +626,12 @@ TEST_F(DocumentSourceFacetTest, ShouldThrowIfAnyPipelineRequiresTextScoreButItIs
  */
 class DocumentSourceNeedsPrimaryShard final : public DocumentSourcePassthrough {
 public:
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.hostRequirement = HostTypeRequirement::kPrimaryShard;
-        return constraints;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kPrimaryShard,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed};
     }
 
     static boost::intrusive_ptr<DocumentSourceNeedsPrimaryShard> create() {
@@ -650,7 +654,7 @@ TEST_F(DocumentSourceFacetTest, ShouldRequirePrimaryShardIfAnyStageRequiresPrima
     facets.emplace_back("needsPrimaryShard", std::move(secondPipeline));
     auto facetStage = DocumentSourceFacet::create(std::move(facets), ctx);
 
-    ASSERT(facetStage->constraints().hostRequirement ==
+    ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).hostRequirement ==
            DocumentSource::StageConstraints::HostTypeRequirement::kPrimaryShard);
 }
 
@@ -670,7 +674,7 @@ TEST_F(DocumentSourceFacetTest, ShouldNotRequirePrimaryShardIfNoStagesRequiresPr
     facets.emplace_back("second", std::move(secondPipeline));
     auto facetStage = DocumentSourceFacet::create(std::move(facets), ctx);
 
-    ASSERT(facetStage->constraints().hostRequirement ==
+    ASSERT(facetStage->constraints(Pipeline::SplitState::kUnsplit).hostRequirement ==
            DocumentSource::StageConstraints::HostTypeRequirement::kAnyShard);
 }
 

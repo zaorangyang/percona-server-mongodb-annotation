@@ -254,7 +254,16 @@ public:
                          const BSONObj& defaultCollation,
                          bool unique,
                          const std::vector<BSONObj>& initPoints,
-                         const bool distributeInitialChunks);
+                         const bool distributeInitialChunks,
+                         const ShardId& dbPrimaryShardId);
+
+    /**
+     * Iterates through each entry in config.collections that does not have a UUID, generates a UUID
+     * for the collection, and updates the entry with the generated UUID.
+     *
+     * Remove after 3.4 -> 3.6 upgrade.
+     */
+    void generateUUIDsForExistingShardedCollections(OperationContext* opCtx);
 
     //
     // Shard Operations
@@ -370,6 +379,12 @@ private:
                                                std::shared_ptr<RemoteCommandTargeter> targeter,
                                                const std::string* shardProposedName,
                                                const ConnectionString& connectionString);
+
+    /**
+     * Drops the sessions collection on the specified host.
+     */
+    Status _dropSessionsCollection(OperationContext* opCtx,
+                                   std::shared_ptr<RemoteCommandTargeter> targeter);
 
     /**
      * Runs the listDatabases command on the specified host and returns the names of all databases

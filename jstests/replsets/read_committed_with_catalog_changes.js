@@ -227,7 +227,7 @@ load("jstests/replsets/rslib.js");       // For startSetIfSupportsReadMajority.
             coll.runCommand('find', {"readConcern": {"level": "majority"}, "maxTimeMS": timeoutMs});
         assert.commandWorked(res, 'reading from ' + coll.getFullName());
         // Exhaust the cursor to avoid leaking cursors on the server.
-        new DBCommandCursor(coll.getMongo(), res).itcount();
+        new DBCommandCursor(coll.getDB(), res).itcount();
     }
 
     // Set up a set and grab things for later.
@@ -262,8 +262,8 @@ load("jstests/replsets/rslib.js");       // For startSetIfSupportsReadMajority.
     // This DB won't be used by any tests so it should always be unblocked.
     var otherDB = primary.getDB('otherDB');
     var otherDBCollection = otherDB.collection;
-    assert.writeOK(
-        otherDBCollection.insert({}, {writeConcern: {w: "majority", wtimeout: 60 * 1000}}));
+    assert.writeOK(otherDBCollection.insert(
+        {}, {writeConcern: {w: "majority", wtimeout: ReplSetTest.kDefaultTimeoutMS}}));
     assertReadsSucceed(otherDBCollection);
 
     for (var testName in testCases) {

@@ -66,7 +66,7 @@
     s.restartMongos(0);
     login(adminUser);
 
-    var d1 = new ReplSetTest({name: "d1", nodes: 3, useHostName: true});
+    var d1 = new ReplSetTest({name: "d1", nodes: 3, useHostName: true, waitForKeys: false});
     d1.startSet({keyFile: "jstests/libs/key2", shardsvr: ""});
     d1.initiate();
 
@@ -147,7 +147,7 @@
 
     logout(testUser);
 
-    var d2 = new ReplSetTest({name: "d2", nodes: 3, useHostName: true});
+    var d2 = new ReplSetTest({name: "d2", nodes: 3, useHostName: true, waitForKeys: false});
     d2.startSet({keyFile: "jstests/libs/key1", shardsvr: ""});
     d2.initiate();
     d2.awaitSecondaryNodes();
@@ -178,9 +178,9 @@
     s.startBalancer(60000);
 
     assert.soon(function() {
-        var d1Chunks = s.getDB("config").chunks.count({shard: "d1"});
-        var d2Chunks = s.getDB("config").chunks.count({shard: "d2"});
-        var totalChunks = s.getDB("config").chunks.count({ns: "test.foo"});
+        var d1Chunks = s.getDB("config").chunks.count({ns: 'test.foo', shard: "d1"});
+        var d2Chunks = s.getDB("config").chunks.count({ns: 'test.foo', shard: "d2"});
+        var totalChunks = s.getDB("config").chunks.count({ns: 'test.foo'});
 
         print("chunks: " + d1Chunks + " " + d2Chunks + " " + totalChunks);
 

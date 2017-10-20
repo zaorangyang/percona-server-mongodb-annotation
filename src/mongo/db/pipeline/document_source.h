@@ -41,6 +41,7 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/collection_index_usage_tracker.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/dependencies.h"
@@ -81,8 +82,11 @@ class Document;
  * If your stage is actually an alias which needs to return more than one stage (such as
  * $sortByCount), you should use the REGISTER_MULTI_STAGE_ALIAS macro instead.
  */
-#define REGISTER_DOCUMENT_SOURCE(key, liteParser, fullParser)                                \
+#define REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, ...)             \
     MONGO_INITIALIZER(addToDocSourceParserMap_##key)(InitializerContext*) {                  \
+        if (!__VA_ARGS__) {                                                                  \
+            return Status::OK();                                                             \
+        }                                                                                    \
         auto fullParserWrapper = [](BSONElement stageSpec,                                   \
                                     const boost::intrusive_ptr<ExpressionContext>& expCtx) { \
             return std::list<boost::intrusive_ptr<DocumentSource>>{                          \
@@ -92,6 +96,13 @@ class Document;
         DocumentSource::registerParser("$" #key, fullParserWrapper);                         \
         return Status::OK();                                                                 \
     }
+
+#define REGISTER_DOCUMENT_SOURCE(key, liteParser, fullParser) \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, true)
+
+#define REGISTER_TEST_DOCUMENT_SOURCE(key, liteParser, fullParser) \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                        \
+        key, liteParser, fullParser, Command::testCommandsEnabled)
 
 /**
  * Registers a multi-stage alias (such as $sortByCount) to have the single name 'key'. When a stage
@@ -120,11 +131,19 @@ public:
 
     /**
      * A struct describing various constraints about where this stage can run, where it must be in
-     * the pipeline, and things like that.
+     * the pipeline, what resources it may require, etc.
      */
     struct StageConstraints {
         /**
-         * A Position describes a requirement of the position of the stage within the pipeline.
+         * A StreamType defines whether this stage is streaming (can produce output based solely on
+         * the current input document) or blocking (must examine subsequent documents before
+         * producing an output document).
+         */
+        enum class StreamType { kStreaming, kBlocking };
+
+        /**
+         * A PositionRequirement stipulates what specific position the stage must occupy within the
+         * pipeline, if any.
          */
         enum class PositionRequirement { kNone, kFirst, kLast };
 
@@ -132,15 +151,135 @@ public:
          * A HostTypeRequirement defines where this stage is permitted to be executed when the
          * pipeline is run on a sharded cluster.
          */
-        enum class HostTypeRequirement { kPrimaryShard, kAnyShard, kAnyShardOrMongoS };
+        enum class HostTypeRequirement {
+            // Indicates that the stage can run either on mongoD or mongoS.
+            kNone,
+            // Indicates that the stage must run on the host to which it was originally sent and
+            // cannot be forwarded from mongoS to the shards.
+            kLocalOnly,
+            // Indicates that the stage must run on the primary shard.
+            kPrimaryShard,
+            // Indicates that the stage must run on any participating shard.
+            kAnyShard,
+            // Indicates that the stage can only run on mongoS.
+            kMongoS,
+        };
 
-        // Set if this stage needs to be in a particular position of the pipeline.
-        PositionRequirement requiredPosition = PositionRequirement::kNone;
+        /**
+         * A DiskUseRequirement indicates whether this stage writes permanent data to disk, or
+         * whether it may spill temporary data to disk if its memory usage exceeds a given
+         * threshold. Note that this only indicates that the stage has the ability to spill; if
+         * 'allowDiskUse' is set to false, it will be prevented from doing so.
+         */
+        enum class DiskUseRequirement { kNoDiskUse, kWritesTmpData, kWritesPersistentData };
 
-        // Set if this stage can only be executed on specific components of a sharded cluster.
-        HostTypeRequirement hostRequirement = HostTypeRequirement::kAnyShard;
+        /**
+         * A ChangeStreamRequirement determines whether a particular stage is itself a ChangeStream
+         * stage, whether it is allowed to exist in a $changeStream pipeline, or whether it is
+         * blacklisted from $changeStream.
+         */
+        enum class ChangeStreamRequirement { kChangeStreamStage, kWhitelist, kBlacklist };
 
-        bool isAllowedInsideFacetStage = true;
+        /**
+         * A FacetRequirement indicates whether this stage may be used within a $facet pipeline.
+         */
+        enum class FacetRequirement { kAllowed, kNotAllowed };
+
+        StageConstraints(
+            StreamType streamType,
+            PositionRequirement requiredPosition,
+            HostTypeRequirement hostRequirement,
+            DiskUseRequirement diskRequirement,
+            FacetRequirement facetRequirement,
+            ChangeStreamRequirement changeStreamRequirement = ChangeStreamRequirement::kBlacklist)
+            : requiredPosition(requiredPosition),
+              hostRequirement(hostRequirement),
+              diskRequirement(diskRequirement),
+              changeStreamRequirement(changeStreamRequirement),
+              facetRequirement(facetRequirement),
+              streamType(streamType) {
+            // Stages which are allowed to run in $facet must not have any position requirements.
+            invariant(
+                !(isAllowedInsideFacetStage() && requiredPosition != PositionRequirement::kNone));
+
+            // No change stream stages are permitted to run in a $facet pipeline.
+            invariant(!(isChangeStreamStage() && isAllowedInsideFacetStage()));
+
+            // Only streaming stages are permitted in $changeStream pipelines.
+            invariant(!(isAllowedInChangeStream() && streamType == StreamType::kBlocking));
+
+            // A stage which is whitelisted for $changeStream cannot have a requirement to run on a
+            // shard, since it needs to be able to run on mongoS in a cluster.
+            invariant(!(changeStreamRequirement == ChangeStreamRequirement::kWhitelist &&
+                        (hostRequirement == HostTypeRequirement::kAnyShard ||
+                         hostRequirement == HostTypeRequirement::kPrimaryShard)));
+
+            // A stage which is whitelisted for $changeStream cannot have a position requirement.
+            invariant(!(changeStreamRequirement == ChangeStreamRequirement::kWhitelist &&
+                        requiredPosition != PositionRequirement::kNone));
+        }
+
+        /**
+         * Returns the literal HostTypeRequirement used to initialize the StageConstraints, or the
+         * effective HostTypeRequirement (kAnyShard or kMongoS) if kLocalOnly was specified.
+         */
+        HostTypeRequirement resolvedHostTypeRequirement(
+            const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
+            return (hostRequirement != HostTypeRequirement::kLocalOnly
+                        ? hostRequirement
+                        : (expCtx->inMongos ? HostTypeRequirement::kMongoS
+                                            : HostTypeRequirement::kAnyShard));
+        }
+
+        /**
+         * True if this stage must run on the same host to which it was originally sent.
+         */
+        bool mustRunLocally() const {
+            return hostRequirement == HostTypeRequirement::kLocalOnly;
+        }
+
+        /**
+         * True if this stage is permitted to run in a $facet pipeline.
+         */
+        bool isAllowedInsideFacetStage() const {
+            return facetRequirement == FacetRequirement::kAllowed;
+        }
+
+        /**
+         * True if this stage is permitted to run in a pipeline which starts with $changeStream.
+         */
+        bool isAllowedInChangeStream() const {
+            return changeStreamRequirement != ChangeStreamRequirement::kBlacklist;
+        }
+
+        /**
+         * True if this stage is itself a $changeStream stage, and is therefore implicitly allowed
+         * to run in a pipeline which begins with $changeStream.
+         */
+        bool isChangeStreamStage() const {
+            return changeStreamRequirement == ChangeStreamRequirement::kChangeStreamStage;
+        }
+
+        // Indicates whether this stage needs to be at a particular position in the pipeline.
+        const PositionRequirement requiredPosition;
+
+        // Indicates whether this stage can only be executed on specific components of a sharded
+        // cluster.
+        const HostTypeRequirement hostRequirement;
+
+        // Indicates whether this stage may write persistent data to disk, or may spill to temporary
+        // files if its memory usage becomes excessive.
+        const DiskUseRequirement diskRequirement;
+
+        // Indicates whether this stage is itself a $changeStream stage, or if not whether it may
+        // exist in a pipeline which begins with $changeStream.
+        const ChangeStreamRequirement changeStreamRequirement;
+
+        // Indicates whether this stage may run inside a $facet stage.
+        const FacetRequirement facetRequirement;
+
+        // Indicates whether this is a streaming or blocking stage.
+        const StreamType streamType;
 
         // True if this stage does not generate results itself, and instead pulls inputs from an
         // input DocumentSource (via 'pSource').
@@ -158,8 +297,12 @@ public:
         bool canSwapWithMatch = false;
     };
 
+    using ChangeStreamRequirement = StageConstraints::ChangeStreamRequirement;
     using HostTypeRequirement = StageConstraints::HostTypeRequirement;
     using PositionRequirement = StageConstraints::PositionRequirement;
+    using DiskUseRequirement = StageConstraints::DiskUseRequirement;
+    using FacetRequirement = StageConstraints::FacetRequirement;
+    using StreamType = StageConstraints::StreamType;
 
     /**
      * This is what is returned from the main DocumentSource API: getNext(). It is essentially a
@@ -253,11 +396,11 @@ public:
 
     /**
      * Returns a struct containing information about any special constraints imposed on using this
-     * stage.
+     * stage. Input parameter Pipeline::SplitState is used by stages whose requirements change
+     * depending on whether they are in a split or unsplit pipeline.
      */
-    virtual StageConstraints constraints() const {
-        return StageConstraints{};
-    }
+    virtual StageConstraints constraints(
+        Pipeline::SplitState = Pipeline::SplitState::kUnsplit) const = 0;
 
     /**
      * Informs the stage that it is no longer needed and can release its resources. After dispose()
@@ -537,12 +680,13 @@ public:
     virtual boost::intrusive_ptr<DocumentSource> getShardSource() = 0;
 
     /**
-     * Returns a source that combines results from the shards, or NULL if no work should be done in
-     * the merge pipeline for this stage. Must not mutate the existing source object; if different
-     * behaviour is required, a new source should be created and configured appropriately. It is an
-     * error for getMergeSource() to return a pointer to the same object as getShardSource().
+     * Returns a list of stages that combine results from the shards, or an empty list if no work
+     * should be done in the merge pipeline for this stage. Must not mutate the existing source
+     * object; if different behaviour is required, a new source should be created and configured
+     * appropriately. It is an error for getMergeSources() to return a pointer to the same object as
+     * getShardSource().
      */
-    virtual boost::intrusive_ptr<DocumentSource> getMergeSource() = 0;
+    virtual std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() = 0;
 
 protected:
     // It is invalid to delete through a SplittableDocumentSource-typed pointer.
@@ -550,20 +694,40 @@ protected:
 };
 
 
-/** This class marks DocumentSources which need mongod-specific functionality.
- *  It causes a MongodInterface to be injected when in a mongod and prevents mongos from
- *  merging pipelines containing this stage.
+/**
+ * This class marks DocumentSources which need functionality specific to a mongos or a mongod. It
+ * causes a MongodProcessInterface to be injected when in a mongod and a MongosProcessInterface when
+ * in a mongos.
  */
-class DocumentSourceNeedsMongod : public DocumentSource {
+class DocumentSourceNeedsMongoProcessInterface : public DocumentSource {
 public:
-    // Wraps mongod-specific functions to allow linking into mongos.
-    class MongodInterface {
+    /**
+     * Any functionality needed by an aggregation stage that is either context specific to a mongod
+     * or mongos process, or is only compiled in to one of those two binaries must be accessed via
+     * this interface. This allows all DocumentSources to be parsed on either mongos or mongod, but
+     * only executable where it makes sense.
+     */
+    class MongoProcessInterface {
     public:
         enum class CurrentOpConnectionsMode { kIncludeIdle, kExcludeIdle };
         enum class CurrentOpUserMode { kIncludeAll, kExcludeOthers };
         enum class CurrentOpTruncateMode { kNoTruncation, kTruncateOps };
 
-        virtual ~MongodInterface(){};
+        struct MakePipelineOptions {
+            MakePipelineOptions(){};
+
+            bool optimize = true;
+            bool attachCursorSource = true;
+
+            // Ordinarily, a MongoProcessInterface is injected into the pipeline at the point
+            // when the cursor source is added. If true, 'forceInjectMongoProcessInterface' will
+            // inject MongoProcessInterfaces into the pipeline even if 'attachCursorSource' is
+            // false. If 'attachCursorSource' is true, then the value of
+            // 'forceInjectMongoProcessInterface' is irrelevant.
+            bool forceInjectMongoProcessInterface = false;
+        };
+
+        virtual ~MongoProcessInterface(){};
 
         /**
          * Sets the OperationContext of the DBDirectClient returned by directClient(). This method
@@ -628,14 +792,30 @@ public:
             const std::list<BSONObj>& originalIndexes) = 0;
 
         /**
-         * Parses a Pipeline from a vector of BSONObjs representing DocumentSources and readies it
-         * for execution. The returned pipeline is optimized and has a cursor source prepared.
+         * Parses a Pipeline from a vector of BSONObjs representing DocumentSources. The state of
+         * the returned pipeline will depend upon the supplied MakePipelineOptions:
+         * - The boolean opts.optimize determines whether the pipeline will be optimized.
+         * - If opts.attachCursorSource is false, the pipeline will be returned without attempting
+         *   to add an initial cursor source.
+         * - If opts.forceInjectMongoProcessInterface is true, then a MongoProcessInterface will be
+         *   provided to each stage which requires one, regardless of whether a cursor source is
+         *   attached to the pipeline.
          *
          * This function returns a non-OK status if parsing the pipeline failed.
          */
         virtual StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> makePipeline(
             const std::vector<BSONObj>& rawPipeline,
-            const boost::intrusive_ptr<ExpressionContext>& expCtx) = 0;
+            const boost::intrusive_ptr<ExpressionContext>& expCtx,
+            const MakePipelineOptions opts = MakePipelineOptions{}) = 0;
+
+        /**
+         * Attaches a cursor source to the start of a pipeline. Performs no further optimization.
+         * This function asserts if the collection to be aggregated is sharded. NamespaceNotFound
+         * will be returned if ExpressionContext has a UUID and that UUID doesn't exist anymore.
+         * That should be the only case where NamespaceNotFound is returned.
+         */
+        virtual Status attachCursorSourceToPipeline(
+            const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) = 0;
 
         /**
          * Returns a vector of owned BSONObjs, each of which contains details of an in-progress
@@ -655,22 +835,23 @@ public:
         // Add new methods as needed.
     };
 
-    DocumentSourceNeedsMongod(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+    DocumentSourceNeedsMongoProcessInterface(const boost::intrusive_ptr<ExpressionContext>& expCtx)
         : DocumentSource(expCtx) {}
 
-    void injectMongodInterface(std::shared_ptr<MongodInterface> mongod) {
-        _mongod = mongod;
-        doInjectMongodInterface(mongod);
+    void injectMongoProcessInterface(std::shared_ptr<MongoProcessInterface> mongoProcessInterface) {
+        _mongoProcessInterface = mongoProcessInterface;
+        doInjectMongoProcessInterface(mongoProcessInterface);
     }
 
     /**
      * Derived classes may override this method to register custom inject functionality.
      */
-    virtual void doInjectMongodInterface(std::shared_ptr<MongodInterface> mongod) {}
+    virtual void doInjectMongoProcessInterface(
+        std::shared_ptr<MongoProcessInterface> mongoProcessInterface) {}
 
     void detachFromOperationContext() override {
-        invariant(_mongod);
-        _mongod->setOperationContext(nullptr);
+        invariant(_mongoProcessInterface);
+        _mongoProcessInterface->setOperationContext(nullptr);
         doDetachFromOperationContext();
     }
 
@@ -680,8 +861,8 @@ public:
     virtual void doDetachFromOperationContext() {}
 
     void reattachToOperationContext(OperationContext* opCtx) final {
-        invariant(_mongod);
-        _mongod->setOperationContext(opCtx);
+        invariant(_mongoProcessInterface);
+        _mongoProcessInterface->setOperationContext(opCtx);
         doReattachToOperationContext(opCtx);
     }
 
@@ -691,11 +872,11 @@ public:
     virtual void doReattachToOperationContext(OperationContext* opCtx) {}
 
 protected:
-    // It is invalid to delete through a DocumentSourceNeedsMongod-typed pointer.
-    virtual ~DocumentSourceNeedsMongod() {}
+    // It is invalid to delete through a DocumentSourceNeedsMongoProcessInterface-typed pointer.
+    virtual ~DocumentSourceNeedsMongoProcessInterface() {}
 
-    // Gives subclasses access to a MongodInterface implementation
-    std::shared_ptr<MongodInterface> _mongod;
+    // Gives subclasses access to a MongoProcessInterface implementation
+    std::shared_ptr<MongoProcessInterface> _mongoProcessInterface;
 };
 
 

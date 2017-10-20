@@ -43,12 +43,16 @@ class OperationContext;
 class SessionsCollectionStandalone : public SessionsCollection {
 public:
     /**
+     * Ensures that the sessions collection exists and has the proper indexes.
+     */
+    Status setupSessionsCollection(OperationContext* opCtx) override;
+
+    /**
      * Updates the last-use times on the given sessions to be greater than
      * or equal to the current time.
      */
     Status refreshSessions(OperationContext* opCtx,
-                           const LogicalSessionRecordSet& sessions,
-                           Date_t refreshTime) override;
+                           const LogicalSessionRecordSet& sessions) override;
 
     /**
      * Removes the authoritative records for the specified sessions.
@@ -57,6 +61,9 @@ public:
 
     StatusWith<LogicalSessionIdSet> findRemovedSessions(
         OperationContext* opCtx, const LogicalSessionIdSet& sessions) override;
+
+    Status removeTransactionRecords(OperationContext* opCtx,
+                                    const LogicalSessionIdSet& sessions) override;
 };
 
 }  // namespace mongo

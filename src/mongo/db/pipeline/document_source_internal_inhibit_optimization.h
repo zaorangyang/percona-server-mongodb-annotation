@@ -52,10 +52,12 @@ public:
         return kStageName.rawData();
     }
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
-        return constraints;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed};
     }
 
     GetNextResult getNext() final;

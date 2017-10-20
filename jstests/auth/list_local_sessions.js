@@ -1,4 +1,4 @@
-// All tests for the $listLocalSessions aggregateion stage.
+// All tests for the $listLocalSessions aggregation stage.
 
 (function() {
     'use strict';
@@ -59,11 +59,6 @@
     const mongod = MongoRunner.runMongod({auth: ""});
     runListLocalSessionsTest(mongod);
     MongoRunner.stopMongod(mongod);
-
-    if (true) {
-        // TODO SERVER-29141: Support forcing pipelines to run on mongos
-        return;
-    }
 
     const st =
         new ShardingTest({shards: 1, mongos: 1, config: 1, other: {keyFile: 'jstests/libs/key1'}});

@@ -420,7 +420,8 @@ void State::prepTempCollection() {
             CollectionOptions options;
             options.setNoIdIndex();
             options.temp = true;
-            if (enableCollectionUUIDs) {
+            if (enableCollectionUUIDs &&
+                serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
                 options.uuid.emplace(UUID::gen());
             }
             incColl = incCtx.db()->createCollection(_opCtx, _config.incLong.ns(), options);
@@ -456,6 +457,20 @@ void State::prepTempCollection() {
         if (finalColl) {
             finalOptions = finalColl->getCatalogEntry()->getCollectionOptions(_opCtx);
 
+            if (_config.finalOutputCollUUID) {
+                // The final output collection's UUID is passed from mongos if the final output
+                // collection is sharded. If a UUID was sent, ensure it matches what's on this
+                // shard.
+                uassert(ErrorCodes::InternalError,
+                        str::stream()
+                            << "UUID sent by mongos for sharded final output collection "
+                            << _config.outputOptions.finalNamespace.ns()
+                            << " does not match UUID for the existing collection with that "
+                               "name on this shard",
+                        finalColl->getCatalogEntry()->isEqualToMetadataUUID(
+                            _opCtx, _config.finalOutputCollUUID));
+            }
+
             IndexCatalog::IndexIterator ii =
                 finalColl->getIndexCatalog()->getIndexIterator(_opCtx, true);
             // Iterate over finalColl's indexes.
@@ -490,8 +505,13 @@ void State::prepTempCollection() {
 
         CollectionOptions options = finalOptions;
         options.temp = true;
-        if (enableCollectionUUIDs) {
-            options.uuid.emplace(UUID::gen());
+        if (enableCollectionUUIDs && serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
+            // If a UUID for the final output collection was sent by mongos (i.e., the final output
+            // collection is sharded), use the UUID mongos sent when creating the temp collection.
+            // When the temp collection is renamed to the final output collection, the UUID will be
+            // preserved.
+            options.uuid.emplace(_config.finalOutputCollUUID ? *_config.finalOutputCollUUID
+                                                             : UUID::gen());
         }
         tempColl = tempCtx.db()->createCollection(_opCtx, _config.tempNamespace.ns(), options);
 
@@ -1102,8 +1122,7 @@ void State::finalReduce(OperationContext* opCtx, CurOp* curOp, ProgressMeterHold
                                      std::move(qr),
                                      expCtx,
                                      extensionsCallback,
-                                     MatchExpressionParser::kAllowAllSpecialFeatures &
-                                         ~MatchExpressionParser::AllowedFeatures::kExpr);
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     verify(statusWithCQ.isOK());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
@@ -1469,13 +1488,12 @@ public:
                 const ExtensionsCallbackReal extensionsCallback(opCtx, &config.nss);
 
                 const boost::intrusive_ptr<ExpressionContext> expCtx;
-                auto statusWithCQ = CanonicalQuery::canonicalize(
-                    opCtx,
-                    std::move(qr),
-                    expCtx,
-                    extensionsCallback,
-                    MatchExpressionParser::kAllowAllSpecialFeatures &
-                        ~MatchExpressionParser::AllowedFeatures::kExpr);
+                auto statusWithCQ =
+                    CanonicalQuery::canonicalize(opCtx,
+                                                 std::move(qr),
+                                                 expCtx,
+                                                 extensionsCallback,
+                                                 MatchExpressionParser::kAllowAllSpecialFeatures);
                 if (!statusWithCQ.isOK()) {
                     uasserted(17238, "Can't canonicalize query " + config.filter.toString());
                     return 0;
@@ -1635,7 +1653,7 @@ public:
                 errmsg = "there were emits but no data!";
                 return false;
             }
-        } catch (SendStaleConfigException& e) {
+        } catch (StaleConfigException& e) {
             log() << "mr detected stale config, should retry" << redact(e);
             throw e;
         }
@@ -1718,6 +1736,18 @@ public:
         CurOp* curOp = CurOp::get(opCtx);
 
         Config config(dbname, cmdObj.firstElement().embeddedObjectUserCheck());
+
+        if (cmdObj["finalOutputCollIsSharded"].trueValue() &&
+            serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "This shard has feature compatibility version 3.6, so it expects mongos to "
+                    "send the UUID to use for the sharded output collection. Was the mapReduce "
+                    "request sent from a 3.4 mongos?",
+                    cmdObj.hasField("shardedOutputCollUUID"));
+            config.finalOutputCollUUID =
+                uassertStatusOK(UUID::parse(cmdObj["shardedOutputCollUUID"]));
+        }
+
         State state(opCtx, config);
         state.init();
 

@@ -34,6 +34,7 @@
 #include "mongo/client/query.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 
 namespace mongo {
 
@@ -44,23 +45,44 @@ BSONObj lsidQuery(const LogicalSessionId& lsid) {
 }
 }  // namespace
 
-Status SessionsCollectionStandalone::refreshSessions(OperationContext* opCtx,
-                                                     const LogicalSessionRecordSet& sessions,
-                                                     Date_t refreshTime) {
+Status SessionsCollectionStandalone::setupSessionsCollection(OperationContext* opCtx) {
     DBDirectClient client(opCtx);
-    return doRefresh(sessions, refreshTime, makeSendFnForBatchWrite(&client));
+    auto cmd = generateCreateIndexesCmd();
+    BSONObj info;
+    if (!client.runCommand(kSessionsDb.toString(), cmd, info)) {
+        return getStatusFromCommandResult(info);
+    }
+
+    return Status::OK();
+}
+
+Status SessionsCollectionStandalone::refreshSessions(OperationContext* opCtx,
+                                                     const LogicalSessionRecordSet& sessions) {
+    DBDirectClient client(opCtx);
+    return doRefresh(kSessionsNamespaceString,
+                     sessions,
+                     makeSendFnForBatchWrite(kSessionsNamespaceString, &client));
 }
 
 Status SessionsCollectionStandalone::removeRecords(OperationContext* opCtx,
                                                    const LogicalSessionIdSet& sessions) {
     DBDirectClient client(opCtx);
-    return doRemove(sessions, makeSendFnForBatchWrite(&client));
+    return doRemove(kSessionsNamespaceString,
+                    sessions,
+                    makeSendFnForBatchWrite(kSessionsNamespaceString, &client));
 }
 
 StatusWith<LogicalSessionIdSet> SessionsCollectionStandalone::findRemovedSessions(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
     DBDirectClient client(opCtx);
-    return doFetch(sessions, makeFindFnForCommand(&client));
+    return doFetch(kSessionsNamespaceString,
+                   sessions,
+                   makeFindFnForCommand(kSessionsNamespaceString, &client));
+}
+
+Status SessionsCollectionStandalone::removeTransactionRecords(OperationContext* opCtx,
+                                                              const LogicalSessionIdSet& sessions) {
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace mongo

@@ -34,7 +34,11 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/query_request.h"
+#include "mongo/db/sessions_collection_rs.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/commands/cluster_write.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_find.h"
 #include "mongo/s/write_ops/batch_write_exec.h"
 #include "mongo/s/write_ops/batched_command_request.h"
@@ -51,9 +55,28 @@ BSONObj lsidQuery(const LogicalSessionId& lsid) {
 
 }  // namespace
 
+Status SessionsCollectionSharded::_checkCacheForSessionsCollection(OperationContext* opCtx) {
+    // If the collection doesn't exist, fail. Only the config servers generate it.
+    auto res = Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
+        opCtx, NamespaceString(SessionsCollection::kSessionsFullNS.toString()));
+    if (!res.isOK()) {
+        return res.getStatus();
+    }
+
+    auto routingInfo = res.getValue();
+    if (routingInfo.cm()) {
+        return Status::OK();
+    }
+
+    return {ErrorCodes::NamespaceNotFound, "config.system.sessions is not yet sharded"};
+}
+
+Status SessionsCollectionSharded::setupSessionsCollection(OperationContext* opCtx) {
+    return _checkCacheForSessionsCollection(opCtx);
+}
+
 Status SessionsCollectionSharded::refreshSessions(OperationContext* opCtx,
-                                                  const LogicalSessionRecordSet& sessions,
-                                                  Date_t refreshTime) {
+                                                  const LogicalSessionRecordSet& sessions) {
     auto send = [&](BSONObj toSend) {
         auto opMsg = OpMsgRequest::fromDBAndBody(SessionsCollection::kSessionsDb, toSend);
         auto request = BatchedCommandRequest::parseUpdate(opMsg);
@@ -71,7 +94,7 @@ Status SessionsCollectionSharded::refreshSessions(OperationContext* opCtx,
         return Status(error, response.getErrMessage());
     };
 
-    return doRefresh(sessions, refreshTime, send);
+    return doRefresh(kSessionsNamespaceString, sessions, send);
 }
 
 Status SessionsCollectionSharded::removeRecords(OperationContext* opCtx,
@@ -94,7 +117,7 @@ Status SessionsCollectionSharded::removeRecords(OperationContext* opCtx,
         return Status(error, response.getErrMessage());
     };
 
-    return doRemove(sessions, send);
+    return doRemove(kSessionsNamespaceString, sessions, send);
 }
 
 StatusWith<LogicalSessionIdSet> SessionsCollectionSharded::findRemovedSessions(
@@ -113,8 +136,7 @@ StatusWith<LogicalSessionIdSet> SessionsCollectionSharded::findRemovedSessions(
                                                std::move(qr.getValue()),
                                                expCtx,
                                                ExtensionsCallbackNoop(),
-                                               MatchExpressionParser::kAllowAllSpecialFeatures &
-                                                   ~MatchExpressionParser::AllowedFeatures::kExpr);
+                                               MatchExpressionParser::kBanAllSpecialFeatures);
         if (!cq.isOK()) {
             return cq.getStatus();
         }
@@ -140,7 +162,12 @@ StatusWith<LogicalSessionIdSet> SessionsCollectionSharded::findRemovedSessions(
         return result.obj();
     };
 
-    return doFetch(sessions, send);
+    return doFetch(kSessionsNamespaceString, sessions, send);
+}
+
+Status SessionsCollectionSharded::removeTransactionRecords(OperationContext* opCtx,
+                                                           const LogicalSessionIdSet& sessions) {
+    return SessionsCollectionRS::removeTransactionRecordsHelper(opCtx, sessions);
 }
 
 }  // namespace mongo

@@ -1,4 +1,4 @@
-// Test stepdown dring drain mode
+// Test stepdown during drain mode
 // 1. Set up a 3-node set. Assume Node 1 is the primary at the beginning for simplicity.
 // 2. Prevent applying retrieved ops on all secondaries, including Node 2.
 // 3. Insert data to ensure Node 2 has ops to apply in its queue.

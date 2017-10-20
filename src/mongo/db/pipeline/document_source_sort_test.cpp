@@ -131,7 +131,7 @@ TEST_F(DocumentSourceSortTest, SortWithLimit) {
         ASSERT_BSONOBJ_EQ(arr[0].getDocument().toBson(), BSON("$sort" << BSON("a" << 1)));
 
         ASSERT(sort()->getShardSource() != nullptr);
-        ASSERT(sort()->getMergeSource() != nullptr);
+        ASSERT(!sort()->getMergeSources().empty());
     }
 
     container.push_back(DocumentSourceLimit::create(expCtx, 10));
@@ -158,7 +158,7 @@ TEST_F(DocumentSourceSortTest, SortWithLimit) {
         DOC_ARRAY(DOC("$sort" << DOC("a" << 1)) << DOC("$limit" << sort()->getLimit())));
 
     ASSERT(sort()->getShardSource() != nullptr);
-    ASSERT(sort()->getMergeSource() != nullptr);
+    ASSERT(!sort()->getMergeSources().empty());
 }
 
 TEST_F(DocumentSourceSortTest, Dependencies) {
@@ -402,7 +402,7 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldBeAbleToPauseLoadingWhileSpilled) 
     // Allow the $sort stage to spill to disk.
     unittest::TempDir tempDir("DocumentSourceSortTest");
     expCtx->tempDir = tempDir.path();
-    expCtx->extSortAllowed = true;
+    expCtx->allowDiskUse = true;
     const size_t maxMemoryUsageBytes = 1000;
 
     auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);
@@ -436,7 +436,7 @@ TEST_F(DocumentSourceSortExecutionTest, ShouldBeAbleToPauseLoadingWhileSpilled) 
 TEST_F(DocumentSourceSortExecutionTest,
        ShouldErrorIfNotAllowedToSpillToDiskAndResultSetIsTooLarge) {
     auto expCtx = getExpCtx();
-    expCtx->extSortAllowed = false;
+    expCtx->allowDiskUse = false;
     const size_t maxMemoryUsageBytes = 1000;
 
     auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);
@@ -451,7 +451,7 @@ TEST_F(DocumentSourceSortExecutionTest,
 
 TEST_F(DocumentSourceSortExecutionTest, ShouldCorrectlyTrackMemoryUsageBetweenPauses) {
     auto expCtx = getExpCtx();
-    expCtx->extSortAllowed = false;
+    expCtx->allowDiskUse = false;
     const size_t maxMemoryUsageBytes = 1000;
 
     auto sort = DocumentSourceSort::create(expCtx, BSON("_id" << -1), -1, maxMemoryUsageBytes);

@@ -111,6 +111,20 @@ var roles_read = {
     root: 1,
     __system: 1
 };
+var roles_userAdmin = {
+    userAdmin: 1,
+    dbOwner: 1,
+    userAdminAnyDatabase: 1,
+    restore: 1,
+    root: 1,
+    __system: 1,
+};
+var roles_userAdminAny = {
+    userAdminAnyDatabase: 1,
+    restore: 1,
+    root: 1,
+    __system: 1,
+};
 var roles_readAny = {readAnyDatabase: 1, readWriteAnyDatabase: 1, backup: 1, root: 1, __system: 1};
 var roles_dbAdmin = {dbAdmin: 1, dbAdminAnyDatabase: 1, dbOwner: 1, root: 1, __system: 1};
 var roles_dbAdminAny = {dbAdminAnyDatabase: 1, root: 1, __system: 1};
@@ -162,6 +176,8 @@ var roles_all = {
     root: 1,
     __system: 1
 };
+
+load("jstests/libs/uuid_util.js");
 
 var authCommandsLib = {
 
@@ -661,10 +677,19 @@ var authCommandsLib = {
           skipSharded: true
         },
         {
+          testname: "aggregate_listLocalCursors",
+          command: {aggregate: 1, pipeline: [{$listLocalCursors: {}}], cursor: {}},
+          testcases: [{
+              runOnDb: adminDbName,
+              roles:
+                  {clusterAdmin: 1, clusterMonitor: 1, clusterManager: 1, root: 1, __system: 1}
+          }],
+        },
+        {
           testname: "aggregate_listLocalSessions_allUsers_true",
           command: {aggregate: 1, pipeline: [{$listLocalSessions: {allUsers: true}}], cursor: {}},
           testcases: [{
-              runOnDb: adminDbName,
+              runOnDb: "config",
               roles:
                   {clusterAdmin: 1, clusterMonitor: 1, clusterManager: 1, root: 1, __system: 1}
           }],
@@ -684,7 +709,7 @@ var authCommandsLib = {
               cursor: {}
           },
           testcases: [{
-              runOnDb: adminDbName,
+              runOnDb: "config",
               roles:
                   {clusterAdmin: 1, clusterMonitor: 1, clusterManager: 1, root: 1, __system: 1}
           }]
@@ -696,7 +721,7 @@ var authCommandsLib = {
               pipeline: [{$listSessions: {allUsers: false}}],
               cursor: {}
           },
-          testcases: [{runOnDb: adminDbName, roles: roles_all}]
+          testcases: [{runOnDb: "config", roles: roles_all}]
         },
         {
           testname: "aggregate_lookup",
@@ -1071,6 +1096,44 @@ var authCommandsLib = {
                     {resource: {db: secondDbName, collection: "view1"}, actions: ["find"]},
                     {resource: {db: secondDbName, collection: "view2"}, actions: ["find"]}
                 ]
+              }
+          ]
+        },
+        {
+          testname: "aggregate_changeStream",
+          command: {aggregate: "foo", pipeline: [{$changeStream: {}}], cursor: {}},
+          setup: function(db) {
+              db.createCollection("foo");
+          },
+          teardown: function(db) {
+              db.foo.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: {
+                    read: 1,
+                    readAnyDatabase: 1,
+                    readWrite: 1,
+                    readWriteAnyDatabase: 1,
+                    dbOwner: 1,
+                    root: 1,
+                    __system: 1
+                },
+                privileges: [{
+                    resource: {db: firstDbName, collection: "foo"},
+                    actions: ["changeStream", "find"]
+                }],
+                expectFail: true,  // because no replication enabled
+              },
+              {
+                runOnDb: secondDbName,
+                roles: {readAnyDatabase: 1, readWriteAnyDatabase: 1, root: 1, __system: 1},
+                privileges: [{
+                    resource: {db: secondDbName, collection: "foo"},
+                    actions: ["changeStream", "find"]
+                }],
+                expectFail: true,  // because no replication enabled
               }
           ]
         },
@@ -1654,6 +1717,67 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "createRole_authenticationRestrictions",
+          command: {
+              createRole: "testRole",
+              roles: [],
+              privileges: [],
+              authenticationRestrictions: [{clientSource: ["127.0.0.1"]}]
+          },
+          teardown: function(db) {
+              db.runCommand({dropRole: "testRole"});
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_userAdmin,
+                privileges: [{
+                    resource: {db: firstDbName, collection: ""},
+                    actions: ["createRole", "setAuthenticationRestriction"]
+                }],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_userAdminAny,
+                privileges: [{
+                    resource: {db: secondDbName, collection: ""},
+                    actions: ["createRole", "setAuthenticationRestriction"]
+                }],
+              }
+
+          ],
+        },
+        {
+          testname: "createUser_authenticationRestrictions",
+          command: {
+              createUser: "testUser",
+              pwd: "test",
+              roles: [],
+              authenticationRestrictions: [{clientSource: ["127.0.0.1"]}]
+          },
+          teardown: function(db) {
+              db.runCommand({dropUser: "testUser"});
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_userAdmin,
+                privileges: [{
+                    resource: {db: firstDbName, collection: ""},
+                    actions: ["createUser", "setAuthenticationRestriction"]
+                }],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_userAdminAny,
+                privileges: [{
+                    resource: {db: secondDbName, collection: ""},
+                    actions: ["createUser", "setAuthenticationRestriction"]
+                }],
+              }
+          ],
+        },
+        {
           testname: "balancerStart",
           command: {balancerStart: 1},
           skipStandalone: true,
@@ -1728,6 +1852,31 @@ var authCommandsLib = {
                 roles: roles_readAny,
                 privileges: [{resource: {db: secondDbName, collection: "x"}, actions: ["find"]}]
               }
+          ]
+        },
+        {
+          testname: "countWithUUID",
+          command: function(state) {
+              return {count: state.uuid};
+          },
+          skipSharded: true,
+          setup: function(db) {
+              db.runCommand({create: "foo"});
+
+              return {uuid: getUUIDFromListCollections(db, db.foo.getName())};
+          },
+          teardown: function(db) {
+              db.foo.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: {__system: 1, root: 1, backup: 1},
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {cluster: true}, actions: ["useUUID"]}
+                ],
+              },
           ]
         },
         {
@@ -2246,20 +2395,6 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "diagLogging",
-          command: {diagLogging: 1},
-          skipSharded: true,
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: roles_hostManager,
-                privileges: [{resource: {cluster: true}, actions: ["diagLogging"]}]
-              },
-              {runOnDb: firstDbName, roles: {}},
-              {runOnDb: secondDbName, roles: {}}
-          ]
-        },
-        {
           testname: "distinct",
           command: {distinct: "coll", key: "a", query: {}},
           testcases: [
@@ -2659,6 +2794,31 @@ var authCommandsLib = {
                 expectFail: true  // because of invalid limit
               },
           ]
+        },
+        {
+          testname: "findWithUUID",
+          command: function(state) {
+              return {find: state.uuid};
+          },
+          skipSharded: true,
+          setup: function(db) {
+              db.runCommand({create: "foo"});
+
+              return {uuid: getUUIDFromListCollections(db, db.foo.getName())};
+          },
+          teardown: function(db) {
+              db.foo.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: {__system: 1, root: 1, backup: 1},
+                privileges: [
+                    {resource: {db: firstDbName, collection: "foo"}, actions: ["find"]},
+                    {resource: {cluster: true}, actions: ["useUUID"]}
+                ],
+              },
+          ],
         },
         {
           testname: "findAndModify",
@@ -3354,6 +3514,42 @@ var authCommandsLib = {
               }
           ]
         },
+        {
+          testname: "listIndexesWithUUID",
+          command: function(state) {
+              return {listIndexes: state.uuid};
+          },
+          skipSharded: true,
+          setup: function(db) {
+              db.x.insert({_id: 5});
+              db.x.insert({_id: 6});
+
+              return {uuid: getUUIDFromListCollections(db, db.x.getName())};
+          },
+          teardown: function(db) {
+              db.x.drop();
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: {backup: 1, root: 1, __system: 1},
+                privileges: [
+                    {resource: {db: firstDbName, collection: ""}, actions: ["listIndexes"]},
+                    {resource: {cluster: true}, actions: ["useUUID"]}
+                ]
+              },
+              // Test legacy (pre 3.0) way of authorizing listIndexes.
+              {
+                runOnDb: firstDbName,
+                privileges: [
+                    {resource: {db: firstDbName, collection: "system.indexes"}, actions: ["find"]},
+                    {resource: {cluster: true}, actions: ["useUUID"]}
+
+                ]
+              }
+          ]
+        },
+
         {
           testname: "listShards",
           command: {listShards: 1},
@@ -4331,6 +4527,79 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "updateRole_authenticationRestrictions",
+          command: {updateRole: "testRole", authenticationRestrictions: []},
+          setup: function(db) {
+              db.runCommand({
+                  createRole: "testRole",
+                  roles: [],
+                  privileges: [],
+                  authenticationRestrictions: [{clientSource: ["127.0.0.1"]}]
+              });
+          },
+          teardown: function(db) {
+              db.runCommand({dropRole: "testRole"});
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_userAdminAny,
+                privileges: [
+                    {resource: {db: "", collection: ""}, actions: ["revokeRole"]},
+                    {
+                      resource: {db: firstDbName, collection: ""},
+                      actions: ["setAuthenticationRestriction"]
+                    }
+                ],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_userAdminAny,
+                privileges: [
+                    {resource: {db: "", collection: ""}, actions: ["revokeRole"]},
+                    {
+                      resource: {db: secondDbName, collection: ""},
+                      actions: ["setAuthenticationRestriction"]
+                    }
+                ],
+              }
+
+          ],
+        },
+        {
+          testname: "updateUser_authenticationRestrictions",
+          command: {updateUser: "testUser", authenticationRestrictions: []},
+          setup: function(db) {
+              db.runCommand({
+                  createUser: "testUser",
+                  pwd: "test",
+                  roles: [],
+                  authenticationRestrictions: [{clientSource: ["127.0.0.1"]}]
+              });
+          },
+          teardown: function(db) {
+              db.runCommand({dropUser: "testUser"});
+          },
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_userAdmin,
+                privileges: [{
+                    resource: {db: firstDbName, collection: ""},
+                    actions: ["setAuthenticationRestriction"]
+                }],
+              },
+              {
+                runOnDb: secondDbName,
+                roles: roles_userAdminAny,
+                privileges: [{
+                    resource: {db: secondDbName, collection: ""},
+                    actions: ["setAuthenticationRestriction"]
+                }],
+              }
+          ],
+        },
+        {
           testname: "validate",
           command: {validate: "x"},
           setup: function(db) {
@@ -4468,6 +4737,19 @@ var authCommandsLib = {
           command: {refreshSessionsInternal: []},
           testcases: [{runOnDb: adminDbName, roles: {__system: 1}}],
         },
+        {
+          testname: "_getNextSessionMods",
+          command: {_getNextSessionMods: "a-b"},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+          ]
+        },
     ],
 
     /************* SHARED TEST LOGIC ****************/
@@ -4512,10 +4794,13 @@ var authCommandsLib = {
         var adminDb = conn.getDB(adminDbName);
         if (t.setup) {
             adminDb.auth("admin", "password");
-            t.setup(runOnDb);
+            var state = t.setup(runOnDb);
             runOnDb.getLastError();
             adminDb.logout();
+            return state;
         }
+
+        return {};
     },
 
     authenticatedSetup: function(t, runOnDb) {

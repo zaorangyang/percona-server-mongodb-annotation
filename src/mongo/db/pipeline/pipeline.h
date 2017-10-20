@@ -33,10 +33,13 @@
 
 #include <boost/intrusive_ptr.hpp>
 
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/query_knobs.h"
+#include "mongo/stdx/functional.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/timer.h"
 
@@ -55,6 +58,12 @@ class OperationContext;
 class Pipeline {
 public:
     typedef std::list<boost::intrusive_ptr<DocumentSource>> SourceContainer;
+
+    /**
+     * A SplitState specifies whether the pipeline is currently unsplit, split for the shards, or
+     * split for merging.
+     */
+    enum class SplitState { kUnsplit, kSplitForShards, kSplitForMerge };
 
     /**
      * This class will ensure a Pipeline is disposed before it is deleted.
@@ -95,6 +104,14 @@ public:
 
         bool _dismissed = false;
     };
+
+    /**
+     * List of supported match expression features in a pipeline.
+     */
+    static constexpr MatchExpressionParser::AllowedFeatureSet kAllowedMatcherFeatures =
+        MatchExpressionParser::AllowedFeatures::kText |
+        MatchExpressionParser::AllowedFeatures::kExpr |
+        MatchExpressionParser::AllowedFeatures::kJSONSchema;
 
     /**
      * Parses a Pipeline from a vector of BSONObjs. Returns a non-OK status if it failed to parse.
@@ -193,11 +210,18 @@ public:
     void unsplitFromSharded(std::unique_ptr<Pipeline, Pipeline::Deleter> pipelineForMergingShard);
 
     /**
+     * Returns true if this pipeline has not been split.
+     */
+    bool isUnsplit() const {
+        return _splitState == SplitState::kUnsplit;
+    }
+
+    /**
      * Returns true if this pipeline is the part of a split pipeline which should be targeted to the
      * shards.
      */
-    bool isSplitForSharded() const {
-        return _splitForSharded;
+    bool isSplitForShards() const {
+        return _splitState == SplitState::kSplitForShards;
     }
 
     /**
@@ -205,7 +229,7 @@ public:
      * merging the results from the shards.
      */
     bool isSplitForMerge() const {
-        return _splitForMerge;
+        return _splitState == SplitState::kSplitForMerge;
     }
 
     /** If the pipeline starts with a $match, return its BSON predicate.
@@ -219,9 +243,16 @@ public:
     bool needsPrimaryShardMerger() const;
 
     /**
-     * Returns whether or not every DocumentSource in the pipeline can run on mongoS.
+     * Returns true if the pipeline can run on mongoS, but is not obliged to; that is, it can run
+     * either on mongoS or on a shard.
      */
     bool canRunOnMongos() const;
+
+    /**
+     * Returns true if this pipeline must only run on mongoS. Can be called on unsplit or merge
+     * pipelines, but not on the shards part of a split pipeline.
+     */
+    bool requiredToRunOnMongos() const;
 
     /**
      * Modifies the pipeline, optimizing it by combining and swapping stages.
@@ -239,8 +270,10 @@ public:
      */
     std::vector<Value> serialize() const;
 
-    /// The initial source is special since it varies between mongos and mongod.
+    // The initial source is special since it varies between mongos and mongod.
     void addInitialSource(boost::intrusive_ptr<DocumentSource> source);
+
+    void addFinalSource(boost::intrusive_ptr<DocumentSource> source);
 
     /**
      * Returns the next result from the pipeline, or boost::none if there are no more results.
@@ -264,10 +297,13 @@ public:
     }
 
     /**
-     * Removes and returns the first stage of the pipeline if its name is 'targetStageName'. Returns
-     * nullptr if there is no first stage, or if the stage's name is not 'targetStageName'.
+     * Removes and returns the first stage of the pipeline if its name is 'targetStageName' and the
+     * given 'predicate' function, if present, returns 'true' when called with a pointer to the
+     * stage. Returns nullptr if there is no first stage which meets these criteria.
      */
-    boost::intrusive_ptr<DocumentSource> popFrontStageWithName(StringData targetStageName);
+    boost::intrusive_ptr<DocumentSource> popFrontWithCriteria(
+        StringData targetStageName,
+        stdx::function<bool(const DocumentSource* const)> predicate = nullptr);
 
     /**
      * PipelineD is a "sister" class that has additional functionality for the Pipeline. It exists
@@ -346,6 +382,12 @@ private:
      */
     void ensureAllStagesAreInLegalPositions() const;
 
+    /**
+     * Returns Status::OK if the pipeline can run on mongoS, or an error with a message explaining
+     * why it cannot.
+     */
+    Status _pipelineCanRunOnMongoS() const;
+
     SourceContainer _sources;
 
     // When a pipeline is split via splitForSharded(), the resulting shards pipeline will set
@@ -354,9 +396,8 @@ private:
     // pipeline, if necessary.
     boost::optional<SourceContainer> _unsplitSources;
 
+    SplitState _splitState = SplitState::kUnsplit;
     boost::intrusive_ptr<ExpressionContext> pCtx;
-    bool _splitForSharded = false;
-    bool _splitForMerge = false;
     bool _disposed = false;
 };
 }  // namespace mongo

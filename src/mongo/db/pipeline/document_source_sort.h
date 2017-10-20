@@ -62,15 +62,18 @@ public:
         return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
     }
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        // Can't swap with a $match if a limit has been absorbed, since in general match can't swap
-        // with limit.
-        constraints.canSwapWithMatch = !limitSrc;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(
+            _mergingPresorted ? StreamType::kStreaming : StreamType::kBlocking,
+            PositionRequirement::kNone,
+            HostTypeRequirement::kNone,
+            _mergingPresorted ? DiskUseRequirement::kNoDiskUse : DiskUseRequirement::kWritesTmpData,
+            _mergingPresorted ? FacetRequirement::kNotAllowed : FacetRequirement::kAllowed,
+            _mergingPresorted ? ChangeStreamRequirement::kWhitelist
+                              : ChangeStreamRequirement::kBlacklist);
 
-        // Can run on mongoS only if this stage is merging presorted streams.
-        constraints.hostRequirement = (_mergingPresorted ? HostTypeRequirement::kAnyShardOrMongoS
-                                                         : HostTypeRequirement::kAnyShard);
+        // Can't swap with a $match if a limit has been absorbed, as $match can't swap with $limit.
+        constraints.canSwapWithMatch = !limitSrc;
         return constraints;
     }
 
@@ -81,7 +84,7 @@ public:
     GetDepsReturn getDependencies(DepsTracker* deps) const final;
 
     boost::intrusive_ptr<DocumentSource> getShardSource() final;
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final;
+    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final;
 
     /**
      * Write out a Document whose contents are the sort key pattern.
@@ -101,7 +104,15 @@ public:
         const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
         BSONObj sortOrder,
         long long limit = -1,
-        uint64_t maxMemoryUsageBytes = kMaxMemoryUsageBytes);
+        uint64_t maxMemoryUsageBytes = kMaxMemoryUsageBytes,
+        bool mergingPresorted = false);
+
+    /**
+     * Returns true if this $sort stage is merging presorted streams.
+     */
+    bool mergingPresorted() const {
+        return _mergingPresorted;
+    }
 
     /**
      * Returns -1 for no limit.

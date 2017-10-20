@@ -206,7 +206,7 @@ bool handleError(OperationContext* opCtx,
     }
 
     if (ErrorCodes::isStaleShardingError(ex.code())) {
-        auto staleConfigException = dynamic_cast<const SendStaleConfigException*>(&ex);
+        auto staleConfigException = dynamic_cast<const StaleConfigException*>(&ex);
         if (!staleConfigException) {
             // We need to get extra info off of the SCE, but some common patterns can result in the
             // exception being converted to a Status then rethrown as a AssertionException, losing
@@ -225,8 +225,7 @@ bool handleError(OperationContext* opCtx,
                 ->onStaleShardVersion(opCtx, nss, staleConfigException->getVersionReceived())
                 .transitional_ignore();
         }
-        out->staleConfigException =
-            stdx::make_unique<SendStaleConfigException>(*staleConfigException);
+        out->staleConfigException = stdx::make_unique<StaleConfigException>(*staleConfigException);
         return false;
     }
 
@@ -298,11 +297,31 @@ WriteResult performCreateIndexes(OperationContext* opCtx, const write_ops::Inser
 
 void insertDocuments(OperationContext* opCtx,
                      Collection* collection,
-                     std::vector<InsertStatement>::const_iterator begin,
-                     std::vector<InsertStatement>::const_iterator end) {
+                     std::vector<InsertStatement>::iterator begin,
+                     std::vector<InsertStatement>::iterator end) {
     // Intentionally not using writeConflictRetry. That is handled by the caller so it can react to
     // oversized batches.
     WriteUnitOfWork wuow(opCtx);
+
+    // Acquire optimes and fill them in for each item in the batch.
+    // This must only be done for doc-locking storage engines, which are allowed to insert oplog
+    // documents out-of-timestamp-order.  For other storage engines, the oplog entries must be
+    // physically written in timestamp order, so we defer optime assignment until the oplog is about
+    // to be written.
+    auto batchSize = std::distance(begin, end);
+    if (supportsDocLocking()) {
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        if (!replCoord->isOplogDisabledFor(opCtx, collection->ns())) {
+            // Populate 'slots' with new optimes for each insert.
+            // This also notifies the storage engine of each new timestamp.
+            auto oplogSlots = repl::getNextOpTimes(opCtx, batchSize);
+            auto slot = oplogSlots.begin();
+            for (auto it = begin; it != end; it++) {
+                it->oplogSlot = *slot++;
+            }
+        }
+    }
+
     uassertStatusOK(collection->insertDocuments(
         opCtx, begin, end, &CurOp::get(opCtx)->debug(), /*enforceQuota*/ true));
     wuow.commit();
@@ -313,7 +332,7 @@ void insertDocuments(OperationContext* opCtx,
  */
 bool insertBatchAndHandleErrors(OperationContext* opCtx,
                                 const write_ops::Insert& wholeOp,
-                                const std::vector<InsertStatement>& batch,
+                                std::vector<InsertStatement>& batch,
                                 LastOpFixer* lastOpFixer,
                                 WriteResult* out) {
     if (batch.empty())
@@ -452,8 +471,6 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
     const size_t maxBatchSize = internalInsertMaxBatchSize.load();
     batch.reserve(std::min(wholeOp.getDocuments().size(), maxBatchSize));
 
-    auto session = OperationContextSession::get(opCtx);
-
     for (auto&& doc : wholeOp.getDocuments()) {
         const bool isLastDoc = (&doc == &wholeOp.getDocuments().back());
         auto fixedDoc = fixDocumentForInsert(opCtx->getServiceContext(), doc);
@@ -462,9 +479,11 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
             // correct order. In an ordered insert, if one of the docs ahead of us fails, we should
             // behave as-if we never got to this document.
         } else {
-            auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
-            if (session) {
-                if (auto entry = session->checkStatementExecuted(opCtx, stmtId)) {
+            const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
+            if (opCtx->getTxnNumber()) {
+                auto session = OperationContextSession::get(opCtx);
+                if (auto entry =
+                        session->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
                     out.results.emplace_back(parseOplogEntryForInsert(*entry));
                     continue;
                 }
@@ -502,6 +521,10 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
                                                const NamespaceString& ns,
                                                StmtId stmtId,
                                                const write_ops::UpdateOpEntry& op) {
+    uassert(ErrorCodes::InvalidOptions,
+            "Cannot use (or request) retryable writes with multi=true",
+            !(opCtx->getTxnNumber() && op.getMulti()));
+
     globalOpCounters.gotUpdate();
     auto& curOp = *CurOp::get(opCtx);
     {
@@ -603,12 +626,12 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
     WriteResult out;
     out.results.reserve(wholeOp.getUpdates().size());
 
-    auto session = OperationContextSession::get(opCtx);
-
     for (auto&& singleOp : wholeOp.getUpdates()) {
-        auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
-        if (session) {
-            if (auto entry = session->checkStatementExecuted(opCtx, stmtId)) {
+        const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
+        if (opCtx->getTxnNumber()) {
+            auto session = OperationContextSession::get(opCtx);
+            if (auto entry =
+                    session->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
                 out.results.emplace_back(parseOplogEntryForUpdate(*entry));
                 continue;
             }
@@ -644,6 +667,10 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
                                                const NamespaceString& ns,
                                                StmtId stmtId,
                                                const write_ops::DeleteOpEntry& op) {
+    uassert(ErrorCodes::InvalidOptions,
+            "Cannot use (or request) retryable writes with limit=0",
+            !(opCtx->getTxnNumber() && op.getMulti()));
+
     globalOpCounters.gotDelete();
     auto& curOp = *CurOp::get(opCtx);
     {
@@ -727,12 +754,12 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
     WriteResult out;
     out.results.reserve(wholeOp.getDeletes().size());
 
-    auto session = OperationContextSession::get(opCtx);
-
     for (auto&& singleOp : wholeOp.getDeletes()) {
-        auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
-        if (session) {
-            if (auto entry = session->checkStatementExecuted(opCtx, stmtId)) {
+        const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
+        if (opCtx->getTxnNumber()) {
+            auto session = OperationContextSession::get(opCtx);
+            if (auto entry =
+                    session->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
                 out.results.emplace_back(parseOplogEntryForDelete(*entry));
                 continue;
             }

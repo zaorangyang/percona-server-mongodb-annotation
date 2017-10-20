@@ -14,6 +14,7 @@
     // Check a few invalid match statements for validator.
     assert.commandFailed(db.createCollection(collName, {validator: 7}));
     assert.commandFailed(db.createCollection(collName, {validator: "assert"}));
+    assert.commandFailed(db.createCollection(collName, {validator: {$jsonSchema: {invalid: 1}}}));
 
     // Check some disallowed match statements.
     assert.commandFailed(db.createCollection(collName, {validator: {$text: "bob"}}));
@@ -22,6 +23,8 @@
     assert.commandFailed(db.createCollection(collName, {validator: {$geoNear: {place: "holder"}}}));
     assert.commandFailed(
         db.createCollection(collName, {validator: {$nearSphere: {place: "holder"}}}));
+    assert.commandFailed(
+        db.createCollection(collName, {validator: {$expr: {$eq: ["$a", "$$unbound"]}}}));
 
     // Verify we fail on admin, local and config databases.
     assert.commandFailed(
@@ -47,9 +50,10 @@
         db.runCommand({"collMod": collName, "validator": {$geoNear: {place: "holder"}}}));
     assert.commandFailed(
         db.runCommand({"collMod": collName, "validator": {$nearSphere: {place: "holder"}}}));
-
     assert.commandFailed(
-        db.runCommand({"collMod": collName, "validator": {$expr: {$eq: ["$a", 5]}}}));
+        db.runCommand({"collMod": collName, "validator": {$expr: {$eq: ["$a", "$$unbound"]}}}));
+    assert.commandFailed(
+        db.runCommand({"collMod": collName, "validator": {$jsonSchema: {invalid: 7}}}));
 
     coll.drop();
 

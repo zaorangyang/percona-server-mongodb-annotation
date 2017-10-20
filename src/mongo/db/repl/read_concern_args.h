@@ -56,6 +56,7 @@ public:
     static const std::string kReadConcernFieldName;
     static const std::string kAfterOpTimeFieldName;
     static const std::string kAfterClusterTimeFieldName;
+    static const std::string kAtClusterTimeFieldName;
     static const std::string kLevelFieldName;
 
     static const OperationContext::Decoration<ReadConcernArgs> get;
@@ -80,8 +81,8 @@ public:
      *    }
      * }
      */
-    Status initialize(const BSONObj& cmdObj) {
-        return initialize(cmdObj[kReadConcernFieldName]);
+    Status initialize(const BSONObj& cmdObj, bool testMode = false) {
+        return initialize(cmdObj[kReadConcernFieldName], testMode);
     }
 
     /**
@@ -89,7 +90,7 @@ public:
      * Use this if you are already iterating over the fields in the command object.
      * This method correctly handles missing BSONElements.
      */
-    Status initialize(const BSONElement& readConcernElem);
+    Status initialize(const BSONElement& readConcernElem, bool testMode = false);
 
     /**
      * Appends level and afterOpTime.
@@ -107,11 +108,18 @@ public:
     ReadConcernLevel getLevel() const;
 
     /**
+     * Checks whether _level is explicitly set.
+     */
+    bool hasLevel() const;
+
+    /**
      * Returns the opTime. Deprecated: will be replaced with getArgsClusterTime.
      */
     boost::optional<OpTime> getArgsOpTime() const;
 
     boost::optional<LogicalTime> getArgsClusterTime() const;
+
+    boost::optional<LogicalTime> getArgsPointInTime() const;
     BSONObj toBSON() const;
     std::string toString() const;
 
@@ -125,6 +133,8 @@ private:
      *  Read data after cluster-wide cluster time.
      */
     boost::optional<LogicalTime> _clusterTime;
+
+    boost::optional<LogicalTime> _pointInTime;
     boost::optional<ReadConcernLevel> _level;
 };
 

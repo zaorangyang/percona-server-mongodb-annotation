@@ -47,7 +47,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalSplitPipeline::create
 
     auto specObj = elem.embeddedObject();
 
-    HostTypeRequirement mergeType = HostTypeRequirement::kAnyShard;
+    HostTypeRequirement mergeType = HostTypeRequirement::kNone;
 
     for (auto&& elt : specObj) {
         if (elt.fieldNameStringData() == "mergeType"_sd) {
@@ -57,12 +57,14 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalSplitPipeline::create
 
             auto mergeTypeString = elt.valueStringData();
 
-            if ("anyShard"_sd == mergeTypeString) {
+            if ("localOnly"_sd == mergeTypeString) {
+                mergeType = HostTypeRequirement::kLocalOnly;
+            } else if ("anyShard"_sd == mergeTypeString) {
                 mergeType = HostTypeRequirement::kAnyShard;
             } else if ("primaryShard"_sd == mergeTypeString) {
                 mergeType = HostTypeRequirement::kPrimaryShard;
             } else if ("mongos"_sd == mergeTypeString) {
-                mergeType = HostTypeRequirement::kAnyShardOrMongoS;
+                mergeType = HostTypeRequirement::kMongoS;
             } else {
                 uasserted(ErrorCodes::BadValue,
                           str::stream() << "unrecognized field while parsing mergeType: '"
@@ -90,20 +92,31 @@ Value DocumentSourceInternalSplitPipeline::serialize(
     std::string mergeTypeString;
 
     switch (_mergeType) {
-        case HostTypeRequirement::kAnyShardOrMongoS:
-            mergeTypeString = "mongos";
+        case HostTypeRequirement::kAnyShard:
+            mergeTypeString = "anyShard";
             break;
 
         case HostTypeRequirement::kPrimaryShard:
             mergeTypeString = "primaryShard";
             break;
 
+        case HostTypeRequirement::kLocalOnly:
+            mergeTypeString = "localOnly";
+            break;
+
+        case HostTypeRequirement::kMongoS:
+            mergeTypeString = "mongos";
+            break;
+
+        case HostTypeRequirement::kNone:
         default:
-            mergeTypeString = "anyShard";
             break;
     }
 
-    return Value(Document{{getSourceName(), Value{Document{{"mergeType", mergeTypeString}}}}});
+    return Value(
+        Document{{getSourceName(),
+                  Value{Document{{"mergeType",
+                                  mergeTypeString.empty() ? Value() : Value(mergeTypeString)}}}}});
 }
 
 }  // namesace mongo

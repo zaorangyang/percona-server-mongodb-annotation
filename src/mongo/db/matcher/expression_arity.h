@@ -79,6 +79,19 @@ public:
             [](const auto& expr1, const auto& expr2) { return expr1->equivalent(expr2.get()); });
     }
 
+    std::vector<MatchExpression*>* getChildVector() final {
+        return nullptr;
+    }
+
+    size_t numChildren() const final {
+        return nargs;
+    }
+
+    MatchExpression* getChild(size_t i) const final {
+        invariant(i < nargs);
+        return _expressions[i].get();
+    }
+
     /**
      * Takes ownership of the MatchExpressions in 'expressions'.
      */
@@ -134,6 +147,20 @@ protected:
     }
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final {
+        return [](std::unique_ptr<MatchExpression> expression) {
+            for (auto& subExpression :
+                 static_cast<FixedArityMatchExpression&>(*expression)._expressions) {
+                // Since 'subExpression' is a reference to a member of the
+                // FixedArityMatchExpression's child array, this assignment replaces the original
+                // child with the optimized child.
+                subExpression = MatchExpression::optimize(std::move(subExpression));
+            }
+
+            return expression;
+        };
+    }
+
     std::array<std::unique_ptr<MatchExpression>, nargs> _expressions;
 };
 

@@ -52,6 +52,7 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/type_shard_identity.h"
+#include "mongo/db/sessions_collection.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -303,26 +304,10 @@ StatusWith<ShardType> ShardingCatalogManager::_validateHostAsShard(
     std::shared_ptr<RemoteCommandTargeter> targeter,
     const std::string* shardProposedName,
     const ConnectionString& connectionString) {
-
-    // Check if the node being added is a mongos or a version of mongod too old to speak the current
-    // communication protocol.
     auto swCommandResponse =
         _runCommandForAddShard(opCtx, targeter.get(), "admin", BSON("isMaster" << 1));
     if (!swCommandResponse.isOK()) {
-        if (swCommandResponse.getStatus() == ErrorCodes::RPCProtocolNegotiationFailed) {
-            // Mongos to mongos commands are no longer supported in the wire protocol
-            // (because mongos does not support OP_COMMAND), similarly for a new mongos
-            // and an old mongod. So the call will fail in such cases.
-            // TODO: If/When mongos ever supports opCommands, this logic will break because
-            // cmdStatus will be OK.
-            return {ErrorCodes::RPCProtocolNegotiationFailed,
-                    str::stream() << targeter->connectionString().toString()
-                                  << " does not recognize the RPC protocol being used. This is"
-                                  << " likely because it contains a node that is a mongos or an old"
-                                  << " version of mongod."};
-        } else {
-            return swCommandResponse.getStatus();
-        }
+        return swCommandResponse.getStatus();
     }
 
     // Check for a command response error
@@ -337,15 +322,14 @@ StatusWith<ShardType> ShardingCatalogManager::_validateHostAsShard(
 
     auto resIsMaster = std::move(swCommandResponse.getValue().response);
 
-    // Check that the node being added is a new enough version.
-    // If we're running this code, that means the mongos that the addShard request originated from
-    // must be at least version 3.4 (since 3.2 mongoses don't know about the _configsvrAddShard
-    // command).  Since it is illegal to have v3.4 mongoses with v3.2 shards, we should reject
-    // adding any shards that are not v3.4.  We can determine this by checking that the
-    // maxWireVersion reported in isMaster is at least COMMANDS_ACCEPT_WRITE_CONCERN.
-    // TODO(SERVER-25623): This approach won't work to prevent v3.6 mongoses from adding v3.4
-    // shards, so we'll have to rethink this during the 3.5 development cycle.
+    // Fail if the node being added is a mongos.
+    const std::string msg = resIsMaster.getStringField("msg");
+    if (msg == "isdbgrid") {
+        return {ErrorCodes::IllegalOperation, "cannot add a mongos as a shard"};
+    }
 
+    // Fail if the node being added's binary version is lower than the cluster's
+    // featureCompatibilityVersion.
     long long maxWireVersion;
     Status status = bsonExtractIntegerField(resIsMaster, "maxWireVersion", &maxWireVersion);
     if (!status.isOK()) {
@@ -356,14 +340,15 @@ StatusWith<ShardType> ShardingCatalogManager::_validateHostAsShard(
                                     << " as a shard: "
                                     << status.reason());
     }
-    if (maxWireVersion < WireVersion::COMMANDS_ACCEPT_WRITE_CONCERN) {
-        return Status(ErrorCodes::IncompatibleServerVersion,
-                      str::stream() << "Cannot add " << connectionString.toString()
-                                    << " as a shard because we detected a mongod with server "
-                                       "version older than 3.4.0.  It is invalid to add v3.2 and "
-                                       "older shards through a v3.4 mongos.");
+    if ((serverGlobalParams.featureCompatibility.isFullyUpgradedTo36() &&
+         maxWireVersion < WireVersion::LATEST_WIRE_VERSION) ||
+        (!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36() &&
+         maxWireVersion < WireVersion::LATEST_WIRE_VERSION - 1)) {
+        return {ErrorCodes::IncompatibleServerVersion,
+                str::stream() << "Cannot add " << connectionString.toString()
+                              << " as a shard because its binary version is not compatible with "
+                                 "the cluster's featureCompatibilityVersion."};
     }
-
 
     // Check whether there is a master. If there isn't, the replica set may not have been
     // initiated. If the connection is a standalone, it will return true for isMaster.
@@ -484,6 +469,30 @@ StatusWith<ShardType> ShardingCatalogManager::_validateHostAsShard(
     return shard;
 }
 
+Status ShardingCatalogManager::_dropSessionsCollection(
+    OperationContext* opCtx, std::shared_ptr<RemoteCommandTargeter> targeter) {
+
+    BSONObjBuilder builder;
+    builder.append("drop", SessionsCollection::kSessionsCollection.toString());
+    {
+        BSONObjBuilder wcBuilder(builder.subobjStart("writeConcern"));
+        wcBuilder.append("w", "majority");
+    }
+
+    auto swCommandResponse = _runCommandForAddShard(
+        opCtx, targeter.get(), SessionsCollection::kSessionsDb.toString(), builder.done());
+    if (!swCommandResponse.isOK()) {
+        return swCommandResponse.getStatus();
+    }
+
+    auto cmdStatus = std::move(swCommandResponse.getValue().commandStatus);
+    if (!cmdStatus.isOK() && cmdStatus.code() != ErrorCodes::NamespaceNotFound) {
+        return cmdStatus;
+    }
+
+    return Status::OK();
+}
+
 StatusWith<std::vector<std::string>> ShardingCatalogManager::_getDBNamesListFromShard(
     OperationContext* opCtx, std::shared_ptr<RemoteCommandTargeter> targeter) {
 
@@ -590,7 +599,8 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     }
 
     for (const auto& dbName : dbNamesStatus.getValue()) {
-        auto dbt = Grid::get(opCtx)->catalogClient()->getDatabase(opCtx, dbName);
+        auto dbt = Grid::get(opCtx)->catalogClient()->getDatabase(
+            opCtx, dbName, repl::ReadConcernLevel::kLocalReadConcern);
         if (dbt.isOK()) {
             const auto& dbDoc = dbt.getValue().value;
             return Status(ErrorCodes::OperationFailed,
@@ -605,6 +615,18 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
         } else if (dbt != ErrorCodes::NamespaceNotFound) {
             return dbt.getStatus();
         }
+    }
+
+    // Check that the shard candidate does not have a local config.system.sessions collection
+    auto res = _dropSessionsCollection(opCtx, targeter);
+
+    if (!res.isOK()) {
+        return Status(
+            res.code(),
+            str::stream()
+                << "can't add shard with a local copy of config.system.sessions due to "
+                << res.reason()
+                << ", please drop this collection from the shard manually and try again.");
     }
 
     // If a name for a shard wasn't provided, generate one
@@ -642,7 +664,7 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
         targeter.get(),
         "admin",
         BSON(FeatureCompatibilityVersion::kCommandName << FeatureCompatibilityVersion::toString(
-                 serverGlobalParams.featureCompatibility.version.load())));
+                 serverGlobalParams.featureCompatibility.getVersion())));
     if (!versionResponse.isOK()) {
         return versionResponse.getStatus();
     }

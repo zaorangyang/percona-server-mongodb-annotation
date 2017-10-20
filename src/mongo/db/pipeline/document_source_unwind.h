@@ -46,9 +46,13 @@ public:
      */
     GetModPathsReturn getModifiedPaths() const final;
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kNone,
+                                     HostTypeRequirement::kNone,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kAllowed);
+
         constraints.canSwapWithMatch = true;
         return constraints;
     }

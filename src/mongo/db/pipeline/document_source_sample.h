@@ -43,10 +43,12 @@ public:
     }
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
-        return constraints;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kBlocking,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kWritesTmpData,
+                FacetRequirement::kAllowed};
     }
 
     GetDepsReturn getDependencies(DepsTracker* deps) const final {
@@ -54,7 +56,7 @@ public:
     }
 
     boost::intrusive_ptr<DocumentSource> getShardSource() final;
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final;
+    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final;
 
     long long getSampleSize() const {
         return _size;

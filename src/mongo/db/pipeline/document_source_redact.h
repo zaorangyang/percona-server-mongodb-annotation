@@ -40,10 +40,13 @@ public:
     const char* getSourceName() const final;
     boost::intrusive_ptr<DocumentSource> optimize() final;
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
-        return constraints;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed,
+                ChangeStreamRequirement::kWhitelist};
     }
 
     /**

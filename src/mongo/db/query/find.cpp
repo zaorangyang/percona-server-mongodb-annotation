@@ -293,17 +293,16 @@ Message getMore(OperationContext* opCtx,
         uassert(
             ErrorCodes::OperationFailed, "collection dropped between getMore calls", collection);
         cursorManager = collection->getCursorManager();
+
+        // This checks to make sure the operation is allowed on a replicated node.  Since we are not
+        // passing in a query object (necessary to check SlaveOK query option), we allow reads
+        // whether we are PRIMARY or SECONDARY.
+        Status status =
+            repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor(opCtx, nss, true);
+        uassertStatusOK(status);
     }
 
     LOG(5) << "Running getMore, cursorid: " << cursorid;
-
-    // This checks to make sure the operation is allowed on a replicated node.  Since we are not
-    // passing in a query object (necessary to check SlaveOK query option), the only state where
-    // reads are allowed is PRIMARY (or master in master/slave).  This function uasserts if
-    // reads are not okay.
-    Status status =
-        repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor_UNSAFE(opCtx, nss, true);
-    uassertStatusOK(status);
 
     // A pin performs a CC lookup and if there is a CC, increments the CC's pin value so it
     // doesn't time out.  Also informs ClientCursor that there is somebody actively holding the
@@ -327,7 +326,7 @@ Message getMore(OperationContext* opCtx,
             cursorid = 0;
             resultFlags = ResultFlag_CursorNotFound;
         } else {
-            invariant(ccPin == ErrorCodes::QueryPlanKilled);
+            invariant(ccPin == ErrorCodes::QueryPlanKilled || ccPin == ErrorCodes::Unauthorized);
             uassertStatusOK(ccPin.getStatus());
         }
     } else {
@@ -534,8 +533,7 @@ std::string runQuery(OperationContext* opCtx,
                                      q,
                                      expCtx,
                                      ExtensionsCallbackReal(opCtx, &nss),
-                                     MatchExpressionParser::kAllowAllSpecialFeatures &
-                                         ~MatchExpressionParser::AllowedFeatures::kExpr);
+                                     MatchExpressionParser::kAllowAllSpecialFeatures);
     if (!statusWithCQ.isOK()) {
         uasserted(17287,
                   str::stream() << "Can't canonicalize query: "
@@ -558,6 +556,17 @@ std::string runQuery(OperationContext* opCtx,
                       << nss.ns()
                       << " is a view. Legacy find operations are not supported on views. "
                       << "Only clients which support the find command can be used to query views.");
+    }
+
+    {
+        const QueryRequest& qr = cq->getQueryRequest();
+
+        // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
+        // TODO(SERVER-31293): Don't set slaveOk for reads with a read pref of "primary".
+        bool slaveOK = qr.isSlaveOk() || qr.hasReadPref();
+        Status serveReadsStatus =
+            repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor(opCtx, nss, slaveOK);
+        uassertStatusOK(serveReadsStatus);
     }
 
     // We have a parsed query. Time to get the execution plan for it.
@@ -601,12 +610,6 @@ std::string runQuery(OperationContext* opCtx,
         opCtx->setDeadlineAfterNowBy(Milliseconds{qr.getMaxTimeMS()});
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
-
-    // uassert if we are not on a primary, and not a secondary with SlaveOk query parameter set.
-    bool slaveOK = qr.isSlaveOk() || qr.hasReadPref();
-    Status serveReadsStatus =
-        repl::getGlobalReplicationCoordinator()->checkCanServeReadsFor_UNSAFE(opCtx, nss, slaveOK);
-    uassertStatusOK(serveReadsStatus);
 
     // Run the query.
     // bb is used to hold query results

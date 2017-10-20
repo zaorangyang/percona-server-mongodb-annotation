@@ -41,10 +41,9 @@
 namespace mongo {
 Status MatchExpressionParser::_parseTreeList(const BSONObj& arr,
                                              ListOfMatchExpression* out,
-                                             const CollatorInterface* collator,
                                              const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                              AllowedFeatureSet allowedFeatures,
-                                             bool topLevel) {
+                                             DocumentParseLevel currentLevel) {
     if (arr.isEmpty())
         return Status(ErrorCodes::BadValue, "$and/$or/$nor must be a nonempty array");
 
@@ -55,8 +54,7 @@ Status MatchExpressionParser::_parseTreeList(const BSONObj& arr,
         if (e.type() != Object)
             return Status(ErrorCodes::BadValue, "$or/$and/$nor entries need to be full objects");
 
-        StatusWithMatchExpression sub =
-            _parse(e.Obj(), collator, expCtx, allowedFeatures, topLevel);
+        StatusWithMatchExpression sub = _parse(e.Obj(), expCtx, allowedFeatures, currentLevel);
         if (!sub.isOK())
             return sub.getStatus();
 
@@ -68,10 +66,9 @@ Status MatchExpressionParser::_parseTreeList(const BSONObj& arr,
 StatusWithMatchExpression MatchExpressionParser::_parseNot(
     const char* name,
     const BSONElement& e,
-    const CollatorInterface* collator,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     AllowedFeatureSet allowedFeatures,
-    bool topLevel) {
+    DocumentParseLevel currentLevel) {
     if (e.type() == RegEx) {
         StatusWithMatchExpression s = _parseRegexElement(name, e);
         if (!s.isOK())
@@ -91,8 +88,7 @@ StatusWithMatchExpression MatchExpressionParser::_parseNot(
         return StatusWithMatchExpression(ErrorCodes::BadValue, "$not cannot be empty");
 
     std::unique_ptr<AndMatchExpression> theAnd = stdx::make_unique<AndMatchExpression>();
-    Status s =
-        _parseSub(name, notObject, theAnd.get(), collator, expCtx, allowedFeatures, topLevel);
+    Status s = _parseSub(name, notObject, theAnd.get(), expCtx, allowedFeatures, currentLevel);
     if (!s.isOK())
         return StatusWithMatchExpression(s);
 

@@ -44,6 +44,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
@@ -84,13 +85,16 @@ Status makePrimaryConnection(OperationContext* opCtx, boost::optional<ScopedDbCo
 }
 
 template <typename Callback>
-auto runIfStandaloneOrPrimary(OperationContext* opCtx, Callback callback)
+auto runIfStandaloneOrPrimary(const NamespaceString& ns,
+                              LockMode mode,
+                              OperationContext* opCtx,
+                              Callback callback)
     -> boost::optional<decltype(std::declval<Callback>()())> {
-    Lock::DBLock lk(opCtx, SessionsCollection::kSessionsDb, MODE_IX);
-    Lock::CollectionLock lock(opCtx->lockState(), SessionsCollection::kSessionsFullNS, MODE_IX);
+    Lock::DBLock lk(opCtx, ns.db(), mode);
+    Lock::CollectionLock lock(opCtx->lockState(), SessionsCollection::kSessionsFullNS, mode);
 
     auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
-    if (coord->canAcceptWritesForDatabase(opCtx, SessionsCollection::kSessionsDb)) {
+    if (coord->canAcceptWritesForDatabase(opCtx, ns.db())) {
         return callback();
     }
 
@@ -110,10 +114,14 @@ auto sendToPrimary(OperationContext* opCtx, Callback callback)
 }
 
 template <typename LocalCallback, typename RemoteCallback>
-auto dispatch(OperationContext* opCtx, LocalCallback localCallback, RemoteCallback remoteCallback)
+auto dispatch(const NamespaceString& ns,
+              LockMode mode,
+              OperationContext* opCtx,
+              LocalCallback localCallback,
+              RemoteCallback remoteCallback)
     -> decltype(std::declval<RemoteCallback>()(static_cast<DBClientBase*>(nullptr))) {
     // If we are the primary, write directly to ourself.
-    auto result = runIfStandaloneOrPrimary(opCtx, [&] { return localCallback(); });
+    auto result = runIfStandaloneOrPrimary(ns, mode, opCtx, [&] { return localCallback(); });
 
     if (result) {
         return *result;
@@ -124,41 +132,105 @@ auto dispatch(OperationContext* opCtx, LocalCallback localCallback, RemoteCallba
 
 }  // namespace
 
-Status SessionsCollectionRS::refreshSessions(OperationContext* opCtx,
-                                             const LogicalSessionRecordSet& sessions,
-                                             Date_t refreshTime) {
-    return dispatch(opCtx,
+Status SessionsCollectionRS::setupSessionsCollection(OperationContext* opCtx) {
+    return dispatch(kSessionsNamespaceString,
+                    MODE_IX,
+                    opCtx,
                     [&] {
+                        // Creating the TTL index will auto-generate the collection.
                         DBDirectClient client(opCtx);
-                        return doRefresh(sessions, refreshTime, makeSendFnForBatchWrite(&client));
+                        BSONObj info;
+                        auto cmd = generateCreateIndexesCmd();
+                        if (!client.runCommand(kSessionsDb.toString(), cmd, info)) {
+                            return getStatusFromCommandResult(info);
+                        }
+
+                        return Status::OK();
                     },
-                    [&](DBClientBase* client) {
-                        return doRefreshExternal(
-                            sessions, refreshTime, makeSendFnForCommand(client));
+                    [&](DBClientBase*) {
+                        // If we are not the primary, we aren't going to do writes
+                        // anyway, so just return ok.
+                        return Status::OK();
                     });
+}
+
+Status SessionsCollectionRS::refreshSessions(OperationContext* opCtx,
+                                             const LogicalSessionRecordSet& sessions) {
+    return dispatch(
+        kSessionsNamespaceString,
+        MODE_IX,
+        opCtx,
+        [&] {
+            DBDirectClient client(opCtx);
+            return doRefresh(kSessionsNamespaceString,
+                             sessions,
+                             makeSendFnForBatchWrite(kSessionsNamespaceString, &client));
+        },
+        [&](DBClientBase* client) {
+            return doRefreshExternal(kSessionsNamespaceString,
+                                     sessions,
+                                     makeSendFnForCommand(kSessionsNamespaceString, client));
+        });
 }
 
 Status SessionsCollectionRS::removeRecords(OperationContext* opCtx,
                                            const LogicalSessionIdSet& sessions) {
-    return dispatch(opCtx,
+    return dispatch(kSessionsNamespaceString,
+                    MODE_IX,
+                    opCtx,
                     [&] {
                         DBDirectClient client(opCtx);
-                        return doRemove(sessions, makeSendFnForBatchWrite(&client));
+                        return doRemove(kSessionsNamespaceString,
+                                        sessions,
+                                        makeSendFnForBatchWrite(kSessionsNamespaceString, &client));
                     },
                     [&](DBClientBase* client) {
-                        return doRemoveExternal(sessions, makeSendFnForCommand(client));
+                        return doRemoveExternal(
+                            kSessionsNamespaceString,
+                            sessions,
+                            makeSendFnForCommand(kSessionsNamespaceString, client));
                     });
 }
 
 StatusWith<LogicalSessionIdSet> SessionsCollectionRS::findRemovedSessions(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
+    return dispatch(kSessionsNamespaceString,
+                    MODE_IS,
+                    opCtx,
+                    [&] {
+                        DBDirectClient client(opCtx);
+                        return doFetch(kSessionsNamespaceString,
+                                       sessions,
+                                       makeFindFnForCommand(kSessionsNamespaceString, &client));
+                    },
+                    [&](DBClientBase* client) {
+                        return doFetch(kSessionsNamespaceString,
+                                       sessions,
+                                       makeFindFnForCommand(kSessionsNamespaceString, client));
+                    });
+}
+
+Status SessionsCollectionRS::removeTransactionRecords(OperationContext* opCtx,
+                                                      const LogicalSessionIdSet& sessions) {
     return dispatch(
+        kSessionsNamespaceString,
+        MODE_IX,
         opCtx,
         [&] {
             DBDirectClient client(opCtx);
-            return doFetch(sessions, makeFindFnForCommand(&client));
+            return doRemove(NamespaceString::kSessionTransactionsTableNamespace,
+                            sessions,
+                            makeSendFnForBatchWrite(
+                                NamespaceString::kSessionTransactionsTableNamespace, &client));
         },
-        [&](DBClientBase* client) { return doFetch(sessions, makeFindFnForCommand(client)); });
+        [](DBClientBase*) {
+            return Status(ErrorCodes::NotMaster, "Not eligible to remove transaction records");
+        });
+}
+
+Status SessionsCollectionRS::removeTransactionRecordsHelper(OperationContext* opCtx,
+                                                            const LogicalSessionIdSet& sessions) {
+    return SessionsCollectionRS{}.removeTransactionRecords(opCtx, sessions);
 }
 
 }  // namespace mongo

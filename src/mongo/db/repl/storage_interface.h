@@ -111,7 +111,8 @@ public:
      */
     virtual Status insertDocument(OperationContext* opCtx,
                                   const NamespaceString& nss,
-                                  const TimestampedBSONObj& doc) = 0;
+                                  const TimestampedBSONObj& doc,
+                                  long long term) = 0;
 
     /**
      * Inserts the given documents, with associated timestamps and statement id's, into the
@@ -144,9 +145,14 @@ public:
                                     const CollectionOptions& options) = 0;
 
     /**
-     * Drops a collection, like the oplog.
+     * Drops a collection.
      */
     virtual Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) = 0;
+
+    /**
+     * Truncates a collection.
+     */
+    virtual Status truncateCollection(OperationContext* opCtx, const NamespaceString& nss) = 0;
 
     /**
      * Renames a collection from the "fromNS" to the "toNS". Fails if the new collection already
@@ -282,6 +288,18 @@ public:
      */
     virtual StatusWith<CollectionCount> getCollectionCount(OperationContext* opCtx,
                                                            const NamespaceString& nss) = 0;
+
+    /**
+     * Returns the UUID of the collection specified by nss, if such a UUID exists.
+     */
+    virtual StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
+                                                                 const NamespaceString& nss) = 0;
+
+    /**
+     * Adds UUIDs for non-replicated collections. To be called only at the end of initial
+     * sync and only if the admin.system.version collection has a UUID.
+     */
+    virtual Status upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) = 0;
 
     /**
      * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.

@@ -32,6 +32,7 @@ env.Library(
 env.Library(
     target="router_exec_stage",
     source=[
+        "document_source_router_adapter.cpp",
         "router_stage_limit.cpp",
         "router_stage_merge.cpp",
         "router_stage_mock.cpp",
@@ -40,6 +41,7 @@ env.Library(
         "router_stage_skip.cpp",
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/db/query/query_common",
         "async_results_merger",
     ],
 )
@@ -70,8 +72,11 @@ env.Library(
         "$BUILD_DIR/mongo/executor/task_executor_interface",
         "$BUILD_DIR/mongo/s/async_requests_sender",
         "$BUILD_DIR/mongo/s/client/sharding_client",
-        '$BUILD_DIR/mongo/db/pipeline/pipeline',
+        "$BUILD_DIR/mongo/db/pipeline/pipeline",
         "$BUILD_DIR/mongo/s/coreshard",
+    ],
+    LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/db/pipeline/document_source_lookup",
     ],
 )
 
@@ -134,6 +139,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/auth/authcore',
+        '$BUILD_DIR/mongo/db/generic_cursor',
         '$BUILD_DIR/mongo/db/kill_sessions',
         '$BUILD_DIR/mongo/db/logical_session_cache',
         '$BUILD_DIR/mongo/db/logical_session_id',

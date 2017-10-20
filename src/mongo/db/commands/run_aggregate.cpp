@@ -56,7 +56,9 @@
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
+#include "mongo/db/read_concern.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view.h"
@@ -93,8 +95,7 @@ bool handleCursorCommand(OperationContext* opCtx,
 
     long long batchSize = request.getBatchSize();
 
-    // can't use result BSONObjBuilder directly since it won't handle exceptions correctly.
-    BSONArrayBuilder resultsArray;
+    CursorResponseBuilder responseBuilder(true, &result);
     BSONObj next;
     for (int objCount = 0; objCount < batchSize; objCount++) {
         // The initial getNext() on a PipelineProxyStage may be very expensive so we don't
@@ -112,6 +113,8 @@ bool handleCursorCommand(OperationContext* opCtx,
         }
 
         if (state == PlanExecutor::IS_EOF) {
+            responseBuilder.setLatestOplogTimestamp(
+                cursor->getExecutor()->getLatestOplogTimestamp());
             if (!cursor->isTailable()) {
                 // make it an obvious error to use cursor or executor after this point
                 cursor = nullptr;
@@ -128,12 +131,13 @@ bool handleCursorCommand(OperationContext* opCtx,
 
         // If adding this object will cause us to exceed the message size limit, then we stash it
         // for later.
-        if (!FindCommon::haveSpaceForNext(next, objCount, resultsArray.len())) {
+        if (!FindCommon::haveSpaceForNext(next, objCount, responseBuilder.bytesUsed())) {
             cursor->getExecutor()->enqueue(next);
             break;
         }
 
-        resultsArray.append(next);
+        responseBuilder.setLatestOplogTimestamp(cursor->getExecutor()->getLatestOplogTimestamp());
+        responseBuilder.append(next);
     }
 
     if (cursor) {
@@ -152,7 +156,7 @@ bool handleCursorCommand(OperationContext* opCtx,
     }
 
     const CursorId cursorId = cursor ? cursor->cursorid() : 0LL;
-    appendCursorResponseObject(cursorId, nsForCursor.ns(), resultsArray.arr(), &result);
+    responseBuilder.done(cursorId, nsForCursor.ns());
 
     return static_cast<bool>(cursor);
 }
@@ -285,6 +289,42 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
     }
     return Status::OK();
 }
+
+Status waitForMajorityReadConcern(OperationContext* opCtx) {
+    const repl::ReadConcernArgs& originalRC = repl::ReadConcernArgs::get(opCtx);
+    if (!originalRC.hasLevel()) {
+        // If the read concern level is not specified, upgrade it to "majority".
+        const repl::ReadConcernArgs readConcern(repl::ReadConcernLevel::kMajorityReadConcern);
+        auto rcStatus = waitForReadConcern(opCtx, readConcern);
+        if (!rcStatus.isOK()) {
+            return rcStatus;
+        }
+    } else if (originalRC.getLevel() != repl::ReadConcernLevel::kMajorityReadConcern) {
+        // Otherwise, only "majority" is allowed for change streams.
+        return {ErrorCodes::InvalidOptions,
+                str::stream() << "Read concern " << originalRC.toString()
+                              << " is not supported for change streams. "
+                                 "Only read concern level \"majority\" is supported."};
+    }
+    return Status::OK();
+}
+
+/**
+ * Resolves the collator to either the user-specified collation or, if none was specified, to the
+ * collection-default collation.
+ */
+std::unique_ptr<CollatorInterface> resolveCollator(OperationContext* opCtx,
+                                                   const AggregationRequest& request,
+                                                   const Collection* collection) {
+    if (!request.getCollation().isEmpty()) {
+        return uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                   ->makeFromBSON(request.getCollation()));
+    }
+
+    return (collection && collection->getDefaultCollator()
+                ? collection->getDefaultCollator()->clone()
+                : nullptr);
+}
 }  // namespace
 
 Status runAggregate(OperationContext* opCtx,
@@ -295,11 +335,17 @@ Status runAggregate(OperationContext* opCtx,
     // For operations on views, this will be the underlying namespace.
     NamespaceString nss = request.getNamespaceString();
 
-    // Parse the user-specified collation, if any.
-    std::unique_ptr<CollatorInterface> userSpecifiedCollator = request.getCollation().isEmpty()
-        ? nullptr
-        : uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
-                              ->makeFromBSON(request.getCollation()));
+    if (request.getExplain() &&
+        repl::ReadConcernArgs::get(opCtx).getLevel() != repl::ReadConcernLevel::kLocalReadConcern) {
+        return {ErrorCodes::InvalidOptions,
+                str::stream() << "Explain for the aggregate command "
+                                 "does not support non-local "
+                                 "readConcern levels"};
+    }
+
+    // The collation to use for this aggregation. boost::optional to distinguish between the case
+    // where the collation has not yet been resolved, and where it has been resolved to nullptr.
+    boost::optional<std::unique_ptr<CollatorInterface>> collatorToUse;
 
     unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
     boost::intrusive_ptr<ExpressionContext> expCtx;
@@ -309,6 +355,17 @@ Status runAggregate(OperationContext* opCtx,
         const LiteParsedPipeline liteParsedPipeline(request);
         if (liteParsedPipeline.hasChangeStream()) {
             nss = NamespaceString::kRsOplogNamespace;
+
+            // Require $changeNotification to run with readConcern:majority.
+            uassertStatusOK(waitForMajorityReadConcern(opCtx));
+
+            // Resolve the collator to either the user-specified collation or the default collation
+            // of the collection on which $changeStream was invoked, so that we do not end up
+            // resolving the collation on the oplog.
+            invariant(!collatorToUse);
+            AutoGetCollection origNssCtx(opCtx, origNss, MODE_IS);
+            Collection* origColl = origNssCtx.getCollection();
+            collatorToUse.emplace(resolveCollator(opCtx, request, origColl));
         }
 
         const auto& pipelineInvolvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
@@ -332,6 +389,12 @@ Status runAggregate(OperationContext* opCtx,
 
         Collection* collection = ctx ? ctx->getCollection() : nullptr;
 
+        // The collator may already have been set if this is a $changeStream pipeline. If not,
+        // resolve the collator to either the user-specified collation or the collection default.
+        if (!collatorToUse) {
+            collatorToUse.emplace(resolveCollator(opCtx, request, collection));
+        }
+
         // If this is a view, resolve it by finding the underlying collection and stitching view
         // pipelines and this request's pipeline together. We then release our locks before
         // recursively calling runAggregate(), which will re-acquire locks on the underlying
@@ -341,11 +404,11 @@ Status runAggregate(OperationContext* opCtx,
             invariant(nss != NamespaceString::kRsOplogNamespace);
             invariant(!nss.isCollectionlessAggregateNS());
             // Check that the default collation of 'view' is compatible with the operation's
-            // collation. The check is skipped if the 'request' has the empty collation, which
-            // means that no collation was specified.
+            // collation. The check is skipped if the request did not specify a collation.
             if (!request.getCollation().isEmpty()) {
+                invariant(collatorToUse);  // Should already be resolved at this point.
                 if (!CollatorInterface::collatorsMatch(ctx->getView()->defaultCollator(),
-                                                       userSpecifiedCollator.get())) {
+                                                       collatorToUse->get())) {
                     return {ErrorCodes::OptionNotSupportedOnView,
                             "Cannot override a view's default collation"};
                 }
@@ -367,16 +430,11 @@ Status runAggregate(OperationContext* opCtx,
                 return resolvedView.getStatus();
             }
 
-            auto collationSpec = ctx->getView()->defaultCollator()
-                ? ctx->getView()->defaultCollator()->getSpec().toBSON().getOwned()
-                : CollationSpec::kSimpleSpec;
-
             // With the view & collation resolved, we can relinquish locks.
             ctx->releaseLocksForView();
 
             // Parse the resolved view into a new aggregation request.
             auto newRequest = resolvedView.getValue().asExpandedViewAggregation(request);
-            newRequest.setCollation(collationSpec);
             auto newCmd = newRequest.serializeToCommandObj().toBson();
 
             auto status = runAggregate(opCtx, origNss, newRequest, newCmd, result);
@@ -389,28 +447,13 @@ Status runAggregate(OperationContext* opCtx,
             return status;
         }
 
-        // Determine the appropriate collation to make the ExpressionContext.
-
-        // If the pipeline does not have a user-specified collation, set it from the collection
-        // default. Be careful to consult the original request BSON to check if a collation was
-        // specified, since a specification of {locale: "simple"} will result in a null
-        // collator.
-        auto collatorToUse = std::move(userSpecifiedCollator);
-        if (request.getCollation().isEmpty() && collection && collection->getDefaultCollator()) {
-            invariant(!collatorToUse);
-            collatorToUse = collection->getDefaultCollator()->clone();
-        }
-
+        invariant(collatorToUse);
         expCtx.reset(
             new ExpressionContext(opCtx,
                                   request,
-                                  std::move(collatorToUse),
+                                  std::move(*collatorToUse),
                                   uassertStatusOK(resolveInvolvedNamespaces(opCtx, request))));
         expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
-
-        if (liteParsedPipeline.hasChangeStream()) {
-            expCtx->tailableMode = ExpressionContext::TailableMode::kTailableAndAwaitData;
-        }
 
         auto pipeline = uassertStatusOK(Pipeline::parse(request.getPipeline(), expCtx));
 
@@ -471,7 +514,7 @@ Status runAggregate(OperationContext* opCtx,
         AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
         opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
         cmdObj);
-    if (expCtx->tailableMode == ExpressionContext::TailableMode::kTailableAndAwaitData) {
+    if (expCtx->tailableMode == TailableMode::kTailableAndAwaitData) {
         cursorParams.setTailable(true);
         cursorParams.setAwaitData(true);
     }

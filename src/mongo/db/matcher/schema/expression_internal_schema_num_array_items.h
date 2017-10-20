@@ -54,12 +54,28 @@ public:
 
     bool equivalent(const MatchExpression* other) const final;
 
+    size_t numChildren() const final {
+        return 0;
+    }
+
+    MatchExpression* getChild(size_t i) const final {
+        MONGO_UNREACHABLE;
+    }
+
+    std::vector<MatchExpression*>* getChildVector() final {
+        return nullptr;
+    }
+
 protected:
     long long numItems() const {
         return _numItems;
     }
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final {
+        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+    }
+
     StringData _name;
     long long _numItems = 0;
 };

@@ -43,6 +43,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database.h"
@@ -127,7 +128,10 @@ Status StorageInterfaceImpl::initializeRollbackID(OperationContext* opCtx) {
     BSONObjBuilder bob;
     rbid.serialize(&bob);
     SnapshotName noTimestamp;  // This write is not replicated.
-    return insertDocument(opCtx, _rollbackIdNss, TimestampedBSONObj{bob.done(), noTimestamp});
+    return insertDocument(opCtx,
+                          _rollbackIdNss,
+                          TimestampedBSONObj{bob.done(), noTimestamp},
+                          OpTime::kUninitializedTerm);
 }
 
 Status StorageInterfaceImpl::incrementRollbackID(OperationContext* opCtx) {
@@ -264,8 +268,9 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
 
 Status StorageInterfaceImpl::insertDocument(OperationContext* opCtx,
                                             const NamespaceString& nss,
-                                            const TimestampedBSONObj& doc) {
-    return insertDocuments(opCtx, nss, {InsertStatement(doc.obj, doc.timestamp)});
+                                            const TimestampedBSONObj& doc,
+                                            long long term) {
+    return insertDocuments(opCtx, nss, {InsertStatement(doc.obj, doc.timestamp, term)});
 }
 
 namespace {
@@ -411,10 +416,32 @@ Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const Names
         }
         WriteUnitOfWork wunit(opCtx);
         const auto status = autoDB.getDb()->dropCollectionEvenIfSystem(opCtx, nss);
-        if (status.isOK()) {
-            wunit.commit();
+        if (!status.isOK()) {
+            return status;
         }
-        return status;
+        wunit.commit();
+        return Status::OK();
+    });
+}
+
+Status StorageInterfaceImpl::truncateCollection(OperationContext* opCtx,
+                                                const NamespaceString& nss) {
+    return writeConflictRetry(opCtx, "StorageInterfaceImpl::truncateCollection", nss.ns(), [&] {
+        AutoGetCollection autoColl(opCtx, nss, MODE_X);
+        auto collectionResult =
+            getCollection(autoColl, nss, "The collection must exist before truncating.");
+        if (!collectionResult.isOK()) {
+            return collectionResult.getStatus();
+        }
+        auto collection = collectionResult.getValue();
+
+        WriteUnitOfWork wunit(opCtx);
+        const auto status = collection->truncate(opCtx);
+        if (!status.isOK()) {
+            return status;
+        }
+        wunit.commit();
+        return Status::OK();
     });
 }
 
@@ -894,6 +921,23 @@ StatusWith<StorageInterface::CollectionCount> StorageInterfaceImpl::getCollectio
     auto collection = collectionResult.getValue();
 
     return collection->numRecords(opCtx);
+}
+
+StatusWith<OptionalCollectionUUID> StorageInterfaceImpl::getCollectionUUID(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    AutoGetCollectionForRead autoColl(opCtx, nss);
+
+    auto collectionResult = getCollection(
+        autoColl, nss, str::stream() << "Unable to get UUID of " << nss.ns() << " collection.");
+    if (!collectionResult.isOK()) {
+        return collectionResult.getStatus();
+    }
+    auto collection = collectionResult.getValue();
+    return collection->uuid();
+}
+
+Status StorageInterfaceImpl::upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) {
+    return updateUUIDSchemaVersionNonReplicated(opCtx, true);
 }
 
 void StorageInterfaceImpl::setStableTimestamp(ServiceContext* serviceCtx,

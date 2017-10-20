@@ -36,7 +36,7 @@
 
 namespace mongo {
 
-class DocumentSourceGraphLookUp final : public DocumentSourceNeedsMongod {
+class DocumentSourceGraphLookUp final : public DocumentSourceNeedsMongoProcessInterface {
 public:
     static std::unique_ptr<LiteParsedDocumentSourceForeignCollections> liteParse(
         const AggregationRequest& request, const BSONElement& spec);
@@ -53,10 +53,14 @@ public:
      */
     GetModPathsReturn getModifiedPaths() const final;
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kNone,
+                                     HostTypeRequirement::kPrimaryShard,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kAllowed);
+
         constraints.canSwapWithMatch = true;
-        constraints.hostRequirement = HostTypeRequirement::kPrimaryShard;
         return constraints;
     }
 

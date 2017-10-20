@@ -75,8 +75,9 @@ env.Library(
         'move_timing_helper.cpp',
         'namespace_metadata_change_notifications.cpp',
         'operation_sharding_state.cpp',
-        'session_catalog_migration_source.cpp',
         'read_only_catalog_cache_loader.cpp',
+        'session_catalog_migration_destination.cpp',
+        'session_catalog_migration_source.cpp',
         'shard_identity_rollback_notifier.cpp',
         'shard_metadata_util.cpp',
         'shard_server_catalog_cache_loader.cpp',
@@ -168,14 +169,12 @@ env.Library(
         'config/configsvr_commit_chunk_migration_command.cpp',
         'config/configsvr_control_balancer_command.cpp',
         'config/configsvr_create_database_command.cpp',
-        'config/configsvr_drop_collection_command.cpp',
         'config/configsvr_enable_sharding_command.cpp',
         'config/configsvr_merge_chunk_command.cpp',
         'config/configsvr_move_chunk_command.cpp',
         'config/configsvr_move_primary_command.cpp',
         'config/configsvr_remove_shard_command.cpp',
         'config/configsvr_remove_shard_from_zone_command.cpp',
-        'config/configsvr_set_feature_compatibility_version_command.cpp',
         'config/configsvr_shard_collection_command.cpp',
         'config/configsvr_split_chunk_command.cpp',
         'config/configsvr_update_zone_key_range_command.cpp',
@@ -343,3 +342,14 @@ env.CppUnitTest(
     ]
 )
 
+env.CppUnitTest(
+    target='session_catalog_migration_destination_test',
+    source=[
+        'session_catalog_migration_destination_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_mock',
+        '$BUILD_DIR/mongo/s/shard_server_test_fixture',
+        'sharding',
+    ]
+)

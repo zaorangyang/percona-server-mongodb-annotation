@@ -37,6 +37,7 @@
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/unittest/ensure_fcv.h"
 #include "mongo/unittest/task_executor_proxy.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/scopeguard.h"
@@ -265,22 +266,6 @@ TEST_F(OplogFetcherTest, AwaitDataTimeoutShouldBeAConstantUnderProtocolVersion0)
     ASSERT_EQUALS(OplogFetcher::kDefaultProtocolZeroAwaitDataTimeout, timeout);
 }
 
-class EnsureFCV {
-public:
-    using Version = ServerGlobalParams::FeatureCompatibility::Version;
-    EnsureFCV(Version version)
-        : _version(version), _origVersion(serverGlobalParams.featureCompatibility.version.load()) {
-        serverGlobalParams.featureCompatibility.version.store(_version);
-    }
-    ~EnsureFCV() {
-        serverGlobalParams.featureCompatibility.version.store(_origVersion);
-    }
-
-private:
-    const Version _version;
-    const Version _origVersion;
-};
-
 TEST_F(OplogFetcherTest, FindQueryHasNoReadconcernIfTermNotLastFetched) {
     auto uninitializedTerm = OpTime::kUninitializedTerm;
     ASSERT_NOT_EQUALS(dataReplicatorExternalState->currentTerm, uninitializedTerm);
@@ -297,8 +282,7 @@ TEST_F(OplogFetcherTest, FindQueryHasNoReadconcernIfTermUninitialized) {
 
 TEST_F(OplogFetcherTest, FindQueryHasAfterOpTimeWithFeatureCompatibilityVersion34) {
     EnsureFCV ensureFCV(EnsureFCV::Version::k34);
-    ASSERT(serverGlobalParams.featureCompatibility.version.load() ==
-           ServerGlobalParams::FeatureCompatibility::Version::k34);
+    ASSERT(!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36());
     auto cmdObj = makeOplogFetcher(_createConfig(true))->getFindQuery_forTest();
     auto readConcernElem = cmdObj["readConcern"];
     ASSERT_EQUALS(mongo::BSONType::Object, readConcernElem.type());
@@ -310,8 +294,7 @@ TEST_F(OplogFetcherTest, FindQueryHasAfterOpTimeWithFeatureCompatibilityVersion3
 
 TEST_F(OplogFetcherTest, FindQueryHasAfterOpTimeWithFeatureCompatibilityVersion36) {
     EnsureFCV ensureFCV(EnsureFCV::Version::k36);
-    ASSERT(serverGlobalParams.featureCompatibility.version.load() !=
-           ServerGlobalParams::FeatureCompatibility::Version::k34);
+    ASSERT(serverGlobalParams.featureCompatibility.isFullyUpgradedTo36());
     auto cmdObj = makeOplogFetcher(_createConfig(true))->getFindQuery_forTest();
     auto readConcernElem = cmdObj["readConcern"];
     ASSERT_EQUALS(mongo::BSONType::Object, readConcernElem.type());
@@ -547,7 +530,7 @@ TEST_F(OplogFetcherTest,
     ASSERT_EQUALS(
         ErrorCodes::OplogStartMissing,
         processSingleBatch(
-            {makeCursorResponse(0, {makeNoopOplogEntry(lastFetched.opTime, lastFetched.value + 1)}),
+            {makeCursorResponse(0, {makeNoopOplogEntry(remoteNewerOpTime, lastFetched.value + 1)}),
              metadataObj,
              Milliseconds(0)})
             ->getStatus());

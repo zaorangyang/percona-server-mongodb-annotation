@@ -462,15 +462,8 @@ private:
         return writeConflictRetry(
             opCtx, "dbCheck oplog entry", NamespaceString::kRsOplogNamespace.ns(), [&] {
                 WriteUnitOfWork uow(opCtx);
-                repl::OpTime result = repl::logOp(opCtx,
-                                                  "c",
-                                                  nss,
-                                                  uuid,
-                                                  obj,
-                                                  nullptr,
-                                                  false,
-                                                  kUninitializedStmtId,
-                                                  repl::PreAndPostImageTimestamps());
+                repl::OpTime result = repl::logOp(
+                    opCtx, "c", nss, uuid, obj, nullptr, false, {}, kUninitializedStmtId, {});
                 uow.commit();
                 return result;
             });
@@ -545,13 +538,14 @@ public:
 
 private:
     bool _hasCorrectFCV(void) {
-        const auto fcv = serverGlobalParams.featureCompatibility.version.load();
-        return fcv >= ServerGlobalParams::FeatureCompatibility::Version::k36;
+        return serverGlobalParams.featureCompatibility.isFullyUpgradedTo36();
     }
 };
 
 MONGO_INITIALIZER(RegisterDbCheckCmd)(InitializerContext* context) {
-    new DbCheckCmd();
+    if (Command::testCommandsEnabled) {
+        new DbCheckCmd();
+    }
     return Status::OK();
 }
 }  // namespace

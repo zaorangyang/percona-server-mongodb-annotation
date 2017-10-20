@@ -36,7 +36,7 @@ namespace mongo {
 
 const int DEFAULT_UNIX_PERMS = 0700;
 const int RATE_LIMIT_MAX = 1000;
-constexpr auto DEFAULT_MAX_CONN = 1000000;
+constexpr size_t DEFAULT_MAX_CONN = 1000000;
 
 enum class ClusterRole { None, ShardServer, ConfigServer };
 
@@ -78,10 +78,10 @@ struct ServerGlobalParams {
     std::string socket = "/tmp";  // UNIX domain socket directory
     std::string transportLayer;   // --transportLayer (must be either "asio" or "legacy")
 
-    // --serviceExecutor ("adaptive", "synchronous", or "fixedForTesting")
+    // --serviceExecutor ("adaptive", "synchronous")
     std::string serviceExecutor;
 
-    int maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
+    size_t maxConns = DEFAULT_MAX_CONN;  // Maximum number of simultaneous open connections.
 
     int unixSocketPermissions = DEFAULT_UNIX_PERMS;  // permissions for the UNIX domain socket
 
@@ -159,26 +159,68 @@ struct ServerGlobalParams {
     BSONObj overrideShardIdentity;
 
     struct FeatureCompatibility {
-        enum class Version {
-            /**
-             * In this mode, the cluster will expose a 3.4-like API. Attempts by a client to use new
-             * features in 3.6 will be rejected.
-             */
-            k34,
+        /**
+         * The combination of the version and targetVersion determine this node's behavior.
+         *
+         * The legal (version, targetVersion) states are:
+         *
+         * (3.4, Unset) aka fully 3.4: only 3.4 features are available, and new and existing storage
+         *                             engine entries use the 3.4 format
+         *
+         * (3.4, 3.6) aka upgrading: only 3.4 features are available, but new storage engine entries
+         *                           use the 3.6 format, and existing entries may have either the
+         *                           3.4 or 3.6 format
+         *
+         * (3.6, Unset) aka fully 3.6: 3.6 features are available, and new and existing storage
+         *                             engine entries use the 3.6 format
+         *
+         * (3.4, 3.4) aka downgrading: only 3.4 features are available and new storage engine
+         *                             entries use the 3.4 format, but existing entries may have
+         *                             either the 3.4 or 3.6 format
+         */
+        enum class Version { k34, k36, kUnset };
 
-            /**
-             * In this mode, new features in 3.6 are allowed. The system should guarantee that no
-             * 3.4 node can participate in a cluster whose feature compatibility version is 3.6.
-             */
-            k36,
-        };
+        const Version getVersion() const {
+            return _version.load();
+        }
 
-        // Read-only parameter featureCompatibilityVersion.
-        AtomicWord<Version> version{Version::k34};
+        void reset() {
+            _version.store(Version::k34);
+            _targetVersion.store(Version::kUnset);
+        }
 
-        // Read-only global isSchemaVersion36. This determines whether to give Collections UUIDs
-        // upon creation.
-        AtomicWord<bool> isSchemaVersion36{false};
+        void setVersion(Version version) {
+            return _version.store(version);
+        }
+
+        const Version getTargetVersion() const {
+            return _targetVersion.load();
+        }
+
+        void setTargetVersion(Version version) {
+            return _targetVersion.store(version);
+        }
+
+        const bool isFullyUpgradedTo36() {
+            return (_version.load() == Version::k36 && _targetVersion.load() == Version::kUnset);
+        }
+
+        const bool isUpgradingTo36() {
+            return (_version.load() == Version::k34 && _targetVersion.load() == Version::k36);
+        }
+
+        const bool isFullyDowngradedTo34() {
+            return (_version.load() == Version::k34 && _targetVersion.load() == Version::kUnset);
+        }
+
+        const bool isDowngradingTo34() {
+            return (_version.load() == Version::k34 && _targetVersion.load() == Version::k34);
+        }
+
+        // This determines whether to give Collections UUIDs upon creation.
+        const bool isSchemaVersion36() {
+            return (isFullyUpgradedTo36() || isUpgradingTo36());
+        }
 
         // Feature validation differs depending on the role of a mongod in a replica set or
         // master/slave configuration. Masters/primaries can accept user-initiated writes and
@@ -186,6 +228,13 @@ struct ServerGlobalParams {
         // a master) always validates in "3.4" mode so that it can sync 3.4 features, even when in
         // "3.2" feature compatibility mode.
         AtomicWord<bool> validateFeaturesAsMaster{true};
+
+    private:
+        AtomicWord<Version> _version{Version::k34};
+
+        // If set, an upgrade or downgrade is in progress to the set version.
+        AtomicWord<Version> _targetVersion{Version::kUnset};
+
     } featureCompatibility;
 
     std::vector<std::string> disabledSecureAllocatorDomains;

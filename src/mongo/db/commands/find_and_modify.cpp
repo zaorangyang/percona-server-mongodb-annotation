@@ -30,10 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/commands/find_and_modify.h"
-
 #include <boost/optional.hpp>
-#include <memory>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
@@ -42,6 +39,7 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/find_and_modify_common.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/update.h"
@@ -71,7 +69,6 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
 namespace {
 
 const UpdateStats* getUpdateStats(const PlanExecutor* exec) {
@@ -167,12 +164,11 @@ void makeDeleteRequest(const FindAndModifyRequest& args, bool explain, DeleteReq
     requestOut->setExplain(explain);
 }
 
-void appendCommandResponse(PlanExecutor* exec,
+void appendCommandResponse(const PlanExecutor* exec,
                            bool isRemove,
                            const boost::optional<BSONObj>& value,
-                           BSONObjBuilder& result) {
-    BSONObjBuilder lastErrorObjBuilder(result.subobjStart("lastErrorObject"));
-
+                           BSONObjBuilder* result) {
+    BSONObjBuilder lastErrorObjBuilder(result->subobjStart("lastErrorObject"));
     if (isRemove) {
         lastErrorObjBuilder.appendNumber("n", getDeleteStats(exec)->docsDeleted);
     } else {
@@ -185,12 +181,12 @@ void appendCommandResponse(PlanExecutor* exec,
             lastErrorObjBuilder.appendAs(updateStats->objInserted["_id"], kUpsertedFieldName);
         }
     }
-    lastErrorObjBuilder.done();
+    lastErrorObjBuilder.doneFast();
 
     if (value) {
-        result.append("value", *value);
+        result->append("value", *value);
     } else {
-        result.appendNull("value");
+        result->appendNull("value");
     }
 }
 
@@ -216,11 +212,10 @@ void recordStatsForTopCommand(OperationContext* opCtx) {
                 curOp->getReadWriteType());
 }
 
-}  // namespace
-
-/* Find and Modify an object returning either the old (default) or new value*/
 class CmdFindAndModify : public BasicCommand {
 public:
+    CmdFindAndModify() : BasicCommand("findAndModify", "findandmodify") {}
+
     void help(std::stringstream& help) const override {
         help << "{ findAndModify: \"collection\", query: {processed:false}, update: {$set: "
                 "{processed:true}}, new: true}\n"
@@ -230,13 +225,11 @@ public:
                 "Output is in the \"value\" field\n";
     }
 
-    CmdFindAndModify() : BasicCommand("findAndModify", "findandmodify") {}
-
     bool slaveOk() const override {
         return false;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
@@ -246,7 +239,7 @@ public:
         find_and_modify::addPrivilegesRequiredForFindAndModify(this, dbname, cmdObj, out);
     }
 
-    ReadWriteType getReadWriteType() const {
+    ReadWriteType getReadWriteType() const override {
         return ReadWriteType::kWrite;
     }
 
@@ -362,14 +355,12 @@ public:
         if (shouldBypassDocumentValidationForCommand(cmdObj))
             maybeDisableValidation.emplace(opCtx);
 
+        const auto stmtId = 0;
         if (opCtx->getTxnNumber()) {
             auto session = OperationContextSession::get(opCtx);
-            invariant(session);
-            auto writeHistory = session->getWriteHistory(opCtx);
-
-            if (writeHistory.hasNext()) {
-                auto findAndModifyResult =
-                    parseOplogEntryForFindAndModify(opCtx, args, writeHistory.next(opCtx));
+            if (auto entry =
+                    session->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
+                auto findAndModifyResult = parseOplogEntryForFindAndModify(opCtx, args, *entry);
                 findAndModifyResult.serialize(&result);
                 return true;
             }
@@ -381,14 +372,14 @@ public:
         // Although usually the PlanExecutor handles WCE internally, it will throw WCEs when it is
         // executing a findAndModify. This is done to ensure that we can always match, modify, and
         // return the document under concurrency, if a matching document exists.
-        bool success = writeConflictRetry(opCtx, "findAndModify", nsString.ns(), [&] {
+        return writeConflictRetry(opCtx, "findAndModify", nsString.ns(), [&] {
             if (args.isRemove()) {
                 DeleteRequest request(nsString);
                 const bool isExplain = false;
                 makeDeleteRequest(args, isExplain, &request);
 
                 if (opCtx->getTxnNumber()) {
-                    request.setStmtId(0);
+                    request.setStmtId(stmtId);
                 }
 
                 ParsedDelete parsedDelete(opCtx, &request);
@@ -464,8 +455,8 @@ public:
                 }
                 recordStatsForTopCommand(opCtx);
 
-                boost::optional<BSONObj> value = advanceStatus.getValue();
-                appendCommandResponse(exec.get(), args.isRemove(), value, result);
+                appendCommandResponse(
+                    exec.get(), args.isRemove(), advanceStatus.getValue(), &result);
             } else {
                 UpdateRequest request(nsString);
                 UpdateLifecycleImpl updateLifecycle(nsString);
@@ -473,7 +464,7 @@ public:
                 makeUpdateRequest(args, isExplain, &updateLifecycle, &request);
 
                 if (opCtx->getTxnNumber()) {
-                    request.setStmtId(0);
+                    request.setStmtId(stmtId);
                 }
 
                 ParsedUpdate parsedUpdate(opCtx, &request);
@@ -578,19 +569,15 @@ public:
                 }
                 recordStatsForTopCommand(opCtx);
 
-                boost::optional<BSONObj> value = advanceStatus.getValue();
-                appendCommandResponse(exec.get(), args.isRemove(), value, result);
+                appendCommandResponse(
+                    exec.get(), args.isRemove(), advanceStatus.getValue(), &result);
             }
+
             return true;
         });
-
-        if (!success) {
-            return false;
-        }
-
-        return true;
     }
 
 } cmdFindAndModify;
 
+}  // namespace
 }  // namespace mongo

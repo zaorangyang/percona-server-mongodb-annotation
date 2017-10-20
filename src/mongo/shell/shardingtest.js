@@ -377,6 +377,8 @@ var ShardingTest = function(params) {
     };
 
     this.stop = function(opts) {
+        this.checkUUIDsConsistentAcrossCluster();
+
         for (var i = 0; i < this._mongos.length; i++) {
             this.stopMongos(i, opts);
         }
@@ -934,60 +936,6 @@ var ShardingTest = function(params) {
         assert(res.ok || res.errmsg == "it is already the primary", tojson(res));
     };
 
-    this.checkUUIDsConsistentAcrossCluster = function() {
-        print("Checking if UUIDs are consistent across the cluster");
-
-        let parseNs = function(dbDotColl) {
-            assert.gt(dbDotColl.indexOf('.'), 0);
-            let dbName = dbDotColl.substring(0, dbDotColl.indexOf('.'));
-            let collName = dbDotColl.substring(dbDotColl.indexOf('.') + 1, dbDotColl.length);
-            return [dbName, collName];
-        };
-
-        // Read from config.collections, config.shards, and config.chunks to construct a picture of
-        // which shards own data for which collections, and what the UUID for those collections are.
-        let authoritativeCollMetadatas =
-            this.s.getDB("config")
-                .chunks
-                .aggregate([
-                    {
-                      $lookup: {
-                          from: "shards",
-                          localField: "shard",
-                          foreignField: "_id",
-                          as: "shardHost"
-                      }
-                    },
-                    {$unwind: "$shardHost"},
-                    {$group: {_id: "$ns", shards: {$addToSet: "$shardHost.host"}}},
-                    {
-                      $lookup: {
-                          from: "collections",
-                          localField: "_id",
-                          foreignField: "_id",
-                          as: "collInfo"
-                      }
-                    },
-                    {$unwind: "$collInfo"}
-                ])
-                .toArray();
-
-        for (authoritativeCollMetadata of authoritativeCollMetadatas) {
-            let [dbName, collName] = parseNs(authoritativeCollMetadata._id);
-            for (shard of authoritativeCollMetadata.shards) {
-                let shardConn = new Mongo(shard);
-                let actualCollMetadata =
-                    shardConn.getDB(dbName).getCollectionInfos({name: collName})[0];
-                assert.eq(authoritativeCollMetadata.collInfo.uuid,
-                          actualCollMetadata.info.uuid,
-                          "authoritative collection info on config server: " +
-                              tojson(authoritativeCollMetadata.collInfo) +
-                              ", actual collection info on shard " + shard + ": " +
-                              tojson(actualCollMetadata));
-            }
-        }
-    };
-
     /**
      * Returns whether any settings to ShardingTest or jsTestOptions indicate this is a multiversion
      * cluster.
@@ -1210,6 +1158,7 @@ var ShardingTest = function(params) {
                 bridgeOptions: otherParams.bridgeOptions,
                 keyFile: keyFile,
                 protocolVersion: protocolVersion,
+                waitForKeys: false,
                 settings: rsSettings
             });
 
@@ -1332,6 +1281,7 @@ var ShardingTest = function(params) {
         useBridge: otherParams.useBridge,
         bridgeOptions: otherParams.bridgeOptions,
         keyFile: keyFile,
+        waitForKeys: false,
         name: testName + "-configRS",
     };
 
@@ -1556,4 +1506,22 @@ var ShardingTest = function(params) {
             return true;
         }, "waiting for all mongos servers to return cluster times", 60 * 1000, 500);
     }
+
+    // Ensure that the sessions collection exists so jstests can run things with
+    // logical sessions and test them. We do this by forcing an immediate cache refresh
+    // on the config server, which auto-shards the collection for the cluster.
+    var lastStableBinVersion = MongoRunner.getBinVersionFor('last-stable');
+    if ((!otherParams.configOptions) ||
+        (otherParams.configOptions && !otherParams.configOptions.binVersion) ||
+        (otherParams.configOptions && otherParams.configOptions.binVersion &&
+         MongoRunner.areBinVersionsTheSame(
+             lastStableBinVersion,
+             MongoRunner.getBinVersionFor(otherParams.configOptions.binVersion)))) {
+        this.configRS.getPrimary().getDB("admin").runCommand({refreshLogicalSessionCacheNow: 1});
+    }
+
 };
+
+// Stub for a hook to check that collection UUIDs are consistent across shards and the config
+// server.
+ShardingTest.prototype.checkUUIDsConsistentAcrossCluster = function() {};

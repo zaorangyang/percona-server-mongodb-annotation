@@ -59,6 +59,19 @@ public:
     static OperationShardingState& get(OperationContext* opCtx);
 
     /**
+     * Requests on a sharded collection that are broadcast without a shardVersion should not cause
+     * the collection to be created on a shard that does not know about the collection already,
+     * since the collection options will not be propagated. Such requests specify to disallow
+     * collection creation, which is saved here.
+     */
+    void setAllowImplicitCollectionCreation(const BSONElement& allowImplicitCollectionCreationElem);
+
+    /**
+     * Specifies whether the request is allowed to create database/collection implicitly.
+     */
+    bool allowImplicitCollectionCreation() const;
+
+    /**
      * Parses shard version from the command parameters 'cmdObj' and stores the results in this
      * object along with the give namespace that is associated with the version. Does nothing
      * if no shard version is attached to the command.
@@ -117,6 +130,9 @@ private:
      * _shardVersion is UNSHARDED, _ns is empty).
      */
     void _clear();
+
+    // Specifies whether the request is allowed to create database/collection implicitly
+    bool _allowImplicitCollectionCreation{true};
 
     bool _hasVersion = false;
     ChunkVersion _shardVersion{ChunkVersion::UNSHARDED()};

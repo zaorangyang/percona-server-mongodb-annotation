@@ -87,16 +87,15 @@ MONGO_EXPORT_STARTUP_SERVER_PARAMETER(rollbackMethod, std::string, kRollbackViaR
 // Checks that only the valid strings above can be used as a rollbackMethod
 // parameter. Throws an error if an invalid string is passed to the server parameter.
 MONGO_INITIALIZER(rollbackMethod)(InitializerContext*) {
-    std::set<StringData> supportedRollbackMethods = {
-        kRollbackViaRefetchNoUUID, kRollbackViaRefetch, kRollbackToCheckpoint};
+    std::set<StringData> supportedRollbackMethods = {kRollbackViaRefetchNoUUID,
+                                                     kRollbackViaRefetch};
 
     // Unsupported rollback method.
     if (supportedRollbackMethods.count(rollbackMethod) == 0) {
         std::string errMsg = str::stream()
             << "Unsupported rollback method: '" + rollbackMethod + "'. "
             << "Supported rollback methods: "
-            << "'" << kRollbackViaRefetchNoUUID << "' | '" << kRollbackViaRefetch << "' | '"
-            << kRollbackToCheckpoint << "'";
+            << "'" << kRollbackViaRefetchNoUUID << "' | '" << kRollbackViaRefetch << "'";
         return Status(ErrorCodes::BadValue, errMsg);
     }
     return Status::OK();
@@ -292,6 +291,10 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
 
     // this oplog reader does not do a handshake because we don't want the server it's syncing
     // from to track how far it has synced
+    HostAndPort oldSource;
+    OpTime lastOpTimeFetched;
+    HostAndPort source;
+    SyncSourceResolverResponse syncSourceResp;
     {
         stdx::unique_lock<stdx::mutex> lock(_mutex);
         if (_lastOpTimeFetched.isNull()) {
@@ -305,13 +308,11 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
         if (_state != ProducerState::Running) {
             return;
         }
+
+        oldSource = _syncSourceHost;
     }
 
     // find a target to sync from the last optime fetched
-    OpTime lastOpTimeFetched;
-    HostAndPort source;
-    HostAndPort oldSource = _syncSourceHost;
-    SyncSourceResolverResponse syncSourceResp;
     {
         const OpTime minValidSaved =
             _replicationProcess->getConsistencyMarkers()->getMinValid(opCtx);
@@ -625,6 +626,7 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
     }
 
     log() << "Starting rollback due to " << redact(fetcherReturnStatus);
+    log() << "Replication commit point: " << _replCoord->getLastCommittedOpTime();
 
     // TODO: change this to call into the Applier directly to block until the applier is
     // drained.
@@ -676,8 +678,7 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
             opCtx, source, &localOplog, storageInterface, getConnection);
 
     } else if (rollbackMethod != kRollbackViaRefetchNoUUID &&
-               (serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k36)) {
+               (serverGlobalParams.featureCompatibility.isFullyUpgradedTo36())) {
         // If the user is in FCV 3.6 and the user did not specify to fall back on "roll back via
         // refetch" without UUID support, then we use "roll back via refetch" with UUIDs.
 
@@ -695,14 +696,12 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
     } else {
         if (rollbackMethod == kRollbackToCheckpoint) {
             invariant(!supportsCheckpointRollback);
-            invariant(serverGlobalParams.featureCompatibility.version.load() ==
-                      ServerGlobalParams::FeatureCompatibility::Version::k34);
+            invariant(!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36());
             log() << "Rollback using the 'rollbackViaRefetchNoUUID' method because this storage "
                      "engine does not support 'roll back to a checkpoint' and we are "
                      "in featureCompatibilityVersion 3.4.";
         } else if (rollbackMethod == kRollbackViaRefetch) {
-            invariant(serverGlobalParams.featureCompatibility.version.load() ==
-                      ServerGlobalParams::FeatureCompatibility::Version::k34);
+            invariant(!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36());
             log() << "Rollback using the 'rollbackViaRefetchNoUUID' method. 'rollbackViaRefetch' "
                      "with UUID support is not feature compatible with featureCompatabilityVersion "
                      "3.4.";
@@ -735,6 +734,8 @@ void BackgroundSync::_runRollbackViaRecoverToCheckpoint(
             return;
         }
     }
+
+    fassertFailedNoTrace(40651);
 
     _rollback = stdx::make_unique<RollbackImpl>(
         localOplog, &remoteOplog, storageInterface, _replicationProcess, _replCoord);

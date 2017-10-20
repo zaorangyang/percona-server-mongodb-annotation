@@ -439,8 +439,10 @@ var ReplSetTest = function(opts) {
             var member = {};
             member._id = i;
 
-            var port = this.ports[i];
-            member.host = this.host + ":" + port;
+            member.host = this.host;
+            if (!member.host.contains('/')) {
+                member.host += ":" + this.ports[i];
+            }
 
             var nodeOpts = this.nodeOptions["n" + i];
             if (nodeOpts) {
@@ -487,6 +489,10 @@ var ReplSetTest = function(opts) {
 
         if (options && options.keyFile) {
             self.keyFile = options.keyFile;
+        }
+
+        if (options) {
+            self.startOptions = options;
         }
 
         var nodes = [];
@@ -540,6 +546,82 @@ var ReplSetTest = function(opts) {
             },
             "Awaiting node " + node + " syncing from " + upstreamNode + ": " + tojson(status),
             timeout);
+    };
+
+    /**
+     * Blocks until each node agrees that all other nodes have applied the most recent oplog entry.
+     */
+    this.awaitNodesAgreeOnAppliedOpTime = function(timeout, nodes) {
+        timeout = timeout || self.kDefaultTimeoutMS;
+        nodes = nodes || self.nodes;
+
+        assert.soon(function() {
+            let appliedOpTimeConsensus = undefined;
+            for (let i = 0; i < nodes.length; i++) {
+                let replSetGetStatus;
+                try {
+                    replSetGetStatus = nodes[i].adminCommand({replSetGetStatus: 1});
+                } catch (e) {
+                    print("AwaitNodesAgreeOnAppliedOpTime: Retrying because node " + nodes[i].name +
+                          " failed to execute replSetGetStatus: " + tojson(e));
+                    return false;
+                }
+                assert.commandWorked(replSetGetStatus);
+
+                if (appliedOpTimeConsensus === undefined) {
+                    if (replSetGetStatus.optimes) {
+                        appliedOpTimeConsensus = replSetGetStatus.optimes.appliedOpTime;
+                    } else {
+                        // Older versions of mongod do not include an 'optimes' field in the
+                        // replSetGetStatus response. We instead pull an optime from the first
+                        // replica set member that includes one in its status. All we need here is
+                        // any initial value that we can compare to all the other optimes.
+                        let optimeMembers = replSetGetStatus.members.filter(m => m.optime);
+                        assert(optimeMembers.length > 0,
+                               "AwaitNodesAgreeOnAppliedOpTime: replSetGetStatus did not " +
+                                   "include optimes for any members: " + tojson(replSetGetStatus));
+                        appliedOpTimeConsensus = optimeMembers[0].optime;
+                    }
+
+                    assert(appliedOpTimeConsensus,
+                           "AwaitNodesAgreeOnAppliedOpTime: missing appliedOpTime in " +
+                               "replSetGetStatus: " + tojson(replSetGetStatus));
+                }
+
+                if (replSetGetStatus.optimes &&
+                    !friendlyEqual(replSetGetStatus.optimes.appliedOpTime,
+                                   appliedOpTimeConsensus)) {
+                    print("AwaitNodesAgreeOnAppliedOpTime: Retrying because node " + nodes[i].name +
+                          " has appliedOpTime " + tojson(replSetGetStatus.optimes.appliedOpTime) +
+                          " that does not match the previously observed appliedOpTime " +
+                          tojson(appliedOpTimeConsensus));
+                    return false;
+                }
+
+                for (let j = 0; j < replSetGetStatus.members.length; j++) {
+                    if (replSetGetStatus.members[j].state == ReplSetTest.State.ARBITER) {
+                        // ARBITER nodes do not apply oplog entries and do not have an 'optime'
+                        // field.
+                        continue;
+                    }
+
+                    if (!friendlyEqual(replSetGetStatus.members[j].optime,
+                                       appliedOpTimeConsensus)) {
+                        print("AwaitNodesAgreeOnAppliedOpTime: Retrying because node " +
+                              nodes[i].name + " sees optime " +
+                              tojson(replSetGetStatus.members[j].optime) + " on node " +
+                              replSetGetStatus.members[j].name + " but expects to see optime " +
+                              tojson(appliedOpTimeConsensus));
+                        return false;
+                    }
+                }
+            }
+
+            print(
+                "AwaitNodesAgreeOnAppliedOpTime: All nodes agree that all ops are applied up to " +
+                tojson(appliedOpTimeConsensus));
+            return true;
+        }, "Awaiting nodes to agree that all ops are applied across replica set", timeout);
     };
 
     /**
@@ -779,8 +861,10 @@ var ReplSetTest = function(opts) {
             printjson(cmd);
 
             // replSetInitiate and replSetReconfig commands can fail with a NodeNotFound error
-            // if a heartbeat times out during the quorum check. We retry three times to reduce
-            // the chance of failing this way.
+            // if a heartbeat times out during the quorum check.
+            // They may also fail with NewReplicaSetConfigurationIncompatible on similar timeout
+            // during the config validation stage while deducing isSelf().
+            // We retry three times to reduce the chance of failing this way.
             assert.retry(() => {
                 var res;
                 try {
@@ -799,7 +883,9 @@ var ReplSetTest = function(opts) {
                 }
 
                 assert.commandFailedWithCode(
-                    res, ErrorCodes.NodeNotFound, "replSetReconfig during initiate failed");
+                    res,
+                    [ErrorCodes.NodeNotFound, ErrorCodes.NewReplicaSetConfigurationIncompatible],
+                    "replSetReconfig during initiate failed");
                 return false;
             }, "replSetReconfig during initiate failed", 3, 5 * 1000);
         }
@@ -811,6 +897,48 @@ var ReplSetTest = function(opts) {
         }
 
         this.awaitSecondaryNodes();
+
+        let shouldWaitForKeys = true;
+        if (self.waitForKeys != undefined) {
+            shouldWaitForKeys = self.waitForKeys;
+            print("Set shouldWaitForKeys from RS options: " + shouldWaitForKeys);
+        } else {
+            Object.keys(self.nodeOptions).forEach(function(key, index) {
+                let val = self.nodeOptions[key];
+                if (typeof(val) === "object" &&
+                    (val.hasOwnProperty("shardsvr") ||
+                     // TODO: SERVER-31376
+                     val.hasOwnProperty("binVersion") && val.binVersion != "latest")) {
+                    shouldWaitForKeys = false;
+                    print("Set shouldWaitForKeys from node options: " + shouldWaitForKeys);
+                }
+            });
+            if (self.startOptions != undefined) {
+                let val = self.startOptions;
+                if (typeof(val) === "object" &&
+                    (val.hasOwnProperty("shardsvr") ||
+                     val.hasOwnProperty("binVersion") && val.binVersion != "latest")) {
+                    shouldWaitForKeys = false;
+                    print("Set shouldWaitForKeys from start options: " + shouldWaitForKeys);
+                }
+            }
+        }
+        /**
+         * Blocks until the primary node generates cluster time sign keys.
+         */
+        if (shouldWaitForKeys) {
+            var timeout = self.kDefaultTimeoutMS;
+            asCluster(this.nodes, function(timeout) {
+                print("Waiting for keys to sign $clusterTime to be generated");
+                assert.soonNoExcept(function(timeout) {
+                    var keyCnt = self.getPrimary(timeout)
+                                     .getCollection('admin.system.keys')
+                                     .find({purpose: 'HMAC'})
+                                     .itcount();
+                    return keyCnt >= 2;
+                }, "Awaiting keys", timeout);
+            });
+        }
     };
 
     /**
@@ -844,6 +972,7 @@ var ReplSetTest = function(opts) {
      */
     this.stepUp = function(node) {
         this.awaitReplication();
+        this.awaitNodesAgreeOnAppliedOpTime();
         this.awaitNodesAgreeOnPrimary();
         if (this.getPrimary() === node) {
             return;
@@ -865,6 +994,7 @@ var ReplSetTest = function(opts) {
                           "': " + tojson(ex));
                 }
                 this.awaitReplication();
+                this.awaitNodesAgreeOnAppliedOpTime();
                 this.awaitNodesAgreeOnPrimary();
             }
 
@@ -1190,9 +1320,8 @@ var ReplSetTest = function(opts) {
         }
     };
 
-    this.checkReplicatedDataHashes = function(msgPrefix = 'checkReplicatedDataHashes',
-                                              excludedDBs = []) {
-
+    this.checkReplicatedDataHashes = function(
+        msgPrefix = 'checkReplicatedDataHashes', excludedDBs = [], ignoreUUIDs = false) {
         // Return items that are in either Array `a` or `b` but not both. Note that this will
         // not work with arrays containing NaN. Array.indexOf(NaN) will always return -1.
         function arraySymmetricDifference(a, b) {
@@ -1267,7 +1396,7 @@ var ReplSetTest = function(opts) {
             }
         }
 
-        function checkDBHashesForReplSet(rst, dbBlacklist = [], msgPrefix) {
+        function checkDBHashesForReplSet(rst, dbBlacklist = [], msgPrefix, ignoreUUIDs) {
             // We don't expect the local database to match because some of its
             // collections are not replicated.
             dbBlacklist.push('local');
@@ -1352,6 +1481,12 @@ var ReplSetTest = function(opts) {
                         primaryCollInfo.forEach(primaryInfo => {
                             if (secondaryInfo.name === primaryInfo.name &&
                                 secondaryInfo.type === primaryInfo.type) {
+                                if (ignoreUUIDs) {
+                                    print(msgPrefix + ", skipping UUID check for " +
+                                          primaryInfo.name);
+                                    primaryInfo.info.uuid = null;
+                                    secondaryInfo.info.uuid = null;
+                                }
                                 if (!bsonBinaryEqual(secondaryInfo, primaryInfo)) {
                                     print(msgPrefix +
                                           ', the primary and secondary have different ' +
@@ -1418,7 +1553,7 @@ var ReplSetTest = function(opts) {
             assert(success, 'dbhash mismatch between primary and secondary');
         }
 
-        this.checkReplicaSet(checkDBHashesForReplSet, this, excludedDBs, msgPrefix);
+        this.checkReplicaSet(checkDBHashesForReplSet, this, excludedDBs, msgPrefix, ignoreUUIDs);
     };
 
     this.checkOplogs = function(msgPrefix) {
@@ -1823,6 +1958,7 @@ var ReplSetTest = function(opts) {
         self.useSeedList = opts.useSeedList || false;
         self.keyFile = opts.keyFile;
         self.protocolVersion = opts.protocolVersion;
+        self.waitForKeys = opts.waitForKeys;
 
         _useBridge = opts.useBridge || false;
         _bridgeOptions = opts.bridgeOptions || {};
@@ -1881,6 +2017,7 @@ var ReplSetTest = function(opts) {
         var existingNodes = conf.members.map(member => member.host);
         self.ports = existingNodes.map(node => node.split(':')[1]);
         self.nodes = existingNodes.map(node => new Mongo(node));
+        self.waitForKeys = false;
     }
 
     if (typeof opts === 'string' || opts instanceof String) {

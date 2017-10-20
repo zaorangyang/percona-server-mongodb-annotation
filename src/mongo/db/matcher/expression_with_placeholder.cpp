@@ -30,6 +30,8 @@
 
 #include "mongo/db/matcher/expression_with_placeholder.h"
 
+#include "mongo/db/matcher/expression_parser.h"
+
 #include <regex>
 
 namespace mongo {
@@ -88,15 +90,8 @@ bool ExpressionWithPlaceholder::equivalent(const ExpressionWithPlaceholder* othe
 const std::regex ExpressionWithPlaceholder::placeholderRegex("^[a-z][a-zA-Z0-9]*$");
 
 // static
-StatusWith<std::unique_ptr<ExpressionWithPlaceholder>> ExpressionWithPlaceholder::parse(
-    BSONObj rawFilter, const CollatorInterface* collator) {
-    StatusWithMatchExpression statusWithFilter = MatchExpressionParser::parse(rawFilter, collator);
-
-    if (!statusWithFilter.isOK()) {
-        return statusWithFilter.getStatus();
-    }
-    auto filter = std::move(statusWithFilter.getValue());
-
+StatusWith<std::unique_ptr<ExpressionWithPlaceholder>> ExpressionWithPlaceholder::make(
+    std::unique_ptr<MatchExpression> filter) {
     auto statusWithId = parseTopLevelFieldName(filter.get());
     if (!statusWithId.isOK()) {
         return statusWithId.getStatus();

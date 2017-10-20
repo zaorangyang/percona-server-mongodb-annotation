@@ -37,7 +37,7 @@ namespace mongo {
  * Provides a document source interface to retrieve index statistics for a given namespace.
  * Each document returned represents a single index and mongod instance.
  */
-class DocumentSourceIndexStats final : public DocumentSourceNeedsMongod {
+class DocumentSourceIndexStats final : public DocumentSourceNeedsMongoProcessInterface {
 public:
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
@@ -69,11 +69,14 @@ public:
     const char* getSourceName() const final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.requiredPosition = PositionRequirement::kFirst;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kFirst,
+                                     HostTypeRequirement::kAnyShard,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed);
+
         constraints.requiresInputDocSource = false;
-        constraints.isAllowedInsideFacetStage = false;
         return constraints;
     }
 

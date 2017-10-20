@@ -50,16 +50,18 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                HostTypeRequirement::kNone,
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kAllowed};
+    }
+
     GetNextResult getNext() final;
 
     const char* getSourceName() const final {
         return kStageName.rawData();
-    }
-
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.hostRequirement = HostTypeRequirement::kAnyShardOrMongoS;
-        return constraints;
     }
 
     /**
@@ -84,8 +86,8 @@ public:
     boost::intrusive_ptr<DocumentSource> getShardSource() final {
         return NULL;
     }
-    boost::intrusive_ptr<DocumentSource> getMergeSource() final {
-        return this;
+    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final {
+        return {this};
     }
 
     long long getSkip() const {

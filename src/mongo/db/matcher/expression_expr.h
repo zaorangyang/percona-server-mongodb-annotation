@@ -32,6 +32,7 @@
 
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/matcher/rewrite_expr.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 
@@ -46,8 +47,7 @@ public:
     ExprMatchExpression(BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     ExprMatchExpression(boost::intrusive_ptr<Expression> expr,
-                        const boost::intrusive_ptr<ExpressionContext>& expCtx)
-        : MatchExpression(MatchType::EXPRESSION), _expCtx(expCtx), _expression(expr) {}
+                        const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     bool matchesSingleElement(const BSONElement& e, MatchDetails* details = nullptr) const final {
         MONGO_UNREACHABLE;
@@ -70,7 +70,23 @@ public:
         return MatchCategory::kOther;
     }
 
+    size_t numChildren() const final {
+        return 0;
+    }
+
+    MatchExpression* getChild(size_t i) const final {
+        MONGO_UNREACHABLE;
+    }
+
+    std::vector<MatchExpression*>* getChildVector() final {
+        return nullptr;
+    }
+
 private:
+    ExpressionOptimizerFunc getOptimizer() const final;
+
+    void _doSetCollator(const CollatorInterface* collator) final;
+
     void _doAddDependencies(DepsTracker* deps) const final {
         if (_expression) {
             _expression->addDependencies(deps);
@@ -79,9 +95,9 @@ private:
 
     boost::intrusive_ptr<ExpressionContext> _expCtx;
 
-    // TODO SERVER-30991: '_expression' should be optimized as part of MatchExpression::optimize().
     boost::intrusive_ptr<Expression> _expression;
-};
 
+    boost::optional<RewriteExpr::RewriteResult> _rewriteResult;
+};
 
 }  // namespace mongo

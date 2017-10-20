@@ -50,6 +50,19 @@ OperationShardingState& OperationShardingState::get(OperationContext* opCtx) {
     return shardingMetadataDecoration(opCtx);
 }
 
+void OperationShardingState::setAllowImplicitCollectionCreation(
+    const BSONElement& allowImplicitCollectionCreationElem) {
+    if (!allowImplicitCollectionCreationElem.eoo()) {
+        _allowImplicitCollectionCreation = allowImplicitCollectionCreationElem.Bool();
+    } else {
+        _allowImplicitCollectionCreation = true;
+    }
+}
+
+bool OperationShardingState::allowImplicitCollectionCreation() const {
+    return _allowImplicitCollectionCreation;
+}
+
 void OperationShardingState::initializeShardVersion(NamespaceString nss,
                                                     const BSONElement& shardVersionElt) {
     invariant(!hasShardVersion());

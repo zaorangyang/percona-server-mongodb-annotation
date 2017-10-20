@@ -216,11 +216,16 @@ public:
 protected:
     struct StorageInterfaceResults {
         bool createOplogCalled = false;
+        bool truncateCalled = false;
         bool insertedOplogEntries = false;
         int oplogEntriesInserted = 0;
         bool droppedUserDBs = false;
         std::vector<std::string> droppedCollections;
         int documentsInsertedCount = 0;
+        bool schemaUpgraded = false;
+        OptionalCollectionUUID uuid;
+        bool getCollectionUUIDShouldFail = false;
+        bool upgradeUUIDSchemaVersionNonReplicatedShouldFail = false;
     };
 
     stdx::mutex _storageInterfaceWorkDoneMutex;  // protects _storageInterfaceWorkDone.
@@ -233,10 +238,22 @@ protected:
                                                   const NamespaceString& nss) {
             LockGuard lock(_storageInterfaceWorkDoneMutex);
             _storageInterfaceWorkDone.createOplogCalled = true;
+            _storageInterfaceWorkDone.schemaUpgraded = false;
+            _storageInterfaceWorkDone.uuid = boost::none;
+            _storageInterfaceWorkDone.getCollectionUUIDShouldFail = false;
+            _storageInterfaceWorkDone.upgradeUUIDSchemaVersionNonReplicatedShouldFail = false;
             return Status::OK();
         };
-        _storageInterface->insertDocumentFn = [this](
-            OperationContext* opCtx, const NamespaceString& nss, const TimestampedBSONObj& doc) {
+        _storageInterface->truncateCollFn = [this](OperationContext* opCtx,
+                                                   const NamespaceString& nss) {
+            LockGuard lock(_storageInterfaceWorkDoneMutex);
+            _storageInterfaceWorkDone.truncateCalled = true;
+            return Status::OK();
+        };
+        _storageInterface->insertDocumentFn = [this](OperationContext* opCtx,
+                                                     const NamespaceString& nss,
+                                                     const TimestampedBSONObj& doc,
+                                                     long long term) {
             LockGuard lock(_storageInterfaceWorkDoneMutex);
             ++_storageInterfaceWorkDone.documentsInsertedCount;
             return Status::OK();
@@ -276,6 +293,35 @@ protected:
 
                 return StatusWith<std::unique_ptr<CollectionBulkLoader>>(
                     std::unique_ptr<CollectionBulkLoader>(collInfo->loader));
+            };
+        _storageInterface->getCollectionUUIDFn = [this](OperationContext* opCtx,
+                                                        const NamespaceString& nss) {
+            LockGuard lock(_storageInterfaceWorkDoneMutex);
+            if (_storageInterfaceWorkDone.getCollectionUUIDShouldFail) {
+                // getCollectionUUID returns NamespaceNotFound if either the db or the collection is
+                // missing.
+                return StatusWith<OptionalCollectionUUID>(Status(
+                    ErrorCodes::NamespaceNotFound,
+                    str::stream() << "getCollectionUUID failed because namespace " << nss.ns()
+                                  << " not found."));
+            } else {
+                return StatusWith<OptionalCollectionUUID>(_storageInterfaceWorkDone.uuid);
+            }
+        };
+
+        _storageInterface->upgradeUUIDSchemaVersionNonReplicatedFn =
+            [this](OperationContext* opCtx) {
+                LockGuard lock(_storageInterfaceWorkDoneMutex);
+                if (_storageInterfaceWorkDone.upgradeUUIDSchemaVersionNonReplicatedShouldFail) {
+                    // One of the status codes a failed upgradeUUIDSchemaVersionNonReplicated call
+                    // can return is NamespaceNotFound.
+                    return Status(ErrorCodes::NamespaceNotFound,
+                                  "upgradeUUIDSchemaVersionNonReplicated failed because the "
+                                  "desired ns was not found.");
+                } else {
+                    _storageInterfaceWorkDone.schemaUpgraded = true;
+                    return Status::OK();
+                }
             };
 
         _dbWorkThreadPool = stdx::make_unique<OldThreadPool>(1);
@@ -395,6 +441,9 @@ protected:
             ASSERT_EQ(cmdName, reqCmdName);
         }
     }
+
+    void doSuccessfulInitialSyncWithOneBatch();
+    OplogEntry doInitialSyncWithOneBatch();
 
     std::unique_ptr<TaskExecutorMock> _executorProxy;
 
@@ -921,14 +970,13 @@ TEST_F(InitialSyncerTest, InitialSyncerResetsOnCompletionCallbackFunctionPointer
     ASSERT_TRUE(sharedCallbackStateDestroyed);
 }
 
-TEST_F(InitialSyncerTest, InitialSyncerRecreatesOplogAndDropsReplicatedDatabases) {
-    // We are not interested in proceeding beyond the oplog creation stage so we inject a failure
-    // after setting '_storageInterfaceWorkDone.createOplogCalled' to true.
-    auto oldCreateOplogFn = _storageInterface->createOplogFn;
-    _storageInterface->createOplogFn = [oldCreateOplogFn](OperationContext* opCtx,
-                                                          const NamespaceString& nss) {
-        oldCreateOplogFn(opCtx, nss).transitional_ignore();
-        return Status(ErrorCodes::OperationFailed, "oplog creation failed");
+TEST_F(InitialSyncerTest, InitialSyncerTruncatesOplogAndDropsReplicatedDatabases) {
+    // We are not interested in proceeding beyond the dropUserDB stage so we inject a failure
+    // after setting '_storageInterfaceWorkDone.droppedUserDBs' to true.
+    auto oldDropUserDBsFn = _storageInterface->dropUserDBsFn;
+    _storageInterface->dropUserDBsFn = [oldDropUserDBsFn](OperationContext* opCtx) {
+        ASSERT_OK(oldDropUserDBsFn(opCtx));
+        return Status(ErrorCodes::OperationFailed, "drop userdbs failed");
     };
 
     auto initialSyncer = &getInitialSyncer();
@@ -941,8 +989,8 @@ TEST_F(InitialSyncerTest, InitialSyncerRecreatesOplogAndDropsReplicatedDatabases
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
 
     LockGuard lock(_storageInterfaceWorkDoneMutex);
+    ASSERT_TRUE(_storageInterfaceWorkDone.truncateCalled);
     ASSERT_TRUE(_storageInterfaceWorkDone.droppedUserDBs);
-    ASSERT_TRUE(_storageInterfaceWorkDone.createOplogCalled);
 }
 
 TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetRollbackIdScheduleError) {
@@ -973,13 +1021,13 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetRollbackIdScheduleError) 
 TEST_F(
     InitialSyncerTest,
     InitialSyncerReturnsShutdownInProgressIfSchedulingRollbackCheckerFailedDueToExecutorShutdown) {
-    // The rollback id request is sent immediately after oplog creation. We shut the task executor
-    // down before returning from createOplog() to make the scheduleRemoteCommand() call for
+    // The rollback id request is sent immediately after oplog truncation. We shut the task executor
+    // down before returning from truncate() to make the scheduleRemoteCommand() call for
     // replSetGetRBID fail.
-    auto oldCreateOplogFn = _storageInterface->createOplogFn;
-    _storageInterface->createOplogFn = [oldCreateOplogFn, this](OperationContext* opCtx,
-                                                                const NamespaceString& nss) {
-        auto status = oldCreateOplogFn(opCtx, nss);
+    auto oldTruncateCollFn = _storageInterface->truncateCollFn;
+    _storageInterface->truncateCollFn = [oldTruncateCollFn, this](OperationContext* opCtx,
+                                                                  const NamespaceString& nss) {
+        auto status = oldTruncateCollFn(opCtx, nss);
         getExecutor().shutdown();
         return status;
     };
@@ -994,7 +1042,7 @@ TEST_F(
     ASSERT_EQUALS(ErrorCodes::ShutdownInProgress, _lastApplied);
 
     LockGuard lock(_storageInterfaceWorkDoneMutex);
-    ASSERT_TRUE(_storageInterfaceWorkDone.createOplogCalled);
+    ASSERT_TRUE(_storageInterfaceWorkDone.truncateCalled);
 }
 
 TEST_F(InitialSyncerTest, InitialSyncerCancelsRollbackCheckerOnShutdown) {
@@ -2047,12 +2095,17 @@ TEST_F(
 
     NamespaceString insertDocumentNss;
     TimestampedBSONObj insertDocumentDoc;
-    _storageInterface->insertDocumentFn = [&insertDocumentDoc, &insertDocumentNss](
-        OperationContext*, const NamespaceString& nss, const TimestampedBSONObj& doc) {
-        insertDocumentNss = nss;
-        insertDocumentDoc = doc;
-        return Status(ErrorCodes::OperationFailed, "failed to insert oplog entry");
-    };
+    long long insertDocumentTerm;
+    _storageInterface->insertDocumentFn =
+        [&insertDocumentDoc, &insertDocumentNss, &insertDocumentTerm](OperationContext*,
+                                                                      const NamespaceString& nss,
+                                                                      const TimestampedBSONObj& doc,
+                                                                      long long term) {
+            insertDocumentNss = nss;
+            insertDocumentDoc = doc;
+            insertDocumentTerm = term;
+            return Status(ErrorCodes::OperationFailed, "failed to insert oplog entry");
+        };
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
     ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
@@ -2106,10 +2159,17 @@ TEST_F(
 
     NamespaceString insertDocumentNss;
     TimestampedBSONObj insertDocumentDoc;
-    _storageInterface->insertDocumentFn = [initialSyncer, &insertDocumentDoc, &insertDocumentNss](
-        OperationContext*, const NamespaceString& nss, const TimestampedBSONObj& doc) {
+    long long insertDocumentTerm;
+    _storageInterface->insertDocumentFn = [initialSyncer,
+                                           &insertDocumentDoc,
+                                           &insertDocumentNss,
+                                           &insertDocumentTerm](OperationContext*,
+                                                                const NamespaceString& nss,
+                                                                const TimestampedBSONObj& doc,
+                                                                long long term) {
         insertDocumentNss = nss;
         insertDocumentDoc = doc;
+        insertDocumentTerm = term;
         initialSyncer->shutdown().transitional_ignore();
         return Status::OK();
     };
@@ -2978,8 +3038,7 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsGetNextApplierBatchCallbackOnOplog
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
 }
 
-TEST_F(InitialSyncerTest,
-       InitialSyncerReturnsLastAppliedOnReachingStopTimestampAfterApplyingOneBatch) {
+OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch() {
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -3036,11 +3095,27 @@ TEST_F(InitialSyncerTest,
     }
 
     initialSyncer->join();
+    return lastOp;
+}
+
+void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch() {
+    auto lastOp = doInitialSyncWithOneBatch();
     ASSERT_EQUALS(lastOp.getOpTime(), unittest::assertGet(_lastApplied).opTime);
     ASSERT_EQUALS(lastOp.getHash(), unittest::assertGet(_lastApplied).value);
 
     ASSERT_EQUALS(SnapshotName(lastOp.getOpTime().getTimestamp()),
                   _storageInterface->getInitialDataTimestamp());
+}
+
+TEST_F(InitialSyncerTest,
+       InitialSyncerReturnsLastAppliedOnReachingStopTimestampAfterApplyingOneBatch) {
+    // In this test, getCollectionUUID should not return a UUID. Hence,
+    // upgradeUUIDSchemaVersionNonReplicated should not be called.
+    doSuccessfulInitialSyncWithOneBatch();
+
+    // Ensure upgradeUUIDSchemaVersionNonReplicated was not called.
+    LockGuard lock(_storageInterfaceWorkDoneMutex);
+    ASSERT_FALSE(_storageInterfaceWorkDone.schemaUpgraded);
 }
 
 TEST_F(InitialSyncerTest,
@@ -3566,4 +3641,53 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
         << attempt1;
 }
 
+TEST_F(InitialSyncerTest, InitialSyncerUpdatesCollectionUUIDsIfgetCollectionUUIDReturnsUUID) {
+    // Ensure getCollectionUUID returns a UUID. This should trigger a call to
+    // upgradeUUIDSchemaVersionNonReplicated.
+    {
+        LockGuard lock(_storageInterfaceWorkDoneMutex);
+        _storageInterfaceWorkDone.uuid = UUID::gen();
+    }
+    doSuccessfulInitialSyncWithOneBatch();
+
+    // Ensure upgradeUUIDSchemaVersionNonReplicated was called.
+    LockGuard lock(_storageInterfaceWorkDoneMutex);
+    ASSERT_TRUE(_storageInterfaceWorkDone.schemaUpgraded);
+}
+
+TEST_F(InitialSyncerTest, InitialSyncerCapturesGetCollectionUUIDError) {
+    // Ensure getCollectionUUID returns a bad status. This should be passed to the initial syncer.
+    {
+        LockGuard lock(_storageInterfaceWorkDoneMutex);
+        _storageInterfaceWorkDone.getCollectionUUIDShouldFail = true;
+    }
+    doInitialSyncWithOneBatch();
+
+    // Ensure the getCollectionUUID status was captured.
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, _lastApplied);
+
+    // Ensure upgradeUUIDSchemaVersionNonReplicated was not called.
+    LockGuard lock(_storageInterfaceWorkDoneMutex);
+    ASSERT_FALSE(_storageInterfaceWorkDone.schemaUpgraded);
+}
+
+TEST_F(InitialSyncerTest, InitialSyncerCapturesUpgradeUUIDSchemaVersionError) {
+    // Ensure getCollectionUUID returns a UUID. This should trigger a call to
+    // upgradeUUIDSchemaVersionNonReplicated.
+    {
+        LockGuard lock(_storageInterfaceWorkDoneMutex);
+        _storageInterfaceWorkDone.uuid = UUID::gen();
+    }
+
+    // Ensure upgradeUUIDSchemaVersionNonReplicated returns a bad status. This should be passed to
+    // the initial syncer.
+    {
+        LockGuard lock(_storageInterfaceWorkDoneMutex);
+        _storageInterfaceWorkDone.upgradeUUIDSchemaVersionNonReplicatedShouldFail = true;
+    }
+    doInitialSyncWithOneBatch();
+
+    // Ensure the upgradeUUIDSchemaVersionNonReplicated status was captured.
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, _lastApplied);
+}
 }  // namespace

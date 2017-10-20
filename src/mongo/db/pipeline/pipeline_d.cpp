@@ -88,9 +88,10 @@ using std::string;
 using std::unique_ptr;
 
 namespace {
-class MongodImplementation final : public DocumentSourceNeedsMongod::MongodInterface {
+class MongodProcessInterface final
+    : public DocumentSourceNeedsMongoProcessInterface::MongoProcessInterface {
 public:
-    MongodImplementation(const intrusive_ptr<ExpressionContext>& ctx)
+    MongodProcessInterface(const intrusive_ptr<ExpressionContext>& ctx)
         : _ctx(ctx), _client(ctx->opCtx) {}
 
     void setOperationContext(OperationContext* opCtx) {
@@ -191,9 +192,10 @@ public:
 
     StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) final {
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const MakePipelineOptions opts) final {
         // 'expCtx' may represent the settings for an aggregation pipeline on a different namespace
-        // than the DocumentSource this MongodImplementation is injected into, but both
+        // than the DocumentSource this MongodProcessInterface is injected into, but both
         // ExpressionContext instances should still have the same OperationContext.
         invariant(_ctx->opCtx == expCtx->opCtx);
 
@@ -202,9 +204,38 @@ public:
             return pipeline.getStatus();
         }
 
-        pipeline.getValue()->optimizePipeline();
+        if (opts.optimize) {
+            pipeline.getValue()->optimizePipeline();
+        }
 
-        AutoGetCollectionForReadCommand autoColl(expCtx->opCtx, expCtx->ns);
+        Status cursorStatus = Status::OK();
+
+        if (opts.attachCursorSource) {
+            cursorStatus = attachCursorSourceToPipeline(expCtx, pipeline.getValue().get());
+        } else if (opts.forceInjectMongoProcessInterface) {
+            PipelineD::injectMongodInterface(pipeline.getValue().get());
+        }
+
+        return cursorStatus.isOK() ? std::move(pipeline) : cursorStatus;
+    }
+
+    Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                        Pipeline* pipeline) final {
+        invariant(_ctx->opCtx == expCtx->opCtx);
+        invariant(pipeline->getSources().empty() ||
+                  !dynamic_cast<DocumentSourceCursor*>(pipeline->getSources().front().get()));
+
+        boost::optional<AutoGetCollectionForReadCommand> autoColl;
+        if (expCtx->uuid) {
+            autoColl.emplace(expCtx->opCtx, expCtx->ns.db(), *expCtx->uuid);
+            if (autoColl->getCollection() == nullptr) {
+                // The UUID doesn't exist anymore.
+                return {ErrorCodes::NamespaceNotFound,
+                        "No namespace with UUID " + expCtx->uuid->toString()};
+            }
+        } else {
+            autoColl.emplace(expCtx->opCtx, expCtx->ns);
+        }
 
         // makePipeline() is only called to perform secondary aggregation requests and expects the
         // collection representing the document source to be not-sharded. We confirm sharding state
@@ -214,12 +245,13 @@ public:
         // TODO SERVER-24960: Use CollectionShardingState::collectionIsSharded() to confirm sharding
         // state.
         auto css = CollectionShardingState::get(_ctx->opCtx, expCtx->ns);
-        uassert(4567, "from collection cannot be sharded", !bool(css->getMetadata()));
+        uassert(4567,
+                str::stream() << "from collection (" << expCtx->ns.ns() << ") cannot be sharded",
+                !bool(css->getMetadata()));
 
-        PipelineD::prepareCursorSource(
-            autoColl.getCollection(), expCtx->ns, nullptr, pipeline.getValue().get());
+        PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline);
 
-        return pipeline;
+        return Status::OK();
     }
 
     std::vector<BSONObj> getCurrentOps(CurrentOpConnectionsMode connMode,
@@ -400,14 +432,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     const AggregationRequest* aggRequest,
     const size_t plannerOpts) {
     auto qr = stdx::make_unique<QueryRequest>(nss);
-    switch (pExpCtx->tailableMode) {
-        case ExpressionContext::TailableMode::kNormal:
-            break;
-        case ExpressionContext::TailableMode::kTailableAndAwaitData:
-            qr->setTailable(true);
-            qr->setAwaitData(true);
-            break;
-    }
+    qr->setTailableMode(pExpCtx->tailableMode);
     qr->setOplogReplay(oplogReplay);
     qr->setFilter(queryObj);
     qr->setProj(projectionObj);
@@ -429,12 +454,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
 
     const ExtensionsCallbackReal extensionsCallback(pExpCtx->opCtx, &nss);
 
-    auto cq = CanonicalQuery::canonicalize(opCtx,
-                                           std::move(qr),
-                                           pExpCtx,
-                                           extensionsCallback,
-                                           MatchExpressionParser::AllowedFeatures::kText |
-                                               MatchExpressionParser::AllowedFeatures::kExpr);
+    auto cq = CanonicalQuery::canonicalize(
+        opCtx, std::move(qr), pExpCtx, extensionsCallback, Pipeline::kAllowedMatcherFeatures);
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of
@@ -457,6 +478,16 @@ BSONObj removeSortKeyMetaProjection(BSONObj projectionObj) {
 }
 }  // namespace
 
+void PipelineD::injectMongodInterface(Pipeline* pipeline) {
+    for (auto&& source : pipeline->_sources) {
+        if (auto needsMongod =
+                dynamic_cast<DocumentSourceNeedsMongoProcessInterface*>(source.get())) {
+            needsMongod->injectMongoProcessInterface(
+                std::make_shared<MongodProcessInterface>(pipeline->getContext()));
+        }
+    }
+}
+
 void PipelineD::prepareCursorSource(Collection* collection,
                                     const NamespaceString& nss,
                                     const AggregationRequest* aggRequest,
@@ -466,14 +497,8 @@ void PipelineD::prepareCursorSource(Collection* collection,
     // We will be modifying the source vector as we go.
     Pipeline::SourceContainer& sources = pipeline->_sources;
 
-    // Inject a MongodImplementation to sources that need them.
-    for (auto&& source : sources) {
-        DocumentSourceNeedsMongod* needsMongod =
-            dynamic_cast<DocumentSourceNeedsMongod*>(source.get());
-        if (needsMongod) {
-            needsMongod->injectMongodInterface(std::make_shared<MongodImplementation>(expCtx));
-        }
-    }
+    // Inject a MongodProcessInterface to sources that need them.
+    injectMongodInterface(pipeline);
 
     if (!sources.empty() && !sources.front()->constraints().requiresInputDocSource) {
         return;
@@ -622,6 +647,10 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     // we need.
     if (!deps.getNeedTextScore() && !deps.getNeedSortKey()) {
         plannerOpts |= QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
+    }
+
+    if (expCtx->needsMerge && expCtx->tailableMode == TailableMode::kTailableAndAwaitData) {
+        plannerOpts |= QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
     }
 
     const BSONObj emptyProjection;
@@ -776,6 +805,14 @@ void PipelineD::addCursorSource(Collection* collection,
     // case the new stage can be absorbed with the first stages of the pipeline.
     pipeline->addInitialSource(pSource);
     pipeline->optimizePipeline();
+}
+
+Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {
+    if (auto docSourceCursor =
+            dynamic_cast<DocumentSourceCursor*>(pipeline->_sources.front().get())) {
+        return docSourceCursor->getLatestOplogTimestamp();
+    }
+    return Timestamp();
 }
 
 std::string PipelineD::getPlanSummaryStr(const Pipeline* pPipeline) {
