@@ -95,7 +95,7 @@ namespace audit {
     class WritableAuditLog : public logger::AuditLog {
     public:
         WritableAuditLog(const BSONObj &filter)
-            : _matcher(filter.getOwned(), nullptr) {
+            : _matcher(filter.getOwned(), new ExpressionContext(nullptr, nullptr)) {
         }
         virtual ~WritableAuditLog() {}
 
