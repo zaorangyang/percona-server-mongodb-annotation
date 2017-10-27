@@ -8,8 +8,8 @@
     if (status.storageEngine.name == 'rocksdb') {
         // check number of counters and presence of legacy counter names
         var counters = status.rocksdb.counters;
-        // number of tickers in rocksdb 4.13.5 is 90
-        assert.eq(90, Object.keys(counters).length);
+        // number of tickers in rocksdb 5.7.3 is 93
+        assert.eq(93, Object.keys(counters).length);
         // legacy names
         assert(counters.hasOwnProperty('num-keys-written'));
         assert(counters.hasOwnProperty('num-keys-read'));
@@ -55,7 +55,9 @@
         assert(counters.hasOwnProperty('l2andup-hit'));
         assert(counters.hasOwnProperty('compaction-key-drop-new'));
         assert(counters.hasOwnProperty('compaction-key-drop-obsolete'));
+        assert(counters.hasOwnProperty('compaction-key-drop-range_del'));
         assert(counters.hasOwnProperty('compaction-key-drop-user'));
+        assert(counters.hasOwnProperty('compaction-range_del-drop-obsolete'));
         assert(counters.hasOwnProperty('number-keys-updated'));
         assert(counters.hasOwnProperty('number-db-seek-found'));
         assert(counters.hasOwnProperty('number-db-next-found'));
@@ -102,6 +104,7 @@
         assert(counters.hasOwnProperty('row-cache-miss'));
         assert(counters.hasOwnProperty('read-amp-estimate-useful-bytes'));
         assert(counters.hasOwnProperty('read-amp-total-read-bytes'));
+        assert(counters.hasOwnProperty('number-rate_limiter-drains'));
 
     }
 
