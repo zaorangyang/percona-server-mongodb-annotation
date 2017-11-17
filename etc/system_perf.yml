@@ -16,21 +16,31 @@ post:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: work/reports.tgz
-        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/${task_name}-${build_id}.${ext|tgz}
+        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/${task_name}-${build_id}-${execution}.${ext|tgz}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
-        display_name: test-log
+        display_name: test-log - Execution ${execution}
     - command: s3.put
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        local_file: work/reports/graphs/timeseries-p1.html
-        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/timeseries-p1-${task_name}-${build_id}.html
+        local_file: work/reports/graphs/timeseries-mongod.0.html
+        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/timeseries-mongod.0-${task_name}-${build_id}-${execution}.html
         bucket: mciuploads
         permissions: public-read
         content_type: text/html
-        display_name: timeseries-p1.html
+        display_name: timeseries-p1.html - Execution ${execution}
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/workloads/workloads/jsdoc/jsdocs-redirect.html
+        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/workloads-${task_name}-${build_id}.html
+        bucket: mciuploads
+        permissions: public-read
+        content_type: text/html
+        display_name: workloads documentation
     - command: attach.results
       params:
         file_location: work/report.json
@@ -102,7 +112,6 @@ functions:
           ext: ${ext}
           script_flags : ${script_flags}
           dsi_rev: ${dsi_rev}
-          compare_task: ${compare_task}
           workloads_rev: ${workloads_rev}
 
           # compositions of expansions
@@ -150,15 +159,15 @@ functions:
 
   "infrastructure provisioning":
     - command: shell.exec
-      # call infrastructure-provisioning.sh. This will either create a cluster, or update tags on existing instances.
+      # call infrastructure-provisioning.py. This will either create a cluster, or update tags on existing instances.
       params:
         working_dir: work
         script: |
           set -e
           set -v
           source ./dsienv.sh
-          export PRODUCTION=true
-          $DSI_PATH/bin/infrastructure_provisioning.sh ${cluster}
+          source ./venv/bin/activate
+          $DSI_PATH/bin/infrastructure_provisioning.py
 
   "configure mongodb cluster":
     - command: shell.exec
@@ -216,7 +225,7 @@ functions:
         silent: true
         script: |
           set -o errexit
-          TAGS="3.2.15-Baseline"
+          TAGS="3.2.17-Baseline 3.4.9-Baseline"
           OVERRIDEFILE="../src/dsi/dsi/analysis/v3.4/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/dashboard_gen.py --rev ${revision} -f history.json -t tags.json --refTag $TAGS --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name} --jira-user ${perf_jira_user} --jira-password ${perf_jira_pw} || true
     - command: "json.send"
@@ -231,48 +240,9 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          TAG="3.2.15-Baseline"
+          TAG="3.2.17-Baseline"
           OVERRIDEFILE="../src/dsi/dsi/analysis/v3.4/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file reports/perf.json --rev ${revision} -f history.json -t tags.json --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
-
-  "compare":
-    - command: shell.exec
-      params:
-        script: |
-          set -o verbose
-          rm -rf ./src ./work
-          mkdir src
-          mkdir work
-    - command: manifest.load
-    - command: git.get_project
-      params:
-        directory: src
-        revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
-          dsi: ${dsi_rev}
-    - command: json.get
-      params:
-        task: ${compare_task}
-        variant : ${variant1}
-        file: "work/standalone.json"
-        name: "perf"
-    - command: json.get
-      params:
-        task: ${compare_task}
-        variant : ${variant2}
-        file: "work/oplog.json"
-        name: "perf"
-    - command: shell.exec
-      type : test
-      params:
-        working_dir: work
-        script: |
-          set -o errexit
-          set -o verbose
-          python -u ../src/dsi/dsi/analysis/compare.py -b standalone.json -c oplog.json
-    - command: "json.send"
-      params:
-        name: "perf"
-        file: "work/perf.json"
 
 #######################################
 #               Tasks                 #
@@ -376,6 +346,50 @@ tasks:
       vars:
         storageEngine: "mmapv1"
         test: "ycsb"
+    - func: "make test log artifact"
+    - func: "analyze"
+      vars:
+        script_flags: --ycsb-throughput-analysis reports
+
+- name: industry_benchmarks_wmajority_WT
+  depends_on:
+    - name: compile
+      variant: linux-standalone
+  commands:
+    - func: "prepare environment"
+      vars:
+        storageEngine: "wiredTiger"
+        test: "ycsb-wmajority"
+    - func: "infrastructure provisioning"
+    - func: "configure mongodb cluster"
+      vars:
+        storageEngine: "wiredTiger"
+    - func: "run test"
+      vars:
+        storageEngine: "wiredTiger"
+        test: "ycsb-wmajority"
+    - func: "make test log artifact"
+    - func: "analyze"
+      vars:
+        script_flags: --ycsb-throughput-analysis reports
+
+- name: industry_benchmarks_wmajority_MMAPv1
+  depends_on:
+    - name: compile
+      variant: linux-standalone
+  commands:
+    - func: "prepare environment"
+      vars:
+        storageEngine: "mmapv1"
+        test: "ycsb-wmajority"
+    - func: "infrastructure provisioning"
+    - func: "configure mongodb cluster"
+      vars:
+        storageEngine: "mmapv1"
+    - func: "run test"
+      vars:
+        storageEngine: "mmapv1"
+        test: "ycsb-wmajority"
     - func: "make test log artifact"
     - func: "analyze"
       vars:
@@ -586,70 +600,6 @@ tasks:
     - func: "make test log artifact"
     - func: "analyze"
 
-- name: industry_benchmarks_WT_oplog_comp
-  depends_on:
-    - name: industry_benchmarks_WT
-      variant: linux-standalone
-      status : "*"
-    - name: industry_benchmarks_WT
-      variant: linux-1-node-replSet
-      status: "*"
-  commands:
-    - func: "compare"
-      vars:
-        compare_task: "industry_benchmarks_WT"
-        variant1: "linux-standalone"
-        variant2: "linux-1-node-replSet"
-    - func: "analyze"
-
-- name: industry_benchmarks_MMAPv1_oplog_comp
-  depends_on:
-    - name: industry_benchmarks_MMAPv1
-      variant: linux-standalone
-      status: "*"
-    - name: industry_benchmarks_MMAPv1
-      variant: linux-1-node-replSet
-      status: "*"
-  commands:
-    - func: "compare"
-      vars:
-        compare_task: "industry_benchmarks_MMAPv1"
-        variant1: "linux-standalone"
-        variant2: "linux-1-node-replSet"
-    - func: "analyze"
-
-- name: core_workloads_WT_oplog_comp
-  depends_on:
-    - name: core_workloads_WT
-      variant: linux-standalone
-      status: "*"
-    - name: core_workloads_WT
-      variant: linux-1-node-replSet
-      status: "*"
-  commands:
-    - func: "compare"
-      vars:
-        compare_task: "core_workloads_WT"
-        variant1: "linux-standalone"
-        variant2: "linux-1-node-replSet"
-    - func: "analyze"
-
-- name: core_workloads_MMAPv1_oplog_comp
-  depends_on:
-    - name: core_workloads_MMAPv1
-      variant: linux-standalone
-      status: "*"
-    - name: core_workloads_MMAPv1
-      variant: linux-1-node-replSet
-      status: "*"
-  commands:
-    - func: "compare"
-      vars:
-        compare_task: "core_workloads_MMAPv1"
-        variant1: "linux-standalone"
-        variant2: "linux-1-node-replSet"
-    - func: "analyze"
-
 - name: initialsync_WT
   depends_on:
     - name: compile
@@ -798,6 +748,8 @@ buildvariants:
     - name: industry_benchmarks_WT
     - name: core_workloads_WT
     - name: industry_benchmarks_MMAPv1
+    - name: industry_benchmarks_wmajority_WT
+    - name: industry_benchmarks_wmajority_MMAPv1
     - name: core_workloads_MMAPv1
     - name: mongos_workloads_WT
     - name: mongos_workloads_MMAPv1
@@ -820,6 +772,8 @@ buildvariants:
     - name: industry_benchmarks_WT
     - name: core_workloads_WT
     - name: industry_benchmarks_MMAPv1
+    - name: industry_benchmarks_wmajority_WT
+    - name: industry_benchmarks_wmajority_MMAPv1
     - name: core_workloads_MMAPv1
     - name: secondary_performance_WT
     - name: secondary_performance_MMAPv1
@@ -858,19 +812,3 @@ buildvariants:
       - "rhel70-perf-initialsync-logkeeper"
   tasks:
     - name: initialsync-logkeeper_WT
-
-- name: linux-oplog-compare
-  display_name: Linux Oplog Compare
-  batchtime: 10080 # 7 days
-  modules: *modules
-  expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
-    use_scons_cache: true
-    project: *project
-  run_on:
-      - "rhel70-perf-single"
-  tasks:
-    - name: industry_benchmarks_WT_oplog_comp
-    - name: core_workloads_WT_oplog_comp
-    - name: industry_benchmarks_MMAPv1_oplog_comp
-    - name: core_workloads_MMAPv1_oplog_comp

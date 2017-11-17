@@ -150,12 +150,10 @@ variables:
   - osx-107-ssl
   - rhel62
   - rhel70
-  - solaris-64-bit
   - suse11
   - suse12
   - ubuntu1204
   - ubuntu1404
-  - ubuntu1404-rocksdb
   - ubuntu1604
   - ubuntu1604-arm64
   - ubuntu1604-asan
@@ -238,9 +236,6 @@ functions:
         if [ "Windows_NT" = "$OS" ]; then
             typeperf -qx PhysicalDisk | grep Disk | grep -v _Total > disk_counters.txt
             typeperf -cf disk_counters.txt -si 5 -o mongo-diskstats
-        # Solaris: iostat -T d option for timestamp.
-        elif iostat -T d -Mx > /dev/null 2>&1; then
-            iostat -T d -Mx 5 > mongo-diskstats
         # Linux: iostat -t option for timestamp.
         elif iostat -tdmx > /dev/null 2>&1; then
             iostat -tdmx 5 > mongo-diskstats
@@ -285,11 +280,8 @@ functions:
           get_pids() { proc_pids=$(pgrep $1); }
           get_process_info() {
             proc_name=$(ps -p $1 -o comm=);
-            # prstat is available on Solaris
-            if [ ! -z $(which prstat 2> /dev/null) ]; then
-              proc_threads=$(prstat -p $1 1 1 | grep $1 | cut -f2 -d "/");
             # /proc is available on Linux platforms
-            elif [ -f /proc/$1/status ]; then
+            if [ -f /proc/$1/status ]; then
               ${set_sudo}
               proc_threads=$($sudo grep Threads /proc/$1/status | sed "s/\s//g" | cut -f2 -d ":");
             else
@@ -364,19 +356,6 @@ functions:
         ${decompress} mongo-debugsymbols.tgz
         mv mongodb*/mongo.{debug,dSYM,pdb} mongodb*/mongod.{debug,dSYM,pdb} mongodb*/mongos.{debug,dSYM,pdb} . 2>/dev/null || true
         rm -r mongodb*/*.{debug,dSYM,pdb} mongo-debugsymbols.tgz 2>/dev/null || true
-
-  "build rocksdb" :
-    command: shell.exec
-    params:
-      script: |
-        set -o errexit
-        set -o verbose
-        if [ "${build_rocksdb|}" = "true" ]; then
-        rm -rf rocksdb
-        git clone https://github.com/facebook/rocksdb.git
-        cd rocksdb
-        make USE_RTTI=1 CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ static_lib
-        fi
 
   "build new tools" :
     command: shell.exec
@@ -1125,6 +1104,12 @@ post:
             if [ ! -f $new_binary_file ]; then
               mv $binary_file_location $new_binary_file
             fi
+            # On Windows if a .pdb symbol file exists, include it in the archive.
+            pdb_file=$(echo $binary_file_location | sed "s/\.exe/.pdb/")
+            if [ -f $pdb_file ]; then
+              new_pdb_file=unittest_binaries/$(echo $pdb_file | sed "s/.*\///")
+              mv $pdb_file $new_pdb_file
+            fi
           done
         done
   - command: archive.targz_pack
@@ -1239,14 +1224,12 @@ tasks:
         directory: src
         revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
           enterprise: ${enterprise_rev}
-          rocksdb: ${rocksdb_rev}
     - command: git.apply_patch
       params:
         directory: src
     - func: "get buildnumber"
     - func: "setup credentials"
     - func: "build new tools" # noop if ${newtools} is not "true"
-    - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
     - command: shell.exec
       params:
         working_dir: src
@@ -1421,7 +1404,6 @@ tasks:
         directory: src
         revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
           enterprise: ${enterprise_rev}
-          rocksdb: ${rocksdb_rev}
     - command: git.apply_patch
       params:
         directory: src
@@ -3097,7 +3079,7 @@ tasks:
           /usr/local/bin/notary-client.py --key-name "server-3.4" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
           if [ "${has_packages|}" = "true" ]; then
-             CURATOR_RELEASE="88f34a9f1c79db7ea9597b6e85eb5995d03714ba"
+             CURATOR_RELEASE="ea8d75dcc1a587111e7418e2428fb67e267af9fe"
              curl -L -O http://boxes.10gen.com/build/curator/curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
              tar -zxvf curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
              ./curator repo --config ./etc/repo_config.yaml --distro ${packager_distro} --edition ${repo_edition} --version ${version} --arch ${packager_arch} --packages repo
@@ -3510,11 +3492,6 @@ tasks:
 modules:
 - name: enterprise
   repo: git@github.com:10gen/mongo-enterprise-modules.git
-  prefix: src/mongo/db/modules
-  branch: v3.4
-
-- name: rocksdb
-  repo: git@github.com:mongodb-partners/mongo-rocks.git
   prefix: src/mongo/db/modules
   branch: v3.4
 
@@ -4475,6 +4452,7 @@ buildvariants:
   - ubuntu1604-zseries-large
   - ubuntu1604-zseries-small
   batchtime: 1440 # 1 day
+  stepback: false
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto libsasl2)" -tags 'sasl ssl'
@@ -6999,6 +6977,7 @@ buildvariants:
   - suse12-zseries-build
   - suse12-zseries-test
   batchtime: 1440 # 1 day
+  stepback: false
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
@@ -7273,6 +7252,7 @@ buildvariants:
   run_on:
   - suse11-zseries-build
   batchtime: 1440 # 1 day
+  stepback: false
   expansions:
     gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
@@ -7479,94 +7459,6 @@ buildvariants:
     - ubuntu1604-packer
   - name: push
 
-
-###########################################
-#          Solaris buildvariants          #
-###########################################
-
-- name: solaris-64-bit
-  display_name: "* Solaris"
-  run_on:
-  - solaris
-  expansions:
-    push_path: sunos5
-    push_bucket: downloads.mongodb.org
-    push_name: sunos5
-    push_arch: x86_64
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "-lsocket -lnsl"
-    compile_flags: CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy -j$(kstat cpu | sort -u | grep -c "^module") --release CCFLAGS="-m64" LINKFLAGS="-m64 -static-libstdc++ -static-libgcc" OBJCOPY=/opt/mongodbtoolchain/bin/objcopy
-    num_jobs_available: $(( $(kstat cpu | sort -u | grep -c "^module") / 2 ))
-    use_scons_cache: true
-  tasks:
-  - name: compile
-  - name: aggregation
-  - name: aggregation_WT
-  - name: auth
-  - name: auth_WT
-  - name: bulk_gle_passthrough
-  - name: bulk_gle_passthrough_WT
-  - name: concurrency
-  - name: concurrency_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_WT
-  - name: dbtest
-  - name: dbtest_WT
-  - name: disk
-  - name: durability
-  - name: failpoints
-  - name: httpinterface
-  - name: jsCore
-  - name: jsCore_compatibility
-  - name: jsCore_compatibility_WT
-  - name: jsCore_decimal
-  - name: jsCore_decimal_WT
-  - name: jsCore_WT
-  - name: jstestfuzz
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_WT
-  - name: mmap
-  - name: mongosTest
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: noPassthrough_WT
-  - name: parallel
-  - name: parallel_compatibility
-  - name: parallel_compatibility_WT
-  - name: parallel_WT
-  - name: replica_sets
-  - name: replica_sets_WT
-  - name: replica_sets_jscore_passthrough
-  - name: replica_sets_jscore_passthrough_WT
-  - name: master_slave
-  - name: master_slave_WT
-  - name: master_slave_jscore_passthrough
-  - name: master_slave_jscore_passthrough_WT
-  - name: sharding
-  - name: sharded_collections_jscore_passthrough
-  - name: sharded_collections_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_passthrough_WT
-  - name: sharding_jscore_passthrough_wire_ops_WT
-  - name: sharding_WT
-  - name: slow1
-  - name: slow1_WT
-  - name: serial_run
-  - name: serial_run_WT
-  - name: tool
-  - name: tool_WT
-  - name: unittests
-  - name: push
-    distros:
-    - rhel70-small
 
 ###########################################
 #          Debian buildvariants           #
@@ -8264,75 +8156,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: unittests
-
-- name: ubuntu1404-rocksdb
-  display_name: Ubuntu 14.04 (RocksDB)
-  modules:
-  - rocksdb
-  run_on:
-  - ubuntu1404-test
-  batchtime: 1440 # 1 day
-  expansions:
-    build_rocksdb: true
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CPPPATH=$(readlink -f ../rocksdb/include/) LIBPATH=$(readlink -f ../rocksdb/) LIBS=rocksdb CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy VARIANT_DIR=release --runtime-hardening=off
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --storageEngine=rocksdb
-    use_scons_cache: true
-    build_mongoreplay: true
-  tasks:
-  - name: compile
-    distros:
-    - ubuntu1404-build
-  - name: aggregation
-  - name: aggregation_WT
-  - name: aggregation_auth
-  - name: auth
-  - name: dbtest
-  # - name: disk
-  # - name: durability
-  # - name: dur_jscore_passthrough
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth
-  - name: gle_auth_write_cmd
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: jsCore
-  - name: jsCore_auth
-  - name: jsCore_compatibility
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
-  - name: bulk_gle_passthrough
-  - name: parallel
-  - name: parallel_compatibility
-  - name: concurrency
-  - name: concurrency_replication
-  - name: concurrency_sharded
-    # We use machines with more RAM to avoid OOM issues when validating collections.
-    distros:
-    - ubuntu1404-build
-  - name: concurrency_simultaneous
-  - name: replica_sets
-  - name: replica_sets_auth
-  - name: replica_sets_jscore_passthrough
-  - name: master_slave
-  - name: master_slave_WT
-  - name: master_slave_auth
-  - name: master_slave_jscore_passthrough
-  - name: sharding
-  - name: sharding_auth
-  - name: slow1
-  - name: serial_run
-  - name: sharding_jscore_passthrough
   - name: unittests
 
 ###########################################
