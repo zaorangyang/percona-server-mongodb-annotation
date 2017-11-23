@@ -9,6 +9,7 @@ export MONGOTOOLS=bsondump mongostat mongofiles mongoexport mongoimport mongores
 export INSTALLDIR=$(PSMSRC)/install
 export TOOLS_TAGS=ssl sasl
 export PORTABLE=1
+export USE_SSE=1
 export PATH := /usr/local/go/bin:$(PATH)
 CC = gcc-4.8
 CXX = g++-4.8
@@ -51,7 +52,7 @@ RocksDB:
 	cp ./lz4-r127/lib/lz4frame.h $(INSTALLDIR)/include; \
 	cp ./lz4-r127/lib/lz4hc.h $(INSTALLDIR)/include; \
 	cp ./lz4-r127/lib/liblz4.a $(INSTALLDIR)/lib; \
-	CC=$(CC) CXX=$(CXX) make -j$(NJOBS) static_lib; \
+	CC=$(CC) CXX=$(CXX) EXTRA_CFLAGS='-DHAVE_SSE42' EXTRA_CXXFLAGS='-DHAVE_SSE42'  make -j$(NJOBS) static_lib; \
 	make install-static INSTALL_PATH=$(INSTALLDIR)
 
 # Finally PSfMDB
