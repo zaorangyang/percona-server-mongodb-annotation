@@ -66,7 +66,8 @@ public:
 
     Status insertDocument(OperationContext* opCtx,
                           const NamespaceString& nss,
-                          const TimestampedBSONObj& doc) override;
+                          const TimestampedBSONObj& doc,
+                          long long term) override;
 
     Status insertDocuments(OperationContext* opCtx,
                            const NamespaceString& nss,
@@ -83,6 +84,8 @@ public:
                             const CollectionOptions& options) override;
 
     Status dropCollection(OperationContext* opCtx, const NamespaceString& nss) override;
+
+    Status truncateCollection(OperationContext* opCtx, const NamespaceString& nss) override;
 
     Status renameCollection(OperationContext* opCtx,
                             const NamespaceString& fromNS,
@@ -133,6 +136,11 @@ public:
 
     StatusWith<StorageInterface::CollectionCount> getCollectionCount(
         OperationContext* opCtx, const NamespaceString& nss) override;
+
+    StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
+                                                         const NamespaceString& nss) override;
+
+    Status upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) override;
 
     void setStableTimestamp(ServiceContext* serviceCtx, SnapshotName snapshotName) override;
 

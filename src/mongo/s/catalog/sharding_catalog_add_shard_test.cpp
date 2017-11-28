@@ -120,6 +120,19 @@ protected:
         });
     }
 
+    void expectCollectionDrop(const HostAndPort& target, const NamespaceString& nss) {
+        onCommandForAddShard([&](const RemoteCommandRequest& request) {
+            ASSERT_EQ(request.target, target);
+            ASSERT_EQ(request.dbname, nss.db());
+            ASSERT_BSONOBJ_EQ(request.cmdObj,
+                              BSON("drop" << nss.coll() << "writeConcern" << BSON("w"
+                                                                                  << "majority")));
+            ASSERT_BSONOBJ_EQ(rpc::makeEmptyMetadata(), request.metadata);
+
+            return BSON("ok" << 1);
+        });
+    }
+
     void expectSetFeatureCompatibilityVersion(const HostAndPort& target,
                                               StatusWith<BSONObj> response) {
         onCommandForAddShard([&, target, response](const RemoteCommandRequest& request) {
@@ -266,7 +279,10 @@ protected:
      */
     void assertDatabaseExists(const DatabaseType& expectedDB) {
         auto foundDB =
-            assertGet(catalogClient()->getDatabase(operationContext(), expectedDB.getName())).value;
+            assertGet(catalogClient()->getDatabase(operationContext(),
+                                                   expectedDB.getName(),
+                                                   repl::ReadConcernLevel::kMajorityReadConcern))
+                .value;
 
         ASSERT_EQUALS(expectedDB.getName(), foundDB.getName());
         ASSERT_EQUALS(expectedDB.getPrimary(), foundDB.getPrimary());
@@ -398,6 +414,8 @@ TEST_F(AddShardTest, StandaloneBasicSuccess) {
                              BSON("name" << discoveredDB1.getName() << "sizeOnDisk" << 2000),
                              BSON("name" << discoveredDB2.getName() << "sizeOnDisk" << 5000)});
 
+    expectCollectionDrop(shardTarget, NamespaceString("config", "system.sessions"));
+
     // The shardIdentity doc inserted into the admin.system.version collection on the shard.
     expectShardIdentityUpsertReturnSuccess(shardTarget, expectedShardName);
 
@@ -480,6 +498,8 @@ TEST_F(AddShardTest, StandaloneGenerateName) {
                                   << 1000),
                              BSON("name" << discoveredDB1.getName() << "sizeOnDisk" << 2000),
                              BSON("name" << discoveredDB2.getName() << "sizeOnDisk" << 5000)});
+
+    expectCollectionDrop(shardTarget, NamespaceString("config", "system.sessions"));
 
     // The shardIdentity doc inserted into the admin.system.version collection on the shard.
     expectShardIdentityUpsertReturnSuccess(shardTarget, expectedShardName);
@@ -580,12 +600,12 @@ TEST_F(AddShardTest, AddMongosAsShard) {
             ShardingCatalogManager::get(operationContext())
                 ->addShard(
                     operationContext(), &expectedShardName, ConnectionString(shardTarget), 100);
-        ASSERT_EQUALS(ErrorCodes::RPCProtocolNegotiationFailed, status);
+        ASSERT_EQUALS(ErrorCodes::IllegalOperation, status);
     });
 
-    Status rpcProtocolNegFailedStatus =
-        Status(ErrorCodes::RPCProtocolNegotiationFailed, "Unable to communicate");
-    expectIsMaster(shardTarget, rpcProtocolNegFailedStatus);
+    expectIsMaster(shardTarget,
+                   BSON("msg"
+                        << "isdbgrid"));
 
     future.timed_get(kLongFutureTimeout);
 }
@@ -906,6 +926,8 @@ TEST_F(AddShardTest, SuccessfullyAddReplicaSet) {
     // Get databases list from new shard
     expectListDatabases(shardTarget, std::vector<BSONObj>{BSON("name" << discoveredDB.getName())});
 
+    expectCollectionDrop(shardTarget, NamespaceString("config", "system.sessions"));
+
     // The shardIdentity doc inserted into the admin.system.version collection on the shard.
     expectShardIdentityUpsertReturnSuccess(shardTarget, expectedShardName);
 
@@ -970,6 +992,8 @@ TEST_F(AddShardTest, ReplicaSetExtraHostsDiscovered) {
 
     // Get databases list from new shard
     expectListDatabases(shardTarget, std::vector<BSONObj>{BSON("name" << discoveredDB.getName())});
+
+    expectCollectionDrop(shardTarget, NamespaceString("config", "system.sessions"));
 
     // The shardIdentity doc inserted into the admin.system.version collection on the shard.
     expectShardIdentityUpsertReturnSuccess(shardTarget, expectedShardName);
@@ -1052,6 +1076,8 @@ TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
                              BSON("name" << discoveredDB1.getName() << "sizeOnDisk" << 2000),
                              BSON("name" << discoveredDB2.getName() << "sizeOnDisk" << 5000)});
 
+    expectCollectionDrop(shardTarget, NamespaceString("config", "system.sessions"));
+
     // The shardIdentity doc inserted into the admin.system.version collection on the shard.
     expectShardIdentityUpsertReturnSuccess(shardTarget, expectedShardName);
 
@@ -1065,12 +1091,18 @@ TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
     assertShardExists(expectedShard);
 
     // Ensure that the databases detected from the shard were *not* added.
-    ASSERT_EQUALS(
-        ErrorCodes::NamespaceNotFound,
-        catalogClient()->getDatabase(operationContext(), discoveredDB1.getName()).getStatus());
-    ASSERT_EQUALS(
-        ErrorCodes::NamespaceNotFound,
-        catalogClient()->getDatabase(operationContext(), discoveredDB2.getName()).getStatus());
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
+                  catalogClient()
+                      ->getDatabase(operationContext(),
+                                    discoveredDB1.getName(),
+                                    repl::ReadConcernLevel::kMajorityReadConcern)
+                      .getStatus());
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
+                  catalogClient()
+                      ->getDatabase(operationContext(),
+                                    discoveredDB2.getName(),
+                                    repl::ReadConcernLevel::kMajorityReadConcern)
+                      .getStatus());
 
     assertChangeWasLogged(expectedShard);
 }

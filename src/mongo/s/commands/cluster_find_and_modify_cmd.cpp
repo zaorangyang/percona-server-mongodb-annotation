@@ -28,15 +28,11 @@
 
 #include "mongo/platform/basic.h"
 
-#include <string>
-#include <vector>
-
 #include "mongo/base/status_with.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/find_and_modify.h"
-#include "mongo/db/operation_context.h"
+#include "mongo/db/commands/find_and_modify_common.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog_cache.h"
@@ -52,10 +48,6 @@
 
 namespace mongo {
 namespace {
-
-using std::shared_ptr;
-using std::string;
-using std::vector;
 
 class FindAndModifyCmd : public BasicCommand {
 public:
@@ -89,8 +81,8 @@ public:
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
-        shared_ptr<ChunkManager> chunkMgr;
-        shared_ptr<Shard> shard;
+        std::shared_ptr<ChunkManager> chunkMgr;
+        std::shared_ptr<Shard> shard;
 
         if (!routingInfo.cm()) {
             shard = routingInfo.primary();
@@ -146,7 +138,7 @@ public:
         cmdResult.target = shard->getConnString();
         cmdResult.result = result.obj();
 
-        vector<Strategy::CommandResult> shardResults;
+        std::vector<Strategy::CommandResult> shardResults;
         shardResults.push_back(cmdResult);
 
         return ClusterExplain::buildExplainResult(
@@ -219,7 +211,7 @@ private:
     }
 
     static bool _runCommand(OperationContext* opCtx,
-                            shared_ptr<ChunkManager> chunkManager,
+                            std::shared_ptr<ChunkManager> chunkManager,
                             const ShardId& shardId,
                             const NamespaceString& nss,
                             const BSONObj& cmdObj,
@@ -234,10 +226,9 @@ private:
             conn->runCommand(nss.db().toString(), filterCommandRequestForPassthrough(cmdObj), res);
         conn.done();
 
-        // ErrorCodes::RecvStaleConfig is the code for RecvStaleConfigException.
-        if (!ok && res.getIntField("code") == ErrorCodes::RecvStaleConfig) {
+        if (!ok && res.getIntField("code") == ErrorCodes::StaleConfig) {
             // Command code traps this exception and re-runs
-            throw RecvStaleConfigException("FindAndModify", res);
+            throw StaleConfigException("FindAndModify", res);
         }
 
         // First append the properly constructed writeConcernError. It will then be skipped

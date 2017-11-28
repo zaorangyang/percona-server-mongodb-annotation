@@ -57,7 +57,7 @@ using std::vector;
 
 DocumentSourceFacet::DocumentSourceFacet(std::vector<FacetPipeline> facetPipelines,
                                          const intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSourceNeedsMongod(expCtx),
+    : DocumentSourceNeedsMongoProcessInterface(expCtx),
       _teeBuffer(TeeBuffer::create(facetPipelines.size())),
       _facets(std::move(facetPipelines)) {
     for (size_t facetId = 0; facetId < _facets.size(); ++facetId) {
@@ -215,11 +215,13 @@ intrusive_ptr<DocumentSource> DocumentSourceFacet::optimize() {
     return this;
 }
 
-void DocumentSourceFacet::doInjectMongodInterface(std::shared_ptr<MongodInterface> mongod) {
+void DocumentSourceFacet::doInjectMongoProcessInterface(
+    std::shared_ptr<MongoProcessInterface> pipelineContext) {
     for (auto&& facet : _facets) {
         for (auto&& stage : facet.pipeline->getSources()) {
-            if (auto stageNeedingMongod = dynamic_cast<DocumentSourceNeedsMongod*>(stage.get())) {
-                stageNeedingMongod->injectMongodInterface(mongod);
+            if (auto stageNeedingMongoProcessInterface =
+                    dynamic_cast<DocumentSourceNeedsMongoProcessInterface*>(stage.get())) {
+                stageNeedingMongoProcessInterface->injectMongoProcessInterface(pipelineContext);
             }
         }
     }
@@ -237,34 +239,47 @@ void DocumentSourceFacet::doReattachToOperationContext(OperationContext* opCtx) 
     }
 }
 
-DocumentSource::StageConstraints DocumentSourceFacet::constraints() const {
-    StageConstraints constraints;
-    constraints.isAllowedInsideFacetStage = false;  // Disallow nested $facets.
+DocumentSource::StageConstraints DocumentSourceFacet::constraints(
+    Pipeline::SplitState pipeState) const {
+    const bool mayUseDisk = std::any_of(_facets.begin(), _facets.end(), [&](const auto& facet) {
+        const auto sources = facet.pipeline->getSources();
+        return std::any_of(sources.begin(), sources.end(), [&](const auto source) {
+            return source->constraints().diskRequirement == DiskUseRequirement::kWritesTmpData;
+        });
+    });
 
-    for (auto&& facet : _facets) {
-        for (auto&& nestedStage : facet.pipeline->getSources()) {
-            if (nestedStage->constraints().hostRequirement == HostTypeRequirement::kPrimaryShard) {
-                // Currently we don't split $facet to have a merger part and a shards part (see
-                // SERVER-24154). This means that if any stage in any of the $facet pipelines
-                // requires the primary shard, then the entire $facet must happen on the merger, and
-                // the merger must be the primary shard.
-                constraints.hostRequirement = HostTypeRequirement::kPrimaryShard;
-            }
-        }
-    }
-    return constraints;
+    // Currently we don't split $facet to have a merger part and a shards part (see SERVER-24154).
+    // This means that if any stage in any of the $facet pipelines requires the primary shard, then
+    // the entire $facet must happen on the merger, and the merger must be the primary shard.
+    const bool needsPrimaryShard =
+        std::any_of(_facets.begin(), _facets.end(), [&](const auto& facet) {
+            const auto sources = facet.pipeline->getSources();
+            return std::any_of(sources.begin(), sources.end(), [&](const auto source) {
+                return source->constraints().hostRequirement == HostTypeRequirement::kPrimaryShard;
+            });
+        });
+
+    return {StreamType::kBlocking,
+            PositionRequirement::kNone,
+            needsPrimaryShard ? HostTypeRequirement::kPrimaryShard : HostTypeRequirement::kAnyShard,
+            mayUseDisk ? DiskUseRequirement::kWritesTmpData : DiskUseRequirement::kNoDiskUse,
+            FacetRequirement::kNotAllowed};
 }
 
 DocumentSource::GetDepsReturn DocumentSourceFacet::getDependencies(DepsTracker* deps) const {
+    const bool scopeHasVariables = pExpCtx->variablesParseState.hasDefinedVariables();
     for (auto&& facet : _facets) {
         auto subDepsTracker = facet.pipeline->getDependencies(deps->getMetadataAvailable());
 
         deps->fields.insert(subDepsTracker.fields.begin(), subDepsTracker.fields.end());
+        deps->vars.insert(subDepsTracker.vars.begin(), subDepsTracker.vars.end());
 
         deps->needWholeDocument = deps->needWholeDocument || subDepsTracker.needWholeDocument;
         deps->setNeedTextScore(deps->getNeedTextScore() || subDepsTracker.getNeedTextScore());
 
-        if (deps->needWholeDocument && deps->getNeedTextScore()) {
+        // If there are variables defined at this stage's scope, there may be dependencies upon
+        // them in subsequent pipelines. Keep enumerating.
+        if (deps->needWholeDocument && deps->getNeedTextScore() && !scopeHasVariables) {
             break;
         }
     }

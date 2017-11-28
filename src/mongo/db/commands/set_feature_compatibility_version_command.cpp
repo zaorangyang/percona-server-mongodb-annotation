@@ -43,12 +43,19 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog/sharding_catalog_client_impl.h"
+#include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/util/exit.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
 namespace {
 
+MONGO_FP_DECLARE(featureCompatibilityDowngrade);
+MONGO_FP_DECLARE(featureCompatibilityUpgrade);
 /**
  * Sets the minimum allowed version for the cluster. If it is 3.4, then the node should not use 3.6
  * features.
@@ -97,54 +104,81 @@ public:
         return Status::OK();
     }
 
-    bool isFCVUpgrade(StringData version) {
-        const auto existingVersion = FeatureCompatibilityVersion::toString(
-            serverGlobalParams.featureCompatibility.version.load());
-        return version == FeatureCompatibilityVersionCommandParser::kVersion36 &&
-            existingVersion == FeatureCompatibilityVersionCommandParser::kVersion34;
-    }
-
     bool run(OperationContext* opCtx,
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
-        const auto version = uassertStatusOK(
+        // Only allow one instance of setFeatureCompatibilityVersion to run at a time.
+        Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+
+        const auto requestedVersion = uassertStatusOK(
             FeatureCompatibilityVersionCommandParser::extractVersionFromCommand(getName(), cmdObj));
-        auto existingVersion = FeatureCompatibilityVersion::toString(
-                                   serverGlobalParams.featureCompatibility.version.load())
-                                   .toString();
 
-        // Wait for majority commit in case we're upgrading simultaneously with another session.
-        if (version == existingVersion) {
-            const WriteConcernOptions writeConcern(WriteConcernOptions::kMajority,
-                                                   WriteConcernOptions::SyncMode::UNSET,
-                                                   /*timeout*/ INT_MAX);
-            repl::getGlobalReplicationCoordinator()->awaitReplicationOfLastOpForClient(
-                opCtx, writeConcern);
-        }
+        if (requestedVersion == FeatureCompatibilityVersionCommandParser::kVersion36) {
+            uassert(ErrorCodes::IllegalOperation,
+                    "cannot initiate featureCompatibilityVersion upgrade while a previous "
+                    "featureCompatibilityVersion downgrade has not completed",
+                    !serverGlobalParams.featureCompatibility.isDowngradingTo34());
 
-        if (version != existingVersion && isFCVUpgrade(version)) {
-            serverGlobalParams.featureCompatibility.isSchemaVersion36.store(true);
+            FeatureCompatibilityVersion::setTargetUpgrade(opCtx);
+
+            // Remove after 3.4 -> 3.6 upgrade.
             updateUUIDSchemaVersion(opCtx, /*upgrade*/ true);
-            existingVersion = version;
-        }
 
-        FeatureCompatibilityVersion::set(opCtx, version);
+            // If config server, upgrade shards *after* upgrading self.
+            if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                // Remove after 3.4 -> 3.6 upgrade.
+                ShardingCatalogManager::get(opCtx)->generateUUIDsForExistingShardedCollections(
+                    opCtx);
 
-        // If version and existingVersion are still not equal, we must be downgrading.
-        if (version != existingVersion) {
-            serverGlobalParams.featureCompatibility.isSchemaVersion36.store(false);
+                uassertStatusOK(
+                    ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
+                        opCtx, requestedVersion));
+            }
+
+            // Fail after adding UUIDs but before updating the FCV document.
+            if (MONGO_FAIL_POINT(featureCompatibilityUpgrade)) {
+                exitCleanly(EXIT_CLEAN);
+            }
+
+            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
+
+            if (ShardingState::get(opCtx)->enabled()) {
+                // Ensure we try reading the keys for signing clusterTime immediately on upgrade.
+                // Remove after 3.4 -> 3.6 upgrade.
+                LogicalTimeValidator::get(opCtx)->forceKeyRefreshNow(opCtx);
+            }
+        } else {
+            invariant(requestedVersion == FeatureCompatibilityVersionCommandParser::kVersion34);
+
+            uassert(ErrorCodes::IllegalOperation,
+                    "cannot initiate featureCompatibilityVersion downgrade while a previous "
+                    "featureCompatibilityVersion upgrade has not completed",
+                    !serverGlobalParams.featureCompatibility.isUpgradingTo36());
+
+            FeatureCompatibilityVersion::setTargetDowngrade(opCtx);
+
+            // Fail after updating the FCV document but before removing UUIDs.
+            if (MONGO_FAIL_POINT(featureCompatibilityDowngrade)) {
+                exitCleanly(EXIT_CLEAN);
+            }
+
+            // If config server, downgrade shards *before* downgrading self.
+            if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                uassertStatusOK(
+                    ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
+                        opCtx, requestedVersion));
+            }
+
+            // Remove after 3.6 -> 3.4 downgrade.
             updateUUIDSchemaVersion(opCtx, /*upgrade*/ false);
-        }
 
-        // Ensure we try reading the keys for signing clusterTime immediately on upgrade to 3.6.
-        if (ShardingState::get(opCtx)->enabled() &&
-            version == FeatureCompatibilityVersionCommandParser::kVersion36) {
-            LogicalTimeValidator::get(opCtx)->forceKeyRefreshNow(opCtx);
+            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
         }
 
         return true;
     }
+
 
 } setFeatureCompatibilityVersionCommand;
 

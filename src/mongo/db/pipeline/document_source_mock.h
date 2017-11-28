@@ -49,11 +49,14 @@ public:
     Value serialize(
         boost::optional<ExplainOptions::Verbosity> explain = boost::none) const override;
 
-    StageConstraints constraints() const override {
-        StageConstraints constraints;
-        constraints.requiredPosition = PositionRequirement::kFirst;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const override {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kFirst,
+                                     HostTypeRequirement::kNone,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed);
+
         constraints.requiresInputDocSource = false;
-        constraints.isAllowedInsideFacetStage = false;
         return constraints;
     }
 

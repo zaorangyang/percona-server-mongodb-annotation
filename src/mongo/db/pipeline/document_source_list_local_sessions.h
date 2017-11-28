@@ -93,13 +93,15 @@ public:
         return Value(Document{{getSourceName(), _spec.toBSON()}});
     }
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.requiredPosition = StageConstraints::PositionRequirement::kFirst;
-        constraints.hostRequirement = StageConstraints::HostTypeRequirement::kAnyShardOrMongoS;
-        constraints.requiresInputDocSource = false;
-        constraints.isAllowedInsideFacetStage = false;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kFirst,
+                                     HostTypeRequirement::kLocalOnly,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed);
+
         constraints.isIndependentOfAnyCollection = true;
+        constraints.requiresInputDocSource = false;
         return constraints;
     }
 

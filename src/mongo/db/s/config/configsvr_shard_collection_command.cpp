@@ -38,12 +38,14 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/sessions_collection.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_database.h"
@@ -151,7 +153,9 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
             !shardKeyPattern.isHashedPattern() || !request->getUnique());
 
     // Ensure the namespace is valid.
-    uassert(ErrorCodes::IllegalOperation, "can't shard system namespaces", !nss.isSystem());
+    uassert(ErrorCodes::IllegalOperation,
+            "can't shard system namespaces",
+            !nss.isSystem() || nss.ns() == SessionsCollection::kSessionsFullNS);
 
     // Ensure the collation is valid. Currently we only allow the simple collation.
     bool simpleCollationSpecified = false;
@@ -244,30 +248,30 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
 /**
  * Throws an exception if the collection is already sharded with different options.
  *
- * Returns true if the collection is already sharded with the same options, and false if the
- * collection is not sharded.
+ * If the collection is already sharded with the same options, returns the existing collection's
+ * full spec, else returns boost::none.
  */
-bool checkIfAlreadyShardedWithSameOptions(OperationContext* opCtx,
-                                          const NamespaceString& nss,
-                                          const ConfigsvrShardCollectionRequest& request) {
-    auto catalogCache = Grid::get(opCtx)->catalogCache();
-
-    // Until all metadata commands are on the config server, the CatalogCache on the config
-    // server may be stale. Force a refresh for the collection before reading it.
-    catalogCache->invalidateShardedCollection(nss);
-    auto routingInfo = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
+boost::optional<CollectionType> checkIfAlreadyShardedWithSameOptions(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const ConfigsvrShardCollectionRequest& request) {
+    // TODO (SERVER-31027): Replace this direct read with using the routing table cache once UUIDs
+    // are stored in the routing table cache.
+    auto existingColls =
+        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+                            opCtx,
+                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                            repl::ReadConcernLevel::kLocalReadConcern,
+                            NamespaceString(CollectionType::ConfigNS),
+                            BSON("_id" << nss.ns() << "dropped" << false),
+                            BSONObj(),
+                            1))
+            .docs;
 
     // If the collection is already sharded, fail if the deduced options in this request do not
     // match the options the collection was originally sharded with.
-    if (routingInfo.cm()) {
-        auto cm = routingInfo.cm();
-
-        CollectionType existingOptions;
-        existingOptions.setNs(NamespaceString(cm->getns()));
-        existingOptions.setKeyPattern(cm->getShardKeyPattern().getKeyPattern());
-        existingOptions.setDefaultCollation(
-            cm->getDefaultCollator() ? cm->getDefaultCollator()->getSpec().toBSON() : BSONObj());
-        existingOptions.setUnique(cm->isUnique());
+    if (!existingColls.empty()) {
+        auto existingOptions = uassertStatusOK(CollectionType::fromBSON(existingColls.front()));
 
         CollectionType requestedOptions;
         requestedOptions.setNs(nss);
@@ -281,12 +285,12 @@ bool checkIfAlreadyShardedWithSameOptions(OperationContext* opCtx,
                               << existingOptions.toString(),
                 requestedOptions.hasSameOptions(existingOptions));
 
-        // If the options do match, we can immediately return success.
-        return true;
+        // If the options do match, return the existing collection's full spec.
+        return existingOptions;
     }
 
     // Not currently sharded.
-    return false;
+    return boost::none;
 }
 
 /**
@@ -425,7 +429,7 @@ void validateShardKeyAgainstExistingIndexes(OperationContext* opCtx,
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             nss.db().toString(),
             createIndexesCmd,
-            Shard::RetryPolicy::kNotIdempotent);
+            Shard::RetryPolicy::kNoRetry);
         auto createIndexesStatus = swResponse.getStatus();
         if (createIndexesStatus.isOK()) {
             const auto response = swResponse.getValue();
@@ -637,8 +641,7 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
 boost::optional<UUID> getUUIDFromPrimaryShard(const NamespaceString& nss,
                                               ScopedDbConnection& conn) {
     // UUIDs were introduced in featureCompatibilityVersion 3.6.
-    if (serverGlobalParams.featureCompatibility.version.load() <
-        ServerGlobalParams::FeatureCompatibility::Version::k36) {
+    if (!serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
         return boost::none;
     }
 
@@ -731,6 +734,10 @@ public:
                 "_configsvrShardCollection can only be run on config servers",
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
 
+        // Do not allow sharding collections while a featureCompatibilityVersion upgrade or
+        // downgrade is in progress (see SERVER-31231 for details).
+        Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+
         const NamespaceString nss(parseNs(dbname, cmdObj));
         auto request = ConfigsvrShardCollectionRequest::parse(
             IDLParserErrorContext("ConfigsvrShardCollectionRequest"), cmdObj);
@@ -764,9 +771,11 @@ public:
         // Until all metadata commands are on the config server, the CatalogCache on the config
         // server may be stale. Read the database entry directly rather than purging and reloading
         // the database into the CatalogCache, which is very expensive.
-        auto dbType = uassertStatusOK(Grid::get(opCtx)->catalogClient()->getDatabase(
-                                          opCtx, nss.db().toString()))
-                          .value;
+        auto dbType =
+            uassertStatusOK(
+                Grid::get(opCtx)->catalogClient()->getDatabase(
+                    opCtx, nss.db().toString(), repl::ReadConcernLevel::kLocalReadConcern))
+                .value;
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "sharding not enabled for db " << nss.db(),
                 dbType.getSharded());
@@ -780,8 +789,42 @@ public:
         Grid::get(opCtx)->shardRegistry()->getAllShardIds(&shardIds);
         const int numShards = shardIds.size();
 
-        auto primaryShard = uassertStatusOK(
-            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dbType.getPrimary()));
+        // Handle collections in the config db separately.
+        if (nss.db() == NamespaceString::kConfigDb) {
+            // Only whitelisted collections in config may be sharded
+            // (unless we are in test mode)
+            uassert(ErrorCodes::IllegalOperation,
+                    "only special collections in the config db may be sharded",
+                    nss.ns() == SessionsCollection::kSessionsFullNS ||
+                        Command::testCommandsEnabled);
+
+            auto configShard = uassertStatusOK(
+                Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dbType.getPrimary()));
+            ScopedDbConnection configConn(configShard->getConnString());
+            ON_BLOCK_EXIT([&configConn] { configConn.done(); });
+
+            // If this is a collection on the config db, it must be empty to be sharded,
+            // otherwise we might end up with chunks on the config servers.
+            uassert(ErrorCodes::IllegalOperation,
+                    "collections in the config db must be empty to be sharded",
+                    configConn->count(nss.ns()) == 0);
+        }
+
+        // For the config db, pick a new host shard for this collection, otherwise
+        // make a connection to the real primary shard for this database.
+        auto primaryShardId = [&]() {
+            if (nss.db() == NamespaceString::kConfigDb) {
+                uassert(ErrorCodes::IllegalOperation,
+                        "cannot shard collections in config before there are shards",
+                        numShards > 0);
+                return shardIds[0];
+            } else {
+                return dbType.getPrimary();
+            }
+        }();
+
+        auto primaryShard =
+            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, primaryShardId));
         ScopedDbConnection conn(primaryShard->getConnString());
         ON_BLOCK_EXIT([&conn] { conn.done(); });
 
@@ -793,7 +836,11 @@ public:
         invariant(request.getCollation());
 
         // Step 2.
-        if (checkIfAlreadyShardedWithSameOptions(opCtx, nss, request)) {
+        if (auto existingColl = checkIfAlreadyShardedWithSameOptions(opCtx, nss, request)) {
+            result << "collectionsharded" << nss.ns();
+            if (existingColl->getUUID()) {
+                result << "collectionUUID" << *existingColl->getUUID();
+            }
             return true;
         }
 
@@ -837,7 +884,8 @@ public:
                                         *request.getCollation(),
                                         request.getUnique(),
                                         initSplits,
-                                        distributeInitialChunks);
+                                        distributeInitialChunks,
+                                        primaryShardId);
         result << "collectionsharded" << nss.ns();
         if (uuid) {
             result << "collectionUUID" << *uuid;

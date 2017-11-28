@@ -41,7 +41,10 @@
 namespace mongo {
 
 ParsedUpdate::ParsedUpdate(OperationContext* opCtx, const UpdateRequest* request)
-    : _opCtx(opCtx), _request(request), _driver(UpdateDriver::Options()), _canonicalQuery() {}
+    : _opCtx(opCtx),
+      _request(request),
+      _driver(UpdateDriver::Options(new ExpressionContext(opCtx, nullptr))),
+      _canonicalQuery() {}
 
 Status ParsedUpdate::parseRequest() {
     // It is invalid to request that the UpdateStage return the prior or newly-updated version
@@ -112,16 +115,26 @@ Status ParsedUpdate::parseQueryToCQ() {
         qr->setLimit(1);
     }
 
-    const boost::intrusive_ptr<ExpressionContext> expCtx;
-    auto statusWithCQ =
-        CanonicalQuery::canonicalize(_opCtx,
-                                     std::move(qr),
-                                     expCtx,
-                                     extensionsCallback,
-                                     MatchExpressionParser::kAllowAllSpecialFeatures &
-                                         ~MatchExpressionParser::AllowedFeatures::kExpr);
+    // $expr is not allowed in the query for an upsert, since it is not clear what the equality
+    // extraction behavior for $expr should be.
+    MatchExpressionParser::AllowedFeatureSet allowedMatcherFeatures =
+        MatchExpressionParser::kAllowAllSpecialFeatures;
+    if (_request->isUpsert()) {
+        allowedMatcherFeatures &= ~MatchExpressionParser::AllowedFeatures::kExpr;
+    }
+
+    boost::intrusive_ptr<ExpressionContext> expCtx;
+    auto statusWithCQ = CanonicalQuery::canonicalize(
+        _opCtx, std::move(qr), std::move(expCtx), extensionsCallback, allowedMatcherFeatures);
     if (statusWithCQ.isOK()) {
         _canonicalQuery = std::move(statusWithCQ.getValue());
+    }
+
+    if (statusWithCQ.getStatus().code() == ErrorCodes::QueryFeatureNotAllowed) {
+        // The default error message for disallowed $expr is not descriptive enough, so we rewrite
+        // it here.
+        return {ErrorCodes::QueryFeatureNotAllowed,
+                "$expr is not allowed in the query predicate for an upsert"};
     }
 
     return statusWithCQ.getStatus();
@@ -135,19 +148,19 @@ Status ParsedUpdate::parseUpdate() {
     // Config db docs shouldn't get checked for valid field names since the shard key can have
     // a dot (".") in it.
     const bool shouldValidate =
-        !(!_opCtx->writesAreReplicated() || ns.isConfigDB() || _request->isFromMigration());
+        !(_request->isFromOplogApplication() || ns.isConfigDB() || _request->isFromMigration());
 
     _driver.setLogOp(true);
+    boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(_opCtx, _collator.get()));
     _driver.setModOptions(ModifierInterface::Options(
-        !_opCtx->writesAreReplicated(), shouldValidate, _collator.get()));
+        _request->isFromOplogApplication(), shouldValidate, std::move(expCtx)));
 
     return _driver.parse(_request->getUpdates(), _arrayFilters, _request->isMulti());
 }
 
 Status ParsedUpdate::parseArrayFilters() {
     if (!_request->getArrayFilters().empty() &&
-        serverGlobalParams.featureCompatibility.version.load() ==
-            ServerGlobalParams::FeatureCompatibility::Version::k34) {
+        !serverGlobalParams.featureCompatibility.isFullyUpgradedTo36()) {
         return Status(ErrorCodes::InvalidOptions,
                       str::stream()
                           << "The featureCompatibilityVersion must be 3.6 to use arrayFilters. See "
@@ -156,14 +169,27 @@ Status ParsedUpdate::parseArrayFilters() {
     }
 
     for (auto rawArrayFilter : _request->getArrayFilters()) {
-        auto arrayFilterStatus = ExpressionWithPlaceholder::parse(rawArrayFilter, _collator.get());
-        if (!arrayFilterStatus.isOK()) {
-            return Status(arrayFilterStatus.getStatus().code(),
+        boost::intrusive_ptr<ExpressionContext> expCtx(
+            new ExpressionContext(_opCtx, _collator.get()));
+        auto parsedArrayFilter =
+            MatchExpressionParser::parse(rawArrayFilter,
+                                         std::move(expCtx),
+                                         ExtensionsCallbackNoop(),
+                                         MatchExpressionParser::kBanAllSpecialFeatures);
+        if (!parsedArrayFilter.isOK()) {
+            return Status(parsedArrayFilter.getStatus().code(),
                           str::stream() << "Error parsing array filter: "
-                                        << arrayFilterStatus.getStatus().reason());
+                                        << parsedArrayFilter.getStatus().reason());
         }
-        auto arrayFilter = std::move(arrayFilterStatus.getValue());
-        auto fieldName = arrayFilter->getPlaceholder();
+        auto parsedArrayFilterWithPlaceholder =
+            ExpressionWithPlaceholder::make(std::move(parsedArrayFilter.getValue()));
+        if (!parsedArrayFilterWithPlaceholder.isOK()) {
+            return Status(parsedArrayFilterWithPlaceholder.getStatus().code(),
+                          str::stream() << "Error parsing array filter: "
+                                        << parsedArrayFilterWithPlaceholder.getStatus().reason());
+        }
+        auto finalArrayFilter = std::move(parsedArrayFilterWithPlaceholder.getValue());
+        auto fieldName = finalArrayFilter->getPlaceholder();
         if (!fieldName) {
             return Status(
                 ErrorCodes::FailedToParse,
@@ -176,7 +202,7 @@ Status ParsedUpdate::parseArrayFilters() {
                               << *fieldName);
         }
 
-        _arrayFilters[*fieldName] = std::move(arrayFilter);
+        _arrayFilters[*fieldName] = std::move(finalArrayFilter);
     }
 
     return Status::OK();

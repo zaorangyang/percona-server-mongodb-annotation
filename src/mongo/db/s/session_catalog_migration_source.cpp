@@ -30,31 +30,39 @@
 
 #include "mongo/db/s/session_catalog_migration_source.h"
 
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/transaction_history_iterator.h"
+#include "mongo/db/write_concern.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
 namespace {
 
-BSONObj fetchPrePostImageOplog(OperationContext* opCtx, const repl::OplogEntry& oplog) {
-    auto tsToFetch = oplog.getPreImageTs();
+boost::optional<repl::OplogEntry> fetchPrePostImageOplog(OperationContext* opCtx,
+                                                         const repl::OplogEntry& oplog) {
+    auto opTimeToFetch = oplog.getPreImageOpTime();
 
-    if (!tsToFetch) {
-        tsToFetch = oplog.getPostImageTs();
+    if (!opTimeToFetch) {
+        opTimeToFetch = oplog.getPostImageOpTime();
     }
 
-    if (!tsToFetch) {
-        return BSONObj();
+    if (!opTimeToFetch) {
+        return boost::none;
     }
 
+    auto opTime = opTimeToFetch.value();
     DBDirectClient client(opCtx);
-    return client.findOne(NamespaceString::kRsOplogNamespace.ns(),
-                          Query(BSON("ts" << tsToFetch.value())));
+    auto oplogBSON = client.findOne(NamespaceString::kRsOplogNamespace.ns(), opTime.asQuery());
+
+    return uassertStatusOK(repl::OplogEntry::parse(oplogBSON));
 }
 
 }  // unnamed namespace
@@ -66,18 +74,17 @@ bool SessionCatalogMigrationSource::hasMoreOplog() {
     return _hasMoreOplogFromSessionCatalog() || _hasNewWrites();
 }
 
-BSONObj SessionCatalogMigrationSource::getLastFetchedOplog() {
+SessionCatalogMigrationSource::OplogResult SessionCatalogMigrationSource::getLastFetchedOplog() {
     {
         stdx::lock_guard<stdx::mutex> _lk(_sessionCloneMutex);
-        if (!_lastFetchedOplog.isEmpty()) {
-            return _lastFetchedOplog;
+        if (_lastFetchedOplog) {
+            return OplogResult(_lastFetchedOplog, false);
         }
     }
 
     {
         stdx::lock_guard<stdx::mutex> _lk(_newOplogMutex);
-        invariant(!_lastFetchedNewWriteOplog.isEmpty());
-        return _lastFetchedNewWriteOplog;
+        return OplogResult(_lastFetchedNewWriteOplog, true);
     }
 }
 
@@ -101,11 +108,12 @@ bool SessionCatalogMigrationSource::_handleWriteHistory(WithLock, OperationConte
                 return false;
             }
 
-            _lastFetchedOplog = nextOplog.toBSON().getOwned();
-
             auto doc = fetchPrePostImageOplog(opCtx, nextOplog);
-            if (!doc.isEmpty()) {
-                _lastFetchedOplogBuffer.push_back(doc);
+            if (doc) {
+                _lastFetchedOplogBuffer.push_back(nextOplog);
+                _lastFetchedOplog = *doc;
+            } else {
+                _lastFetchedOplog = nextOplog;
             }
 
             return true;
@@ -119,44 +127,38 @@ bool SessionCatalogMigrationSource::_handleWriteHistory(WithLock, OperationConte
 
 bool SessionCatalogMigrationSource::_hasMoreOplogFromSessionCatalog() {
     stdx::lock_guard<stdx::mutex> _lk(_sessionCloneMutex);
-    return !_lastFetchedOplog.isEmpty() || !_lastFetchedOplogBuffer.empty();
+    return _lastFetchedOplog || !_lastFetchedOplogBuffer.empty();
 }
 
 // Important: The no-op oplog entry for findAndModify should always be returned first before the
 // actual operation.
-BSONObj SessionCatalogMigrationSource::_getLastFetchedOplogFromSessionCatalog() {
+repl::OplogEntry SessionCatalogMigrationSource::_getLastFetchedOplogFromSessionCatalog() {
     stdx::lock_guard<stdx::mutex> lk(_sessionCloneMutex);
     return _lastFetchedOplogBuffer.back();
 }
 
 bool SessionCatalogMigrationSource::_fetchNextOplogFromSessionCatalog(OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lk(_sessionCloneMutex);
+    stdx::unique_lock<stdx::mutex> lk(_sessionCloneMutex);
 
+    invariant(_alreadyInitialized);
     if (!_lastFetchedOplogBuffer.empty()) {
         _lastFetchedOplog = _lastFetchedOplogBuffer.back();
         _lastFetchedOplogBuffer.pop_back();
         return true;
     }
 
-    _lastFetchedOplog = BSONObj();
+    _lastFetchedOplog.reset();
 
     if (_handleWriteHistory(lk, opCtx)) {
         return true;
     }
 
-    if (!_sessionCatalogCursor) {
-        DBDirectClient client(opCtx);
-        Query query;
-        query.sort(BSON("_id" << 1));  // strictly not required, but helps make test deterministic.
-        _sessionCatalogCursor =
-            client.query(NamespaceString::kSessionTransactionsTableNamespace.ns(), query);
-    }
+    while (!_sessionLastWriteOpTimes.empty()) {
+        auto lowestOpTimeIter = _sessionLastWriteOpTimes.begin();
+        auto nextOpTime = *lowestOpTimeIter;
+        _sessionLastWriteOpTimes.erase(lowestOpTimeIter);
 
-    while (_sessionCatalogCursor->more()) {
-        auto nextSession = SessionTxnRecord::parse(
-            IDLParserErrorContext("Session migration cloning"), _sessionCatalogCursor->next());
-        _writeHistoryIterator =
-            stdx::make_unique<TransactionHistoryIterator>(nextSession.getLastWriteOpTimeTs());
+        _writeHistoryIterator = stdx::make_unique<TransactionHistoryIterator>(nextOpTime);
         if (_handleWriteHistory(lk, opCtx)) {
             return true;
         }
@@ -167,48 +169,93 @@ bool SessionCatalogMigrationSource::_fetchNextOplogFromSessionCatalog(OperationC
 
 bool SessionCatalogMigrationSource::_hasNewWrites() {
     stdx::lock_guard<stdx::mutex> lk(_newOplogMutex);
-    return !_lastFetchedNewWriteOplog.isEmpty() || !_newWriteTsList.empty();
+    return _lastFetchedNewWriteOplog || !_newWriteOpTimeList.empty();
 }
 
-BSONObj SessionCatalogMigrationSource::_getLastFetchedNewWriteOplog() {
+repl::OplogEntry SessionCatalogMigrationSource::_getLastFetchedNewWriteOplog() {
     stdx::lock_guard<stdx::mutex> lk(_newOplogMutex);
-    return _lastFetchedNewWriteOplog;
+    invariant(_lastFetchedNewWriteOplog);
+    return *_lastFetchedNewWriteOplog;
 }
 
 bool SessionCatalogMigrationSource::_fetchNextNewWriteOplog(OperationContext* opCtx) {
-    Timestamp nextOplogTsToFetch;
+    repl::OpTime nextOpTimeToFetch;
 
     {
         stdx::lock_guard<stdx::mutex> lk(_newOplogMutex);
 
-        if (_newWriteTsList.empty()) {
-            _lastFetchedNewWriteOplog = BSONObj();
+        invariant(_alreadyInitialized);
+        if (_newWriteOpTimeList.empty()) {
+            _lastFetchedNewWriteOplog.reset();
             return false;
         }
 
-        nextOplogTsToFetch = _newWriteTsList.front();
-        _newWriteTsList.pop_front();
+        nextOpTimeToFetch = _newWriteOpTimeList.front();
     }
 
     DBDirectClient client(opCtx);
-    auto newWriteOplog = client.findOne(NamespaceString::kRsOplogNamespace.ns(),
-                                        Query(BSON("ts" << nextOplogTsToFetch)));
+    auto newWriteOplog =
+        client.findOne(NamespaceString::kRsOplogNamespace.ns(), nextOpTimeToFetch.asQuery());
 
     uassert(40620,
-            str::stream() << "Unable to fetch oplog entry with ts: " << nextOplogTsToFetch.toBSON(),
+            str::stream() << "Unable to fetch oplog entry with opTime: "
+                          << nextOpTimeToFetch.toBSON(),
             !newWriteOplog.isEmpty());
 
     {
         stdx::lock_guard<stdx::mutex> lk(_newOplogMutex);
-        _lastFetchedNewWriteOplog = newWriteOplog;
+        _lastFetchedNewWriteOplog = uassertStatusOK(repl::OplogEntry::parse(newWriteOplog));
+        _newWriteOpTimeList.pop_front();
     }
 
     return true;
 }
 
-void SessionCatalogMigrationSource::notifyNewWriteTS(Timestamp opTimestamp) {
+void SessionCatalogMigrationSource::notifyNewWriteOpTime(repl::OpTime opTime) {
     stdx::lock_guard<stdx::mutex> lk(_newOplogMutex);
-    _newWriteTsList.push_back(opTimestamp);
+    _newWriteOpTimeList.push_back(opTime);
+}
+
+void SessionCatalogMigrationSource::init(OperationContext* opCtx) {
+    invariant(!_alreadyInitialized);
+
+    DBDirectClient client(opCtx);
+    auto cursor = client.query(NamespaceString::kSessionTransactionsTableNamespace.ns(), {});
+
+    std::set<repl::OpTime> opTimes;
+    while (cursor->more()) {
+        auto nextSession = SessionTxnRecord::parse(
+            IDLParserErrorContext("Session migration cloning"), cursor->next());
+        auto opTime = nextSession.getLastWriteOpTime();
+        if (!opTime.isNull()) {
+            opTimes.insert(nextSession.getLastWriteOpTime());
+        }
+    }
+
+    {
+        auto message = BSON("sessionMigrateCloneStart" << _ns.ns());
+        AutoGetCollection autoColl(opCtx, NamespaceString::kRsOplogNamespace, MODE_IX);
+        writeConflictRetry(
+            opCtx,
+            "session migration initialization majority commit barrier",
+            NamespaceString::kRsOplogNamespace.ns(),
+            [&] {
+                WriteUnitOfWork wuow(opCtx);
+                opCtx->getClient()->getServiceContext()->getOpObserver()->onInternalOpMessage(
+                    opCtx, _ns, {}, {}, message);
+                wuow.commit();
+            });
+    }
+
+    auto opTimeToWait = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    WriteConcernResult result;
+    WriteConcernOptions majority(
+        WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, 0);
+    uassertStatusOK(waitForWriteConcern(opCtx, opTimeToWait, majority, &result));
+
+    stdx::lock_guard<stdx::mutex> lk(_sessionCloneMutex);
+    _alreadyInitialized = true;
+    _sessionLastWriteOpTimes.swap(opTimes);
 }
 
 }  // namespace mongo

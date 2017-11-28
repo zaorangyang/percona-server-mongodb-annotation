@@ -33,6 +33,7 @@
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/bson/bson_helper.h"
 #include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/pipeline/close_change_stream_exception.h"
 #include "mongo/db/pipeline/document_source_check_resume_token.h"
 #include "mongo/db/pipeline/document_source_limit.h"
@@ -76,6 +77,11 @@ constexpr StringData DocumentSourceChangeStream::kDeleteOpType;
 constexpr StringData DocumentSourceChangeStream::kReplaceOpType;
 constexpr StringData DocumentSourceChangeStream::kInsertOpType;
 constexpr StringData DocumentSourceChangeStream::kInvalidateOpType;
+constexpr StringData DocumentSourceChangeStream::kRetryNeededOpType;
+
+const BSONObj DocumentSourceChangeStream::kSortSpec =
+    BSON("_id.clusterTime.ts" << 1 << "_id.uuid" << 1 << "_id.documentKey" << 1);
+
 
 namespace {
 
@@ -94,11 +100,14 @@ const char* DocumentSourceOplogMatch::getSourceName() const {
     return DocumentSourceChangeStream::kStageName.rawData();
 }
 
-DocumentSource::StageConstraints DocumentSourceOplogMatch::constraints() const {
-    StageConstraints constraints;
-    constraints.requiredPosition = PositionRequirement::kFirst;
-    constraints.isAllowedInsideFacetStage = false;
-    return constraints;
+DocumentSource::StageConstraints DocumentSourceOplogMatch::constraints(
+    Pipeline::SplitState pipeState) const {
+    return {StreamType::kStreaming,
+            PositionRequirement::kFirst,
+            HostTypeRequirement::kAnyShard,
+            DiskUseRequirement::kNoDiskUse,
+            FacetRequirement::kNotAllowed,
+            ChangeStreamRequirement::kChangeStreamStage};
 }
 
 /**
@@ -131,13 +140,25 @@ namespace {
  * "invalidate" entries.
  * It is not intended to be created by the user.
  */
-class DocumentSourceCloseCursor final : public DocumentSource {
+class DocumentSourceCloseCursor final : public DocumentSource, public SplittableDocumentSource {
 public:
     GetNextResult getNext() final;
 
     const char* getSourceName() const final {
         // This is used in error reporting.
         return "$changeStream";
+    }
+
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        // This stage should never be in the shards part of a split pipeline.
+        invariant(pipeState != Pipeline::SplitState::kSplitForShards);
+        return {StreamType::kStreaming,
+                PositionRequirement::kNone,
+                (pipeState == Pipeline::SplitState::kUnsplit ? HostTypeRequirement::kNone
+                                                             : HostTypeRequirement::kMongoS),
+                DiskUseRequirement::kNoDiskUse,
+                FacetRequirement::kNotAllowed,
+                ChangeStreamRequirement::kChangeStreamStage};
     }
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final {
@@ -149,6 +170,26 @@ public:
     static boost::intrusive_ptr<DocumentSourceCloseCursor> create(
         const boost::intrusive_ptr<ExpressionContext>& expCtx) {
         return new DocumentSourceCloseCursor(expCtx);
+    }
+
+    boost::intrusive_ptr<DocumentSource> getShardSource() final {
+        return nullptr;
+    }
+
+    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final {
+        // This stage must run on mongos to ensure it sees any invalidation in the correct order,
+        // and to ensure that all remote cursors are cleaned up properly. We also must include a
+        // mergingPresorted $sort stage to communicate to the AsyncResultsMerger that we need to
+        // merge the streams in a particular order.
+        const bool mergingPresorted = true;
+        const long long noLimit = -1;
+        auto sortMergingPresorted =
+            DocumentSourceSort::create(pExpCtx,
+                                       DocumentSourceChangeStream::kSortSpec,
+                                       noLimit,
+                                       DocumentSourceSort::kMaxMemoryUsageBytes,
+                                       mergingPresorted);
+        return {sortMergingPresorted, this};
     }
 
 private:
@@ -176,7 +217,9 @@ DocumentSource::GetNextResult DocumentSourceCloseCursor::getNext() {
     auto doc = nextInput.getDocument();
     const auto& kOperationTypeField = DocumentSourceChangeStream::kOperationTypeField;
     checkValueType(doc[kOperationTypeField], kOperationTypeField, BSONType::String);
-    if (doc[kOperationTypeField].getString() == DocumentSourceChangeStream::kInvalidateOpType) {
+    auto operationType = doc[kOperationTypeField].getString();
+    if (operationType == DocumentSourceChangeStream::kInvalidateOpType ||
+        operationType == DocumentSourceChangeStream::kRetryNeededOpType) {
         // Pass the invalidation forward, so that it can be included in the results, or
         // filtered/transformed by further stages in the pipeline, then throw an exception
         // to close the cursor on the next call to getNext().
@@ -207,10 +250,18 @@ BSONObj DocumentSourceChangeStream::buildMatchFilter(const NamespaceString& nss,
                                 << "c"
                                 << OR(commandsOnTargetDb, renameDropTarget));
 
-    // 2) Normal CRUD ops on the target collection.
-    auto opMatch = BSON("ns" << target);
+    // 2.1) Normal CRUD ops on the target collection.
+    auto normalOpTypeMatch = BSON("op" << NE << "n");
 
-    // Match oplog entries after "start" and are either (1) supported commands or (2) CRUD ops,
+    // 2.2) A chunk gets migrated to a new shard that doesn't have any chunks.
+    auto chunkMigratedMatch = BSON("op"
+                                   << "n"
+                                   << "o2.type"
+                                   << "migrateChunkToNewShard");
+    // 2) Supported operations on the target namespace.
+    auto opMatch = BSON("ns" << target << OR(normalOpTypeMatch, chunkMigratedMatch));
+
+    // Match oplog entries after "start" and are either supported (1) commands or (2) operations,
     // excepting those tagged "fromMigrate".
     // Include the resume token, if resuming, so we can verify it was still present in the oplog.
     return BSON("$and" << BSON_ARRAY(BSON("ts" << (isResume ? GTE : GT) << startFrom)
@@ -220,41 +271,57 @@ BSONObj DocumentSourceChangeStream::buildMatchFilter(const NamespaceString& nss,
 
 list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
-    // TODO: Add sharding support here (SERVER-29141).
     uassert(
-        40470, "The $changeStream stage is not supported on sharded systems.", !expCtx->inMongos);
+        ErrorCodes::InvalidOptions,
+        str::stream()
+            << "The featureCompatibilityVersion must be 3.6 to use the $changeStream stage. See "
+            << feature_compatibility_version::kDochubLink
+            << ".",
+        serverGlobalParams.featureCompatibility.isFullyUpgradedTo36());
+
+    // A change stream is a tailable + awaitData cursor.
+    expCtx->tailableMode = TailableMode::kTailableAndAwaitData;
+
     uassert(40471,
-            "Only default collation is allowed when using a $changeStream stage.",
+            "Only simple collation is currently allowed when using a $changeStream stage. Please "
+            "specify a collation of {locale: 'simple'} to open a $changeStream on this collection.",
             !expCtx->getCollator());
 
-    auto replCoord = repl::ReplicationCoordinator::get(expCtx->opCtx);
-    uassert(40573,
-            "The $changeStream stage is only supported on replica sets",
-            replCoord &&
-                replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet);
-    Timestamp startFrom = replCoord->getMyLastAppliedOpTime().getTimestamp();
+    boost::optional<Timestamp> startFrom;
+    if (!expCtx->inMongos) {
+        auto replCoord = repl::ReplicationCoordinator::get(expCtx->opCtx);
+        uassert(40573,
+                "The $changeStream stage is only supported on replica sets",
+                replCoord &&
+                    replCoord->getReplicationMode() ==
+                        repl::ReplicationCoordinator::Mode::modeReplSet);
+        startFrom = replCoord->getMyLastAppliedOpTime().getTimestamp();
+    }
 
     intrusive_ptr<DocumentSource> resumeStage = nullptr;
     auto spec = DocumentSourceChangeStreamSpec::parse(IDLParserErrorContext("$changeStream"),
                                                       elem.embeddedObject());
     if (auto resumeAfter = spec.getResumeAfter()) {
         ResumeToken token = resumeAfter.get();
-        auto resumeNamespace = UUIDCatalog::get(expCtx->opCtx).lookupNSSByUUID(token.getUuid());
-        uassert(40615,
-                "The resume token UUID does not exist. Has the collection been dropped?",
-                !resumeNamespace.isEmpty());
-        startFrom = token.getTimestamp();
+        ResumeTokenData tokenData = token.getData();
+        uassert(40645,
+                "The resume token is invalid (no UUID), possibly from an invalidate.",
+                tokenData.uuid);
+        auto resumeNamespace =
+            UUIDCatalog::get(expCtx->opCtx).lookupNSSByUUID(tokenData.uuid.get());
+        if (!expCtx->inMongos) {
+            uassert(40615,
+                    "The resume token UUID does not exist. Has the collection been dropped?",
+                    !resumeNamespace.isEmpty());
+        }
+        startFrom = tokenData.clusterTime;
         if (expCtx->needsMerge) {
-            DocumentSourceShardCheckResumabilitySpec spec;
-            spec.setResumeToken(std::move(token));
-            resumeStage = DocumentSourceShardCheckResumability::create(expCtx, std::move(spec));
+            resumeStage = DocumentSourceShardCheckResumability::create(expCtx, std::move(token));
         } else {
-            DocumentSourceEnsureResumeTokenPresentSpec spec;
-            spec.setResumeToken(std::move(token));
-            resumeStage = DocumentSourceEnsureResumeTokenPresent::create(expCtx, std::move(spec));
+            resumeStage = DocumentSourceEnsureResumeTokenPresent::create(expCtx, std::move(token));
         }
     }
-    const bool changeStreamIsResuming = resumeStage != nullptr;
+    const bool changeStreamIsResuming = (resumeStage != nullptr);
 
     auto fullDocOption = spec.getFullDocument();
     uassert(40575,
@@ -266,17 +333,30 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
             fullDocOption == "updateLookup"_sd || fullDocOption == "default"_sd);
     const bool shouldLookupPostImage = (fullDocOption == "updateLookup"_sd);
 
-    auto oplogMatch = DocumentSourceOplogMatch::create(
-        buildMatchFilter(expCtx->ns, startFrom, changeStreamIsResuming), expCtx);
-    auto transformation = createTransformationStage(elem.embeddedObject(), expCtx);
-    list<intrusive_ptr<DocumentSource>> stages = {oplogMatch, transformation};
+    list<intrusive_ptr<DocumentSource>> stages;
+
+    // There might not be a starting point if we're on mongos, otherwise we should either have a
+    // 'resumeAfter' starting point, or should start from the latest majority committed operation.
+    invariant(expCtx->inMongos || static_cast<bool>(startFrom));
+    if (startFrom) {
+        stages.push_back(DocumentSourceOplogMatch::create(
+            buildMatchFilter(expCtx->ns, *startFrom, changeStreamIsResuming), expCtx));
+    }
+
+    stages.push_back(createTransformationStage(elem.embeddedObject(), expCtx));
     if (resumeStage) {
         stages.push_back(resumeStage);
     }
-    auto closeCursorSource = DocumentSourceCloseCursor::create(expCtx);
-    stages.push_back(closeCursorSource);
-    if (shouldLookupPostImage) {
-        stages.push_back(DocumentSourceLookupChangePostImage::create(expCtx));
+    if (!expCtx->needsMerge) {
+        // There should only be one close cursor stage. If we're on the shards and producing input
+        // to be merged, do not add a close cursor stage, since the mongos will already have one.
+        stages.push_back(DocumentSourceCloseCursor::create(expCtx));
+
+        // There should be only one post-image lookup stage.  If we're on the shards and producing
+        // input to be merged, the lookup is done on the mongos.
+        if (shouldLookupPostImage) {
+            stages.push_back(DocumentSourceLookupChangePostImage::create(expCtx));
+        }
     }
     return stages;
 }
@@ -284,7 +364,9 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
 intrusive_ptr<DocumentSource> DocumentSourceChangeStream::createTransformationStage(
     BSONObj changeStreamSpec, const intrusive_ptr<ExpressionContext>& expCtx) {
     return intrusive_ptr<DocumentSource>(new DocumentSourceSingleDocumentTransformation(
-        expCtx, stdx::make_unique<Transformation>(changeStreamSpec), kStageName.toString()));
+        expCtx,
+        stdx::make_unique<Transformation>(expCtx, changeStreamSpec),
+        kStageName.toString()));
 }
 
 Document DocumentSourceChangeStream::Transformation::applyTransformation(const Document& input) {
@@ -299,15 +381,16 @@ Document DocumentSourceChangeStream::Transformation::applyTransformation(const D
     Value ns = input[repl::OplogEntry::kNamespaceFieldName];
     checkValueType(ns, repl::OplogEntry::kNamespaceFieldName, BSONType::String);
     Value uuid = input[repl::OplogEntry::kUuidFieldName];
-    if (!uuid.missing())
+    if (!uuid.missing()) {
         checkValueType(uuid, repl::OplogEntry::kUuidFieldName, BSONType::BinData);
+    }
     NamespaceString nss(ns.getString());
     Value id = input.getNestedField("o._id");
     // Non-replace updates have the _id in field "o2".
-    Value documentId = id.missing() ? input.getNestedField("o2._id") : id;
     StringData operationType;
     Value fullDocument;
     Value updateDescription;
+    Value documentKey;
 
     // Deal with CRUD operations and commands.
     auto opType = repl::OpType_parse(IDLParserErrorContext("ChangeStreamEntry.op"), op);
@@ -315,10 +398,12 @@ Document DocumentSourceChangeStream::Transformation::applyTransformation(const D
         case repl::OpTypeEnum::kInsert: {
             operationType = kInsertOpType;
             fullDocument = input[repl::OplogEntry::kObjectFieldName];
+            documentKey = Value(Document{{kIdField, id}});
             break;
         }
         case repl::OpTypeEnum::kDelete: {
             operationType = kDeleteOpType;
+            documentKey = input[repl::OplogEntry::kObjectFieldName];
             break;
         }
         case repl::OpTypeEnum::kUpdate: {
@@ -346,38 +431,59 @@ Document DocumentSourceChangeStream::Transformation::applyTransformation(const D
                 operationType = kReplaceOpType;
                 fullDocument = input[repl::OplogEntry::kObjectFieldName];
             }
+            documentKey = input[repl::OplogEntry::kObject2FieldName];
             break;
         }
         case repl::OpTypeEnum::kCommand: {
             operationType = kInvalidateOpType;
-            // Make sure the result doesn't have a document id.
-            documentId = Value();
+            // Make sure the result doesn't have a document key.
+            documentKey = Value();
+            break;
+        }
+        case repl::OpTypeEnum::kNoop: {
+            operationType = kRetryNeededOpType;
+            // Generate a fake document Id for RetryNeeded operation so that we can resume after
+            // this operation.
+            documentKey = Value(Document{{kIdField, input[repl::OplogEntry::kObject2FieldName]}});
             break;
         }
         default: { MONGO_UNREACHABLE; }
     }
 
-    // UUID should always be present except for invalidate entries.
-    invariant(operationType == kInvalidateOpType || !uuid.missing());
-
-    // Construct the result document.
-    Value documentKey;
-    if (!documentId.missing()) {
-        documentKey = Value(Document{{kIdField, documentId}});
+    // UUID should always be present except for invalidate entries.  It will not be under
+    // FCV 3.4, so we should close the stream as invalid.
+    if (operationType != kInvalidateOpType && uuid.missing()) {
+        warning() << "Saw a CRUD op without a UUID.  Did Feature Compatibility Version get "
+                     "downgraded after opening the stream?";
+        operationType = kInvalidateOpType;
+        fullDocument = Value();
+        updateDescription = Value();
+        documentKey = Value();
     }
-    // Note that 'documentKey' might be missing, in which case it will not appear in the output.
-    Document resumeToken{{kClusterTimeField, Document{{kTimestampField, ts}}},
-                         {kUuidField, uuid},
-                         {kDocumentKeyField, documentKey}};
-    doc.addField(kIdField, Value(resumeToken));
-    doc.addField(kOperationTypeField, Value(operationType));
-    doc.addField(kFullDocumentField, fullDocument);
 
-    // "invalidate" entry has fewer fields.
-    if (opType == repl::OpTypeEnum::kCommand) {
+    // Note that 'documentKey' and/or 'uuid' might be missing, in which case the missing fields will
+    // not appear in the output.
+    ResumeTokenData resumeTokenData;
+    resumeTokenData.clusterTime = ts.getTimestamp();
+    resumeTokenData.documentKey = documentKey;
+    if (!uuid.missing())
+        resumeTokenData.uuid = uuid.getUuid();
+    doc.addField(kIdField, Value(ResumeToken(resumeTokenData).toDocument()));
+    doc.addField(kOperationTypeField, Value(operationType));
+
+    // If we're in a sharded environment, we'll need to merge the results by their sort key, so add
+    // that as metadata.
+    if (_expCtx->needsMerge) {
+        auto change = doc.peek();
+        doc.setSortKeyMetaField(BSON("" << ts << "" << uuid << "" << documentKey));
+    }
+
+    // "invalidate" and "retryNeeded" entries have fewer fields.
+    if (operationType == kInvalidateOpType || operationType == kRetryNeededOpType) {
         return doc.freeze();
     }
 
+    doc.addField(kFullDocumentField, fullDocument);
     doc.addField(kNamespaceField, Value(Document{{"db", nss.db()}, {"coll", nss.coll()}}));
     doc.addField(kDocumentKeyField, documentKey);
 

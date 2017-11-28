@@ -45,8 +45,10 @@ public:
     public:
         static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
                                                  const BSONElement& spec) {
-            return stdx::make_unique<LiteParsed>();
+            return stdx::make_unique<LiteParsed>(request.getNamespaceString());
         }
+
+        explicit LiteParsed(NamespaceString nss) : _nss(std::move(nss)) {}
 
         bool isChangeStream() const final {
             return true;
@@ -58,19 +60,20 @@ public:
             return stdx::unordered_set<NamespaceString>();
         }
 
-        // TODO SERVER-29138: Add required privileges.
+        ActionSet actions{ActionType::changeStream, ActionType::find};
         PrivilegeVector requiredPrivileges(bool isMongos) const final {
-            return {};
+            return {Privilege(ResourcePattern::forExactNamespace(_nss), actions)};
         }
 
-        bool allowedToForwardFromMongos() const final {
-            return false;
-        }
+    private:
+        const NamespaceString _nss;
     };
 
     class Transformation : public DocumentSourceSingleDocumentTransformation::TransformerInterface {
     public:
-        Transformation(BSONObj changeStreamSpec) : _changeStreamSpec(changeStreamSpec.getOwned()) {}
+        Transformation(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                       BSONObj changeStreamSpec)
+            : _expCtx(expCtx), _changeStreamSpec(changeStreamSpec.getOwned()) {}
         ~Transformation() = default;
         Document applyTransformation(const Document& input) final;
         TransformerType getType() const final {
@@ -83,8 +86,12 @@ public:
         DocumentSource::GetModPathsReturn getModifiedPaths() const final;
 
     private:
+        boost::intrusive_ptr<ExpressionContext> _expCtx;
         BSONObj _changeStreamSpec;
     };
+
+    // The sort pattern used to merge results from multiple change streams on a mongos.
+    static const BSONObj kSortSpec;
 
     // The name of the field where the document key (_id and shard key, if present) will be found
     // after the transformation.
@@ -128,6 +135,8 @@ public:
     static constexpr StringData kReplaceOpType = "replace"_sd;
     static constexpr StringData kInsertOpType = "insert"_sd;
     static constexpr StringData kInvalidateOpType = "invalidate"_sd;
+    // Internal op type to close the cursor.
+    static constexpr StringData kRetryNeededOpType = "retryNeeded"_sd;
 
     /**
      * Produce the BSON object representing the filter for the $match stage to filter oplog entries
@@ -162,7 +171,7 @@ public:
 
     const char* getSourceName() const final;
 
-    StageConstraints constraints() const final;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final;
 
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final;
 

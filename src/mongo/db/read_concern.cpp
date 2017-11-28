@@ -54,14 +54,6 @@
 namespace mongo {
 namespace {
 
-// This is a special flag that allows for testing of snapshot behavior by skipping the replication
-// related checks and isolating the storage/query side of snapshotting.
-bool testingSnapshotBehaviorInIsolation = false;
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly> TestingSnapshotBehaviorInIsolation(
-    ServerParameterSet::getGlobal(),
-    "testingSnapshotBehaviorInIsolation",
-    &testingSnapshotBehaviorInIsolation);
-
 /**
  *  Schedule a write via appendOplogNote command to the primary of this replica set.
  */
@@ -82,6 +74,8 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
         auto shardingState = ShardingState::get(opCtx);
         // standalone replica set, so there is no need to advance the OpLog on the primary.
         if (!shardingState->enabled()) {
+            log() << "Attempting to make a write for clusterTIme: " << clusterTime
+                  << " but is in standalone RS";
             return Status::OK();
         }
 
@@ -164,8 +158,7 @@ Status waitForReadConcern(OperationContext* opCtx, const repl::ReadConcernArgs& 
 
     auto afterClusterTime = readConcernArgs.getArgsClusterTime();
     if (afterClusterTime) {
-        if (serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k34 &&
+        if (!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36() &&
             ShardingState::get(opCtx)->enabled()) {
             return {ErrorCodes::InvalidOptions,
                     "readConcern afterClusterTime is not available in featureCompatibilityVersion "
@@ -179,8 +172,13 @@ Status waitForReadConcern(OperationContext* opCtx, const repl::ReadConcernArgs& 
         }
     }
 
-    // Skip waiting for the OpTime when testing snapshot behavior
-    if (!testingSnapshotBehaviorInIsolation && !readConcernArgs.isEmpty()) {
+    auto pointInTime = readConcernArgs.getArgsPointInTime();
+    if (pointInTime) {
+        fassertStatusOK(
+            39345, opCtx->recoveryUnit()->selectSnapshot(SnapshotName(pointInTime->asTimestamp())));
+    }
+
+    if (!readConcernArgs.isEmpty()) {
         if (replCoord->isReplEnabled() && afterClusterTime) {
             auto status = makeNoopWriteIfNeeded(opCtx, *afterClusterTime);
             if (!status.isOK()) {
@@ -196,11 +194,10 @@ Status waitForReadConcern(OperationContext* opCtx, const repl::ReadConcernArgs& 
         }
     }
 
-    if ((replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet ||
-         testingSnapshotBehaviorInIsolation) &&
-        readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
+    if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern &&
+        replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet) {
         // ReadConcern Majority is not supported in ProtocolVersion 0.
-        if (!testingSnapshotBehaviorInIsolation && !replCoord->isV1ElectionProtocol()) {
+        if (!replCoord->isV1ElectionProtocol()) {
             return {ErrorCodes::ReadConcernMajorityNotEnabled,
                     str::stream() << "Replica sets running protocol version 0 do not support "
                                      "readConcern: majority"};

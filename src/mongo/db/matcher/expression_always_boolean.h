@@ -69,16 +69,34 @@ public:
         return MatchCategory::kOther;
     }
 
+    size_t numChildren() const override {
+        return 0;
+    }
+
+    MatchExpression* getChild(size_t i) const override {
+        MONGO_UNREACHABLE;
+    }
+
+    std::vector<MatchExpression*>* getChildVector() override {
+        return nullptr;
+    }
+
 private:
+    ExpressionOptimizerFunc getOptimizer() const final {
+        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+    }
+
     bool _value;
 };
 
 class AlwaysFalseMatchExpression final : public AlwaysBooleanMatchExpression {
 public:
+    static constexpr StringData kName = "$alwaysFalse"_sd;
+
     AlwaysFalseMatchExpression() : AlwaysBooleanMatchExpression(MatchType::ALWAYS_FALSE, false) {}
 
     StringData name() const final {
-        return "$alwaysFalse"_sd;
+        return kName;
     }
 
     std::unique_ptr<MatchExpression> shallowClone() const final {
@@ -88,10 +106,12 @@ public:
 
 class AlwaysTrueMatchExpression final : public AlwaysBooleanMatchExpression {
 public:
+    static constexpr StringData kName = "$alwaysTrue"_sd;
+
     AlwaysTrueMatchExpression() : AlwaysBooleanMatchExpression(MatchType::ALWAYS_TRUE, true) {}
 
     StringData name() const final {
-        return "$alwaysTrue"_sd;
+        return kName;
     }
 
     std::unique_ptr<MatchExpression> shallowClone() const final {

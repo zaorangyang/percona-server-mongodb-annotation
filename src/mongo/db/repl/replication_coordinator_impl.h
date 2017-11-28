@@ -53,6 +53,7 @@
 #include "mongo/platform/unordered_set.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/net/hostandport.h"
 
 namespace mongo {
@@ -302,8 +303,6 @@ public:
 
     virtual SnapshotName reserveSnapshotName(OperationContext* opCtx) override;
 
-    virtual void forceSnapshotCreation() override;
-
     virtual void createSnapshot(OperationContext* opCtx,
                                 OpTime timeOfSnapshot,
                                 SnapshotName name) override;
@@ -408,6 +407,12 @@ public:
      * last vote and scheduling the real election.
      */
     void waitForElectionDryRunFinish_forTest();
+
+    /**
+     * Waits until a stepdown command has begun. Callers should ensure that the stepdown attempt
+     * won't fully complete before this method is called, or this method may never return.
+     */
+    void waitForStepDownAttempt_forTest();
 
 private:
     using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -594,7 +599,8 @@ private:
      * Returns an action to be performed after unlocking _mutex, via
      * _performPostMemberStateUpdateAction.
      */
-    PostMemberStateUpdateAction _setCurrentRSConfig_inlock(const ReplSetConfig& newConfig,
+    PostMemberStateUpdateAction _setCurrentRSConfig_inlock(OperationContext* opCtx,
+                                                           const ReplSetConfig& newConfig,
                                                            int myIndex);
 
     /**
@@ -632,17 +638,11 @@ private:
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;
 
     /**
-     * Triggers all callbacks that are blocked waiting for new heartbeat data
-     * to decide whether or not to finish a step down.
+     * Wakes up threads in the process of handling a stepdown request based on whether the
+     * TopologyCoordinator now believes enough secondaries are caught up for the stepdown request to
+     * complete.
      */
-    void _signalStepDownWaiter_inlock();
-
-    /**
-     * Non-blocking helper method for the stepDown method, that represents executing
-     * one attempt to step down. See implementation of this method and stepDown for
-     * details.
-     */
-    bool _tryToStepDown_inlock(Date_t waitUntil, Date_t stepdownUntil, bool force);
+    void _signalStepDownWaiterIfReady_inlock();
 
     bool _canAcceptWritesFor_inlock(const NamespaceString& ns);
 
@@ -782,7 +782,9 @@ private:
     /**
      * Finishes the work of processReplSetInitiate() in the event of a successful quorum check.
      */
-    void _finishReplSetInitiate(const ReplSetConfig& newConfig, int myIndex);
+    void _finishReplSetInitiate(OperationContext* opCtx,
+                                const ReplSetConfig& newConfig,
+                                int myIndex);
 
     /**
      * Finishes the work of processReplSetReconfig, in the event of
@@ -806,8 +808,12 @@ private:
      * Returns an enum indicating what action to take after releasing _mutex, if any.
      * Call performPostMemberStateUpdateAction on the return value after releasing
      * _mutex.
+     *
+     * Note: opCtx may be null as currently not all paths thread an OperationContext all the way
+     * down, but it must be non-null for any calls that change _canAcceptNonLocalWrites.
      */
-    PostMemberStateUpdateAction _updateMemberStateFromTopologyCoordinator_inlock();
+    PostMemberStateUpdateAction _updateMemberStateFromTopologyCoordinator_inlock(
+        OperationContext* opCtx);
 
     /**
      * Performs a post member-state update action.  Do not call while holding _mutex.
@@ -1145,9 +1151,8 @@ private:
     // (PS) Pointer is read-only in concurrent operation, item pointed to is self-synchronizing;
     //      Access in any context.
     // (M)  Reads and writes guarded by _mutex
-    // (GM) Readable under a global intent lock.  Must either hold global lock in exclusive
-    //      mode (MODE_X) or both hold global lock in shared mode (MODE_S) and hold _mutex
-    //      to write.
+    // (GM) Readable under any global intent lock.  Must hold both the global lock in exclusive
+    //      mode (MODE_X) and hold _mutex to write.
     // (I)  Independently synchronized, see member variable comment.
 
     // Protects member data of this ReplicationCoordinator.
@@ -1332,7 +1337,7 @@ private:
     int _earliestMemberId = -1;  // (M)
 
     // Cached copy of the current config protocol version.
-    AtomicInt64 _protVersion;  // (S)
+    AtomicInt64 _protVersion{1};  // (S)
 
     // Source of random numbers used in setting election timeouts, etc.
     PseudoRandom _random;  // (M)

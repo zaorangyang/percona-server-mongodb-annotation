@@ -36,7 +36,7 @@ namespace mongo {
  * Provides a document source interface to retrieve collection-level statistics for a given
  * collection.
  */
-class DocumentSourceCollStats : public DocumentSourceNeedsMongod {
+class DocumentSourceCollStats : public DocumentSourceNeedsMongoProcessInterface {
 public:
     class LiteParsed final : public LiteParsedDocumentSource {
     public:
@@ -68,17 +68,20 @@ public:
     };
 
     DocumentSourceCollStats(const boost::intrusive_ptr<ExpressionContext>& pExpCtx)
-        : DocumentSourceNeedsMongod(pExpCtx) {}
+        : DocumentSourceNeedsMongoProcessInterface(pExpCtx) {}
 
     GetNextResult getNext() final;
 
     const char* getSourceName() const final;
 
-    StageConstraints constraints() const final {
-        StageConstraints constraints;
-        constraints.requiredPosition = PositionRequirement::kFirst;
+    StageConstraints constraints(Pipeline::SplitState pipeState) const final {
+        StageConstraints constraints(StreamType::kStreaming,
+                                     PositionRequirement::kFirst,
+                                     HostTypeRequirement::kAnyShard,
+                                     DiskUseRequirement::kNoDiskUse,
+                                     FacetRequirement::kNotAllowed);
+
         constraints.requiresInputDocSource = false;
-        constraints.isAllowedInsideFacetStage = false;
         return constraints;
     }
 

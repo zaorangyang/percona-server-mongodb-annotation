@@ -49,6 +49,18 @@ public:
         return Status::OK();
     }
 
+    size_t numChildren() const final {
+        return 0;
+    }
+
+    MatchExpression* getChild(size_t i) const final {
+        MONGO_UNREACHABLE;
+    }
+
+    std::vector<MatchExpression*>* getChildVector() final {
+        return nullptr;
+    }
+
     void debugString(StringBuilder& debug, int level) const final;
 
     void serialize(BSONObjBuilder* out) const final;
@@ -69,6 +81,10 @@ protected:
     }
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final {
+        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+    }
+
     long long _numProperties;
     std::string _name;
 };

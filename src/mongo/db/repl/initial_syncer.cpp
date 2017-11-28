@@ -424,6 +424,11 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
     _lastApplied = {};
     _lastFetched = {};
 
+    LOG(2) << "Resetting feature compatibility version to 3.4. If the sync source is in feature "
+              "compatibility version 3.6, we will find out when we clone the admin.system.version "
+              "collection.";
+    serverGlobalParams.featureCompatibility.reset();
+
     // Clear the oplog buffer.
     _oplogBuffer->clear(makeOpCtx().get());
 
@@ -505,7 +510,7 @@ void InitialSyncer::_chooseSyncSourceCallback(
     // There is no need to schedule separate task to create oplog collection since we are already in
     // a callback and we are certain there's no existing operation context (required for creating
     // collections and dropping user databases) attached to the current thread.
-    status = _recreateOplogAndDropReplicatedDatabases();
+    status = _truncateOplogAndDropReplicatedDatabases();
     if (!status.isOK()) {
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
         return;
@@ -527,9 +532,9 @@ void InitialSyncer::_chooseSyncSourceCallback(
     _getBaseRollbackIdHandle = scheduleResult.getValue();
 }
 
-Status InitialSyncer::_recreateOplogAndDropReplicatedDatabases() {
-    // drop/create oplog; drop user databases.
-    LOG(1) << "About to drop+create the oplog, if it exists, ns:" << _opts.localOplogNS
+Status InitialSyncer::_truncateOplogAndDropReplicatedDatabases() {
+    // truncate oplog; drop user databases.
+    LOG(1) << "About to truncate the oplog, if it exists, ns:" << _opts.localOplogNS
            << ", and drop all user databases (so that we can clone them).";
 
     auto opCtx = makeOpCtx();
@@ -537,23 +542,21 @@ Status InitialSyncer::_recreateOplogAndDropReplicatedDatabases() {
     // We are not replicating nor validating these writes.
     UnreplicatedWritesBlock unreplicatedWritesBlock(opCtx.get());
 
-    // 1.) Drop the oplog.
-    LOG(2) << "Dropping the existing oplog: " << _opts.localOplogNS;
-    auto status = _storage->dropCollection(opCtx.get(), _opts.localOplogNS);
+    // 1.) Truncate the oplog.
+    LOG(2) << "Truncating the existing oplog: " << _opts.localOplogNS;
+    auto status = _storage->truncateCollection(opCtx.get(), _opts.localOplogNS);
     if (!status.isOK()) {
-        return status;
+        // 1a.) Create the oplog.
+        LOG(2) << "Creating the oplog: " << _opts.localOplogNS;
+        status = _storage->createOplog(opCtx.get(), _opts.localOplogNS);
+        if (!status.isOK()) {
+            return status;
+        }
     }
 
     // 2.) Drop user databases.
-    LOG(2) << "Dropping  user databases";
-    status = _storage->dropReplicatedDatabases(opCtx.get());
-    if (!status.isOK()) {
-        return status;
-    }
-
-    // 3.) Create the oplog.
-    LOG(2) << "Creating the oplog: " << _opts.localOplogNS;
-    return _storage->createOplog(opCtx.get(), _opts.localOplogNS);
+    LOG(2) << "Dropping user databases";
+    return _storage->dropReplicatedDatabases(opCtx.get());
 }
 
 void InitialSyncer::_rollbackCheckerResetCallback(
@@ -758,7 +761,6 @@ void InitialSyncer::_databasesClonerCallback(const Status& databaseClonerFinishS
 void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
     const StatusWith<Fetcher::QueryResponse>& result,
     std::shared_ptr<OnCompletionGuard> onCompletionGuard) {
-    Timestamp oplogSeedDocTimestamp;
     OpTimeWithHash optimeWithHash;
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -776,8 +778,7 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
             return;
         }
         optimeWithHash = optimeWithHashStatus.getValue();
-        oplogSeedDocTimestamp = _initialSyncState->stopTimestamp =
-            optimeWithHash.opTime.getTimestamp();
+        _initialSyncState->stopTimestamp = optimeWithHash.opTime.getTimestamp();
 
         if (_initialSyncState->beginTimestamp != _initialSyncState->stopTimestamp) {
             invariant(_lastApplied.opTime.isNull());
@@ -802,7 +803,8 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
         auto status = _storage->insertDocument(
             opCtx.get(),
             _opts.localOplogNS,
-            TimestampedBSONObj{oplogSeedDoc, SnapshotName(oplogSeedDocTimestamp)});
+            TimestampedBSONObj{oplogSeedDoc, SnapshotName(optimeWithHash.opTime.getTimestamp())},
+            optimeWithHash.opTime.getTerm());
         if (!status.isOK()) {
             stdx::lock_guard<stdx::mutex> lock(_mutex);
             onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
@@ -1009,6 +1011,30 @@ void InitialSyncer::_rollbackCheckerCheckForRollbackCallback(
         return;
     }
 
+    // Set UUIDs for all non-replicated collections on secondaries. See comment in
+    // ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage() for the explanation of
+    // why we do this and why it is not necessary for sharded clusters.
+    if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
+        serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
+        const NamespaceString nss("admin", "system.version");
+        auto opCtx = makeOpCtx();
+        auto statusWithUUID = _storage->getCollectionUUID(opCtx.get(), nss);
+        if (!statusWithUUID.isOK()) {
+            // If the admin database does not exist, we intentionally fail initial sync. As part of
+            // SERVER-29448, we will disallow dropping the admin database, so failing here is fine.
+            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock,
+                                                                      statusWithUUID.getStatus());
+            return;
+        }
+        if (statusWithUUID.getValue()) {
+            auto schemaStatus = _storage->upgradeUUIDSchemaVersionNonReplicated(opCtx.get());
+            if (!schemaStatus.isOK()) {
+                onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, schemaStatus);
+                return;
+            }
+        }
+    }
+
     // Success!
     onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, _lastApplied);
 }
@@ -1157,7 +1183,8 @@ Status InitialSyncer::_scheduleLastOplogEntryFetcher_inlock(Fetcher::CallbackFn 
                                    query,
                                    callback,
                                    ReadPreferenceSetting::secondaryPreferredMetadata(),
-                                   RemoteCommandRequest::kNoTimeout,
+                                   RemoteCommandRequest::kNoTimeout /* find network timeout */,
+                                   RemoteCommandRequest::kNoTimeout /* getMore network timeout */,
                                    RemoteCommandRetryScheduler::makeRetryPolicy(
                                        numInitialSyncOplogFindAttempts.load(),
                                        executor::RemoteCommandRequest::kNoTimeout,

@@ -18,6 +18,7 @@
 "changePassword",
 "changeOwnPassword",
 "changeOwnCustomData",
+"changeStream",
 "cleanupOrphaned",
 "closeAllDatabases",  # Deprecated, needs to stay around for backwards compatibility
 "collMod",
@@ -34,7 +35,6 @@
 "createUser",
 "dbHash",
 "dbStats",
-"diagLogging",
 "dropAllRolesFromDatabase",  # Not used for permissions checks, but to id the event in logs.
 "dropAllUsersFromDatabase",  # Not used for permissions checks, but to id the event in logs.
 "dropCollection",
@@ -68,6 +68,7 @@
 "killCursors",
 "killop",
 "listCollections",
+"listCursors",
 "listDatabases",
 "listIndexes",
 "listSessions",
@@ -98,6 +99,7 @@
 "revokeRolesFromRole",  # Not used for permissions checks, but to id the event in logs.
 "revokeRolesFromUser",  # Not used for permissions checks, but to id the event in logs.
 "serverStatus",
+"setAuthenticationRestriction",
 "setParameter",
 "shardCollection",  # Not used for permissions checks, but to id the event in logs.
 "shardingState",
@@ -109,6 +111,7 @@
 "top",
 "touch",
 "unlock",
+"useUUID",
 "update",
 "updateRole",  # Not used for permissions checks, but to id the event in logs.
 "updateUser",  # Not used for permissions checks, but to id the event in logs.

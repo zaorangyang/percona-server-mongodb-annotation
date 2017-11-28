@@ -90,6 +90,10 @@ public:
 
     virtual void serialize(BSONObjBuilder* out) const;
 
+    std::vector<MatchExpression*>* getChildVector() final {
+        return nullptr;
+    }
+
     virtual size_t numChildren() const {
         return 1;
     }
@@ -107,6 +111,8 @@ public:
     }
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final;
+
     std::unique_ptr<MatchExpression> _sub;
 };
 
@@ -151,6 +157,8 @@ public:
     }
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final;
+
     bool _arrayElementMatchesAll(const BSONElement& e) const;
 
     std::vector<MatchExpression*> _subs;
@@ -170,6 +178,18 @@ public:
         return std::move(e);
     }
 
+    size_t numChildren() const override {
+        return 0;
+    }
+
+    MatchExpression* getChild(size_t i) const override {
+        return nullptr;
+    }
+
+    std::vector<MatchExpression*>* getChildVector() final {
+        return nullptr;
+    }
+
     virtual bool matchesArray(const BSONObj& anArray, MatchDetails* details) const;
 
     virtual void debugString(StringBuilder& debug, int level) const;
@@ -183,6 +203,10 @@ public:
     }
 
 private:
+    virtual ExpressionOptimizerFunc getOptimizer() const final {
+        return [](std::unique_ptr<MatchExpression> expression) { return expression; };
+    }
+
     int _size;  // >= 0 real, < 0, nothing will match
 };
 }

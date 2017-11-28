@@ -99,6 +99,8 @@ protected:
     void _listToBSON(BSONArrayBuilder* out) const;
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final;
+
     std::vector<MatchExpression*> _expressions;
 };
 
@@ -177,7 +179,7 @@ public:
     virtual void serialize(BSONObjBuilder* out) const;
 };
 
-class NotMatchExpression : public MatchExpression {
+class NotMatchExpression final : public MatchExpression {
 public:
     NotMatchExpression() : MatchExpression(NOT) {}
     NotMatchExpression(MatchExpression* e) : MatchExpression(NOT), _exp(e) {}
@@ -212,12 +214,16 @@ public:
 
     bool equivalent(const MatchExpression* other) const;
 
-    virtual size_t numChildren() const {
+    size_t numChildren() const final {
         return 1;
     }
 
-    virtual MatchExpression* getChild(size_t i) const {
+    MatchExpression* getChild(size_t i) const final {
         return _exp.get();
+    }
+
+    std::vector<MatchExpression*>* getChildVector() final {
+        return nullptr;
     }
 
     MatchExpression* releaseChild(void) {
@@ -233,6 +239,8 @@ public:
     }
 
 private:
+    ExpressionOptimizerFunc getOptimizer() const final;
+
     std::unique_ptr<MatchExpression> _exp;
 };
 }

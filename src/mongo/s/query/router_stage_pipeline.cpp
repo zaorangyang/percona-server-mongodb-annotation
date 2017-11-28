@@ -31,81 +31,42 @@
 #include "mongo/s/query/router_stage_pipeline.h"
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_change_stream.h"
+#include "mongo/db/pipeline/document_source_list_local_sessions.h"
 #include "mongo/db/pipeline/document_source_merge_cursors.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/s/query/document_source_router_adapter.h"
 
 namespace mongo {
-
-namespace {
-
-/**
- * A class that acts as an adapter between the RouterExecStage and DocumentSource interfaces,
- * translating results from an input RouterExecStage into DocumentSource::GetNextResults.
- */
-class DocumentSourceRouterAdapter : public DocumentSource {
-public:
-    static boost::intrusive_ptr<DocumentSourceRouterAdapter> create(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        std::unique_ptr<RouterExecStage> childStage) {
-        return new DocumentSourceRouterAdapter(expCtx, std::move(childStage));
-    }
-
-    GetNextResult getNext() final {
-        auto next = uassertStatusOK(_child->next());
-        if (auto nextObj = next.getResult()) {
-            return Document::fromBsonWithMetaData(*nextObj);
-        }
-        return GetNextResult::makeEOF();
-    }
-
-    void doDispose() final {
-        _child->kill(pExpCtx->opCtx);
-    }
-
-    void reattachToOperationContext(OperationContext* opCtx) final {
-        _child->reattachToOperationContext(opCtx);
-    }
-
-    void detachFromOperationContext() final {
-        _child->detachFromOperationContext();
-    }
-
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final {
-        invariant(explain);  // We shouldn't need to serialize this stage to send it anywhere.
-        return Value();      // Return the empty value to hide this stage from explain output.
-    }
-
-    bool remotesExhausted() {
-        return _child->remotesExhausted();
-    }
-
-private:
-    DocumentSourceRouterAdapter(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                std::unique_ptr<RouterExecStage> childStage)
-        : DocumentSource(expCtx), _child(std::move(childStage)) {}
-
-    std::unique_ptr<RouterExecStage> _child;
-};
-}  // namespace
 
 RouterStagePipeline::RouterStagePipeline(std::unique_ptr<RouterExecStage> child,
                                          std::unique_ptr<Pipeline, Pipeline::Deleter> mergePipeline)
     : RouterExecStage(mergePipeline->getContext()->opCtx),
-      _mergePipeline(std::move(mergePipeline)) {
-    // Add an adapter to the front of the pipeline to draw results from 'child'.
-    _mergePipeline->addInitialSource(
-        DocumentSourceRouterAdapter::create(_mergePipeline->getContext(), std::move(child)));
+      _mergePipeline(std::move(mergePipeline)),
+      _mongosOnlyPipeline(!_mergePipeline->isSplitForMerge()) {
+    if (!_mongosOnlyPipeline) {
+        // Add an adapter to the front of the pipeline to draw results from 'child'.
+        _routerAdapter =
+            DocumentSourceRouterAdapter::create(_mergePipeline->getContext(), std::move(child)),
+        _mergePipeline->addInitialSource(_routerAdapter);
+    }
 }
 
-StatusWith<ClusterQueryResult> RouterStagePipeline::next() {
+StatusWith<ClusterQueryResult> RouterStagePipeline::next(RouterExecStage::ExecContext execContext) {
+    if (_routerAdapter) {
+        _routerAdapter->setExecContext(execContext);
+    }
+
     // Pipeline::getNext will return a boost::optional<Document> or boost::none if EOF.
     if (auto result = _mergePipeline->getNext()) {
         return {result->toBson()};
     }
 
     // If we reach this point, we have hit EOF.
-    _mergePipeline.get_deleter().dismissDisposal();
-    _mergePipeline->dispose(getOpCtx());
+    if (!_mergePipeline->getContext()->isTailableAwaitData()) {
+        _mergePipeline.get_deleter().dismissDisposal();
+        _mergePipeline->dispose(getOpCtx());
+    }
 
     return {ClusterQueryResult()};
 }
@@ -124,12 +85,11 @@ void RouterStagePipeline::kill(OperationContext* opCtx) {
 }
 
 bool RouterStagePipeline::remotesExhausted() {
-    return static_cast<DocumentSourceRouterAdapter*>(_mergePipeline->getSources().front().get())
-        ->remotesExhausted();
+    return _mongosOnlyPipeline || _routerAdapter->remotesExhausted();
 }
 
 Status RouterStagePipeline::doSetAwaitDataTimeout(Milliseconds awaitDataTimeout) {
-    return {ErrorCodes::InvalidOptions, "maxTimeMS is not valid for aggregation getMore"};
+    return _routerAdapter->setAwaitDataTimeout(awaitDataTimeout);
 }
 
 }  // namespace mongo

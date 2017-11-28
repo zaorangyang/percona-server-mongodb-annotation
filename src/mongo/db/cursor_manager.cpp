@@ -175,7 +175,7 @@ bool GlobalCursorIdCache::eraseCursor(OperationContext* opCtx, CursorId id, bool
     if (CursorManager::isGloballyManagedCursor(id)) {
         auto pin = globalCursorManager->pinCursor(opCtx, id);
         if (!pin.isOK()) {
-            invariant(pin == ErrorCodes::CursorNotFound);
+            invariant(pin == ErrorCodes::CursorNotFound || pin == ErrorCodes::Unauthorized);
             // No such cursor.  TODO: Consider writing to audit log here (even though we don't
             // have a namespace).
             return false;
@@ -307,6 +307,14 @@ CursorManager* CursorManager::getGlobalCursorManager() {
 void CursorManager::appendAllActiveSessions(OperationContext* opCtx, LogicalSessionIdSet* lsids) {
     auto visitor = [&](CursorManager& mgr) { mgr.appendActiveSessions(lsids); };
     globalCursorIdCache->visitAllCursorManagers(opCtx, &visitor);
+}
+
+std::vector<GenericCursor> CursorManager::getAllCursors(OperationContext* opCtx) {
+    std::vector<GenericCursor> cursors;
+    auto visitor = [&](CursorManager& mgr) { mgr.appendActiveCursors(&cursors); };
+    globalCursorIdCache->visitAllCursorManagers(opCtx, &visitor);
+
+    return cursors;
 }
 
 Status CursorManager::killCursorsWithMatchingSessions(OperationContext* opCtx,
@@ -551,6 +559,20 @@ void CursorManager::appendActiveSessions(LogicalSessionIdSet* lsids) const {
             if (auto id = cursor->getSessionId()) {
                 lsids->insert(id.value());
             }
+        }
+    }
+}
+
+void CursorManager::appendActiveCursors(std::vector<GenericCursor>* cursors) const {
+    auto allPartitions = _cursorMap->lockAllPartitions();
+    for (auto&& partition : allPartitions) {
+        for (auto&& entry : partition) {
+            auto cursor = entry.second;
+            cursors->emplace_back();
+            auto& gc = cursors->back();
+            gc.setId(cursor->_cursorid);
+            gc.setNs(cursor->nss());
+            gc.setLsid(cursor->getSessionId());
         }
     }
 }

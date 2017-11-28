@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
@@ -40,6 +41,7 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -63,6 +65,7 @@
 #include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/concurrency/old_thread_pool.h"
 #include "mongo/util/md5.hpp"
@@ -142,6 +145,20 @@ void createCollection(OperationContext* opCtx,
     });
 }
 
+auto parseFromOplogEntryArray(const BSONObj& obj, int elem) {
+    BSONElement tsArray;
+    Status status =
+        bsonExtractTypedField(obj, OpTime::kTimestampFieldName, BSONType::Array, &tsArray);
+    ASSERT_OK(status);
+
+    BSONElement termArray;
+    status = bsonExtractTypedField(obj, OpTime::kTermFieldName, BSONType::Array, &termArray);
+    ASSERT_OK(status);
+
+    return OpTime(tsArray.Array()[elem].timestamp(), termArray.Array()[elem].Long());
+};
+
+
 TEST_F(SyncTailTest, SyncApplyNoNamespaceBadOp) {
     const BSONObj op = BSON("op"
                             << "x");
@@ -194,27 +211,6 @@ TEST_F(SyncTailTest, SyncApplyNoOp) {
     ASSERT_FALSE(documentValidationDisabled(_opCtx.get()));
     ASSERT_OK(SyncTail::syncApply(_opCtx.get(), op, false, applyOp, failedApplyCommand, _incOps));
     ASSERT_TRUE(applyOpCalled);
-}
-
-TEST_F(SyncTailTest, SyncApplyNoOpApplyOpThrowsException) {
-    const BSONObj op = BSON("op"
-                            << "n"
-                            << "ns"
-                            << "test.t");
-    int applyOpCalled = 0;
-    SyncTail::ApplyOperationInLockFn applyOp = [&](OperationContext* opCtx,
-                                                   Database* db,
-                                                   const BSONObj& theOperation,
-                                                   bool inSteadyStateReplication,
-                                                   stdx::function<void()>) {
-        applyOpCalled++;
-        if (applyOpCalled < 5) {
-            throw WriteConflictException();
-        }
-        return Status::OK();
-    };
-    ASSERT_OK(SyncTail::syncApply(_opCtx.get(), op, false, applyOp, failedApplyCommand, _incOps));
-    ASSERT_EQUALS(5, applyOpCalled);
 }
 
 TEST_F(SyncTailTest, SyncApplyInsertDocumentDatabaseMissing) {
@@ -547,31 +543,40 @@ TEST_F(SyncTailTest, MultiApplyUpdatesTheTransactionTable) {
     DBDirectClient client(_opCtx.get());
 
     // The txnNum and optime of the only write were saved.
-    auto resultSingle =
+    auto resultSingleDoc =
         client.findOne(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                        BSON(SessionTxnRecord::kSessionIdFieldName << lsidSingle.toBSON()));
-    ASSERT_TRUE(!resultSingle.isEmpty());
-    ASSERT_EQ(resultSingle[SessionTxnRecord::kTxnNumFieldName].numberLong(), 5LL);
-    ASSERT_EQ(resultSingle[SessionTxnRecord::kLastWriteOpTimeTsFieldName].timestamp(),
-              Timestamp(Seconds(1), 0));
+    ASSERT_TRUE(!resultSingleDoc.isEmpty());
+
+    auto resultSingle =
+        SessionTxnRecord::parse(IDLParserErrorContext("resultSingleDoc test"), resultSingleDoc);
+
+    ASSERT_EQ(resultSingle.getTxnNum(), 5LL);
+    ASSERT_EQ(resultSingle.getLastWriteOpTime(), repl::OpTime(Timestamp(Seconds(1), 0), 1));
 
     // The txnNum and optime of the write with the larger txnNum were saved.
-    auto resultDiffTxn =
+    auto resultDiffTxnDoc =
         client.findOne(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                        BSON(SessionTxnRecord::kSessionIdFieldName << lsidDiffTxn.toBSON()));
-    ASSERT_TRUE(!resultDiffTxn.isEmpty());
-    ASSERT_EQ(resultDiffTxn[SessionTxnRecord::kTxnNumFieldName].numberLong(), 20LL);
-    ASSERT_EQ(resultDiffTxn[SessionTxnRecord::kLastWriteOpTimeTsFieldName].timestamp(),
-              Timestamp(Seconds(3), 0));
+    ASSERT_TRUE(!resultDiffTxnDoc.isEmpty());
+
+    auto resultDiffTxn =
+        SessionTxnRecord::parse(IDLParserErrorContext("resultDiffTxnDoc test"), resultDiffTxnDoc);
+
+    ASSERT_EQ(resultDiffTxn.getTxnNum(), 20LL);
+    ASSERT_EQ(resultDiffTxn.getLastWriteOpTime(), repl::OpTime(Timestamp(Seconds(3), 0), 1));
 
     // The txnNum and optime of the write with the later optime were saved.
-    auto resultSameTxn =
+    auto resultSameTxnDoc =
         client.findOne(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                        BSON(SessionTxnRecord::kSessionIdFieldName << lsidSameTxn.toBSON()));
-    ASSERT_TRUE(!resultSameTxn.isEmpty());
-    ASSERT_EQ(resultSameTxn[SessionTxnRecord::kTxnNumFieldName].numberLong(), 30LL);
-    ASSERT_EQ(resultSameTxn[SessionTxnRecord::kLastWriteOpTimeTsFieldName].timestamp(),
-              Timestamp(Seconds(6), 0));
+    ASSERT_TRUE(!resultSameTxnDoc.isEmpty());
+
+    auto resultSameTxn =
+        SessionTxnRecord::parse(IDLParserErrorContext("resultSameTxnDoc test"), resultSameTxnDoc);
+
+    ASSERT_EQ(resultSameTxn.getTxnNum(), 30LL);
+    ASSERT_EQ(resultSameTxn.getLastWriteOpTime(), repl::OpTime(Timestamp(Seconds(6), 0), 1));
 
     // There is no entry for the write with no txnNumber.
     auto resultNoTxn =
@@ -590,6 +595,36 @@ TEST_F(SyncTailTest, MultiSyncApplyUsesSyncApplyToApplyOperation) {
     // Collection should be created after SyncTail::syncApply() processes operation.
     _opCtx = cc().makeOperationContext();
     ASSERT_TRUE(AutoGetCollectionForReadCommand(_opCtx.get(), nss).getCollection());
+}
+
+DEATH_TEST_F(SyncTailTest,
+             MultiSyncApplyFailsWhenCollectionCreationTriesToMakeUUID,
+             "Attempt to assign UUID to replicated collection") {
+    NamespaceString nss("foo." + _agent.getSuiteName() + "_" + _agent.getTestName());
+
+    serverGlobalParams.featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::k36);
+
+    auto op = makeCreateCollectionOplogEntry({Timestamp(Seconds(1), 0), 1LL}, nss);
+    _opCtx.reset();
+    MultiApplier::OperationPtrs ops = {&op};
+    multiSyncApply(&ops, nullptr);
+}
+
+TEST_F(SyncTailTest, MultiInitialSyncApplyFailsWhenCollectionCreationTriesToMakeUUID) {
+    NamespaceString nss("foo." + _agent.getSuiteName() + "_" + _agent.getTestName());
+
+    serverGlobalParams.featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::k36);
+
+    auto op = makeCreateCollectionOplogEntry({Timestamp(Seconds(1), 0), 1LL}, nss);
+
+    _opCtx.reset();
+    MultiApplier::OperationPtrs ops = {&op};
+    ASSERT_EQUALS(ErrorCodes::InvalidOptions, multiInitialSyncApply(&ops, nullptr, nullptr));
+
+    serverGlobalParams.featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::k34);
 }
 
 TEST_F(SyncTailTest, MultiSyncApplyDisablesDocumentValidationWhileApplyingOperations) {
@@ -683,7 +718,7 @@ TEST_F(SyncTailTest, MultiSyncApplyGroupsInsertOperationByNamespaceBeforeApplyin
     ASSERT_BSONOBJ_EQ(createOp2.raw, operationsApplied[1]);
 
     // Check grouped insert operations in namespace "nss1".
-    ASSERT_EQUALS(insertOp1a.getOpTime(), OpTime::parseFromOplogEntry(operationsApplied[2]));
+    ASSERT_EQUALS(insertOp1a.getOpTime(), parseFromOplogEntryArray(operationsApplied[2], 0));
     ASSERT_EQUALS(insertOp1a.getNamespace().ns(), operationsApplied[2]["ns"].valuestrsafe());
     ASSERT_EQUALS(BSONType::Array, operationsApplied[2]["o"].type());
     auto group1 = operationsApplied[2]["o"].Array();
@@ -692,7 +727,7 @@ TEST_F(SyncTailTest, MultiSyncApplyGroupsInsertOperationByNamespaceBeforeApplyin
     ASSERT_BSONOBJ_EQ(insertOp1b.getObject(), group1[1].Obj());
 
     // Check grouped insert operations in namespace "nss2".
-    ASSERT_EQUALS(insertOp2a.getOpTime(), OpTime::parseFromOplogEntry(operationsApplied[3]));
+    ASSERT_EQUALS(insertOp2a.getOpTime(), parseFromOplogEntryArray(operationsApplied[3], 0));
     ASSERT_EQUALS(insertOp2a.getNamespace().ns(), operationsApplied[3]["ns"].valuestrsafe());
     ASSERT_EQUALS(BSONType::Array, operationsApplied[3]["o"].type());
     auto group2 = operationsApplied[3]["o"].Array();
@@ -738,7 +773,7 @@ TEST_F(SyncTailTest, MultiSyncApplyLimitsBatchCountWhenGroupingInsertOperation) 
     ASSERT_BSONOBJ_EQ(createOp.raw, operationsApplied[0]);
 
     const auto& groupedInsertOp = operationsApplied[1];
-    ASSERT_EQUALS(insertOps.front().getOpTime(), OpTime::parseFromOplogEntry(groupedInsertOp));
+    ASSERT_EQUALS(insertOps.front().getOpTime(), parseFromOplogEntryArray(groupedInsertOp, 0));
     ASSERT_EQUALS(insertOps.front().getNamespace().ns(), groupedInsertOp["ns"].valuestrsafe());
     ASSERT_EQUALS(BSONType::Array, groupedInsertOp["o"].type());
     auto groupedInsertDocuments = groupedInsertOp["o"].Array();
@@ -1413,18 +1448,49 @@ TEST_F(IdempotencyTest, CollModIndexNotFound) {
     testOpsAreIdempotent(ops);
 }
 
-TEST_F(IdempotencyTest, ResyncOnRenameCollection) {
+TEST_F(IdempotencyTest, ResyncOnDropFCVCollection) {
     ASSERT_OK(
         ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
-    auto cmd = BSON("renameCollection" << nss.ns() << "to"
-                                       << "test.bar"
-                                       << "stayTemp"
-                                       << false
-                                       << "dropTarget"
-                                       << false);
-    auto op = makeCommandOplogEntry(nextOpTime(), nss, cmd);
+    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
+    auto cmd = BSON("drop" << fcvNS.coll());
+    auto op = makeCommandOplogEntry(
+        nextOpTime(), NamespaceString(FeatureCompatibilityVersion::kCollection), cmd);
     ASSERT_EQUALS(runOp(op), ErrorCodes::OplogOperationUnsupported);
+}
+
+TEST_F(IdempotencyTest, ResyncOnInsertFCVDocument) {
+    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
+    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
+
+    auto op = makeInsertDocumentOplogEntry(
+        nextOpTime(), fcvNS, BSON("_id" << FeatureCompatibilityVersion::kParameterName));
+    ASSERT_EQUALS(runOp(op), ErrorCodes::OplogOperationUnsupported);
+}
+
+TEST_F(IdempotencyTest, InsertToFCVCollectionBesidesFCVDocumentSucceeds) {
+    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
+    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
+
+    auto op = makeInsertDocumentOplogEntry(nextOpTime(),
+                                           fcvNS,
+                                           BSON("_id"
+                                                << "other"));
+    ASSERT_OK(runOp(op));
+}
+
+TEST_F(IdempotencyTest, DropDatabaseSucceeds) {
+    auto ns = NamespaceString("foo.bar");
+    ::mongo::repl::createCollection(_opCtx.get(), ns, CollectionOptions());
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
+
+    auto op = makeCommandOplogEntry(nextOpTime(), ns, BSON("dropDatabase" << 1));
+    ASSERT_OK(runOp(op));
 }
 
 }  // namespace

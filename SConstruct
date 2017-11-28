@@ -496,7 +496,7 @@ try:
         version_data = json.load(version_fp)
 
     if 'version' not in version_data:
-        print "version.json does not contain a version string"
+        print("version.json does not contain a version string")
         Exit(1)
     if 'githash' not in version_data:
         version_data['githash'] = utils.getGitVersion()
@@ -504,7 +504,7 @@ try:
 except IOError as e:
     # If the file error wasn't because the file is missing, error out
     if e.errno != errno.ENOENT:
-        print "Error opening version.json: {0}".format(e.strerror)
+        print("Error opening version.json: {0}".format(e.strerror))
         Exit(1)
 
     version_data = {
@@ -513,7 +513,7 @@ except IOError as e:
     }
 
 except ValueError as e:
-    print "Error decoding version.json: {0}".format(e)
+    print("Error decoding version.json: {0}".format(e))
     Exit(1)
 
 # Setup the command-line variables
@@ -584,7 +584,7 @@ def variable_distsrc_converter(val):
 
 variables_files = variable_shlex_converter(get_option('variables-files'))
 for file in variables_files:
-    print "Using variable customization file %s" % file
+    print("Using variable customization file %s" % file)
 
 env_vars = Variables(
     files=variables_files,
@@ -593,7 +593,7 @@ env_vars = Variables(
 
 sconsflags = os.environ.get('SCONSFLAGS', None)
 if sconsflags:
-    print "Using SCONSFLAGS environment variable arguments: %s" % sconsflags
+    print("Using SCONSFLAGS environment variable arguments: %s" % sconsflags)
 
 env_vars.Add('ABIDW',
     help="Configures the path to the 'abidw' (a libabigail) utility")
@@ -652,6 +652,19 @@ env_vars.Add('HOST_ARCH',
     help='Sets the native architecture of the compiler',
     converter=variable_arch_converter,
     default=None)
+
+env_vars.Add('ICECC',
+    help='Tell SCons where icecream icecc tool is')
+
+env_vars.Add('ICERUN',
+    help='Tell SCons where icecream icerun tool is')
+
+env_vars.Add('ICECC_CREATE_ENV',
+    help='Tell SCons where icecc-create-env tool is',
+    default='buildscripts/icecc_create_env')
+
+env_vars.Add('ICECC_SCHEDULER',
+    help='Tell ICECC where the sceduler daemon is running')
 
 env_vars.Add('LIBPATH',
     help='Adds paths to the linker search path',
@@ -912,12 +925,12 @@ env.AddMethod(mongo_platform.env_os_is_wrapper, 'TargetOSIs')
 env.AddMethod(mongo_platform.env_get_os_name_wrapper, 'GetTargetOSName')
 
 def fatal_error(env, msg, *args):
-    print msg.format(*args)
+    print(msg.format(*args))
     Exit(1)
 
 def conf_error(env, msg, *args):
-    print msg.format(*args)
-    print "See {0} for details".format(env.File('$CONFIGURELOG').abspath)
+    print(msg.format(*args))
+    print("See {0} for details".format(env.File('$CONFIGURELOG').abspath))
     Exit(1)
 
 env.AddMethod(fatal_error, 'FatalError')
@@ -936,7 +949,7 @@ else:
 env.AddMethod(lambda env: env['VERBOSE'], 'Verbose')
 
 if has_option('variables-help'):
-    print env_vars.GenerateHelpText(env)
+    print(env_vars.GenerateHelpText(env))
     Exit(0)
 
 unknown_vars = env_vars.UnknownVariables()
@@ -1144,7 +1157,7 @@ else:
     env['TARGET_ARCH'] = detected_processor
 
 if env['TARGET_OS'] not in os_macros:
-    print "No special config for [{0}] which probably means it won't work".format(env['TARGET_OS'])
+    print("No special config for [{0}] which probably means it won't work".format(env['TARGET_OS']))
 elif not detectConf.CheckForOS(env['TARGET_OS']):
     env.ConfError("TARGET_OS ({0}) is not supported by compiler", env['TARGET_OS'])
 
@@ -1403,7 +1416,7 @@ if env['_LIBDEPS'] == '$_LIBDEPS_LIBS':
     # toolchain, or may be using it for the archiver but not the
     # linker, and binutils currently is the olny thing that supports
     # thin archives. Don't even try on those platforms.
-    if not env.TargetOSIs('solaris', 'darwin', 'windows'):
+    if not env.TargetOSIs('solaris', 'darwin', 'windows', 'openbsd'):
         env.Tool('thin_archive')
 
 if env.TargetOSIs('linux', 'freebsd', 'openbsd'):
@@ -2042,6 +2055,18 @@ def doConfigure(myenv):
         # occurs after an explicit specialization has no effect', it is harmless on platforms where
         # it isn't required
         AddToCXXFLAGSIfSupported(myenv, "-Wno-instantiation-after-specialization")
+
+        # This warning was added in clang-5 and flags many of our lambdas. Since it isn't actively
+        # harmful to capture unused variables we are suppressing for now with a plan to fix later.
+        # Additionally, this has some false-positives where removing the capture makes the code
+        # incorrect and fail to compile on other compilers.
+        # See https://bugs.llvm.org/show_bug.cgi?id=34865.
+        AddToCCFLAGSIfSupported(myenv, "-Wno-unused-lambda-capture")
+
+        # This warning was added in clang-5 and incorrectly flags our implementation of
+        # exceptionToStatus(). See https://bugs.llvm.org/show_bug.cgi?id=34804
+        AddToCCFLAGSIfSupported(myenv, "-Wno-exceptions")
+
 
         # Check if we can set "-Wnon-virtual-dtor" when "-Werror" is set. The only time we can't set it is on
         # clang 3.4, where a class with virtual function(s) and a non-virtual destructor throws a warning when
@@ -3048,6 +3073,9 @@ def doConfigure(myenv):
 
 env = doConfigure( env )
 
+# Now that we are done with configure checks, enable icecream, if available.
+env.Tool('icecream')
+
 # If the flags in the environment are configured for -gsplit-dwarf,
 # inject the necessary emitter.
 split_dwarf = Tool('split_dwarf')
@@ -3117,7 +3145,8 @@ def getSystemInstallName():
     # between the names used by env.TargetOSIs/env.GetTargetOSName should be added
     # to the translation dictionary below.
     os_name_translations = {
-        'windows': 'win32'
+        'windows': 'win32',
+        'macOS': 'osx'
     }
     os_name = env.GetTargetOSName()
     os_name = os_name_translations.get(os_name, os_name)

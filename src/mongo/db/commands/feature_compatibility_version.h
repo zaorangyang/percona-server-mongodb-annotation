@@ -41,6 +41,18 @@ class BSONObj;
 class OperationContext;
 
 /**
+ * Store state of featureCompatibilityVersion document.
+ **/
+struct FeatureCompatibilityVersionInfo {
+    ServerGlobalParams::FeatureCompatibility::Version version;
+    ServerGlobalParams::FeatureCompatibility::Version targetVersion;
+
+    FeatureCompatibilityVersionInfo()
+        : version(ServerGlobalParams::FeatureCompatibility::Version::kUnset),
+          targetVersion(ServerGlobalParams::FeatureCompatibility::Version::kUnset) {}
+};
+
+/**
  * Startup parameter to ignore featureCompatibilityVersion checks. This parameter cannot be set if
  * the node is started with --replSet, --master, or --slave. This should never be set by end users.
  */
@@ -53,12 +65,19 @@ public:
     static constexpr StringData kDatabase = "admin"_sd;
     static constexpr StringData kParameterName = "featureCompatibilityVersion"_sd;
     static constexpr StringData kVersionField = "version"_sd;
+    static constexpr StringData kTargetVersionField = "targetVersion"_sd;
+
+    /**
+     * Should be taken in exclusive mode by any operations that should not run while
+     * setFeatureCompatibilityVersion is running.
+     */
+    static Lock::ResourceMutex fcvLock;
 
     /**
      * Parses the featureCompatibilityVersion document from admin.system.version, and returns the
      * version.
      */
-    static StatusWith<ServerGlobalParams::FeatureCompatibility::Version> parse(
+    static StatusWith<FeatureCompatibilityVersionInfo> parse(
         const BSONObj& featureCompatibilityVersionDoc);
 
     static StringData toString(ServerGlobalParams::FeatureCompatibility::Version version) {
@@ -67,17 +86,34 @@ public:
                 return FeatureCompatibilityVersionCommandParser::kVersion36;
             case ServerGlobalParams::FeatureCompatibility::Version::k34:
                 return FeatureCompatibilityVersionCommandParser::kVersion34;
+            case ServerGlobalParams::FeatureCompatibility::Version::kUnset:
+                return FeatureCompatibilityVersionCommandParser::kVersionUnset;
             default:
                 MONGO_UNREACHABLE;
         }
     }
 
     /**
-     * Sets the minimum allowed version in the cluster, which determines what features are
-     * available.
-     * 'version' should be '3.4' or '3.6'.
+     * Records intent to perform a 3.4 -> 3.6 upgrade by updating the on-disk feature
+     * compatibility version document to have 'version'=3.4, 'targetVersion'=3.6.
+     * Should be called before schemas are modified.
      */
-    static void set(OperationContext* opCtx, StringData version);
+    static void setTargetUpgrade(OperationContext* opCtx);
+
+    /**
+     * Records intent to perform a 3.6 -> 3.4 downgrade by updating the on-disk feature
+     * compatibility version document to have 'version'=3.4, 'targetVersion'=3.4.
+     * Should be called before schemas are modified.
+     */
+    static void setTargetDowngrade(OperationContext* opCtx);
+
+    /**
+     * Records the completion of a 3.4 <-> 3.6 upgrade or downgrade by updating the on-disk
+     * feature compatibility version document to have 'version'=version and unsetting the
+     * 'targetVersion' field.
+     * Should be called after schemas are modified.
+     */
+    static void unsetTargetUpgradeOrDowngrade(OperationContext* opCtx, StringData version);
 
     /**
      * If there are no non-local databases and we are not running with --shardsvr, set
@@ -104,6 +140,19 @@ public:
      * Resets the server parameter to its default value on commit.
      */
     static void onDropCollection(OperationContext* opCtx);
+
+private:
+    /**
+     * Validate version. Uasserts if invalid.
+     */
+    static void _validateVersion(StringData version);
+
+    /**
+     * Build update command.
+     */
+    typedef stdx::function<void(BSONObjBuilder)> UpdateBuilder;
+    static void _runUpdateCommand(OperationContext* opCtx, UpdateBuilder callback);
 };
+
 
 }  // namespace mongo

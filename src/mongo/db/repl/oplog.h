@@ -34,10 +34,11 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_options.h"
+#include "mongo/db/logical_session_id.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/storage/snapshot_name.h"
 #include "mongo/stdx/functional.h"
 
 namespace mongo {
@@ -45,17 +46,41 @@ class Collection;
 class Database;
 class NamespaceString;
 class OperationContext;
+class OperationSessionInfo;
+class Session;
+
+struct OplogSlot {
+    OplogSlot() {}
+    OplogSlot(repl::OpTime opTime, std::int64_t hash) : opTime(opTime), hash(hash) {}
+    repl::OpTime opTime;
+    std::int64_t hash = 0;
+};
+
+struct InsertStatement {
+public:
+    InsertStatement() = default;
+    explicit InsertStatement(BSONObj toInsert) : doc(toInsert) {}
+
+    InsertStatement(StmtId statementId, BSONObj toInsert) : stmtId(statementId), doc(toInsert) {}
+    InsertStatement(StmtId statementId, BSONObj toInsert, OplogSlot os)
+        : stmtId(statementId), oplogSlot(os), doc(toInsert) {}
+    InsertStatement(BSONObj toInsert, SnapshotName ts, long long term)
+        : oplogSlot(repl::OpTime(Timestamp(ts.asU64()), term), 0), doc(toInsert) {}
+
+    StmtId stmtId = kUninitializedStmtId;
+    OplogSlot oplogSlot;
+    BSONObj doc;
+};
 
 namespace repl {
 class ReplSettings;
 
-struct PreAndPostImageTimestamps {
-    PreAndPostImageTimestamps() = default;
-    PreAndPostImageTimestamps(Timestamp _preImageTs, Timestamp _postImageTs)
-        : preImageTs(std::move(_preImageTs)), postImageTs(std::move(_postImageTs)) {}
+struct OplogLink {
+    OplogLink() = default;
 
-    Timestamp preImageTs;
-    Timestamp postImageTs;
+    OpTime prevOpTime;
+    OpTime preImageOpTime;
+    OpTime postImageOpTime;
 };
 
 /**
@@ -77,14 +102,15 @@ extern int OPLOG_VERSION;
 
 /**
  * Log insert(s) to the local oplog.
- * Returns the OpTime of the last insert.
+ * Returns the OpTime of every insert.
  */
-OpTime logInsertOps(OperationContext* opCtx,
-                    const NamespaceString& nss,
-                    OptionalCollectionUUID uuid,
-                    std::vector<InsertStatement>::const_iterator begin,
-                    std::vector<InsertStatement>::const_iterator end,
-                    bool fromMigrate);
+std::vector<OpTime> logInsertOps(OperationContext* opCtx,
+                                 const NamespaceString& nss,
+                                 OptionalCollectionUUID uuid,
+                                 Session* session,
+                                 std::vector<InsertStatement>::const_iterator begin,
+                                 std::vector<InsertStatement>::const_iterator end,
+                                 bool fromMigrate);
 
 /**
  * @param opstr
@@ -98,7 +124,8 @@ OpTime logInsertOps(OperationContext* opCtx,
  * For 'u' records, 'obj' captures the mutation made to the object but not
  * the object itself. 'o2' captures the the criteria for the object that will be modified.
  *
- * preAndPostImageTs this contains the timestamp of the oplog entry that contains the document
+ * oplogLink this contains the timestamp that points to the previous write that will be
+ *   linked via prevTs, and the timestamps of the oplog entry that contains the document
  *   before/after update was applied. The timestamps are ignored if isNull() is true.
  *
  * Returns the optime of the oplog entry written to the oplog.
@@ -111,12 +138,18 @@ OpTime logOp(OperationContext* opCtx,
              const BSONObj& obj,
              const BSONObj* o2,
              bool fromMigrate,
+             const OperationSessionInfo& sessionInfo,
              StmtId stmtId,
-             const PreAndPostImageTimestamps& preAndPostTs);
+             const OplogLink& oplogLink);
 
-// Flush out the cached pointers to the local database and oplog.
+// Flush out the cached pointer to the oplog.
 // Used by the closeDatabase command to ensure we don't cache closed things.
 void oplogCheckCloseDatabase(OperationContext* opCtx, Database* db);
+
+/**
+ * Establish the cached pointer to the local oplog.
+ */
+void acquireOplogCollectionForLogging(OperationContext* opCtx);
 
 using IncrementOpsAppliedStatsFn = stdx::function<void()>;
 /**
@@ -179,6 +212,13 @@ void createIndexForApplyOps(OperationContext* opCtx,
                             const BSONObj& indexSpec,
                             const NamespaceString& indexNss,
                             IncrementOpsAppliedStatsFn incrementOpsAppliedStats);
+
+/**
+ * Allocates optimes for new entries in the oplog.  Returns an OplogSlot or a vector of OplogSlots,
+ * which contain the new optimes along with their terms and newly calculated hash fields.
+ */
+OplogSlot getNextOpTime(OperationContext* opCtx);
+std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count);
 
 }  // namespace repl
 }  // namespace mongo

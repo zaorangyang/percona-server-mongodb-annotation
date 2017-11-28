@@ -321,6 +321,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                                        bool repair,
                                        bool readOnly)
     : _eventHandler(WiredTigerUtil::defaultEventHandlers()),
+      _clockSource(cs),
       _canonicalName(canonicalName),
       _path(path),
       _sizeStorerSyncTracker(cs, 100000, Seconds(60)),
@@ -340,7 +341,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         }
     }
 
-    _previousCheckedDropsQueued = Date_t::now();
+    _previousCheckedDropsQueued = _clockSource->now();
 
     std::stringstream ss;
     ss << "create,";
@@ -494,9 +495,8 @@ void WiredTigerKVEngine::cleanShutdown() {
             closeConfig = "leak_memory=true";
         }
 
-        const bool needsDowngrade = !_readOnly &&
-            serverGlobalParams.featureCompatibility.version.load() ==
-                ServerGlobalParams::FeatureCompatibility::Version::k34;
+        const bool needsDowngrade =
+            !_readOnly && !serverGlobalParams.featureCompatibility.isFullyUpgradedTo36();
 
         invariantWTOK(_conn->close(_conn, closeConfig));
         _conn = nullptr;
@@ -564,12 +564,12 @@ Status WiredTigerKVEngine::okToRename(OperationContext* opCtx,
 }
 
 int64_t WiredTigerKVEngine::getIdentSize(OperationContext* opCtx, StringData ident) {
-    WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx);
+    WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession();
     return WiredTigerUtil::getIdentSize(session->getSession(), _uri(ident));
 }
 
 Status WiredTigerKVEngine::repairIdent(OperationContext* opCtx, StringData ident) {
-    WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx);
+    WiredTigerSession* session = WiredTigerRecoveryUnit::get(opCtx)->getSession();
     string uri = _uri(ident);
     session->closeAllCursors(uri);
     _sessionCache->closeAllCursors(uri);
@@ -845,13 +845,10 @@ SortedDataInterface* WiredTigerKVEngine::getGroupedSortedDataInterface(Operation
 }
 
 Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, StringData ident) {
-    _drop(ident);
-    return Status::OK();
-}
-
-bool WiredTigerKVEngine::_drop(StringData ident) {
     string uri = _uri(ident);
 
+    WiredTigerRecoveryUnit* ru = WiredTigerRecoveryUnit::get(opCtx);
+    ru->getSessionNoTxn()->closeAllCursors(uri);
     _sessionCache->closeAllCursors(uri);
 
     WiredTigerSession session(_conn);
@@ -862,7 +859,7 @@ bool WiredTigerKVEngine::_drop(StringData ident) {
 
     if (ret == 0) {
         // yay, it worked
-        return true;
+        return Status::OK();
     }
 
     if (ret == EBUSY) {
@@ -872,11 +869,11 @@ bool WiredTigerKVEngine::_drop(StringData ident) {
             _identToDrop.push_front(uri);
         }
         _sessionCache->closeCursorsForQueuedDrops();
-        return false;
+        return Status::OK();
     }
 
     invariantWTOK(ret);
-    return false;
+    return Status::OK();
 }
 
 std::list<WiredTigerCachedCursor> WiredTigerKVEngine::filterCursorsWithQueuedDrops(
@@ -902,7 +899,7 @@ std::list<WiredTigerCachedCursor> WiredTigerKVEngine::filterCursorsWithQueuedDro
 }
 
 bool WiredTigerKVEngine::haveDropsQueued() const {
-    Date_t now = Date_t::now();
+    Date_t now = _clockSource->now();
     Milliseconds delta = now - _previousCheckedDropsQueued;
 
     if (!_readOnly && _sizeStorerSyncTracker.intervalHasElapsed()) {
@@ -968,8 +965,7 @@ bool WiredTigerKVEngine::supportsDirectoryPerDB() const {
 }
 
 bool WiredTigerKVEngine::hasIdent(OperationContext* opCtx, StringData ident) const {
-    return _hasUri(WiredTigerRecoveryUnit::get(opCtx)->getSession(opCtx)->getSession(),
-                   _uri(ident));
+    return _hasUri(WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession(), _uri(ident));
 }
 
 bool WiredTigerKVEngine::_hasUri(WT_SESSION* session, const std::string& uri) const {
@@ -1069,7 +1065,7 @@ void WiredTigerKVEngine::setStableTimestamp(SnapshotName stableTimestamp) {
     // taking "stable checkpoints". In the transitioning case, it's imperative for the "stable
     // timestamp" to have first been communicated to WiredTiger.
     if (!keepOldBehavior) {
-        std::string conf = str::stream() << "stable_timestamp=" << stableTimestamp.toString();
+        std::string conf = "stable_timestamp=" + stableTimestamp.toString();
         _conn->set_timestamp(_conn, conf.c_str());
     }
     if (_checkpointThread) {
@@ -1100,15 +1096,22 @@ void WiredTigerKVEngine::_setOldestTimestamp(SnapshotName oldestTimestamp) {
             return;
         }
     }
+    auto timestampToSet = _previousSetOldestTimestamp;
+    _previousSetOldestTimestamp = oldestTimestamp;
+    if (timestampToSet == SnapshotName()) {
+        // Nothing to set yet.
+        return;
+    }
+
     char oldestTSConfigString["oldest_timestamp="_sd.size() + (8 * 2) /* 16 hexadecimal digits */ +
                               1 /* trailing null */];
     auto size = std::snprintf(oldestTSConfigString,
                               sizeof(oldestTSConfigString),
                               "oldest_timestamp=%llx",
-                              static_cast<unsigned long long>(oldestTimestamp.asU64()));
+                              static_cast<unsigned long long>(timestampToSet.asU64()));
     invariant(static_cast<std::size_t>(size) < sizeof(oldestTSConfigString));
     invariantWTOK(_conn->set_timestamp(_conn, oldestTSConfigString));
-    LOG(2) << "oldest_timestamp set to " << oldestTimestamp.asU64();
+    LOG(2) << "oldest_timestamp set to " << timestampToSet.asU64();
 }
 
 void WiredTigerKVEngine::setInitialDataTimestamp(SnapshotName initialDataTimestamp) {
@@ -1128,7 +1131,7 @@ bool WiredTigerKVEngine::supportsRecoverToStableTimestamp() const {
 void WiredTigerKVEngine::initializeOplogManager(OperationContext* opCtx,
                                                 const std::string& uri,
                                                 WiredTigerRecordStore* oplogRecordStore) {
-    stdx::unique_lock<stdx::mutex> lock(_oplogManagerMutex);
+    stdx::lock_guard<stdx::mutex> lock(_oplogManagerMutex);
     if (_oplogManagerCount == 0)
         _oplogManager.reset(new WiredTigerOplogManager(opCtx, uri, oplogRecordStore));
     _oplogManagerCount++;
@@ -1138,12 +1141,16 @@ void WiredTigerKVEngine::deleteOplogManager() {
     stdx::unique_lock<stdx::mutex> lock(_oplogManagerMutex);
     invariant(_oplogManagerCount > 0);
     _oplogManagerCount--;
-    if (_oplogManagerCount == 0)
+    if (_oplogManagerCount == 0) {
+        // Destructor may lock the mutex, so we must unlock here.
+        // Oplog managers only destruct at shutdown or test exit, so it is safe to unlock here.
+        lock.unlock();
         _oplogManager.reset();
+    }
 }
 
 void WiredTigerKVEngine::replicationBatchIsComplete() const {
-    stdx::unique_lock<stdx::mutex> lock(_oplogManagerMutex);
+    stdx::lock_guard<stdx::mutex> lock(_oplogManagerMutex);
     if (_oplogManager) {
         _oplogManager->triggerJournalFlush();
     }

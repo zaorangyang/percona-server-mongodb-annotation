@@ -235,8 +235,6 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
         if (db == "admin") {
             if (coll == "system.version")
                 return Status::OK();
-            if (coll == "system.sessions")
-                return Status::OK();
             if (coll == "system.roles")
                 return Status::OK();
             if (coll == "system.new_users")
@@ -244,6 +242,10 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
             if (coll == "system.backup_users")
                 return Status::OK();
             if (coll == "system.keys")
+                return Status::OK();
+        }
+        if (db == "config") {
+            if (coll == "system.sessions")
                 return Status::OK();
         }
         if (db == "local") {
@@ -259,6 +261,12 @@ Status userAllowedCreateNS(StringData db, StringData coll) {
     // some special rules
 
     if (coll.find(".system.") != string::npos) {
+        // If this is metadata for the sessions collection, shard servers need to be able to
+        // write to it.
+        if (coll.find(".system.sessions") != string::npos) {
+            return Status::OK();
+        }
+
         // this matches old (2.4 and older) behavior, but I'm not sure its a good idea
         return Status(ErrorCodes::BadValue,
                       str::stream() << "cannot write to '" << db << "." << coll << "'");

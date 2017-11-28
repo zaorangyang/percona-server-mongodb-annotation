@@ -66,8 +66,11 @@ public:
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
                                  const BSONObj& cmdObj) override {
-        // Anybody may start a session. The command body below checks
-        // that only a single user is logged in.
+
+        if (!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36()) {
+            return SessionsCommandFCV34Status(getName());
+        }
+
         return Status::OK();
     }
 
@@ -75,6 +78,10 @@ public:
                      const std::string& db,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) override {
+
+        if (!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36()) {
+            return appendCommandStatus(result, SessionsCommandFCV34Status(getName()));
+        }
 
         auto client = opCtx->getClient();
         ServiceContext* serviceContext = client->getServiceContext();
@@ -90,11 +97,7 @@ public:
             return appendCommandStatus(result, status);
         }
 
-        Status startSessionStatus = lsCache->startSession(opCtx, record.get());
-
-        if (!startSessionStatus.isOK()) {
-            return appendCommandStatus(result, startSessionStatus);
-        }
+        lsCache->startSession(opCtx, record.get());
 
         makeLogicalSessionToClient(record->getId()).serialize(&result);
 

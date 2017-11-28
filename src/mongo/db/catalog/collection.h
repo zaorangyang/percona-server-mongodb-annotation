@@ -48,6 +48,7 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/repl/oplog.h"
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/snapshot.h"
@@ -94,21 +95,6 @@ struct CompactOptions {
 
 struct CompactStats {
     long long corruptDocuments = 0;
-};
-
-struct InsertStatement {
-public:
-    InsertStatement() = default;
-    explicit InsertStatement(BSONObj toInsert) : doc(toInsert) {}
-
-    InsertStatement(StmtId statementId, BSONObj toInsert) : stmtId(statementId), doc(toInsert) {}
-    InsertStatement(StmtId statementId, BSONObj toInsert, SnapshotName ts)
-        : stmtId(statementId), timestamp(ts), doc(toInsert) {}
-    InsertStatement(BSONObj toInsert, SnapshotName ts) : timestamp(ts), doc(toInsert) {}
-
-    StmtId stmtId = kUninitializedStmtId;
-    SnapshotName timestamp = SnapshotName();
-    BSONObj doc;
 };
 
 /**
@@ -316,6 +302,7 @@ public:
         virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) = 0;
 
         virtual StatusWithMatchExpression parseValidator(
+            OperationContext* opCtx,
             const BSONObj& validator,
             MatchExpressionParser::AllowedFeatureSet allowedFeatures) const = 0;
 
@@ -641,8 +628,10 @@ public:
      * Returns a non-ok Status if validator is not legal for this collection.
      */
     inline StatusWithMatchExpression parseValidator(
-        const BSONObj& validator, MatchExpressionParser::AllowedFeatureSet allowedFeatures) const {
-        return this->_impl().parseValidator(validator, allowedFeatures);
+        OperationContext* opCtx,
+        const BSONObj& validator,
+        MatchExpressionParser::AllowedFeatureSet allowedFeatures) const {
+        return this->_impl().parseValidator(opCtx, validator, allowedFeatures);
     }
 
     static StatusWith<ValidationLevel> parseValidationLevel(StringData);

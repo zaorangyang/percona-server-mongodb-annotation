@@ -35,8 +35,11 @@
 
 namespace mongo {
 
-enum class LogicalSessionCacheServer { kSharded, kReplicaSet, kStandalone };
+enum class LogicalSessionCacheServer { kSharded, kConfigServer, kReplicaSet, kStandalone };
 
-std::unique_ptr<LogicalSessionCache> makeLogicalSessionCacheD(LogicalSessionCacheServer state);
+class ServiceContext;
+
+std::unique_ptr<LogicalSessionCache> makeLogicalSessionCacheD(ServiceContext* svc,
+                                                              LogicalSessionCacheServer state);
 
 }  // namespace mongo
