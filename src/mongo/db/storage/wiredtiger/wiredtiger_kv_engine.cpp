@@ -213,6 +213,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     ss << "checkpoint=(wait=" << wiredTigerGlobalOptions.checkpointDelaySecs;
     ss << ",log_size=" << wiredTigerGlobalOptions.checkpointSizeMB << "MB),";
     ss << "statistics_log=(wait=" << wiredTigerGlobalOptions.statisticsLogDelaySecs << "),";
+    ss << "verbose=(recovery_progress),";
     ss << WiredTigerCustomizationHooks::get(getGlobalServiceContext())->getOpenConfig("system");
     ss << extraOpenOptions;
     if (!_durable) {

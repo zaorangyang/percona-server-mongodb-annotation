@@ -16,21 +16,21 @@ post:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: work/reports.tgz
-        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/${task_name}-${build_id}.${ext|tgz}
+        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/${task_name}-${build_id}-${execution}.${ext|tgz}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
-        display_name: test-log
+        display_name: test-log - Execution ${execution}
     - command: s3.put
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        local_file: work/reports/graphs/timeseries-mongod.0.html
-        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/timeseries-mongod.0-${task_name}-${build_id}.html
+        local_file: src/workloads/workloads/jsdoc/jsdocs-redirect.html
+        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/workloads-${task_name}-${build_id}.html
         bucket: mciuploads
         permissions: public-read
         content_type: text/html
-        display_name: timeseries-p1.html
+        display_name: workloads documentation
     - command: attach.results
       params:
         file_location: work/report.json
@@ -216,8 +216,7 @@ functions:
         silent: true
         script: |
           set -o errexit
-          TAGS="3.2.15-Baseline"
-          PROJECT="sys-perf-3.2"
+          TAGS="3.2.17-Baseline"
           OVERRIDEFILE="../src/dsi/dsi/analysis/v3.2/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/dashboard_gen.py --rev ${revision} -f history.json -t tags.json --refTag $TAGS --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name} --jira-user ${perf_jira_user} --jira-password ${perf_jira_pw} || true
     - command: "json.send"
@@ -232,8 +231,8 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          TAG="3.2.15-Baseline"
-          OVERRIDEFILE="../src/dsi/dsi/analysis/v3.2/system_perf_override.json"
+          TAG="3.2.17-Baseline"
+          OVERRIDEFILE="../src/dsi/dsi/analysis/${branch_name}/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file reports/perf.json --rev ${revision} -f history.json -t tags.json --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
 
 #######################################

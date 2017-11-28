@@ -87,7 +87,6 @@ variables:
   - ubuntu1204
   - ubuntu1404
   - ubuntu1604
-  - ubuntu1404-rocksdb
   - debian71
   - debian81
   - osx-107-ssl
@@ -190,19 +189,6 @@ functions:
       build_variants:
         *debug_symbol_variants
 
-  "build rocksdb" :
-    command: shell.exec
-    params:
-      script: |
-        set -o errexit
-        set -o verbose
-        if [ "${build_rocksdb|}" = "true" ]; then
-        rm -rf rocksdb
-        git clone https://github.com/facebook/rocksdb.git
-        cd rocksdb
-        make USE_RTTI=1 static_lib
-        fi
-
   "build new tools" :
     command: shell.exec
     params:
@@ -295,7 +281,7 @@ functions:
         fi
         set -o errexit
 
-        ${path_prefix} ${asan_symbolizer} ${enable_lsan} ${rlp_environment} ${python|python} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json
+        ${path_prefix} ${asan_symbolizer} ${enable_lsan} ${lang_environment} ${rlp_environment} ${python|python} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json
 
   "run jstestfuzz":
     - command: shell.exec
@@ -573,14 +559,12 @@ tasks:
         revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
           enterprise: ${enterprise_rev}
           mongo-tools: ${mongo-tools_rev}
-          rocksdb: ${rocksdb_rev}
     - command: git.apply_patch
       params:
         directory: src
     - func: "get buildnumber"
     - func: "setup credentials"
     - func: "build new tools" # noop if ${newtools} is not "true"
-    - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
     - command: shell.exec
       params:
         working_dir: src
@@ -747,7 +731,6 @@ tasks:
         revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
           enterprise: ${enterprise_rev}
           mongo-tools: ${mongo-tools_rev}
-          rocksdb: ${rocksdb_rev}
     - command: git.apply_patch
       params:
         directory: src
@@ -2005,7 +1988,7 @@ tasks:
           notary-client.py --key-name "server-3.2" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
           if [ "${has_packages|}" = "true" ]; then
-             CURATOR_RELEASE="88f34a9f1c79db7ea9597b6e85eb5995d03714ba"
+             CURATOR_RELEASE="ea8d75dcc1a587111e7418e2428fb67e267af9fe"
              curl -L -O http://boxes.10gen.com/build/curator/curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
              tar -zxvf curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
              ./curator repo --config ./etc/repo_config.yaml --distro ${packager_distro} --edition ${repo_edition} --version ${version} --arch ${packager_arch} --packages repo
@@ -2424,11 +2407,6 @@ modules:
 - name: mongo-tools
   repo: git@github.com:mongodb/mongo-tools.git
   prefix: .
-  branch: v3.2
-
-- name: rocksdb
-  repo: git@github.com:mongodb-partners/mongo-rocks.git
-  prefix: src/mongo/db/modules
   branch: v3.2
 
 #######################################
@@ -3044,6 +3022,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-ubuntu1604
+    lang_environment: LANG=C
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
@@ -5020,6 +4999,7 @@ buildvariants:
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
+    lang_environment: LANG=C
     push_arch: x86_64-enterprise-ubuntu1604
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
@@ -5900,67 +5880,6 @@ buildvariants:
   - name: tool
   - name: unittests
 
-- name: ubuntu1404-rocksdb
-  display_name: Ubuntu 14.04 (RocksDB)
-  modules:
-  - rocksdb
-  - mongo-tools
-  run_on:
-  - ubuntu1404-test
-  batchtime: 1440 # 1 day
-  expansions:
-    build_rocksdb: true
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CPPPATH=$(readlink -f ../rocksdb/include/) LIBPATH=$(readlink -f ../rocksdb/) LIBS=rocksdb CC=/opt/mongodbtoolchain/bin/gcc CXX=/opt/mongodbtoolchain/bin/g++ VARIANT_DIR=release
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --storageEngine=rocksdb
-  tasks:
-  - name: compile
-    distros:
-    - ubuntu1404-build
-  - name: aggregation
-  - name: aggregation_WT
-  - name: aggregation_auth
-  - name: auth
-  - name: dbtest
-  # - name: disk
-  # - name: durability
-  # - name: dur_jscore_passthrough
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth
-  - name: gle_auth_write_cmd
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: jsCore
-  - name: jsCore_auth
-  - name: jsCore_compatibility
-  - name: jsCore_small_oplog
-  - name: jsCore_small_oplog_rs
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
-  - name: bulk_gle_passthrough
-  - name: parallel
-  - name: parallel_compatibility
-  - name: concurrency
-  - name: concurrency_replication
-  - name: concurrency_sharded
-  - name: concurrency_sharded_sccc
-  - name: replicasets
-  - name: replicasets_auth
-  - name: replication
-  - name: replication_WT
-  - name: replication_auth
-  - name: sharding
-  - name: sharding_auth
-  - name: sharding_csrs_upgrade
-  - name: sharding_csrs_upgrade_auth_WT
-  - name: slow1
-  - name: slow2
-  - name: sharding_jscore_passthrough
-  - name: unittests
-
 ###########################################
 #     Experimental buildvariants          #
 ###########################################
@@ -6108,6 +6027,7 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     path_prefix: PATH=$PATH:/usr/lib/llvm-3.8/bin
     enable_lsan: LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1
+    lang_environment: LANG=C
     compile_flags: CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 CPPDEFINES="_GLIBCXX_USE_CXX11_ABI=0" --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip VARIANT_DIR=build
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: -j1 # Avoid starting too many mongod's under ASAN build.
