@@ -95,7 +95,7 @@ def download_file(url, file_name, download_retries=5):
                     continue
 
         # Check if file download was completed.
-        if "Content-length" in response.headers:
+        if "Content-length" in response.headers and "Content-encoding" not in response.headers:
             url_content_length = int(response.headers["Content-length"])
             file_size = os.path.getsize(file_name)
             # Retry download if file_size has an unexpected size.
