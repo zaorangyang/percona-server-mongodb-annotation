@@ -43,6 +43,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/sessions_collection.h"
@@ -255,8 +256,6 @@ boost::optional<CollectionType> checkIfAlreadyShardedWithSameOptions(
     OperationContext* opCtx,
     const NamespaceString& nss,
     const ConfigsvrShardCollectionRequest& request) {
-    // TODO (SERVER-31027): Replace this direct read with using the routing table cache once UUIDs
-    // are stored in the routing table cache.
     auto existingColls =
         uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
                             opCtx,
@@ -268,8 +267,6 @@ boost::optional<CollectionType> checkIfAlreadyShardedWithSameOptions(
                             1))
             .docs;
 
-    // If the collection is already sharded, fail if the deduced options in this request do not
-    // match the options the collection was originally sharded with.
     if (!existingColls.empty()) {
         auto existingOptions = uassertStatusOK(CollectionType::fromBSON(existingColls.front()));
 
@@ -279,13 +276,20 @@ boost::optional<CollectionType> checkIfAlreadyShardedWithSameOptions(
         requestedOptions.setDefaultCollation(*request.getCollation());
         requestedOptions.setUnique(request.getUnique());
 
+        // If the collection is already sharded, fail if the deduced options in this request do not
+        // match the options the collection was originally sharded with.
         uassert(ErrorCodes::AlreadyInitialized,
                 str::stream() << "sharding already enabled for collection " << nss.ns()
                               << " with options "
                               << existingOptions.toString(),
                 requestedOptions.hasSameOptions(existingOptions));
 
-        // If the options do match, return the existing collection's full spec.
+        // We did a local read of the collection entry above and found that this shardCollection
+        // request was already satisfied. However, the data may not be majority committed (a
+        // previous shardCollection attempt may have failed with a writeConcern error).
+        // Since the current Client doesn't know the opTime of the last write to the collection
+        // entry, make it wait for the last opTime in the system when we wait for writeConcern.
+        repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
         return existingOptions;
     }
 
@@ -734,6 +738,11 @@ public:
                 "_configsvrShardCollection can only be run on config servers",
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
 
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "shardCollection must be called with majority writeConcern, got "
+                              << cmdObj,
+                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+
         // Do not allow sharding collections while a featureCompatibilityVersion upgrade or
         // downgrade is in progress (see SERVER-31231 for details).
         Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
@@ -744,27 +753,21 @@ public:
 
         auto const catalogManager = ShardingCatalogManager::get(opCtx);
         auto const catalogCache = Grid::get(opCtx)->catalogCache();
+        auto const catalogClient = Grid::get(opCtx)->catalogClient();
 
-        // Take a lock to ensure that different movePrimary and shardCollection commands cannot run
-        // concurrently in mixed 3.4 and 3.6 MongoS versions.
-        boost::optional<DistLockManager::ScopedDistLock> backwardsCompatibleLock(
-            uassertStatusOK(Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
-                opCtx,
-                nss.db() + "-movePrimary",
-                "shardCollection",
-                DistLockManager::kDefaultLockTimeout)));
-
-        // If shardCollection is called concurrently with movePrimary, which changes the UUID of a
-        // collection, shardCollection may persist the original UUID on the config server, leaving
-        // the collection UUIDs inconsistent between the moved collection and the config server.
-        boost::optional<DistLockManager::ScopedDistLock> scopedDatabaseDistLock(
-            uassertStatusOK(Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
+        // Make the distlocks boost::optional so that they can be released by being reset below.
+        // Remove the backwards compatible lock after 3.6 ships.
+        boost::optional<DistLockManager::ScopedDistLock> backwardsCompatibleDbDistLock(
+            uassertStatusOK(
+                catalogClient->getDistLockManager()->lock(opCtx,
+                                                          nss.db() + "-movePrimary",
+                                                          "shardCollection",
+                                                          DistLockManager::kDefaultLockTimeout)));
+        boost::optional<DistLockManager::ScopedDistLock> dbDistLock(
+            uassertStatusOK(catalogClient->getDistLockManager()->lock(
                 opCtx, nss.db(), "shardCollection", DistLockManager::kDefaultLockTimeout)));
-
-        // Lock the collection to prevent older mongos instances from trying to shard or drop it
-        // concurrently.
-        boost::optional<DistLockManager::ScopedDistLock> scopedCollectionDistLock(
-            uassertStatusOK(Grid::get(opCtx)->catalogClient()->getDistLockManager()->lock(
+        boost::optional<DistLockManager::ScopedDistLock> collDistLock(
+            uassertStatusOK(catalogClient->getDistLockManager()->lock(
                 opCtx, nss.ns(), "shardCollection", DistLockManager::kDefaultLockTimeout)));
 
         // Ensure sharding is allowed on the database.
@@ -894,13 +897,10 @@ public:
         // Make sure the cached metadata for the collection knows that we are now sharded
         catalogCache->invalidateShardedCollection(nss);
 
-        // Free the collection dist lock in order to allow the initial splits and moves below to
-        // proceed.
-        scopedCollectionDistLock.reset();
-
-        // Free the database and backwards compatibility dist locks, as they are no longer needed.
-        scopedDatabaseDistLock.reset();
-        backwardsCompatibleLock.reset();
+        // Free the distlocks to allow the splits and migrations below to proceed.
+        collDistLock.reset();
+        dbDistLock.reset();
+        backwardsCompatibleDbDistLock.reset();
 
         // Step 7. Migrate initial chunks to distribute them across shards.
         migrateAndFurtherSplitInitialChunks(

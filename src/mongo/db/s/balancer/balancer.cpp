@@ -243,8 +243,9 @@ void Balancer::waitForBalancerToStop() {
 void Balancer::joinCurrentRound(OperationContext* opCtx) {
     stdx::unique_lock<stdx::mutex> scopedLock(_mutex);
     const auto numRoundsAtStart = _numBalancerRounds;
-    _condVar.wait(scopedLock,
-                  [&] { return !_inBalancerRound || _numBalancerRounds != numRoundsAtStart; });
+    opCtx->waitForConditionOrInterrupt(_condVar, scopedLock, [&] {
+        return !_inBalancerRound || _numBalancerRounds != numRoundsAtStart;
+    });
 }
 
 Status Balancer::rebalanceSingleChunk(OperationContext* opCtx, const ChunkType& chunk) {
@@ -644,7 +645,7 @@ void Balancer::_splitOrMarkJumbo(OperationContext* opCtx,
                                                   cm->getVersion(),
                                                   ChunkRange(chunk->getMin(), chunk->getMax()),
                                                   splitPoints));
-    } catch (const DBException& ex) {
+    } catch (const DBException&) {
         log() << "Marking chunk " << redact(chunk->toString()) << " as jumbo.";
 
         chunk->markAsJumbo();

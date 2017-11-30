@@ -634,11 +634,12 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
     const auto needsInitialSync =
         lastOpTime.isNull() || _externalState->isInitialSyncFlagSet(opCtx);
     if (!needsInitialSync) {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        if (!_inShutdown) {
-            // Start steady replication, since we already have data.
-            _externalState->startSteadyStateReplication(opCtx, this);
-        }
+        // Start steady replication, since we already have data.
+        // ReplSetConfig has been installed, so it's either in STARTUP2 or REMOVED.
+        auto memberState = getMemberState();
+        invariant(memberState.startup2() || memberState.removed());
+        invariantOK(setFollowerMode(MemberState::RS_RECOVERING));
+        _externalState->startSteadyStateReplication(opCtx, this);
         return;
     }
 
@@ -680,6 +681,10 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         // Repair local db (to compact it).
         auto opCtxHolder = cc().makeOperationContext();
         uassertStatusOK(_externalState->runRepairOnLocalDB(opCtxHolder.get()));
+        // Because initial sync completed, we can only be in STARTUP2, not REMOVED.
+        // Transition from STARTUP2 to RECOVERING and start the producer and the applier.
+        invariant(getMemberState().startup2());
+        invariantOK(setFollowerMode(MemberState::RS_RECOVERING));
         _externalState->startSteadyStateReplication(opCtxHolder.get(), this);
     };
 
@@ -859,7 +864,6 @@ void ReplicationCoordinatorImpl::clearSyncSourceBlacklist() {
 
 Status ReplicationCoordinatorImpl::setFollowerMode(const MemberState& newState) {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-
     if (newState == _topCoord->getMemberState()) {
         return Status::OK();
     }
@@ -1065,7 +1069,7 @@ void ReplicationCoordinatorImpl::_resetMyLastOpTimes_inlock() {
     // Reset to uninitialized OpTime
     _setMyLastAppliedOpTime_inlock(OpTime(), true);
     _setMyLastDurableOpTime_inlock(OpTime(), true);
-    _stableTimestampCandidates.clear();
+    _stableOpTimeCandidates.clear();
 }
 
 void ReplicationCoordinatorImpl::_reportUpstream_inlock(stdx::unique_lock<stdx::mutex> lock) {
@@ -1091,16 +1095,16 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTime_inlock(const OpTime& op
     myMemberData->setLastAppliedOpTime(opTime, _replExecutor->now());
     _updateLastCommittedOpTime_inlock();
 
-    // Add the new applied timestamp to the list of stable timestamp candidates and then set the
-    // last stable timestamp. Stable timestamps are used to determine the last timestamp that it is
+    // Add the new applied optime to the list of stable optime candidates and then set the
+    // last stable optime. Stable optimes are used to determine the last optime that it is
     // safe to revert the database to, in the event of a rollback. Note that master-slave mode has
     // no automatic fail over, and so rollbacks never occur. Additionally, the commit point for a
     // master-slave set will never advance, since it doesn't use any consensus protocol. Since the
-    // set of stable timestamp candidates can only get cleaned up when the commit point advances, we
-    // should refrain from updating stable timestamp candidates in master-slave mode, to avoid the
+    // set of stable optime candidates can only get cleaned up when the commit point advances, we
+    // should refrain from updating stable optime candidates in master-slave mode, to avoid the
     // candidates list from growing unbounded.
     if (!opTime.isNull() && getReplicationMode() == Mode::modeReplSet) {
-        _stableTimestampCandidates.insert(opTime.getTimestamp());
+        _stableOpTimeCandidates.insert(opTime);
         _setStableTimestampForStorage_inlock();
     }
 
@@ -1135,9 +1139,6 @@ Status ReplicationCoordinatorImpl::_validateReadConcern(OperationContext* opCtx,
                 "Waiting for replication not allowed while holding a lock"};
     }
 
-    const bool isMajorityReadConcern =
-        readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern;
-
     if (readConcern.getArgsClusterTime() &&
         readConcern.getLevel() != ReadConcernLevel::kMajorityReadConcern &&
         readConcern.getLevel() != ReadConcernLevel::kLocalReadConcern) {
@@ -1146,11 +1147,10 @@ Status ReplicationCoordinatorImpl::_validateReadConcern(OperationContext* opCtx,
                 "afterClusterTime"};
     }
 
-    if (isMajorityReadConcern && !getSettings().isMajorityReadConcernEnabled()) {
-        // This is an opt-in feature. Fail if the user didn't opt-in.
+    if (readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern &&
+        !_externalState->isReadCommittedSupportedByStorageEngine(opCtx)) {
         return {ErrorCodes::ReadConcernMajorityNotEnabled,
-                "Majority read concern requested, but server was not started with "
-                "--enableMajorityReadConcern."};
+                "Majority read concern requested, but it is not supported by the storage engine."};
     }
 
     return Status::OK();
@@ -2598,8 +2598,14 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator_inlock(
         _cancelPriorityTakeover_inlock();
     }
 
+    log() << "transition to " << newState << " from " << _memberState << rsLog;
+    // Initializes the featureCompatibilityVersion to the default value, because arbiters do not
+    // receive the replicated version.
+    if (newState.arbiter()) {
+        serverGlobalParams.featureCompatibility.reset();
+    }
+
     _memberState = newState;
-    log() << "transition to " << newState.toString() << rsLog;
 
     _cancelAndRescheduleElectionTimeout_inlock();
 
@@ -3130,77 +3136,80 @@ void ReplicationCoordinatorImpl::_updateLastCommittedOpTime_inlock() {
     _wakeReadyWaiters_inlock();
 }
 
-boost::optional<Timestamp> ReplicationCoordinatorImpl::_calculateStableTimestamp(
-    const std::set<Timestamp>& candidates, const Timestamp& commitPoint) {
+boost::optional<OpTime> ReplicationCoordinatorImpl::_calculateStableOpTime(
+    const std::set<OpTime>& candidates, const OpTime& commitPoint) {
 
-    // No timestamp candidates.
+    // No optime candidates.
     if (candidates.empty()) {
         return boost::none;
     }
 
-    // Find the greatest timestamp candidate that is less than or equal to the commit point.
+    // Find the greatest optime candidate that is less than or equal to the commit point.
     // To do this we first find the upper bound of 'commitPoint', which points to the smallest
     // element in 'candidates' that is greater than 'commitPoint'. We then step back one element,
     // which should give us the largest element in 'candidates' that is less than or equal to the
     // 'commitPoint'.
     auto upperBoundIter = candidates.upper_bound(commitPoint);
 
-    // All timestamp candidates are greater than the commit point.
+    // All optime candidates are greater than the commit point.
     if (upperBoundIter == candidates.begin()) {
         return boost::none;
     }
-    // There is a valid stable timestamp.
+    // There is a valid stable optime.
     else {
         return *std::prev(upperBoundIter);
     }
 }
 
-void ReplicationCoordinatorImpl::_cleanupStableTimestampCandidates(std::set<Timestamp>* candidates,
-                                                                   Timestamp stableTimestamp) {
-    // Discard timestamp candidates earlier than the current stable timestamp, since we don't need
-    // them anymore. To do this, we find the lower bound of the 'stableTimestamp' which is the first
-    // element that is greater than or equal to the 'stableTimestamp'. Then we discard everything up
+void ReplicationCoordinatorImpl::_cleanupStableOpTimeCandidates(std::set<OpTime>* candidates,
+                                                                OpTime stableOpTime) {
+    // Discard optime candidates earlier than the current stable optime, since we don't need
+    // them anymore. To do this, we find the lower bound of the 'stableOpTime' which is the first
+    // element that is greater than or equal to the 'stableOpTime'. Then we discard everything up
     // to but not including this lower bound i.e. 'deletePoint'.
-    auto deletePoint = candidates->lower_bound(stableTimestamp);
+    auto deletePoint = candidates->lower_bound(stableOpTime);
 
-    // Delete the entire range of unneeded timestamps.
+    // Delete the entire range of unneeded optimes.
     candidates->erase(candidates->begin(), deletePoint);
 }
 
-boost::optional<Timestamp> ReplicationCoordinatorImpl::calculateStableTimestamp_forTest(
-    const std::set<Timestamp>& candidates, const Timestamp& commitPoint) {
-    return _calculateStableTimestamp(candidates, commitPoint);
+boost::optional<OpTime> ReplicationCoordinatorImpl::calculateStableOpTime_forTest(
+    const std::set<OpTime>& candidates, const OpTime& commitPoint) {
+    return _calculateStableOpTime(candidates, commitPoint);
 }
-void ReplicationCoordinatorImpl::cleanupStableTimestampCandidates_forTest(
-    std::set<Timestamp>* candidates, Timestamp stableTimestamp) {
-    _cleanupStableTimestampCandidates(candidates, stableTimestamp);
+void ReplicationCoordinatorImpl::cleanupStableOpTimeCandidates_forTest(std::set<OpTime>* candidates,
+                                                                       OpTime stableOpTime) {
+    _cleanupStableOpTimeCandidates(candidates, stableOpTime);
 }
 
-std::set<Timestamp> ReplicationCoordinatorImpl::getStableTimestampCandidates_forTest() {
+std::set<OpTime> ReplicationCoordinatorImpl::getStableOpTimeCandidates_forTest() {
     stdx::unique_lock<stdx::mutex> lk(_mutex);
-    return _stableTimestampCandidates;
+    return _stableOpTimeCandidates;
 }
 
 void ReplicationCoordinatorImpl::_setStableTimestampForStorage_inlock() {
 
-    // Get the current stable timestamp.
+    // Get the current stable optime.
     auto commitPoint = _topCoord->getLastCommittedOpTime();
-    auto stableTimestamp =
-        _calculateStableTimestamp(_stableTimestampCandidates, commitPoint.getTimestamp());
+    auto stableOpTime = _calculateStableOpTime(_stableOpTimeCandidates, commitPoint);
 
-    // If there is a valid stable timestamp, set it for the storage engine, and then remove any
-    // old, unneeded stable timestamp candidates.
-    if (stableTimestamp) {
-        LOG(2) << "Setting replication's stable timestamp to " << stableTimestamp.value();
+    invariant(stableOpTime <= commitPoint);
+
+    // If there is a valid stable optime, set it for the storage engine, and then remove any
+    // old, unneeded stable optime candidates.
+    if (stableOpTime) {
+        LOG(2) << "Setting replication's stable optime to " << stableOpTime.value();
 
         if (!testingSnapshotBehaviorInIsolation) {
             // Update committed snapshot and wake up any threads waiting on read concern or
             // write concern.
-            _updateCommittedSnapshot_inlock(SnapshotInfo{
-                OpTime(stableTimestamp.get(), _topCoord->getTerm()), SnapshotName::min()});
-            _storage->setStableTimestamp(getServiceContext(), SnapshotName(stableTimestamp.get()));
+            _updateCommittedSnapshot_inlock(SnapshotInfo{stableOpTime.get(), SnapshotName::min()});
+
+            // Update the stable timestamp for the storage engine.
+            auto stableTimestamp = SnapshotName(stableOpTime->getTimestamp());
+            _storage->setStableTimestamp(getServiceContext(), stableTimestamp);
         }
-        _cleanupStableTimestampCandidates(&_stableTimestampCandidates, stableTimestamp.get());
+        _cleanupStableOpTimeCandidates(&_stableOpTimeCandidates, stableOpTime.get());
     }
 }
 
@@ -3219,15 +3228,6 @@ void ReplicationCoordinatorImpl::_advanceCommitPoint_inlock(const OpTime& commit
         // Even if we have no new snapshot, we need to notify waiters that the commit point moved.
         _externalState->notifyOplogMetadataWaiters(committedOpTime);
     }
-}
-
-void ReplicationCoordinatorImpl::_updateCommitPoint_inlock() {
-    // Update the stable timestamp
-    _setStableTimestampForStorage_inlock();
-
-    auto committedOpTime = _topCoord->getLastCommittedOpTime();
-    // Notify waiters that the commit point moved.
-    _externalState->notifyOplogMetadataWaiters(committedOpTime);
 }
 
 OpTime ReplicationCoordinatorImpl::getLastCommittedOpTime() const {

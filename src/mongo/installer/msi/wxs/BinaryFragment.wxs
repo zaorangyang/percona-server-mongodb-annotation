@@ -6,6 +6,9 @@
         <File Id="f_bsondump" Name="bsondump.exe" Source="$(var.ToolBinarySource)\bsondump.exe"
               DiskId ="1" KeyPath="yes"/>
       </Component>
+      <Component Id="InstallCompass" Guid="FDB7B7C4-B78F-4A85-8F98-E8E49F6027B2">
+        <File Id="InstallCompassScript" Name="InstallCompass.ps1" Source="$(var.CompassDir)\Install-Compass.ps1" />
+      </Component>
       <Component Id="c_mongo" Guid="395C3DA5-A905-409C-AD96-29BFFF5E12D6">
         <File Id="f_mongo" Name="mongo.exe" Source="$(var.BinarySource)\mongo.exe"
               DiskId ="1" KeyPath="yes"/>
@@ -32,10 +35,6 @@
       </Component>
       <Component Id="c_mongoimport" Guid="A4C06F69-2BB3-4068-A7E7-25347CCF01DE">
         <File Id="f_mongoimport" Name="mongoimport.exe" Source="$(var.ToolBinarySource)\mongoimport.exe"
-              DiskId ="1" KeyPath="yes"/>
-      </Component>
-      <Component Id="c_mongooplog" Guid="FAD84CBB-4666-4C22-A0DF-E1D2AEEC1601">
-        <File Id="f_mongooplog" Name="mongooplog.exe" Source="$(var.ToolBinarySource)\mongooplog.exe"
               DiskId ="1" KeyPath="yes"/>
       </Component>
       <Component Id="c_mongoperf" Guid="B046CCD2-39DC-4CB4-8A58-A7790148C41E">

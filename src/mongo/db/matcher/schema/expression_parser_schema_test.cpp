@@ -231,14 +231,14 @@ TEST(MatchExpressionParserSchemaTest, ObjectMatchCorrectlyParsesNestedObjectMatc
         result.getValue()->matchesBSON(fromjson("{a: [{b: 0}, {b: [{c: 0}, {c: 'string'}]}]}")));
 }
 
-TEST(MatchExpressionParserSchemaTest, ObjectMatchSubExprRejectsTopLevelOperators) {
+TEST(MatchExpressionParserSchemaTest, ObjectMatchSubExprRejectsPathlessOperators) {
     auto query = fromjson(
         "{a: {$_internalSchemaObjectMatch: {"
-        "    $isolated: 1"
+        "    $expr: {$eq: ['$a', 5]}"
         "}}}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto result = MatchExpressionParser::parse(query, expCtx);
-    ASSERT_EQ(result.getStatus(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(result.getStatus(), ErrorCodes::BadValue);
 }
 
 //
@@ -849,15 +849,15 @@ TEST(MatchExpressionParserSchemaTest, RootDocEqFailsToParseNonObjects) {
     ASSERT_EQ(rootDocEq.getStatus(), ErrorCodes::TypeMismatch);
 }
 
-TEST(MatchExpressionParserSchemaTest, RootDocEqMustBeTopLevel) {
+TEST(MatchExpressionParserSchemaTest, RootDocEqMustApplyToTopLevelDocument) {
     auto query = fromjson("{a: {$_internalSchemaRootDocEq: 1}}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
     auto rootDocEq = MatchExpressionParser::parse(query, expCtx);
-    ASSERT_EQ(rootDocEq.getStatus(), ErrorCodes::FailedToParse);
+    ASSERT_EQ(rootDocEq.getStatus(), ErrorCodes::BadValue);
 
-    query = fromjson("{$or: [{a: 1}, {$_internalSchemaRootDocEq: 1}]}");
+    query = fromjson("{$or: [{a: 1}, {$_internalSchemaRootDocEq: {}}]}");
     rootDocEq = MatchExpressionParser::parse(query, expCtx);
-    ASSERT_EQ(rootDocEq.getStatus(), ErrorCodes::FailedToParse);
+    ASSERT_OK(rootDocEq.getStatus());
 
     query = fromjson("{a: {$elemMatch: {$_internalSchemaRootDocEq: 1}}}");
     rootDocEq = MatchExpressionParser::parse(query, expCtx);

@@ -112,10 +112,25 @@ public:
             str::stream() << "invalid db name specified: " << dbname,
             NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
 
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "createDatabase must be called with majority writeConcern, got "
+                              << cmdObj,
+                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+
         // Make sure to force update of any stale metadata
         ON_BLOCK_EXIT([opCtx, dbname] { Grid::get(opCtx)->catalogCache()->purgeDatabase(dbname); });
 
-        uassertStatusOK(ShardingCatalogManager::get(opCtx)->createDatabase(opCtx, dbname));
+        // Remove the backwards compatible lock after 3.6 ships.
+        auto const catalogClient = Grid::get(opCtx)->catalogClient();
+        auto backwardsCompatibleDbDistLock = uassertStatusOK(
+            catalogClient->getDistLockManager()->lock(opCtx,
+                                                      dbname + "-movePrimary",
+                                                      "createDatabase",
+                                                      DistLockManager::kDefaultLockTimeout));
+        auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+            opCtx, dbname, "createDatabase", DistLockManager::kDefaultLockTimeout));
+
+        ShardingCatalogManager::get(opCtx)->createDatabase(opCtx, dbname);
 
         return true;
     }

@@ -79,7 +79,7 @@ public:
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
+        return true;
     }
 
     void help(std::stringstream& help) const override {
@@ -129,16 +129,11 @@ public:
             opCtx,
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
-            Command::appendPassthroughFields(cmdObj, configShardCollRequest.toBSON()),
+            Command::appendMajorityWriteConcern(
+                Command::appendPassthroughFields(cmdObj, configShardCollRequest.toBSON())),
             Shard::RetryPolicy::kIdempotent));
 
-        uassertStatusOK(cmdResponse.commandStatus);
-
-        if (!cmdResponse.writeConcernStatus.isOK()) {
-            appendWriteConcernErrorToCmdResponse(
-                configShard->getId(), cmdResponse.response["writeConcernError"], result);
-        }
-
+        Command::filterCommandReplyForPassthrough(cmdResponse.response, &result);
         return true;
     }
 

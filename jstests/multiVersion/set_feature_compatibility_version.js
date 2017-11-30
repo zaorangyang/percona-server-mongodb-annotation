@@ -1,3 +1,7 @@
+
+// Checking UUID consistency involves talking to a shard node, which in this test is shutdown
+TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+
 // Tests for setFeatureCompatibilityVersion.
 (function() {
     "use strict";
@@ -25,6 +29,85 @@
     let res;
     const latest = "latest";
     const downgrade = "3.4";
+
+    let recoverMMapJournal = function(isMMAPv1, conn, dbpath) {
+        // If we're using mmapv1, recover the journal files from the unclean shutdown before
+        // attempting to run with --repair.
+        if (isMMAPv1) {
+            let returnCode = runMongoProgram("mongod",
+                                             "--port",
+                                             conn.port,
+                                             "--journalOptions",
+                                             /*MMAPV1Options::JournalRecoverOnly*/ 4,
+                                             "--dbpath",
+                                             dbpath);
+            assert.eq(returnCode, /*EXIT_NET_ERROR*/ 48);
+        }
+    };
+
+    let doStartupFailTests = function(withUUIDs, dbpath) {
+        // Fail to start up if no admin database is present but other non-local databases are
+        // present.
+        if (withUUIDs) {
+            setupMissingAdminDB(latest, dbpath);
+        } else {
+            setupMissingAdminDB(downgrade, dbpath);
+        }
+        conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: latest, noCleanData: true});
+        assert.eq(
+            null,
+            conn,
+            "expected mongod to fail when data files are present and no admin database is found.");
+
+        // Fail to start up if no featureCompatibilityVersion document is present and non-local
+        // databases are present.
+        if (withUUIDs) {
+            setupMissingFCVDoc(latest, dbpath);
+        } else {
+            setupMissingFCVDoc(downgrade, dbpath);
+        }
+        conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: latest, noCleanData: true});
+        assert.eq(
+            null,
+            conn,
+            "expected mongod to fail when data files are present and no featureCompatibilityVersion document is found.");
+    };
+
+    let setupMissingFCVDoc = function(version, dbpath) {
+        let conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: version});
+        assert.neq(null,
+                   conn,
+                   "mongod was unable to start up with version=" + version + " and no data files");
+        adminDB = conn.getDB("admin");
+        if (version === latest) {
+            assert.eq(
+                adminDB.system.version.findOne({_id: "featureCompatibilityVersion"}).version,
+                "3.6",
+                "expected 3.6 mongod with no data files to start up with featureCompatibilityVersion 3.6");
+        } else {
+            assert.eq(
+                adminDB.system.version.findOne({_id: "featureCompatibilityVersion"}).version,
+                "3.4",
+                "expected 3.4 mongod with no data files to start up with featureCompatibilityVersion 3.4");
+        }
+        assert.writeOK(adminDB.system.version.remove({_id: "featureCompatibilityVersion"}));
+        MongoRunner.stopMongod(conn);
+        return conn;
+    };
+
+    let setupMissingAdminDB = function(version, dbpath) {
+        conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: version});
+        assert.neq(null,
+                   conn,
+                   "mongod was unable to start up with version=" + version + " and no data files");
+        let testDB = conn.getDB("test");
+        assert.commandWorked(testDB.createCollection("testcoll"));
+        adminDB = conn.getDB("admin");
+        assert.commandWorked(adminDB.runCommand({dropDatabase: 1}),
+                             "expected drop of admin database to be successful");
+        MongoRunner.stopMongod(conn);
+        return conn;
+    };
 
     //
     // Standalone tests.
@@ -58,9 +141,37 @@
     // featureCompatibilityVersion cannot be set via setParameter.
     assert.commandFailed(adminDB.runCommand({setParameter: 1, featureCompatibilityVersion: "3.4"}));
 
+    // setFeatureCompatibilityVersion fails to downgrade to FCV=3.4 if the write fails.
+    assert.commandWorked(adminDB.runCommand({
+        configureFailPoint: "failCollectionUpdates",
+        data: {collectionNS: "admin.system.version"},
+        mode: "alwaysOn"
+    }));
+    assert.commandFailed(adminDB.runCommand({setFeatureCompatibilityVersion: "3.4"}));
+    checkFCV(adminDB, "3.6");
+    assert.commandWorked(adminDB.runCommand({
+        configureFailPoint: "failCollectionUpdates",
+        data: {collectionNS: "admin.system.version"},
+        mode: "off"
+    }));
+
     // featureCompatibilityVersion can be set to 3.4.
     assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: "3.4"}));
     checkFCV(adminDB, "3.4");
+
+    // setFeatureCompatibilityVersion fails to upgrade to FCV=3.6 if the write fails.
+    assert.commandWorked(adminDB.runCommand({
+        configureFailPoint: "failCollectionUpdates",
+        data: {collectionNS: "admin.system.version"},
+        mode: "alwaysOn"
+    }));
+    assert.commandFailed(adminDB.runCommand({setFeatureCompatibilityVersion: "3.6"}));
+    checkFCV(adminDB, "3.4");
+    assert.commandWorked(adminDB.runCommand({
+        configureFailPoint: "failCollectionUpdates",
+        data: {collectionNS: "admin.system.version"},
+        mode: "off"
+    }));
 
     // featureCompatibilityVersion can be set to 3.6.
     assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: "3.6"}));
@@ -104,6 +215,73 @@
     adminDB = conn.getDB("admin");
     checkFCV(adminDB, "3.4");
     MongoRunner.stopMongod(conn);
+
+    const isMMAPv1 = jsTest.options().storageEngine === "mmapv1";
+    // Fail to start up if no featureCompatibilityVersion is present.
+    doStartupFailTests(/*withUUIDs*/ true, dbpath);
+
+    // Fail to start up if no featureCompatibilityVersion is present and no collections have UUIDs.
+    doStartupFailTests(/*withUUIDs*/ false, dbpath);
+
+    // --repair can be used to restore a missing admin database and featureCompatibilityVersion
+    // document if at least some collections have UUIDs.
+    conn = setupMissingAdminDB(latest, dbpath);
+    recoverMMapJournal(isMMAPv1, conn, dbpath);
+    let returnCode = runMongoProgram("mongod", "--port", conn.port, "--repair", "--dbpath", dbpath);
+    assert.eq(
+        returnCode,
+        0,
+        "expected mongod --repair to execute successfully when restoring a missing admin database.");
+    conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: latest, noCleanData: true});
+    assert.neq(null,
+               conn,
+               "mongod was unable to start up with version=" + latest + " and existing data files");
+    // featureCompatibilityVersion is 3.4 and targetVersion is 3.6 because the admin.system.version
+    // collection was restored without a UUID.
+    adminDB = conn.getDB("admin");
+    assert.eq(adminDB.system.version.findOne({_id: "featureCompatibilityVersion"}).version, "3.4");
+    assert.eq(adminDB.system.version.findOne({_id: "featureCompatibilityVersion"}).targetVersion,
+              "3.6");
+    let adminInfos = adminDB.getCollectionInfos();
+    assert(!adminInfos[0].info.uuid,
+           "Expected collection with infos " + tojson(adminInfos) + " to not have a UUID.");
+    MongoRunner.stopMongod(conn);
+
+    // --repair can be used to restore a missing featureCompatibilityVersion document to an
+    // existing admin database if at least some collections have UUIDs.
+    conn = setupMissingFCVDoc(latest, dbpath);
+    recoverMMapJournal(isMMAPv1, conn, dbpath);
+    returnCode = runMongoProgram("mongod", "--port", conn.port, "--repair", "--dbpath", dbpath);
+    assert.eq(
+        returnCode,
+        0,
+        "expected mongod --repair to execute successfully when restoring a missing featureCompatibilityVersion document.");
+    conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: latest, noCleanData: true});
+    assert.neq(null,
+               conn,
+               "mongod was unable to start up with version=" + latest + " and existing data files");
+    // featureCompatibilityVersion is 3.6 because all collections were left intact with UUIDs.
+    adminDB = conn.getDB("admin");
+    assert.eq(adminDB.system.version.findOne({_id: "featureCompatibilityVersion"}).version, "3.6");
+    MongoRunner.stopMongod(conn);
+
+    // --repair cannot be used to restore a missing featureCompatibilityVersion document if there
+    // are no collections with UUIDs.
+    conn = setupMissingFCVDoc(downgrade, dbpath);
+    recoverMMapJournal(isMMAPv1, conn, dbpath);
+    returnCode = runMongoProgram("mongod", "--port", conn.port, "--repair", "--dbpath", dbpath);
+    assert.neq(returnCode, 0, "expected mongod --repair to fail if no collections have UUIDs.");
+
+    // If the featureCompatibilityVersion document is present but there are no collection UUIDs,
+    // --repair should not attempt to restore the document and thus not fassert.
+    conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: downgrade});
+    assert.neq(null,
+               conn,
+               "mongod was unable to start up with version=" + downgrade + " and no data files");
+    MongoRunner.stopMongod(conn);
+    recoverMMapJournal(isMMAPv1, conn, dbpath);
+    returnCode = runMongoProgram("mongod", "--port", conn.port, "--repair", "--dbpath", dbpath);
+    assert.eq(returnCode, 0);
 
     //
     // Replica set tests.
@@ -152,7 +330,10 @@
 
     // Test that a 3.4 secondary can successfully perform initial sync from a 3.6 primary with
     // featureCompatibilityVersion=3.4.
-    rst = new ReplSetTest({nodes: [{binVersion: latest}]});
+    // Start with 2 3.6 nodes so that when the 3.4 node added later crashes the primary doesn't
+    // step down.
+    rst = new ReplSetTest(
+        {nodes: [{binVersion: latest}, {binVersion: latest, rsConfig: {priority: 0}}]});
     rst.startSet();
     rst.initiate();
 
@@ -165,8 +346,8 @@
     // Rig the election so that the first node running latest version remains the primary after the
     // 3.4 secondary is added to the replica set.
     replSetConfig = rst.getReplSetConfig();
-    replSetConfig.version = 3;
-    replSetConfig.members[1].priority = 0;
+    replSetConfig.version = 4;
+    replSetConfig.members[2].priority = 0;
 
     // The default value for 'catchUpTimeoutMillis' on 3.6 is -1. A 3.4 secondary will refuse to
     // join a replica set with catchUpTimeoutMillis=-1.
@@ -175,12 +356,11 @@
 
     // Verify that the 3.4 secondary successfully performed its initial sync.
     assert.writeOK(
-        primaryAdminDB.getSiblingDB("test").coll.insert({awaitRepl: true}, {writeConcern: {w: 2}}));
+        primaryAdminDB.getSiblingDB("test").coll.insert({awaitRepl: true}, {writeConcern: {w: 3}}));
 
     // Test that a 3.4 secondary crashes when syncing from a 3.6 primary and the
-    // featureCompatibilityVersion is set to 3.6. The primary may step down before the command
-    // returns.
-    assert.adminCommandWorkedAllowingNetworkError(primary, {setFeatureCompatibilityVersion: "3.6"});
+    // featureCompatibilityVersion is set to 3.6.
+    assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: "3.6"}));
     assert.soon(function() {
         try {
             secondaryAdminDB.runCommand({ping: 1});

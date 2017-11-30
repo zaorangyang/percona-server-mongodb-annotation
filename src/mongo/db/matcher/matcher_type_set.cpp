@@ -30,6 +30,7 @@
 
 #include "mongo/db/matcher/matcher_type_set.h"
 
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/schema/json_schema_parser.h"
 
 namespace mongo {
@@ -78,18 +79,18 @@ Status parseSingleType(BSONElement elt,
         return addAliasToTypeSet(elt.valueStringData(), aliasMap, typeSet);
     }
 
-    invariant(elt.isNumber());
-    int typeInt = elt.numberInt();
-    if (elt.type() != BSONType::NumberInt && typeInt != elt.number()) {
-        typeInt = -1;
-    }
-
-    if (!isValidBSONType(typeInt)) {
+    auto valueAsInt = MatchExpressionParser::parseIntegerElementToInt(elt);
+    if (!valueAsInt.isOK()) {
         return Status(ErrorCodes::BadValue,
-                      str::stream() << "Invalid numerical type code: " << typeInt);
+                      str::stream() << "Invalid numerical type code: " << elt.number());
     }
 
-    typeSet->bsonTypes.insert(static_cast<BSONType>(typeInt));
+    if (!isValidBSONType(valueAsInt.getValue())) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Invalid numerical type code: " << elt.number());
+    }
+
+    typeSet->bsonTypes.insert(static_cast<BSONType>(valueAsInt.getValue()));
     return Status::OK();
 }
 

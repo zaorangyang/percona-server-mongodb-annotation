@@ -157,6 +157,10 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    std::vector<FieldPath> collectDocumentKeyFields(UUID) const override {
+        MONGO_UNREACHABLE;
+    }
+
 private:
     StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> makePipelineWithOneRemote(
         const std::vector<BSONObj>& rawPipeline,
@@ -627,7 +631,7 @@ BSONObj establishMergingMongosCursor(
         ClusterQueryResult next;
         try {
             next = uassertStatusOK(ccc->next(RouterExecStage::ExecContext::kInitialFind));
-        } catch (const CloseChangeStreamException& ex) {
+        } catch (const CloseChangeStreamException&) {
             // This exception is thrown when a $changeStream stage encounters an event
             // that invalidates the cursor. We should close the cursor and return without
             // error.

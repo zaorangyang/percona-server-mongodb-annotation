@@ -47,15 +47,26 @@
 
     let droppedCollName = twoPhaseDropTest.prepareDropCollection(collName);
 
-    // Check that, on MMAPv1, indexes that would violate the namespace length constraints after
-    // rename were dropped.
-    let storageEngine = jsTest.options().storageEngine;
-    if (storageEngine === 'mmapv1') {
-        let primaryDB = replTest.getPrimary().getDB(dbName);
-        let indexes = listIndexes(primaryDB, droppedCollName);
-        assert(indexes.find(idx => idx.name === shortIndexName));
-        assert.eq(undefined, indexes.find(idx => idx.name === longIndexName));
-    }
+    // Check that indexes that would violate the namespace length constraints after rename were
+    // dropped.
+    const primary = replTest.getPrimary();
+    let primaryDB = primary.getDB(dbName);
+    let indexes = listIndexes(primaryDB, droppedCollName);
+    assert(indexes.find(idx => idx.name === shortIndexName));
+    assert.eq(undefined, indexes.find(idx => idx.name === longIndexName));
+
+    // Check that index drop appears before collection drop in the oplog.
+    const oplogColl = primary.getCollection('local.oplog.rs');
+    const cmdNs = primaryDB.getCollection('$cmd').getFullName();
+    const dropOplogEntry = oplogColl.findOne({ns: cmdNs, o: {drop: collName}});
+    const dropIndexOplogEntry =
+        oplogColl.findOne({ns: cmdNs, o: {dropIndexes: collName, index: longIndexName}});
+    const dropTimestamp = dropOplogEntry.ts;
+    const dropIndexTimestamp = dropIndexOplogEntry.ts;
+    assert.lt(dropIndexTimestamp,
+              dropTimestamp,
+              'index was not dropped before collection. index drop: ' +
+                  tojson(dropIndexOplogEntry) + ' . collection drop: ' + tojson(dropOplogEntry));
 
     twoPhaseDropTest.commitDropCollection(collName);
 

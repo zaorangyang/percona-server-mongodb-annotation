@@ -442,7 +442,7 @@ functions:
 
         . ./${set_tools_gopath|set_gopath.sh}
 
-        build_tools="bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog"
+        build_tools="bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop"
 
         if [ "${build_mongoreplay}" = "true" ]; then
             build_tools="$build_tools mongoreplay"
@@ -563,117 +563,34 @@ functions:
           path_value="$path_value:${task_path_suffix}"
         fi
 
-        preamble="PATH='$path_value'   \
-                  ${gcov_environment}  \
-                  ${rlp_environment}   \
-                  ${san_options}       \
-                  ${san_symbolizer}    \
-                  ${snmp_config_path}"
-        # The "resmoke_wrapper" expansion is used by the 'burn_in_tests' task to wrap the resmoke.py
-        # invocation. It must be placed between $preamble and $resmoke.
-        wrapper="${resmoke_wrapper}"
-        resmoke="${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/resmoke.py \
-                 ${resmoke_args}                   \
-                 $extra_args                       \
-                 ${test_flags}                     \
-                 --log=buildlogger                 \
-                 --staggerJobs=on                  \
-                 --taskId=${task_id}"
-
-        # Set variables for mainline builds. Patch builds will override these values below.
-        tag_file=etc/test_retrial.yml
-        retry_on_failure_options="--continueOnFailure --repeat=2"
-        resmoke_tags="retry_on_failure,                                \
-                      retry_on_failure|${task_name},                   \
-                      retry_on_failure|${task_name}|${build_variant},  \
-                      retry_on_failure|${task_name}|${build_variant}|${distro_id}"
-
-        # promote_silent_failures.py is only run on Evergreen mainline. Override in patch builds.
-        run_promote_silent_failures="${python|/opt/mongodbtoolchain/v2/bin/python2}  \
-                                     buildscripts/promote_silent_failures.py -o      \
-                                     report_unreliable.json report_unreliable.json"
-
-        # For patch builds, we run reliable and then unreliable tests and combine the reports.
         if [ "${is_patch|}" = "true" ]; then
-          tag_file=etc/test_lifecycle.yml
-          retry_on_failure_options=""
-          run_promote_silent_failures=""
-          resmoke_tags="unreliable,                                \
-                        unreliable|${task_name},                   \
-                        unreliable|${task_name}|${build_variant},  \
-                        unreliable|${task_name}|${build_variant}|${distro_id}"
+          extra_args="$extra_args --tagFile=etc/test_lifecycle.yml --patchBuild"
+        else
+          extra_args="$extra_args --tagFile=etc/test_retrial.yml"
         fi
 
-        # Remove spaces from the tags argument.
-        resmoke_tags=$(echo $resmoke_tags| tr -d " ")
+        # The "resmoke_wrapper" expansion is used by the 'burn_in_tests' task to wrap the resmoke.py
+        # invocation. It doesn't set any environment variables and should therefore come last in
+        # this list of expansions.
+        PATH="$path_value"                              \
+            ${gcov_environment}                         \
+            ${rlp_environment}                          \
+            ${san_options}                              \
+            ${san_symbolizer}                           \
+            ${snmp_config_path}                         \
+            ${resmoke_wrapper}                          \
+            $python buildscripts/evergreen_run_tests.py \
+                ${resmoke_args}                         \
+                $extra_args                             \
+                ${test_flags}                           \
+                --log=buildlogger                       \
+                --staggerJobs=on                        \
+                --taskId=${task_id}                     \
+                --taskName=${task_name}                 \
+                --variantName=${build_variant}          \
+                --distroId=${distro_id}                 \
+                --reportFile=report.json
 
-        # Set report file for reliable test run.
-        report_file=report_reliable.json
-
-        # Disable errexit, until we run combine_reports, so we can execute the reliable and
-        # unreliable tests.
-        set +o errexit
-
-        # If the "resmoke_wrapper" expansion is used for 'burn_in_tests' then add the reportFile.
-        echo "$wrapper" | grep -q burn_in_tests
-        add_report_file=$?
-        wrapper_report_file=""
-        if [ $add_report_file -eq 0 ]; then
-          wrapper_report_file="--reportFile=$report_file"
-        fi
-
-        # Set up resmoke to run without tagged tests.
-        resmoke_base="$resmoke                         \
-                 --excludeWithAnyTags='$resmoke_tags'  \
-                 --reportFailureStatus=fail            \
-                 --reportFile=$report_file             \
-                 --tagFile=$tag_file"
-
-        # Run reliable set of tests once.
-        eval $preamble $wrapper $wrapper_report_file $resmoke_base
-        reliable_exit_code=$?
-
-        # Set report file for unreliable test run.
-        report_file=report_unreliable.json
-
-        # Set up resmoke to run with only tagged tests.
-        resmoke_base="$resmoke                         \
-                 --includeWithAnyTags='$resmoke_tags'  \
-                 --reportFailureStatus=silentfail      \
-                 --reportFile=$report_file             \
-                 --tagFile=$tag_file                   \
-                 $retry_on_failure_options"
-
-        if [ $add_report_file -eq 0 ]; then
-          wrapper_report_file="--reportFile=$report_file"
-        fi
-
-        # Run unreliable set of tests.
-        eval $preamble $wrapper $wrapper_report_file $resmoke_base
-        unreliable_exit_code=$?
-
-        #  Reenable errexit, as the return from combine_reports will return the cumulative error.
-        set -o errexit
-
-        # If both executions of the test with an "retry_on_failure*" tag fail, promote the task as
-        # a failure. Only promote silent failures on mainline.
-        eval $run_promote_silent_failures
-
-        # Combine reliable and unreliable reports.
-        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/combine_reports.py -o report.json report_reliable.json report_unreliable.json
-
-        # We mask any errors from the resmoke runs above (by disabling errexit) until both have
-        # completed. If any of the resmoke runs failed due to non-test failures
-        # (i.e fixture failures), we need to exit with non-zero status.
-        if [ $reliable_exit_code -ne 0 ]; then
-          echo "resmoke.py reliable run failed with error code: $reliable_exit_code"
-          exit $reliable_exit_code
-        fi
-        # Ignoring the error code 1 that is returned when there are only silent failures.
-        if [ $unreliable_exit_code -ne 0 ] && [ $unreliable_exit_code -ne 1 ]; then
-          echo "resmoke.py unreliable run failed with error code: $unreliable_exit_code"
-          exit $unreliable_exit_code
-        fi
         fi # end if ${disable_unit_tests}
 
   "do jepsen setup" :
@@ -869,7 +786,8 @@ functions:
           set -o errexit
           echo "jstestfuzz self-tests finished"
 
-          npm start -- --jsTestsDir ../jstests ${jstestfuzz_vars}
+          npm run ${npm_command|jstestfuzz} -- --jsTestsDir ../jstests ${jstestfuzz_vars}
+
     - command: archive.targz_pack
       params:
         target: "jstests.tgz"
@@ -971,8 +889,17 @@ functions:
         set -o errexit
         set -o verbose
 
+        ${activate_virtualenv}
+        # The Windows build variants are running python 2.7.3 and require TLS 1.2 from pyOpenSSL
+        pip install 'pyOpenSSL ; sys_platform == "win32" or sys_platform == "cygwin"'
+
         rm -rf /data/install /data/multiversion
-        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/setup_multiversion_mongodb.py /data/install /data/multiversion ${multiversion_edition|"base"} ${multiversion_platform_arch|"linux/x86_64"} "3.0" "3.2" "3.4"
+        $python buildscripts/setup_multiversion_mongodb.py                  \
+          --installDir /data/install                                        \
+          --linkDir /data/multiversion                                      \
+          --edition ${multiversion_edition|base}                            \
+          --platformArchitecture ${multiversion_platform_arch|linux/x86_64} \
+          --useLatest 3.0 3.2 3.4
 
   "do snmp setup" :
     command: shell.exec
@@ -1368,6 +1295,10 @@ pre:
             else
               . ./venv/bin/activate
             fi
+
+            python=python
+          else
+            python=${python|/opt/mongodbtoolchain/v2/bin/python2}
           fi
        - key: posix_workdir
          value: eval 'if [ "Windows_NT" = "$OS" ]; then echo $(cygpath -u "${workdir}"); else echo ${workdir}; fi'
@@ -1412,11 +1343,6 @@ pre:
 
 
 post:
-  - command: shell.exec
-    params:
-      working_dir: src
-      script: |
-        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/combine_reports.py -x -o report.json report_reliable.json report_unreliable.json
   - command: attach.results
     params:
       file_location: src/report.json
@@ -1785,7 +1711,7 @@ timeout:
           ${set_sudo}
         fi
 
-        hang_analyzer_option="-o file -o stdout -p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test} -g bsondump,mongodump,mongoexport,mongofiles,mongoimport,mongooplog,mongoreplay,mongorestore,mongostat,mongotop"
+        hang_analyzer_option="-o file -o stdout -p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test} -g bsondump,mongodump,mongoexport,mongofiles,mongoimport,mongoreplay,mongorestore,mongostat,mongotop"
 
         if [ ${hang_analyzer_dump_core|true} = true ]; then
           hang_analyzer_option="-c $hang_analyzer_option"
@@ -1836,6 +1762,7 @@ test_lifecycle_excluded_tasks:
 - burn_in_tests
 - compile*
 - dbtest*
+- generational_jstestfuzz*
 - idl_tests
 - integration*
 - jepsen*
@@ -1844,6 +1771,7 @@ test_lifecycle_excluded_tasks:
 - mongos*
 - package
 - push
+- rollback_fuzzer*
 - unittests*
 
 tasks:
@@ -2080,17 +2008,19 @@ tasks:
     params:
       working_dir: src
       script: |
+        ${activate_virtualenv}
+
         # If this is a scheduled build, we check for changes against the last scheduled commit.
         if [ "${is_patch}" != "true" ]; then
           burn_in_args="--checkEvergreen"
         fi
         # Capture a list of new and modified tests.
-        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=${build_variant} --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
+        $python buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=${build_variant} --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
   - func: "do multiversion setup"
   - func: "run tests"
     vars:
       task_path_suffix: /data/multiversion
-      resmoke_wrapper: ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/burn_in_tests.py --testListFile=jstests/new_tests.json
+      resmoke_wrapper: $python buildscripts/burn_in_tests.py --testListFile=jstests/new_tests.json
       resmoke_args: --repeat=2
       run_multiple_jobs: true
 
@@ -2236,6 +2166,34 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=generational_jstestfuzz --storageEngine=wiredTiger
+
+## rollback fuzzer ##
+- <<: *jstestfuzz_template
+  name: rollback_fuzzer
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 15
+      npm_command: rollback-fuzzer
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=rollback_fuzzer --storageEngine=mmapv1
+
+## rollback fuzzer WT ##
+- <<: *jstestfuzz_template
+  name: rollback_fuzzer_WT
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 15
+      npm_command: rollback-fuzzer
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=rollback_fuzzer --storageEngine=wiredTiger
 
 ## jstestfuzz mmapv1 ##
 - <<: *jstestfuzz_template
@@ -2721,7 +2679,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=change_streams --storageEngine=wiredTiger
+      resmoke_args: --suites=change_streams_mongos_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -3240,6 +3198,7 @@ tasks:
   name: multiversion
   commands:
   - func: "do setup"
+  - func: "set up virtualenv"
   - func: "do multiversion setup"
   - func: "run tests"
     vars:
@@ -3251,6 +3210,7 @@ tasks:
   name: multiversion_auth
   commands:
   - func: "do setup"
+  - func: "set up virtualenv"
   - func: "do multiversion setup"
   - func: "run tests"
     vars:
@@ -3262,6 +3222,7 @@ tasks:
   name: multiversion_WT
   commands:
   - func: "do setup"
+  - func: "set up virtualenv"
   - func: "do multiversion setup"
   - func: "run tests"
     vars:
@@ -3273,6 +3234,7 @@ tasks:
   name: multiversion_multistorage_engine
   commands:
   - func: "do setup"
+  - func: "set up virtualenv"
   - func: "do multiversion setup"
   - func: "run tests"
     vars:
@@ -3719,6 +3681,15 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: replica_sets_rollback_refetch_no_uuid
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_rollback_refetch_no_uuid
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: master_slave
   commands:
   - func: "do setup"
@@ -3825,6 +3796,7 @@ tasks:
   name: sharding_last_stable_mongos_and_mixed_shards
   commands:
   - func: "do setup"
+  - func: "set up virtualenv"
   - func: "do multiversion setup"
   - func: "run tests"
     vars:
@@ -4901,6 +4873,7 @@ buildvariants:
   - name: replica_sets_resync_static_jscore_passthrough
   - name: replica_sets_resync_static_jscore_passthrough_WT
   - name: replica_sets_pv0
+  - name: replica_sets_rollback_refetch_no_uuid
   - name: retryable_writes_jscore_passthrough
   - name: retryable_writes_jscore_passthrough_WT
   - name: master_slave
@@ -6077,6 +6050,8 @@ buildvariants:
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod
   - name: noPassthroughWithMongod_WT
+  - name: rollback_fuzzer
+  - name: rollback_fuzzer_WT
   - name: bulk_gle_passthrough
   - name: bulk_gle_passthrough_WT
   - name: parallel
@@ -6822,6 +6797,8 @@ buildvariants:
   - name: replica_sets_kill_secondaries_jscore_passthrough_WT
   - name: retryable_writes_jscore_passthrough
   - name: retryable_writes_jscore_passthrough_WT
+  - name: rollback_fuzzer
+  - name: rollback_fuzzer_WT
   - name: serial_run
   - name: serial_run_WT
   - name: session_jscore_passthrough_WT
@@ -7040,6 +7017,8 @@ buildvariants:
     - rhel62-large
   - name: lint
   - name: burn_in_tests
+  - name: rollback_fuzzer
+  - name: rollback_fuzzer_WT
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -7184,6 +7163,9 @@ buildvariants:
   - name: replica_sets_pv0
     distros:
     - rhel62-large
+  - name: replica_sets_rollback_refetch_no_uuid
+    distros:
+    - rhel62-large
   - name: replica_sets_jscore_passthrough
     distros:
     - rhel62-large
@@ -7297,6 +7279,8 @@ buildvariants:
   tasks:
   - name: compile
   - name: compile_all
+  - name: rollback_fuzzer
+  - name: rollback_fuzzer_WT
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -9472,6 +9456,7 @@ buildvariants:
   - name: retryable_writes_jscore_passthrough
   - name: retryable_writes_jscore_passthrough_WT
   - name: rlp
+  - name: rollback_fuzzer_WT
   - name: sasl
   - name: session_jscore_passthrough_WT
   - name: sharded_collections_jscore_passthrough
@@ -9555,6 +9540,7 @@ buildvariants:
   - name: replica_sets_auth
   - name: replica_sets_pv0
   - name: replica_sets_jscore_passthrough
+  - name: rollback_fuzzer_WT
   - name: master_slave_WT
   - name: master_slave_auth
   - name: master_slave_jscore_passthrough
@@ -9756,65 +9742,13 @@ buildvariants:
     test_flags: --storageEngine=rocksdb
     use_scons_cache: true
     build_mongoreplay: true
+  stepback: false
   tasks:
   - name: compile
     distros:
     - ubuntu1404-build
-  - name: compile_all
-    distros:
-    - ubuntu1404-build
-  - name: aggregation
-  - name: aggregation_WT
-  - name: aggregation_auth
-  - name: auth
   - name: dbtest
-  # - name: disk
-  # - name: durability
-  # - name: dur_jscore_passthrough
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth
-  - name: gle_auth_write_cmd
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: jsCore
-  - name: jsCore_auth
-  - name: jsCore_compatibility
-  - name: generational_jstestfuzz
-  - name: generational_jstestfuzz_WT
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
-  - name: bulk_gle_passthrough
-  - name: parallel
-  - name: parallel_compatibility
-  - name: concurrency
-  - name: concurrency_replication
-  - name: concurrency_sharded
-    # We use machines with more RAM to avoid OOM issues when validating collections.
-    distros:
-    - ubuntu1404-build
-  - name: concurrency_simultaneous
-  - name: read_concern_linearizable_passthrough
-  - name: replica_sets
-  - name: replica_sets_auth
-  - name: replica_sets_jscore_passthrough
-  - name: master_slave
-  - name: master_slave_WT
-  - name: master_slave_auth
-  - name: master_slave_jscore_passthrough
-  - name: sharding
-  - name: sharding_auth
-  - name: slow1
-  - name: serial_run
-  - name: sharding_jscore_passthrough
 
 ###########################################
 #     Experimental buildvariants          #
@@ -9842,6 +9776,8 @@ buildvariants:
   tasks:
   - name: compile
   - name: compile_all
+  - name: rollback_fuzzer
+  - name: rollback_fuzzer_WT
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
@@ -10053,6 +9989,8 @@ buildvariants:
   - name: aggregation
   - name: aggregation_WT
   - name: aggregation_WT_ese
+  - name: rollback_fuzzer
+  - name: rollback_fuzzer_WT
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough_WT
   - name: aggregation_read_concern_majority_passthrough_WT
@@ -10535,120 +10473,6 @@ buildvariants:
   - name: compile_all
     distros:
     - ubuntu1604-build
-
-- name: rollback-3dot4-rhel-62
-  display_name: "~ Rollback 3.4 Enterprise RHEL 6.2"
-  modules:
-  - enterprise
-  run_on:
-  - rhel62-small
-  batchtime: 1440 # 1 day
-  expansions:
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
-    rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
-    # Write the resmoke.py value using a YAML "folded style" (>) string in order to be able to
-    # nest curly braces inside. The curly braces "{}" need their own quotes to protect them from
-    # being interpreted by bash.
-    test_flags: >
-      --mongodSetParameters='{rollbackMethod: rollbackViaRefetch}'
-    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    use_scons_cache: true
-    build_mongoreplay: true
-  tasks:
-  - name: compile
-    distros:
-    - rhel62-large
-  - name: auth
-  - name: auth_WT
-  - name: concurrency_replication
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded
-  - name: concurrency_sharded_WT
-  - name: jsCore
-  - name: jsCore_WT
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
-  - name: noPassthroughWithMongod_WT
-  - name: noPassthrough_WT
-  - name: read_concern_linearizable_passthrough
-    distros:
-    - rhel62-large
-  - name: read_concern_linearizable_passthrough_WT
-    distros:
-    - rhel62-large
-  - name: read_concern_majority_passthrough_WT
-    distros:
-    - rhel62-large
-  - name: replica_sets
-    distros:
-    - rhel62-large
-  - name: replica_sets_WT
-    distros:
-    - rhel62-large
-  - name: replica_sets_WT_ese
-    distros:
-    - rhel62-large
-  - name: replica_sets_auth
-    distros:
-    - rhel62-large
-  - name: replica_sets_pv0
-    distros:
-    - rhel62-large
-  - name: replica_sets_jscore_passthrough
-    distros:
-    - rhel62-large
-  - name: replica_sets_jscore_passthrough_WT
-    distros:
-    - rhel62-large
-  - name: replica_sets_initsync_static_jscore_passthrough
-    distros:
-    - rhel62-large
-  - name: replica_sets_initsync_static_jscore_passthrough_WT
-    distros:
-    - rhel62-large
-  - name: replica_sets_resync_static_jscore_passthrough
-    distros:
-    - rhel62-large
-  - name: replica_sets_resync_static_jscore_passthrough_WT
-    distros:
-    - rhel62-large
-  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
-    distros:
-    - rhel62-large
-  - name: sharded_collections_jscore_passthrough
-  - name: sharded_collections_jscore_passthrough_WT
-  - name: sharding
-    distros:
-    - rhel62-large
-  - name: sharding_WT
-    distros:
-    - rhel62-large
-  - name: sharding_WT_ese
-    distros:
-    - rhel62-large
-  - name: sharding_auth
-    distros:
-    - rhel62-large
-  - name: sharding_auth_audit_WT
-    distros:
-    - rhel62-large
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_passthrough_WT
-  - name: sharding_jscore_op_query_passthrough_WT
-  - name: sharding_jscore_passthrough_wire_ops_WT
-  - name: sharding_last_stable_mongos_and_mixed_shards
-    distros:
-    - rhel62-large
-  - name: sharding_op_query_WT
-    distros:
-    - rhel62-large
-  - name: sharding_csrs_continuous_config_stepdown_WT
-    distros:
-    - rhel62-large
-  - name: slow1
-  - name: slow1_WT
 
 - name: tig-daily-cron
   display_name: "~ TIG Daily Cron"

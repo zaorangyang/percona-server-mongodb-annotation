@@ -1,12 +1,16 @@
-load('jstests/libs/write_concern_util.js');
-
 /**
  * This file tests that commands that do writes accept a write concern in a sharded cluster. This
  * test defines various database commands and what they expect to be true before and after the fact.
  * It then runs the commands with an invalid writeConcern and a valid writeConcern and
  * ensures that they succeed and fail appropriately. This only tests functions that aren't run
  * on config servers.
+ *
+ * This test is labeled resource intensive because its total io_write is 58MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger. Its total io_write is 4200MB compared to a median
+ * of 135MB in mmapv1.
+ * @tags: [resource_intensive]
  */
+load('jstests/libs/write_concern_util.js');
 
 (function() {
     "use strict";
@@ -362,47 +366,6 @@ load('jstests/libs/write_concern_util.js');
             db.foo.drop();
         },
         admin: false
-    });
-
-    // Only create shards for the movePrimary test once.
-    shardCollectionWithChunks(st, db.getSiblingDB("move-primary-db-sharded").shardColl);
-    // Create a non-sharded collection in the move-primary-db.
-    db.getSiblingDB("move-primary-db-sharded").nonshardColl.insert({a: 1});
-    commands.push({
-        req: {movePrimary: "move-primary-db-sharded", to: st.shard1.shardName},
-        setupFunc: function() {
-            st.ensurePrimaryShard("move-primary-db-sharded", st.shard0.shardName);
-            assert.eq(db.getSiblingDB('config')
-                          .databases.findOne({_id: 'move-primary-db-sharded'})
-                          .primary,
-                      st.shard0.shardName);
-        },
-        confirmFunc: function() {
-            assert.eq(db.getSiblingDB('config')
-                          .databases.findOne({_id: 'move-primary-db-sharded'})
-                          .primary,
-                      st.shard1.shardName);
-        },
-        admin: true
-    });
-
-    commands.push({
-        req: {movePrimary: "move-primary-db-unsharded", to: st.shard1.shardName},
-        setupFunc: function() {
-            db.getSiblingDB("move-primary-db-unsharded").nonshardColl.insert({a: 1});
-            st.ensurePrimaryShard("move-primary-db-unsharded", st.shard0.shardName);
-            assert.eq(db.getSiblingDB('config')
-                          .databases.findOne({_id: 'move-primary-db-unsharded'})
-                          .primary,
-                      st.shard0.shardName);
-        },
-        confirmFunc: function() {
-            assert.eq(db.getSiblingDB('config')
-                          .databases.findOne({_id: 'move-primary-db-unsharded'})
-                          .primary,
-                      st.shard1.shardName);
-        },
-        admin: true
     });
 
     function testValidWriteConcern(cmd) {

@@ -118,8 +118,8 @@ TEST(MatcherTypeSetTest, ParseFromElementFailsToParseUnknownBSONType) {
     ASSERT_NOT_OK(result.getStatus());
 }
 
-TEST(MatcherTypeSetTest, ParseFromElementCanParseIntegerTypeCode) {
-    auto obj = BSON("" << 2);
+TEST(MatcherTypeSetTest, ParseFromElementCanParseRoundDoubleTypeCode) {
+    auto obj = BSON("" << 2.0);
     auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
     ASSERT_OK(result.getStatus());
     ASSERT_FALSE(result.getValue().allNumbers);
@@ -127,13 +127,75 @@ TEST(MatcherTypeSetTest, ParseFromElementCanParseIntegerTypeCode) {
     ASSERT_TRUE(result.getValue().hasType(BSONType::String));
 }
 
-TEST(MatcherTypeSetTest, ParseFromElementCanParseDoubleTypeCode) {
-    auto obj = BSON("" << 2.0);
+TEST(MatcherTypeSetTest, ParseFailsWhenElementIsNonRoundDoubleTypeCode) {
+    auto obj = BSON("" << 2.5);
+    auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(MatcherTypeSetTest, ParseFromElementCanParseRoundDecimalTypeCode) {
+    auto obj = BSON("" << Decimal128(2));
     auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
     ASSERT_OK(result.getStatus());
     ASSERT_FALSE(result.getValue().allNumbers);
-    ASSERT_EQ(result.getValue().bsonTypes.size(), 1u);
+    ASSERT_EQ(result.getValue().bsonTypes.size(), 1U);
     ASSERT_TRUE(result.getValue().hasType(BSONType::String));
+}
+
+TEST(MatcherTypeSetTest, ParseFailsWhenElementIsNonRoundDecimalTypeCode) {
+    auto obj = BSON("" << Decimal128(2.5));
+    auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(MatcherTypeSetTest, ParseFailsWhenDoubleElementIsTooPositiveForInteger) {
+    double doubleTooLarge = scalbn(1, std::numeric_limits<long long>::digits);
+    auto obj = BSON("" << doubleTooLarge);
+    auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(MatcherTypeSetTest, ParseFailsWhenDoubleElementIsTooNegativeForInteger) {
+    double doubleTooNegative = std::numeric_limits<double>::lowest();
+    auto obj = BSON("" << doubleTooNegative);
+    auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(MatcherTypeSetTest, ParseFailsWhenDoubleElementIsNaN) {
+    auto obj = BSON("" << std::nan(""));
+    auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(MatcherTypeSetTest, ParseFailsWhenDoubleElementIsInfinite) {
+    auto obj = BSON("" << std::numeric_limits<double>::infinity());
+    auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(MatcherTypeSetTest, ParseFailsWhenDecimalElementIsTooPositiveForInteger) {
+    auto obj = BSON("" << Decimal128(static_cast<int64_t>(std::numeric_limits<int>::max()) + 1));
+    auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(MatcherTypeSetTest, ParseFailsWhenDecimalElementIsTooNegativeForInteger) {
+    auto obj = BSON("" << Decimal128(static_cast<int64_t>(std::numeric_limits<int>::min()) - 1));
+    auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(MatcherTypeSetTest, ParseFailsWhenDecimalElementIsNaN) {
+    auto obj = BSON("" << Decimal128::kPositiveNaN);
+    auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
+    ASSERT_NOT_OK(result.getStatus());
+}
+
+TEST(MatcherTypeSetTest, ParseFailsWhenDecimalElementIsInfinite) {
+    auto obj = BSON("" << Decimal128::kPositiveInfinity);
+    auto result = MatcherTypeSet::parse(obj.firstElement(), MatcherTypeSet::kTypeAliasMap);
+    ASSERT_NOT_OK(result.getStatus());
 }
 
 TEST(MatcherTypeSetTest, ParseFromElementFailsWhenArrayHasUnknownType) {

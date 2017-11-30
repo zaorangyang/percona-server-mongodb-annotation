@@ -97,8 +97,8 @@ using std::string;
 using std::stringstream;
 using std::vector;
 
-void massertNamespaceNotIndex(StringData ns, StringData caller) {
-    massert(17320,
+void uassertNamespaceNotIndex(StringData ns, StringData caller) {
+    uassert(17320,
             str::stream() << "cannot do " << caller << " on namespace with a $ in it: " << ns,
             NamespaceString::normal(ns));
 }
@@ -311,7 +311,7 @@ void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) {
             }
 
             wunit.commit();
-        } catch (const WriteConflictException& exp) {
+        } catch (const WriteConflictException&) {
             warning() << "could not drop temp collection '" << ns << "' due to "
                                                                      "WriteConflictException";
             opCtx->recoveryUnit()->abandonSnapshot();
@@ -483,7 +483,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
         return Status::OK();  // Post condition already met.
     }
 
-    massertNamespaceNotIndex(fullns.toString(), "dropCollection");
+    uassertNamespaceNotIndex(fullns.toString(), "dropCollection");
 
     BackgroundOperation::assertNoBgOpInProgForNs(fullns);
 
@@ -523,6 +523,42 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     // Replicated collections will be renamed with a special drop-pending namespace and dropped when
     // the replica set optime reaches the drop optime.
     if (dropOpTime.isNull()) {
+        // MMAPv1 requires that index namespaces are subject to the same length constraints as
+        // indexes in collections that are not in a drop-pending state. Therefore, we check if the
+        // drop-pending namespace is too long for any index names in the collection.
+        // These indexes are dropped regardless of the storage engine on the current node because we
+        // may still have nodes running MMAPv1 in the replica set.
+
+        // Compile a list of any indexes that would become too long following the drop-pending
+        // rename. In the case that this collection drop gets rolled back, this will incur a
+        // performance hit, since those indexes will have to be rebuilt from scratch, but data
+        // integrity is maintained.
+        std::vector<IndexDescriptor*> indexesToDrop;
+        auto indexIter = collection->getIndexCatalog()->getIndexIterator(opCtx, true);
+
+        // Determine which index names are too long. Since we don't have the collection drop optime
+        // at this time, use the maximum optime to check the index names.
+        auto longDpns = fullns.makeDropPendingNamespace(repl::OpTime::max());
+        while (indexIter.more()) {
+            auto index = indexIter.next();
+            auto status = longDpns.checkLengthForRename(index->indexName().size());
+            if (!status.isOK()) {
+                indexesToDrop.push_back(index);
+            }
+        }
+
+        // Drop the offending indexes.
+        for (auto&& index : indexesToDrop) {
+            log() << "dropCollection: " << fullns << " - index namespace '"
+                  << index->indexNamespace()
+                  << "' would be too long after drop-pending rename. Dropping index immediately.";
+            fassertStatusOK(40463, collection->getIndexCatalog()->dropIndex(opCtx, index));
+            opObserver->onDropIndex(
+                opCtx, fullns, collection->uuid(), index->indexName(), index->infoObj());
+        }
+
+        // Log oplog entry for collection drop and proceed to complete rest of two phase drop
+        // process.
         dropOpTime = opObserver->onDropCollection(opCtx, fullns, uuid);
 
         // Drop collection immediately if OpObserver did not write entry to oplog.
@@ -549,39 +585,6 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     }
 
     auto dpns = fullns.makeDropPendingNamespace(dropOpTime);
-
-    // MMAPv1 requires that index namespaces are subject to the same length constraints as indexes
-    // in collections that are not in a drop-pending state. Therefore, we check if the drop-pending
-    // namespace is too long for any index names in the collection.
-    if (opCtx->getServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
-
-        // Compile a list of any indexes that would become too long following the drop-pending
-        // rename. In the case that this collection drop gets rolled back, this will incur a
-        // performance hit, since those indexes will have to be rebuilt from scratch, but data
-        // integrity is maintained.
-        std::vector<IndexDescriptor*> indexesToDrop;
-        auto indexIter = collection->getIndexCatalog()->getIndexIterator(opCtx, true);
-
-        // Determine which index names are too long.
-        while (indexIter.more()) {
-            auto index = indexIter.next();
-            auto status = dpns.checkLengthForRename(index->indexName().size());
-            if (!status.isOK()) {
-                indexesToDrop.push_back(index);
-            }
-        }
-
-        // Drop the offending indexes.
-        for (auto&& index : indexesToDrop) {
-            log() << "dropCollection: " << fullns << " - index namespace '"
-                  << index->indexNamespace()
-                  << "' would be too long after drop-pending rename. Dropping index immediately.";
-            fassertStatusOK(40463, collection->getIndexCatalog()->dropIndex(opCtx, index));
-            opObserver->onDropIndex(
-                opCtx, fullns, collection->uuid(), index->indexName(), index->infoObj());
-        }
-    }
-
 
     // Rename collection using drop-pending namespace generated from drop optime.
     const bool stayTemp = true;
@@ -710,7 +713,7 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
             str::stream() << "Cannot create collection " << nss.ns()
                           << " - collection already exists.",
             getCollection(opCtx, nss) == nullptr);
-    massertNamespaceNotIndex(nss.ns(), "createCollection");
+    uassertNamespaceNotIndex(nss.ns(), "createCollection");
 
     uassert(14037,
             "can't create user databases on a --configsvr instance",
@@ -1043,7 +1046,7 @@ auto mongo::userCreateNSImpl(OperationContext* opCtx,
                 // enough, so we rewrite it here.
                 return {ErrorCodes::QueryFeatureNotAllowed,
                         str::stream() << "The featureCompatibilityVersion must be 3.6 to create a "
-                                         "collection validator using 3.6 query featuress. See "
+                                         "collection validator using 3.6 query features. See "
                                       << feature_compatibility_version::kDochubLink
                                       << "."};
             } else {
