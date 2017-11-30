@@ -269,15 +269,9 @@ class MultiVersionDownloader(object):
                     # to extract the binaries into inside 'self.install_dir'. The name of the root
                     # directory nearly always matches the parsed URL text, with the exception of
                     # versions such as "v3.2-latest" that instead contain the githash.
-<<<<<<< HEAD
-                    first_file = zf.namelist()[0]
-                    zf.extractall(temp_dir)
-            elif file_suffix == ".gz" or file_suffix == ".tgz":
-=======
                     first_file = zip_handle.namelist()[0]
                     zip_handle.extractall(temp_dir)
-            elif file_suffix == ".tgz":
->>>>>>> r3.6.0-rc1
+            elif file_suffix == ".gz" or file_suffix == ".tgz":
                 # Support .tgz downloads, used for Linux binaries.
                 with contextlib.closing(tarfile.open(temp_file, "r:gz")) as tar_handle:
                     # Use the name of the root directory in the archive as the name of the directory
