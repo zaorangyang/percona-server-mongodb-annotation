@@ -201,7 +201,7 @@ public:
                         _sessionCache->waitUntilDurable(forceCheckpoint, stableCheckpoint);
                     }
                 }
-            } catch (const WriteConflictException& wce) {
+            } catch (const WriteConflictException&) {
                 // Temporary: remove this after WT-3483
                 warning() << "Checkpoint encountered a write conflict exception.";
             } catch (const AssertionException& exc) {
@@ -495,8 +495,10 @@ void WiredTigerKVEngine::cleanShutdown() {
             closeConfig = "leak_memory=true";
         }
 
-        const bool needsDowngrade =
-            !_readOnly && !serverGlobalParams.featureCompatibility.isFullyUpgradedTo36();
+        // Only downgrade when the fCV document has been explicitly initialized and is 3.4.
+        const bool needsDowngrade = !_readOnly &&
+            serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.isFullyDowngradedTo34();
 
         invariantWTOK(_conn->close(_conn, closeConfig));
         _conn = nullptr;

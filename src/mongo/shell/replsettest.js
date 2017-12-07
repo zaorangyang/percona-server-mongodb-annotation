@@ -939,6 +939,23 @@ var ReplSetTest = function(opts) {
                 }, "Awaiting keys", timeout);
             });
         }
+
+        // Set 'featureCompatibilityVersion' for the entire replica set, if specified.
+        if (jsTest.options().replSetFeatureCompatibilityVersion) {
+            // Authenticate before running the command.
+            asCluster(self.nodes, function setFCV() {
+                let fcv = jsTest.options().replSetFeatureCompatibilityVersion;
+                print("Setting feature compatibility version for replica set to '" + fcv + "'");
+                assert.commandWorked(
+                    self.getPrimary().adminCommand({setFeatureCompatibilityVersion: fcv}));
+
+                // Wait for the new 'featureCompatibilityVersion' to propagate to all nodes in the
+                // replica set. The 'setFeatureCompatibilityVersion' command only waits for
+                // replication to a majority of nodes by default.
+                self.awaitReplication();
+            });
+        }
+
     };
 
     /**
@@ -1244,14 +1261,17 @@ var ReplSetTest = function(opts) {
     };
 
     this.dumpOplog = function(conn, query = {}, limit = 10) {
-        print('Dumping the latest ' + limit + ' documents that match ' + tojson(query) +
-              ' from the oplog ' + oplogName + ' of ' + conn.host);
+        var log = 'Dumping the latest ' + limit + ' documents that match ' + tojson(query) +
+            ' from the oplog ' + oplogName + ' of ' + conn.host;
         var cursor = conn.getDB('local')
                          .getCollection(oplogName)
                          .find(query)
                          .sort({$natural: -1})
                          .limit(limit);
-        cursor.forEach(printjsononeline);
+        cursor.forEach(function(entry) {
+            log = log + '\n' + tojsononeline(entry);
+        });
+        jsTestLog(log);
     };
 
     // Call the provided checkerFunction, after the replica set has been write locked.
@@ -1647,9 +1667,11 @@ var ReplSetTest = function(opts) {
                     if (!bsonBinaryEqual(oplogEntry, otherOplogEntry)) {
                         var query = prevOplogEntry ? {ts: {$lte: prevOplogEntry.ts}} : {};
                         rst.nodes.forEach(node => this.dumpOplog(node, query, 100));
-                        assert(false,
-                               msgPrefix + ", non-matching oplog entry for nodes: " +
-                                   firstReader.mongo.host + " " + readers[i].mongo.host);
+                        var log = msgPrefix +
+                            ", non-matching oplog entries for the following nodes: \n" +
+                            firstReader.mongo.host + ": " + tojsononeline(oplogEntry) + "\n" +
+                            readers[i].mongo.host + ": " + tojsononeline(otherOplogEntry);
+                        assert(false, log);
                     }
                 }
                 prevOplogEntry = oplogEntry;

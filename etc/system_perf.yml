@@ -15,21 +15,31 @@ post:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: work/reports.tgz
-        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/${task_name}-${build_id}.${ext|tgz}
+        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/${task_name}-${build_id}-${execution}.${ext|tgz}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
-        display_name: test-log
+        display_name: test-log - Execution ${execution}
     - command: s3.put
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: work/reports/graphs/timeseries-mongod.0.html
-        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/timeseries-mongod.0-${task_name}-${build_id}.html
+        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/timeseries-mongod.0-${task_name}-${build_id}-${execution}.html
         bucket: mciuploads
         permissions: public-read
         content_type: text/html
-        display_name: timeseries-p1.html
+        display_name: timeseries-p1.html - Execution ${execution}
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/workloads/workloads/jsdoc/jsdocs-redirect.html
+        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/workloads-${task_name}-${build_id}.html
+        bucket: mciuploads
+        permissions: public-read
+        content_type: text/html
+        display_name: workloads documentation
     - command: attach.results
       params:
         file_location: work/report.json
@@ -214,7 +224,7 @@ functions:
         silent: true
         script: |
           set -o errexit
-          TAGS="3.4.6-Baseline 3.2.15-Baseline"
+          TAGS="3.4.9-Baseline 3.2.17-Baseline"
           OVERRIDEFILE="../src/dsi/dsi/analysis/master/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/dashboard_gen.py --rev ${revision} -f history.json -t tags.json --refTag $TAGS --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name} --jira-user ${perf_jira_user} --jira-password ${perf_jira_pw} || true
     - command: "json.send"
@@ -229,7 +239,7 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          TAG="3.4.6-Baseline"
+          TAG="3.4.9-Baseline"
           OVERRIDEFILE="../src/dsi/dsi/analysis/master/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file reports/perf.json --rev ${revision} -f history.json -t tags.json --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
 
@@ -279,7 +289,7 @@ tasks:
           sed -i.bak "s/built-without-version-string/$(git describe)/" common/options/options.go
           sed -i.bak "s/built-without-git-spec/$(git rev-parse HEAD)/" common/options/options.go
           . ./${set_tools_gopath|set_gopath.sh}
-          build_tools="bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog"
+          build_tools="bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop"
           if [ "${build_mongoreplay}" = "true" ]; then
             build_tools="$build_tools mongoreplay"
           fi

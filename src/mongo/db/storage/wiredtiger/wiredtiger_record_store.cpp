@@ -506,7 +506,7 @@ public:
         if (_cursor && !wt_keeptxnopen()) {
             try {
                 _cursor->reset(_cursor);
-            } catch (const WriteConflictException& wce) {
+            } catch (const WriteConflictException&) {
                 // Ignore since this is only called when we are about to kill our transaction
                 // anyway.
             }
@@ -1020,7 +1020,7 @@ int64_t WiredTigerRecordStore::cappedDeleteAsNeeded_inlock(OperationContext* opC
                 _cappedFirstRecord = firstRemainingId;
             }
         }
-    } catch (const WriteConflictException& wce) {
+    } catch (const WriteConflictException&) {
         delete opCtx->releaseRecoveryUnit();
         opCtx->setRecoveryUnit(realRecoveryUnit, realRUstate);
         log() << "got conflict truncating capped, ignoring";
@@ -1095,7 +1095,7 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx) {
 
             // Stash the truncate point for next time to cleanly skip over tombstones, etc.
             _oplogStones->firstRecord = stone->lastRecord;
-        } catch (const WriteConflictException& wce) {
+        } catch (const WriteConflictException&) {
             LOG(1) << "Caught WriteConflictException while truncating oplog entries, retrying";
         }
     }
@@ -1714,11 +1714,15 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
         // Note that an unpositioned (or eof) WT_CURSOR returns the first/last entry in the
         // table when you call next/prev.
         int advanceRet = WT_READ_CHECK(_forward ? c->next(c) : c->prev(c));
-        if (advanceRet == WT_NOTFOUND || hasWrongPrefix(c, &id)) {
+        if (advanceRet == WT_NOTFOUND) {
             _eof = true;
             return {};
         }
         invariantWTOK(advanceRet);
+        if (hasWrongPrefix(c, &id)) {
+            _eof = true;
+            return {};
+        }
     }
 
     _skipNextAdvance = false;
@@ -1768,7 +1772,7 @@ void WiredTigerRecordStoreCursorBase::save() {
     try {
         if (_cursor)
             _cursor->reset();
-    } catch (const WriteConflictException& wce) {
+    } catch (const WriteConflictException&) {
         // Ignore since this is only called when we are about to kill our transaction
         // anyway.
     }
@@ -1806,11 +1810,15 @@ bool WiredTigerRecordStoreCursorBase::restore() {
     int cmp;
     int ret = WT_READ_CHECK(c->search_near(c, &cmp));
     RecordId id;
-    if (ret == WT_NOTFOUND || hasWrongPrefix(c, &id)) {
+    if (ret == WT_NOTFOUND) {
         _eof = true;
         return !_rs._isCapped;
     }
     invariantWTOK(ret);
+    if (hasWrongPrefix(c, &id)) {
+        _eof = true;
+        return !_rs._isCapped;
+    }
 
     if (cmp == 0)
         return true;  // Landed right where we left off.
@@ -1860,11 +1868,6 @@ RecordId StandardWiredTigerRecordStore::getKey(WT_CURSOR* cursor) const {
 
 void StandardWiredTigerRecordStore::setKey(WT_CURSOR* cursor, RecordId id) const {
     cursor->set_key(cursor, id.repr());
-}
-
-bool StandardWiredTigerRecordStore::hasWrongPrefix(WT_CURSOR* cursor, RecordId* id) const {
-    // The 'WT_NOTFOUND' check a caller does is sufficient.
-    return false;
 }
 
 std::unique_ptr<SeekableRecordCursor> StandardWiredTigerRecordStore::getCursor(
@@ -1949,13 +1952,6 @@ RecordId PrefixedWiredTigerRecordStore::getKey(WT_CURSOR* cursor) const {
 
 void PrefixedWiredTigerRecordStore::setKey(WT_CURSOR* cursor, RecordId id) const {
     cursor->set_key(cursor, _prefix.repr(), id.repr());
-}
-
-bool PrefixedWiredTigerRecordStore::hasWrongPrefix(WT_CURSOR* cursor, RecordId* id) const {
-    std::int64_t prefix;
-    invariantWTOK(cursor->get_key(cursor, &prefix, id));
-
-    return prefix != _prefix.repr();
 }
 
 WiredTigerRecordStorePrefixedCursor::WiredTigerRecordStorePrefixedCursor(

@@ -182,7 +182,8 @@ Status FixUpInfo::recordDropTargetInfo(const BSONElement& dropTarget,
 }
 
 Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInfo,
-                                                             const BSONObj& ourObj) {
+                                                             const BSONObj& ourObj,
+                                                             bool isNestedApplyOpsCommand) {
 
     // Checks that the oplog entry is smaller than 512 MB. We do not roll back if the
     // oplog entry is larger than 512 MB.
@@ -190,10 +191,31 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
         throw RSFatalException(str::stream() << "Rollback too large, oplog size: "
                                              << ourObj.objsize());
 
-    // Parse the oplog entry.
-    auto oplogEntry = OplogEntry(ourObj);
+    // If required fields are not present in the BSONObj for an applyOps entry, create these fields
+    // and populate them with dummy values before parsing ourObj as an oplog entry.
+    BSONObjBuilder bob;
+    if (isNestedApplyOpsCommand) {
+        if (!ourObj.hasField("ts")) {
+            bob.appendTimestamp("ts");
+        }
+        if (!ourObj.hasField("h")) {
+            long long dummyHash = 0;
+            bob.append("h", dummyHash);
+        }
+    }
+    bob.appendElements(ourObj);
+    BSONObj fixedObj = bob.obj();
 
-    LOG(2) << "Updating rollback FixUpInfo for local oplog entry: " << oplogEntry.toBSON();
+    // Parse the oplog entry.
+    auto oplogEntry = OplogEntry(fixedObj);
+
+    if (isNestedApplyOpsCommand) {
+        LOG(2) << "Updating rollback FixUpInfo for nested applyOps entry: "
+               << redact(oplogEntry.toBSON());
+    } else {
+        LOG(2) << "Updating rollback FixUpInfo for local oplog entry: "
+               << redact(oplogEntry.toBSON());
+    }
 
     // Extract the op's collection namespace and UUID.
     NamespaceString nss = oplogEntry.getNamespace();
@@ -201,10 +223,6 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
 
     if (oplogEntry.getOpType() == OpTypeEnum::kNoop)
         return Status::OK();
-
-    // If we are inserting/updating/deleting a document in the oplog entry, we will update
-    // the doc._id field when we actually insert the docID into the docsToRefetch set.
-    DocID doc = DocID(oplogEntry.raw, BSONElement(), *uuid);
 
     if (oplogEntry.getNamespace().isEmpty()) {
         throw RSFatalException(str::stream() << "Local op on rollback has no ns: "
@@ -312,7 +330,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
                 if (!status.isOK()) {
                     severe()
                         << "Missing index name in dropIndexes operation on rollback, document: "
-                        << redact(doc.ownedObj);
+                        << redact(oplogEntry.toBSON());
                     throw RSFatalException(
                         "Missing index name in dropIndexes operation on rollback.");
                 }
@@ -340,7 +358,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
                 if (!status.isOK()) {
                     severe()
                         << "Missing index name in createIndexes operation on rollback, document: "
-                        << redact(doc.ownedObj);
+                        << redact(oplogEntry.toBSON());
                     throw RSFatalException(
                         "Missing index name in createIndexes operation on rollback.");
                 }
@@ -487,7 +505,6 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
                 //                        }]
                 //         }
                 // }
-
                 if (first.type() != Array) {
                     std::string message = str::stream()
                         << "Expected applyOps argument to be an array; found " << redact(first);
@@ -507,7 +524,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
                     // needed for rollback that is contained within the applyOps, creating a nested
                     // call.
                     auto subStatus =
-                        updateFixUpInfoFromLocalOplogEntry(fixUpInfo, subopElement.Obj());
+                        updateFixUpInfoFromLocalOplogEntry(fixUpInfo, subopElement.Obj(), true);
                     if (!subStatus.isOK()) {
                         return subStatus;
                     }
@@ -522,6 +539,10 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(FixUpInfo& fixUpInf
             }
         }
     }
+
+    // If we are inserting/updating/deleting a document in the oplog entry, we will update
+    // the doc._id field when we actually insert the docID into the docsToRefetch set.
+    DocID doc = DocID(oplogEntry.raw, BSONElement(), *uuid);
 
     doc._id = oplogEntry.getIdElement();
     if (doc._id.eoo()) {
@@ -634,9 +655,13 @@ void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::str
     for (auto itIndex = indexNames.begin(); itIndex != indexNames.end(); itIndex++) {
         const string& indexName = *itIndex;
 
+        log() << "Dropping index in rollback for collection: " << nss << ", UUID: " << uuid
+              << ", index: " << indexName;
+
         dropIndex(opCtx, indexCatalog, indexName, nss);
-        log() << "Dropped index in rollback: collection = " << nss.toString()
-              << ", index = " << indexName;
+
+        LOG(1) << "Dropped index in rollback for collection: " << nss << ", UUID: " << uuid
+               << ", index: " << indexName;
     }
 }
 
@@ -669,12 +694,15 @@ void rollbackDropIndexes(OperationContext* opCtx,
         updatedNss.append("ns", nss.ns());
 
         BSONObj updatedNssObj = updatedNss.obj();
-        indexSpec.addField(updatedNssObj.firstElement());
+        indexSpec = indexSpec.addField(updatedNssObj.firstElement());
+
+        log() << "Creating index in rollback for collection: " << nss << ", UUID: " << uuid
+              << ", index: " << indexName;
 
         createIndexForApplyOps(opCtx, indexSpec, nss, {});
 
-        log() << "Created index in rollback: collection = " << nss.toString()
-              << ", index = " << indexName;
+        LOG(1) << "Created index in rollback for collection: " << nss << ", UUID: " << uuid
+               << ", index: " << indexName;
     }
 }
 
@@ -761,7 +789,8 @@ void renameOutOfTheWay(OperationContext* opCtx, RenameCollectionInfo info, Datab
 
     LOG(2) << "Attempted to rename collection from " << info.renameFrom << " to " << info.renameTo
            << " but " << info.renameTo << " exists already. Temporarily renaming collection "
-           << info.renameTo << " out of the way to " << tempNss;
+           << info.renameTo << " with UUID " << collection->uuid().get() << " out of the way to "
+           << tempNss;
 
     BSONObjBuilder tempRenameCmd;
     tempRenameCmd.append("renameCollection", info.renameTo.ns());
@@ -788,6 +817,8 @@ void rollbackRenameCollection(OperationContext* opCtx, UUID uuid, RenameCollecti
     std::string dbName = info.renameFrom.db().toString();
     BSONObj ui = uuid.toBSON();
 
+    log() << "Attempting to rename collection with UUID: " << uuid << ", from: " << info.renameFrom
+          << ", to: " << info.renameTo;
     Lock::DBLock dbLock(opCtx, dbName, MODE_X);
     auto db = dbHolder().openDb(opCtx, dbName);
     invariant(db);
@@ -824,8 +855,8 @@ void rollbackRenameCollection(OperationContext* opCtx, UUID uuid, RenameCollecti
         throw RSFatalException("Unable to rollback renameCollection command");
     }
 
-    log() << "Renamed collection from " << info.renameFrom.ns() << "to " << info.renameTo.ns()
-          << " with uuid: " << uuid;
+    LOG(1) << "Renamed collection with UUID: " << uuid << ", from: " << info.renameFrom
+           << ", to: " << info.renameTo;
 }
 
 Status _syncRollback(OperationContext* opCtx,
@@ -850,7 +881,7 @@ Status _syncRollback(OperationContext* opCtx,
     try {
 
         auto processOperationForFixUp = [&how](const BSONObj& operation) {
-            return updateFixUpInfoFromLocalOplogEntry(how, operation);
+            return updateFixUpInfoFromLocalOplogEntry(how, operation, false);
         };
 
         // Calls syncRollBackLocalOperations to run updateFixUpInfoFromLocalOplogEntry
@@ -931,8 +962,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         NamespaceString nss = catalog.lookupNSSByUUID(uuid);
 
         try {
-            LOG(2) << "Refetching document, namespace: " << nss.toString()
-                   << ", _id: " << redact(doc._id);
+            LOG(2) << "Refetching document, collection: " << nss << ", UUID: " << uuid << ", "
+                   << redact(doc._id);
             // TODO : Slow. Lots of round trips.
             numFetched++;
 
@@ -1007,13 +1038,14 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         invariant(!fixUpInfo.collectionsToResyncMetadata.count(uuid));
 
         NamespaceString nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(uuid);
+        log() << "Dropping collection: " << nss << ", UUID: " << uuid;
         AutoGetDb dbLock(opCtx, nss.db(), MODE_X);
 
         Database* db = dbLock.getDb();
         if (db) {
             Collection* collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(uuid);
             dropCollection(opCtx, nss, collection, db);
-            log() << "Dropped collection with UUID: " << uuid << " and nss: " << nss;
+            LOG(1) << "Dropped collection: " << nss << ", UUID: " << uuid;
         }
     }
 
@@ -1037,6 +1069,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     for (const auto& collPair : fixUpInfo.collectionsToRemoveFromDropPendingCollections) {
         const auto& optime = collPair.second.first;
         const auto& collectionNamespace = collPair.second.second;
+        LOG(1) << "Rolling back collection pending being dropped for OpTime: " << optime
+               << ", collection: " << collectionNamespace;
         DropPendingCollectionReaper::get(opCtx)->rollBackDropPendingCollection(
             opCtx, optime, collectionNamespace);
     }
@@ -1051,9 +1085,9 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         // occurs and then the collection is dropped. If we do not first re-create the
         // collection, we will not be able to retrieve the collection's catalog entries.
         for (auto uuid : fixUpInfo.collectionsToResyncMetadata) {
-            log() << "Resyncing collection metadata, uuid: " << uuid;
-
             NamespaceString nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(uuid);
+
+            log() << "Resyncing collection metadata for collection: " << nss << ", UUID: " << uuid;
 
             Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
 
@@ -1128,6 +1162,10 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                 opCtx, options.validator, options.validationLevel, options.validationAction);
 
             wuow.commit();
+
+            LOG(1) << "Resynced collection metadata for collection: " << nss << ", UUID: " << uuid
+                   << ", with: " << redact(options.toBSON())
+                   << ", to: " << redact(cce->getCollectionOptions(opCtx).toBSON());
         }
 
         // Since we read from the sync source to retrieve the metadata of the
@@ -1227,6 +1265,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                 }
 
                 if (idAndDoc.second.isEmpty()) {
+                    LOG(2) << "Deleting document with: " << redact(doc._id)
+                           << ", from collection: " << doc.ns << ", with UUID: " << uuid;
                     // If the document could not be found on the primary, deletes the document.
                     // TODO 1.6 : can't delete from a capped collection. Need to handle that
                     // here.
@@ -1288,6 +1328,9 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                         }
                     }
                 } else {
+                    LOG(2) << "Updating document with: " << redact(doc._id)
+                           << ", from collection: " << doc.ns << ", UUID: " << uuid
+                           << ", to: " << redact(idAndDoc.second);
                     // TODO faster...
                     updates++;
 

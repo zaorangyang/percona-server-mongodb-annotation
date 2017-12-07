@@ -69,7 +69,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session.h"
-#include "mongo/db/session_txn_record.h"
+#include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/exit.h"
@@ -87,12 +87,13 @@ namespace repl {
 
 AtomicInt32 SyncTail::replBatchLimitOperations{50 * 1000};
 
-/**
- * This variable determines the number of writer threads SyncTail will have. It has a default
- * value, which varies based on architecture and can be overridden using the
- * "replWriterThreadCount" server parameter.
- */
 namespace {
+
+/**
+ * This variable determines the number of writer threads SyncTail will have. It has a default value,
+ * which varies based on architecture and can be overridden using the "replWriterThreadCount" server
+ * parameter.
+ */
 #if defined(MONGO_PLATFORM_64)
 int replWriterThreadCount = 16;
 #elif defined(MONGO_PLATFORM_32)
@@ -149,6 +150,7 @@ ServerStatusMetricField<Counter64> displayAttemptsToBecomeSecondary(
 // Number and time of each ApplyOps worker pool round
 TimerStats applyBatchStats;
 ServerStatusMetricField<TimerStats> displayOpBatchesApplied("repl.apply.batches", &applyBatchStats);
+
 void initializePrefetchThread() {
     if (!Client::getCurrent()) {
         Client::initThreadIfNotAlready();
@@ -270,13 +272,16 @@ NamespaceString parseUUIDOrNs(OperationContext* opCtx, const BSONObj& o) {
     if (!statusWithUUID.isOK()) {
         return NamespaceString(o.getStringField("ns"));
     }
-    auto uuid = statusWithUUID.getValue();
+
+    const auto& uuid = statusWithUUID.getValue();
     auto& catalog = UUIDCatalog::get(opCtx);
     auto nss = catalog.lookupNSSByUUID(uuid);
-    uassert(
-        ErrorCodes::NamespaceNotFound, "No namespace with UUID " + uuid.toString(), !nss.isEmpty());
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "No namespace with UUID " << uuid.toString(),
+            !nss.isEmpty());
     return nss;
 }
+
 }  // namespace
 
 SyncTail::SyncTail(BackgroundSync* q, MultiSyncApplyFunc func)
@@ -529,36 +534,6 @@ void scheduleWritesToOplog(OperationContext* opCtx,
 using SessionRecordMap =
     stdx::unordered_map<LogicalSessionId, SessionTxnRecord, LogicalSessionIdHash>;
 
-// Returns a map of the "latest" transaction table records for each logical session id present in
-// the given operations. Each record represents the final state of the transaction table entry for
-// that session id after the operations are applied.
-SessionRecordMap computeLatestTransactionTableRecords(const MultiApplier::Operations& ops) {
-    SessionRecordMap latestRecords;
-    for (const auto& op : ops) {
-        auto sessionInfo = op.getOperationSessionInfo();
-        if (!sessionInfo.getTxnNumber()) {
-            continue;
-        }
-
-        invariant(sessionInfo.getSessionId());
-        LogicalSessionId lsid(*sessionInfo.getSessionId());
-
-        auto txnNumber = *sessionInfo.getTxnNumber();
-        auto opTime = op.getOpTime();
-
-        auto it = latestRecords.find(lsid);
-        if (it != latestRecords.end()) {
-            auto record = makeSessionTxnRecord(lsid, txnNumber, opTime);
-            if (record > it->second) {
-                latestRecords[lsid] = std::move(record);
-            }
-        } else {
-            latestRecords.emplace(lsid, makeSessionTxnRecord(lsid, txnNumber, opTime));
-        }
-    }
-    return latestRecords;
-}
-
 void scheduleTxnTableUpdates(OperationContext* opCtx,
                              OldThreadPool* threadPool,
                              const SessionRecordMap& latestRecords) {
@@ -574,6 +549,19 @@ void scheduleTxnTableUpdates(OperationContext* opCtx,
             Session::updateSessionRecordOnSecondary(opCtx, record);
         });
     }
+}
+
+/**
+ * A session txn record is greater (i.e. later) than another if its transaction number is greater,
+ * or if its transaction number is the same, and its last write optime is greater.
+ *
+ * Records can only be compared meaningfully if they are for the same session id.
+ */
+bool isSessionTxnRecordLaterThan(const SessionTxnRecord& lhs, const SessionTxnRecord& rhs) {
+    invariant(lhs.getSessionId() == rhs.getSessionId());
+
+    return (lhs.getTxnNum() > rhs.getTxnNum()) ||
+        (lhs.getTxnNum() == rhs.getTxnNum() && lhs.getLastWriteOpTime() > rhs.getLastWriteOpTime());
 }
 
 /**
@@ -622,13 +610,23 @@ private:
     StringMap<CollectionProperties> _cache;
 };
 
-// This only modifies the isForCappedCollection field on each op. It does not alter the ops vector
-// in any other way.
-void fillWriterVectors(OperationContext* opCtx,
-                       MultiApplier::Operations* ops,
-                       std::vector<MultiApplier::OperationPtrs>* writerVectors) {
-    const bool supportsDocLocking =
-        getGlobalServiceContext()->getGlobalStorageEngine()->supportsDocLocking();
+/**
+ * ops - This only modifies the isForCappedCollection field on each op. It does not alter the ops
+ *      vector in any other way.
+ * writerVectors - Set of operations for each worker thread to apply.
+ * latestSessionRecords - Populated map of the "latest" transaction table records for each logical
+ *      session id present in the given operations. Each record represents the final state of the
+ *      transaction table entry for that session id after the operations are applied.
+ */
+void fillWriterVectorsAndLastestSessionRecords(
+    OperationContext* opCtx,
+    MultiApplier::Operations* ops,
+    std::vector<MultiApplier::OperationPtrs>* writerVectors,
+    SessionRecordMap* latestSessionRecords) {
+    const auto serviceContext = opCtx->getServiceContext();
+    const auto storageEngine = serviceContext->getGlobalStorageEngine();
+
+    const bool supportsDocLocking = storageEngine->supportsDocLocking();
     const uint32_t numWriters = writerVectors->size();
 
     CachedCollectionProperties collPropertiesCache;
@@ -660,9 +658,27 @@ void fillWriterVectors(OperationContext* opCtx,
             }
         }
 
+        const auto& sessionInfo = op.getOperationSessionInfo();
+        if (sessionInfo.getTxnNumber()) {
+            const auto& lsid = *sessionInfo.getSessionId();
+
+            SessionTxnRecord record;
+            record.setSessionId(lsid);
+            record.setTxnNum(*sessionInfo.getTxnNumber());
+            record.setLastWriteOpTime(op.getOpTime());
+
+            auto it = latestSessionRecords->find(lsid);
+            if (it == latestSessionRecords->end()) {
+                latestSessionRecords->emplace(lsid, std::move(record));
+            } else if (isSessionTxnRecordLaterThan(record, it->second)) {
+                (*latestSessionRecords)[lsid] = std::move(record);
+            }
+        }
+
         auto& writer = (*writerVectors)[hash % numWriters];
-        if (writer.empty())
-            writer.reserve(8);  // skip a few growth rounds.
+        if (writer.empty()) {
+            writer.reserve(8);  // Skip a few growth rounds
+        }
         writer.push_back(&op);
     }
 }
@@ -691,7 +707,8 @@ void tryToGoLiveAsASecondary(OperationContext* opCtx, ReplicationCoordinator* re
     // This needs to happen after the attempt so readers can be sure we've already tried.
     ON_BLOCK_EXIT([] { attemptsToBecomeSecondary.increment(); });
 
-    Lock::GlobalRead readLock(opCtx);
+    // Need global X lock to transition to SECONDARY
+    Lock::GlobalWrite readLock(opCtx);
 
     if (replCoord->getMaintenanceMode()) {
         LOG(1) << "Can't go live (tryToGoLiveAsASecondary) as maintenance mode is active.";
@@ -746,32 +763,53 @@ public:
     }
 
 private:
+    /**
+     * Calculates batch limit size (in bytes) using the maximum capped collection size of the oplog
+     * size.
+     * Batches are limited to 10% of the oplog.
+     */
+    std::size_t _calculateBatchLimitBytes() {
+        auto opCtx = cc().makeOperationContext();
+        auto storageInterface = StorageInterface::get(opCtx.get());
+        auto oplogMaxSizeResult =
+            storageInterface->getOplogMaxSize(opCtx.get(), NamespaceString::kRsOplogNamespace);
+        auto oplogMaxSize = fassertStatusOK(40301, oplogMaxSizeResult);
+        return std::min(oplogMaxSize / 10, std::size_t(replBatchLimitBytes));
+    }
+
+    /**
+     * If slaveDelay is enabled, this function calculates the most recent timestamp of any oplog
+     * entries that can be be returned in a batch.
+     */
+    boost::optional<Date_t> _calculateSlaveDelayLatestTimestamp() {
+        auto service = cc().getServiceContext();
+        auto replCoord = ReplicationCoordinator::get(service);
+        auto slaveDelay = replCoord->getSlaveDelaySecs();
+        if (slaveDelay <= Seconds(0)) {
+            return {};
+        }
+        auto fastClockSource = service->getFastClockSource();
+        return fastClockSource->now() - slaveDelay;
+    }
+
     void run() {
         Client::initThread("ReplBatcher");
-        const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
-        OperationContext& opCtx = *opCtxPtr;
-        const auto replCoord = ReplicationCoordinator::get(&opCtx);
-        const auto fastClockSource = opCtx.getServiceContext()->getFastClockSource();
-        const auto oplogMaxSize = fassertStatusOK(40301,
-                                                  StorageInterface::get(&opCtx)->getOplogMaxSize(
-                                                      &opCtx, NamespaceString::kRsOplogNamespace));
 
-        // Batches are limited to 10% of the oplog.
         BatchLimits batchLimits;
-        batchLimits.bytes = std::min(oplogMaxSize / 10, size_t(replBatchLimitBytes));
+        batchLimits.bytes = _calculateBatchLimitBytes();
 
         while (true) {
-            const auto slaveDelay = replCoord->getSlaveDelaySecs();
-            batchLimits.slaveDelayLatestTimestamp = (slaveDelay > Seconds(0))
-                ? (fastClockSource->now() - slaveDelay)
-                : boost::optional<Date_t>();
+            batchLimits.slaveDelayLatestTimestamp = _calculateSlaveDelayLatestTimestamp();
 
             // Check this once per batch since users can change it at runtime.
             batchLimits.ops = replBatchLimitOperations.load();
 
             OpQueue ops;
             // tryPopAndWaitForMore adds to ops and returns true when we need to end a batch early.
-            while (!_syncTail->tryPopAndWaitForMore(&opCtx, &ops, batchLimits)) {
+            {
+                auto opCtx = cc().makeOperationContext();
+                while (!_syncTail->tryPopAndWaitForMore(opCtx.get(), &ops, batchLimits)) {
+                }
             }
 
             if (ops.empty() && !ops.mustShutdown()) {
@@ -1391,7 +1429,8 @@ StatusWith<OpTime> multiApply(OperationContext* opCtx,
         return {ErrorCodes::BadValue, "invalid apply operation function"};
     }
 
-    if (getGlobalServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
+    const auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    if (storageEngine->isMmapV1()) {
         // Use a ThreadPool to prefetch all the operations in a batch.
         prefetchOps(ops, workerPool);
     }
@@ -1410,18 +1449,20 @@ StatusWith<OpTime> multiApply(OperationContext* opCtx,
                 "attempting to replicate ops while primary"};
     }
 
-    auto latestTxnRecords = computeLatestTransactionTableRecords(ops);
     std::vector<Status> statusVector(workerPool->getNumThreads(), Status::OK());
     {
         // We must wait for the all work we've dispatched to complete before leaving this block
-        // because the spawned threads refer to objects on our stack, including writerVectors.
-        std::vector<MultiApplier::OperationPtrs> writerVectors(workerPool->getNumThreads());
+        // because the spawned threads refer to objects on the stack
         ON_BLOCK_EXIT([&] { workerPool->join(); });
 
         // Write batch of ops into oplog.
         consistencyMarkers->setOplogTruncateAfterPoint(opCtx, ops.front().getTimestamp());
         scheduleWritesToOplog(opCtx, workerPool, ops);
-        fillWriterVectors(opCtx, &ops, &writerVectors);
+
+        std::vector<MultiApplier::OperationPtrs> writerVectors(workerPool->getNumThreads());
+        SessionRecordMap latestSessionRecords;
+        fillWriterVectorsAndLastestSessionRecords(
+            opCtx, &ops, &writerVectors, &latestSessionRecords);
 
         // Wait for writes to finish before applying ops.
         workerPool->join();
@@ -1434,13 +1475,15 @@ StatusWith<OpTime> multiApply(OperationContext* opCtx,
         workerPool->join();
 
         // Update the transaction table to point to the latest oplog entries for each session id.
-        scheduleTxnTableUpdates(opCtx, workerPool, latestTxnRecords);
+        scheduleTxnTableUpdates(opCtx, workerPool, latestSessionRecords);
+        workerPool->join();
 
         // Notify the storage engine that a replication batch has completed.
         // This means that all the writes associated with the oplog entries in the batch are
         // finished and no new writes with timestamps associated with those oplog entries will show
         // up in the future.
-        getGlobalServiceContext()->getGlobalStorageEngine()->replicationBatchIsComplete();
+        const auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+        storageEngine->replicationBatchIsComplete();
     }
 
     // If any of the statuses is not ok, return error.

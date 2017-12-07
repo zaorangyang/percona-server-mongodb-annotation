@@ -39,6 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
@@ -54,6 +55,10 @@ namespace mongo {
 using std::string;
 
 namespace {
+
+const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
+                                                WriteConcernOptions::SyncMode::UNSET,
+                                                Seconds(60));
 
 /**
  * Internal sharding command run on config servers to change a database's primary shard.
@@ -127,19 +132,23 @@ public:
                  str::stream() << "Can't move primary for " << dbname << " database"});
         }
 
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "movePrimary must be called with majority writeConcern, got "
+                              << cmdObj,
+                opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
+
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
         auto const catalogCache = Grid::get(opCtx)->catalogCache();
         auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
 
-        // The first lock is taken to ensure that different movePrimary commands cannot run
-        // concurrently in mixed 3.4 and 3.6 MongoS versions. The second lock is what is
-        // consistently used to lock the actual database.
-        const std::string whyMessage(str::stream() << "Moving primary shard of " << dbname);
-        auto backwardsCompatibleLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
-            opCtx, dbname + "-movePrimary", whyMessage, DistLockManager::kDefaultLockTimeout));
-
-        auto scopedDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
-            opCtx, dbname, whyMessage, DistLockManager::kDefaultLockTimeout));
+        // Remove the backwards compatible lock after 3.6 ships.
+        auto backwardsCompatibleDbDistLock = uassertStatusOK(
+            catalogClient->getDistLockManager()->lock(opCtx,
+                                                      dbname + "-movePrimary",
+                                                      "movePrimary",
+                                                      DistLockManager::kDefaultLockTimeout));
+        auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+            opCtx, dbname, "movePrimary", DistLockManager::kDefaultLockTimeout));
 
         auto dbType = uassertStatusOK(catalogClient->getDatabase(
                                           opCtx, dbname, repl::ReadConcernLevel::kLocalReadConcern))
@@ -170,9 +179,16 @@ public:
             return toShardStatus.getValue();
         }();
 
-        uassert(ErrorCodes::IllegalOperation,
-                "it is already the primary",
-                fromShard->getId() != toShard->getId());
+        if (fromShard->getId() == toShard->getId()) {
+            // We did a local read of the database entry above and found that this movePrimary
+            // request was already satisfied. However, the data may not be majority committed (a
+            // previous movePrimary attempt may have failed with a write concern error).
+            // Since the current Client doesn't know the opTime of the last write to the database
+            // entry, make it wait for the last opTime in the system when we wait for writeConcern.
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+            result << "primary" << toShard->toString();
+            return true;
+        }
 
         log() << "Moving " << dbname << " primary from: " << fromShard->toString()
               << " to: " << toShard->toString();
@@ -223,15 +239,9 @@ public:
             }
         }
 
-        // Update the new primary in the config server metadata
-        {
-            auto dbt =
-                uassertStatusOK(catalogClient->getDatabase(
-                                    opCtx, dbname, repl::ReadConcernLevel::kLocalReadConcern))
-                    .value;
-            dbt.setPrimary(toShard->getId());
-            uassertStatusOK(catalogClient->updateDatabase(opCtx, dbname, dbt));
-        }
+        // Update the new primary in the config server metadata.
+        dbType.setPrimary(toShard->getId());
+        uassertStatusOK(catalogClient->updateDatabase(opCtx, dbname, dbType));
 
         // Ensure the next attempt to retrieve the database or any of its collections will do a full
         // reload

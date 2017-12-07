@@ -19,15 +19,18 @@ selector:
   # 3.6 becomes 'last-stable'.
   - jstests/sharding/covered_shard_key_indexes.js
   # Enable when 3.6 becomes last-stable.
+  - jstests/sharding/configsvr_metadata_commands_require_majority_write_concern.js
   - jstests/sharding/views.js
   - jstests/sharding/view_rewrite.js
   - jstests/sharding/explain_agg_read_pref.js
   - jstests/sharding/max_time_ms_sharded_new_commands.js
+  - jstests/sharding/move_primary_basic.js
   - jstests/sharding/write_cmd_auto_split.js
   - jstests/sharding/index_and_collection_option_propagation.js
   # New feature in v3.6 mongos
   - jstests/sharding/logical_time_metadata.js
   # New feature in v3.6 mongos and mongod.
+  - jstests/sharding/advance_cluster_time_action_type.js
   - jstests/sharding/advance_logical_time_with_valid_signature.js
   - jstests/sharding/after_cluster_time.js
   - jstests/sharding/lookup_change_stream_post_image_id_shard_key.js
@@ -65,14 +68,21 @@ selector:
   - jstests/sharding/uuid_propagated_to_shards_on_setFCV_3_6.js
   - jstests/sharding/write_transactions_during_migration.js
   - jstests/sharding/json_schema.js
+  - jstests/sharding/current_op_no_shards.js
   # New feature in v3.6 mongo shell.
   - jstests/sharding/causal_consistency_shell_support.js
   - jstests/sharding/keys_rotation_interval_sec.js
   # Changes to currentOp format in 3.6.
   - jstests/sharding/features3.js
+  - jstests/sharding/migration_ignore_interrupts_1.js
+  - jstests/sharding/migration_ignore_interrupts_2.js
   - jstests/sharding/migration_ignore_interrupts_3.js
   - jstests/sharding/migration_ignore_interrupts_4.js
+  - jstests/sharding/cleanup_orphaned_cmd_during_movechunk_hashed.js
+  - jstests/sharding/cleanup_orphaned_cmd_during_movechunk.js
   - jstests/sharding/mongos_query_comment.js
+  - jstests/sharding/migration_move_chunk_after_receive.js
+  - jstests/sharding/migration_server_status.js
   - jstests/sharding/sharded_profile.js
   # Changes to cluster listDatabases format in 3.6.
   - jstests/sharding/listDatabases.js
@@ -89,4 +99,5 @@ executor:
         TestData:
           mongosBinVersion: 'last-stable'
           shardMixedBinVersions: true
+          skipCheckingUUIDsConsistentAcrossCluster: true
       nodb: ''

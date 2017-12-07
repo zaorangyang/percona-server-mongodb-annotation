@@ -181,11 +181,12 @@ public:
 
         if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
              repl::ReplicationCoordinator::modeNone) &&
-            (dbname == NamespaceString::kLocalDb)) {
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::IllegalOperation,
-                                              "Cannot drop 'local' database while replication "
-                                              "is active"));
+            ((dbname == NamespaceString::kLocalDb) || (dbname == NamespaceString::kAdminDb))) {
+            return appendCommandStatus(
+                result,
+                Status(ErrorCodes::IllegalOperation,
+                       str::stream() << "Cannot drop '" << dbname
+                                     << "' database while replication is active"));
         }
         BSONElement e = cmdObj.firstElement();
         int p = (int)e.number();
@@ -527,7 +528,7 @@ public:
 
             // Perform index spec validation.
             idIndexSpec = uassertStatusOK(index_key_validate::validateIndexSpec(
-                idIndexSpec, ns, serverGlobalParams.featureCompatibility));
+                opCtx, idIndexSpec, ns, serverGlobalParams.featureCompatibility));
             uassertStatusOK(index_key_validate::validateIdIndexSpec(idIndexSpec));
 
             // Validate or fill in _id index collation.
@@ -700,7 +701,7 @@ public:
                 try {
                     // RELOCKED
                     ctx.reset(new AutoGetCollectionForReadCommand(opCtx, nss));
-                } catch (const StaleConfigException& ex) {
+                } catch (const StaleConfigException&) {
                     LOG(1) << "chunk metadata changed during filemd5, will retarget and continue";
                     break;
                 }

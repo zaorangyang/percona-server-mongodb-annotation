@@ -26,24 +26,52 @@
  *    it in the license file.
  */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+
 #include "mongo/platform/basic.h"
 
-#include "mongo/bson/timestamp.h"
-#include "mongo/db/logical_session_id.h"
-#include "mongo/db/session_txn_record.h"
+#include "mongo/db/ops/find_and_modify_result.h"
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/lasterror.h"
 
 namespace mongo {
+namespace find_and_modify {
+namespace {
 
-SessionTxnRecord makeSessionTxnRecord(LogicalSessionId lsid,
-                                      TxnNumber txnNum,
-                                      repl::OpTime opTime) {
-    SessionTxnRecord record;
-
-    record.setSessionId(lsid);
-    record.setTxnNum(txnNum);
-    record.setLastWriteOpTime(std::move(opTime));
-
-    return record;
+void appendValue(const boost::optional<BSONObj>& value, BSONObjBuilder* builder) {
+    if (value) {
+        builder->append("value", *value);
+    } else {
+        builder->appendNull("value");
+    }
 }
 
+}  // namespace
+
+void serializeRemove(size_t n, const boost::optional<BSONObj>& value, BSONObjBuilder* builder) {
+    BSONObjBuilder lastErrorObjBuilder(builder->subobjStart("lastErrorObject"));
+    builder->appendNumber("n", n);
+    lastErrorObjBuilder.doneFast();
+
+    appendValue(value, builder);
+}
+
+void serializeUpsert(size_t n,
+                     const boost::optional<BSONObj>& value,
+                     bool updatedExisting,
+                     const BSONObj& objInserted,
+                     BSONObjBuilder* builder) {
+    BSONObjBuilder lastErrorObjBuilder(builder->subobjStart("lastErrorObject"));
+    lastErrorObjBuilder.appendNumber("n", n);
+    lastErrorObjBuilder.appendBool("updatedExisting", updatedExisting);
+    if (!objInserted.isEmpty()) {
+        lastErrorObjBuilder.appendAs(objInserted["_id"], kUpsertedFieldName);
+    }
+    lastErrorObjBuilder.doneFast();
+
+    appendValue(value, builder);
+}
+
+}  // namespace find_and_modify
 }  // namespace mongo

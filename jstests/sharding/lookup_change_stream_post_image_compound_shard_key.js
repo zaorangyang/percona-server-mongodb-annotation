@@ -22,7 +22,7 @@
     });
 
     const mongosDB = st.s0.getDB(jsTestName());
-    const mongosColl = mongosDB[jsTestName()];
+    const mongosColl = mongosDB['coll'];
 
     assert.commandWorked(mongosDB.dropDatabase());
 
@@ -70,7 +70,7 @@
         assert.soon(() => changeStream.hasNext());
         let next = changeStream.next();
         assert.eq(next.operationType, "insert");
-        assert.eq(next.documentKey, {_id: id});
+        assert.eq(next.documentKey, Object.merge(shardKeyFromId(id), {_id: id}));
 
         assert.soon(() => changeStream.hasNext());
         next = changeStream.next();

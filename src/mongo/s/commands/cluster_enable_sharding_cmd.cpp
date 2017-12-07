@@ -60,9 +60,8 @@ public:
         return true;
     }
 
-
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
+        return true;
     }
 
     virtual void help(std::stringstream& help) const {
@@ -99,19 +98,15 @@ public:
         ON_BLOCK_EXIT([opCtx, db] { Grid::get(opCtx)->catalogCache()->purgeDatabase(db); });
 
         auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-        auto cmdResponseStatus = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
             "admin",
-            Command::appendPassthroughFields(cmdObj, BSON("_configsvrEnableSharding" << db)),
+            Command::appendMajorityWriteConcern(
+                Command::appendPassthroughFields(cmdObj, BSON("_configsvrEnableSharding" << db))),
             Shard::RetryPolicy::kIdempotent));
-        uassertStatusOK(cmdResponseStatus.commandStatus);
 
-        if (!cmdResponseStatus.writeConcernStatus.isOK()) {
-            appendWriteConcernErrorToCmdResponse(
-                configShard->getId(), cmdResponseStatus.response["writeConcernError"], result);
-        }
-
+        Command::filterCommandReplyForPassthrough(cmdResponse.response, &result);
         return true;
     }
 

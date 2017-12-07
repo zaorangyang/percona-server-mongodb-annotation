@@ -83,13 +83,13 @@ Status persistCollectionAndChangedChunks(OperationContext* opCtx,
                                          const CollectionAndChangedChunks& collAndChunks) {
     // Update the collections collection entry for 'nss' in case there are any new updates.
     ShardCollectionType update = ShardCollectionType(nss,
-                                                     nss,
+                                                     collAndChunks.uuid,
                                                      collAndChunks.epoch,
                                                      collAndChunks.shardKeyPattern,
                                                      collAndChunks.defaultCollation,
                                                      collAndChunks.shardKeyIsUnique);
     Status status = updateShardCollectionsEntry(
-        opCtx, BSON(ShardCollectionType::uuid() << nss.ns()), update.toBSON(), true /*upsert*/);
+        opCtx, BSON(ShardCollectionType::ns() << nss.ns()), update.toBSON(), true /*upsert*/);
     if (!status.isOK()) {
         return status;
     }
@@ -189,7 +189,8 @@ CollectionAndChangedChunks getPersistedMetadataSinceVersion(OperationContext* op
     auto changedChunks = uassertStatusOK(
         readShardChunks(opCtx, nss, diff.query, diff.sort, boost::none, startingVersion.epoch()));
 
-    return CollectionAndChangedChunks{shardCollectionEntry.getEpoch(),
+    return CollectionAndChangedChunks{shardCollectionEntry.getUUID(),
+                                      shardCollectionEntry.getEpoch(),
                                       shardCollectionEntry.getKeyPattern().toBSON(),
                                       shardCollectionEntry.getDefaultCollation(),
                                       shardCollectionEntry.getUnique(),
@@ -282,8 +283,14 @@ ShardServerCatalogCacheLoader::ShardServerCatalogCacheLoader(
 }
 
 ShardServerCatalogCacheLoader::~ShardServerCatalogCacheLoader() {
-    _contexts.interrupt(ErrorCodes::InterruptedAtShutdown);
+    // Prevent further scheduling, then interrupt ongoing tasks.
     _threadPool.shutdown();
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        _contexts.interrupt(ErrorCodes::InterruptedAtShutdown);
+        ++_term;
+    }
+
     _threadPool.join();
     invariant(_contexts.isEmpty());
 }
@@ -314,7 +321,6 @@ void ShardServerCatalogCacheLoader::onStepDown() {
 void ShardServerCatalogCacheLoader::onStepUp() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     invariant(_role != ReplicaSetRole::None);
-    _contexts.resetInterrupt();
     ++_term;
     _role = ReplicaSetRole::Primary;
 }
@@ -340,6 +346,22 @@ std::shared_ptr<Notification<void>> ShardServerCatalogCacheLoader::getChunksSinc
     uassertStatusOK(_threadPool.schedule(
         [ this, nss, version, callbackFn, notify, isPrimary, currentTerm ]() noexcept {
             auto context = _contexts.makeOperationContext(*Client::getCurrent());
+
+            {
+                stdx::lock_guard<stdx::mutex> lock(_mutex);
+                // We may have missed an OperationContextGroup interrupt since this operation began
+                // but before the OperationContext was added to the group. So we'll check that
+                // we're still in the same _term.
+                if (_term != currentTerm) {
+                    callbackFn(context.opCtx(),
+                               Status{ErrorCodes::Interrupted,
+                                      "Unable to refresh routing table because replica set state "
+                                      "changed or node is shutting down."});
+                    notify->set();
+                    return;
+                }
+            }
+
             try {
                 if (isPrimary) {
                     _schedulePrimaryGetChunksSince(

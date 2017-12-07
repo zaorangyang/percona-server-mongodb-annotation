@@ -248,15 +248,9 @@ void BackgroundSync::_runProducer() {
         return;
     }
 
-    // TODO(spencer): Use a condition variable to await loading a config.
-    // TODO(siyuan): Control bgsync with producer state.
-    if (_replCoord->getMemberState().startup()) {
-        // Wait for a config to be loaded
-        sleepsecs(1);
-        return;
-    }
-
-    invariant(!_replCoord->getMemberState().rollback());
+    auto memberState = _replCoord->getMemberState();
+    invariant(!memberState.rollback());
+    invariant(!memberState.startup());
 
     // We need to wait until initial sync has started.
     if (_replCoord->getMyLastAppliedOpTime().isNull()) {
@@ -265,15 +259,16 @@ void BackgroundSync::_runProducer() {
     }
     // we want to start when we're no longer primary
     // start() also loads _lastOpTimeFetched, which we know is set from the "if"
-    auto opCtx = cc().makeOperationContext();
-    if (getState() == ProducerState::Starting) {
-        start(opCtx.get());
+    {
+        auto opCtx = cc().makeOperationContext();
+        if (getState() == ProducerState::Starting) {
+            start(opCtx.get());
+        }
     }
-
-    _produce(opCtx.get());
+    _produce();
 }
 
-void BackgroundSync::_produce(OperationContext* opCtx) {
+void BackgroundSync::_produce() {
     if (MONGO_FAIL_POINT(stopReplProducer)) {
         // This log output is used in js tests so please leave it.
         log() << "bgsync - stopReplProducer fail point "
@@ -314,9 +309,11 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
 
     // find a target to sync from the last optime fetched
     {
-        const OpTime minValidSaved =
-            _replicationProcess->getConsistencyMarkers()->getMinValid(opCtx);
-
+        OpTime minValidSaved;
+        {
+            auto opCtx = cc().makeOperationContext();
+            minValidSaved = _replicationProcess->getConsistencyMarkers()->getMinValid(opCtx.get());
+        }
         stdx::lock_guard<stdx::mutex> lock(_mutex);
         if (_state != ProducerState::Running) {
             return;
@@ -366,6 +363,10 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
 
         // Mark yourself as too stale.
         _tooStale = true;
+
+        // Need to take global X lock to transition out of SECONDARY.
+        auto opCtx = cc().makeOperationContext();
+        Lock::GlobalWrite globalWriteLock(opCtx.get());
 
         error() << "too stale to catch up -- entering maintenance mode";
         log() << "Our newest OpTime : " << lastOpTimeFetched;
@@ -439,9 +440,12 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
     // Set the applied point if unset. This is most likely the first time we've established a sync
     // source since stepping down or otherwise clearing the applied point. We need to set this here,
     // before the OplogWriter gets a chance to append to the oplog.
-    if (_replicationProcess->getConsistencyMarkers()->getAppliedThrough(opCtx).isNull()) {
-        _replicationProcess->getConsistencyMarkers()->setAppliedThrough(
-            opCtx, _replCoord->getMyLastAppliedOpTime());
+    {
+        auto opCtx = cc().makeOperationContext();
+        if (_replicationProcess->getConsistencyMarkers()->getAppliedThrough(opCtx.get()).isNull()) {
+            _replicationProcess->getConsistencyMarkers()->setAppliedThrough(
+                opCtx.get(), _replCoord->getMyLastAppliedOpTime());
+        }
     }
 
     // "lastFetched" not used. Already set in _enqueueDocuments.
@@ -478,7 +482,7 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
         }
         _oplogFetcher = std::move(oplogFetcherPtr);
         oplogFetcher = _oplogFetcher.get();
-    } catch (const mongo::DBException& ex) {
+    } catch (const mongo::DBException&) {
         fassertFailedWithStatus(34440, exceptionToStatus());
     }
 
@@ -513,8 +517,10 @@ void BackgroundSync::_produce(OperationContext* opCtx) {
         // if it can't return a matching oplog start from the last fetch oplog ts field.
         return;
     } else if (fetcherReturnStatus.code() == ErrorCodes::OplogStartMissing) {
-        auto storageInterface = StorageInterface::get(opCtx);
-        _runRollback(opCtx, fetcherReturnStatus, source, syncSourceResp.rbid, storageInterface);
+        auto opCtx = cc().makeOperationContext();
+        auto storageInterface = StorageInterface::get(opCtx.get());
+        _runRollback(
+            opCtx.get(), fetcherReturnStatus, source, syncSourceResp.rbid, storageInterface);
     } else if (fetcherReturnStatus == ErrorCodes::InvalidBSON) {
         Seconds blacklistDuration(60);
         warning() << "Fetcher got invalid BSON while querying oplog. Blacklisting sync source "
