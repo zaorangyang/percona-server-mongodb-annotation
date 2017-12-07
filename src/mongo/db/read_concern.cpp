@@ -181,7 +181,9 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
 }
 }  // namespace
 
-Status waitForReadConcern(OperationContext* opCtx, const repl::ReadConcernArgs& readConcernArgs) {
+Status waitForReadConcern(OperationContext* opCtx,
+                          const repl::ReadConcernArgs& readConcernArgs,
+                          bool allowAfterClusterTime) {
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     invariant(replCoord);
 
@@ -213,7 +215,12 @@ Status waitForReadConcern(OperationContext* opCtx, const repl::ReadConcernArgs& 
 
     auto afterClusterTime = readConcernArgs.getArgsClusterTime();
     if (afterClusterTime) {
-        if (!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36() &&
+        if (!allowAfterClusterTime) {
+            return {ErrorCodes::InvalidOptions, "afterClusterTime is not allowed for this command"};
+        }
+
+        if ((serverGlobalParams.featureCompatibility.getVersion() !=
+             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) &&
             ShardingState::get(opCtx)->enabled()) {
             return {ErrorCodes::InvalidOptions,
                     "readConcern afterClusterTime is not available in featureCompatibilityVersion "

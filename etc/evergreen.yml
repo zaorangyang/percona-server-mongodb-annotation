@@ -146,16 +146,19 @@ variables:
 # Templates used by powercycle
 - &powercycle_remote_credentials
   private_key_file: $(${posix_workdir})/powercycle.pem
-  private_key_remote: ${kitchen_private_key}
-  aws_key_remote: ${kitchen_aws_key}
-  aws_secret_remote: ${kitchen_aws_secret}
+  private_key_remote: ${powercycle_private_key}
+  aws_key_remote: ${powercycle_aws_key}
+  aws_secret_remote: ${powercycle_aws_secret}
 
 # TODO: Remove psutil from virtualenv_requirements when BUILD-3083 is done
 - &powercycle_ec2_instance
   aws_ec2_yml: aws_ec2.yml
   remote_dir: powercycle
+  secret_port: "20001"
+  security_groups: mci powercycle_testing
   ssh_identity: -i ${private_key_file}
-  ssh_key_id: ${kitchen_ssh_key_id}
+  ssh_key_id: ${powercycle_ssh_key_id}
+  standard_port: "20000"
   virtualenv_dir: venv_powercycle
   virtualenv_requirements: psutil
 
@@ -173,12 +176,13 @@ variables:
 
 - &powercycle_test
   ec2_artifacts: ${log_path} ${backup_path_after} ${backup_path_before}
-  program_options: --logLevel debug --backupPathBefore  ${backup_path_before} --backupPathAfter ${backup_path_after}
+  program_options: --logLevel info --backupPathBefore  ${backup_path_before} --backupPathAfter ${backup_path_after}
   connection_options: --sshUserHost ${ip_address} --sshConnection \"${ssh_identity} ${ssh_connection_options}\"
-  test_options: --testLoops 25 --seedDocNum 10000 --rsync --validate remote --canary remote
-  crash_options: --crashMethod internal --crashWaitTime 30 --jitterForCrashWaitTime 5
+  test_options: --testLoops 25 --seedDocNum 10000 --rsync --validate local --canary local
+  crash_options: "--crashMethod aws_ec2 --crashOptions ${instance_id}:private_ip_address --crashWaitTime 30 --jitterForCrashWaitTime 5"
+  client_options: --numCrudClients 10 --numFsmClients 10
   mongodb_options: --rootDir ${remote_dir}-${task_id} --mongodbBinDir ${remote_dir}
-  mongod_options: --dbPath ${db_path} --logPath ${log_path}
+  mongod_options: --mongodUsablePorts ${standard_port} ${secret_port} --dbPath ${db_path} --logPath ${log_path}
   mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1\"
 
 #######################################
@@ -575,6 +579,7 @@ functions:
         PATH="$path_value"                              \
             ${gcov_environment}                         \
             ${rlp_environment}                          \
+            ${lang_environment}                         \
             ${san_options}                              \
             ${san_symbolizer}                           \
             ${snmp_config_path}                         \
@@ -830,56 +835,67 @@ functions:
         fi
 
   "run powercycle test" :
-    command: shell.exec
-    params:
-      working_dir: src
-      script: |
-        set -o verbose
-        set -o errexit
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o verbose
+          set -o errexit
 
-        ${activate_virtualenv}
-        if [ ! -z "${virtualenv_requirements}" ]; then
-          easy_install ${virtualenv_requirements}
-        fi
+          ${activate_virtualenv}
+          if [ ! -z "${virtualenv_requirements}" ]; then
+            pip install ${virtualenv_requirements}
+          fi
 
-        ${set_sudo}
-        if [ ! -z $sudo ]; then
-          remote_sudo="--remoteSudo"
-        fi
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        script: |
+          set -o verbose
+          set -o errexit
 
-        # The virtaulenv bin_dir is different for Linux and Windows
-        bin_dir=$(find $VIRTUAL_ENV -name activate | sed -e "s,$VIRTUAL_ENV,,;s,activate,,;s,/,,g")
-        cmds="source ${virtualenv_dir|venv}/$bin_dir/activate"
-        cmds="$cmds; python -u"
-        # The remote python operates in a virtualenv
-        remote_python="--remotePython \"$cmds\""
+          ${activate_virtualenv}
 
-        start_time=$(date +%s)
-        status="\"pass\""
-        failures=0
+          ${set_sudo}
+          if [ ! -z $sudo ]; then
+            remote_sudo="--remoteSudo"
+          fi
 
-        set +o errexit
-        eval python -u pytests/powertest.py \
-          "${connection_options} \
-          ${program_options}     \
-          $remote_sudo           \
-          $remote_python         \
-          ${test_options}        \
-          ${crash_options}       \
-          ${mongodb_options}     \
-          ${mongod_options}      \
-          ${mongod_extra_options}"
-        exit_code=$?
+          # The virtaulenv bin_dir is different for Linux and Windows
+          bin_dir=$(find $VIRTUAL_ENV -name activate | sed -e "s,$VIRTUAL_ENV,,;s,activate,,;s,/,,g")
+          cmds="source ${virtualenv_dir|venv}/$bin_dir/activate"
+          cmds="$cmds; python -u"
+          # The remote python operates in a virtualenv
+          remote_python="--remotePython \"$cmds\""
 
-        # Create report.json
-        end_time=$(date +%s)
-        elapsed_secs=$((end_time-start_time))
-        if [ $exit_code -ne 0 ]; then
-          status="\"fail\""
-          failures=1
-        fi
-        echo "{\"failures\": $failures, \"results\": [{\"status\": $status, \"exit_code\": $exit_code, \"test_file\": \"${task_name}\", \"start\": $start_time, \"end\": $end_time, \"elapsed\": $elapsed_secs}]}" > report.json
-        exit $exit_code
+          start_time=$(date +%s)
+          status="\"pass\""
+          failures=0
+
+          set +o errexit
+          eval python -u pytests/powertest.py \
+            "${connection_options} \
+            ${program_options}     \
+            $remote_sudo           \
+            $remote_python         \
+            ${test_options}        \
+            ${crash_options}       \
+            ${client_options}      \
+            ${mongodb_options}     \
+            ${mongod_options}      \
+            ${mongod_extra_options}"
+          exit_code=$?
+
+          # Create report.json
+          end_time=$(date +%s)
+          elapsed_secs=$((end_time-start_time))
+          if [ $exit_code -ne 0 ]; then
+            status="\"fail\""
+            failures=1
+          fi
+          echo "{\"failures\": $failures, \"results\": [{\"status\": $status, \"exit_code\": $exit_code, \"test_file\": \"${task_name}\", \"start\": $start_time, \"end\": $end_time, \"elapsed\": $elapsed_secs}]}" > report.json
+          exit $exit_code
 
   "do multiversion setup" :
     command: shell.exec
@@ -1087,11 +1103,17 @@ functions:
 
           set -o errexit
           ${activate_virtualenv}
-          easy_install --upgrade boto3
+          pip install boto3
+
+          for security_group in ${security_groups}
+          do
+            security_groups="$security_groups -s $security_group"
+          done
 
           # Clone another instance of this host in EC2.
           buildscripts/launch_evergreen_ec2_instance.sh \
             -k ${ssh_key_id}                            \
+            $security_groups                            \
             -t "AMI Evergreen ${task_id}"               \
             -y ${aws_ec2_yml}
 
@@ -1220,7 +1242,7 @@ functions:
             cmds="$cmds; virtualenv --python \$python_loc --system-site-packages ${virtualenv_dir|venv}"
             cmds="$cmds; activate=\$(find ${virtualenv_dir|venv} -name 'activate')"
             cmds="$cmds; source \$activate"
-            cmds="$cmds; easy_install ${virtualenv_requirements}"
+            cmds="$cmds; pip install ${virtualenv_requirements}"
             ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
             ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
               --verbose                                        \
@@ -1236,11 +1258,30 @@ functions:
         shell: bash
         working_dir: src
         script: |
+          if [ -z "${ec2_artifacts}" ]; then
+            exit 0
+          fi
+          # Ensure we use the latest ip_address, as it could change if the EC2 instance
+          # has been stopped and started.
+          ${activate_virtualenv}
+          aws_ec2=$(python buildscripts/aws_ec2.py --imageId ${instance_id} --mode status)
+          ip_address=$(echo $aws_ec2 | sed -e "s/.*private_ip_address: //; s/ .*//")
+          sed -i -e "s/${ip_address}/$ip_address/" ${aws_ec2_yml}
+
+    - command: expansions.update
+      params:
+        file: src/${aws_ec2_yml}
+
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src
+        script: |
           # Tar/zip artifacts on remote host.
           if [ -z "${ec2_artifacts}" ]; then
             exit 0
           fi
-          cmd="${tar|tar} czvf ec2_artifacts.tgz ${ec2_artifacts}"
+          cmd="${tar|tar} czf ec2_artifacts.tgz ${ec2_artifacts}"
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
             --verbose                                        \
@@ -1427,6 +1468,27 @@ post:
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
       display_name: Remote EC2 Artifacts - Execution ${execution}
+      optional: true
+
+  # Gather and archive the local client logs.
+  - command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        client_logs=$(ls crud*.log fsm*.log 2> /dev/null)
+        if [ ! -z "$client_logs" ]; then
+          ${tar|tar} czf client-logs.tgz $client_logs
+        fi
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/client-logs.tgz
+      remote_file: mongodb-mongo-master/${build_variant}/${revision}/client_logs/mongo-client-logs-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Client logs - Execution ${execution}
       optional: true
 
   # Process and save coverage data.
@@ -1800,7 +1862,7 @@ tasks:
 
           rm -rf ${install_directory|/data/mongo-install-directory}
 
-          ${compile_env|} ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" core tools dbtest integration_tests dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|} MONGO_VERSION=${version}
+          ${compile_env|} ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" --detect-odr-violations core tools dbtest integration_tests dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|} MONGO_VERSION=${version}
 
           mv mongodb-src-*.${ext|tgz} distsrc.${ext|tgz}
           mv mongodb-*-debugsymbols.${ext|tgz} mongo-debugsymbols.tgz || true
@@ -1948,7 +2010,7 @@ tasks:
             extra_args="$extra_args --jobs=${num_scons_compile_all_jobs_available|}"
           fi
 
-          ${compile_env|} ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" $extra_args all ${additional_targets|} MONGO_VERSION=${version}
+          ${compile_env|} ${python|/opt/mongodbtoolchain/v2/bin/python2} ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" --detect-odr-violations $extra_args all ${additional_targets|} MONGO_VERSION=${version}
 
     - command: s3.put
       params:
@@ -1960,7 +2022,7 @@ tasks:
         permissions: public-read
         content_type: application/json
         display_name: Library Dependency Graph (library_dependency_graph.json)
-        build_variants: [enterprise-ubuntu-dynamic-1604-64-bit]
+        build_variants: [enterprise-ubuntu1604-64]
 
     # Run the C++ unittests as part of compile_all. The compiled binaries are automatically
     # installed into the top-level directory by SCons.
@@ -4026,8 +4088,11 @@ tasks:
   - command: expansions.update
     <<: *powercycle_expansions
   - func: "run powercycle test"
+    # Disable the FSM clients for mmapv1.
+    # mongod will not start if it crashed mongod while creating a namespace (SERVER-26499).
     vars:
       <<: *powercycle_test
+      client_options: --numCrudClients 10 --numFsmClients 0
       mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine mmapv1\"
 
 - name: powercycle_WT
@@ -5325,6 +5390,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-ubuntu1604
+    lang_environment: LANG=C
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     multiversion_platform_arch: "ubuntu1604"
     multiversion_edition: "targeted"
@@ -6694,7 +6760,6 @@ buildvariants:
     gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
-    python: python2.7
     num_jobs_available: 1
     build_mongoreplay: true
   tasks:
@@ -6835,7 +6900,6 @@ buildvariants:
     gorootvars: CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --dbg=on --opt=on -j$(sysctl -n hw.logicalcpu) --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
-    python: python2.7
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -6881,7 +6945,6 @@ buildvariants:
     gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
-    python: python2.7
     num_jobs_available: 1
     build_mongoreplay: true
   tasks:
@@ -6929,7 +6992,6 @@ buildvariants:
     cdriver_configure_flags: --host arm-apple-darwin CC="$(xcrun -f --sdk iphoneos clang)" CXX="$(xcrun -f --sdk iphoneos clang++)" CPPFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 -fembed-bitcode"  CFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 -fembed-bitcode" CXXFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 -fembed-bitcode" LDFLAGS="-miphoneos-version-min=10.2 -arch arm64"
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_ios.vars  CPPPATH="$(dirname $PWD)/mongo-c-driver/install/include/libbson-1.0 $(dirname $PWD)/mongo-c-driver/install/include/libmongoc-1.0" LIBPATH="$(dirname $PWD)/mongo-c-driver/install/lib" all
-    python: python2.7
     disable_unit_tests: true
   tasks:
   - name: compile_all
@@ -6944,7 +7006,6 @@ buildvariants:
     cdriver_configure_flags: --host x86_64-apple-darwin16.6.0 CC="$(xcrun -f --sdk iphonesimulator clang)" CXX="$(xcrun -f --sdk iphonesimulator clang++)" CPPFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"  CFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2" CXXFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2" LDFLAGS="-miphoneos-version-min=10.2"
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_ios_sim.vars CPPPATH="$(dirname $PWD)/mongo-c-driver/install/include/libbson-1.0 $(dirname $PWD)/mongo-c-driver/install/include/libmongoc-1.0" LIBPATH="$(dirname $PWD)/mongo-c-driver/install/lib" all
-    python: python2.7
     disable_unit_tests: true
     enable_ios_sim_tests: true
   tasks:
@@ -6958,7 +7019,6 @@ buildvariants:
   expansions:
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_tvos.vars all
-    python: python2.7
     disable_unit_tests: true
   tasks:
   - name: compile_all
@@ -6971,7 +7031,6 @@ buildvariants:
   expansions:
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_tvos_sim.vars all
-    python: python2.7
     disable_unit_tests: true
   tasks:
   - name: compile_all
@@ -8292,7 +8351,7 @@ buildvariants:
 
 
 - name: enterprise-ubuntu1604-64
-  display_name: Enterprise Ubuntu 16.04
+  display_name: Enterprise Ubuntu 16.04 (+Dagger)
   modules:
   - enterprise
   run_on:
@@ -8304,6 +8363,7 @@ buildvariants:
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
+    lang_environment: LANG=C
     push_arch: x86_64-enterprise-ubuntu1604
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
@@ -8314,6 +8374,7 @@ buildvariants:
     repo_edition: enterprise
     use_scons_cache: true
     build_mongoreplay: true
+    additional_targets: dagger
   tasks:
   - name: compile
     distros:
@@ -8367,6 +8428,7 @@ buildvariants:
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
+    lang_environment: LANG=C
     compile_flags: --link-model=dynamic --ssl CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
     use_scons_cache: true
     build_mongoreplay: true
@@ -9766,6 +9828,7 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
+    lang_environment: LANG=C
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform_arch: "ubuntu1604"
@@ -9929,6 +9992,7 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
+    lang_environment: LANG=C
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
@@ -9977,6 +10041,7 @@ buildvariants:
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
+    lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform_arch: "ubuntu1604"
@@ -10140,6 +10205,7 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
+    lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
@@ -10167,6 +10233,7 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
+    lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
@@ -10317,6 +10384,7 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
+    lang_environment: LANG=C
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     build_mongoreplay: false
@@ -10460,12 +10528,12 @@ buildvariants:
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
+    lang_environment: LANG=C
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --link-model=dynamic
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     use_scons_cache: true
     scons_cache_mode: all
     build_mongoreplay: true
-    additional_targets: dagger
   tasks:
   - name: compile
     distros:

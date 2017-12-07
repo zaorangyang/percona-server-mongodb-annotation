@@ -274,20 +274,28 @@ StatusWithMatchExpression CollectionImpl::parseValidator(
 
     if (ns().isSystem() && !ns().isDropPendingNamespace()) {
         return {ErrorCodes::InvalidOptions,
-                "Document validators not allowed on system collections."};
+                str::stream() << "Document validators not allowed on system collection "
+                              << ns().ns()
+                              << (_uuid ? " with UUID " + _uuid->toString() : "")};
     }
 
     if (ns().isOnInternalDb()) {
         return {ErrorCodes::InvalidOptions,
-                str::stream() << "Document validators are not allowed on collections in"
-                              << " the "
+                str::stream() << "Document validators are not allowed on collection " << ns().ns()
+                              << (_uuid ? " with UUID " + _uuid->toString() : "")
+                              << " in the "
                               << ns().db()
-                              << " database"};
+                              << " internal database"};
     }
 
     boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, _collator.get()));
-    auto statusWithMatcher = MatchExpressionParser::parse(
-        validator, std::move(expCtx), ExtensionsCallbackNoop(), allowedFeatures);
+
+    // The MatchExpression and contained ExpressionContext created as part of the validator are
+    // owned by the Collection and will outlive the OperationContext they were created under.
+    expCtx->opCtx = nullptr;
+
+    auto statusWithMatcher =
+        MatchExpressionParser::parse(validator, expCtx, ExtensionsCallbackNoop(), allowedFeatures);
     if (!statusWithMatcher.isOK())
         return statusWithMatcher.getStatus();
 

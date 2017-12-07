@@ -7,24 +7,8 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     "use strict";
 
     load("jstests/replsets/rslib.js");
+    load("jstests/libs/feature_compatibility_version.js");
     load("jstests/libs/get_index_helpers.js");
-
-    let checkFCV = function(adminDB, version, targetVersion) {
-        let res = adminDB.runCommand({getParameter: 1, featureCompatibilityVersion: 1});
-        assert.commandWorked(res);
-        assert.eq(res.featureCompatibilityVersion, version);
-
-        let doc = adminDB.system.version.findOne({_id: "featureCompatibilityVersion"});
-        assert.eq(doc.version, version);
-
-        // The 'targetVersion' field only exists on v3.6+ binaries, and is only present while an
-        // upgrade or downgrade is in progress.
-        if (targetVersion) {
-            assert.eq(doc.targetVersion, targetVersion);
-        } else {
-            assert.eq(null, doc.targetVersion);
-        }
-    };
 
     let res;
     const latest = "latest";
@@ -58,6 +42,12 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
             null,
             conn,
             "expected mongod to fail when data files are present and no admin database is found.");
+        if (!withUUIDs) {
+            conn =
+                MongoRunner.runMongod({dbpath: dbpath, binVersion: downgrade, noCleanData: true});
+            assert.neq(null, conn, "expected 3.4 to startup when the admin database is missing");
+            MongoRunner.stopMongod(conn);
+        }
 
         // Fail to start up if no featureCompatibilityVersion document is present and non-local
         // databases are present.
@@ -71,6 +61,12 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
             null,
             conn,
             "expected mongod to fail when data files are present and no featureCompatibilityVersion document is found.");
+        if (!withUUIDs) {
+            conn =
+                MongoRunner.runMongod({dbpath: dbpath, binVersion: downgrade, noCleanData: true});
+            assert.neq(null, conn, "expected 3.4 to startup when the FCV document is missing");
+            MongoRunner.stopMongod(conn);
+        }
     };
 
     let setupMissingFCVDoc = function(version, dbpath) {
@@ -204,7 +200,7 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
         null, conn, "mongod was unable to start up with version=" + latest + " and no data files");
     assert.writeOK(conn.getDB("test").coll.insert({a: 5}));
     adminDB = conn.getDB("admin");
-    checkFCV(adminDB, "3.4");
+    checkFCV34(adminDB, "3.4");
     MongoRunner.stopMongod(conn);
 
     conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: latest, noCleanData: true});
@@ -212,6 +208,15 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
                conn,
                "mongod was unable to start up with version=" + latest +
                    " and featureCompatibilityVersion=3.4");
+    adminDB = conn.getDB("admin");
+    checkFCV(adminDB, "3.4");
+    MongoRunner.stopMongod(conn);
+
+    // A 3.6 mongod started with --shardsvr and clean data files gets featureCompatibilityVersion
+    // 3.4.
+    conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: latest, shardsvr: ""});
+    assert.neq(
+        null, conn, "mongod was unable to start up with version=" + latest + " and no data files");
     adminDB = conn.getDB("admin");
     checkFCV(adminDB, "3.4");
     MongoRunner.stopMongod(conn);
@@ -270,7 +275,11 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     conn = setupMissingFCVDoc(downgrade, dbpath);
     recoverMMapJournal(isMMAPv1, conn, dbpath);
     returnCode = runMongoProgram("mongod", "--port", conn.port, "--repair", "--dbpath", dbpath);
-    assert.neq(returnCode, 0, "expected mongod --repair to fail if no collections have UUIDs.");
+    let exitNeedsDowngradeCode = 62;
+    assert.eq(
+        returnCode,
+        exitNeedsDowngradeCode,
+        "Expected running --repair with the latest mongod to fail because no collections have UUIDs. MongoDB 3.4 is required.");
 
     // If the featureCompatibilityVersion document is present but there are no collection UUIDs,
     // --repair should not attempt to restore the document and thus not fassert.
@@ -358,18 +367,13 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     assert.writeOK(
         primaryAdminDB.getSiblingDB("test").coll.insert({awaitRepl: true}, {writeConcern: {w: 3}}));
 
-    // Test that a 3.4 secondary crashes when syncing from a 3.6 primary and the
+    // Test that a 3.4 secondary can no longer replicate from the primary after the
     // featureCompatibilityVersion is set to 3.6.
     assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: "3.6"}));
-    assert.soon(function() {
-        try {
-            secondaryAdminDB.runCommand({ping: 1});
-        } catch (e) {
-            return true;
-        }
-        return false;
-    }, "Expected 3.4 secondary to terminate due to replicating featureCompatibilityVersion=3.6");
-    rst.stop(secondary, undefined, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
+    checkFCV34(secondaryAdminDB, "3.4");
+    assert.writeOK(primaryAdminDB.getSiblingDB("test").coll.insert({shouldReplicate: false}));
+    assert.eq(secondaryAdminDB.getSiblingDB("test").coll.find({shouldReplicate: false}).itcount(),
+              0);
     rst.stopSet();
 
     // A mixed 3.4/3.6 replica set without a featureCompatibilityVersion document unfortunately
@@ -390,7 +394,8 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     assert.eq(res.featureCompatibilityVersion, "3.2");
     res = secondaryAdminDB.runCommand({getParameter: 1, featureCompatibilityVersion: 1});
     assert.commandWorked(res);
-    assert.eq(res.featureCompatibilityVersion, "3.4");
+    assert.eq(res.featureCompatibilityVersion.version, "3.4", tojson(res));
+    assert.eq(res.featureCompatibilityVersion.targetVersion, null, tojson(res));
     rst.stopSet();
 
     //
@@ -466,8 +471,10 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     });
     latestShard.startSet();
     latestShard.initiate();
-    assert.commandWorked(mongosAdminDB.runCommand({addShard: latestShard.getURL()}));
     let latestShardPrimaryAdminDB = latestShard.getPrimary().getDB("admin");
+    // The featureCompatibilityVersion is 3.4 before the shard is added.
+    checkFCV(latestShardPrimaryAdminDB, "3.4");
+    assert.commandWorked(mongosAdminDB.runCommand({addShard: latestShard.getURL()}));
     checkFCV(latestShardPrimaryAdminDB, "3.4");
 
     // Shard some collections before upgrade, to ensure UUIDs are generated for them on upgrade.
@@ -549,7 +556,7 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     downgradeShard.startSet();
     downgradeShard.initiate();
     assert.commandWorked(mongosAdminDB.runCommand({addShard: downgradeShard.getURL()}));
-    checkFCV(downgradeShard.getPrimary().getDB("admin"), "3.4");
+    checkFCV34(downgradeShard.getPrimary().getDB("admin"), "3.4");
 
     // call ShardingTest.stop before shutting down downgradeShard, so that the UUID check in
     // ShardingTest.stop can talk to downgradeShard.

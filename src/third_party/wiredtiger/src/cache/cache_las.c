@@ -27,7 +27,7 @@ __wt_las_stats_update(WT_SESSION_IMPL *session)
 	 * table data-source statistics. If there's no lookaside table, values
 	 * remain 0.
 	 */
-	if (!F_ISSET(conn, WT_CONN_LAS_OPEN))
+	if (!F_ISSET(conn, WT_CONN_LOOKASIDE_OPEN))
 		return;
 
 	/*
@@ -89,24 +89,19 @@ __wt_las_create(WT_SESSION_IMPL *session)
 	WT_RET(__wt_session_create(session, WT_LAS_URI, WT_LAS_FORMAT));
 
 	/*
-	 * Flag that the lookaside table has been created (before creating the
-	 * connection's lookaside table session, it checks before creating a
-	 * lookaside table cursor.
+	 * Open a shared internal session and cursor used for the lookaside
+	 * table. This session should never be tapped for eviction.
 	 */
-	F_SET(conn, WT_CONN_LAS_OPEN);
-
-	/*
-	 * Open a shared internal session used to access the lookaside table.
-	 * This session should never be tapped for eviction.
-	 */
-	session_flags = WT_SESSION_LOOKASIDE_CURSOR | WT_SESSION_NO_EVICTION;
-	WT_ERR(__wt_open_internal_session(
+	session_flags = WT_SESSION_NO_EVICTION;
+	WT_RET(__wt_open_internal_session(
 	    conn, "lookaside table", true, session_flags, &conn->las_session));
+	WT_RET(__wt_las_cursor_open(conn->las_session));
+
+	/* The statistics server is already running, make sure we don't race. */
+	WT_WRITE_BARRIER();
+	F_SET(conn, WT_CONN_LOOKASIDE_OPEN);
 
 	return (0);
-
-err:	F_CLR(conn, WT_CONN_LAS_OPEN);
-	return (ret);
 }
 
 /*
@@ -122,6 +117,7 @@ __wt_las_destroy(WT_SESSION_IMPL *session)
 
 	conn = S2C(session);
 
+	F_CLR(conn, WT_CONN_LOOKASIDE_OPEN);
 	if (conn->las_session == NULL)
 		return (0);
 
@@ -138,15 +134,16 @@ __wt_las_destroy(WT_SESSION_IMPL *session)
  *	Open a new lookaside table cursor.
  */
 int
-__wt_las_cursor_open(WT_SESSION_IMPL *session, WT_CURSOR **cursorp)
+__wt_las_cursor_open(WT_SESSION_IMPL *session)
 {
 	WT_BTREE *btree;
+	WT_CURSOR *cursor;
 	WT_DECL_RET;
 	const char *open_cursor_cfg[] = {
 	    WT_CONFIG_BASE(session, WT_SESSION_open_cursor), NULL };
 
 	WT_WITHOUT_DHANDLE(session, ret = __wt_open_cursor(
-	    session, WT_LAS_URI, NULL, open_cursor_cfg, cursorp));
+	    session, WT_LAS_URI, NULL, open_cursor_cfg, &cursor));
 	WT_RET(ret);
 
 	/*
@@ -154,7 +151,7 @@ __wt_las_cursor_open(WT_SESSION_IMPL *session, WT_CURSOR **cursorp)
 	 * we don't always switch the LAS handle in to the session before
 	 * entering this function.
 	 */
-	btree = ((WT_CURSOR_BTREE *)(*cursorp))->btree;
+	btree = ((WT_CURSOR_BTREE *)cursor)->btree;
 
 	/* Track the lookaside file ID. */
 	if (S2C(session)->las_fileid == 0)
@@ -175,6 +172,9 @@ __wt_las_cursor_open(WT_SESSION_IMPL *session, WT_CURSOR **cursorp)
 		F_SET(btree, WT_BTREE_NO_CHECKPOINT);
 	if (!F_ISSET(btree, WT_BTREE_NO_LOGGING))
 		F_SET(btree, WT_BTREE_NO_LOGGING);
+
+	session->las_cursor = cursor;
+	F_SET(session, WT_SESSION_LOOKASIDE_CURSOR);
 
 	return (0);
 }
@@ -333,7 +333,7 @@ __wt_las_insert_block(WT_SESSION_IMPL *session,
 	insert_cnt = 0;
 
 	btree_id = S2BT(session)->id;
-	las_pageid = multi->las_pageid =
+	las_pageid = multi->page_las.las_pageid =
 	    __wt_atomic_add64(&S2BT(session)->las_pageid, 1);
 
 	/*
@@ -437,6 +437,57 @@ __wt_las_insert_block(WT_SESSION_IMPL *session,
 }
 
 /*
+ * __wt_las_cursor_position --
+ *	Position a lookaside cursor at the beginning of a block.
+ *
+ *	There may be no block of lookaside entries if they have been removed by
+ *	WT_CONNECTION::rollback_to_stable.
+ */
+int
+__wt_las_cursor_position(WT_CURSOR *cursor, uint32_t btree_id, uint64_t pageid)
+{
+	WT_ITEM las_key;
+	uint64_t las_counter, las_pageid;
+	uint32_t las_id;
+	int exact;
+
+	/*
+	 * Because of the special visibility rules for lookaside, a new block
+	 * can appear in between our search and the block of interest.  Keep
+	 * trying until we find it.
+	 */
+	for (;;) {
+		WT_CLEAR(las_key);
+		cursor->set_key(cursor,
+		    btree_id, pageid, (uint64_t)0, &las_key);
+		WT_RET(cursor->search_near(cursor, &exact));
+		if (exact < 0) {
+			WT_RET(cursor->next(cursor));
+
+			/*
+			 * Because of the special visibility rules for
+			 * lookaside, a new block can appear in between our
+			 * search and the block of interest.  Keep trying while
+			 * we have a key lower that we expect.
+			 *
+			 * There may be no block of lookaside entries if they
+			 * have been removed by
+			 * WT_CONNECTION::rollback_to_stable.
+			 */
+			WT_RET(cursor->get_key(cursor,
+			    &las_id, &las_pageid, &las_counter, &las_key));
+			if (las_id < btree_id || (las_id == btree_id &&
+			    pageid != 0 && las_pageid < pageid))
+				continue;
+		}
+
+		return (0);
+	}
+
+	/* NOTREACHED */
+}
+
+/*
  * __wt_las_remove_block --
  *	Remove all records matching a key prefix from the lookaside store.
  */
@@ -448,7 +499,6 @@ __wt_las_remove_block(WT_SESSION_IMPL *session,
 	WT_ITEM las_key;
 	uint64_t las_counter, las_pageid, remove_cnt;
 	uint32_t las_id, session_flags;
-	int exact;
 	bool local_cursor;
 
 	remove_cnt = 0;
@@ -464,10 +514,7 @@ __wt_las_remove_block(WT_SESSION_IMPL *session,
 	 * Search for the block's unique prefix and step through all matching
 	 * records, removing them.
 	 */
-	las_key.size = 0;
-	cursor->set_key(cursor, btree_id, pageid, (uint64_t)0, &las_key);
-	if ((ret = cursor->search_near(cursor, &exact)) == 0 && exact < 0)
-		ret = cursor->next(cursor);
+	ret = __wt_las_cursor_position(cursor, btree_id, pageid);
 	for (; ret == 0; ret = cursor->next(cursor)) {
 		WT_ERR(cursor->get_key(cursor,
 		    &las_id, &las_pageid, &las_counter, &las_key));

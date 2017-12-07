@@ -394,6 +394,11 @@ add_option('disable-warnings-as-errors',
     nargs=0,
 )
 
+add_option('detect-odr-violations',
+    help="Have the linker try to detect ODR violations, if supported",
+    nargs=0,
+)
+
 add_option('variables-help',
     help='Print the help text for SCons variables',
     nargs=0,
@@ -1451,7 +1456,7 @@ else:
     env.AppendUnique( CPPDEFINES=[ 'NDEBUG' ] )
 
 if env.TargetOSIs('linux'):
-    env.Append( LIBS=['m'] )
+    env.Append( LIBS=['m',"resolv"] )
 
 elif env.TargetOSIs('solaris'):
      env.Append( LIBS=["socket","resolv","lgrp"] )
@@ -1459,6 +1464,9 @@ elif env.TargetOSIs('solaris'):
 elif env.TargetOSIs('freebsd'):
     env.Append( LIBS=[ "kvm" ] )
     env.Append( CCFLAGS=[ "-fno-omit-frame-pointer" ] )
+
+elif env.TargetOSIs('darwin'):
+     env.Append( LIBS=["resolv"] )
 
 elif env.TargetOSIs('openbsd'):
     env.Append( LIBS=[ "kvm" ] )
@@ -1620,6 +1628,7 @@ elif env.TargetOSIs('windows'):
             'advapi32.lib',
             'bcrypt.lib',
             'crypt32.lib',
+            'dnsapi.lib',
             'kernel32.lib',
             'shell32.lib',
             'pdh.lib',
@@ -2501,7 +2510,8 @@ def doConfigure(myenv):
         # probably built with GCC. That combination appears to cause
         # false positives for the ODR detector. See SERVER-28133 for
         # additional details.
-        if not (myenv.ToolchainIs('clang') and usingLibStdCxx):
+        if (get_option('detect-odr-violations') and
+                not (myenv.ToolchainIs('clang') and usingLibStdCxx)):
             AddToLINKFLAGSIfSupported(myenv, '-Wl,--detect-odr-violations')
 
         # Disallow an executable stack. Also, issue a warning if any files are found that would

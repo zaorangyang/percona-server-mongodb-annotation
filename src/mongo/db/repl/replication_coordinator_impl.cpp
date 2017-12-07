@@ -969,7 +969,13 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
         AllowNonLocalWritesBlock writesAllowed(opCtx);
         OpTime firstOpTime = _externalState->onTransitionToPrimary(opCtx, isV1ElectionProtocol());
         lk.lock();
-        _topCoord->completeTransitionToPrimary(firstOpTime);
+
+        auto status = _topCoord->completeTransitionToPrimary(firstOpTime);
+        if (status.code() == ErrorCodes::PrimarySteppedDown) {
+            log() << "Transition to primary failed" << causedBy(status);
+            return;
+        }
+        invariantOK(status);
     }
 
     // Must calculate the commit level again because firstOpTimeOfMyTerm wasn't set when we logged
@@ -2444,6 +2450,8 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
         return status;
     }
 
+    _replicationProcess->getConsistencyMarkers()->initializeMinValidDocument(opCtx);
+
     auto lastAppliedOpTime = getMyLastAppliedOpTime();
 
     // Since the JournalListener has not yet been set up, we must manually set our
@@ -2528,7 +2536,7 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator_inlock(
         // _canAcceptNonLocalWrites should already be set above.
         invariant(!_canAcceptNonLocalWrites);
 
-        serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.store(false);
+        serverGlobalParams.validateFeaturesAsMaster.store(false);
         result = kActionCloseAllConnections;
     } else {
         result = kActionFollowerModeStateChange;

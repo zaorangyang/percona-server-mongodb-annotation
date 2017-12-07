@@ -34,7 +34,6 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/close_change_stream_exception.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
@@ -77,7 +76,7 @@ class ChangeStreamStageTestNoSetup : public AggregationContextFixture {
 public:
     ChangeStreamStageTestNoSetup() : ChangeStreamStageTestNoSetup(nss) {}
     ChangeStreamStageTestNoSetup(NamespaceString nsString)
-        : AggregationContextFixture(nsString), _ensureFCV(EnsureFCV::Version::k36) {}
+        : AggregationContextFixture(nsString), _ensureFCV(EnsureFCV::Version::kFullyUpgradedTo36) {}
 
 private:
     EnsureFCV _ensureFCV;
@@ -131,25 +130,30 @@ public:
             DSChangeStream::createFromBson(spec.firstElement(), getExpCtx());
         vector<intrusive_ptr<DocumentSource>> stages(std::begin(result), std::end(result));
 
+        // This match stage is a DocumentSourceOplogMatch, which we explicitly disallow from
+        // executing as a safety mechanism, since it needs to use the collection-default collation,
+        // even if the rest of the pipeline is using some other collation. To avoid ever executing
+        // that stage here, we'll up-convert it from the non-executable DocumentSourceOplogMatch to
+        // a fully-executable DocumentSourceMatch. This is safe because all of the unit tests will
+        // use the 'simple' collation.
         auto match = dynamic_cast<DocumentSourceMatch*>(stages[0].get());
         ASSERT(match);
+        auto executableMatch = DocumentSourceMatch::create(match->getQuery(), getExpCtx());
+
         auto mock = DocumentSourceMock::create(D(entry.toBSON()));
-        match->setSource(mock.get());
+        executableMatch->setSource(mock.get());
 
         // Check the oplog entry is transformed correctly.
         auto transform = stages[1].get();
         ASSERT(transform);
         ASSERT_EQ(string(transform->getSourceName()), DSChangeStream::kStageName);
-        transform->setSource(match);
+        transform->setSource(executableMatch.get());
 
         auto closeCursor = stages.back().get();
         ASSERT(closeCursor);
         closeCursor->setSource(transform);
 
-        // Include the mock stage in the "stages" so it won't get destroyed outside the function
-        // scope.
-        stages.insert(stages.begin(), mock);
-        return stages;
+        return {mock, executableMatch, transform, closeCursor};
     }
 
     OplogEntry createCommand(const BSONObj& oField,
@@ -512,8 +516,7 @@ TEST_F(ChangeStreamStageTest, CloseCursorOnInvalidateEntries) {
     // Transform into invalidate entry.
     ASSERT_DOCUMENT_EQ(next.releaseDocument(), expectedInvalidate);
     // Then throw an exception on the next call of getNext().
-    ASSERT_THROWS_CODE(
-        closeCursor->getNext(), CloseChangeStreamException, ErrorCodes::CloseChangeStream);
+    ASSERT_THROWS(closeCursor->getNext(), ExceptionFor<ErrorCodes::CloseChangeStream>);
 }
 
 TEST_F(ChangeStreamStageTest, CloseCursorEvenIfInvalidateEntriesGetFilteredOut) {
@@ -525,7 +528,7 @@ TEST_F(ChangeStreamStageTest, CloseCursorEvenIfInvalidateEntriesGetFilteredOut) 
     match->setSource(closeCursor.get());
 
     // Throw an exception on the call of getNext().
-    ASSERT_THROWS_CODE(match->getNext(), CloseChangeStreamException, ErrorCodes::CloseChangeStream);
+    ASSERT_THROWS(match->getNext(), ExceptionFor<ErrorCodes::CloseChangeStream>);
 }
 
 TEST_F(ChangeStreamStageTest, CloseCursorOnRetryNeededEntries) {
@@ -544,8 +547,7 @@ TEST_F(ChangeStreamStageTest, CloseCursorOnRetryNeededEntries) {
     // Transform into RetryNeeded entry.
     ASSERT_DOCUMENT_EQ(next.releaseDocument(), expectedRetryNeeded);
     // Then throw an exception on the next call of getNext().
-    ASSERT_THROWS_CODE(
-        closeCursor->getNext(), CloseChangeStreamException, ErrorCodes::CloseChangeStream);
+    ASSERT_THROWS(closeCursor->getNext(), ExceptionFor<ErrorCodes::CloseChangeStream>);
 }
 
 }  // namespace

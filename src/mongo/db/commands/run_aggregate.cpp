@@ -43,7 +43,6 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/close_change_stream_exception.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
@@ -104,7 +103,7 @@ bool handleCursorCommand(OperationContext* opCtx,
 
         try {
             state = cursor->getExecutor()->getNext(&next, nullptr);
-        } catch (const CloseChangeStreamException&) {
+        } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
             // This exception is thrown when a $changeStream stage encounters an event
             // that invalidates the cursor. We should close the cursor and return without
             // error.
@@ -295,7 +294,7 @@ Status waitForMajorityReadConcern(OperationContext* opCtx) {
     if (!originalRC.hasLevel()) {
         // If the read concern level is not specified, upgrade it to "majority".
         const repl::ReadConcernArgs readConcern(repl::ReadConcernLevel::kMajorityReadConcern);
-        auto rcStatus = waitForReadConcern(opCtx, readConcern);
+        auto rcStatus = waitForReadConcern(opCtx, readConcern, true);
         if (!rcStatus.isOK()) {
             return rcStatus;
         }
@@ -478,9 +477,20 @@ Status runAggregate(OperationContext* opCtx,
             pipeline = reparsePipeline(pipeline.get(), request, expCtx);
         }
 
-        // This does mongod-specific stuff like creating the input PlanExecutor and adding
-        // it to the front of the pipeline if needed.
-        PipelineD::prepareCursorSource(collection, nss, &request, pipeline.get());
+        // Prepare a PlanExecutor to provide input into the pipeline, if needed.
+        if (liteParsedPipeline.hasChangeStream()) {
+            // If we are using a change stream, the cursor stage should have a simple collation,
+            // regardless of what the user's collation was.
+            std::unique_ptr<CollatorInterface> collatorForCursor = nullptr;
+            auto collatorStash = expCtx->temporarilyChangeCollator(std::move(collatorForCursor));
+            PipelineD::prepareCursorSource(collection, nss, &request, pipeline.get());
+        } else {
+            PipelineD::prepareCursorSource(collection, nss, &request, pipeline.get());
+        }
+        // Optimize again, since there may be additional optimizations that can be done after adding
+        // the initial cursor stage. Note this has to be done outside the above blocks to ensure
+        // this process uses the correct collation if it does any string comparisons.
+        pipeline->optimizePipeline();
 
         // Transfer ownership of the Pipeline to the PipelineProxyStage.
         unownedPipeline = pipeline.get();

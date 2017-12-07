@@ -27,6 +27,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <string>
 #include <typeinfo>
 
@@ -65,24 +66,16 @@ std::string causedBy(const std::string& e);
 /** Most mongo exceptions inherit from this; this is commonly caught in most threads */
 class DBException : public std::exception {
 public:
-    DBException(const Status& status) : _status(status) {
-        invariant(!status.isOK());
-        traceIfNeeded(*this);
-    }
-    DBException(int code, StringData msg)
-        : DBException(Status(code ? ErrorCodes::fromInt(code) : ErrorCodes::UnknownError, msg)) {}
-    virtual ~DBException() throw() {}
-
-    virtual const char* what() const throw() {
+    const char* what() const throw() final {
         return reason().c_str();
     }
 
-    virtual void addContext(const std::string& str) {
-        _status = Status(code(), str + causedBy(reason()));
+    virtual void addContext(StringData context) {
+        _status.addContext(context);
     }
 
-    Status toStatus(const std::string& context) const {
-        return Status(code(), context + causedBy(*this));
+    Status toStatus(StringData context) const {
+        return _status.withContext(context);
     }
     const Status& toStatus() const {
         return _status;
@@ -100,13 +93,38 @@ public:
         return _status.code();
     }
 
-private:
-    static void traceIfNeeded(const DBException& e);
+    std::string codeString() const {
+        return _status.codeString();
+    }
 
-public:
+    /**
+     * Returns true if this DBException's code is a member of the given category.
+     */
+    template <ErrorCategory category>
+    bool isA() const {
+        return ErrorCodes::isA<category>(code());
+    }
+
     static AtomicBool traceExceptions;
 
 protected:
+    DBException(const Status& status) : _status(status) {
+        invariant(!status.isOK());
+        traceIfNeeded(*this);
+    }
+
+    DBException(int code, StringData msg)
+        : DBException(Status(code ? ErrorCodes::Error(code) : ErrorCodes::UnknownError, msg)) {}
+
+private:
+    static void traceIfNeeded(const DBException& e);
+
+    /**
+     * This method exists only to make all non-final types in this hierarchy abstract to prevent
+     * accidental slicing.
+     */
+    virtual void defineOnlyInFinalSubclassToPreventSlicing() = 0;
+
     Status _status;
 };
 
@@ -114,9 +132,69 @@ class AssertionException : public DBException {
 public:
     AssertionException(const Status& status) : DBException(status) {}
     AssertionException(int code, StringData msg) : DBException(code, msg) {}
-
-    virtual ~AssertionException() throw() {}
 };
+
+/**
+ * The base class of all DBExceptions for codes of the given ErrorCategory to allow catching by
+ * category.
+ */
+template <ErrorCategory kCategory>
+class ExceptionForCat : public virtual AssertionException {
+protected:
+    // This will only be called by subclasses, and they are required to instantiate
+    // AssertionException themselves since it is a virtual base. Therefore, the AssertionException
+    // construction here should never actually execute, but it is required to be present to allow
+    // subclasses to construct us.
+    ExceptionForCat() : AssertionException((std::abort(), Status::OK())) {
+        invariant(isA<kCategory>());
+    }
+};
+
+
+/**
+ * This namespace contains implementation details for our error handling code and should not be used
+ * directly in general code.
+ */
+namespace error_details {
+
+template <ErrorCodes::Error kCode, typename... Bases>
+class ExceptionForImpl final : public Bases... {
+public:
+    MONGO_STATIC_ASSERT(isNamedCode<kCode>);
+
+    ExceptionForImpl(const Status& status) : AssertionException(status) {
+        invariant(status.code() == kCode);
+    }
+
+private:
+    void defineOnlyInFinalSubclassToPreventSlicing() final {}
+};
+
+template <ErrorCodes::Error code, typename categories = ErrorCategoriesFor<code>>
+struct ExceptionForDispatcher;
+
+template <ErrorCodes::Error code, ErrorCategory... categories>
+struct ExceptionForDispatcher<code, CategoryList<categories...>> {
+    using type = std::conditional_t<sizeof...(categories) == 0,
+                                    ExceptionForImpl<code, AssertionException>,
+                                    ExceptionForImpl<code, ExceptionForCat<categories>...>>;
+};
+
+}  // namespace error_details
+
+
+/**
+ * Resolves to the concrete exception type for the given error code.
+ *
+ * It will be a subclass of both AssertionException, along with ExceptionForCat<> of every category
+ * that the code belongs to.
+ *
+ * TODO in C++17 we can combine this with ExceptionForCat by doing something like:
+ * template <auto codeOrCategory> using ExceptionFor = typename
+ *      error_details::ExceptionForDispatcher<decltype(codeOrCategory)>::type;
+ */
+template <ErrorCodes::Error code>
+using ExceptionFor = typename error_details::ExceptionForDispatcher<code>::type;
 
 MONGO_COMPILER_NORETURN void verifyFailed(const char* expr, const char* file, unsigned line);
 MONGO_COMPILER_NORETURN void invariantOKFailed(const char* expr,

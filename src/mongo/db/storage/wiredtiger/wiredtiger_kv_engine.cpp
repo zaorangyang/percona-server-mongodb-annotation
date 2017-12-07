@@ -322,6 +322,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                                        bool readOnly)
     : _eventHandler(WiredTigerUtil::defaultEventHandlers()),
       _clockSource(cs),
+      _oplogManager(stdx::make_unique<WiredTigerOplogManager>()),
       _canonicalName(canonicalName),
       _path(path),
       _sizeStorerSyncTracker(cs, 100000, Seconds(60)),
@@ -495,10 +496,19 @@ void WiredTigerKVEngine::cleanShutdown() {
             closeConfig = "leak_memory=true";
         }
 
-        // Only downgrade when the fCV document has been explicitly initialized and is 3.4.
+        // There are two cases to consider where the server will shutdown before the in-memory FCV
+        // state is set. One is when `EncryptionHooks::restartRequired` is true. The other is when
+        // the server shuts down because it refuses to acknowledge an FCV value more than one
+        // version behind (e.g: 3.6 errors when reading 3.2).
+        //
+        // In the first case, we ideally do not perform a file format downgrade (but it is
+        // acceptable). In the second, the server must downgrade to allow a 3.4 binary to start
+        // up. Ideally, our internal FCV value would allow for older values, even if only to
+        // immediately shutdown. This would allow downstream logic, such as this method, to make
+        // an informed decision.
         const bool needsDowngrade = !_readOnly &&
-            serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.isFullyDowngradedTo34();
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34;
 
         invariantWTOK(_conn->close(_conn, closeConfig));
         _conn = nullptr;
@@ -1111,6 +1121,11 @@ void WiredTigerKVEngine::_setOldestTimestamp(SnapshotName oldestTimestamp) {
                               sizeof(oldestTSConfigString),
                               "oldest_timestamp=%llx",
                               static_cast<unsigned long long>(timestampToSet.asU64()));
+    if (size < 0) {
+        int e = errno;
+        error() << "error snprintf " << errnoWithDescription(e);
+        fassertFailedNoTrace(40661);
+    }
     invariant(static_cast<std::size_t>(size) < sizeof(oldestTSConfigString));
     invariantWTOK(_conn->set_timestamp(_conn, oldestTSConfigString));
     LOG(2) << "oldest_timestamp set to " << timestampToSet.asU64();
@@ -1130,16 +1145,16 @@ bool WiredTigerKVEngine::supportsRecoverToStableTimestamp() const {
     return _checkpointThread->supportsRecoverToStableTimestamp();
 }
 
-void WiredTigerKVEngine::initializeOplogManager(OperationContext* opCtx,
-                                                const std::string& uri,
-                                                WiredTigerRecordStore* oplogRecordStore) {
+void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,
+                                           const std::string& uri,
+                                           WiredTigerRecordStore* oplogRecordStore) {
     stdx::lock_guard<stdx::mutex> lock(_oplogManagerMutex);
     if (_oplogManagerCount == 0)
-        _oplogManager.reset(new WiredTigerOplogManager(opCtx, uri, oplogRecordStore));
+        _oplogManager->start(opCtx, uri, oplogRecordStore);
     _oplogManagerCount++;
 }
 
-void WiredTigerKVEngine::deleteOplogManager() {
+void WiredTigerKVEngine::haltOplogManager() {
     stdx::unique_lock<stdx::mutex> lock(_oplogManagerMutex);
     invariant(_oplogManagerCount > 0);
     _oplogManagerCount--;
@@ -1147,15 +1162,12 @@ void WiredTigerKVEngine::deleteOplogManager() {
         // Destructor may lock the mutex, so we must unlock here.
         // Oplog managers only destruct at shutdown or test exit, so it is safe to unlock here.
         lock.unlock();
-        _oplogManager.reset();
+        _oplogManager->halt();
     }
 }
 
 void WiredTigerKVEngine::replicationBatchIsComplete() const {
-    stdx::lock_guard<stdx::mutex> lock(_oplogManagerMutex);
-    if (_oplogManager) {
-        _oplogManager->triggerJournalFlush();
-    }
+    _oplogManager->triggerJournalFlush();
 }
 
 }  // namespace mongo

@@ -64,14 +64,16 @@ struct __wt_cache {
 	uint64_t bytes_dirty_leaf;
 	uint64_t pages_dirty_leaf;
 	uint64_t bytes_evict;		/* Bytes/pages discarded by eviction */
-	volatile uint64_t pages_evict;
-	uint64_t pages_evicted;		/* Pages evicted during a pass */
+	uint64_t pages_evicted;
 	uint64_t bytes_image;		/* Bytes of disk images */
 	uint64_t bytes_inmem;		/* Bytes/pages in memory */
 	uint64_t pages_inmem;
 	uint64_t bytes_internal;	/* Bytes of internal pages */
 	uint64_t bytes_read;		/* Bytes read into memory */
 	uint64_t bytes_written;
+
+	volatile uint64_t eviction_progress;	/* Eviction progress count */
+	uint64_t last_eviction_progress;/* Tracked eviction progress */
 
 	uint64_t app_waits;		/* User threads waited for cache */
 	uint64_t app_evicts;		/* Pages evicted by user threads */
@@ -111,6 +113,18 @@ struct __wt_cache {
 	u_int overhead_pct;	        /* Cache percent adjustment */
 
 	/*
+	 * Eviction thread tuning information.
+	 */
+	uint32_t evict_tune_datapts_needed;         /* Data needed to tune */
+	struct timespec evict_tune_last_action_time;/* Time of last action */
+	struct timespec evict_tune_last_time;	    /* Time of last check */
+	uint32_t evict_tune_num_points;	            /* Number of values tried */
+	uint64_t evict_tune_progress_last;	    /* Progress counter */
+	uint64_t evict_tune_progress_rate_max;	    /* Max progress rate */
+	bool evict_tune_stable;	                    /* Are we stable? */
+	uint32_t evict_tune_workers_best;           /* Best performing value */
+
+	/*
 	 * Pass interrupt counter.
 	 */
 	volatile uint32_t pass_intr;	/* Interrupt eviction pass. */
@@ -138,20 +152,28 @@ struct __wt_cache {
 #define	WT_EVICT_SCORE_BUMP	10
 #define	WT_EVICT_SCORE_CUTOFF	10
 #define	WT_EVICT_SCORE_MAX	100
-	uint32_t evict_aggressive_score;/* Score of how aggressive eviction
-					   should be about selecting eviction
-					   candidates. If eviction is
-					   struggling to make progress, this
-					   score rises (up to a maximum of
-					   100), at which point the cache is
-					   "stuck" and transaction will be
-					   rolled back. */
-	uint32_t evict_empty_score;	/* Score of how often LRU queues are
-					   empty on refill. This score varies
-					   between 0 (if the queue hasn't been
-					   empty for a long time) and 100 (if
-					   the queue has been empty the last 10
-					   times we filled up. */
+	/*
+	 * Score of how aggressive eviction should be about selecting eviction
+	 * candidates. If eviction is struggling to make progress, this score
+	 * rises (up to a maximum of 100), at which point the cache is "stuck"
+	 * and transaction will be rolled back.
+	 */
+	uint32_t evict_aggressive_score;
+
+	/*
+	 * Score of how often LRU queues are empty on refill. This score varies
+	 * between 0 (if the queue hasn't been empty for a long time) and 100
+	 * (if the queue has been empty the last 10 times we filled up.
+	 */
+	uint32_t evict_empty_score;
+
+	/*
+	 * Score of how much pressure storing historical versions is having on
+	 * eviction.  This score varies between 0, if reconciliation always
+	 * sees updates that are globally visible and hence can be discarded,
+	 * to 100 if no updates are globally visible.
+	 */
+	int32_t evict_lookaside_score;
 
 	/*
 	 * Cache pool information.

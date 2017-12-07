@@ -1808,6 +1808,7 @@ __wt_verbose_config(WT_SESSION_IMPL *session, const char *cfg[])
 		{ "api",		WT_VERB_API },
 		{ "block",		WT_VERB_BLOCK },
 		{ "checkpoint",		WT_VERB_CHECKPOINT },
+		{ "checkpoint_progress",WT_VERB_CHECKPOINT_PROGRESS },
 		{ "compact",		WT_VERB_COMPACT },
 		{ "evict",		WT_VERB_EVICT },
 		{ "evict_stuck",	WT_VERB_EVICT_STUCK },
@@ -2652,8 +2653,15 @@ err:	/* Discard the scratch buffers. */
 		__wt_scr_discard(session);
 	__wt_scr_discard(&conn->dummy_session);
 
-	if (ret != 0)
+	if (ret != 0) {
+		/*
+		 * Set panic if we're returning the run recovery error so that
+		 * we don't try to checkpoint data handles.
+		 */
+		if (ret == WT_RUN_RECOVERY)
+			F_SET(conn, WT_CONN_PANIC);
 		WT_TRET(__wt_connection_close(conn));
+	}
 
 	return (ret);
 }

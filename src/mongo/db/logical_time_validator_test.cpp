@@ -62,8 +62,8 @@ protected:
         ConfigServerTestFixture::setUp();
 
         serverGlobalParams.featureCompatibility.setVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::k36);
-        serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.store(true);
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
+        serverGlobalParams.validateFeaturesAsMaster.store(true);
 
         auto clockSource = stdx::make_unique<ClockSourceMock>();
         operationContext()->getServiceContext()->setFastClockSource(std::move(clockSource));

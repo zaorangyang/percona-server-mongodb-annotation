@@ -268,6 +268,15 @@ struct __wt_connection_impl {
 	uint64_t  ckpt_time_recent;	/* Checkpoint time recent/total */
 	uint64_t  ckpt_time_total;
 
+	/* Checkpoint stats and verbosity timers */
+	struct timespec ckpt_timer_start;
+	struct timespec ckpt_timer_scrub_end;
+
+	/* Checkpoint progress message data */
+	uint64_t ckpt_progress_msg_count;
+	uint64_t ckpt_write_bytes;
+	uint64_t ckpt_write_pages;
+
 	uint32_t stat_flags;		/* Options declared in flags.py */
 
 					/* Connection statistics */
@@ -288,15 +297,6 @@ struct __wt_connection_impl {
 	WT_THREAD_GROUP  evict_threads;
 	uint32_t	 evict_threads_max;/* Max eviction threads */
 	uint32_t	 evict_threads_min;/* Min eviction threads */
-
-	uint32_t         evict_tune_datapts_needed;/* Data needed to tune */
-	struct timespec  evict_tune_last_action_time;/* Time of last action */
-	struct timespec  evict_tune_last_time;	/* Time of last check */
-	uint32_t         evict_tune_num_points;	/* Number of values tried */
-	uint64_t	 evict_tune_pgs_last;	/* Number of pages evicted */
-	uint64_t	 evict_tune_pg_sec_max;	/* Max throughput encountered */
-	bool             evict_tune_stable;	/* Are we stable? */
-	uint32_t	 evict_tune_workers_best;/* Best performing value */
 
 #define	WT_STATLOG_FILENAME	"WiredTigerStat.%d.%H"
 	WT_SESSION_IMPL *stat_session;	/* Statistics log session */
