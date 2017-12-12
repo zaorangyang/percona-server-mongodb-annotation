@@ -354,6 +354,8 @@ StatusWith<DispatchShardPipelineResults> dispatchShardPipeline(
     const bool needsPrimaryShardMerge =
         (pipeline->needsPrimaryShardMerger() || internalQueryAlwaysMergeOnPrimaryShard.load());
 
+    const bool needsMongosMerge = pipeline->needsMongosMerger();
+
     const auto shardQuery = pipeline->getInitialQuery();
 
     auto pipelineForTargetedShards = std::move(pipeline);
@@ -380,11 +382,12 @@ StatusWith<DispatchShardPipelineResults> dispatchShardPipeline(
                 "cluster mid-operation",
                 shardIds.size() > 0);
 
-        // Don't need to split pipeline if we are only targeting a single shard, unless there is a
-        // stage that needs to be run on the primary shard and the single target shard is not the
-        // primary.
+        // Don't need to split the pipeline if we are only targeting a single shard, unless:
+        // - There is a stage that needs to be run on the primary shard and the single target shard
+        //   is not the primary.
+        // - The pipeline contains one or more stages which must always merge on mongoS.
         const bool needsSplit =
-            (shardIds.size() > 1u ||
+            (shardIds.size() > 1u || needsMongosMerge ||
              (needsPrimaryShardMerge && *(shardIds.begin()) != executionNsRoutingInfo.primaryId()));
 
         const bool isSplit = pipelineForTargetedShards->isSplitForShards();
@@ -401,6 +404,16 @@ StatusWith<DispatchShardPipelineResults> dispatchShardPipeline(
         // Generate the command object for the targeted shards.
         BSONObj targetedCommand =
             createCommandForTargetedShards(aggRequest, originalCmdObj, pipelineForTargetedShards);
+
+        // Refresh the shard registry if we're targeting all shards.  We need the shard registry
+        // to be at least as current as the logical time used when creating the command for
+        // $changeStream to work reliably, so we do a "hard" reload.
+        if (mustRunOnAllShards(executionNss, liteParsedPipeline)) {
+            auto* shardRegistry = Grid::get(opCtx)->shardRegistry();
+            if (!shardRegistry->reload(opCtx)) {
+                shardRegistry->reload(opCtx);
+            }
+        }
 
         // Explain does not produce a cursor, so instead we scatter-gather commands to the shards.
         if (expCtx->explain) {

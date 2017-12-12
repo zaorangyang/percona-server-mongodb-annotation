@@ -148,7 +148,6 @@ void _getNextOpTimes(OperationContext* opCtx,
                      Collection* oplog,
                      std::size_t count,
                      OplogSlot* slotsOut) {
-    synchronizeOnOplogInFlightResource(opCtx->lockState());
     auto replCoord = ReplicationCoordinator::get(opCtx);
     long long term = OpTime::kUninitializedTerm;
 
@@ -159,6 +158,8 @@ void _getNextOpTimes(OperationContext* opCtx,
         term = replCoord->getTerm();
     }
 
+    // Allow the storage engine to start the transaction outside the critical section.
+    opCtx->recoveryUnit()->prepareSnapshot();
     stdx::lock_guard<stdx::mutex> lk(newOpMutex);
 
     auto ts = LogicalClock::get(opCtx)->reserveTicks(count).asTimestamp();

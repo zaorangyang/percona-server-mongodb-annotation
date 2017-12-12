@@ -87,8 +87,6 @@ const JSFunctionSpec MongoBase::methods[] = {
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(
         isReplicaSetMember, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(isMongos, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(getClusterTime, MongoLocalInfo, MongoExternalInfo),
-    MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(setClusterTime, MongoLocalInfo, MongoExternalInfo),
     MONGO_ATTACH_JS_CONSTRAINED_METHOD_NO_PROTO(_startSession, MongoLocalInfo, MongoExternalInfo),
     JS_FS_END,
 };
@@ -103,15 +101,6 @@ const JSFunctionSpec MongoExternalInfo::freeFunctions[4] = {
 };
 
 namespace {
-
-/**
- * Mutex and storage for global cluster time via set/getClusterTime.
- *
- * We need this to be global so that we can gossip times seen on one connection across to other
- * connections within the same cluster.
- */
-stdx::mutex logicalTimeMutex;
-BSONObj latestlogicalTime;
 
 const std::shared_ptr<DBClientBase>& getConnectionRef(JS::CallArgs& args) {
     auto ret =
@@ -188,23 +177,6 @@ void setHiddenMongo(JSContext* cx,
     }
 }
 }  // namespace
-
-BSONObj MongoBase::getClusterTime() {
-    stdx::lock_guard<stdx::mutex> lk(logicalTimeMutex);
-    return latestlogicalTime;
-}
-
-void MongoBase::setClusterTime(const BSONObj& newTime) {
-    if (newTime["clusterTime"].eoo())
-        uasserted(ErrorCodes::BadValue, "missing clusterTime field in setClusterTime argument");
-
-    stdx::lock_guard<stdx::mutex> lk(logicalTimeMutex);
-    if (latestlogicalTime.isEmpty() ||
-        SimpleBSONElementComparator::kInstance.evaluate(latestlogicalTime["clusterTime"] <
-                                                        newTime["clusterTime"])) {
-        latestlogicalTime = newTime.getOwned();
-    }
-}
 
 void MongoBase::finalize(JSFreeOp* fop, JSObject* obj) {
     auto conn = static_cast<std::shared_ptr<DBClientBase>*>(JS_GetPrivate(obj));
@@ -778,31 +750,6 @@ void MongoBase::Functions::isMongos::call(JSContext* cx, JS::CallArgs args) {
     auto conn = getConnection(args);
 
     args.rval().setBoolean(conn->isMongos());
-}
-
-void MongoBase::Functions::getClusterTime::call(JSContext* cx, JS::CallArgs args) {
-    auto ct = MongoBase::getClusterTime();
-
-    if (!ct.isEmpty()) {
-        ValueReader(cx, args.rval()).fromBSON(MongoBase::getClusterTime(), nullptr, true);
-        return;
-    }
-
-    args.rval().setUndefined();
-}
-
-void MongoBase::Functions::setClusterTime::call(JSContext* cx, JS::CallArgs args) {
-    if (args.length() != 1)
-        uasserted(ErrorCodes::BadValue, "setClusterTime takes 1 argument");
-
-    if (!args.get(0).isObject())
-        uasserted(ErrorCodes::BadValue, "the parameter to setClusterTime must be an object");
-
-    auto newTime = ObjectWrapper(cx, args.get(0)).toBSON();
-
-    MongoBase::setClusterTime(newTime);
-
-    args.rval().setUndefined();
 }
 
 void MongoBase::Functions::_startSession::call(JSContext* cx, JS::CallArgs args) {
