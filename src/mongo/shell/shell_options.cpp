@@ -348,20 +348,18 @@ Status storeMongoShellOptions(const moe::Environment& params,
     if (params.count("writeMode")) {
         std::string mode = params["writeMode"].as<string>();
         if (mode != "commands" && mode != "legacy" && mode != "compatibility") {
-            throw AssertionException(
-                17396, mongoutils::str::stream() << "Unknown writeMode option: " << mode);
+            uasserted(17396, mongoutils::str::stream() << "Unknown writeMode option: " << mode);
         }
         shellGlobalParams.writeMode = mode;
     }
     if (params.count("readMode")) {
         std::string mode = params["readMode"].as<string>();
         if (mode != "commands" && mode != "compatibility" && mode != "legacy") {
-            throw AssertionException(
-                17397,
-                mongoutils::str::stream()
-                    << "Unknown readMode option: '"
-                    << mode
-                    << "'. Valid modes are: {commands, compatibility, legacy}");
+            uasserted(17397,
+                      mongoutils::str::stream()
+                          << "Unknown readMode option: '"
+                          << mode
+                          << "'. Valid modes are: {commands, compatibility, legacy}");
         }
         shellGlobalParams.readMode = mode;
     }
@@ -369,10 +367,10 @@ Status storeMongoShellOptions(const moe::Environment& params,
         std::string protos = params["rpcProtocols"].as<string>();
         auto parsedRPCProtos = rpc::parseProtocolSet(protos);
         if (!parsedRPCProtos.isOK()) {
-            throw AssertionException(28653,
-                                     str::stream() << "Unknown RPC Protocols: '" << protos
-                                                   << "'. Valid values are {none, opQueryOnly, "
-                                                   << "opCommandOnly, all}");
+            uasserted(28653,
+                      str::stream() << "Unknown RPC Protocols: '" << protos
+                                    << "'. Valid values are {none, opQueryOnly, "
+                                    << "opCommandOnly, all}");
         }
         shellGlobalParams.rpcProtocols = parsedRPCProtos.getValue();
     }
@@ -418,7 +416,8 @@ Status storeMongoShellOptions(const moe::Environment& params,
         return Status(ErrorCodes::BadValue, sb.str());
     }
 
-    if (shellGlobalParams.url.find("mongodb://") == 0) {
+    if ((shellGlobalParams.url.find("mongodb://") == 0) &&
+        (shellGlobalParams.url.find("mongodb+srv://") == 0)) {
         auto cs_status = MongoURI::parse(shellGlobalParams.url);
         if (!cs_status.isOK()) {
             return cs_status.getStatus();

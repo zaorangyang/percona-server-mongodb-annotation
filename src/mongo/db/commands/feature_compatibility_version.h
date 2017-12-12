@@ -41,16 +41,6 @@ class BSONObj;
 class OperationContext;
 
 /**
- * Store state of featureCompatibilityVersion document.
- **/
-struct FeatureCompatibilityVersionInfo {
-    ServerGlobalParams::FeatureCompatibility::Version version;
-
-    FeatureCompatibilityVersionInfo()
-        : version(ServerGlobalParams::FeatureCompatibility::Version::kUnset) {}
-};
-
-/**
  * Startup parameter to ignore featureCompatibilityVersion checks. This parameter cannot be set if
  * the node is started with --replSet, --master, or --slave. This should never be set by end users.
  */
@@ -73,22 +63,22 @@ public:
 
     /**
      * Parses the featureCompatibilityVersion document from admin.system.version, and returns the
-     * version.
+     * state represented by the combination of the targetVersion and version.
      */
-    static StatusWith<FeatureCompatibilityVersionInfo> parse(
+    static StatusWith<ServerGlobalParams::FeatureCompatibility::Version> parse(
         const BSONObj& featureCompatibilityVersionDoc);
 
     static StringData toString(ServerGlobalParams::FeatureCompatibility::Version version) {
         switch (version) {
-            case ServerGlobalParams::FeatureCompatibility::Version::k36:
+            case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36:
                 return FeatureCompatibilityVersionCommandParser::kVersion36;
-            case ServerGlobalParams::FeatureCompatibility::Version::k34:
+            case ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34:
                 return FeatureCompatibilityVersionCommandParser::kVersion34;
             case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo36:
                 return FeatureCompatibilityVersionCommandParser::kVersionUpgradingTo36;
             case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo34:
                 return FeatureCompatibilityVersionCommandParser::kVersionDowngradingTo34;
-            case ServerGlobalParams::FeatureCompatibility::Version::kUnset:
+            case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault34Behavior:
                 return FeatureCompatibilityVersionCommandParser::kVersionUnset;
             default:
                 MONGO_UNREACHABLE;
@@ -118,8 +108,9 @@ public:
     static void unsetTargetUpgradeOrDowngrade(OperationContext* opCtx, StringData version);
 
     /**
-     * If there are no non-local databases and we are not running with --shardsvr, set
-     * featureCompatibilityVersion to the latest value.
+     * If there are no non-local databases, store the featureCompatibilityVersion document. If we
+     * are not running with --shardsvr, set the version to be the upgrade value. If we are running
+     * with --shardsvr, set the version to be the downgrade value.
      */
     static void setIfCleanStartup(OperationContext* opCtx,
                                   repl::StorageInterface* storageInterface);

@@ -42,6 +42,7 @@
 #include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collator_interface.h"
+#include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/tailable_mode.h"
 #include "mongo/util/intrusive_counter.h"
@@ -58,6 +59,38 @@ public:
 
         NamespaceString ns;
         std::vector<BSONObj> pipeline;
+    };
+
+    /**
+     * An RAII type that will temporarily change the ExpressionContext's collator. Resets the
+     * collator to the previous value upon destruction.
+     */
+    class CollatorStash {
+    public:
+        /**
+         * Resets the collator on '_expCtx' to the original collator present at the time this
+         * CollatorStash was constructed.
+         */
+        ~CollatorStash();
+
+    private:
+        /**
+         * Temporarily changes the collator on 'expCtx' to be 'newCollator'. The collator will be
+         * set back to the original value when this CollatorStash is deleted.
+         *
+         * This constructor is private, all CollatorStashes should be created by calling
+         * ExpressionContext::temporarilyChangeCollator().
+         */
+        CollatorStash(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                      std::unique_ptr<CollatorInterface> newCollator);
+
+        friend class ExpressionContext;
+
+        boost::intrusive_ptr<ExpressionContext> _expCtx;
+
+        BSONObj _originalCollation;
+        std::unique_ptr<CollatorInterface> _originalCollatorOwned;
+        const CollatorInterface* _originalCollatorUnowned{nullptr};
     };
 
     /**
@@ -94,6 +127,13 @@ public:
     const ValueComparator& getValueComparator() const {
         return _valueComparator;
     }
+
+    /**
+     * Temporarily resets the collator to be 'newCollator'. Returns a CollatorStash which will reset
+     * the collator back to the old value upon destruction.
+     */
+    std::unique_ptr<CollatorStash> temporarilyChangeCollator(
+        std::unique_ptr<CollatorInterface> newCollator);
 
     /**
      * Returns an ExpressionContext that is identical to 'this' that can be used to execute a
@@ -141,6 +181,8 @@ public:
 
     OperationContext* opCtx;
 
+    const TimeZoneDatabase* timeZoneDatabase;
+
     // Collation requested by the user for this pipeline. Empty if the user did not request a
     // collation.
     BSONObj collation;
@@ -153,8 +195,10 @@ public:
 protected:
     static const int kInterruptCheckPeriod = 128;
 
-    ExpressionContext(NamespaceString nss)
-        : ns(std::move(nss)), variablesParseState(variables.useIdGenerator()) {}
+    ExpressionContext(NamespaceString nss, const TimeZoneDatabase* tzDb)
+        : ns(std::move(nss)),
+          timeZoneDatabase(tzDb),
+          variablesParseState(variables.useIdGenerator()) {}
 
     /**
      * Sets '_ownedCollator' and resets '_collator', 'documentComparator' and 'valueComparator'.
@@ -166,6 +210,8 @@ protected:
         _ownedCollator = std::move(collator);
         setCollator(_ownedCollator.get());
     }
+
+    friend class CollatorStash;
 
     // Collator used for comparisons. This is owned in the context of a Pipeline.
     // TODO SERVER-31294: Move ownership of an aggregation's collator elsewhere.

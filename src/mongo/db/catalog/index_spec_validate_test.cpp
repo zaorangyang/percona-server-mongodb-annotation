@@ -66,8 +66,8 @@ BSONObj sorted(const BSONObj& obj) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfKeyPatternIsNotAnObject) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::TypeMismatch,
               validateIndexSpec(kDefaultOpCtx,
@@ -93,8 +93,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfKeyPatternIsNotAnObject) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfFieldRepeatedInKeyPattern) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::BadValue,
               validateIndexSpec(kDefaultOpCtx,
@@ -114,8 +114,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfFieldRepeatedInKeyPattern) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfKeyPatternIsNotPresent) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::FailedToParse,
               validateIndexSpec(kDefaultOpCtx,
@@ -127,8 +127,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfKeyPatternIsNotPresent) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfNameIsNotAString) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::TypeMismatch,
               validateIndexSpec(kDefaultOpCtx,
@@ -139,8 +139,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfNameIsNotAString) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfNameIsNotPresent) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::FailedToParse,
               validateIndexSpec(kDefaultOpCtx,
@@ -151,8 +151,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfNameIsNotPresent) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfNamespaceIsNotAString) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::TypeMismatch,
               validateIndexSpec(kDefaultOpCtx,
@@ -174,8 +174,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfNamespaceIsNotAString) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfNamespaceIsEmptyString) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::BadValue,
               validateIndexSpec(kDefaultOpCtx,
@@ -189,8 +189,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfNamespaceIsEmptyString) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfNamespaceDoesNotMatch) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::BadValue,
               validateIndexSpec(kDefaultOpCtx,
@@ -215,8 +215,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfNamespaceDoesNotMatch) {
 
 TEST(IndexSpecValidateTest, ReturnsIndexSpecWithNamespaceFilledInIfItIsNotPresent) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -243,8 +243,8 @@ TEST(IndexSpecValidateTest, ReturnsIndexSpecWithNamespaceFilledInIfItIsNotPresen
 
 TEST(IndexSpecValidateTest, ReturnsIndexSpecUnchangedIfNamespaceAndVersionArePresent) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -269,8 +269,8 @@ TEST(IndexSpecValidateTest, ReturnsIndexSpecUnchangedIfNamespaceAndVersionArePre
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsNotANumber) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::TypeMismatch,
               validateIndexSpec(kDefaultOpCtx,
@@ -292,8 +292,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsNotANumber) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsNotRepresentableAsInt) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::BadValue,
               validateIndexSpec(kDefaultOpCtx,
@@ -331,8 +331,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsNotRepresentableAsInt) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsV0) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::CannotCreateIndex,
               validateIndexSpec(kDefaultOpCtx,
@@ -346,8 +346,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsV0) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsUnsupported) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::CannotCreateIndex,
               validateIndexSpec(kDefaultOpCtx,
@@ -373,8 +373,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfVersionIsUnsupported) {
 
 TEST(IndexSpecValidateTest, AcceptsIndexVersionsThatAreAllowedForCreation) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -415,8 +415,8 @@ TEST(IndexSpecValidateTest, AcceptsIndexVersionsThatAreAllowedForCreation) {
 
 TEST(IndexSpecValidateTest, DefaultIndexVersionIsV2) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -443,8 +443,8 @@ TEST(IndexSpecValidateTest, DefaultIndexVersionIsV2) {
 
 TEST(IndexSpecValidateTest, AcceptsIndexVersionV1) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -467,8 +467,8 @@ TEST(IndexSpecValidateTest, AcceptsIndexVersionV1) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsNotAnObject) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::TypeMismatch,
               validateIndexSpec(kDefaultOpCtx,
@@ -498,8 +498,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsNotAnObject) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsEmpty) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::BadValue,
               validateIndexSpec(kDefaultOpCtx,
@@ -513,8 +513,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsEmpty) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsPresentAndVersionIsLessThanV2) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     ASSERT_EQ(ErrorCodes::CannotCreateIndex,
               validateIndexSpec(kDefaultOpCtx,
@@ -531,8 +531,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfCollationIsPresentAndVersionIsLessTh
 
 TEST(IndexSpecValidateTest, AcceptsAnyNonEmptyObjectValueForCollation) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -583,8 +583,8 @@ TEST(IndexSpecValidateTest, AcceptsAnyNonEmptyObjectValueForCollation) {
 
 TEST(IndexSpecValidateTest, AcceptsIndexSpecIfCollationIsPresentAndVersionIsEqualToV2) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -613,8 +613,8 @@ TEST(IndexSpecValidateTest, AcceptsIndexSpecIfCollationIsPresentAndVersionIsEqua
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfUnknownFieldIsPresentInSpecV2) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -630,8 +630,8 @@ TEST(IndexSpecValidateTest, ReturnsAnErrorIfUnknownFieldIsPresentInSpecV2) {
 
 TEST(IndexSpecValidateTest, ReturnsAnErrorIfUnknownFieldIsPresentInSpecV1) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -868,8 +868,8 @@ TEST(IndexSpecCollationValidateTest, FillsInCollationFieldWithCollectionDefaultI
 
 TEST(IndexSpecPartialFilterTest, FailsIfPartialFilterIsNotAnObject) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -883,8 +883,8 @@ TEST(IndexSpecPartialFilterTest, FailsIfPartialFilterIsNotAnObject) {
 
 TEST(IndexSpecPartialFilterTest, FailsIfPartialFilterContainsBannedFeature) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"
@@ -898,8 +898,8 @@ TEST(IndexSpecPartialFilterTest, FailsIfPartialFilterContainsBannedFeature) {
 
 TEST(IndexSpecPartialFilterTest, AcceptsValidPartialFilterExpression) {
     ServerGlobalParams::FeatureCompatibility featureCompatibility;
-    featureCompatibility.setVersion(ServerGlobalParams::FeatureCompatibility::Version::k36);
-    featureCompatibility.validateFeaturesAsMaster.store(true);
+    featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("field" << 1) << "name"

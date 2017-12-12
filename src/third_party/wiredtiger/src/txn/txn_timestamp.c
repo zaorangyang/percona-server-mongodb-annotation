@@ -467,11 +467,11 @@ __wt_txn_global_set_timestamp(WT_SESSION_IMPL *session, const char *cfg[])
 	if (has_oldest || has_stable)
 		WT_RET(__wt_txn_update_pinned_timestamp(session));
 	}
-#else
-		WT_RET_MSG(session, ENOTSUP, "set_timestamp requires a "
-		    "version of WiredTiger built with timestamp support");
-#endif
 	return (0);
+#else
+	WT_RET_MSG(session, ENOTSUP, "set_timestamp requires a "
+	    "version of WiredTiger built with timestamp support");
+#endif
 }
 
 #ifdef HAVE_TIMESTAMPS
@@ -481,8 +481,9 @@ __wt_txn_global_set_timestamp(WT_SESSION_IMPL *session, const char *cfg[])
  *	global stable and/or running transaction commit timestamp.
  */
 int
-__wt_timestamp_validate(WT_SESSION_IMPL *session, wt_timestamp_t *ts,
-    WT_CONFIG_ITEM *cval, bool cmp_oldest, bool cmp_stable, bool cmp_commit)
+__wt_timestamp_validate(WT_SESSION_IMPL *session, const char *name,
+    wt_timestamp_t *ts, WT_CONFIG_ITEM *cval,
+    bool cmp_oldest, bool cmp_stable, bool cmp_commit)
 {
 	WT_TXN *txn = &session->txn;
 	WT_TXN_GLOBAL *txn_global = &S2C(session)->txn_global;
@@ -503,12 +504,12 @@ __wt_timestamp_validate(WT_SESSION_IMPL *session, wt_timestamp_t *ts,
 
 	if (older_than_oldest_ts)
 		WT_RET_MSG(session, EINVAL,
-		    "commit timestamp %.*s older than oldest timestamp",
-		    (int)cval->len, cval->str);
+		    "%s timestamp %.*s older than oldest timestamp",
+		    name, (int)cval->len, cval->str);
 	if (older_than_stable_ts)
 		WT_RET_MSG(session, EINVAL,
-		    "commit timestamp %.*s older than stable timestamp",
-		    (int)cval->len, cval->str);
+		    "%s timestamp %.*s older than stable timestamp",
+		    name, (int)cval->len, cval->str);
 
 	/*
 	 * Compare against the commit timestamp of the current transaction.
@@ -520,9 +521,9 @@ __wt_timestamp_validate(WT_SESSION_IMPL *session, wt_timestamp_t *ts,
 		WT_RET(__wt_timestamp_to_hex_string(
 		    session, hex_timestamp, &txn->first_commit_timestamp));
 		WT_RET_MSG(session, EINVAL,
-		    "commit timestamp %.*s older than the first "
+		    "%s timestamp %.*s older than the first "
 		    "commit timestamp %s for this transaction",
-		    (int)cval->len, cval->str, hex_timestamp);
+		    name, (int)cval->len, cval->str, hex_timestamp);
 	}
 
 	return (0);
@@ -554,7 +555,7 @@ __wt_txn_set_timestamp(WT_SESSION_IMPL *session, const char *cfg[])
 			    "to set a commit_timestamp");
 		WT_RET(__wt_txn_parse_timestamp(session, "commit", &ts, &cval));
 		WT_RET(__wt_timestamp_validate(session,
-		    &ts, &cval, true, true, true));
+		    "commit", &ts, &cval, true, true, true));
 		__wt_timestamp_set(&txn->commit_timestamp, &ts);
 		__wt_txn_set_commit_timestamp(session);
 #else
@@ -685,6 +686,17 @@ __wt_txn_clear_read_timestamp(WT_SESSION_IMPL *session)
 
 	if (!F_ISSET(txn, WT_TXN_PUBLIC_TS_READ))
 		return;
+
+#ifdef HAVE_DIAGNOSTIC
+	{
+	wt_timestamp_t pinned_ts;
+
+	WT_WITH_TIMESTAMP_READLOCK(session, &txn_global->rwlock,
+	    __wt_timestamp_set(&pinned_ts, &txn_global->pinned_timestamp));
+	WT_ASSERT(session,
+	    __wt_timestamp_cmp(&txn->read_timestamp, &pinned_ts) >= 0);
+	}
+#endif
 
 	__wt_writelock(session, &txn_global->read_timestamp_rwlock);
 	TAILQ_REMOVE(&txn_global->read_timestamph, txn, read_timestampq);

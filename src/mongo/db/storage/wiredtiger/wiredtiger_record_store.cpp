@@ -89,23 +89,6 @@ MONGO_FP_DECLARE(WTWriteConflictExceptionForReads);
 
 const std::string kWiredTigerEngineName = "wiredTiger";
 
-class WiredTigerRecordStore::OplogInsertChange final : public RecoveryUnit::Change {
-public:
-    OplogInsertChange(WiredTigerOplogManager* om) : _om(om) {}
-
-    void commit() final {
-        _om->triggerJournalFlush();
-    }
-
-    void rollback() final {
-        // Trigger even on rollback since it might make later commits visible.
-        _om->triggerJournalFlush();
-    }
-
-private:
-    WiredTigerOplogManager* const _om;
-};
-
 class WiredTigerRecordStore::OplogStones::InsertChange final : public RecoveryUnit::Change {
 public:
     InsertChange(OplogStones* oplogStones,
@@ -689,7 +672,7 @@ WiredTigerRecordStore::~WiredTigerRecordStore() {
 
     if (_isOplog) {
         // Delete oplog visibility manager on KV engine.
-        _kvEngine->deleteOplogManager();
+        _kvEngine->haltOplogManager();
     }
 }
 
@@ -733,7 +716,7 @@ void WiredTigerRecordStore::postConstructorInit(OperationContext* opCtx) {
 
     if (_isOplog) {
         invariant(_kvEngine);
-        _kvEngine->initializeOplogManager(opCtx, _uri, this);
+        _kvEngine->startOplogManager(opCtx, _uri, this);
     }
 }
 
@@ -1051,7 +1034,9 @@ bool WiredTigerRecordStore::yieldAndAwaitOplogDeletionRequest(OperationContext* 
 
     // The top-level locks were freed, so also release any potential low-level (storage engine)
     // locks that might be held.
-    opCtx->recoveryUnit()->abandonSnapshot();
+    WiredTigerRecoveryUnit* recoveryUnit = (WiredTigerRecoveryUnit*)opCtx->recoveryUnit();
+    recoveryUnit->abandonSnapshot();
+    recoveryUnit->beginIdle();
 
     // Wait for an oplog deletion request, or for this record store to have been destroyed.
     oplogStones->awaitHasExcessStonesOrDead();
@@ -1130,12 +1115,6 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
     WT_CURSOR* c = curwrap.get();
     invariant(c);
 
-    if (_isOplog) {
-        // Register a change to notify the oplog journal flusher thread when this transaction
-        // finishes.
-        opCtx->recoveryUnit()->registerChange(new OplogInsertChange(_kvEngine->getOplogManager()));
-    }
-
     RecordId highestId = RecordId();
     dassert(nRecords != 0);
     for (size_t i = 0; i < nRecords; i++) {
@@ -1202,7 +1181,7 @@ StatusWith<RecordId> WiredTigerRecordStore::insertRecord(
 
 bool WiredTigerRecordStore::isOpHidden_forTest(const RecordId& id) const {
     invariant(id.repr() > 0);
-    invariant(_kvEngine->getOplogManager());
+    invariant(_kvEngine->getOplogManager()->isRunning());
     return _kvEngine->getOplogManager()->getOplogReadTimestamp() <
         static_cast<std::uint64_t>(id.repr());
 }
@@ -1504,7 +1483,7 @@ Status WiredTigerRecordStore::touch(OperationContext* opCtx, BSONObjBuilder* out
 
 void WiredTigerRecordStore::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const {
     auto oplogManager = _kvEngine->getOplogManager();
-    if (oplogManager) {
+    if (oplogManager->isRunning()) {
         oplogManager->waitForAllEarlierOplogWritesToBeVisible(this, opCtx);
     }
 }
@@ -1670,6 +1649,11 @@ void WiredTigerRecordStore::cappedTruncateAfter(OperationContext* opCtx,
                                   sizeof(commitTSConfigString),
                                   "commit_timestamp=%llx",
                                   truncTs.asULL());
+        if (size < 0) {
+            int e = errno;
+            error() << "error snprintf " << errnoWithDescription(e);
+            fassertFailedNoTrace(40662);
+        }
 
         invariant(static_cast<std::size_t>(size) < sizeof(commitTSConfigString));
         auto conn = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn();

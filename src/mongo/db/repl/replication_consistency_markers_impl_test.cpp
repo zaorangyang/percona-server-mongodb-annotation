@@ -288,6 +288,55 @@ TEST_F(ReplicationConsistencyMarkersTest, ReplicationConsistencyMarkers) {
     ASSERT_FALSE(recoveryUnit->waitUntilDurableCalled);
 }
 
+TEST_F(ReplicationConsistencyMarkersTest, SetMinValidOnPVChange) {
+    auto minValidNss = makeNamespace(_agent, "minValid");
+    auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
+    auto checkpointTimestampNss = makeNamespace(_agent, "checkpointTimestamp");
+
+    ReplicationConsistencyMarkersImpl consistencyMarkers(
+        getStorageInterface(), minValidNss, oplogTruncateAfterPointNss, checkpointTimestampNss);
+    auto opCtx = getOperationContext();
+    consistencyMarkers.initializeMinValidDocument(opCtx);
+
+    auto advanceAndCheckMinValidOpTime = [&](OpTime advanceTo, OpTime expected) {
+        consistencyMarkers.setMinValidToAtLeast(opCtx, advanceTo);
+        ASSERT_EQUALS(expected, consistencyMarkers.getMinValid(opCtx));
+    };
+
+    // Set minValid in PV 1.
+    OpTime startOpTime({Seconds(20), 0}, 1LL);
+    advanceAndCheckMinValidOpTime(startOpTime, startOpTime);
+
+    // In rollback, minValid is when the date becomes consistent and never goes back.
+    OpTime rollbackOpTime({Seconds(10), 0}, 1LL);
+    advanceAndCheckMinValidOpTime(rollbackOpTime, startOpTime);
+
+    // Writes arrive, so minValid advances.
+    OpTime opTime1({Seconds(30), 0}, 1LL);
+    advanceAndCheckMinValidOpTime(opTime1, opTime1);
+
+    // A new term starts and oplog diverges, so the timestamp is lower.
+    OpTime newTermOpTime({Seconds(20), 0}, 2LL);
+    advanceAndCheckMinValidOpTime(newTermOpTime, newTermOpTime);
+
+    // We should never advance minValid to a lower term, but verify it never goes back even if the
+    // timestamp is higher.
+    OpTime invalidOpTime({Seconds(80), 0}, 1LL);
+    advanceAndCheckMinValidOpTime(invalidOpTime, newTermOpTime);
+
+    // PV downgrade to PV0
+    OpTime downgradeOpTime({Seconds(50), 0}, -1LL);
+    advanceAndCheckMinValidOpTime(downgradeOpTime, downgradeOpTime);
+
+    // Writes arrive in PV0.
+    OpTime opTime2({Seconds(60), 0}, -1LL);
+    advanceAndCheckMinValidOpTime(opTime2, opTime2);
+
+    // PV upgrade again.
+    OpTime upgradeOpTime({Seconds(70), 0}, 0LL);
+    advanceAndCheckMinValidOpTime(upgradeOpTime, upgradeOpTime);
+}
+
 TEST_F(ReplicationConsistencyMarkersTest, OplogTruncateAfterPointUpgrade) {
     auto minValidNss = makeNamespace(_agent, "minValid");
     auto oplogTruncateAfterPointNss = makeNamespace(_agent, "oplogTruncateAfterPoint");
@@ -317,7 +366,7 @@ TEST_F(ReplicationConsistencyMarkersTest, OplogTruncateAfterPointUpgrade) {
 
     // Set the feature compatibility version to 3.6.
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::k36);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     // Check that we see no oplog truncate after point in FCV 3.6.
     ASSERT(consistencyMarkers.getOplogTruncateAfterPoint(opCtx).isNull());
@@ -325,7 +374,7 @@ TEST_F(ReplicationConsistencyMarkersTest, OplogTruncateAfterPointUpgrade) {
 
     // Set the feature compatibility version to 3.4.
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::k34);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34);
 
     // Check that we see the old oplog delete from point in FCV 3.4.
     ASSERT_EQ(consistencyMarkers.getOplogTruncateAfterPoint(opCtx), time1);
@@ -348,7 +397,7 @@ TEST_F(ReplicationConsistencyMarkersTest, OplogTruncateAfterPointUpgrade) {
 
     // Set the feature compatibility version to 3.6.
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::k36);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 
     // Check that after removing the old oplog delete from point, that we do not see the oplog
     // truncate after point in FCV 3.6.

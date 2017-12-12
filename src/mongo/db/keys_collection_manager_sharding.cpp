@@ -190,8 +190,8 @@ void KeysCollectionManagerSharding::PeriodicRunner::refreshNow(OperationContext*
         stdx::lock_guard<stdx::mutex> lk(_mutex);
 
         if (_inShutdown) {
-            throw DBException(ErrorCodes::ShutdownInProgress,
-                              "aborting keys cache refresh because node is shutting down");
+            uasserted(ErrorCodes::ShutdownInProgress,
+                      "aborting keys cache refresh because node is shutting down");
         }
 
         if (_refreshRequest) {
@@ -207,7 +207,7 @@ void KeysCollectionManagerSharding::PeriodicRunner::refreshNow(OperationContext*
     // waitFor also throws if timeout, so also throw when notification was not satisfied after
     // waiting.
     if (!refreshRequest->waitFor(opCtx, kDefaultRefreshWaitTime)) {
-        throw DBException(ErrorCodes::ExceededTimeLimit, "timed out waiting for refresh");
+        uasserted(ErrorCodes::ExceededTimeLimit, "timed out waiting for refresh");
     }
 }
 
@@ -216,8 +216,6 @@ void KeysCollectionManagerSharding::PeriodicRunner::_doPeriodicRefresh(
     Client::initThreadIfNotAlready(threadName);
 
     while (true) {
-        auto opCtx = cc().makeOperationContext();
-
         bool hasRefreshRequestInitially = false;
         unsigned errorCount = 0;
         std::shared_ptr<RefreshFunc> doRefresh;
@@ -236,7 +234,10 @@ void KeysCollectionManagerSharding::PeriodicRunner::_doPeriodicRefresh(
         Milliseconds nextWakeup = kRefreshIntervalIfErrored;
 
         // No need to refresh keys in FCV 3.4, since key generation will be disabled.
-        if (serverGlobalParams.featureCompatibility.isFullyUpgradedTo36()) {
+        if (serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
+            auto opCtx = cc().makeOperationContext();
+
             auto latestKeyStatusWith = (*doRefresh)(opCtx.get());
             if (latestKeyStatusWith.getStatus().isOK()) {
                 errorCount = 0;
@@ -284,6 +285,9 @@ void KeysCollectionManagerSharding::PeriodicRunner::_doPeriodicRefresh(
         if (_inShutdown) {
             break;
         }
+
+        // Use a new opCtx so we won't be holding any RecoveryUnit while this thread goes to sleep.
+        auto opCtx = cc().makeOperationContext();
 
         MONGO_IDLE_THREAD_BLOCK;
         auto sleepStatus = opCtx->waitForConditionOrInterruptNoAssertUntil(

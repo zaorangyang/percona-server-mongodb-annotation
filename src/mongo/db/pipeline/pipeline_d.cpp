@@ -200,7 +200,7 @@ public:
     StatusWith<std::unique_ptr<Pipeline, Pipeline::Deleter>> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        const MakePipelineOptions opts) final {
+        const MakePipelineOptions opts = MakePipelineOptions{}) final {
         // 'expCtx' may represent the settings for an aggregation pipeline on a different namespace
         // than the DocumentSource this MongodProcessInterface is injected into, but both
         // ExpressionContext instances should still have the same OperationContext.
@@ -257,6 +257,9 @@ public:
                 !bool(css->getMetadata()));
 
         PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline);
+        // Optimize again, since there may be additional optimizations that can be done after adding
+        // the initial cursor stage.
+        pipeline->optimizePipeline();
 
         return Status::OK();
     }
@@ -379,6 +382,27 @@ public:
             result.emplace_back("_id");
         }
         return result;
+    }
+
+    boost::optional<Document> lookupSingleDocument(const intrusive_ptr<ExpressionContext>& expCtx,
+                                                   const Document& filter) final {
+        auto swPipeline = makePipeline({BSON("$match" << filter)}, expCtx);
+        if (swPipeline == ErrorCodes::NamespaceNotFound) {
+            return boost::none;
+        }
+        auto pipeline = uassertStatusOK(std::move(swPipeline));
+
+        auto lookedUpDocument = pipeline->getNext();
+        if (auto next = pipeline->getNext()) {
+            uasserted(ErrorCodes::TooManyMatchingDocuments,
+                      str::stream() << "found more than one document matching " << filter.toString()
+                                    << " ["
+                                    << lookedUpDocument->toString()
+                                    << ", "
+                                    << next->toString()
+                                    << "]");
+        }
+        return lookedUpDocument;
     }
 
 private:
@@ -839,11 +863,7 @@ void PipelineD::addCursorSource(Collection* collection,
 
         pSource->setProjection(deps.toProjection(), deps.toParsedDeps());
     }
-
-    // Add the initial DocumentSourceCursor to the front of the pipeline. Then optimize again in
-    // case the new stage can be absorbed with the first stages of the pipeline.
     pipeline->addInitialSource(pSource);
-    pipeline->optimizePipeline();
 }
 
 Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {

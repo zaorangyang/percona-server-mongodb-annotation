@@ -36,15 +36,19 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
 
+namespace mongo {
 namespace {
-
-using mongo::ErrorCodes;
-using mongo::Status;
 
 TEST(Basic, Accessors) {
     Status status(ErrorCodes::MaxError, "error");
     ASSERT_EQUALS(status.code(), ErrorCodes::MaxError);
     ASSERT_EQUALS(status.reason(), "error");
+}
+
+TEST(Basic, IsA) {
+    ASSERT(!Status(ErrorCodes::BadValue, "").isA<ErrorCategory::Interruption>());
+    ASSERT(Status(ErrorCodes::Interrupted, "").isA<ErrorCategory::Interruption>());
+    ASSERT(!Status(ErrorCodes::Interrupted, "").isA<ErrorCategory::ShutdownError>());
 }
 
 TEST(Basic, OKIsAValidStatus) {
@@ -56,6 +60,18 @@ TEST(Basic, Compare) {
     Status errMax(ErrorCodes::MaxError, "error");
     ASSERT_EQ(errMax, errMax);
     ASSERT_NE(errMax, Status::OK());
+}
+
+TEST(Basic, WithContext) {
+    const Status orig(ErrorCodes::MaxError, "error");
+
+    const auto copy = orig.withContext("context");
+    ASSERT_EQ(copy.code(), ErrorCodes::MaxError);
+    ASSERT(str::startsWith(copy.reason(), "context ")) << copy.reason();
+    ASSERT(str::endsWith(copy.reason(), " error")) << copy.reason();
+
+    ASSERT_EQ(orig.code(), ErrorCodes::MaxError);
+    ASSERT_EQ(orig.reason(), "error");
 }
 
 TEST(Cloning, Copy) {
@@ -195,10 +211,10 @@ TEST(Cloning, OKIsNotRefCounted) {
 }
 
 TEST(Parsing, CodeToEnum) {
-    ASSERT_EQUALS(ErrorCodes::TypeMismatch, ErrorCodes::fromInt(ErrorCodes::TypeMismatch));
-    ASSERT_EQUALS(ErrorCodes::UnknownError, ErrorCodes::fromInt(ErrorCodes::UnknownError));
-    ASSERT_EQUALS(ErrorCodes::MaxError, ErrorCodes::fromInt(ErrorCodes::MaxError));
-    ASSERT_EQUALS(ErrorCodes::OK, ErrorCodes::fromInt(0));
+    ASSERT_EQUALS(ErrorCodes::TypeMismatch, ErrorCodes::Error(int(ErrorCodes::TypeMismatch)));
+    ASSERT_EQUALS(ErrorCodes::UnknownError, ErrorCodes::Error(int(ErrorCodes::UnknownError)));
+    ASSERT_EQUALS(ErrorCodes::MaxError, ErrorCodes::Error(int(ErrorCodes::MaxError)));
+    ASSERT_EQUALS(ErrorCodes::OK, ErrorCodes::duplicateCodeForTest(0));
 }
 
 TEST(Transformers, ExceptionToStatus) {
@@ -209,7 +225,7 @@ TEST(Transformers, ExceptionToStatus) {
 
     Status fromDBExcept = [=]() {
         try {
-            throw DBException(ErrorCodes::TypeMismatch, reason);
+            uasserted(ErrorCodes::TypeMismatch, reason);
         } catch (...) {
             return exceptionToStatus();
         }
@@ -249,4 +265,5 @@ TEST(Transformers, ExceptionToStatus) {
     ASSERT_TRUE(fromBoostExcept.reason().find("boost::exception") != std::string::npos);
 }
 
-}  // unnamed namespace
+}  // namespace
+}  // namespace mongo

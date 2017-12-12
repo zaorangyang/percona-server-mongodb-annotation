@@ -49,7 +49,6 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
-
 namespace {
 
 const auto kOplogField = "oplog";
@@ -75,9 +74,9 @@ BSONObj buildMigrateSessionCmd(const MigrationSessionId& migrationSessionId) {
 }
 
 /**
- * Determines whether the oplog entry has a link to either preImage/postImage and return
- * a new oplogLink that contains the same link, but pointing to lastResult.oplogTime. For example,
- * if entry has link to preImageTs, this returns an oplogLink with preImageTs pointing to
+ * Determines whether the oplog entry has a link to either preImage/postImage and return a new
+ * oplogLink that contains the same link, but pointing to lastResult.oplogTime. For example, if
+ * entry has link to preImageTs, this returns an oplogLink with preImageTs pointing to
  * lastResult.oplogTime.
  *
  * It is an error to have both preImage and postImage as well as not having them at all.
@@ -242,11 +241,25 @@ ProcessOplogResult processSessionOplog(OperationContext* opCtx,
     result.txnNum = sessionInfo.getTxnNumber().value();
     const auto stmtId = *oplogEntry.getStatementId();
 
+    // Session oplog entries must always contain wall clock time, because we will not be
+    // transferring anything from a previous version of the server
+    invariant(oplogEntry.getWallClockTime());
+
     auto scopedSession = SessionCatalog::get(opCtx)->getOrCreateSession(opCtx, result.sessionId);
     scopedSession->beginTxn(opCtx, result.txnNum);
 
-    if (scopedSession->checkStatementExecuted(opCtx, result.txnNum, stmtId)) {
-        return lastResult;
+    try {
+        if (scopedSession->checkStatementExecuted(opCtx, result.txnNum, stmtId)) {
+            return lastResult;
+        }
+    } catch (const DBException& ex) {
+        if (ex.code() != ErrorCodes::IncompleteTransactionHistory) {
+            throw;
+        }
+
+        if (stmtId == kIncompleteHistoryStmtId) {
+            return lastResult;
+        }
     }
 
     BSONObj object(result.isPrePostImage
@@ -255,55 +268,54 @@ ProcessOplogResult processSessionOplog(OperationContext* opCtx,
     auto oplogLink = extractPrePostImageTs(lastResult, oplogEntry);
     oplogLink.prevOpTime = scopedSession->getLastWriteOpTime(result.txnNum);
 
-    writeConflictRetry(opCtx,
-                       "SessionOplogMigration",
-                       NamespaceString::kSessionTransactionsTableNamespace.ns(),
-                       [&] {
-                           // Need to take global lock here so repl::logOp will not unlock it and
-                           // trigger the invariant that disallows unlocking global lock while
-                           // inside a WUOW. Grab a DBLock here instead of plain GlobalLock to make
-                           // sure the MMAPV1 flush lock will be lock/unlocked correctly. Take the
-                           // transaction table db lock to ensure the same lock ordering with normal
-                           // replicated updates to the table.
-                           Lock::DBLock lk(opCtx,
-                                           NamespaceString::kSessionTransactionsTableNamespace.db(),
-                                           MODE_IX);
-                           WriteUnitOfWork wunit(opCtx);
+    writeConflictRetry(
+        opCtx,
+        "SessionOplogMigration",
+        NamespaceString::kSessionTransactionsTableNamespace.ns(),
+        [&] {
+            // Need to take global lock here so repl::logOp will not unlock it and trigger the
+            // invariant that disallows unlocking global lock while inside a WUOW. Grab a DBLock
+            // here instead of plain GlobalLock to make sure the MMAPV1 flush lock will be
+            // lock/unlocked correctly. Take the transaction table db lock to ensure the same lock
+            // ordering with normal replicated updates to the table.
+            Lock::DBLock lk(
+                opCtx, NamespaceString::kSessionTransactionsTableNamespace.db(), MODE_IX);
+            WriteUnitOfWork wunit(opCtx);
 
-                           result.oplogTime = repl::logOp(opCtx,
-                                                          "n",
-                                                          oplogEntry.getNamespace(),
-                                                          oplogEntry.getUuid(),
-                                                          object,
-                                                          &object2,
-                                                          true,
-                                                          sessionInfo,
-                                                          stmtId,
-                                                          oplogLink);
+            result.oplogTime = repl::logOp(opCtx,
+                                           "n",
+                                           oplogEntry.getNamespace(),
+                                           oplogEntry.getUuid(),
+                                           object,
+                                           &object2,
+                                           true,
+                                           *oplogEntry.getWallClockTime(),
+                                           sessionInfo,
+                                           stmtId,
+                                           oplogLink);
 
-                           auto oplogOpTime = result.oplogTime;
-                           uassert(40633,
-                                   str::stream()
-                                       << "Failed to create new oplog entry for oplog with opTime: "
-                                       << oplogEntry.getOpTime().toString()
-                                       << ": "
-                                       << redact(oplogBSON),
-                                   !oplogOpTime.isNull());
+            auto oplogOpTime = result.oplogTime;
+            uassert(40633,
+                    str::stream() << "Failed to create new oplog entry for oplog with opTime: "
+                                  << oplogEntry.getOpTime().toString()
+                                  << ": "
+                                  << redact(oplogBSON),
+                    !oplogOpTime.isNull());
 
-                           // Do not call onWriteOpCompletedOnPrimary if we inserted a pre/post
-                           // image, because
-                           // the next oplog will contain the real operation.
-                           if (!result.isPrePostImage) {
-                               scopedSession->onWriteOpCompletedOnPrimary(
-                                   opCtx, result.txnNum, {stmtId}, oplogOpTime);
-                           }
+            // Do not call onWriteOpCompletedOnPrimary if we inserted a pre/post image, because the
+            // next oplog will contain the real operation
+            if (!result.isPrePostImage) {
+                scopedSession->onMigrateCompletedOnPrimary(
+                    opCtx, result.txnNum, {stmtId}, oplogOpTime, *oplogEntry.getWallClockTime());
+            }
 
-                           wunit.commit();
-                       });
+            wunit.commit();
+        });
 
     return result;
 }
-}  // unnamed namespace
+
+}  // namespace
 
 const char SessionCatalogMigrationDestination::kSessionMigrateOplogTag[] = "$sessionMigrateInfo";
 
@@ -430,15 +442,16 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
         } catch (const DBException& excep) {
             if (excep.code() == ErrorCodes::ConflictingOperationInProgress ||
                 excep.code() == ErrorCodes::TransactionTooOld) {
-                // This means that the server has a newer txnNumber than the oplog being
-                // migrated, so just skip it.
+                // This means that the server has a newer txnNumber than the oplog being migrated,
+                // so just skip it.
                 continue;
             }
 
             if (excep.code() == ErrorCodes::CommandNotFound) {
-                // TODO: remove this after v3.7.
-                // This means that the donor shard is running at an older version so it is safe
-                // to just end this because there is no session information to transfer.
+                // TODO: remove this after v3.7
+                //
+                // This means that the donor shard is running at an older version so it is safe to
+                // just end this because there is no session information to transfer.
                 break;
             }
 

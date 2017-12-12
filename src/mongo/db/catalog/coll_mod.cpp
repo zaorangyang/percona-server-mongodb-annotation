@@ -172,8 +172,9 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
         } else if (fieldName == "validator" && !isView) {
             MatchExpressionParser::AllowedFeatureSet allowedFeatures =
                 MatchExpressionParser::kBanAllSpecialFeatures;
-            if (!serverGlobalParams.featureCompatibility.validateFeaturesAsMaster.load() ||
-                serverGlobalParams.featureCompatibility.isFullyUpgradedTo36()) {
+            if (!serverGlobalParams.validateFeaturesAsMaster.load() ||
+                (serverGlobalParams.featureCompatibility.getVersion() ==
+                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36)) {
                 // Note that we don't enforce this restriction on the secondary or on backup
                 // instances, as indicated by !validateFeaturesAsMaster.
                 allowedFeatures |= MatchExpressionParser::kJSONSchema;
@@ -424,9 +425,12 @@ Status _collModInternal(OperationContext* opCtx,
     // don't implicitly upgrade them on collMod either.
     if (upgradeUUID && !nss.isSystemDotIndexes()) {
         if (uuid && !coll->uuid()) {
+            log() << "Assigning UUID " << uuid.get().toString() << " to collection " << coll->ns();
             CollectionCatalogEntry* cce = coll->getCatalogEntry();
             cce->addUUID(opCtx, uuid.get(), coll);
         } else if (!uuid && coll->uuid()) {
+            log() << "Removing UUID " << coll->uuid().get().toString() << " from collection "
+                  << coll->ns();
             CollectionCatalogEntry* cce = coll->getCatalogEntry();
             cce->removeUUID(opCtx);
         }

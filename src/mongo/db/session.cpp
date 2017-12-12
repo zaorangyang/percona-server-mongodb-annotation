@@ -50,6 +50,85 @@
 namespace mongo {
 namespace {
 
+void fassertOnRepeatedExecution(OperationContext* opCtx,
+                                const LogicalSessionId& lsid,
+                                TxnNumber txnNumber,
+                                StmtId stmtId,
+                                const repl::OpTime& firstOpTime,
+                                const repl::OpTime& secondOpTime) {
+    severe() << "Statement id " << stmtId << " from transaction [ " << lsid.toBSON() << ":"
+             << txnNumber << " ] was committed once with opTime " << firstOpTime
+             << " and a second time with opTime " << secondOpTime
+             << ". This indicates possible data corruption or server bug and the process will be "
+                "terminated.";
+    fassertFailed(40526);
+}
+
+struct ActiveTransactionHistory {
+    boost::optional<SessionTxnRecord> lastTxnRecord;
+    Session::CommittedStatementTimestampMap committedStatements;
+    bool hasIncompleteHistory{false};
+};
+
+ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
+                                                       const LogicalSessionId& lsid) {
+    ActiveTransactionHistory result;
+
+    result.lastTxnRecord = [&]() -> boost::optional<SessionTxnRecord> {
+        DBDirectClient client(opCtx);
+        auto result =
+            client.findOne(NamespaceString::kSessionTransactionsTableNamespace.ns(),
+                           {BSON(SessionTxnRecord::kSessionIdFieldName << lsid.toBSON())});
+        if (result.isEmpty()) {
+            return boost::none;
+        }
+
+        return SessionTxnRecord::parse(IDLParserErrorContext("parse latest txn record for session"),
+                                       result);
+    }();
+
+    if (!result.lastTxnRecord) {
+        return result;
+    }
+
+    auto it = TransactionHistoryIterator(result.lastTxnRecord->getLastWriteOpTime());
+    while (it.hasNext()) {
+        try {
+            const auto entry = it.next(opCtx);
+            invariant(entry.getStatementId());
+
+            if (*entry.getStatementId() == kIncompleteHistoryStmtId) {
+                // Only the dead end sentinel can have this id for oplog write history
+                invariant(entry.getObject2());
+                invariant(entry.getObject2()->woCompare(Session::kDeadEndSentinel) == 0);
+                result.hasIncompleteHistory = true;
+                continue;
+            }
+
+            const auto insertRes =
+                result.committedStatements.emplace(*entry.getStatementId(), entry.getOpTime());
+            if (!insertRes.second) {
+                const auto& existingOpTime = insertRes.first->second;
+                fassertOnRepeatedExecution(opCtx,
+                                           lsid,
+                                           result.lastTxnRecord->getTxnNum(),
+                                           *entry.getStatementId(),
+                                           existingOpTime,
+                                           entry.getOpTime());
+            }
+        } catch (const DBException& ex) {
+            if (ex.code() == ErrorCodes::IncompleteTransactionHistory) {
+                result.hasIncompleteHistory = true;
+                break;
+            }
+
+            throw;
+        }
+    }
+
+    return result;
+}
+
 void updateSessionEntry(OperationContext* opCtx, const UpdateRequest& updateRequest) {
     AutoGetCollection autoColl(opCtx, NamespaceString::kSessionTransactionsTableNamespace, MODE_IX);
 
@@ -77,20 +156,6 @@ void updateSessionEntry(OperationContext* opCtx, const UpdateRequest& updateRequ
     }
 }
 
-void fassertOnRepeatedExecution(OperationContext* opCtx,
-                                const LogicalSessionId& lsid,
-                                TxnNumber txnNumber,
-                                StmtId stmtId,
-                                const repl::OpTime& firstOpTime,
-                                const repl::OpTime& secondOpTime) {
-    severe() << "Statement id " << stmtId << " from transaction [ " << lsid.toBSON() << ":"
-             << txnNumber << " ] was committed once with opTime " << firstOpTime
-             << " and a second time with opTime " << secondOpTime
-             << ". This indicates possible data corruption or server bug and the process will be "
-                "terminated.";
-    fassertFailed(40526);
-}
-
 // Failpoint which allows different failure actions to happen after each write. Supports the
 // parameters below, which can be combined with each other (unless explicitly disallowed):
 //
@@ -101,6 +166,8 @@ void fassertOnRepeatedExecution(OperationContext* opCtx,
 MONGO_FP_DECLARE(onPrimaryTransactionalWrite);
 
 }  // namespace
+
+const BSONObj Session::kDeadEndSentinel(BSON("$incompleteOplogHistory" << 1));
 
 Session::Session(LogicalSessionId sessionId) : _sessionId(std::move(sessionId)) {}
 
@@ -116,50 +183,19 @@ void Session::refreshFromStorageIfNeeded(OperationContext* opCtx) {
 
         ul.unlock();
 
-        const auto lastWrittenTxnRecord = [&]() -> boost::optional<SessionTxnRecord> {
-            DBDirectClient client(opCtx);
-            auto result = client.findOne(
-                NamespaceString::kSessionTransactionsTableNamespace.ns(),
-                {BSON(SessionTxnRecord::kSessionIdFieldName << _sessionId.toBSON())});
-            if (result.isEmpty()) {
-                return boost::none;
-            }
-
-            return SessionTxnRecord::parse(
-                IDLParserErrorContext("parse latest txn record for session"), result);
-        }();
-
-        CommittedStatementTimestampMap activeTxnCommittedStatements;
-
-        if (lastWrittenTxnRecord) {
-            auto it = TransactionHistoryIterator(lastWrittenTxnRecord->getLastWriteOpTime());
-            while (it.hasNext()) {
-                const auto entry = it.next(opCtx);
-                invariant(entry.getStatementId());
-                const auto insertRes = activeTxnCommittedStatements.emplace(*entry.getStatementId(),
-                                                                            entry.getOpTime());
-                if (!insertRes.second) {
-                    const auto& existingOpTime = insertRes.first->second;
-                    fassertOnRepeatedExecution(opCtx,
-                                               _sessionId,
-                                               lastWrittenTxnRecord->getTxnNum(),
-                                               *entry.getStatementId(),
-                                               existingOpTime,
-                                               entry.getOpTime());
-                }
-            }
-        }
+        auto activeTxnHistory = fetchActiveTransactionHistory(opCtx, _sessionId);
 
         ul.lock();
 
         // Protect against concurrent refreshes or invalidations
         if (!_isValid && _numInvalidations == numInvalidations) {
             _isValid = true;
-            _lastWrittenSessionRecord = std::move(lastWrittenTxnRecord);
+            _lastWrittenSessionRecord = std::move(activeTxnHistory.lastTxnRecord);
 
             if (_lastWrittenSessionRecord) {
                 _activeTxnNumber = _lastWrittenSessionRecord->getTxnNum();
-                _activeTxnCommittedStatements = std::move(activeTxnCommittedStatements);
+                _activeTxnCommittedStatements = std::move(activeTxnHistory.committedStatements);
+                _hasIncompleteHistory = activeTxnHistory.hasIncompleteHistory;
             }
 
             break;
@@ -177,7 +213,8 @@ void Session::beginTxn(OperationContext* opCtx, TxnNumber txnNumber) {
 void Session::onWriteOpCompletedOnPrimary(OperationContext* opCtx,
                                           TxnNumber txnNumber,
                                           std::vector<StmtId> stmtIdsWritten,
-                                          const repl::OpTime& lastStmtIdWriteOpTime) {
+                                          const repl::OpTime& lastStmtIdWriteOpTime,
+                                          Date_t lastStmtIdWriteDate) {
     invariant(opCtx->lockState()->inAWriteUnitOfWork());
 
     stdx::unique_lock<stdx::mutex> ul(_mutex);
@@ -191,7 +228,32 @@ void Session::onWriteOpCompletedOnPrimary(OperationContext* opCtx,
         }
     }
 
-    const auto updateRequest = _makeUpdateRequest(ul, txnNumber, lastStmtIdWriteOpTime);
+    const auto updateRequest =
+        _makeUpdateRequest(ul, txnNumber, lastStmtIdWriteOpTime, lastStmtIdWriteDate);
+
+    ul.unlock();
+
+    repl::UnreplicatedWritesBlock doNotReplicateWrites(opCtx);
+
+    updateSessionEntry(opCtx, updateRequest);
+    _registerUpdateCacheOnCommit(
+        opCtx, txnNumber, std::move(stmtIdsWritten), lastStmtIdWriteOpTime);
+}
+
+void Session::onMigrateCompletedOnPrimary(OperationContext* opCtx,
+                                          TxnNumber txnNumber,
+                                          std::vector<StmtId> stmtIdsWritten,
+                                          const repl::OpTime& lastStmtIdWriteOpTime,
+                                          Date_t lastStmtIdWriteDate) {
+    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+
+    stdx::unique_lock<stdx::mutex> ul(_mutex);
+
+    _checkValid(ul);
+    _checkIsActiveTransaction(ul, txnNumber);
+
+    const auto updateRequest =
+        _makeUpdateRequest(ul, txnNumber, lastStmtIdWriteOpTime, lastStmtIdWriteDate);
 
     ul.unlock();
 
@@ -209,10 +271,10 @@ void Session::updateSessionRecordOnSecondary(OperationContext* opCtx,
     writeConflictRetry(
         opCtx, "Update session txn", NamespaceString::kSessionTransactionsTableNamespace.ns(), [&] {
             UpdateRequest updateRequest(NamespaceString::kSessionTransactionsTableNamespace);
-            updateRequest.setUpsert(true);
             updateRequest.setQuery(BSON(SessionTxnRecord::kSessionIdFieldName
                                         << sessionTxnRecord.getSessionId().toBSON()));
             updateRequest.setUpdates(sessionTxnRecord.toBSON());
+            updateRequest.setUpsert(true);
 
             repl::UnreplicatedWritesBlock doNotReplicateWrites(opCtx);
 
@@ -232,6 +294,7 @@ void Session::invalidate() {
 
     _activeTxnNumber = kUninitializedTxnNumber;
     _activeTxnCommittedStatements.clear();
+    _hasIncompleteHistory = false;
 }
 
 repl::OpTime Session::getLastWriteOpTime(TxnNumber txnNumber) const {
@@ -289,6 +352,7 @@ void Session::_beginTxn(WithLock wl, TxnNumber txnNumber) {
 
     _activeTxnNumber = txnNumber;
     _activeTxnCommittedStatements.clear();
+    _hasIncompleteHistory = false;
 }
 
 void Session::_checkValid(WithLock) const {
@@ -316,8 +380,15 @@ boost::optional<repl::OpTime> Session::_checkStatementExecuted(WithLock wl,
     _checkIsActiveTransaction(wl, txnNumber);
 
     const auto it = _activeTxnCommittedStatements.find(stmtId);
-    if (it == _activeTxnCommittedStatements.end())
+    if (it == _activeTxnCommittedStatements.end()) {
+        uassert(ErrorCodes::IncompleteTransactionHistory,
+                str::stream() << "Incomplete history detected for transaction " << txnNumber
+                              << " on session "
+                              << _sessionId.toBSON(),
+                !_hasIncompleteHistory);
+
         return boost::none;
+    }
 
     invariant(_lastWrittenSessionRecord);
     invariant(_lastWrittenSessionRecord->getTxnNum() == txnNumber);
@@ -327,21 +398,30 @@ boost::optional<repl::OpTime> Session::_checkStatementExecuted(WithLock wl,
 
 UpdateRequest Session::_makeUpdateRequest(WithLock,
                                           TxnNumber newTxnNumber,
-                                          const repl::OpTime& newLastWriteOpTime) const {
+                                          const repl::OpTime& newLastWriteOpTime,
+                                          Date_t newLastWriteDate) const {
     UpdateRequest updateRequest(NamespaceString::kSessionTransactionsTableNamespace);
 
     if (_lastWrittenSessionRecord) {
-        updateRequest.setQuery(_lastWrittenSessionRecord->toBSON());
+        updateRequest.setQuery(BSON(SessionTxnRecord::kSessionIdFieldName
+                                    << _sessionId.toBSON()
+                                    << SessionTxnRecord::kTxnNumFieldName
+                                    << _lastWrittenSessionRecord->getTxnNum()
+                                    << SessionTxnRecord::kLastWriteOpTimeFieldName
+                                    << _lastWrittenSessionRecord->getLastWriteOpTime()));
         updateRequest.setUpdates(BSON("$set" << BSON(SessionTxnRecord::kTxnNumFieldName
                                                      << newTxnNumber
                                                      << SessionTxnRecord::kLastWriteOpTimeFieldName
-                                                     << newLastWriteOpTime)));
+                                                     << newLastWriteOpTime
+                                                     << SessionTxnRecord::kLastWriteDateFieldName
+                                                     << newLastWriteDate)));
     } else {
         const auto updateBSON = [&] {
             SessionTxnRecord newTxnRecord;
             newTxnRecord.setSessionId(_sessionId);
             newTxnRecord.setTxnNum(newTxnNumber);
             newTxnRecord.setLastWriteOpTime(newLastWriteOpTime);
+            newTxnRecord.setLastWriteDate(newLastWriteDate);
             return newTxnRecord.toBSON();
         }();
 
@@ -396,6 +476,11 @@ void Session::_registerUpdateCacheOnCommit(OperationContext* opCtx,
 
         if (newTxnNumber == _activeTxnNumber) {
             for (const auto stmtId : stmtIdsWritten) {
+                if (stmtId == kIncompleteHistoryStmtId) {
+                    _hasIncompleteHistory = true;
+                    continue;
+                }
+
                 const auto insertRes =
                     _activeTxnCommittedStatements.emplace(stmtId, lastStmtIdWriteOpTime);
                 if (!insertRes.second) {
@@ -422,8 +507,7 @@ void Session::_registerUpdateCacheOnCommit(OperationContext* opCtx,
 
         const auto failBeforeCommitExceptionElem = data["failBeforeCommitExceptionCode"];
         if (!failBeforeCommitExceptionElem.eoo()) {
-            const auto failureCode =
-                ErrorCodes::fromInt(int(failBeforeCommitExceptionElem.Number()));
+            const auto failureCode = ErrorCodes::Error(int(failBeforeCommitExceptionElem.Number()));
             uasserted(failureCode,
                       str::stream() << "Failing write for " << _sessionId << ":" << newTxnNumber
                                     << " due to failpoint. The write must not be reflected.");

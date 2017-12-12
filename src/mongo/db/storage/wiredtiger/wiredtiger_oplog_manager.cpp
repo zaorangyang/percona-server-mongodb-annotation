@@ -47,9 +47,10 @@ const uint64_t kMinimumTimestamp = 1;
 
 MONGO_FP_DECLARE(WTPausePrimaryOplogDurabilityLoop);
 
-WiredTigerOplogManager::WiredTigerOplogManager(OperationContext* opCtx,
-                                               const std::string& uri,
-                                               WiredTigerRecordStore* oplogRecordStore) {
+void WiredTigerOplogManager::start(OperationContext* opCtx,
+                                   const std::string& uri,
+                                   WiredTigerRecordStore* oplogRecordStore) {
+    invariant(!_isRunning);
     // Prime the oplog read timestamp.
     auto sessionCache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
     _setOplogReadTimestamp(_fetchAllCommittedValue(sessionCache->conn()));
@@ -59,14 +60,29 @@ WiredTigerOplogManager::WiredTigerOplogManager(OperationContext* opCtx,
     auto lastRecord = reverseOplogCursor->next();
     _oplogMaxAtStartup = lastRecord ? lastRecord->id : RecordId();
 
-    _oplogJournalThread = stdx::thread(
-        &WiredTigerOplogManager::_oplogJournalThreadLoop, this, sessionCache, oplogRecordStore);
+    auto replCoord = repl::ReplicationCoordinator::get(getGlobalServiceContext());
+    bool isMasterSlave = false;
+    if (replCoord) {
+        isMasterSlave =
+            replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeMasterSlave;
+    }
+    _oplogJournalThread = stdx::thread(&WiredTigerOplogManager::_oplogJournalThreadLoop,
+                                       this,
+                                       sessionCache,
+                                       oplogRecordStore,
+                                       isMasterSlave);
+
+    stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
+    _isRunning = true;
+    _shuttingDown = false;
 }
 
-WiredTigerOplogManager::~WiredTigerOplogManager() {
+void WiredTigerOplogManager::halt() {
     {
         stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
+        invariant(_isRunning);
         _shuttingDown = true;
+        _isRunning = false;
     }
 
     if (_oplogJournalThread.joinable()) {
@@ -130,8 +146,9 @@ void WiredTigerOplogManager::triggerJournalFlush() {
     }
 }
 
-void WiredTigerOplogManager::_oplogJournalThreadLoop(
-    WiredTigerSessionCache* sessionCache, WiredTigerRecordStore* oplogRecordStore) noexcept {
+void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* sessionCache,
+                                                     WiredTigerRecordStore* oplogRecordStore,
+                                                     bool isMasterSlave) noexcept {
     Client::initThread("WTOplogJournalThread");
 
     // This thread updates the oplog read timestamp, the timestamp used to read from the oplog with
@@ -178,6 +195,12 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(
 
         // Wake up any await_data cursors and tell them more data might be visible now.
         oplogRecordStore->notifyCappedWaitersIfNeeded();
+
+        // For master/slave masters, set oldest timestamp here so that we clean up old timestamp
+        // data.  SERVER-31802
+        if (isMasterSlave) {
+            sessionCache->getKVEngine()->setStableTimestamp(SnapshotName(newTimestamp));
+        }
     }
 }
 

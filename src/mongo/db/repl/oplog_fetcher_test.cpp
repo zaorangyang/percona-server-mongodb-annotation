@@ -281,8 +281,9 @@ TEST_F(OplogFetcherTest, FindQueryHasNoReadconcernIfTermUninitialized) {
 }
 
 TEST_F(OplogFetcherTest, FindQueryHasAfterOpTimeWithFeatureCompatibilityVersion34) {
-    EnsureFCV ensureFCV(EnsureFCV::Version::k34);
-    ASSERT(!serverGlobalParams.featureCompatibility.isFullyUpgradedTo36());
+    EnsureFCV ensureFCV(EnsureFCV::Version::kFullyDowngradedTo34);
+    ASSERT(serverGlobalParams.featureCompatibility.getVersion() !=
+           ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
     auto cmdObj = makeOplogFetcher(_createConfig(true))->getFindQuery_forTest();
     auto readConcernElem = cmdObj["readConcern"];
     ASSERT_EQUALS(mongo::BSONType::Object, readConcernElem.type());
@@ -293,8 +294,9 @@ TEST_F(OplogFetcherTest, FindQueryHasAfterOpTimeWithFeatureCompatibilityVersion3
 }
 
 TEST_F(OplogFetcherTest, FindQueryHasAfterOpTimeWithFeatureCompatibilityVersion36) {
-    EnsureFCV ensureFCV(EnsureFCV::Version::k36);
-    ASSERT(serverGlobalParams.featureCompatibility.isFullyUpgradedTo36());
+    EnsureFCV ensureFCV(EnsureFCV::Version::kFullyUpgradedTo36);
+    ASSERT(serverGlobalParams.featureCompatibility.getVersion() ==
+           ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
     auto cmdObj = makeOplogFetcher(_createConfig(true))->getFindQuery_forTest();
     auto readConcernElem = cmdObj["readConcern"];
     ASSERT_EQUALS(mongo::BSONType::Object, readConcernElem.type());

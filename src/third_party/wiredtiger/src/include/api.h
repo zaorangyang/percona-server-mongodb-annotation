@@ -39,15 +39,10 @@
 } while (0)
 
 /* An API call wrapped in a transaction if necessary. */
-#ifdef HAVE_TIMESTAMPS
-#define	WT_TXN_TIMESTAMP_FLAG_CHECK(s) __wt_txn_timestamp_flags((s))
-#else
-#define	WT_TXN_TIMESTAMP_FLAG_CHECK(s)
-#endif
 #define	TXN_API_CALL(s, h, n, bt, config, cfg) do {			\
 	bool __autotxn = false;						\
 	API_CALL(s, h, n, bt, config, cfg);				\
-	WT_TXN_TIMESTAMP_FLAG_CHECK(s);					\
+	__wt_txn_timestamp_flags(s);					\
 	__autotxn = !F_ISSET(&(s)->txn, WT_TXN_AUTOCOMMIT | WT_TXN_RUNNING);\
 	if (__autotxn)							\
 		F_SET(&(s)->txn, WT_TXN_AUTOCOMMIT)
@@ -56,7 +51,7 @@
 #define	TXN_API_CALL_NOCONF(s, h, n, dh) do {				\
 	bool __autotxn = false;						\
 	API_CALL_NOCONF(s, h, n, dh);					\
-	WT_TXN_TIMESTAMP_FLAG_CHECK(s);					\
+	__wt_txn_timestamp_flags(s);					\
 	__autotxn = !F_ISSET(&(s)->txn, WT_TXN_AUTOCOMMIT | WT_TXN_RUNNING);\
 	if (__autotxn)							\
 		F_SET(&(s)->txn, WT_TXN_AUTOCOMMIT)
@@ -99,6 +94,15 @@
 	return (ret)
 #define	API_END_RET_NOTFOUND_MAP(s, ret)				\
 	API_END(s, ret);						\
+	return ((ret) == WT_NOTFOUND ? ENOENT : (ret))
+
+/*
+ * Used in cases where transaction error should not be set, but the error is
+ * returned from the API. Success is passed to the API_END macro.  If the
+ * method is about to return WT_NOTFOUND map it to ENOENT.
+ */
+#define	API_END_RET_NO_TXN_ERROR(s, ret)				\
+	API_END(s, 0);							\
 	return ((ret) == WT_NOTFOUND ? ENOENT : (ret))
 
 #define	CONNECTION_API_CALL(conn, s, n, config, cfg)			\
