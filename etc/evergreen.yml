@@ -153,6 +153,8 @@ variables:
 # TODO: Remove psutil from virtualenv_requirements when BUILD-3083 is done
 - &powercycle_ec2_instance
   aws_ec2_yml: aws_ec2.yml
+  monitor_proc_file: proc.json
+  monitor_system_file: system.json
   remote_dir: powercycle
   secret_port: "20001"
   security_groups: mci powercycle_testing
@@ -175,12 +177,12 @@ variables:
        value: ${remote_dir}/mongod.log
 
 - &powercycle_test
-  ec2_artifacts: ${log_path} ${backup_path_after} ${backup_path_before}
+  ec2_artifacts: ${monitor_proc_file} ${monitor_system_file} ${log_path} ${backup_path_after} ${backup_path_before}
   program_options: --logLevel info --backupPathBefore  ${backup_path_before} --backupPathAfter ${backup_path_after}
   connection_options: --sshUserHost ${ip_address} --sshConnection \"${ssh_identity} ${ssh_connection_options}\"
-  test_options: --testLoops 25 --seedDocNum 10000 --rsync --validate local --canary local
+  test_options: --testLoops 15 --seedDocNum 10000 --rsync --validate local --canary local
   crash_options: "--crashMethod aws_ec2 --crashOptions ${instance_id}:private_ip_address --crashWaitTime 30 --jitterForCrashWaitTime 5"
-  client_options: --numCrudClients 10 --numFsmClients 10
+  client_options: --numCrudClients 20 --numFsmClients 20
   mongodb_options: --rootDir ${remote_dir}-${task_id} --mongodbBinDir ${remote_dir}
   mongod_options: --mongodUsablePorts ${standard_port} ${secret_port} --dbPath ${db_path} --logPath ${log_path}
   mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1\"
@@ -1243,6 +1245,127 @@ functions:
             cmds="$cmds; activate=\$(find ${virtualenv_dir|venv} -name 'activate')"
             cmds="$cmds; source \$activate"
             cmds="$cmds; pip install ${virtualenv_requirements}"
+            ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+            ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
+              --verbose                                        \
+              --userHost $USER@${ip_address}                   \
+              --sshConnectionOptions "$ssh_connection_options" \
+              --retries ${ssh_retries|0}                       \
+              --commands "$cmds"
+          fi
+
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src
+        script: |
+          set -o errexit
+          ${set_sudo}
+          # Setup curator to collect system & process stats on remote.
+          # TODO: Update command once curator supports displaying all processes.
+          # Note: On Windows using 'process-tree --pid 1' does not work, as it does on Linux.
+          if [ "Windows_NT" = "$OS" ]; then
+            cmds="cygrunsrv --install curator_sys --path $(which curator) --args 'stat system' -1 $HOME/${monitor_system_file}"
+            cmds="$cmds; cygrunsrv --install curator_proc --path $(which curator) --args 'stat process-tree --pid 1' -1 $HOME/${monitor_proc_file}"
+          else
+            cmds="cmd='@reboot ${sudo} $(which curator) stat system >> ${monitor_system_file}'"
+            cmds="$cmds; (crontab -l ; echo \"\$cmd\") | crontab -"
+            cmds="$cmds; cmd='@reboot ${sudo} $(which curator) stat process-tree --pid 1 >> ${monitor_proc_file}'"
+            cmds="$cmds; (crontab -l ; echo "\$cmd") | crontab -"
+          fi
+          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+          ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
+            --verbose                                        \
+            --userHost $USER@${ip_address}                   \
+            --sshConnectionOptions "$ssh_connection_options" \
+            --retries ${ssh_retries|0}                       \
+            --commands "$cmds"
+
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src
+        script: |
+          set -o errexit
+          ${set_sudo}
+          # Start curator to collect system & process stats on remote.
+          if [ "Windows_NT" = "$OS" ]; then
+            cmds="cygrunsrv --start curator_sys"
+            cmds="$cmds; cygrunsrv --start curator_proc"
+          else
+            cmds="{ ${sudo} $(which curator) stat system > ${monitor_system_file} &"
+            cmds="$cmds ${sudo} $(which curator) stat process-tree --pid 1 > ${monitor_proc_file} & } & disown"
+          fi
+          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+          ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
+            --verbose                                        \
+            --userHost $USER@${ip_address}                   \
+            --sshConnectionOptions "$ssh_connection_options" \
+            --retries ${ssh_retries|0}                       \
+            --commands "$cmds"
+
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src
+        script: |
+          set -o errexit
+          ${set_sudo}
+          # Many systems have the firewall disabled, by default. In case the firewall is
+          # enabled we add rules for the mongod ports on the remote.
+          # RHEL 7 firewall rules
+          if [ ! -z "$(which firewall-cmd 2> /dev/null)" ]; then
+            cmds="$sudo firewall-cmd --permanent --zone=public --add-port=ssh/tcp"
+            cmds="$cmds; $sudo firewall-cmd --permanent --zone=public --add-port=${standard_port}/tcp"
+            cmds="$cmds; $sudo firewall-cmd --permanent --zone=public --add-port=${secret_port}/tcp"
+            cmds="$cmds; $sudo firewall-cmd --reload"
+            cmds="$cmds; $sudo firewall-cmd --list-all"
+          # ArchLinux, Debian, RHEL 6 firewall rules
+          elif [ ! -z "$($sudo iptables --list 2> /dev/null)" ]; then
+            cmds="$sudo iptables -I INPUT 1 -p tcp --dport ssh -j ACCEPT"
+            cmds="$cmds; $sudo iptables -I INPUT 1 -p tcp --dport ${standard_port} -j ACCEPT"
+            cmds="$cmds; $sudo iptables -I INPUT 1 -p tcp --dport ${secret_port} -j ACCEPT"
+            if [ -d /etc/iptables ]; then
+              rules_file=/etc/iptables/iptables.rules
+            elif [ -f /etc/sysconfig/iptables ]; then
+              rules_file=/etc/sysconfig/iptables
+            else
+              rules_file=/etc/iptables.up.rules
+            fi
+            cmds="$cmds; $sudo iptables-save | $sudo tee $rules_file"
+            cmds="$cmds; $sudo iptables --list-rules"
+          elif [ ! -z "$($sudo service iptables status 2> /dev/null)" ]; then
+            cmds="$sudo iptables -I INPUT 1 -p tcp --dport ssh -j ACCEPT"
+            cmds="$cmds; $sudo iptables -I INPUT 1 -p tcp --dport ${standard_port} -j ACCEPT"
+            cmds="$cmds; $sudo iptables -I INPUT 1 -p tcp --dport ${secret_port} -j ACCEPT"
+            cmds="$cmds; $sudo service iptables save"
+            cmds="$cmds; $sudo service iptables status"
+          # Ubuntu firewall rules
+          elif [ ! -z "$($sudo ufw status 2> /dev/null)" ]; then
+            cmds="$sudo ufw allow ssh/tcp"
+            cmds="$cmds; $sudo ufw allow ${standard_port}/tcp"
+            cmds="$cmds; $sudo ufw allow ${secret_port}/tcp"
+            cmds="$cmds; $sudo ufw reload"
+            cmds="$cmds; $sudo ufw status"
+          # SuSE firewall rules
+          # TODO: Add firewall rules using SuSEfirewall2
+          elif [ ! -z "$($sudo /sbin/SuSEfirewall2 help 2> /dev/null)" ]; then
+            cmds="$sudo /sbin/SuSEfirewall2 stop"
+            cmds="$cmds; $sudo /sbin/SuSEfirewall2 off"
+          # Windows firewall rules
+          elif [ ! -z "$(netsh advfirewall show store 2> /dev/null)" ]; then
+            add_rule="netsh advfirewall firewall add rule"
+            cmds="$add_rule name='MongoDB port ${standard_port} in' dir=in action=allow protocol=TCP localport=${standard_port}"
+            cmds="$cmds; $add_rule name='MongoDB port ${standard_port} out' dir=in action=allow protocol=TCP localport=${standard_port}"
+            cmds="$cmds; $add_rule name='MongoDB port ${secret_port} in' dir=in action=allow protocol=TCP localport=${secret_port}"
+            cmds="$cmds; $add_rule name='MongoDB port ${secret_port} out' dir=in action=allow protocol=TCP localport=${secret_port}"
+            cmds="$cmds; netsh advfirewall firewall show rule name=all | grep -A 13 'MongoDB'"
+          else
+            echo "Firewall not active or unknown firewall command on this platform"
+            exit 0
+          fi
+          set -o errexit
+          if [ ! -z "$cmds" ]; then
             ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
             ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
               --verbose                                        \
@@ -2737,11 +2860,24 @@ tasks:
 
 - <<: *task_template
   name: change_streams_mongos_passthrough_WT
+  depends_on:
+  - name: change_streams_WT
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
       resmoke_args: --suites=change_streams_mongos_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: change_streams_secondary_reads_WT
+  depends_on:
+  - name: change_streams_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_secondary_reads --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4030,7 +4166,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=retryable_writes_jscore_passthrough --storageEngine=mmapv1
+      resmoke_args: --suites=retryable_writes_jscore_passthrough --storageEngine=mmapv1 --excludeWithAnyTags=skip_in_retryable_writes_mmapv1_passthrough
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4092,7 +4228,7 @@ tasks:
     # mongod will not start if it crashed mongod while creating a namespace (SERVER-26499).
     vars:
       <<: *powercycle_test
-      client_options: --numCrudClients 10 --numFsmClients 0
+      client_options: --numCrudClients 20 --numFsmClients 0
       mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine mmapv1\"
 
 - name: powercycle_WT
@@ -4112,6 +4248,104 @@ tasks:
   - func: "run powercycle test"
     vars:
       <<: *powercycle_test
+      mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
+
+- name: powercycle_fcv3.4_WT
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "set up remote credentials"
+    vars:
+      <<: *powercycle_remote_credentials
+  - func: "set up virtualenv"
+  - func: "set up EC2 instance"
+    vars:
+      <<: *powercycle_ec2_instance
+  - command: expansions.update
+    <<: *powercycle_expansions
+  - func: "run powercycle test"
+    vars:
+      <<: *powercycle_test
+      client_options: --numCrudClients 20 --numFsmClients 20 --fsmWorkloadBlacklistFiles toggle_feature_compatibility.js
+      mongod_options: --mongodUsablePorts ${standard_port} ${secret_port} --dbPath ${db_path} --logPath ${log_path} --fcv 3.4
+      mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
+
+- name: powercycle_replication_WT
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "set up remote credentials"
+    vars:
+      <<: *powercycle_remote_credentials
+  - func: "set up virtualenv"
+  - func: "set up EC2 instance"
+    vars:
+      <<: *powercycle_ec2_instance
+  - command: expansions.update
+    <<: *powercycle_expansions
+  - func: "run powercycle test"
+    vars:
+      <<: *powercycle_test
+      mongod_extra_options: --replSet powercyle --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
+
+- name: powercycle_replication_smalloplog_WT
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "set up remote credentials"
+    vars:
+      <<: *powercycle_remote_credentials
+  - func: "set up virtualenv"
+  - func: "set up EC2 instance"
+    vars:
+      <<: *powercycle_ec2_instance
+  - command: expansions.update
+    <<: *powercycle_expansions
+  - func: "run powercycle test"
+    vars:
+      <<: *powercycle_test
+      mongod_extra_options: --replSet powercyle --mongodOptions \"--setParameter enableTestCommands=1 --oplogSize 1 --storageEngine wiredTiger\"
+
+- name: powercycle_syncdelay_WT
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "set up remote credentials"
+    vars:
+      <<: *powercycle_remote_credentials
+  - func: "set up virtualenv"
+  - func: "set up EC2 instance"
+    vars:
+      <<: *powercycle_ec2_instance
+  - command: expansions.update
+    <<: *powercycle_expansions
+  - func: "run powercycle test"
+    vars:
+      <<: *powercycle_test
+      mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --syncdelay 10 --storageEngine wiredTiger\"
+
+- name: powercycle_write_concern_majority_WT
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "set up remote credentials"
+    vars:
+      <<: *powercycle_remote_credentials
+  - func: "set up virtualenv"
+  - func: "set up EC2 instance"
+    vars:
+      <<: *powercycle_ec2_instance
+  - command: expansions.update
+    <<: *powercycle_expansions
+  - func: "run powercycle test"
+    vars:
+      <<: *powercycle_test
+      client_options: "--numCrudClients 20 --numFsmClients 20 --writeConcern '{\"w\": \"majority\"}'"
       mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
 
 - name: idl_tests
@@ -4705,6 +4939,9 @@ buildvariants:
   - name: aggregation_sharded_collections_passthrough_WT
   - name: auth
   - name: auth_WT
+  - name: change_streams_WT
+  - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_secondary_reads_WT
   - name: dbtest
   - name: dbtest_WT
   - name: disk
@@ -5374,6 +5611,11 @@ buildvariants:
   - name: tool_WT
   - name: powercycle
   - name: powercycle_WT
+  - name: powercycle_fcv3.4_WT
+  - name: powercycle_replication_WT
+  - name: powercycle_replication_smalloplog_WT
+  - name: powercycle_syncdelay_WT
+  - name: powercycle_write_concern_majority_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -5910,6 +6152,8 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
+  - name: powercycle
+  - name: powercycle_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7356,6 +7600,7 @@ buildvariants:
   - name: bulk_gle_passthrough_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_secondary_reads_WT
   - name: concurrency
   - name: concurrency_WT
   - name: concurrency_replication
@@ -7541,19 +7786,19 @@ buildvariants:
     - ubuntu1604-packer
   - name: push
 
-- name: rhel-70-64-bit-debug
-  display_name: "* RHEL 7.0 DEBUG"
+- name: ubuntu1604-debug
+  display_name: "* Ubuntu 16.04 DEBUG"
   run_on:
-  - rhel70-small
+  - ubuntu1604-test
   expansions:
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 2)) # Avoid starting too many mongod's
-    compile_flags: MONGO_DISTMOD=rhel70 --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    compile_flags: MONGO_DISTMOD=ubuntu1604 --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     use_scons_cache: true
     build_mongoreplay: true
   tasks:
   - name: compile
     distros:
-    - rhel70
+    - ubuntu1604-build
   - name: jsCore
   - name: jsCore_WT
   - name: read_concern_linearizable_passthrough
@@ -9829,7 +10074,7 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
     lang_environment: LANG=C
-    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
+    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform_arch: "ubuntu1604"
     multiversion_edition: "targeted"
@@ -9861,6 +10106,7 @@ buildvariants:
   - name: sharded_causally_consistent_jscore_passthrough_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_secondary_reads_WT
   - name: concurrency
   - name: concurrency_WT
   - name: concurrency_replication
@@ -9993,7 +10239,7 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
     lang_environment: LANG=C
-    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
+    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
     build_mongoreplay: true
@@ -10042,7 +10288,7 @@ buildvariants:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
     lang_environment: LANG=C
-    san_options: UBSAN_OPTIONS="print_stacktrace=1"
+    san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform_arch: "ubuntu1604"
     multiversion_edition: "targeted"
@@ -10073,6 +10319,7 @@ buildvariants:
   - name: sharded_causally_consistent_jscore_passthrough_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_secondary_reads_WT
   - name: concurrency
   - name: concurrency_WT
   - name: concurrency_replication
@@ -10206,7 +10453,7 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
     lang_environment: LANG=C
-    san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
+    san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
     build_mongoreplay: true
@@ -10234,7 +10481,7 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
     lang_environment: LANG=C
-    san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0
+    san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
     build_mongoreplay: false

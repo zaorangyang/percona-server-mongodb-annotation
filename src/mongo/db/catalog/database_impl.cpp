@@ -74,6 +74,7 @@
 #include "mongo/platform/random.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -87,6 +88,7 @@ MONGO_INITIALIZER(InitializeDatabaseFactory)(InitializerContext* const) {
     });
     return Status::OK();
 }
+MONGO_FP_DECLARE(hangBeforeLoggingCreateCollection);
 }  // namespace
 
 using std::unique_ptr;
@@ -453,7 +455,8 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
                     return Status(ErrorCodes::IllegalOperation,
                                   "turn off profiling before dropping system.profile collection");
             } else if (!(nss.isSystemDotViews() || nss.isHealthlog() ||
-                         nss == SessionsCollection::kSessionsNamespaceString)) {
+                         nss == SessionsCollection::kSessionsNamespaceString ||
+                         nss == NamespaceString::kSystemKeysCollectionName)) {
                 return Status(ErrorCodes::IllegalOperation,
                               str::stream() << "can't drop system collection " << fullns);
             }
@@ -774,30 +777,39 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
             OperationShardingState::get(opCtx).allowImplicitCollectionCreation());
 
     CollectionOptions optionsWithUUID = options;
+    bool generatedUUID = false;
     if (enableCollectionUUIDs && !optionsWithUUID.uuid &&
         serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
         auto coordinator = repl::ReplicationCoordinator::get(opCtx);
-        bool okayCreation =
-            (coordinator->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet ||
-             (serverGlobalParams.featureCompatibility.getVersion() !=
-              ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) ||
-             coordinator->canAcceptWritesForDatabase(opCtx, nss.db()) ||
-             nss.isSystemDotProfile());  // system.profile is special as it's not replicated
-        if (!okayCreation) {
-            std::string msg = str::stream() << "Attempt to assign UUID to replicated collection: "
-                                            << nss.ns();
+        bool fullyUpgraded = serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36;
+        bool canGenerateUUID =
+            (coordinator->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) ||
+            coordinator->canAcceptWritesForDatabase(opCtx, nss.db()) || nss.isSystemDotProfile();
+
+        if (fullyUpgraded && !canGenerateUUID) {
+            std::string msg = str::stream() << "Attempted to create a new collection " << nss.ns()
+                                            << " without a UUID";
             severe() << msg;
             uasserted(ErrorCodes::InvalidOptions, msg);
         }
-        optionsWithUUID.uuid.emplace(CollectionUUID::gen());
+        if (canGenerateUUID) {
+            optionsWithUUID.uuid.emplace(CollectionUUID::gen());
+            generatedUUID = true;
+        }
     }
 
     _checkCanCreateCollection(opCtx, nss, optionsWithUUID);
     audit::logCreateCollection(&cc(), ns);
 
-    std::string uuidString =
-        (optionsWithUUID.uuid) ? optionsWithUUID.uuid.get().toString() : "none";
-    log() << "createCollection: " << ns << " with UUID: " << uuidString;
+    if (optionsWithUUID.uuid) {
+        log() << "createCollection: " << ns << " with "
+              << (generatedUUID ? "generated" : "provided")
+              << " UUID: " << optionsWithUUID.uuid.get();
+    } else {
+        log() << "createCollection: " << ns << " with no UUID.";
+    }
+
     massertStatusOK(
         _dbEntry->createCollection(opCtx, ns, optionsWithUUID, true /*allocateDefaultSpace*/));
 
@@ -826,6 +838,8 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
             createSystemIndexes(opCtx, collection);
         }
     }
+
+    MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangBeforeLoggingCreateCollection);
 
     opCtx->getServiceContext()->getOpObserver()->onCreateCollection(
         opCtx, collection, nss, optionsWithUUID, fullIdIndexSpec);
