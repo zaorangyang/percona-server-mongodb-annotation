@@ -5,7 +5,7 @@ export DEB_BUILD_HARDENING=1
 export NJOBS=$(shell grep -c processor /proc/cpuinfo)
 export PSM_TARGETS=mongod mongos mongo
 export PSMSRC=$(CURDIR)
-export MONGOTOOLS=bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongooplog mongoreplay
+export MONGOTOOLS=bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop mongoreplay
 export INSTALLDIR=$(PSMSRC)/install
 export TOOLS_TAGS=ssl sasl
 export PORTABLE=1
@@ -59,16 +59,16 @@ build: RocksDB percona-server-mongodb compile-mongo-tools
 
 override_dh_auto_install:
 	dh_auto_install
-	cp -av mongos debian/percona-server-mongodb-34-mongos/usr/bin
-	cp -av mongo debian/percona-server-mongodb-34-shell/usr/bin
-	cp -av mongod debian/percona-server-mongodb-34-server/usr/bin
-	cp -av debian/percona-server-mongodb-helper.sh debian/percona-server-mongodb-34-server/usr/bin
-	cp -av debian/percona-server-mongodb-enable-auth.sh debian/percona-server-mongodb-34-server/usr/bin
-	cp -av debian/mongod.conf debian/percona-server-mongodb-34-server/etc/mongod.conf
-	cp -av $(PSMSRC)/bin/* debian/percona-server-mongodb-34-tools/usr/bin
+	cp -av mongos debian/percona-server-mongodb-36-mongos/usr/bin
+	cp -av mongo debian/percona-server-mongodb-36-shell/usr/bin
+	cp -av mongod debian/percona-server-mongodb-36-server/usr/bin
+	cp -av debian/percona-server-mongodb-helper.sh debian/percona-server-mongodb-36-server/usr/bin
+	cp -av debian/percona-server-mongodb-enable-auth.sh debian/percona-server-mongodb-36-server/usr/bin
+	cp -av debian/mongod.conf debian/percona-server-mongodb-36-server/etc/mongod.conf
+	cp -av $(PSMSRC)/bin/* debian/percona-server-mongodb-36-tools/usr/bin
 
 override_dh_strip:
-	dh_strip -a --dbg-package=percona-server-mongodb-34-dbg
+	dh_strip -a --dbg-package=percona-server-mongodb-36-dbg
 
 override_dh_installinit:
 	dh_installinit -a --name=mongod
