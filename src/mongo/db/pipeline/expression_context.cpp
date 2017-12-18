@@ -29,6 +29,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 
 namespace mongo {
@@ -45,6 +46,7 @@ ExpressionContext::ExpressionContext(OperationContext* opCtx,
                                      StringMap<ResolvedNamespace> resolvedNamespaces)
     : ExpressionContext(opCtx, collator.get()) {
     explain = request.getExplain();
+    comment = request.getComment();
     fromMongos = request.isFromMongos();
     needsMerge = request.needsMerge();
     allowDiskUse = request.shouldAllowDiskUse();
@@ -121,13 +123,16 @@ void ExpressionContext::setCollator(const CollatorInterface* collator) {
     _valueComparator = ValueComparator(_collator);
 }
 
-intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(NamespaceString ns,
-                                                             boost::optional<UUID> uuid) const {
+intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(
+    NamespaceString ns,
+    boost::optional<UUID> uuid,
+    boost::optional<std::unique_ptr<CollatorInterface>> collator) const {
     intrusive_ptr<ExpressionContext> expCtx =
         new ExpressionContext(std::move(ns), timeZoneDatabase);
 
     expCtx->uuid = std::move(uuid);
     expCtx->explain = explain;
+    expCtx->comment = comment;
     expCtx->needsMerge = needsMerge;
     expCtx->fromMongos = fromMongos;
     expCtx->from34Mongos = from34Mongos;
@@ -140,11 +145,17 @@ intrusive_ptr<ExpressionContext> ExpressionContext::copyWith(NamespaceString ns,
 
     expCtx->opCtx = opCtx;
 
-    expCtx->collation = collation;
-    if (_ownedCollator) {
-        expCtx->setCollator(_ownedCollator->clone());
-    } else if (_collator) {
-        expCtx->setCollator(_collator);
+    if (collator) {
+        expCtx->collation =
+            *collator ? (*collator)->getSpec().toBSON() : CollationSpec::kSimpleSpec;
+        expCtx->setCollator(std::move(*collator));
+    } else {
+        expCtx->collation = collation;
+        if (_ownedCollator) {
+            expCtx->setCollator(_ownedCollator->clone());
+        } else if (_collator) {
+            expCtx->setCollator(_collator);
+        }
     }
 
     expCtx->_resolvedNamespaces = _resolvedNamespaces;

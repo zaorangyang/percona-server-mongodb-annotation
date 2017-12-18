@@ -157,7 +157,7 @@ public:
     virtual void setMyLastAppliedOpTime(const OpTime& opTime);
     virtual void setMyLastDurableOpTime(const OpTime& opTime);
 
-    virtual void setMyLastAppliedOpTimeForward(const OpTime& opTime);
+    virtual void setMyLastAppliedOpTimeForward(const OpTime& opTime, DataConsistency consistency);
     virtual void setMyLastDurableOpTimeForward(const OpTime& opTime);
 
     virtual void resetMyLastOpTimes();
@@ -166,6 +166,10 @@ public:
 
     virtual OpTime getMyLastAppliedOpTime() const override;
     virtual OpTime getMyLastDurableOpTime() const override;
+
+    virtual Status waitUntilOpTimeForReadUntil(OperationContext* opCtx,
+                                               const ReadConcernArgs& readConcern,
+                                               boost::optional<Date_t> deadline) override;
 
     virtual Status waitUntilOpTimeForRead(OperationContext* opCtx,
                                           const ReadConcernArgs& readConcern) override;
@@ -261,7 +265,8 @@ public:
 
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until) override;
 
-    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx) override;
+    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx,
+                                           DataConsistency consistency) override;
 
     virtual bool shouldChangeSyncSource(
         const HostAndPort& currentSource,
@@ -383,6 +388,7 @@ public:
                                                           const OpTime& commitPoint);
     void cleanupStableOpTimeCandidates_forTest(std::set<OpTime>* candidates, OpTime stableOpTime);
     std::set<OpTime> getStableOpTimeCandidates_forTest();
+    boost::optional<OpTime> getStableOpTime_forTest();
 
     /**
      * Non-blocking version of updateTerm.
@@ -678,7 +684,9 @@ private:
     /**
      * Helpers to set the last applied and durable OpTime.
      */
-    void _setMyLastAppliedOpTime_inlock(const OpTime& opTime, bool isRollbackAllowed);
+    void _setMyLastAppliedOpTime_inlock(const OpTime& opTime,
+                                        bool isRollbackAllowed,
+                                        DataConsistency consistency);
     void _setMyLastDurableOpTime_inlock(const OpTime& opTime, bool isRollbackAllowed);
 
     /**
@@ -997,6 +1005,12 @@ private:
     void _updateCommittedSnapshot_inlock(SnapshotInfo newCommittedSnapshot);
 
     /**
+     * A helper method that returns the current stable optime based on the current commit point and
+     * set of stable optime candidates.
+     */
+    boost::optional<OpTime> _getStableOpTime_inlock();
+
+    /**
      * Calculates the 'stable' replication optime given a set of optime candidates and the
      * current commit point. The stable optime is the greatest optime in 'candidates' that is
      * also less than or equal to 'commitPoint'.
@@ -1111,7 +1125,10 @@ private:
     /**
      * Waits until the optime of the current node is at least the 'opTime'.
      */
-    Status _waitUntilOpTime(OperationContext* opCtx, bool isMajorityReadConcern, OpTime opTime);
+    Status _waitUntilOpTime(OperationContext* opCtx,
+                            bool isMajorityReadConcern,
+                            OpTime opTime,
+                            boost::optional<Date_t> deadline = boost::none);
 
     /**
      * Waits until the optime of the current node is at least the opTime specified in 'readConcern'.
@@ -1122,11 +1139,13 @@ private:
                                              const ReadConcernArgs& readConcern);
 
     /**
-     * Waits until the optime of the current node is at least the clusterTime specified in
-     * 'readConcern'. Supports local and majority readConcern.
+     * Waits until the deadline or until the optime of the current node is at least the clusterTime
+     * specified in 'readConcern'. Supports local and majority readConcern.
+     * If maxTimeMS and deadline are both specified, it waits for min(maxTimeMS, deadline).
      */
     Status _waitUntilClusterTimeForRead(OperationContext* opCtx,
-                                        const ReadConcernArgs& readConcern);
+                                        const ReadConcernArgs& readConcern,
+                                        boost::optional<Date_t> deadline);
 
     /**
      * Returns a pseudorandom number no less than 0 and less than limit (which must be positive).

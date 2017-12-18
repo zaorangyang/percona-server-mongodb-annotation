@@ -200,7 +200,8 @@ void ReplicationCoordinatorMock::setMyLastDurableOpTime(const OpTime& opTime) {
     _myLastDurableOpTime = opTime;
 }
 
-void ReplicationCoordinatorMock::setMyLastAppliedOpTimeForward(const OpTime& opTime) {
+void ReplicationCoordinatorMock::setMyLastAppliedOpTimeForward(const OpTime& opTime,
+                                                               DataConsistency consistency) {
     if (opTime > _myLastAppliedOpTime) {
         _myLastAppliedOpTime = opTime;
     }
@@ -229,6 +230,11 @@ Status ReplicationCoordinatorMock::waitUntilOpTimeForRead(OperationContext* opCt
     return Status::OK();
 }
 
+Status ReplicationCoordinatorMock::waitUntilOpTimeForReadUntil(OperationContext* opCtx,
+                                                               const ReadConcernArgs& settings,
+                                                               boost::optional<Date_t> deadline) {
+    return Status::OK();
+}
 
 OID ReplicationCoordinatorMock::getElectionId() {
     // TODO
@@ -407,7 +413,8 @@ HostAndPort ReplicationCoordinatorMock::chooseNewSyncSource(const OpTime& lastOp
 
 void ReplicationCoordinatorMock::blacklistSyncSource(const HostAndPort& host, Date_t until) {}
 
-void ReplicationCoordinatorMock::resetLastOpTimesFromOplog(OperationContext* opCtx) {
+void ReplicationCoordinatorMock::resetLastOpTimesFromOplog(OperationContext* opCtx,
+                                                           DataConsistency consistency) {
     invariant(false);
 }
 

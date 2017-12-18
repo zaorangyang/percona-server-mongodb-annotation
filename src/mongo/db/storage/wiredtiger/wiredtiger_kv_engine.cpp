@@ -169,9 +169,10 @@ public:
 
             try {
                 if (keepOldBehavior) {
-                    const bool forceCheckpoint = true;
-                    const bool stableCheckpoint = false;
-                    _sessionCache->waitUntilDurable(forceCheckpoint, stableCheckpoint);
+                    UniqueWiredTigerSession session = _sessionCache->getSession();
+                    WT_SESSION* s = session->getSession();
+                    invariantWTOK(s->checkpoint(s, nullptr));
+                    LOG(4) << "created checkpoint (forced)";
                 } else {
                     // Three cases:
                     //
@@ -320,7 +321,8 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                                        bool ephemeral,
                                        bool repair,
                                        bool readOnly)
-    : _eventHandler(WiredTigerUtil::defaultEventHandlers()),
+    : _keepDataHistory(serverGlobalParams.enableMajorityReadConcern),
+      _eventHandler(WiredTigerUtil::defaultEventHandlers()),
       _clockSource(cs),
       _oplogManager(stdx::make_unique<WiredTigerOplogManager>()),
       _canonicalName(canonicalName),
@@ -1084,13 +1086,18 @@ void WiredTigerKVEngine::setStableTimestamp(SnapshotName stableTimestamp) {
         _checkpointThread->setStableTimestamp(stableTimestamp);
     }
 
-    // Communicate to WiredTiger that it can clean up timestamp data earlier than the timestamp
-    // provided.  No future queries will need point-in-time reads at a timestamp prior to the one
-    // provided here.
-    _setOldestTimestamp(stableTimestamp);
+    if (_keepDataHistory) {
+        // If `_keepDataHistory` is false, the OplogManager is responsible for setting the
+        // `oldest_timestamp`.
+        //
+        // Communicate to WiredTiger that it can clean up timestamp data earlier than the
+        // timestamp provided.  No future queries will need point-in-time reads at a timestamp
+        // prior to the one provided here.
+        setOldestTimestamp(stableTimestamp);
+    }
 }
 
-void WiredTigerKVEngine::_setOldestTimestamp(SnapshotName oldestTimestamp) {
+void WiredTigerKVEngine::setOldestTimestamp(SnapshotName oldestTimestamp) {
     if (oldestTimestamp == SnapshotName()) {
         // No oldestTimestamp to set, yet.
         return;
@@ -1101,13 +1108,19 @@ void WiredTigerKVEngine::_setOldestTimestamp(SnapshotName oldestTimestamp) {
             // No oplog yet, so don't bother setting oldest_timestamp.
             return;
         }
-        if (_oplogManager->getOplogReadTimestamp() < oldestTimestamp.asU64()) {
+        auto oplogReadTimestamp = _oplogManager->getOplogReadTimestamp();
+        if (oplogReadTimestamp < oldestTimestamp.asU64()) {
             // For one node replica sets, the commit point might race ahead of the oplog read
             // timestamp.
-            // For now, we will simply avoid setting the oldestTimestamp in such cases.
-            return;
+            oldestTimestamp = SnapshotName(oplogReadTimestamp);
+            if (_previousSetOldestTimestamp > oldestTimestamp) {
+                // Do not go backwards.
+                return;
+            }
         }
     }
+
+    // Lag the oldest_timestamp by one timestamp set, to give a bit more history.
     auto timestampToSet = _previousSetOldestTimestamp;
     _previousSetOldestTimestamp = oldestTimestamp;
     if (timestampToSet == SnapshotName()) {
@@ -1149,8 +1162,12 @@ void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,
                                            const std::string& uri,
                                            WiredTigerRecordStore* oplogRecordStore) {
     stdx::lock_guard<stdx::mutex> lock(_oplogManagerMutex);
-    if (_oplogManagerCount == 0)
-        _oplogManager->start(opCtx, uri, oplogRecordStore);
+    if (_oplogManagerCount == 0) {
+        // If we don't want to keep a long history of data changes, have the OplogManager thread
+        // update the oldest timestamp with the "all committed" timestamp, i.e: the latest time at
+        // which there are no holes.
+        _oplogManager->start(opCtx, uri, oplogRecordStore, !_keepDataHistory);
+    }
     _oplogManagerCount++;
 }
 

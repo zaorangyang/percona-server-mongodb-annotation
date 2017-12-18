@@ -31,6 +31,8 @@
 #include "mongo/s/commands/pipeline_s.h"
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/commands/cluster_commands_helpers.h"
@@ -53,7 +55,7 @@ std::pair<ShardId, ChunkVersion> getSingleTargetedShardForQuery(
     OperationContext* opCtx, const CachedCollectionRoutingInfo& routingInfo, BSONObj query) {
     if (auto chunkMgr = routingInfo.cm()) {
         std::set<ShardId> shardIds;
-        chunkMgr->getShardIdsForQuery(opCtx, query, BSONObj(), &shardIds);
+        chunkMgr->getShardIdsForQuery(opCtx, query, CollationSpec::kSimpleSpec, &shardIds);
         uassert(ErrorCodes::InternalError,
                 str::stream() << "Unable to target lookup query to a single shard: "
                               << query.toString(),
@@ -171,45 +173,70 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    boost::optional<Document> lookupSingleDocument(const intrusive_ptr<ExpressionContext>& expCtx,
-                                                   const Document& filter) final {
-        // The passed ExpressionContext may use a different namespace than the _expCtx used to
-        // construct the MongosProcessInterface, but both should be using the same opCtx.
-        invariant(expCtx->opCtx == _expCtx->opCtx);
+    boost::optional<Document> lookupSingleDocument(const NamespaceString& nss,
+                                                   UUID collectionUUID,
+                                                   const Document& filter,
+                                                   boost::optional<BSONObj> readConcern) final {
+        auto foreignExpCtx = _expCtx->copyWith(nss, collectionUUID);
 
-        // Create a QueryRequest from the given filter. This will be used to generate the find
-        // command to be dispatched to the shard in order to return the post-change document.
+        // Create the find command to be dispatched to the shard in order to return the post-change
+        // document.
         auto filterObj = filter.toBson();
-        QueryRequest qr(expCtx->ns);
-        qr.setFilter(filterObj);
+        BSONObjBuilder cmdBuilder;
+        bool findCmdIsByUuid(foreignExpCtx->uuid);
+        if (findCmdIsByUuid) {
+            foreignExpCtx->uuid->appendToBuilder(&cmdBuilder, "find");
+        } else {
+            cmdBuilder.append("find", nss.coll());
+        }
+        cmdBuilder.append("filter", filterObj);
+        cmdBuilder.append("comment", _expCtx->comment);
+        if (readConcern) {
+            cmdBuilder.append(repl::ReadConcernArgs::kReadConcernFieldName, *readConcern);
+        }
 
         auto swShardResult = makeStatusWith<std::vector<ClusterClientCursorParams::RemoteCursor>>();
-        auto findCmd = qr.asFindCommand();
+        auto findCmd = cmdBuilder.obj();
         size_t numAttempts = 0;
         do {
-            // Verify that the collection exists, with the UUID passed in the expCtx.
-            auto catalogCache = Grid::get(expCtx->opCtx)->catalogCache();
-            auto swRoutingInfo = getCollectionRoutingInfo(expCtx);
+            // Verify that the collection exists, with the correct UUID.
+            auto catalogCache = Grid::get(_expCtx->opCtx)->catalogCache();
+            auto swRoutingInfo = getCollectionRoutingInfo(foreignExpCtx);
             if (swRoutingInfo == ErrorCodes::NamespaceNotFound) {
                 return boost::none;
             }
             auto routingInfo = uassertStatusOK(std::move(swRoutingInfo));
+            if (findCmdIsByUuid && routingInfo.cm()) {
+                // Find by UUID and shard versioning do not work together (SERVER-31946).  In the
+                // sharded case we've already checked the UUID, so find by namespace is safe.  In
+                // the unlikely case that the collection has been deleted and a new collection with
+                // the same name created through a different mongos, the shard version will be
+                // detected as stale, as shard versions contain an 'epoch' field unique to the
+                // collection.
+                findCmd = findCmd.addField(BSON("find" << nss.coll()).firstElement());
+                findCmdIsByUuid = false;
+            }
 
             // Get the ID and version of the single shard to which this query will be sent.
-            auto shardInfo = getSingleTargetedShardForQuery(expCtx->opCtx, routingInfo, filterObj);
+            auto shardInfo = getSingleTargetedShardForQuery(_expCtx->opCtx, routingInfo, filterObj);
 
             // Dispatch the request. This will only be sent to a single shard and only a single
             // result will be returned. The 'establishCursors' method conveniently prepares the
             // result into a cursor response for us.
             swShardResult = establishCursors(
-                expCtx->opCtx,
-                Grid::get(expCtx->opCtx)->getExecutorPool()->getArbitraryExecutor(),
-                expCtx->ns,
-                ReadPreferenceSetting::get(expCtx->opCtx),
+                _expCtx->opCtx,
+                Grid::get(_expCtx->opCtx)->getExecutorPool()->getArbitraryExecutor(),
+                nss,
+                ReadPreferenceSetting::get(_expCtx->opCtx),
                 {{shardInfo.first, appendShardVersion(findCmd, shardInfo.second)}},
                 false,
                 nullptr);
 
+            // If it's an unsharded collection which has been deleted and re-created, we may get a
+            // NamespaceNotFound error when looking up by UUID.
+            if (swShardResult.getStatus().code() == ErrorCodes::NamespaceNotFound) {
+                return boost::none;
+            }
             // If we hit a stale shardVersion exception, invalidate the routing table cache.
             if (ErrorCodes::isStaleShardingError(swShardResult.getStatus().code())) {
                 catalogCache->onStaleConfigError(std::move(routingInfo));

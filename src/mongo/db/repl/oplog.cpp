@@ -348,11 +348,8 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
     if (o2)
         b.append("o2", *o2);
 
-    if (wallTime != Date_t{} &&
-        (serverGlobalParams.featureCompatibility.getVersion() ==
-         ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36)) {
-        b.appendDate("wall", wallTime);
-    }
+    invariant(wallTime != Date_t{});
+    b.appendDate("wall", wallTime);
 
     appendSessionInfo(opCtx, &b, statementId, sessionInfo, oplogLink);
     return OplogDocWriter(OplogDocWriter(b.obj(), obj));
@@ -401,7 +398,9 @@ void _logOpsInner(OperationContext* opCtx,
 
     // Set replCoord last optime only after we're sure the WUOW didn't abort and roll back.
     opCtx->recoveryUnit()->onCommit([opCtx, replCoord, finalOpTime] {
-        replCoord->setMyLastAppliedOpTimeForward(finalOpTime);
+        // Optimes on the primary should always represent consistent database states.
+        replCoord->setMyLastAppliedOpTimeForward(
+            finalOpTime, ReplicationCoordinator::DataConsistency::Consistent);
         ReplClientInfo::forClient(opCtx->getClient()).setLastOp(finalOpTime);
     });
 }
@@ -714,7 +713,8 @@ using OpApplyFn = stdx::function<Status(OperationContext* opCtx,
                                         const char* ns,
                                         const BSONElement& ui,
                                         BSONObj& cmd,
-                                        const OpTime& opTime)>;
+                                        const OpTime& opTime,
+                                        OplogApplication::Mode mode)>;
 
 struct ApplyOpMetadata {
     OpApplyFn applyFunc;
@@ -736,7 +736,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           const NamespaceString nss(parseNs(ns, cmd));
           if (auto idIndexElem = cmd["idIndex"]) {
               // Remove "idIndex" field from command.
@@ -761,7 +762,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           const NamespaceString nss(parseUUID(opCtx, ui));
           BSONElement first = cmd.firstElement();
           invariant(first.fieldNameStringData() == "createIndexes");
@@ -782,7 +784,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           OptionalCollectionUUID uuid;
           NamespaceString nss;
           std::tie(uuid, nss) = parseCollModUUIDAndNss(opCtx, ui, ns, cmd);
@@ -795,7 +798,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           return dropDatabase(opCtx, NamespaceString(ns).db().toString());
       },
       {ErrorCodes::NamespaceNotFound}}},
@@ -804,7 +808,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           auto nss = parseUUIDorNs(opCtx, ns, ui, cmd);
           if (nss.isDropPendingNamespace()) {
@@ -827,7 +832,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
@@ -837,7 +843,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
@@ -847,7 +854,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
@@ -857,7 +865,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
       },
@@ -867,7 +876,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           return renameCollectionForApplyOps(opCtx, nsToDatabase(ns), ui, cmd, opTime);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::NamespaceExists}}},
@@ -876,9 +886,10 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
-          return applyOps(opCtx, nsToDatabase(ns), cmd, &resultWeDontCareAbout);
+          return applyOps(opCtx, nsToDatabase(ns), cmd, mode, &resultWeDontCareAbout);
       },
       {ErrorCodes::UnknownError}}},
     {"convertToCapped",
@@ -886,7 +897,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
          return convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
      }}},
     {"emptycapped",
@@ -894,7 +906,8 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
-         const OpTime& opTime) -> Status {
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status {
          return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
      }}},
 };
@@ -905,7 +918,7 @@ constexpr StringData OplogApplication::kInitialSyncOplogApplicationMode;
 constexpr StringData OplogApplication::kMasterSlaveOplogApplicationMode;
 constexpr StringData OplogApplication::kRecoveringOplogApplicationMode;
 constexpr StringData OplogApplication::kSecondaryOplogApplicationMode;
-constexpr StringData OplogApplication::kApplyOpsOplogApplicationMode;
+constexpr StringData OplogApplication::kApplyOpsCmdOplogApplicationMode;
 
 StringData OplogApplication::modeToString(OplogApplication::Mode mode) {
     switch (mode) {
@@ -917,8 +930,8 @@ StringData OplogApplication::modeToString(OplogApplication::Mode mode) {
             return OplogApplication::kRecoveringOplogApplicationMode;
         case OplogApplication::Mode::kSecondary:
             return OplogApplication::kSecondaryOplogApplicationMode;
-        case OplogApplication::Mode::kApplyOps:
-            return OplogApplication::kApplyOpsOplogApplicationMode;
+        case OplogApplication::Mode::kApplyOpsCmd:
+            return OplogApplication::kApplyOpsCmdOplogApplicationMode;
     }
     MONGO_UNREACHABLE;
 }
@@ -932,8 +945,8 @@ StatusWith<OplogApplication::Mode> OplogApplication::parseMode(const std::string
         return OplogApplication::Mode::kRecovering;
     } else if (mode == OplogApplication::kSecondaryOplogApplicationMode) {
         return OplogApplication::Mode::kSecondary;
-    } else if (mode == OplogApplication::kApplyOpsOplogApplicationMode) {
-        return OplogApplication::Mode::kApplyOps;
+    } else if (mode == OplogApplication::kApplyOpsCmdOplogApplicationMode) {
+        return OplogApplication::Mode::kApplyOpsCmd;
     } else {
         return Status(ErrorCodes::FailedToParse,
                       str::stream() << "Invalid oplog application mode provided: " << mode);
@@ -988,7 +1001,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
                              bool alwaysUpsert,
                              OplogApplication::Mode mode,
                              IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
-    LOG(3) << "applying op: " << redact(op);
+    LOG(3) << "applying op: " << redact(op)
+           << ", oplog application mode: " << OplogApplication::modeToString(mode);
 
     OpCounters* opCounters = opCtx->writesAreReplicated() ? &globalOpCounters : &replOpCounters;
 
@@ -1282,12 +1296,15 @@ Status applyOperation_inlock(OperationContext* opCtx,
     } else if (*opType == 'u') {
         opCounters->gotUpdate();
 
-        BSONObj updateCriteria = o2;
-        const bool upsert = valueB || alwaysUpsert;
-
+        auto idField = o2["_id"];
         uassert(ErrorCodes::NoSuchKey,
                 str::stream() << "Failed to apply update due to missing _id: " << op.toString(),
-                updateCriteria.hasField("_id"));
+                !idField.eoo());
+
+        // The o2 field may contain additional fields besides the _id (like the shard key fields),
+        // but we want to do the update by just _id so we can take advantage of the IDHACK.
+        BSONObj updateCriteria = idField.wrap();
+        const bool upsert = valueB || alwaysUpsert;
 
         UpdateRequest request(requestNss);
         request.setQuery(updateCriteria);
@@ -1364,9 +1381,14 @@ Status applyOperation_inlock(OperationContext* opCtx,
     } else if (*opType == 'd') {
         opCounters->gotDelete();
 
+        auto idField = o["_id"];
         uassert(ErrorCodes::NoSuchKey,
                 str::stream() << "Failed to apply delete due to missing _id: " << op.toString(),
-                o.hasField("_id"));
+                !idField.eoo());
+
+        // The o field may contain additional fields besides the _id (like the shard key fields),
+        // but we want to do the delete by just _id so we can take advantage of the IDHACK.
+        BSONObj deleteCriteria = idField.wrap();
 
         SnapshotName timestamp;
         if (assignOperationTimestamp) {
@@ -1381,7 +1403,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             }
 
             if (opType[1] == 0) {
-                deleteObjects(opCtx, collection, requestNss, o, /*justOne*/ valueB);
+                deleteObjects(opCtx, collection, requestNss, deleteCriteria, /*justOne*/ valueB);
             } else
                 verify(opType[1] == 'b');  // "db" advertisement
             wuow.commit();
@@ -1406,6 +1428,9 @@ Status applyOperation_inlock(OperationContext* opCtx,
 Status applyCommand_inlock(OperationContext* opCtx,
                            const BSONObj& op,
                            OplogApplication::Mode mode) {
+    LOG(3) << "applying command op: " << redact(op)
+           << ", oplog application mode: " << OplogApplication::modeToString(mode);
+
     std::array<StringData, 4> names = {"o", "ui", "ns", "op"};
     std::array<BSONElement, 4> fields;
     op.getFields(names, &fields);
@@ -1500,7 +1525,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
         ApplyOpMetadata curOpToApply = op->second;
         Status status = Status::OK();
         try {
-            status = curOpToApply.applyFunc(opCtx, nss.ns().c_str(), fieldUI, o, opTime);
+            status = curOpToApply.applyFunc(opCtx, nss.ns().c_str(), fieldUI, o, opTime, mode);
         } catch (...) {
             status = exceptionToStatus();
         }

@@ -55,6 +55,14 @@ public:
             return true;
         }
 
+        bool allowedToForwardFromMongos() const final {
+            return false;
+        }
+
+        bool allowedToPassthroughFromMongos() const final {
+            return false;
+        }
+
         stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
             // TODO SERVER-29138: we need to communicate that this stage will need to look up
             // documents from different collections.
@@ -141,8 +149,8 @@ public:
     static constexpr StringData kReplaceOpType = "replace"_sd;
     static constexpr StringData kInsertOpType = "insert"_sd;
     static constexpr StringData kInvalidateOpType = "invalidate"_sd;
-    // Internal op type to close the cursor.
-    static constexpr StringData kRetryNeededOpType = "retryNeeded"_sd;
+    // Internal op type to signal mongos to open cursors on new shards.
+    static constexpr StringData kNewShardDetectedOpType = "kNewShardDetected"_sd;
 
     /**
      * Produce the BSON object representing the filter for the $match stage to filter oplog entries
@@ -161,6 +169,15 @@ public:
 
     static boost::intrusive_ptr<DocumentSource> createTransformationStage(
         BSONObj changeStreamSpec, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+
+    /**
+     * Given a BSON object containing an aggregation command with a $changeStream stage, and a
+     * resume token, returns a new BSON object with the same command except with the addition of a
+     * resumeAfter: option containing the resume token.  If there was a previous resumeAfter:
+     * option, it is removed.
+     */
+    static BSONObj replaceResumeTokenInCommand(const BSONObj originalCmdObj,
+                                               const BSONObj resumeToken);
 
 private:
     // It is illegal to construct a DocumentSourceChangeStream directly, use createFromBson()
