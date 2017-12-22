@@ -46,6 +46,7 @@
 #include "mongo/db/update/storage_validation.h"
 #include "mongo/util/embedded_builder.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/stringutils.h"
 
 namespace mongo {
 
@@ -165,7 +166,7 @@ Status UpdateDriver::parse(
     clear();
 
     // Check if the update expression is a full object replacement.
-    if (*updateExpr.firstElementFieldName() != '$') {
+    if (isDocReplacement(updateExpr)) {
         if (multi) {
             return Status(ErrorCodes::FailedToParse, "multi update only works with $ operators");
         }
@@ -448,7 +449,17 @@ Status UpdateDriver::update(StringData matchedField,
                 // Find the updated field in the updated document.
                 auto newElem = doc->root();
                 for (size_t i = 0; i < (*path)->numParts(); ++i) {
-                    newElem = newElem[(*path)->getPart(i)];
+                    if (newElem.getType() == BSONType::Array) {
+                        auto indexFromField = parseUnsignedBase10Integer((*path)->getPart(i));
+                        if (indexFromField) {
+                            newElem = newElem.findNthChild(*indexFromField);
+                        } else {
+                            newElem = newElem.getDocument().end();
+                        }
+                    } else {
+                        newElem = newElem[(*path)->getPart(i)];
+                    }
+
                     if (!newElem.ok()) {
                         break;
                     }
@@ -568,6 +579,10 @@ void UpdateDriver::clear() {
     _indexedFields = NULL;
     _replacementMode = false;
     _positional = false;
+}
+
+bool UpdateDriver::isDocReplacement(const BSONObj& updateExpr) {
+    return *updateExpr.firstElementFieldName() != '$';
 }
 
 }  // namespace mongo

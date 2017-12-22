@@ -140,7 +140,9 @@ public:
      * separate aggregation pipeline on 'ns' with the optional 'uuid'.
      */
     boost::intrusive_ptr<ExpressionContext> copyWith(
-        NamespaceString ns, boost::optional<UUID> uuid = boost::none) const;
+        NamespaceString ns,
+        boost::optional<UUID> uuid = boost::none,
+        boost::optional<std::unique_ptr<CollatorInterface>> collator = boost::none) const;
 
     /**
      * Returns the ResolvedNamespace corresponding to 'nss'. It is an error to call this method on a
@@ -162,6 +164,9 @@ public:
 
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
     boost::optional<ExplainOptions::Verbosity> explain;
+
+    // The comment provided by the user, or the empty string if no comment was provided.
+    std::string comment;
 
     bool fromMongos = false;
     bool needsMerge = false;

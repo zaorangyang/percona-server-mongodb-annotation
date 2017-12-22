@@ -935,9 +935,20 @@ Status _syncRollback(OperationContext* opCtx,
                           << e.what());
     }
 
-    log() << "Rollback common point is " << how.commonPoint;
+    OpTime commonPoint = how.commonPoint;
+    OpTime lastCommittedOpTime = replCoord->getLastCommittedOpTime();
+    OpTime committedSnapshot = replCoord->getCurrentCommittedSnapshotOpTime();
+
+    log() << "Rollback common point is " << commonPoint;
+
+    // Rollback common point should be >= the replication commit point.
     invariant(!replCoord->isV1ElectionProtocol() ||
-              how.commonPoint >= replCoord->getLastCommittedOpTime());
+              commonPoint.getTimestamp() >= lastCommittedOpTime.getTimestamp());
+    invariant(!replCoord->isV1ElectionProtocol() || commonPoint >= lastCommittedOpTime);
+
+    // Rollback common point should be >= the committed snapshot optime.
+    invariant(commonPoint.getTimestamp() >= committedSnapshot.getTimestamp());
+    invariant(commonPoint >= committedSnapshot);
 
     try {
         ON_BLOCK_EXIT([&] {
@@ -1180,13 +1191,22 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             // Set any document validation options. We update the validator fields without
             // parsing/validation, since we fetched the options object directly from the sync
             // source, and we should set our validation options to match it exactly.
-            cce->updateValidator(
+            auto validatorStatus = collection->updateValidator(
                 opCtx, options.validator, options.validationLevel, options.validationAction);
+            if (!validatorStatus.isOK()) {
+                throw RSFatalException(
+                    str::stream() << "Failed to update validator for " << nss.toString() << " ("
+                                  << uuid
+                                  << ") with "
+                                  << redact(info)
+                                  << ". Got: "
+                                  << validatorStatus.toString());
+            }
 
             wuow.commit();
 
             LOG(1) << "Resynced collection metadata for collection: " << nss << ", UUID: " << uuid
-                   << ", with: " << redact(options.toBSON())
+                   << ", with: " << redact(info)
                    << ", to: " << redact(cce->getCollectionOptions(opCtx).toBSON());
         }
 
@@ -1409,8 +1429,13 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     }
 
     // Reload the lastAppliedOpTime and lastDurableOpTime value in the replcoord and the
-    // lastAppliedHash value in bgsync to reflect our new last op.
-    replCoord->resetLastOpTimesFromOplog(opCtx);
+    // lastAppliedHash value in bgsync to reflect our new last op. The rollback common point does
+    // not necessarily represent a consistent database state. For example, on a secondary, we may
+    // have rolled back to an optime that fell in the middle of an oplog application batch. We make
+    // the database consistent again after rollback by applying ops forward until we reach
+    // 'minValid'.
+    replCoord->resetLastOpTimesFromOplog(opCtx,
+                                         ReplicationCoordinator::DataConsistency::Inconsistent);
 }
 
 Status syncRollback(OperationContext* opCtx,

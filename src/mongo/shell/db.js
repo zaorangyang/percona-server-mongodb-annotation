@@ -215,6 +215,9 @@ var DB;
             delete optcpy['useCursor'];
         }
 
+        const maxAwaitTimeMS = optcpy.maxAwaitTimeMS;
+        delete optcpy.maxAwaitTimeMS;
+
         // Reassign the cleaned-up options.
         aggregateOptions = optcpy;
 
@@ -263,7 +266,7 @@ var DB;
                 batchSizeValue = cmdObj["cursor"]["batchSize"];
             }
 
-            return new DBCommandCursor(this, res, batchSizeValue);
+            return new DBCommandCursor(this, res, batchSizeValue, maxAwaitTimeMS);
         }
 
         return res;
@@ -322,10 +325,8 @@ var DB;
         var options = opt || {};
 
         // We have special handling for the 'flags' field, and provide sugar for specific flags. If
-        // the
-        // user specifies any flags we send the field in the command. Otherwise, we leave it blank
-        // and
-        // use the server's defaults.
+        // the user specifies any flags we send the field in the command. Otherwise, we leave it
+        // blank and use the server's defaults.
         var sendFlags = false;
         var flags = 0;
         if (options.usePowerOf2Sizes != undefined) {

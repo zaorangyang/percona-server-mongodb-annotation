@@ -24,16 +24,6 @@ post:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        local_file: work/reports/graphs/timeseries-mongod.0.html
-        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/timeseries-mongod.0-${task_name}-${build_id}-${execution}.html
-        bucket: mciuploads
-        permissions: public-read
-        content_type: text/html
-        display_name: timeseries-p1.html - Execution ${execution}
-    - command: s3.put
-      params:
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
         local_file: src/workloads/workloads/jsdoc/jsdocs-redirect.html
         remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/workloads-${task_name}-${build_id}.html
         bucket: mciuploads
@@ -225,7 +215,7 @@ functions:
         script: |
           set -o errexit
           TAGS="3.4.9-Baseline 3.2.17-Baseline"
-          OVERRIDEFILE="../src/dsi/dsi/analysis/master/system_perf_override.json"
+          OVERRIDEFILE="../src/dsi/dsi/analysis/${branch_name}/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/dashboard_gen.py --rev ${revision} -f history.json -t tags.json --refTag $TAGS --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name} --jira-user ${perf_jira_user} --jira-password ${perf_jira_pw} || true
     - command: "json.send"
       params:
@@ -240,7 +230,7 @@ functions:
           set -o errexit
           set -o verbose
           TAG="3.4.9-Baseline"
-          OVERRIDEFILE="../src/dsi/dsi/analysis/master/system_perf_override.json"
+          OVERRIDEFILE="../src/dsi/dsi/analysis/${branch_name}/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file reports/perf.json --rev ${revision} -f history.json -t tags.json --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
 
 #######################################
@@ -348,7 +338,8 @@ tasks:
     - func: "make test log artifact"
     - func: "analyze"
       vars:
-        script_flags: --ycsb-throughput-analysis reports
+        # Disabling --ycsb-throughput-analysis until BF-7153 fixed
+        # script_flags: --ycsb-throughput-analysis reports
 
 - name: industry_benchmarks_MMAPv1
   depends_on:

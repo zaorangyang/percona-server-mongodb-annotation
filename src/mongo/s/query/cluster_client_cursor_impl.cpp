@@ -146,6 +146,10 @@ boost::optional<LogicalSessionId> ClusterClientCursorImpl::getLsid() const {
     return _lsid;
 }
 
+boost::optional<ReadPreferenceSetting> ClusterClientCursorImpl::getReadPreference() const {
+    return _params.readPreference;
+}
+
 namespace {
 
 /**
@@ -183,6 +187,20 @@ bool isAllLimitsAndSkips(Pipeline* pipeline) {
         stages.begin(), stages.end(), [&](const auto& stage) { return isSkipOrLimit(stage); });
 }
 
+/**
+ * Creates the initial stage to feed data into the execution plan.  By default, a RouterExecMerge
+ * stage, or a custom stage if specified in 'params->creatCustomMerge'.
+ */
+std::unique_ptr<RouterExecStage> createInitialStage(OperationContext* opCtx,
+                                                    executor::TaskExecutor* executor,
+                                                    ClusterClientCursorParams* params) {
+    if (params->createCustomCursorSource) {
+        return params->createCustomCursorSource(opCtx, executor, params);
+    } else {
+        return stdx::make_unique<RouterStageMerge>(opCtx, executor, params);
+    }
+}
+
 std::unique_ptr<RouterExecStage> buildPipelinePlan(executor::TaskExecutor* executor,
                                                    ClusterClientCursorParams* params) {
     invariant(params->mergePipeline);
@@ -191,8 +209,7 @@ std::unique_ptr<RouterExecStage> buildPipelinePlan(executor::TaskExecutor* execu
     auto* pipeline = params->mergePipeline.get();
     auto* opCtx = pipeline->getContext()->opCtx;
 
-    std::unique_ptr<RouterExecStage> root =
-        stdx::make_unique<RouterStageMerge>(opCtx, executor, params);
+    std::unique_ptr<RouterExecStage> root = createInitialStage(opCtx, executor, params);
     if (!isAllLimitsAndSkips(pipeline)) {
         return stdx::make_unique<RouterStagePipeline>(std::move(root),
                                                       std::move(params->mergePipeline));
@@ -235,8 +252,7 @@ std::unique_ptr<RouterExecStage> ClusterClientCursorImpl::buildMergerPlan(
         return buildPipelinePlan(executor, params);
     }
 
-    std::unique_ptr<RouterExecStage> root =
-        stdx::make_unique<RouterStageMerge>(opCtx, executor, params);
+    std::unique_ptr<RouterExecStage> root = createInitialStage(opCtx, executor, params);
 
     if (skip) {
         root = stdx::make_unique<RouterStageSkip>(opCtx, std::move(root), *skip);

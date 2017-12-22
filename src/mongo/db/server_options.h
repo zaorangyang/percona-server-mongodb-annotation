@@ -242,6 +242,8 @@ struct ServerGlobalParams {
     AtomicWord<bool> validateFeaturesAsMaster{true};
 
     std::vector<std::string> disabledSecureAllocatorDomains;
+
+    bool enableMajorityReadConcern = true;
 };
 
 extern ServerGlobalParams serverGlobalParams;
