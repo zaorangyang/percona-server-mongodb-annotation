@@ -130,9 +130,9 @@ add_value_to_yaml() {
 }
 
 add_user_to_mongo() {
-    port=$(get_value_from_yaml net port)
-    user='dba'
-    password=`cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1`
+    port="$(get_value_from_yaml net port)"
+    user="dba"
+    password="$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 32)"
     password="${password%\\n}"
     echo "db.createUser({user: \"$user\", pwd: \"$password\", roles: [ \"root\" ] });" | ${MONGO_CLIENT_BIN} -p $port localhost/admin
     if [ $? -eq 0 ];then
