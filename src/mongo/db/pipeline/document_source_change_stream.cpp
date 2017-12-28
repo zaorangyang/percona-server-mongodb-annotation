@@ -46,6 +46,8 @@
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/grid.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -327,7 +329,7 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
         }
     }
     if (auto resumeAfterClusterTime = spec.getResumeAfterClusterTime()) {
-        uassert(50656,
+        uassert(40674,
                 str::stream() << "Do not specify both "
                               << DocumentSourceChangeStreamSpec::kResumeAfterFieldName
                               << " and "
@@ -407,6 +409,22 @@ intrusive_ptr<DocumentSource> DocumentSourceChangeStream::createTransformationSt
 }
 
 Document DocumentSourceChangeStream::Transformation::applyTransformation(const Document& input) {
+    // If we're executing a change stream pipeline that was forwarded from mongos, then we expect it
+    // to "need merge"---we expect to be executing the shards part of a split pipeline. It is never
+    // correct for mongos to pass through the change stream without splitting into into a merging
+    // part executed on mongos and a shards part.
+    //
+    // This is necessary so that mongos can correctly handle "invalidate" and "retryNeeded" change
+    // notifications. See SERVER-31978 for an example of why the pipeline must be split.
+    //
+    // We have to check this invariant at run-time of the change stream rather than parse time,
+    // since a mongos may forward a change stream in an invalid position (e.g. in a nested $lookup
+    // or $facet pipeline). In this case, mongod is responsible for parsing the pipeline and
+    // throwing an error without ever executing the change stream.
+    if (_expCtx->fromMongos) {
+        invariant(_expCtx->needsMerge);
+    }
+
     MutableDocument doc;
 
     // Extract the fields we need.
@@ -420,8 +438,24 @@ Document DocumentSourceChangeStream::Transformation::applyTransformation(const D
     Value uuid = input[repl::OplogEntry::kUuidFieldName];
     if (!uuid.missing()) {
         checkValueType(uuid, repl::OplogEntry::kUuidFieldName, BSONType::BinData);
-        if (_mongoProcess && _documentKeyFields.empty()) {
-            _documentKeyFields = _mongoProcess->collectDocumentKeyFields(uuid.getUuid());
+        // We need to retrieve the document key fields if our cached copy has not been populated. If
+        // the collection was unsharded but has now transitioned to a sharded state, we must update
+        // the documentKey fields to include the shard key. We only need to re-check the documentKey
+        // while the collection is unsharded; if the collection is or becomes sharded, then the
+        // documentKey is final and will not change.
+        if (_mongoProcess && !_documentKeyFieldsSharded) {
+            // If this is not a shard server, 'catalogCache' will be nullptr and we will skip the
+            // routing table check.
+            auto catalogCache = Grid::get(_expCtx->opCtx)->catalogCache();
+            const bool collectionIsSharded = catalogCache && [catalogCache, this]() {
+                auto routingInfo =
+                    catalogCache->getCollectionRoutingInfo(_expCtx->opCtx, _expCtx->ns);
+                return routingInfo.isOK() && routingInfo.getValue().cm();
+            }();
+            if (_documentKeyFields.empty() || collectionIsSharded) {
+                _documentKeyFields = _mongoProcess->collectDocumentKeyFields(uuid.getUuid());
+                _documentKeyFieldsSharded = collectionIsSharded;
+            }
         }
     }
     NamespaceString nss(ns.getString());

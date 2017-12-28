@@ -1025,6 +1025,15 @@ Status applyOperation_inlock(OperationContext* opCtx,
     // operation type -- see logOp() comments for types
     const char* opType = fieldOp.valuestrsafe();
 
+    if (*opType == 'n') {
+        // no op
+        if (incrementOpsAppliedStats) {
+            incrementOpsAppliedStats();
+        }
+
+        return Status::OK();
+    }
+
     NamespaceString requestNss;
     Collection* collection = nullptr;
     if (fieldUI) {
@@ -1112,7 +1121,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
     const bool assignOperationTimestamp = !opCtx->writesAreReplicated() &&
         !haveWrappingWriteUnitOfWork && fieldTs &&
         getGlobalReplicationCoordinator()->getReplicationMode() !=
-            ReplicationCoordinator::modeMasterSlave;
+            ReplicationCoordinator::modeMasterSlave &&
+        serverGlobalParams.enableMajorityReadConcern;
 
     if (*opType == 'i') {
         if (requestNss.isSystemDotIndexes()) {
@@ -1157,12 +1167,15 @@ Status applyOperation_inlock(OperationContext* opCtx,
             while (true) {
                 auto oElem = fieldOIt.next();
                 auto tsElem = fieldTsIt.next();
+                Timestamp timestamp;
+                if (assignOperationTimestamp) {
+                    timestamp = tsElem.timestamp();
+                }
                 auto tElem = fieldTIt.next();
 
                 // Note: we don't care about statement ids here since the secondaries don't create
                 // their own oplog entries.
-                insertObjs.emplace_back(
-                    oElem.Obj(), SnapshotName(tsElem.timestamp()), tElem.Long());
+                insertObjs.emplace_back(oElem.Obj(), timestamp, tElem.Long());
                 if (!fieldOIt.more()) {
                     // Make sure arrays are the same length.
                     uassert(ErrorCodes::OperationFailed,
@@ -1215,11 +1228,11 @@ Status applyOperation_inlock(OperationContext* opCtx,
             // case.
             bool needToDoUpsert = haveWrappingWriteUnitOfWork;
 
-            SnapshotName timestamp;
+            Timestamp timestamp;
             long long term = OpTime::kUninitializedTerm;
             if (assignOperationTimestamp) {
                 if (fieldTs) {
-                    timestamp = SnapshotName(fieldTs.timestamp());
+                    timestamp = fieldTs.timestamp();
                 }
                 if (fieldT) {
                     term = fieldT.Long();
@@ -1233,7 +1246,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 // a user to dictate what timestamps appear in the oplog.
                 if (assignOperationTimestamp) {
                     if (fieldTs.ok()) {
-                        timestamp = SnapshotName(fieldTs.timestamp());
+                        timestamp = fieldTs.timestamp();
                     }
                     if (fieldT.ok()) {
                         term = fieldT.Long();
@@ -1275,7 +1288,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     WriteUnitOfWork wuow(opCtx);
                     // If this is an atomic applyOps (i.e: `haveWrappingWriteUnitOfWork` is true),
                     // do not timestamp the write.
-                    if (assignOperationTimestamp && timestamp != SnapshotName::min()) {
+                    if (assignOperationTimestamp && timestamp != Timestamp::min()) {
                         uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(timestamp));
                     }
 
@@ -1315,15 +1328,15 @@ Status applyOperation_inlock(OperationContext* opCtx,
         UpdateLifecycleImpl updateLifecycle(requestNss);
         request.setLifecycle(&updateLifecycle);
 
-        SnapshotName timestamp;
+        Timestamp timestamp;
         if (assignOperationTimestamp) {
-            timestamp = SnapshotName(fieldTs.timestamp());
+            timestamp = fieldTs.timestamp();
         }
 
         const StringData ns = fieldNs.valueStringData();
         auto status = writeConflictRetry(opCtx, "applyOps_update", ns, [&] {
             WriteUnitOfWork wuow(opCtx);
-            if (timestamp != SnapshotName::min()) {
+            if (timestamp != Timestamp::min()) {
                 uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(timestamp));
             }
 
@@ -1390,15 +1403,15 @@ Status applyOperation_inlock(OperationContext* opCtx,
         // but we want to do the delete by just _id so we can take advantage of the IDHACK.
         BSONObj deleteCriteria = idField.wrap();
 
-        SnapshotName timestamp;
+        Timestamp timestamp;
         if (assignOperationTimestamp) {
-            timestamp = SnapshotName(fieldTs.timestamp());
+            timestamp = fieldTs.timestamp();
         }
 
         const StringData ns = fieldNs.valueStringData();
         writeConflictRetry(opCtx, "applyOps_delete", ns, [&] {
             WriteUnitOfWork wuow(opCtx);
-            if (timestamp != SnapshotName::min()) {
+            if (timestamp != Timestamp::min()) {
                 uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(timestamp));
             }
 
@@ -1409,11 +1422,6 @@ Status applyOperation_inlock(OperationContext* opCtx,
             wuow.commit();
         });
 
-        if (incrementOpsAppliedStats) {
-            incrementOpsAppliedStats();
-        }
-    } else if (*opType == 'n') {
-        // no op
         if (incrementOpsAppliedStats) {
             incrementOpsAppliedStats();
         }
