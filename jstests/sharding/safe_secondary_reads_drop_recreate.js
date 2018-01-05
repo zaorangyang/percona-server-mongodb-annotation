@@ -61,6 +61,7 @@
         _configsvrShardCollection: {skip: "primary only"},
         _configsvrSetFeatureCompatibilityVersion: {skip: "primary only"},
         _configsvrUpdateZoneKeyRange: {skip: "primary only"},
+        _flushRoutingTableCacheUpdates: {skip: "does not return user data"},
         _getUserCacheGeneration: {skip: "does not return user data"},
         _hashBSONElement: {skip: "does not return user data"},
         _isSelf: {skip: "does not return user data"},
@@ -173,7 +174,6 @@
         findAndModify: {skip: "primary only"},
         flushRouterConfig: {skip: "does not return user data"},
         forceerror: {skip: "does not return user data"},
-        forceRoutingTableRefresh: {skip: "does not return user data"},
         fsync: {skip: "does not return user data"},
         fsyncUnlock: {skip: "does not return user data"},
         geoNear: {
@@ -333,8 +333,8 @@
 
             // Ensure the latest version changes have been persisted and propagate to the secondary
             // before we target it with versioned commands.
-            assert.commandWorked(
-                st.rs0.getPrimary().getDB('admin').runCommand({forceRoutingTableRefresh: nss}));
+            assert.commandWorked(st.rs0.getPrimary().getDB('admin').runCommand(
+                {_flushRoutingTableCacheUpdates: nss}));
             st.rs0.awaitReplication();
 
             let res = staleMongos.getDB(db).runCommand(Object.assign(
@@ -397,8 +397,8 @@
 
             // Ensure the latest version changes have been persisted and propagate to the secondary
             // before we target it with versioned commands.
-            assert.commandWorked(
-                st.rs0.getPrimary().getDB('admin').runCommand({forceRoutingTableRefresh: nss}));
+            assert.commandWorked(st.rs0.getPrimary().getDB('admin').runCommand(
+                {_flushRoutingTableCacheUpdates: nss}));
             st.rs0.awaitReplication();
 
             let res = staleMongos.getDB(db).runCommand(Object.assign(

@@ -958,7 +958,6 @@ env.Library(
     source=[
         'repl_client_info.cpp',
         'replication_coordinator.cpp',
-        'replication_coordinator_external_state.cpp',
     ],
     LIBDEPS=[
         'optime',
@@ -1152,29 +1151,6 @@ env.CppUnitTest(
     LIBDEPS=[
         'oplog_fetcher',
         'data_replicator_external_state_mock',
-        'abstract_oplog_fetcher_test_fixture',
-    ],
-)
-
-env.Library(
-    target='rollback_common_point_resolver',
-    source=[
-        'rollback_common_point_resolver.cpp',
-    ],
-    LIBDEPS=[
-        'abstract_oplog_fetcher',
-        'replica_set_messages',
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/namespace_string',
-    ],
-)
-
-env.CppUnitTest(
-    target='rollback_common_point_resolver_test',
-    source='rollback_common_point_resolver_test.cpp',
-    LIBDEPS=[
-        'rollback_common_point_resolver',
-        'oplog_interface_mock',
         'abstract_oplog_fetcher_test_fixture',
     ],
 )
@@ -1534,45 +1510,6 @@ env.CppUnitTest(
 )
 
 env.Library(
-    target='rollback_fix_up_info',
-    source=[
-        'rollback_fix_up_info.cpp',
-        'rollback_fix_up_info_descriptions.cpp',
-    ],
-    LIBDEPS=[
-        'storage_interface',
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/catalog/collection_options',
-        '$BUILD_DIR/mongo/db/namespace_string',
-        '$BUILD_DIR/mongo/util/uuid',
-    ],
-)
-
-env.CppUnitTest(
-    target='rollback_fix_up_info_test',
-    source=[
-        'rollback_fix_up_info_test.cpp',
-    ],
-    LIBDEPS=[
-        'replmocks',
-        'rollback_fix_up_info',
-        'storage_interface_impl',
-        '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
-    ],
-)
-
-env.CppUnitTest(
-    target='rollback_fix_up_info_descriptions_test',
-    source=[
-        'rollback_fix_up_info_descriptions_test.cpp',
-    ],
-    LIBDEPS=[
-        'rollback_fix_up_info',
-    ],
-)
-
-env.Library(
     target='roll_back_local_operations',
     source=[
         'roll_back_local_operations.cpp',
@@ -1654,4 +1591,3 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
     ]
 )
-

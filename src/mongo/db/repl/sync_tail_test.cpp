@@ -1552,6 +1552,61 @@ TEST_F(IdempotencyTest, CollModIndexNotFound) {
     testOpsAreIdempotent(ops);
 }
 
+TEST_F(SyncTailTest, FailOnAssigningUUIDToCollectionWithExistingUUID) {
+    NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
+    auto oldUUID = UUID::gen();
+    CollectionOptions options;
+    options.uuid = oldUUID;
+    createCollection(_opCtx.get(), nss, options);
+
+    auto collModCmd = BSON("collMod" << nss.coll());
+    auto newUUID = UUID::gen();
+    auto collModOp = repl::OplogEntry(nextOpTime(),
+                                      1LL,
+                                      OpTypeEnum::kCommand,
+                                      nss,
+                                      newUUID,
+                                      boost::none,
+                                      repl::OplogEntry::kOplogVersion,
+                                      collModCmd,
+                                      boost::none,
+                                      {},
+                                      boost::none,
+                                      boost::none,
+                                      boost::none,
+                                      boost::none,
+                                      boost::none);
+
+    ASSERT_EQUALS(runOpInitialSync(collModOp), ErrorCodes::duplicateCodeForTest(40676));
+}
+
+TEST_F(SyncTailTest, SuccessOnAssigningUUIDToCollectionWithExistingUUID) {
+    NamespaceString nss("local." + _agent.getSuiteName() + "_" + _agent.getTestName());
+    auto oldUUID = UUID::gen();
+    CollectionOptions options;
+    options.uuid = oldUUID;
+    createCollection(_opCtx.get(), nss, options);
+
+    auto collModCmd = BSON("collMod" << nss.coll());
+    auto collModOp = repl::OplogEntry(nextOpTime(),
+                                      1LL,
+                                      OpTypeEnum::kCommand,
+                                      nss,
+                                      oldUUID,
+                                      boost::none,
+                                      repl::OplogEntry::kOplogVersion,
+                                      collModCmd,
+                                      boost::none,
+                                      {},
+                                      boost::none,
+                                      boost::none,
+                                      boost::none,
+                                      boost::none,
+                                      boost::none);
+
+    ASSERT_OK(runOpInitialSync(collModOp));
+}
+
 TEST_F(SyncTailTest, FailOnDropFCVCollection) {
     ASSERT_OK(
         ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
@@ -1608,29 +1663,6 @@ TEST_F(SyncTailTest, FailOnDropFCVCollectionInRecovering) {
     ASSERT_EQUALS(runOpSteadyState(op), ErrorCodes::OplogOperationUnsupported);
 }
 
-TEST_F(SyncTailTest, FailOnDeleteFCVDocumentInRecovering) {
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    CollectionOptions options;
-    options.uuid = UUID::gen();
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, options);
-
-    // Insert the fCV document.
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_SECONDARY));
-    auto insertCmd = BSON("_id" << FeatureCompatibilityVersion::kParameterName
-                                << FeatureCompatibilityVersion::kVersionField
-                                << FeatureCompatibilityVersionCommandParser::kVersion36);
-    auto insertOp = makeInsertDocumentOplogEntry(nextOpTime(), fcvNS, insertCmd);
-    ASSERT_OK(runOpSteadyState(insertOp));
-
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
-
-    auto cmd = BSON("_id" << FeatureCompatibilityVersion::kParameterName);
-    auto op = makeDeleteDocumentOplogEntry(nextOpTime(), fcvNS, cmd);
-    ASSERT_EQUALS(runOpSteadyState(op), ErrorCodes::OplogOperationUnsupported);
-}
-
 TEST_F(SyncTailTest, SuccessOnUpdateFCV34TargetVersionUnsetDocumentInRecovering) {
     auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
     ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
@@ -1673,26 +1705,6 @@ TEST_F(SyncTailTest, SuccessOnDropFCVCollectionInSecondary) {
 
     auto cmd = BSON("drop" << fcvNS.coll());
     auto op = makeCommandOplogEntry(nextOpTime(), fcvNS, cmd);
-    ASSERT_OK(runOpSteadyState(op));
-}
-
-TEST_F(SyncTailTest, SuccessOnDeleteFCVDocumentInSecondary) {
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    CollectionOptions options;
-    options.uuid = UUID::gen();
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, options);
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_SECONDARY));
-
-    // Insert the fCV document.
-    auto insertCmd = BSON("_id" << FeatureCompatibilityVersion::kParameterName
-                                << FeatureCompatibilityVersion::kVersionField
-                                << FeatureCompatibilityVersionCommandParser::kVersion36);
-    auto insertOp = makeInsertDocumentOplogEntry(nextOpTime(), fcvNS, insertCmd);
-    ASSERT_OK(runOpSteadyState(insertOp));
-
-    auto cmd = BSON("_id" << FeatureCompatibilityVersion::kParameterName);
-    auto op = makeDeleteDocumentOplogEntry(nextOpTime(), fcvNS, cmd);
     ASSERT_OK(runOpSteadyState(op));
 }
 

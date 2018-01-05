@@ -1,3 +1,7 @@
+// Uses features that require featureCompatibilityVersion 3.6.
+// @tags: [requires_fcv36, does_not_support_stepdowns, requires_getmore,
+// requires_non_retryable_commands, requires_non_retryable_writes]
+
 /*
  * Declaratively-defined tests for views for all database commands. This file contains a map of test
  * definitions as well as code to run them.
@@ -48,9 +52,6 @@
  *
  *  skipStandalone
  *      If true, do not run this command on a standalone mongod.
- *
- * Uses features that require featureCompatibilityVersion 3.6.
- * @tags: [requires_fcv36]
  */
 
 (function() {
@@ -78,6 +79,7 @@
         _configsvrShardCollection: {skip: isAnInternalCommand},
         _configsvrSetFeatureCompatibilityVersion: {skip: isAnInternalCommand},
         _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
+        _flushRoutingTableCacheUpdates: {skip: isUnrelated},
         _getNextSessionMods: {skip: isAnInternalCommand},
         _getUserCacheGeneration: {skip: isAnInternalCommand},
         _hashBSONElement: {skip: isAnInternalCommand},
@@ -218,7 +220,6 @@
         },
         flushRouterConfig: {skip: isUnrelated},
         forceerror: {skip: isUnrelated},
-        forceRoutingTableRefresh: {skip: isUnrelated},
         fsync: {skip: isUnrelated},
         fsyncUnlock: {skip: isUnrelated},
         geoNear: {
