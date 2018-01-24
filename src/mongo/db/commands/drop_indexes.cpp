@@ -58,6 +58,13 @@
 
 namespace mongo {
 
+namespace {
+
+const auto kMsgObj = BSON("msg"
+                          << "noop to force sync replication state after reIndex");
+
+}  // namespace
+
 using std::endl;
 using std::string;
 using std::stringstream;
@@ -211,6 +218,17 @@ public:
             indexer.commit();
             wunit.commit();
         }
+
+        // Write Noop into the oplog just to increment timestamp value returned by following call
+        // to reserveSnapshotName. Thus setMinimumVisibleSnapshot will be guaranteed to record value
+        // that is greater than current majority committed snapshot.
+        writeConflictRetry(
+            opCtx, "writeNoop", NamespaceString::kRsOplogNamespace.ns(), [&opCtx] {
+                WriteUnitOfWork uow(opCtx);
+                opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(opCtx,
+                                                                                      kMsgObj);
+                uow.commit();
+            });
 
         // Do not allow majority reads from this collection until all original indexes are visible.
         // This was also done when dropAllIndexes() committed, but we need to ensure that no one

@@ -58,6 +58,7 @@ class WriteUnitOfWork;
 
 namespace repl {
 class UnreplicatedWritesBlock;
+class ReplicatedWritesBlock;
 }  // namespace repl
 
 /**
@@ -459,6 +460,7 @@ private:
     friend class DeadlineStash;
     friend class WriteUnitOfWork;
     friend class repl::UnreplicatedWritesBlock;
+    friend class repl::ReplicatedWritesBlock;
     Client* const _client;
     const unsigned int _opId;
 
@@ -572,6 +574,28 @@ public:
     }
 
     ~UnreplicatedWritesBlock() {
+        _opCtx->setReplicatedWrites(_shouldReplicateWrites);
+    }
+
+private:
+    OperationContext* _opCtx;
+    const bool _shouldReplicateWrites;
+};
+
+/**
+ * RAII-style class to turn on replicated writes. Writes will create oplog entries while the
+ * object is in scope.
+ */
+class ReplicatedWritesBlock {
+    MONGO_DISALLOW_COPYING(ReplicatedWritesBlock);
+
+public:
+    ReplicatedWritesBlock(OperationContext* opCtx)
+        : _opCtx(opCtx), _shouldReplicateWrites(opCtx->writesAreReplicated()) {
+        opCtx->setReplicatedWrites(true);
+    }
+
+    ~ReplicatedWritesBlock() {
         _opCtx->setReplicatedWrites(_shouldReplicateWrites);
     }
 
