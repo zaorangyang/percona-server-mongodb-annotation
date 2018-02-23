@@ -337,7 +337,7 @@ __wt_conn_btree_open(
 
 	/* Discard any previous configuration, set up the new configuration. */
 	__conn_btree_config_clear(session);
-	WT_RET(__conn_btree_config_set(session));
+	WT_ERR(__conn_btree_config_set(session));
 
 	/* Set any special flags on the handle. */
 	F_SET(btree, LF_MASK(WT_BTREE_SPECIAL_FLAGS));
@@ -582,7 +582,7 @@ __conn_dhandle_remove(WT_SESSION_IMPL *session, bool final)
 
 	WT_ASSERT(session,
 	    F_ISSET(session, WT_SESSION_LOCKED_HANDLE_LIST_WRITE));
-	WT_ASSERT(session, dhandle != conn->cache->evict_file_next);
+	WT_ASSERT(session, dhandle != conn->cache->walk_tree);
 
 	/* Check if the handle was reacquired by a session while we waited. */
 	if (!final &&
