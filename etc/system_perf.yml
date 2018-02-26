@@ -15,12 +15,12 @@ post:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        local_file: work/reports.tgz
-        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/${task_name}-${build_id}-${execution}.${ext|tgz}
+        local_file: work/dsi-artifacts.tgz
+        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/dsi-artifacts-${task_name}-${build_id}-${execution}.${ext|tgz}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
-        display_name: test-log - Execution ${execution}
+        display_name: Dsi Artifacts - Execution ${execution}
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -86,6 +86,8 @@ functions:
           test: ${test}
           production: true
           mongodb_binary_archive: "https://s3.amazonaws.com/mciuploads/${project}/${version_id}/${revision}/${platform}/mongod-${version_id}.tar.gz"
+          workloads_dir: ../src/workloads/workloads
+          ycsb_dir: ../src/YCSB/YCSB
           EOF
 
           cat > runtime.yml <<EOF
@@ -157,8 +159,8 @@ functions:
           source ./dsienv.sh
           source ./venv/bin/activate
           infrastructure_provisioning.py
-          mongodb_setup.py
           workload_setup.py
+          mongodb_setup.py
 
   "run test":
     - command: shell.exec
@@ -175,14 +177,6 @@ functions:
       params:
          name: "perf"
          file: "work/perf.json"
-
-  "make test log artifact":
-    - command: shell.exec
-      params:
-        working_dir: work
-        script: |
-          source ./dsienv.sh
-          make_artifact.sh
 
   "analyze":
     - command: json.get_history
@@ -221,7 +215,7 @@ functions:
           set -o verbose
           TAG="3.2.17-Baseline"
           OVERRIDEFILE="../src/dsi/dsi/analysis/${branch_name}/system_perf_override.json"
-          python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file reports/perf.json --rev ${revision} -f history.json -t tags.json --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
+          python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file perf.json --rev ${revision} -f history.json -t tags.json --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
 
 #######################################
 #               Tasks                 #
@@ -306,7 +300,6 @@ tasks:
         test: "ycsb"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
       vars:
         script_flags: --ycsb-throughput-analysis reports
@@ -322,7 +315,6 @@ tasks:
         test: "ycsb"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
       vars:
         script_flags: --ycsb-throughput-analysis reports
@@ -338,7 +330,6 @@ tasks:
         test: "ycsb-wmajority"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
       vars:
         script_flags: --ycsb-throughput-analysis reports
@@ -354,7 +345,6 @@ tasks:
         test: "ycsb-wmajority"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
       vars:
         script_flags: --ycsb-throughput-analysis reports
@@ -370,7 +360,6 @@ tasks:
         test: "core"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: core_workloads_MMAPv1
@@ -384,7 +373,6 @@ tasks:
         test: "core"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: non_sharded_workloads_WT
@@ -398,7 +386,6 @@ tasks:
         test: "non_sharded"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: non_sharded_workloads_MMAPv1
@@ -412,7 +399,6 @@ tasks:
         test: "non_sharded"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: mongos_workloads_WT
@@ -426,7 +412,6 @@ tasks:
         test: "mongos"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: mongos_workloads_MMAPv1
@@ -441,7 +426,6 @@ tasks:
         test: "mongos"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: move_chunk_workloads_WT
@@ -455,7 +439,6 @@ tasks:
         test: "move_chunk"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: move_chunk_workloads_MMAPv1
@@ -469,7 +452,6 @@ tasks:
         test: "move_chunk"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: secondary_performance_WT
@@ -485,7 +467,6 @@ tasks:
         setup: "secondary-performance"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: secondary_performance_MMAPv1
@@ -501,7 +482,6 @@ tasks:
         setup: "secondary-performance"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: initialsync_WT
@@ -515,7 +495,6 @@ tasks:
         test: "initialsync"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: initialsync_MMAPv1
@@ -529,7 +508,6 @@ tasks:
         test: "initialsync"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: initialsync-logkeeper_WT
@@ -544,9 +522,7 @@ tasks:
         test: "initialsync-logkeeper"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
-
 
 #######################################
 #               Modules               #
