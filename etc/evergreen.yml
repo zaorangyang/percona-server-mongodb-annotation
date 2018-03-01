@@ -113,7 +113,7 @@ variables:
   - enterprise-debian71-64
   - enterprise-debian81-64
   - enterprise-linux-64-amazon-ami
-  - enterprise-osx-107
+  - enterprise-osx-108
   - enterprise-rhel-62-64-bit
   - enterprise-rhel-62-64-bit-coverage
   - enterprise-rhel-62-64-bit-inmem
@@ -145,9 +145,9 @@ variables:
   - linux-64-ephemeralForTest
   - linux-64-lsm
   - linux-64-repeated-execution
-  - osx-107
-  - osx-107-debug
-  - osx-107-ssl
+  - osx-108
+  - osx-108-debug
+  - osx-108-ssl
   - rhel62
   - rhel70
   - suse11
@@ -420,6 +420,13 @@ functions:
         set -o errexit
         set -o verbose
 
+        # Set the TMPDIR environment variable to be a directory in the task's working
+        # directory so that temporary files created by processes spawned by resmoke.py get
+        # cleaned up after the task completes. This also ensures the spawned processes
+        # aren't impacted by limited space in the mount point for the /tmp directory.
+        export TMPDIR="${workdir}/tmp"
+        mkdir -p $TMPDIR
+
         # check if virtualenv is set up
         if [ -d "venv" ]; then
           if [ "Windows_NT" = "$OS" ]; then
@@ -503,7 +510,7 @@ functions:
           path_value="$path_value:${task_path_suffix}"
         fi
 
-        ${resmoke_wrapper} PATH="$path_value" ${san_symbolizer} ${san_options} ${rlp_environment} ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json
+        ${resmoke_wrapper} PATH="$path_value" ${san_symbolizer} ${lang_environment} ${san_options} ${rlp_environment} ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/resmoke.py ${resmoke_args} $extra_args ${test_flags} --log=buildlogger --reportFile=report.json
 
 
   "do jepsen setup" :
@@ -831,10 +838,18 @@ functions:
       script: |
         set -o errexit
 
+        # Override the aws credentials with the kitchen specific credentials
+        cat <<EOF > ~/.aws/credentials
+        [default]
+        aws_access_key_id = ${kitchen_aws_key}
+        aws_secret_access_key = ${kitchen_aws_secret}
+        EOF
+
         export KITCHEN_ARTIFACTS_URL="https://s3.amazonaws.com/mciuploads/${project}/${build_variant}/${revision}/artifacts/${build_id}.tgz"
         export KITCHEN_SECURITY_GROUP="${kitchen_security_group}"
         export KITCHEN_SSH_KEY_ID="${kitchen_ssh_key_id}"
         export KITCHEN_SUBNET="${kitchen_subnet}"
+        export KITCHEN_VPC="${kitchen_vpc}"
 
         for i in {1..3}
         do
@@ -1278,14 +1293,6 @@ tasks:
             ${strip_command|/usr/bin/strip} mongobridge
           fi
 
-          # If this is a scheduled build, we check for changes against the last scheduled commit.
-          if [ "${is_patch}" != "true" ]; then
-            burn_in_args="--checkEvergreen"
-          fi
-
-          # Capture a list of new and modified tests.
-          ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=${build_variant} --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
-
           # On windows we need to make sure the paths in unittests.txt are compatible with cygwin tar
           sed 's|\\|/|g' build/unittests.txt > build/unittests-tarlist.txt
           ${tar|tar} -czvf mongodb-unittests.tgz -T build/unittests-tarlist.txt build/unittests.txt
@@ -1422,7 +1429,38 @@ tasks:
   depends_on:
   - name: compile
   commands:
+  - command: git.get_project
+    # The repository is cloned in a directory distinct from src for the modified test detection
+    # because the extraction of the artifacts performed in the 'do setup' causes
+    # 'git diff --name-only' to see all tests as modified on Windows (git 1.9.5). See SERVER-30634.
+    params:
+      directory: burn_in_tests_clonedir
+      revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
+        enterprise: ${enterprise_rev}
+  - command: shell.exec
   - func: "do setup"
+  - func: "set up virtualenv"
+  - command: shell.exec
+    params:
+      working_dir: burn_in_tests_clonedir
+      script: |
+        set -o errexit
+        # Create a symbolic link to the venv in the src directory so activate_virtualenv can use it
+        # if it exists.
+        ln -s ../src/venv venv
+        ${activate_virtualenv}
+        set -o verbose
+        # If this is a scheduled build, we check for changes against the last scheduled commit.
+        if [ "${is_patch}" != "true" ]; then
+          burn_in_args="--checkEvergreen"
+        fi
+        # Copy the dbtest executable from the src dir because burn_in_tests.py calls it to get the
+        # list of dbtest suites.
+        cp ../src/dbtest${exe} .
+        # Capture a list of new and modified tests.
+        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=${build_variant} --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
+        # Copy the results to the src dir.
+        cp jstests/new_tests.json ../src/jstests/new_tests.json
   - func: "do multiversion setup"
   - func: "run tests"
     vars:
@@ -4136,6 +4174,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-ubuntu1604
+    lang_environment: LANG=C
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     multiversion_platform_arch: "ubuntu1604"
     multiversion_edition: "targeted"
@@ -5371,8 +5410,8 @@ buildvariants:
 #             OSX buildvariants           #
 ###########################################
 
-- name: osx-107
-  display_name: OS X 10.7
+- name: osx-108
+  display_name: OS X 10.8
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -5381,8 +5420,8 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: osx
     push_arch: x86_64
-    gorootvars: CGO_CFLAGS=-mmacosx-version-min=10.7 CGO_LDFLAGS=-mmacosx-version-min=10.7
-    compile_flags: --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++
+    gorootvars: CGO_CFLAGS=-mmacosx-version-min=10.8 CGO_LDFLAGS=-mmacosx-version-min=10.8
+    compile_flags: --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.8 --libc++
     python: python2.7
     num_jobs_available: 1
     build_mongoreplay: true
@@ -5471,8 +5510,8 @@ buildvariants:
     distros:
     - rhel70-small
 
-- name: osx-107-ssl
-  display_name: SSL OS X 10.7
+- name: osx-108-ssl
+  display_name: SSL OS X 10.8
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -5482,8 +5521,8 @@ buildvariants:
     push_name: osx-ssl
     push_arch: x86_64
     tooltags: "-tags ssl"
-    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.7 CGO_LDFLAGS=-mmacosx-version-min=10.7
-    compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++ CPPPATH=/opt/mongodbtoolchain/v2/include
+    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.8 CGO_LDFLAGS=-mmacosx-version-min=10.8
+    compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.8 --libc++ CPPPATH=/opt/mongodbtoolchain/v2/include
     python: python2.7
     num_jobs_available: 1
     build_mongoreplay: true
@@ -5572,8 +5611,8 @@ buildvariants:
     distros:
     - rhel70-small
 
-- name: osx-107-debug
-  display_name: "* OS X 10.7 DEBUG"
+- name: osx-108-debug
+  display_name: "* OS X 10.8 DEBUG"
   run_on:
   - macos-1012
   expansions:
@@ -5582,8 +5621,8 @@ buildvariants:
     push_name: osx-debug
     push_arch: x86_64
     num_jobs_available: 1
-    gorootvars: CGO_CFLAGS=-mmacosx-version-min=10.7 CGO_LDFLAGS=-mmacosx-version-min=10.7
-    compile_flags: --dbg=on --opt=on --allocator=system -j$(sysctl -n hw.logicalcpu) --osx-version-min=10.7 --libc++
+    gorootvars: CGO_CFLAGS=-mmacosx-version-min=10.8 CGO_LDFLAGS=-mmacosx-version-min=10.8
+    compile_flags: --dbg=on --opt=on --allocator=system -j$(sysctl -n hw.logicalcpu) --osx-version-min=10.8 --libc++
     python: python2.7
     build_mongoreplay: true
   tasks:
@@ -5613,8 +5652,8 @@ buildvariants:
   - name: tool_WT
   - name: unittests
 
-- name: enterprise-osx-107
-  display_name: Enterprise OS X 10.7
+- name: enterprise-osx-108
+  display_name: Enterprise OS X 10.8
   modules:
   - enterprise
   run_on:
@@ -5626,8 +5665,8 @@ buildvariants:
     push_name: osx
     push_arch: x86_64-enterprise
     tooltags: "-tags 'ssl sasl'"
-    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.7 CGO_LDFLAGS=-mmacosx-version-min=10.7
-    compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.7 --libc++ CPPPATH=/opt/mongodbtoolchain/v2/include
+    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.8 CGO_LDFLAGS=-mmacosx-version-min=10.8
+    compile_flags: --ssl --allocator=system -j$(sysctl -n hw.logicalcpu) --release --osx-version-min=10.8 --libc++ CPPPATH=/opt/mongodbtoolchain/v2/include
     python: python2.7
     num_jobs_available: 1
     build_mongoreplay: true
@@ -6845,6 +6884,7 @@ buildvariants:
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
+    lang_environment: LANG=C
     push_arch: x86_64-enterprise-ubuntu1604
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
@@ -8174,6 +8214,7 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /usr/lib/llvm-3.8/bin
+    lang_environment: LANG=C
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1
     compile_flags: CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 CPPDEFINES="_GLIBCXX_USE_CXX11_ABI=0" --dbg=on --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip VARIANT_DIR=build
     multiversion_platform_arch: "ubuntu1604"
@@ -8318,6 +8359,7 @@ buildvariants:
     tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /usr/lib/llvm-3.8/bin
+    lang_environment: LANG=C
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions" ASAN_OPTIONS=detect_leaks=1
     compile_flags: CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 CPPDEFINES="_GLIBCXX_USE_CXX11_ABI=0" --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip VARIANT_DIR=build
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
@@ -8349,6 +8391,7 @@ buildvariants:
     variant_path_suffix: /usr/lib/llvm-3.8/bin
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
+    lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1"
     compile_flags: CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 --dbg=on --opt=on --allocator=system --sanitize=undefined --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip CXXFLAGS="-nostdlib -nostdinc++" LIBPATH=/opt/mongodbtoolchain/v2/lib/gcc/x86_64-mongodb-linux/5.4.0 CPPPATH="/opt/mongodbtoolchain/v2/include/c++/5.4.0/ /opt/mongodbtoolchain/v2/include/c++/5.4.0/x86_64-mongodb-linux" CPPDEFINES="_GLIBCXX_USE_CXX11_ABI=0" VARIANT_DIR=build
     multiversion_platform_arch: "ubuntu1604"
@@ -8489,6 +8532,7 @@ buildvariants:
   expansions:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
+    lang_environment: LANG=C
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ OBJCOPY=/opt/mongodbtoolchain/v2/bin/objcopy --link-model=dynamic
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     use_scons_cache: true
