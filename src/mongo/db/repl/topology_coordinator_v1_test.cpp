@@ -38,7 +38,6 @@
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/topology_coordinator.h"
-#include "mongo/db/repl/topology_coordinator_impl.h"
 #include "mongo/db/server_options.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/logger/logger.h"
@@ -74,9 +73,9 @@ bool stringContains(const std::string& haystack, const std::string& needle) {
 class TopoCoordTest : public mongo::unittest::Test {
 public:
     virtual void setUp() {
-        _options = TopologyCoordinatorImpl::Options{};
+        _options = TopologyCoordinator::Options{};
         _options.maxSyncSourceLagSecs = Seconds{100};
-        _topo.reset(new TopologyCoordinatorImpl(_options));
+        _topo.reset(new TopologyCoordinator(_options));
         _now = Date_t();
         _selfIndex = -1;
         _cbData.reset(new executor::TaskExecutor::CallbackArgs(
@@ -89,7 +88,7 @@ public:
     }
 
 protected:
-    TopologyCoordinatorImpl& getTopoCoord() {
+    TopologyCoordinator& getTopoCoord() {
         return *_topo;
     }
     executor::TaskExecutor::CallbackArgs cbData() {
@@ -99,9 +98,9 @@ protected:
         return _now;
     }
 
-    void setOptions(const TopologyCoordinatorImpl::Options& options) {
+    void setOptions(const TopologyCoordinator::Options& options) {
         _options = options;
-        _topo.reset(new TopologyCoordinatorImpl(_options));
+        _topo.reset(new TopologyCoordinator(_options));
     }
 
     int64_t countLogLinesContaining(const std::string& needle) {
@@ -252,12 +251,12 @@ private:
     }
 
 private:
-    unique_ptr<TopologyCoordinatorImpl> _topo;
+    unique_ptr<TopologyCoordinator> _topo;
     unique_ptr<executor::TaskExecutor::CallbackArgs> _cbData;
     ReplSetConfig _currentConfig;
     Date_t _now;
     int _selfIndex;
-    TopologyCoordinatorImpl::Options _options;
+    TopologyCoordinator::Options _options;
 };
 
 TEST_F(TopoCoordTest, NodeReturnsSecondaryWithMostRecentDataAsSyncSource) {
@@ -2024,7 +2023,7 @@ TEST_F(PrepareHeartbeatResponseV1Test,
 }
 
 TEST_F(TopoCoordTest, BecomeCandidateWhenBecomingSecondaryInSingleNodeSet) {
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
     updateConfig(BSON("_id"
                       << "rs0"
@@ -2037,14 +2036,14 @@ TEST_F(TopoCoordTest, BecomeCandidateWhenBecomingSecondaryInSingleNodeSet) {
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
 
     // if we are the only node, we should become a candidate when we transition to SECONDARY
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     getTopoCoord().setFollowerMode(MemberState::RS_SECONDARY);
-    ASSERT_TRUE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
 }
 
 TEST_F(TopoCoordTest, DoNotBecomeCandidateWhenBecomingSecondaryInSingleNodeSetIfInMaintenanceMode) {
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
     updateConfig(BSON("_id"
                       << "rs0"
@@ -2058,10 +2057,10 @@ TEST_F(TopoCoordTest, DoNotBecomeCandidateWhenBecomingSecondaryInSingleNodeSetIf
 
     // If we are the only node and we are in maintenance mode, we should not become a candidate when
     // we transition to SECONDARY.
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     getTopoCoord().adjustMaintenanceCountBy(1);
     getTopoCoord().setFollowerMode(MemberState::RS_SECONDARY);
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 
     // getMemberState() returns RS_RECOVERING while we are in maintenance mode even though
     // _memberState is set to RS_SECONDARY.
@@ -2073,7 +2072,7 @@ TEST_F(TopoCoordTest, DoNotBecomeCandidateWhenBecomingSecondaryInSingleNodeSetIf
 }
 
 TEST_F(TopoCoordTest, BecomeCandidateWhenReconfigToBeElectableInSingleNodeSet) {
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
     ReplSetConfig cfg;
     cfg.initialize(BSON("_id"
@@ -2089,9 +2088,9 @@ TEST_F(TopoCoordTest, BecomeCandidateWhenReconfigToBeElectableInSingleNodeSet) {
     getTopoCoord().updateConfig(cfg, 0, now()++);
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
 
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     getTopoCoord().setFollowerMode(MemberState::RS_SECONDARY);
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
 
     // we should become a candidate when we reconfig to become electable
@@ -2104,12 +2103,12 @@ TEST_F(TopoCoordTest, BecomeCandidateWhenReconfigToBeElectableInSingleNodeSet) {
                       << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                << "hself"))),
                  0);
-    ASSERT_TRUE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 }
 
 TEST_F(TopoCoordTest,
        DoNotBecomeCandidateWhenReconfigToBeElectableInSingleNodeSetIfInMaintenanceMode) {
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
     ReplSetConfig cfg;
     ASSERT_OK(cfg.initialize(BSON("_id"
@@ -2124,9 +2123,9 @@ TEST_F(TopoCoordTest,
     getTopoCoord().updateConfig(cfg, 0, now()++);
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
 
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     getTopoCoord().setFollowerMode(MemberState::RS_SECONDARY);
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
 
     // We should not become a candidate when we reconfig to become electable if we are currently in
@@ -2140,11 +2139,11 @@ TEST_F(TopoCoordTest,
                       << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                << "hself"))),
                  0);
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 }
 
 TEST_F(TopoCoordTest, NodeDoesNotBecomeCandidateWhenBecomingSecondaryInSingleNodeSetIfUnelectable) {
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
     ReplSetConfig cfg;
     cfg.initialize(BSON("_id"
@@ -2162,14 +2161,14 @@ TEST_F(TopoCoordTest, NodeDoesNotBecomeCandidateWhenBecomingSecondaryInSingleNod
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
 
     // despite being the only node, we are unelectable, so we should not become a candidate
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     getTopoCoord().setFollowerMode(MemberState::RS_SECONDARY);
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
 }
 
 TEST_F(TopoCoordTest, NodeTransitionsFromRemovedToStartup2WhenAddedToConfig) {
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
     // config to be absent from the set
     updateConfig(BSON("_id"
@@ -2183,7 +2182,7 @@ TEST_F(TopoCoordTest, NodeTransitionsFromRemovedToStartup2WhenAddedToConfig) {
                                                   << "host3:27017"))),
                  -1);
     // should become removed since we are not in the set
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_REMOVED, getTopoCoord().getMemberState().s);
 
     // reconfig to add to set
@@ -2200,12 +2199,12 @@ TEST_F(TopoCoordTest, NodeTransitionsFromRemovedToStartup2WhenAddedToConfig) {
                                                   << "host3:27017"))),
                  0);
     // having been added to the config, we should no longer be REMOVED and should enter STARTUP2
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
 }
 
 TEST_F(TopoCoordTest, NodeTransitionsToRemovedWhenRemovedFromConfig) {
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
     updateConfig(BSON("_id"
                       << "rs0"
@@ -2219,7 +2218,7 @@ TEST_F(TopoCoordTest, NodeTransitionsToRemovedWhenRemovedFromConfig) {
                                     << BSON("_id" << 2 << "host"
                                                   << "host3:27017"))),
                  0);
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
 
     // reconfig to remove self
@@ -2234,12 +2233,12 @@ TEST_F(TopoCoordTest, NodeTransitionsToRemovedWhenRemovedFromConfig) {
                                                   << "host3:27017"))),
                  -1);
     // should become removed since we are no longer in the set
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_REMOVED, getTopoCoord().getMemberState().s);
 }
 
 TEST_F(TopoCoordTest, NodeTransitionsToRemovedWhenRemovedFromConfigEvenWhenPrimary) {
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
     updateConfig(BSON("_id"
                       << "rs0"
@@ -2249,14 +2248,14 @@ TEST_F(TopoCoordTest, NodeTransitionsToRemovedWhenRemovedFromConfigEvenWhenPrima
                       << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                << "host1:27017"))),
                  0);
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
     getTopoCoord().setFollowerMode(MemberState::RS_SECONDARY);
-    ASSERT_TRUE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 
     // win election and primary
     getTopoCoord().processWinElection(OID::gen(), Timestamp());
-    ASSERT_TRUE(TopologyCoordinator::Role::leader == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kLeader == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_PRIMARY, getTopoCoord().getMemberState().s);
 
     // reconfig to remove self
@@ -2271,12 +2270,12 @@ TEST_F(TopoCoordTest, NodeTransitionsToRemovedWhenRemovedFromConfigEvenWhenPrima
                                                   << "host3:27017"))),
                  -1);
     // should become removed since we are no longer in the set even though we were primary
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_REMOVED, getTopoCoord().getMemberState().s);
 }
 
 TEST_F(TopoCoordTest, NodeTransitionsToSecondaryWhenReconfiggingToBeUnelectable) {
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
     updateConfig(BSON("_id"
                       << "rs0"
@@ -2286,14 +2285,14 @@ TEST_F(TopoCoordTest, NodeTransitionsToSecondaryWhenReconfiggingToBeUnelectable)
                       << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                << "host1:27017"))),
                  0);
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
     getTopoCoord().setFollowerMode(MemberState::RS_SECONDARY);
-    ASSERT_TRUE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 
     // win election and primary
     getTopoCoord().processWinElection(OID::gen(), Timestamp());
-    ASSERT_TRUE(TopologyCoordinator::Role::leader == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kLeader == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_PRIMARY, getTopoCoord().getMemberState().s);
 
     // now lose primary due to loss of electability
@@ -2311,12 +2310,12 @@ TEST_F(TopoCoordTest, NodeTransitionsToSecondaryWhenReconfiggingToBeUnelectable)
                                     << BSON("_id" << 2 << "host"
                                                   << "host3:27017"))),
                  0);
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
 }
 
 TEST_F(TopoCoordTest, NodeMaintainsPrimaryStateAcrossReconfigIfNodeRemainsElectable) {
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
     updateConfig(BSON("_id"
                       << "rs0"
@@ -2327,14 +2326,14 @@ TEST_F(TopoCoordTest, NodeMaintainsPrimaryStateAcrossReconfigIfNodeRemainsElecta
                                                << "host1:27017"))),
                  0);
 
-    ASSERT_FALSE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_FALSE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
     getTopoCoord().setFollowerMode(MemberState::RS_SECONDARY);
-    ASSERT_TRUE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 
     // win election and primary
     getTopoCoord().processWinElection(OID::gen(), Timestamp());
-    ASSERT_TRUE(TopologyCoordinator::Role::leader == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kLeader == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_PRIMARY, getTopoCoord().getMemberState().s);
 
     // Now reconfig in ways that leave us electable and ensure we are still the primary.
@@ -2352,7 +2351,7 @@ TEST_F(TopoCoordTest, NodeMaintainsPrimaryStateAcrossReconfigIfNodeRemainsElecta
                                                   << "host3:27017"))),
                  0,
                  Date_t::fromMillisSinceEpoch(-1));
-    ASSERT_TRUE(TopologyCoordinator::Role::leader == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kLeader == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_PRIMARY, getTopoCoord().getMemberState().s);
 
     // Change priorities and tags
@@ -2376,7 +2375,7 @@ TEST_F(TopoCoordTest, NodeMaintainsPrimaryStateAcrossReconfigIfNodeRemainsElecta
                                                           << "rack1")))),
                  0,
                  Date_t::fromMillisSinceEpoch(-1));
-    ASSERT_TRUE(TopologyCoordinator::Role::leader == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kLeader == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_PRIMARY, getTopoCoord().getMemberState().s);
 }
 
@@ -2391,7 +2390,7 @@ TEST_F(TopoCoordTest, NodeMaintainsSecondaryStateAcrossReconfig) {
                                     << BSON("_id" << 2 << "host"
                                                   << "host2:27017"))),
                  0);
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
     setSelfMemberState(MemberState::RS_SECONDARY);
     ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
@@ -2409,7 +2408,7 @@ TEST_F(TopoCoordTest, NodeMaintainsSecondaryStateAcrossReconfig) {
                                     << BSON("_id" << 2 << "host"
                                                   << "host3:27017"))),
                  0);
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_SECONDARY, getTopoCoord().getMemberState().s);
 }
 
@@ -3179,7 +3178,7 @@ TEST_F(TopoCoordTest, DoNotGrantDryRunVoteWhenOpTimeIsStale) {
 TEST_F(TopoCoordTest, NodeTransitionsToRemovedIfCSRSButHaveNoReadCommittedSupport) {
     ON_BLOCK_EXIT([]() { serverGlobalParams.clusterRole = ClusterRole::None; });
     serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
-    TopologyCoordinatorImpl::Options options;
+    TopologyCoordinator::Options options;
     options.clusterRole = ClusterRole::ConfigServer;
     setOptions(options);
     getTopoCoord().setStorageEngineSupportsReadCommitted(false);
@@ -3206,7 +3205,7 @@ TEST_F(TopoCoordTest, NodeTransitionsToRemovedIfCSRSButHaveNoReadCommittedSuppor
 TEST_F(TopoCoordTest, NodeBecomesSecondaryAsNormalWhenReadCommittedSupportedAndCSRS) {
     ON_BLOCK_EXIT([]() { serverGlobalParams.clusterRole = ClusterRole::None; });
     serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
-    TopologyCoordinatorImpl::Options options;
+    TopologyCoordinator::Options options;
     options.clusterRole = ClusterRole::ConfigServer;
     setOptions(options);
     getTopoCoord().setStorageEngineSupportsReadCommitted(true);
@@ -3723,7 +3722,7 @@ TEST_F(HeartbeatResponseTestV1, NodeDoesNotUpdateHeartbeatDataIfNodeIsAbsentFrom
         HostAndPort("host9"), "rs0", MemberState::RS_PRIMARY, election, election);
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1, RelinquishPrimaryWhenMajorityOfVotersIsNoLongerVisible) {
@@ -3746,7 +3745,7 @@ TEST_F(HeartbeatResponseTestV1, RelinquishPrimaryWhenMajorityOfVotersIsNoLongerV
     ASSERT_NO_ACTION(nextAction.getAction());
     nextAction = receiveDownHeartbeat(HostAndPort("host3"), "rs0");
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::leader == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kLeader == getTopoCoord().getRole());
     ASSERT_EQUALS(0, getCurrentPrimaryIndex());
 }
 
@@ -4531,11 +4530,11 @@ TEST_F(HeartbeatResponseTestV1,
     nextAction = receiveDownHeartbeat(HostAndPort("host2"), "rs0");
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     // We are electable now.
     ASSERT_OK(getTopoCoord().becomeCandidateIfElectable(
         now(), TopologyCoordinator::StartElectionReason::kElectionTimeout));
-    ASSERT_TRUE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1, ScheduleElectionWhenPrimaryIsMarkedDownAndWeAreElectable) {
@@ -4557,11 +4556,11 @@ TEST_F(HeartbeatResponseTestV1, ScheduleElectionWhenPrimaryIsMarkedDownAndWeAreE
 
     nextAction = receiveDownHeartbeat(HostAndPort("host2"), "rs0");
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     // We are electable now.
     ASSERT_OK(getTopoCoord().becomeCandidateIfElectable(
         now(), TopologyCoordinator::StartElectionReason::kElectionTimeout));
-    ASSERT_TRUE(TopologyCoordinator::Role::candidate == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kCandidate == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1,
@@ -4600,7 +4599,7 @@ TEST_F(HeartbeatResponseTestV1,
     nextAction = receiveDownHeartbeat(HostAndPort("host2"), "rs0");
     ASSERT_NO_ACTION(nextAction.getAction());
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1,
@@ -4628,7 +4627,7 @@ TEST_F(HeartbeatResponseTestV1,
     nextAction = receiveDownHeartbeat(HostAndPort("host2"), "rs0");
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1,
@@ -4648,7 +4647,7 @@ TEST_F(HeartbeatResponseTestV1,
     nextAction = receiveDownHeartbeat(HostAndPort("host2"), "rs0");
     ASSERT_NO_ACTION(nextAction.getAction());
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1,
@@ -4672,7 +4671,7 @@ TEST_F(HeartbeatResponseTestV1,
     nextAction = receiveDownHeartbeat(HostAndPort("host2"), "rs0");
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1,
@@ -4714,7 +4713,7 @@ TEST_F(HeartbeatResponseTestV1,
     nextAction = receiveDownHeartbeat(HostAndPort("host2"), "rs0");
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1,
@@ -4734,7 +4733,7 @@ TEST_F(HeartbeatResponseTestV1,
     nextAction = receiveDownHeartbeat(HostAndPort("host2"), "rs0");
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1, NodeDoesNotStepDownSelfWhenRemoteNodeWasElectedMoreRecently) {
@@ -4751,12 +4750,12 @@ TEST_F(HeartbeatResponseTestV1, NodeDoesNotStepDownSelfWhenRemoteNodeWasElectedM
     HeartbeatResponseAction nextAction = receiveUpHeartbeat(
         HostAndPort("host2"), "rs0", MemberState::RS_PRIMARY, election, election);
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::leader == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kLeader == getTopoCoord().getRole());
     ASSERT_EQUALS(0, getCurrentPrimaryIndex());
 
     // If the other PRIMARY falls down, this node should set its primaryIndex to itself.
     nextAction = receiveDownHeartbeat(HostAndPort("host2"), "rs0");
-    ASSERT_TRUE(TopologyCoordinator::Role::leader == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kLeader == getTopoCoord().getRole());
     ASSERT_EQUALS(0, getCurrentPrimaryIndex());
     ASSERT_NO_ACTION(nextAction.getAction());
 }
@@ -4971,7 +4970,7 @@ TEST_F(HeartbeatResponseTestV1,
     // Second primary does not change primary index.
     ASSERT_EQUALS(1, getCurrentPrimaryIndex());
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1,
@@ -4992,7 +4991,7 @@ TEST_F(HeartbeatResponseTestV1,
     // Second primary does not change primary index.
     ASSERT_EQUALS(1, getCurrentPrimaryIndex());
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1, UpdatePrimaryIndexWhenAHeartbeatMakesNodeAwareOfANewPrimary) {
@@ -5005,7 +5004,7 @@ TEST_F(HeartbeatResponseTestV1, UpdatePrimaryIndexWhenAHeartbeatMakesNodeAwareOf
         HostAndPort("host2"), "rs0", MemberState::RS_PRIMARY, election, election);
     ASSERT_EQUALS(1, getCurrentPrimaryIndex());
     ASSERT_NO_ACTION(nextAction.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 }
 
 TEST_F(HeartbeatResponseTestV1, NodeDoesNotRetryHeartbeatIfTheFirstFailureTakesTheFullTime) {
@@ -5030,7 +5029,7 @@ TEST_F(HeartbeatResponseTestV1, NodeDoesNotRetryHeartbeatIfTheFirstFailureTakesT
         StatusWith<ReplSetHeartbeatResponse>(ErrorCodes::ExceededTimeLimit, "Took too long"));
 
     ASSERT_EQUALS(HeartbeatResponseAction::NoAction, action.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     // Because the heartbeat timed out, we'll retry in half of the election timeout.
     ASSERT_EQUALS(firstRequestDate + Milliseconds(5000) +
                       ReplSetConfig::kDefaultElectionTimeoutPeriod / 2,
@@ -5130,7 +5129,7 @@ public:
         HeartbeatResponseAction upAction = getTopoCoord().processHeartbeatResponse(
             _upRequestDate, Milliseconds(0), _target, makeStatusWith<ReplSetHeartbeatResponse>());
         ASSERT_EQUALS(HeartbeatResponseAction::NoAction, upAction.getAction());
-        ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+        ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 
 
         // Time of first request for this heartbeat period
@@ -5151,7 +5150,7 @@ public:
                 ErrorCodes::ExceededTimeLimit, "Took too long"));  // We've never applied anything.
 
         ASSERT_EQUALS(HeartbeatResponseAction::NoAction, action.getAction());
-        ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+        ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
         // Because the heartbeat failed without timing out, we expect to retry immediately.
         ASSERT_EQUALS(_firstRequestDate + Seconds(4), action.getNextHeartbeatStartDate());
 
@@ -5209,7 +5208,7 @@ TEST_F(HeartbeatResponseTestOneRetryV1,
                                              "Took too long"));  // We've never applied anything.
 
     ASSERT_EQUALS(HeartbeatResponseAction::NoAction, action.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     // Because the heartbeat timed out, we'll retry in half of the election timeout.
     ASSERT_EQUALS(firstRequestDate() + Milliseconds(5010) +
                       ReplSetConfig::kDefaultElectionTimeoutPeriod / 2,
@@ -5228,7 +5227,7 @@ public:
             target(),
             StatusWith<ReplSetHeartbeatResponse>(ErrorCodes::NodeNotFound, "Bad DNS?"));
         ASSERT_EQUALS(HeartbeatResponseAction::NoAction, action.getAction());
-        ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+        ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
         // Because the first retry failed without timing out, we expect to retry immediately.
         ASSERT_EQUALS(firstRequestDate() + Milliseconds(4500), action.getNextHeartbeatStartDate());
 
@@ -5275,7 +5274,7 @@ TEST_F(HeartbeatResponseTestTwoRetriesV1, NodeDoesNotRetryHeartbeatsAfterFailing
         target(),
         StatusWith<ReplSetHeartbeatResponse>(ErrorCodes::NodeNotFound, "Bad DNS?"));
     ASSERT_EQUALS(HeartbeatResponseAction::NoAction, action.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     // Because this is the second retry, rather than retry again, we expect to wait for half
     // of the election timeout interval of 2 seconds to elapse.
     ASSERT_EQUALS(firstRequestDate() + Milliseconds(4800) +
@@ -5317,7 +5316,7 @@ TEST_F(HeartbeatResponseTestTwoRetriesV1, HeartbeatThreeNonconsecutiveFailures) 
                                                 StatusWith<ReplSetHeartbeatResponse>(response));
 
     ASSERT_EQUALS(HeartbeatResponseAction::NoAction, action.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     // Because the heartbeat succeeded, we'll retry in half of the election timeout.
     ASSERT_EQUALS(firstRequestDate() + Milliseconds(4500) +
                       ReplSetConfig::kDefaultElectionTimeoutPeriod / 2,
@@ -5334,7 +5333,7 @@ TEST_F(HeartbeatResponseTestTwoRetriesV1, HeartbeatThreeNonconsecutiveFailures) 
         StatusWith<ReplSetHeartbeatResponse>(Status{ErrorCodes::HostUnreachable, ""}));
 
     ASSERT_EQUALS(HeartbeatResponseAction::NoAction, action.getAction());
-    ASSERT_TRUE(TopologyCoordinator::Role::follower == getTopoCoord().getRole());
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
 
     // Ensure a third nonconsecutive heartbeat failure did not cause the node to be marked down
     BSONObjBuilder statusBuilder;

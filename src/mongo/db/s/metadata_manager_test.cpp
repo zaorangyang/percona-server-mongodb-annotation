@@ -32,14 +32,12 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/metadata_manager.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/type_shard_identity.h"
@@ -116,7 +114,8 @@ protected:
         invariant(!rangeMapOverlaps(metadata.getChunks(), minKey, maxKey));
 
         auto cm = metadata.getChunkManager();
-        auto chunkToSplit = cm->findIntersectingChunkWithSimpleCollation(minKey);
+
+        const auto chunkToSplit = cm->findIntersectingChunkWithSimpleCollation(minKey);
         ASSERT(SimpleBSONObjComparator::kInstance.evaluate(maxKey <= chunkToSplit->getMax()))
             << "maxKey == " << maxKey
             << " and chunkToSplit->getMax() == " << chunkToSplit->getMax();

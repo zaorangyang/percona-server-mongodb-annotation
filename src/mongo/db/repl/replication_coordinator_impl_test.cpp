@@ -55,7 +55,7 @@
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_coordinator_test_fixture.h"
 #include "mongo/db/repl/storage_interface_mock.h"
-#include "mongo/db/repl/topology_coordinator_impl.h"
+#include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context_noop.h"
@@ -2583,7 +2583,7 @@ TEST_F(ReplCoordTest, DoNotAllowSettingMaintenanceModeWhileConductingAnElection)
         .transitional_ignore();
 
     // Can't modify maintenance mode when running for election (before and after dry run).
-    ASSERT_EQUALS(TopologyCoordinator::Role::follower, getTopoCoord().getRole());
+    ASSERT_EQUALS(TopologyCoordinator::Role::kFollower, getTopoCoord().getRole());
     auto net = this->getNet();
     net->enterNetwork();
     auto when = getReplCoord()->getElectionTimeout_forTest();
@@ -2596,14 +2596,14 @@ TEST_F(ReplCoordTest, DoNotAllowSettingMaintenanceModeWhileConductingAnElection)
     }
     ASSERT_EQUALS(when, net->now());
     net->exitNetwork();
-    ASSERT_EQUALS(TopologyCoordinator::Role::candidate, getTopoCoord().getRole());
+    ASSERT_EQUALS(TopologyCoordinator::Role::kCandidate, getTopoCoord().getRole());
     Status status = getReplCoord()->setMaintenanceMode(false);
     ASSERT_EQUALS(ErrorCodes::NotSecondary, status);
     status = getReplCoord()->setMaintenanceMode(true);
     ASSERT_EQUALS(ErrorCodes::NotSecondary, status);
 
     simulateSuccessfulDryRun();
-    ASSERT_EQUALS(TopologyCoordinator::Role::candidate, getTopoCoord().getRole());
+    ASSERT_EQUALS(TopologyCoordinator::Role::kCandidate, getTopoCoord().getRole());
     status = getReplCoord()->setMaintenanceMode(false);
     ASSERT_EQUALS(ErrorCodes::NotSecondary, status);
     status = getReplCoord()->setMaintenanceMode(true);

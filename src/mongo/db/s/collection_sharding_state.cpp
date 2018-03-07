@@ -33,12 +33,10 @@
 #include "mongo/db/s/collection_sharding_state.h"
 
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/concurrency/lock_state.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/migration_chunk_cloner_source.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/operation_sharding_state.h"
@@ -604,8 +602,7 @@ uint64_t CollectionShardingState::_incrementChunkOnInsertOrUpdate(OperationConte
     // Use the shard key to locate the chunk into which the document was updated, and increment the
     // number of bytes tracked for the chunk. Note that we can assume the simple collation, because
     // shard keys do not support non-simple collations.
-    std::shared_ptr<Chunk> chunk = cm->findIntersectingChunkWithSimpleCollation(shardKey);
-    invariant(chunk);
+    auto chunk = cm->findIntersectingChunkWithSimpleCollation(shardKey);
     chunk->addBytesWritten(dataWritten);
 
     // If the chunk becomes too large, then we call the ChunkSplitter to schedule a split. Then, we
@@ -614,6 +611,7 @@ uint64_t CollectionShardingState::_incrementChunkOnInsertOrUpdate(OperationConte
         // TODO: call ChunkSplitter here
         chunk->clearBytesWritten();
     }
+
     return chunk->getBytesWritten();
 }
 
