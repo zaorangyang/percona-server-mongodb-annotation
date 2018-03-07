@@ -41,19 +41,14 @@ namespace mongo {
  */
 class PathMatchExpression : public MatchExpression {
 public:
-    PathMatchExpression(MatchType matchType) : MatchExpression(matchType) {}
+    PathMatchExpression(MatchType matchType,
+                        ElementPath::LeafArrayBehavior leafArrayBehavior,
+                        ElementPath::NonLeafArrayBehavior nonLeafArrayBehavior)
+        : MatchExpression(matchType),
+          _leafArrayBehavior(leafArrayBehavior),
+          _nonLeafArrayBehavior(nonLeafArrayBehavior) {}
 
     virtual ~PathMatchExpression() {}
-
-    /**
-     * Returns whether or not this expression should match against each element of an array (in
-     * addition to the array as a whole).
-     *
-     * For example, returns true if a path match expression on "f" should match against 1, 2, and
-     * [1, 2] for document {f: [1, 2]}. Returns false if this expression should only match against
-     * [1, 2].
-     */
-    virtual bool shouldExpandLeafArray() const = 0;
 
     bool matches(const MatchableDocument* doc, MatchDetails* details = nullptr) const final {
         MatchableDocument::IteratorHolder cursor(doc, &_elementPath);
@@ -76,12 +71,15 @@ public:
 
     Status setPath(StringData path) {
         _path = path;
+
         auto status = _elementPath.init(_path);
         if (!status.isOK()) {
             return status;
         }
 
-        _elementPath.setTraverseLeafArray(shouldExpandLeafArray());
+        _elementPath.setLeafArrayBehavior(_leafArrayBehavior);
+        _elementPath.setNonLeafArrayBehavior(_nonLeafArrayBehavior);
+
         return Status::OK();
     }
 
@@ -94,11 +92,10 @@ public:
     void applyRename(const StringMap<std::string>& renameList) {
         FieldRef pathFieldRef(_path);
 
-        int renamesFound = 0;
+        size_t renamesFound = 0u;
         for (auto rename : renameList) {
             if (rename.first == _path) {
                 _rewrittenPath = rename.second;
-                invariantOK(setPath(_rewrittenPath));
 
                 ++renamesFound;
             }
@@ -112,14 +109,18 @@ public:
                 // Replace the chopped off components with the component names resulting from the
                 // rename.
                 _rewrittenPath = str::stream() << rename.second << "." << pathTail.toString();
-                invariantOK(setPath(_rewrittenPath));
 
                 ++renamesFound;
             }
         }
 
         // There should never be multiple applicable renames.
-        invariant(renamesFound <= 1);
+        invariant(renamesFound <= 1u);
+        if (renamesFound == 1u) {
+            // There is an applicable rename. Modify the path of this expression to use the new
+            // name.
+            invariantOK(setPath(_rewrittenPath));
+        }
     }
 
 protected:
@@ -130,6 +131,8 @@ protected:
     }
 
 private:
+    ElementPath::LeafArrayBehavior _leafArrayBehavior;
+    ElementPath::NonLeafArrayBehavior _nonLeafArrayBehavior;
     StringData _path;
     ElementPath _elementPath;
 

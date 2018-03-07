@@ -18,6 +18,7 @@ selector:
   # 3.6 mongods have improved covering behavior for queries on shard key index. Un-blacklist when
   # 3.6 becomes 'last-stable'.
   - jstests/sharding/covered_shard_key_indexes.js
+  - jstests/sharding/movechunk_commit_changelog_stats.js
   # Enable when 3.6 becomes last-stable.
   - jstests/sharding/configsvr_metadata_commands_require_majority_write_concern.js
   - jstests/sharding/views.js
@@ -28,6 +29,7 @@ selector:
   - jstests/sharding/moveChunk_recipient_rejects_chunk_if_UUID_mismatch.js
   - jstests/sharding/write_cmd_auto_split.js
   - jstests/sharding/index_and_collection_option_propagation.js
+  - jstests/sharding/remove4.js
   # New feature in v3.6 mongos
   - jstests/sharding/logical_time_metadata.js
   # New feature in v3.6 mongos and mongod.
@@ -46,6 +48,7 @@ selector:
   - jstests/sharding/change_streams_establishment_finds_new_shards.js
   - jstests/sharding/change_streams_shards_start_in_sync.js
   - jstests/sharding/change_streams_unsharded_becomes_sharded.js
+  - jstests/sharding/change_streams_primary_shard_unaware.js
   - jstests/sharding/enable_sharding_basic.js
   - jstests/sharding/key_rotation.js
   - jstests/sharding/kill_sessions.js

@@ -49,7 +49,6 @@
 #include "mongo/db/lasterror.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
-#include "mongo/db/repl/old_update_position_args.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
@@ -657,21 +656,7 @@ public:
 
         status = args.initialize(cmdObj);
         if (status.isOK()) {
-            // v3.2.4+ style replSetUpdatePosition command.
             status = replCoord->processReplSetUpdatePosition(args, &configVersion);
-
-            if (status == ErrorCodes::InvalidReplicaSetConfig) {
-                result.append("configVersion", configVersion);
-            }
-            return appendCommandStatus(result, status);
-        } else if (status == ErrorCodes::NoSuchKey) {
-            // Pre-3.2.4 style replSetUpdatePosition command.
-            OldUpdatePositionArgs oldArgs;
-            status = oldArgs.initialize(cmdObj);
-            if (!status.isOK())
-                return appendCommandStatus(result, status);
-
-            status = replCoord->processReplSetUpdatePosition(oldArgs, &configVersion);
 
             if (status == ErrorCodes::InvalidReplicaSetConfig) {
                 result.append("configVersion", configVersion);
@@ -743,20 +728,6 @@ public:
             status = Status(ErrorCodes::NoReplicationEnabled, "not running with --replSet");
             return appendCommandStatus(result, status);
         }
-
-        /* we want to keep heartbeat connections open when relinquishing primary.
-           tag them here. */
-        auto session = opCtx->getClient()->session();
-        if (session) {
-            session->setTags(transport::Session::kKeepOpen);
-        }
-
-        // Unset the tag on block exit
-        ON_BLOCK_EXIT([session]() {
-            if (session) {
-                session->unsetTags(transport::Session::kKeepOpen);
-            }
-        });
 
         // Process heartbeat based on the version of request. The missing fields in mismatched
         // version will be empty.

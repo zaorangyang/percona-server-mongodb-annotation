@@ -284,6 +284,12 @@ public:
     bool advanceLastCommittedOpTime(const OpTime& committedOpTime);
 
     /**
+     * Resets _lastCommittedOpTime to OpTime(), the default value at startup.
+     * Used on PV downgrade to forget the OpTimes in PV1.
+     */
+    void resetLastCommittedOpTime();
+
+    /**
      * Returns the OpTime of the latest majority-committed op known to this server.
      */
     OpTime getLastCommittedOpTime() const;
@@ -360,7 +366,6 @@ public:
 
     // Produce a replSetUpdatePosition command to be sent to the node's sync source.
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand(
-        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle,
         OpTime currentCommittedSnapshotOpTime) const;
 
     // produce a reply to an ismaster request.  It is only valid to call this if we are a

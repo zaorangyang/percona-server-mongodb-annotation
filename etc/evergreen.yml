@@ -153,16 +153,24 @@ variables:
 # TODO: Remove psutil from virtualenv_requirements when BUILD-3083 is done
 - &powercycle_ec2_instance
   aws_ec2_yml: aws_ec2.yml
+  expire_hours: "3"
+  ec2_monitor_files: proc.json system.json
   monitor_proc_file: proc.json
   monitor_system_file: system.json
   remote_dir: powercycle
   secret_port: "20001"
+  security_group_ids: ${powercycle_aws_security_group_id}
   security_groups: mci powercycle_testing
+  subnet_id: ${powercycle_aws_subnet_id}
   ssh_identity: -i ${private_key_file}
   ssh_key_id: ${powercycle_ssh_key_id}
   standard_port: "20000"
   virtualenv_dir: venv_powercycle
   virtualenv_requirements: psutil
+  windows_crash_cmd: \"notmyfault/notmyfaultc64.exe -accepteula crash 1\"
+  windows_crash_dl: https://download.sysinternals.com/files/NotMyFault.zip
+  windows_crash_dir: notmyfault
+  windows_crash_zip: notmyfault.zip
 
 - &powercycle_expansions
   params:
@@ -177,15 +185,15 @@ variables:
        value: ${remote_dir}/mongod.log
 
 - &powercycle_test
-  ec2_artifacts: ${monitor_proc_file} ${monitor_system_file} ${log_path} ${backup_path_after} ${backup_path_before}
-  program_options: --logLevel info --backupPathBefore  ${backup_path_before} --backupPathAfter ${backup_path_after}
-  connection_options: --sshUserHost ${ip_address} --sshConnection \"${ssh_identity} ${ssh_connection_options}\"
-  test_options: --testLoops 15 --seedDocNum 10000 --rsync --validate local --canary local
-  crash_options: "--crashMethod aws_ec2 --crashOptions ${instance_id}:private_ip_address --crashWaitTime 30 --jitterForCrashWaitTime 5"
-  client_options: --numCrudClients 20 --numFsmClients 20
-  mongodb_options: --rootDir ${remote_dir}-${task_id} --mongodbBinDir ${remote_dir}
-  mongod_options: --mongodUsablePorts ${standard_port} ${secret_port} --dbPath ${db_path} --logPath ${log_path}
-  mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1\"
+  ec2_artifacts: ${log_path} ${backup_path_after} ${backup_path_before}
+  program_options: --logLevel=info --backupPathBefore=${backup_path_before} --backupPathAfter=${backup_path_after}
+  connection_options: --sshUserHost=${ip_address} --sshConnection=\"${ssh_identity} ${ssh_connection_options}\"
+  test_options: --testLoops=15 --seedDocNum=10000 --rsync --rsyncExcludeFiles=diagnostic.data/metrics.interim* --validate=local --canary=local
+  crash_options: --crashMethod=internal --crashOption=${windows_crash_cmd} --crashWaitTime=45 --jitterForCrashWaitTime=5 --instanceId=${instance_id}
+  client_options: --numCrudClients=20 --numFsmClients=20
+  mongodb_options: --rootDir=${remote_dir}-${task_id} --mongodbBinDir=${remote_dir}
+  mongod_options: --mongodUsablePorts ${standard_port} ${secret_port} --dbPath=${db_path} --logPath=${log_path}
+  mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1\"
 
 #######################################
 #            Functions                #
@@ -494,6 +502,13 @@ functions:
       script: |
         set -o errexit
         set -o verbose
+
+        # Set the TMPDIR environment variable to be a directory in the task's working
+        # directory so that temporary files created by processes spawned by resmoke.py get
+        # cleaned up after the task completes. This also ensures the spawned processes
+        # aren't impacted by limited space in the mount point for the /tmp directory.
+        export TMPDIR="${workdir}/tmp"
+        mkdir -p $TMPDIR
 
         if [ ${disable_unit_tests|false} = "false" ]; then
 
@@ -853,6 +868,7 @@ functions:
       type: test
       params:
         working_dir: src
+        shell: bash
         script: |
           set -o verbose
           set -o errexit
@@ -869,35 +885,54 @@ functions:
           cmds="source ${virtualenv_dir|venv}/$bin_dir/activate"
           cmds="$cmds; python -u"
           # The remote python operates in a virtualenv
-          remote_python="--remotePython \"$cmds\""
+          remote_python="--remotePython=\"$cmds\""
 
+          # Initialize report.json. The report will be finalized by powertest.py.
+          report_json="report.json"
           start_time=$(date +%s)
-          status="\"pass\""
+          status="\"fail\""
           failures=0
+          exit_code=1
+          end_time=$start_time
+          elapsed_secs=0
+          echo "{\"failures\": $failures, \"results\": [{\"status\": $status, \"exit_code\": $exit_code, \"test_file\": \"${task_name}\", \"start\": $start_time, \"end\": $end_time, \"elapsed\": $elapsed_secs}]}" > $report_json
+          generate_report_json="--reportJsonFile=$report_json"
 
-          set +o errexit
-          eval python -u pytests/powertest.py \
-            "${connection_options} \
+          # Windows task overrides:
+          #   - Execute 10 test loops
+          #   - Cap the maximum number of clients to 10 each
+          if [ "Windows_NT" = "$OS" ]; then
+            test_override=--testLoops=10
+            max_clients=10
+            for client in --numCrudClients --numFsmClients
+            do
+              override=$(echo ${client_options} | awk "BEGIN {FS=\" |=\"} {for(j=1;j<=NF;j++) if (\$j~/^$client/) {min=(\$(j+1) < $max_clients) ? \$(j+1) : $max_clients; printf \"%s=%d\", \$j,min}}")
+              client_override="$client_override $override"
+            done
+          fi
+
+          config_file=powertest.yml
+          eval $python pytests/powertest.py \
+            "--saveConfigOptions=$config_file \
+            ${connection_options}  \
             ${program_options}     \
+            $generate_report_json  \
             $remote_sudo           \
             $remote_python         \
             ${test_options}        \
+            $test_override         \
             ${crash_options}       \
             ${client_options}      \
+            $client_override       \
             ${mongodb_options}     \
             ${mongod_options}      \
             ${mongod_extra_options}"
-          exit_code=$?
-
-          # Create report.json
-          end_time=$(date +%s)
-          elapsed_secs=$((end_time-start_time))
-          if [ $exit_code -ne 0 ]; then
-            status="\"fail\""
-            failures=1
-          fi
-          echo "{\"failures\": $failures, \"results\": [{\"status\": $status, \"exit_code\": $exit_code, \"test_file\": \"${task_name}\", \"start\": $start_time, \"end\": $end_time, \"elapsed\": $elapsed_secs}]}" > report.json
-          exit $exit_code
+          set +o errexit
+          $python -u pytests/powertest.py --configFile=$config_file
+          test_status=$?
+          aws_ec2=$(python buildscripts/aws_ec2.py --imageId ${instance_id} --mode status)
+          echo "Test completed, AMI EC2 instance ${instance_id} status: $aws_ec2"
+          exit $test_status
 
   "do multiversion setup" :
     command: shell.exec
@@ -1052,10 +1087,18 @@ functions:
       script: |
         set -o errexit
 
+        # Override the aws credentials with the kitchen specific credentials
+        cat <<EOF > ~/.aws/credentials
+        [default]
+        aws_access_key_id = ${kitchen_aws_key}
+        aws_secret_access_key = ${kitchen_aws_secret}
+        EOF
+
         export KITCHEN_ARTIFACTS_URL="https://s3.amazonaws.com/mciuploads/${project}/${build_variant}/${revision}/artifacts/${build_id}.tgz"
         export KITCHEN_SECURITY_GROUP="${kitchen_security_group}"
         export KITCHEN_SSH_KEY_ID="${kitchen_ssh_key_id}"
         export KITCHEN_SUBNET="${kitchen_subnet}"
+        export KITCHEN_VPC="${kitchen_vpc}"
 
         # set expiration tag 2 hours in the future, since no test should take this long
         export KITCHEN_EXPIRE="$(${python|/opt/mongodbtoolchain/v2/bin/python2} -c 'import datetime; print((datetime.datetime.utcnow() + datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S"))')"
@@ -1097,6 +1140,46 @@ functions:
           exit 0
         fi
 
+  "copy ec2 monitor files": &copy_ec2_monitor_files
+    command: shell.exec
+    params:
+      background: true
+      system_log: true
+      working_dir: src
+      silent: false
+      script: |
+        while [ 1 ]
+        do
+          # Tar/zip monitor files on remote host.
+          if [ -z "${ec2_monitor_files}" ] || [ -z "${instance_id}" ]; then
+            exit 0
+          fi
+          # Ensure we use the latest ip_address, as it could change if the EC2 instance
+          # has been stopped and started.
+          ${activate_virtualenv}
+          # Specify '--mode start' to ensure the remote instance is running.
+          aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode start)
+          echo "AMI EC2 instance ${instance_id} status: $aws_ec2"
+          ip_address=$(echo $aws_ec2 | sed -e "s/[^[:print:]\t]//g; s/.*private_ip_address: //; s/ .*//")
+          cmd="${tar|tar} czf ec2_monitor_files.tgz ${ec2_monitor_files}"
+          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+          ssh_connection_options="$ssh_connection_options -o ConnectionAttempts=3"
+          $python buildscripts/remote_operations.py          \
+            --verbose                                        \
+            --userHost $USER@$ip_address                     \
+            --sshConnectionOptions "$ssh_connection_options" \
+            --retries ${ssh_retries|0}                       \
+            --commands "$cmd"
+          $python buildscripts/remote_operations.py          \
+            --verbose                                        \
+            --userHost $USER@$ip_address                     \
+            --operation "copy_from"                          \
+            --sshConnectionOptions "$ssh_connection_options" \
+            --retries ${ssh_retries|0}                       \
+            --file ec2_monitor_files.tgz
+          sleep 30
+        done
+
   "set up EC2 instance":
     - command: shell.exec
       params:
@@ -1107,15 +1190,33 @@ functions:
           ${activate_virtualenv}
           pip install boto3
 
-          for security_group in ${security_groups}
+          if [ ! -z "${subnet_id}" ]; then
+            subnet_id="-n ${subnet_id}"
+          fi
+
+          for security_group_id in ${security_group_ids}
           do
-            security_groups="$security_groups -s $security_group"
+            security_group_ids="$security_group_ids -g $security_group_id"
           done
+
+          if [ -z "${security_group_ids}" ]; then
+            for security_group in ${security_groups}
+            do
+              security_groups="$security_groups -s $security_group"
+            done
+          fi
+
+          if [ ! -z "${expire_hours}" ]; then
+            expire_hours="-e ${expire_hours}"
+          fi
 
           # Clone another instance of this host in EC2.
           buildscripts/launch_evergreen_ec2_instance.sh \
+            $expire_hours                               \
             -k ${ssh_key_id}                            \
             $security_groups                            \
+            $security_group_ids                         \
+            $subnet_id                                  \
             -t "AMI Evergreen ${task_id}"               \
             -y ${aws_ec2_yml}
 
@@ -1206,20 +1307,12 @@ functions:
         working_dir: src
         script: |
           set -o errexit
-          # Copy buildscripts, mongoDB executables and debug symbols to the remote host.
+          # Copy buildscripts and mongoDB executables to the remote host.
           file_param="--file buildscripts"
           mongo_executables="mongo mongod mongos"
-          file_extensions=".debug .dSYM .pdb"
           for executable in $mongo_executables
           do
             file_param="$file_param --file $executable${exe}"
-            for extension in $file_extensions
-            do
-              file=$executable$extension
-              if [[ -f $file || -d $file ]]; then
-                file_param="$file_param --file $file"
-              fi
-            done
           done
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
@@ -1262,39 +1355,30 @@ functions:
           set -o errexit
           ${set_sudo}
           # Setup curator to collect system & process stats on remote.
-          # TODO: Update command once curator supports displaying all processes.
-          # Note: On Windows using 'process-tree --pid 1' does not work, as it does on Linux.
           if [ "Windows_NT" = "$OS" ]; then
-            cmds="cygrunsrv --install curator_sys --path $(which curator) --args 'stat system' -1 $HOME/${monitor_system_file}"
-            cmds="$cmds; cygrunsrv --install curator_proc --path $(which curator) --args 'stat process-tree --pid 1' -1 $HOME/${monitor_proc_file}"
+             variant=windows-64
           else
-            cmds="cmd='@reboot ${sudo} $(which curator) stat system >> ${monitor_system_file}'"
-            cmds="$cmds; (crontab -l ; echo \"\$cmd\") | crontab -"
-            cmds="$cmds; cmd='@reboot ${sudo} $(which curator) stat process-tree --pid 1 >> ${monitor_proc_file}'"
-            cmds="$cmds; (crontab -l ; echo "\$cmd") | crontab -"
+             variant=ubuntu1604
           fi
-          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
-          ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
-            --verbose                                        \
-            --userHost $USER@${ip_address}                   \
-            --sshConnectionOptions "$ssh_connection_options" \
-            --retries ${ssh_retries|0}                       \
-            --commands "$cmds"
-
-    - command: shell.exec
-      params:
-        shell: bash
-        working_dir: src
-        script: |
-          set -o errexit
-          ${set_sudo}
-          # Start curator to collect system & process stats on remote.
+          # Download latest version of curator
+          latest_curator_hash=$(git ls-remote https://github.com/mongodb/curator.git | grep HEAD | cut -f1)
+          curator_url="https://s3.amazonaws.com/boxes.10gen.com/build/curator/curator-dist-$variant-$latest_curator_hash.tar.gz"
+          cmds="curl -s $curator_url | tar -xzv"
           if [ "Windows_NT" = "$OS" ]; then
-            cmds="cygrunsrv --start curator_sys"
+            # Since curator runs as SYSTEM user, ensure the output files can be accessed.
+            cmds="$cmds; touch ${monitor_system_file}; chmod 777 ${monitor_system_file}"
+            cmds="$cmds; cygrunsrv --install curator_sys --path curator --chdir \$HOME --args 'stat system --file ${monitor_system_file}'"
+            cmds="$cmds; touch ${monitor_proc_file}; chmod 777 ${monitor_proc_file}"
+            cmds="$cmds; cygrunsrv --install curator_proc --path curator --chdir \$HOME --args 'stat process-all --file ${monitor_proc_file}'"
+            cmds="$cmds; cygrunsrv --start curator_sys"
             cmds="$cmds; cygrunsrv --start curator_proc"
           else
-            cmds="{ ${sudo} $(which curator) stat system > ${monitor_system_file} &"
-            cmds="$cmds ${sudo} $(which curator) stat process-tree --pid 1 > ${monitor_proc_file} & } & disown"
+            cmds="$cmds; cmd=\"@reboot cd \$HOME && ${sudo} ./curator stat system >> ${monitor_system_file}\""
+            cmds="$cmds; (crontab -l ; echo \"\$cmd\") | crontab -"
+            cmds="$cmds; cmd=\"@reboot cd \$HOME && ${sudo} ./curator stat process-all >> ${monitor_proc_file}\""
+            cmds="$cmds; (crontab -l ; echo \"\$cmd\") | crontab -"
+            cmds="$cmds; crontab -l"
+            cmds="$cmds; { ${sudo} \$HOME/curator stat system --file ${monitor_system_file} > /dev/null 2>&1 & ${sudo} \$HOME/curator stat process-all --file ${monitor_proc_file} > /dev/null 2>&1 & } & disown"
           fi
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
@@ -1375,26 +1459,54 @@ functions:
               --commands "$cmds"
           fi
 
-  "copy EC2 artifacts":
     - command: shell.exec
       params:
         shell: bash
         working_dir: src
         script: |
-          if [ -z "${ec2_artifacts}" ]; then
+          set -o errexit
+          if [[ "Windows_NT" != "$OS" || -z "${windows_crash_zip}" ]]; then
+            exit 0
+          fi
+          # Install NotMyFault, used to crash Windows.
+          cmds="curl -s -o ${windows_crash_zip} ${windows_crash_dl}"
+          cmds="$cmds; unzip -q ${windows_crash_zip} -d ${windows_crash_dir}"
+          cmds="$cmds; chmod +x ${windows_crash_dir}/*.exe"
+          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+          ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
+            --verbose                                        \
+            --userHost $USER@${ip_address}                   \
+            --sshConnectionOptions "$ssh_connection_options" \
+            --retries ${ssh_retries|0}                       \
+            --commands "$cmds"
+
+    - *copy_ec2_monitor_files
+
+
+  "set EC2 address":
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src
+        script: |
+          if [ -z "${instance_id}" ]; then
             exit 0
           fi
           # Ensure we use the latest ip_address, as it could change if the EC2 instance
           # has been stopped and started.
           ${activate_virtualenv}
-          aws_ec2=$(python buildscripts/aws_ec2.py --imageId ${instance_id} --mode status)
-          ip_address=$(echo $aws_ec2 | sed -e "s/.*private_ip_address: //; s/ .*//")
+          # Specify '--mode start' to ensure the remote instance is running.
+          aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode start)
+          echo "AMI EC2 instance ${instance_id} status: $aws_ec2"
+          ip_address=$(echo $aws_ec2 | sed -e "s/[^[:print:]\t]//g; s/.*private_ip_address: //; s/ .*//")
           sed -i -e "s/${ip_address}/$ip_address/" ${aws_ec2_yml}
+          echo "Instance status: $aws_ec2"
 
     - command: expansions.update
       params:
         file: src/${aws_ec2_yml}
 
+  "copy EC2 artifacts":
     - command: shell.exec
       params:
         shell: bash
@@ -1441,7 +1553,7 @@ functions:
         fi
         ${activate_virtualenv}
         echo "Terminating $instance_id"
-        aws_ec2=$(python buildscripts/aws_ec2.py --imageId ${instance_id} --mode terminate)
+        aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode terminate)
         echo "Terminated AMI EC2 instance: $aws_ec2"
 
 pre:
@@ -1511,7 +1623,54 @@ post:
     params:
       file_location: src/report.json
 
+  - func: "set EC2 address"
   - func: "copy EC2 artifacts"
+  # Gather remote mongo coredumps.
+  - command: shell.exec
+    params:
+      working_dir: "src"
+      script: |
+        if [ ! -f ${aws_ec2_yml|""} ]; then
+          exit 0
+        fi
+        ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+        remote_dir=${remote_dir|.}
+        # Find all core files and move to $remote_dir
+        cmds="core_files=\$(/usr/bin/find -H . \( -name '*.core' -o -name '*.mdmp' \) 2> /dev/null)"
+        cmds="$cmds; if [ -z \"\$core_files\" ]; then exit 0; fi"
+        cmds="$cmds; echo Found remote core files \$core_files, moving to \$(pwd)"
+        cmds="$cmds; for core_file in \$core_files"
+        cmds="$cmds; do base_name=\$(echo \$core_file | sed 's/.*\///')"
+        cmds="$cmds;   if [ ! -f \$base_name ]; then mv \$core_file .; fi"
+        cmds="$cmds; done"
+        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
+          --verbose                                        \
+          --userHost $USER@${ip_address}                   \
+          --sshConnectionOptions "$ssh_connection_options" \
+          --retries ${ssh_retries}                         \
+          --commands "$cmds"                               \
+          --commandDir $remote_dir
+  - command: shell.exec
+    params:
+      working_dir: "src"
+      script: |
+        if [ ! -f ${aws_ec2_yml|""} ]; then
+          exit 0
+        fi
+        ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+        remote_dir=${remote_dir|.}
+        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
+          --verbose                                        \
+          --userHost $USER@${ip_address}                   \
+          --operation "copy_from"                          \
+          --sshConnectionOptions "$ssh_connection_options" \
+          --retries ${ssh_retries}                         \
+          --file "$remote_dir/*.core"                      \
+          --file "$remote_dir/*.mdmp"
+        # Since both type of core files do not exist on the same host, this command
+        # will always return non-zero. As the core file retrieval is optional, we
+        # always exit successfully.
+        exit 0
   - func: "cleanup EC2 instance"
 
   - func: "kill processes"
@@ -1578,6 +1737,19 @@ post:
       permissions: public-read
       content_type: ${content_type|application/x-gzip}
       display_name: FTDC Diagnostic Data - Execution ${execution}
+      optional: true
+
+  # Archive remote EC2 monitor files.
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/ec2_monitor_files.tgz
+      remote_file: ${project}/${build_variant}/${revision}/remote_ec2/remote_ec2_monitor-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Remote EC2 Monitor - Execution ${execution}
       optional: true
 
   # Archive remote EC2 artifacts.
@@ -1883,6 +2055,7 @@ post:
 timeout:
   - func: "fetch debugsymbols archive"
   - func: "extract debugsymbols"
+  - func: "set EC2 address"
   - command: shell.exec
     params:
       working_dir: src
@@ -1908,7 +2081,7 @@ timeout:
         # Call hang_analyzer.py script for tasks that are running remote mongo processes
         # The file ${aws_ec2_yml} will define the remote's ${ip_address}.
         # Any task which uses remote processes will have previously loaded this file to set these
-        # expansions macros.
+        # expansion macros.
         if [ -f ${aws_ec2_yml|""} ]; then
           core_ext=core
           if [ "Windows_NT" = "$OS" ]; then
@@ -1917,6 +2090,24 @@ timeout:
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           # buildscripts must be installed in ${remote_dir} on the remote host.
           remote_dir=${remote_dir|.}
+
+          # Copy mongoDB debug symbols to the remote host.
+          debug_files=$(ls *.debug *.dSYM *.pdb 2> /dev/null)
+          for debug_file in $debug_files
+          do
+            file_param="$file_param --file $debug_file"
+          done
+          if [ ! -z "$file_param" ]; then
+            ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
+              --verbose                                        \
+              --userHost $USER@${ip_address}                   \
+              --operation "copy_to"                            \
+              --sshConnectionOptions "$ssh_connection_options" \
+              --retries ${ssh_retries}                         \
+              $file_param                                      \
+              --remoteDir $remote_dir
+          fi
+
           cmds="PATH=\"/opt/mongodbtoolchain/gdb/bin:\$PATH\" $sudo ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/hang_analyzer.py $hang_analyzer_option"
           ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
             --verbose                                        \
@@ -1944,10 +2135,10 @@ timeout:
 ##   - Non standard jstests, i.e., jstestfuzz
 ## Note that the task name supports glob patterns.
 test_lifecycle_excluded_tasks:
+- aggregation_fuzzer*
 - burn_in_tests
 - compile*
 - dbtest*
-- generational_jstestfuzz*
 - idl_tests
 - integration*
 - jepsen*
@@ -1958,6 +2149,7 @@ test_lifecycle_excluded_tasks:
 - push
 - rollback_fuzzer*
 - unittests*
+- update_fuzzer*
 
 tasks:
 
@@ -2231,32 +2423,6 @@ tasks:
       jepsen_test_name: register
 
 - <<: *run_jepsen_template
-  name: jepsen_register_findAndModify_pv0
-  commands:
-  - func: "do setup"
-  - func: "do jepsen setup"
-  - func: "run jepsen test"
-    vars:
-      <<: *jepsen_config_vars
-      jepsen_protocol_version: --protocol-version 0
-      jepsen_read_with_find_and_modify: --read-with-find-and-modify
-      jepsen_storage_engine: --storage-engine mmapv1
-      jepsen_test_name: register
-
-- <<: *run_jepsen_template
-  name: jepsen_register_findAndModify_pv0_WT
-  commands:
-  - func: "do setup"
-  - func: "do jepsen setup"
-  - func: "run jepsen test"
-    vars:
-      <<: *jepsen_config_vars
-      jepsen_protocol_version: --protocol-version 0
-      jepsen_read_with_find_and_modify: --read-with-find-and-modify
-      jepsen_storage_engine: --storage-engine wiredTiger
-      jepsen_test_name: register
-
-- <<: *run_jepsen_template
   name: jepsen_register_linearizableRead
   commands:
   - func: "do setup"
@@ -2335,33 +2501,99 @@ tasks:
       jepsen_test_name: read-concern-majority
       jepsen_write_concern: --write-concern w1
 
-## jstestfuzz standalone generational fuzzer mmapv1 ##
+## jstestfuzz standalone aggregation generational fuzzer mmapv1 ##
 - <<: *jstestfuzz_template
-  name: generational_jstestfuzz
+  name: aggregation_fuzzer
   commands:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: -g -f 50
+      jstestfuzz_vars: --numGeneratedFiles 50
+      npm_command: aggregation-fuzzer
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
-      resmoke_args: --suites=generational_jstestfuzz --storageEngine=mmapv1
+      resmoke_args: --suites=generational_fuzzer --storageEngine=mmapv1
 
-## jstestfuzz standalone generational fuzzer WT ##
+## jstestfuzz standalone aggregation generational fuzzer WT ##
 - <<: *jstestfuzz_template
-  name: generational_jstestfuzz_WT
+  name: aggregation_fuzzer_WT
   commands:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: -g -f 50
+      jstestfuzz_vars: --numGeneratedFiles 50
+      npm_command: aggregation-fuzzer
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
-      resmoke_args: --suites=generational_jstestfuzz --storageEngine=wiredTiger
+      resmoke_args: --suites=generational_fuzzer --storageEngine=wiredTiger
 
-## rollback fuzzer ##
+## jstestfuzz standalone update generational fuzzer mmapv1 ##
+- <<: *jstestfuzz_template
+  name: update_fuzzer
+  commands:
+  - func: "do setup"
+  - func: "set up virtualenv"
+  - func: "do multiversion setup"
+  - func: "run jstestfuzz"
+    vars:
+      npm_command: update-fuzzer
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=generational_fuzzer --storageEngine=mmapv1
+
+## jstestfuzz replication update generational fuzzer mmapv1 ##
+- <<: *jstestfuzz_template
+  name: update_fuzzer_replication
+  commands:
+  - func: "do setup"
+  - func: "set up virtualenv"
+  - func: "do multiversion setup"
+  - func: "run jstestfuzz"
+    vars:
+      npm_command: update-fuzzer
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=generational_fuzzer_replication --storageEngine=mmapv1
+
+## jstestfuzz standalone update generational fuzzer WT ##
+- <<: *jstestfuzz_template
+  name: update_fuzzer_WT
+  commands:
+  - func: "do setup"
+  - func: "set up virtualenv"
+  - func: "do multiversion setup"
+  - func: "run jstestfuzz"
+    vars:
+      npm_command: update-fuzzer
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=generational_fuzzer --storageEngine=wiredTiger
+
+## jstestfuzz replication update generational fuzzer WT ##
+- <<: *jstestfuzz_template
+  name: update_fuzzer_replication_WT
+  commands:
+  - func: "do setup"
+  - func: "set up virtualenv"
+  - func: "do multiversion setup"
+  - func: "run jstestfuzz"
+    vars:
+      npm_command: update-fuzzer
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=generational_fuzzer_replication --storageEngine=wiredTiger
+
+## rollback generational fuzzer mmapv1 ##
 - <<: *jstestfuzz_template
   name: rollback_fuzzer
   commands:
@@ -2375,7 +2607,7 @@ tasks:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=rollback_fuzzer --storageEngine=mmapv1
 
-## rollback fuzzer WT ##
+## rollback generational fuzzer WT ##
 - <<: *jstestfuzz_template
   name: rollback_fuzzer_WT
   commands:
@@ -2970,8 +3202,7 @@ tasks:
         set -o verbose
 
         ${activate_virtualenv}
-        # we should go back to using pip when it works on SLES
-        easy_install --upgrade `cat src/mongo/db/modules/enterprise/jstests/encryptdb/libs/requirements.txt`
+        python -m pip install -r src/mongo/db/modules/enterprise/jstests/encryptdb/libs/requirements.txt
   - func: "run tests"
     vars:
       resmoke_args: --suites=ese --storageEngine=wiredTiger
@@ -3854,6 +4085,17 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: write_concern_majority_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=write_concern_majority_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: replica_sets
   commands:
   - func: "do setup"
@@ -4229,30 +4471,8 @@ tasks:
       resmoke_args: --suites=json_schema --storageEngine=wiredTiger
       run_multiple_jobs: false
 
-- name: powercycle
-  depends_on:
-  - name: compile
-  commands:
-  - func: "do setup"
-  - func: "set up remote credentials"
-    vars:
-      <<: *powercycle_remote_credentials
-  - func: "set up virtualenv"
-  - func: "set up EC2 instance"
-    vars:
-      <<: *powercycle_ec2_instance
-  - command: expansions.update
-    <<: *powercycle_expansions
-  - func: "run powercycle test"
-    # Disable the FSM clients for mmapv1.
-    # mongod will not start if it crashed mongod while creating a namespace (SERVER-26499).
-    vars:
-      <<: *powercycle_test
-      client_options: --numCrudClients 20 --numFsmClients 0
-      test_options: --testLoops 15 --seedDocNum 10000 --rsync --validate local --canary local --removeLockFile
-      mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine mmapv1\"
-
 - name: powercycle_WT
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on:
   - name: compile
   commands:
@@ -4269,9 +4489,10 @@ tasks:
   - func: "run powercycle test"
     vars:
       <<: *powercycle_test
-      mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
+      mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
 
 - name: powercycle_fcv3.4_WT
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on:
   - name: compile
   commands:
@@ -4288,11 +4509,12 @@ tasks:
   - func: "run powercycle test"
     vars:
       <<: *powercycle_test
-      client_options: --numCrudClients 20 --numFsmClients 20 --fsmWorkloadBlacklistFiles toggle_feature_compatibility.js
-      mongod_options: --mongodUsablePorts ${standard_port} ${secret_port} --dbPath ${db_path} --logPath ${log_path} --fcv 3.4
-      mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
+      client_options: --numCrudClients=20 --numFsmClients=20 --fsmWorkloadBlacklistFiles=toggle_feature_compatibility.js
+      mongod_options: --mongodUsablePorts ${standard_port} ${secret_port} --dbPath=${db_path} --logPath=${log_path} --fcv=3.4
+      mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
 
 - name: powercycle_replication_WT
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on:
   - name: compile
   commands:
@@ -4309,9 +4531,10 @@ tasks:
   - func: "run powercycle test"
     vars:
       <<: *powercycle_test
-      mongod_extra_options: --replSet powercyle --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
+      mongod_extra_options: --replSet=powercyle --mongodOptions=\"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
 
 - name: powercycle_replication_smalloplog_WT
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on:
   - name: compile
   commands:
@@ -4328,9 +4551,10 @@ tasks:
   - func: "run powercycle test"
     vars:
       <<: *powercycle_test
-      mongod_extra_options: --replSet powercyle --mongodOptions \"--setParameter enableTestCommands=1 --oplogSize 1 --storageEngine wiredTiger\"
+      mongod_extra_options: --replSet=powercyle --mongodOptions=\"--setParameter enableTestCommands=1 --oplogSize 20 --storageEngine wiredTiger\"
 
 - name: powercycle_syncdelay_WT
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on:
   - name: compile
   commands:
@@ -4347,9 +4571,10 @@ tasks:
   - func: "run powercycle test"
     vars:
       <<: *powercycle_test
-      mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --syncdelay 10 --storageEngine wiredTiger\"
+      mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1 --syncdelay 10 --storageEngine wiredTiger\"
 
 - name: powercycle_write_concern_majority_WT
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on:
   - name: compile
   commands:
@@ -4366,7 +4591,7 @@ tasks:
   - func: "run powercycle test"
     vars:
       <<: *powercycle_test
-      client_options: "--numCrudClients 20 --numFsmClients 20 --writeConcern '{\"w\": \"majority\"}'"
+      client_options: "--numCrudClients=20 --numFsmClients=20 --writeConcern='{\"w\": \"majority\"}'"
       mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
 
 - name: idl_tests
@@ -4981,7 +5206,7 @@ buildvariants:
   - name: jsCore_op_query_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5022,6 +5247,7 @@ buildvariants:
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
   - name: push
 
 - name: linux-64-repeated-execution
@@ -5138,6 +5364,7 @@ buildvariants:
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: slow1_WT
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
 
 - name: linux-64-duroff
   display_name: Linux (No Journal)
@@ -5170,7 +5397,7 @@ buildvariants:
   - name: failpoints_auth
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5213,7 +5440,7 @@ buildvariants:
   - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5289,7 +5516,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5372,12 +5599,6 @@ buildvariants:
   - name: jepsen_register_findAndModify_WT
     distros:
     - ubuntu1404-jepsen
-  - name: jepsen_register_findAndModify_pv0
-    distros:
-    - ubuntu1404-jepsen
-  - name: jepsen_register_findAndModify_pv0_WT
-    distros:
-    - ubuntu1404-jepsen
   - name: jepsen_register_linearizableRead
     distros:
     - ubuntu1404-jepsen
@@ -5401,7 +5622,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5425,6 +5646,12 @@ buildvariants:
   - name: master_slave_WT
   - name: master_slave_auth
   - name: master_slave_jscore_passthrough_WT
+  - name: powercycle_WT
+  - name: powercycle_fcv3.4_WT
+  - name: powercycle_replication_WT
+  - name: powercycle_replication_smalloplog_WT
+  - name: powercycle_syncdelay_WT
+  - name: powercycle_write_concern_majority_WT
   - name: sharding_WT
   - name: sharding_auth
   - name: sharding_last_stable_mongos_and_mixed_shards
@@ -5434,13 +5661,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
-  - name: powercycle
-  - name: powercycle_WT
-  - name: powercycle_fcv3.4_WT
-  - name: powercycle_replication_WT
-  - name: powercycle_replication_smalloplog_WT
-  - name: powercycle_syncdelay_WT
-  - name: powercycle_write_concern_majority_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -5494,7 +5714,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5549,6 +5769,7 @@ buildvariants:
     push_arch: arm64-enterprise-ubuntu1604
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    max_jobs: 8 # Avoid starting too many mongod's on ARM test servers
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
     packager_script: packager-enterprise.py
@@ -5578,7 +5799,7 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5639,6 +5860,7 @@ buildvariants:
     push_arch: arm64-ubuntu1604
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    max_jobs: 8 # Avoid starting too many mongod's on ARM test servers
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
     packager_script: packager.py
@@ -5705,7 +5927,7 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5801,7 +6023,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5842,6 +6064,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
   - name: push
     distros:
     - ubuntu1604-test
@@ -5888,7 +6111,7 @@ buildvariants:
   - name: jsCore_WT_ese
   - name: jsCore_auth
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5902,6 +6125,7 @@ buildvariants:
   - name: replica_sets_WT_ese
   - name: master_slave_auth
   - name: master_slave_WT
+  - name: powercycle_WT
   - name: sasl
   - name: sharding_auth
   - name: sharding_auth_audit_WT
@@ -5915,8 +6139,6 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
-  - name: powercycle
-  - name: powercycle_WT
   - name: package
     distros:
     - ubuntu1604-packer
@@ -5969,7 +6191,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6137,6 +6359,9 @@ buildvariants:
     distros:
     - windows-64-vs2015-large
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
+    distros:
+    - windows-64-vs2015-large
 
 - name: enterprise-windows-64-2k8
   display_name: "! Enterprise Windows 2008R2"
@@ -6186,7 +6411,7 @@ buildvariants:
     distros:
     - windows-64-vs2015-large
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6296,7 +6521,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsonSchema
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6334,6 +6559,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
 
 - name: enterprise-windows-64-2k8-inmem
   display_name: Enterprise Windows 2008R2 (inMemory)
@@ -6380,8 +6606,8 @@ buildvariants:
   - name: concurrency_simultaneous
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6455,7 +6681,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsonSchema
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6478,6 +6704,18 @@ buildvariants:
   - name: noPassthrough_WT
   - name: parallel_WT
   - name: parallel_compatibility_WT
+  - name: powercycle_WT
+    distros:
+    - windows-64-vs2015-large
+  - name: powercycle_fcv3.4_WT
+    distros:
+    - windows-64-vs2015-large
+  - name: powercycle_replication_WT
+    distros:
+    - windows-64-vs2015-large
+  - name: powercycle_syncdelay_WT
+    distros:
+    - windows-64-vs2015-large
   - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: replica_sets_WT
@@ -6499,6 +6737,9 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: update_fuzzer_WT
+  - name: update_fuzzer_replication_WT
+  - name: write_concern_majority_passthrough_WT
   - name: push
     distros:
     - rhel70-small
@@ -6552,6 +6793,7 @@ buildvariants:
     gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
+    multiversion_platform_arch: "osx-ssl"
     num_jobs_available: 1
     build_mongoreplay: true
   tasks:
@@ -6586,7 +6828,7 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6626,6 +6868,8 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: update_fuzzer_WT
+  - name: write_concern_majority_passthrough_WT
   - name: push
     distros:
     - rhel70-small
@@ -6687,7 +6931,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6844,7 +7088,7 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query_WT
   - name: jsonSchema
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6952,6 +7196,11 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: update_fuzzer_WT
+  - name: update_fuzzer_replication_WT
+  - name: write_concern_majority_passthrough_WT
+    distros:
+    - rhel62-large
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7073,6 +7322,8 @@ buildvariants:
   - name: snmp_WT
   - name: ssl
   - name: sslSpecial
+  - name: update_fuzzer_WT
+  - name: write_concern_majority_passthrough_WT
 
 - name: enterprise-rhel-70-64-bit
   display_name: "* Enterprise RHEL 7.0"
@@ -7110,7 +7361,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7199,7 +7450,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7285,7 +7536,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7393,7 +7644,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7434,6 +7685,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
   - name: push
     distros:
     - rhel70-small
@@ -7499,7 +7751,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7540,6 +7792,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
   - name: push
     distros:
     - rhel70-small
@@ -7677,6 +7930,7 @@ buildvariants:
   - name: sslSpecial
   # - name: tool
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
   - name: push
     distros:
     - rhel70
@@ -7721,7 +7975,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7776,12 +8030,6 @@ buildvariants:
   - name: jepsen_register_findAndModify_WT
     distros:
     - ubuntu1404-jepsen
-  - name: jepsen_register_findAndModify_pv0
-    distros:
-    - ubuntu1404-jepsen
-  - name: jepsen_register_findAndModify_pv0_WT
-    distros:
-    - ubuntu1404-jepsen
   - name: jepsen_register_linearizableRead
     distros:
     - ubuntu1404-jepsen
@@ -7802,7 +8050,7 @@ buildvariants:
     - ubuntu1404-jepsen
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7858,7 +8106,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7939,7 +8187,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8019,7 +8267,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8060,6 +8308,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
   - name: push
     distros:
     - suse12-test
@@ -8111,7 +8360,7 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8184,7 +8433,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8257,7 +8506,7 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8298,6 +8547,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
   - name: push
     distros:
     - suse11-test
@@ -8348,7 +8598,7 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8426,7 +8676,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8480,7 +8730,7 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8546,7 +8796,7 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8635,7 +8885,7 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8694,6 +8944,8 @@ buildvariants:
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
+    multiversion_platform_arch: "rhel62"
+    multiversion_edition: "enterprise"
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     use_scons_cache: true
     build_mongoreplay: true
@@ -8743,7 +8995,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8793,6 +9045,9 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
+  - name: update_fuzzer_WT
+  - name: update_fuzzer_replication_WT
+  - name: write_concern_majority_passthrough_WT
 
 - name: linux-64-ephemeralForTest
   display_name: Linux (ephemeralForTest)
@@ -8838,7 +9093,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_op_query
   - name: jsCore_compatibility
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8873,6 +9128,8 @@ buildvariants:
   - name: sharding_jscore_op_query_passthrough_WT
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool
+  - name: update_fuzzer_WT
+  - name: update_fuzzer_replication_WT
 
 - name: enterprise-rhel-71-ppc64le-inmem
   display_name: Enterprise RHEL 7.1 PPC64LE (inMemory) DEBUG
@@ -8956,6 +9213,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
+  - name: write_concern_majority_passthrough_WT
 
 - name: enterprise-rhel-72-s390x-inmem
   display_name: Enterprise RHEL 7.2 s390x (inMemory) DEBUG
@@ -9046,6 +9304,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
+  - name: write_concern_majority_passthrough_WT
 
 - name: ubuntu1404-rocksdb
   display_name: Ubuntu 14.04 (RocksDB)
@@ -9190,6 +9449,9 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: update_fuzzer_WT
+  - name: update_fuzzer_replication_WT
+  - name: write_concern_majority_passthrough_WT
 
 - name: ubuntu1604-asan
   display_name: ~ ASAN SSL Ubuntu 16.04
@@ -9210,7 +9472,7 @@ buildvariants:
   tasks:
   - name: compile
   - name: compile_all
-  - name: generational_jstestfuzz_WT
+  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -9342,6 +9604,9 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: update_fuzzer_WT
+  - name: update_fuzzer_replication_WT
+  - name: write_concern_majority_passthrough_WT
 
 - name: ubuntu1604-debug-aubsan-lite
   display_name: "! {A,UB}SAN Enterprise SSL Ubuntu 16.04 DEBUG"
@@ -9472,6 +9737,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
 
 - name: ubuntu1604-debug-legacy-transportlayer
   display_name: "Enterprise SSL Ubuntu 16.04 DEBUG Legacy Transport"
@@ -9576,6 +9842,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
+  - name: write_concern_majority_passthrough_WT
 
 - name: enterprise-ubuntu-dynamic-1604-64-bit
   display_name: "* Shared Library Enterprise Ubuntu 16.04"
@@ -9723,6 +9990,8 @@ buildvariants:
   - name: slow1
   - name: snmp
   - name: tool
+  - name: update_fuzzer
+  - name: update_fuzzer_replication
 
 - name: enterprise-windows-64-2k8-mmapv1
   display_name: Enterprise Windows 2008R2 MMAPv1
@@ -9739,6 +10008,8 @@ buildvariants:
     gorootvars: >-
       PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH"
       CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"
+    multiversion_platform_arch: windows
+    multiversion_edition: "enterprise"
     msi_target: msi
     content_type: application/zip
     compile_flags: >-
@@ -9850,6 +10121,8 @@ buildvariants:
   - name: slow1
   - name: snmp
   - name: tool
+  - name: update_fuzzer
+  - name: update_fuzzer_replication
 
 - name: enterprise-osx-1010-mmapv1
   display_name: Enterprise OS X 10.10 MMAPv1
@@ -9868,6 +10141,8 @@ buildvariants:
     compile_flags: >-
       --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10"
       LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
+    multiversion_platform_arch: "osx"
+    multiversion_edition: "enterprise"
     num_jobs_available: 1
     build_mongoreplay: true
   tasks:
@@ -9935,3 +10210,4 @@ buildvariants:
   - name: sharding_jscore_passthrough
   - name: slow1
   - name: tool
+  - name: update_fuzzer

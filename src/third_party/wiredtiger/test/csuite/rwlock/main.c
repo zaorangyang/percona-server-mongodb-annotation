@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -50,8 +50,8 @@ void *thread_dump(void *);
 int
 main(int argc, char *argv[])
 {
-	TEST_OPTS *opts, _opts;
 	struct timespec te, ts;
+	TEST_OPTS *opts, _opts;
 	pthread_t dump_id, id[MAX_THREADS];
 	int i;
 

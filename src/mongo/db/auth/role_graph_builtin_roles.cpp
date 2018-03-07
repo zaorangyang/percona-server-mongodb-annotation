@@ -222,6 +222,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::flushRouterConfig  // clusterManager gets this also
         << ActionType::fsync
         << ActionType::invalidateUserCache // userAdminAnyDatabase gets this also
+        << ActionType::killAnyCursor
         << ActionType::killAnySession
         << ActionType::killop
         << ActionType::replSetResizeOplog

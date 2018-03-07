@@ -45,7 +45,10 @@ class InternalSchemaEqMatchExpression final : public LeafMatchExpression {
 public:
     static constexpr StringData kName = "$_internalSchemaEq"_sd;
 
-    InternalSchemaEqMatchExpression() : LeafMatchExpression(MatchType::INTERNAL_SCHEMA_EQ) {}
+    InternalSchemaEqMatchExpression()
+        : LeafMatchExpression(MatchType::INTERNAL_SCHEMA_EQ,
+                              ElementPath::LeafArrayBehavior::kNoTraversal,
+                              ElementPath::NonLeafArrayBehavior::kTraverse) {}
 
     Status init(StringData path, BSONElement rhs);
 
@@ -69,10 +72,6 @@ public:
 
     std::vector<MatchExpression*>* getChildVector() final {
         return nullptr;
-    }
-
-    bool shouldExpandLeafArray() const final {
-        return false;
     }
 
 private:

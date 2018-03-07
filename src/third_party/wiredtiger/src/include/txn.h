@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -9,6 +9,19 @@
 #define	WT_TXN_NONE	0		/* No txn running in a session. */
 #define	WT_TXN_FIRST	1		/* First transaction to run. */
 #define	WT_TXN_ABORTED	UINT64_MAX	/* Update rolled back, ignore. */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_TXN_LOG_CKPT_CLEANUP	0x01u
+#define	WT_TXN_LOG_CKPT_PREPARE	0x02u
+#define	WT_TXN_LOG_CKPT_START	0x04u
+#define	WT_TXN_LOG_CKPT_STOP	0x08u
+#define	WT_TXN_LOG_CKPT_SYNC	0x10u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_TXN_OLDEST_STRICT	0x1u
+#define	WT_TXN_OLDEST_WAIT	0x2u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 
 /*
  * Transaction ID comparison dealing with edge cases.
@@ -228,6 +241,7 @@ struct __wt_txn {
 
 	TAILQ_ENTRY(__wt_txn) commit_timestampq;
 	TAILQ_ENTRY(__wt_txn) read_timestampq;
+	bool clear_ts_queue;	/* Set if we need to clear from the queue */
 
 	/* Array of modifications by this transaction. */
 	WT_TXN_OP      *mod;
@@ -246,19 +260,26 @@ struct __wt_txn {
 	WT_ITEM		*ckpt_snapshot;
 	bool		full_ckpt;
 
-#define	WT_TXN_AUTOCOMMIT	0x00001
-#define	WT_TXN_ERROR		0x00002
-#define	WT_TXN_HAS_ID		0x00004
-#define	WT_TXN_HAS_SNAPSHOT	0x00008
-#define	WT_TXN_HAS_TS_COMMIT	0x00010
-#define	WT_TXN_HAS_TS_READ	0x00020
-#define	WT_TXN_NAMED_SNAPSHOT	0x00040
-#define	WT_TXN_PUBLIC_TS_COMMIT	0x00080
-#define	WT_TXN_PUBLIC_TS_READ	0x00100
-#define	WT_TXN_READONLY		0x00200
-#define	WT_TXN_RUNNING		0x00400
-#define	WT_TXN_SYNC_SET		0x00800
-#define	WT_TXN_TS_COMMIT_ALWAYS	0x01000
-#define	WT_TXN_TS_COMMIT_NEVER	0x02000
+	const char *rollback_reason;		/* If rollback, the reason */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define	WT_TXN_AUTOCOMMIT	0x00001u
+#define	WT_TXN_ERROR		0x00002u
+#define	WT_TXN_HAS_ID		0x00004u
+#define	WT_TXN_HAS_SNAPSHOT	0x00008u
+#define	WT_TXN_HAS_TS_COMMIT	0x00010u
+#define	WT_TXN_HAS_TS_READ	0x00020u
+#define	WT_TXN_IGNORE_PREPARE	0x00040u
+#define	WT_TXN_NAMED_SNAPSHOT	0x00080u
+#define	WT_TXN_PUBLIC_TS_COMMIT	0x00100u
+#define	WT_TXN_PUBLIC_TS_READ	0x00200u
+#define	WT_TXN_READONLY		0x00400u
+#define	WT_TXN_RUNNING		0x00800u
+#define	WT_TXN_SYNC_SET		0x01000u
+#define	WT_TXN_TS_COMMIT_ALWAYS	0x02000u
+#define	WT_TXN_TS_COMMIT_KEYS	0x04000u
+#define	WT_TXN_TS_COMMIT_NEVER	0x08000u
+#define	WT_TXN_UPDATE	        0x10000u
+/* AUTOMATIC FLAG VALUE GENERATION STOP */
 	uint32_t flags;
 };

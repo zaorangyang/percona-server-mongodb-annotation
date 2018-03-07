@@ -382,9 +382,14 @@ def update_tags(lifecycle_tags, config, report, tests):
                                + datetime.timedelta(days=1))
         reliable_entries = [entry for entry in grouped_entries
                             if entry.start_date >= reliable_start_date]
-        reliable_report = tf.Report(reliable_entries)
-        reliable_combinations = {_test_combination_from_entry(entry, components)
-                                 for entry in reliable_entries}
+        if reliable_entries:
+            reliable_report = tf.Report(reliable_entries)
+            reliable_combinations = {_test_combination_from_entry(entry, components)
+                                     for entry in reliable_entries}
+            reliable_summaries = reliable_report.summarize_by(components)
+        else:
+            reliable_combinations = set()
+            reliable_summaries = []
 
         # Create the unreliable report.
         # Filter out any test executions from prior to 'config.unreliable_time_period'.
@@ -397,11 +402,15 @@ def update_tags(lifecycle_tags, config, report, tests):
             if (entry.start_date >= unreliable_start_date and
                 _test_combination_from_entry(entry, components) in reliable_combinations)
         ]
-        unreliable_report = tf.Report(unreliable_entries)
+        if unreliable_entries:
+            unreliable_report = tf.Report(unreliable_entries)
+            unreliable_summaries = unreliable_report.summarize_by(components)
+        else:
+            unreliable_summaries = []
 
         # Update the tags using the unreliable report.
         update_lifecycle(lifecycle_tags,
-                         unreliable_report.summarize_by(components),
+                         unreliable_summaries,
                          unreliable_test,
                          True,
                          rates.unacceptable,
@@ -409,7 +418,7 @@ def update_tags(lifecycle_tags, config, report, tests):
 
         # Update the tags using the reliable report.
         update_lifecycle(lifecycle_tags,
-                         reliable_report.summarize_by(components),
+                         reliable_summaries,
                          reliable_test,
                          False,
                          rates.acceptable,
@@ -559,6 +568,7 @@ class TagsConfigWithChangelog(object):
 class JiraIssueCreator(object):
     _LABEL = "test-lifecycle"
     _PROJECT = "TIGBOT"
+    _MAX_DESCRIPTION_SIZE = 32767
 
     def __init__(self, jira_server, jira_user, jira_password):
         self._client = jiraclient.JiraClient(jira_server, jira_user, jira_password)
@@ -591,6 +601,16 @@ class JiraIssueCreator(object):
         return "{{" + text + "}}"
 
     @staticmethod
+    def _truncate_description(desc):
+        max_size = JiraIssueCreator._MAX_DESCRIPTION_SIZE
+        if len(desc) > max_size:
+            warning = ("\nDescription truncated: "
+                       "exceeded max size of {} characters.").format(max_size)
+            truncated_length = max_size - len(warning)
+            desc = desc[:truncated_length] + warning
+        return desc
+
+    @staticmethod
     def _get_jira_description(project, mongo_revision, model_config, added, removed, cleaned_up):
         mono = JiraIssueCreator._monospace
         config_desc = _config_as_options(model_config)
@@ -601,15 +621,17 @@ class JiraIssueCreator(object):
             mono(project), project)
         revision_link = "[{0}|https://github.com/mongodb/mongo/commit/{1}]".format(
             mono(mongo_revision), mongo_revision)
-        return ("h3. Automatic update of the test lifecycle tags\n"
-                "Evergreen Project: {0}\n"
-                "Revision: {1}\n\n"
-                "{{{{update_test_lifecycle.py}}}} options:\n{2}\n\n"
-                "h5. Tags added\n{3}\n\n"
-                "h5. Tags removed\n{4}\n\n"
-                "h5. Tags cleaned up (no longer relevant)\n{5}\n").format(
-                    project_link, revision_link, mono(config_desc),
-                    added_desc, removed_desc, cleaned_up_desc)
+        full_desc = ("h3. Automatic update of the test lifecycle tags\n"
+                     "Evergreen Project: {0}\n"
+                     "Revision: {1}\n\n"
+                     "{{{{update_test_lifecycle.py}}}} options:\n{2}\n\n"
+                     "h5. Tags added\n{3}\n\n"
+                     "h5. Tags removed\n{4}\n\n"
+                     "h5. Tags cleaned up (no longer relevant)\n{5}\n").format(
+                         project_link, revision_link, mono(config_desc),
+                         added_desc, removed_desc, cleaned_up_desc)
+
+        return JiraIssueCreator._truncate_description(full_desc)
 
     @staticmethod
     def _make_updated_tags_description(data):
@@ -1167,6 +1189,8 @@ def main():
             LOGGER.warning("No tasks found for tests %s, skipping this group.", tests)
             continue
         history_data = test_history_source.get_history_data(tests, tasks)
+        if not history_data:
+            continue
         report = tf.Report(history_data)
         update_tags(lifecycle_tags_file.changelog_lifecycle, config, report, tests)
 

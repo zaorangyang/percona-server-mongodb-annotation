@@ -256,7 +256,6 @@ void CollectionCloner::_cancelRemainingWork_inlock() {
     }
     if (_verifyCollectionDroppedScheduler) {
         _verifyCollectionDroppedScheduler->shutdown();
-        _verifyCollectionDroppedScheduler.reset();
     }
     _dbWorkTaskRunner.cancel();
 }
@@ -867,14 +866,7 @@ void CollectionCloner::_verifyCollectionWasDropped(
                       << "' uuid: UUID(\"" << *_options.uuid << "\"), status "
                       << args.response.status;
             }
-            // Because setResultAndCancelRemainingWork destroys the RemoteCommandRetryScheduler, it
-            // must be done outside this callback.
-            auto result = _executor->scheduleWork([this, finalStatus, onCompletionGuard](
-                const executor::TaskExecutor::CallbackArgs& args) {
-                UniqueLock lk(_mutex);
-                onCompletionGuard->setResultAndCancelRemainingWork_inlock(lk, finalStatus);
-            });
-            invariant(result.isOK() || result.getStatus().code() == ErrorCodes::ShutdownInProgress);
+            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lk, finalStatus);
         },
         RemoteCommandRetryScheduler::makeNoRetryPolicy());
 

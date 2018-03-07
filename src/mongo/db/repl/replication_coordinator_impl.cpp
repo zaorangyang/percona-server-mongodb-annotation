@@ -52,7 +52,6 @@
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/member_data.h"
-#include "mongo/db/repl/old_update_position_args.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config_checks.h"
@@ -1155,6 +1154,23 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTime_inlock(const OpTime& op
         // last applied optime here will permit WiredTiger to evict this data as it sees fit.
         _service->getGlobalStorageEngine()->setOldestTimestamp(opTime.getTimestamp());
     }
+    // If we are in pv0, we do not set the stable timestamp on secondaries, and thus do not set the
+    // oldest timestamp either.  This can cause timestamp history to accrue in the storage engine
+    // and never be purged.
+    // To solve this, we manually set the oldest timestamp here to the last applied write, so that
+    // oplog visibility will continue to operate properly (it uses timestamps).  Inside
+    // setOldestTimestamp(), it takes the minimum of the oplog read timestamp and the proposed
+    // oldest_timestamp value, to ensure that oplog reads are never impacted by an oldest_timestamp
+    // value that is too high.
+    if (!isV1ElectionProtocol() && !_memberState.primary()) {
+        auto storageEngine = _service->getGlobalStorageEngine();
+        if (storageEngine) {
+            auto newOldestTimestamp = opTime.getTimestamp();
+            if (!newOldestTimestamp.isNull()) {
+                _storage->setStableTimestamp(getServiceContext(), newOldestTimestamp);
+            }
+        }
+    }
 }
 
 void ReplicationCoordinatorImpl::_setMyLastDurableOpTime_inlock(const OpTime& opTime,
@@ -1372,73 +1388,6 @@ Status ReplicationCoordinatorImpl::setLastAppliedOptime_forTest(long long cfgVer
     const auto status = _setLastOptime_inlock(update, &configVersion);
     _updateLastCommittedOpTime_inlock();
     return status;
-}
-
-Status ReplicationCoordinatorImpl::_setLastOptime_inlock(
-    const OldUpdatePositionArgs::UpdateInfo& args, long long* configVersion) {
-    if (_selfIndex == -1) {
-        // Ignore updates when we're in state REMOVED
-        return Status(ErrorCodes::NotMasterOrSecondary,
-                      "Received replSetUpdatePosition command but we are in state REMOVED");
-    }
-    invariant(getReplicationMode() == modeReplSet);
-
-    if (args.memberId < 0) {
-        std::string errmsg = str::stream()
-            << "Received replSetUpdatePosition for node with memberId " << args.memberId
-            << " which is negative and therefore invalid";
-        LOG(1) << errmsg;
-        return Status(ErrorCodes::NodeNotFound, errmsg);
-    }
-
-    if (args.memberId == _rsConfig.getMemberAt(_selfIndex).getId()) {
-        // Do not let remote nodes tell us what our optime is.
-        return Status::OK();
-    }
-
-    LOG(2) << "received notification that node with memberID " << args.memberId
-           << " in config with version " << args.cfgver
-           << " has durably reached optime: " << args.ts;
-
-    if (args.cfgver != _rsConfig.getConfigVersion()) {
-        std::string errmsg = str::stream()
-            << "Received replSetUpdatePosition for node with memberId " << args.memberId
-            << " whose config version of " << args.cfgver << " doesn't match our config version of "
-            << _rsConfig.getConfigVersion();
-        LOG(1) << errmsg;
-        *configVersion = _rsConfig.getConfigVersion();
-        return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
-    }
-
-    auto* memberData = _topCoord->findMemberDataByMemberId(args.memberId);
-    if (!memberData) {
-        invariant(!_rsConfig.findMemberByID(args.memberId));
-
-        std::string errmsg = str::stream()
-            << "Received replSetUpdatePosition for node with memberId " << args.memberId
-            << " which doesn't exist in our config";
-        LOG(1) << errmsg;
-        return Status(ErrorCodes::NodeNotFound, errmsg);
-    }
-
-    invariant(args.memberId == memberData->getMemberId());
-
-    LOG(3) << "Node with memberID " << args.memberId << " has durably applied operations through "
-           << memberData->getLastDurableOpTime() << " and has applied operations through "
-           << memberData->getLastAppliedOpTime()
-           << "; updating to new durable operation with timestamp " << args.ts;
-
-    auto now(_replExecutor->now());
-    bool advancedOpTime = memberData->advanceLastAppliedOpTime(args.ts, now);
-    advancedOpTime = memberData->advanceLastDurableOpTime(args.ts, now) || advancedOpTime;
-
-    // Only update committed optime if the remote optimes increased.
-    if (advancedOpTime) {
-        _updateLastCommittedOpTime_inlock();
-    }
-
-    _cancelAndRescheduleLivenessUpdate_inlock(args.memberId);
-    return Status::OK();
 }
 
 Status ReplicationCoordinatorImpl::_setLastOptime_inlock(const UpdatePositionArgs::UpdateInfo& args,
@@ -2060,11 +2009,10 @@ Status ReplicationCoordinatorImpl::resyncData(OperationContext* opCtx, bool wait
     return Status::OK();
 }
 
-StatusWith<BSONObj> ReplicationCoordinatorImpl::prepareReplSetUpdatePositionCommand(
-    ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle) const {
+StatusWith<BSONObj> ReplicationCoordinatorImpl::prepareReplSetUpdatePositionCommand() const {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     return _topCoord->prepareReplSetUpdatePositionCommand(
-        commandStyle, _getCurrentCommittedSnapshotOpTime_inlock());
+        _getCurrentCommittedSnapshotOpTime_inlock());
 }
 
 Status ReplicationCoordinatorImpl::processReplSetGetStatus(
@@ -2951,25 +2899,79 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
         // nodes in the set will contact us.
         _startHeartbeats_inlock();
     }
-    _updateLastCommittedOpTime_inlock();
 
-    // Set election id if we're primary.
-    if (oldConfig.isInitialized() && _memberState.primary()) {
+    /**
+     * Protocol Version upgrade and downgrade.
+     *
+     * Since PV upgrade resets its term to 0, in-memory states that involve terms should be
+     * reset on either PV downgrade or upgrade unless they can be updated in both PV0 and PV1 by
+     * data replication or heartbeats, like the last applied. Otherwise PV downgrade then upgrade
+     * will pollute the terms with higher terms from the first PV1.
+     *
+     * Here we reset those in-memory states including:
+     * - last committed optime
+     * - election id (reset for drivers' primary discovery)
+     * - first optime of term (used by primary)
+     * - optime used by snapshots
+     * - stable optime candidates.
+     *
+     * _replicationWaiterList and _opTimeWaiterList are used by awaitReplication() and awaitOptime()
+     * for write/read concerns. Because we are holding the global lock here, there should be no
+     * running client requests and these waiter lists should be empty. One exception I can think of
+     * is the target optime of catchup, which doesn't acquire the global lock. It's potentially
+     * problematic, but very rare.
+     */
+    if (oldConfig.isInitialized()) {
         if (oldConfig.getProtocolVersion() > newConfig.getProtocolVersion()) {
             // Downgrade
-            invariant(newConfig.getProtocolVersion() == 0);
-            _electionId = OID::gen();
-            auto ts = LogicalClock::get(getServiceContext())->reserveTicks(1).asTimestamp();
-            _topCoord->setElectionInfo(_electionId, ts);
+            // Reset last committed optime for all nodes. After this reset, the commit point will
+            // not move forward on secondaries since it's only maintained on primary in PV0 and
+            // never get propagated to secondaries.
+            _topCoord->resetLastCommittedOpTime();
+            // Set election id if we're primary.
+            if (_memberState.primary()) {
+                invariant(newConfig.getProtocolVersion() == 0);
+                _electionId = OID::gen();
+                auto ts = LogicalClock::get(getServiceContext())->reserveTicks(1).asTimestamp();
+                _topCoord->setElectionInfo(_electionId, ts);
+            }
+
+            // On PV downgrade, we drop all snapshots and clear the stable optime candidates because
+            // read majority isn't supported in PV0.
+            //
+            // TODO: On a reconfig in PV1, we should also drop all snapshots so we don't mistakenly
+            // read from the wrong one, for example, if we change the meaning of the "committed"
+            // snapshot from applied -> durable or the quorum gets changed.
+            // We currently only do this on the primary that processes the replSetReconfig command,
+            // but not on nodes that learn of the new config via a heartbeat.
+            _dropAllSnapshots_inlock();
+            // Also clear all stable snapshots. This is critical for PV downgrade and then upgrade
+            // to make sure OpTimes before the downgrade don't interfere the second upgrade.
+            _stableOpTimeCandidates.clear();
+
         } else if (oldConfig.getProtocolVersion() < newConfig.getProtocolVersion()) {
             // Upgrade
-            invariant(newConfig.getProtocolVersion() == 1);
-            invariant(_topCoord->getTerm() != OpTime::kUninitializedTerm);
-            _electionId = OID::fromTerm(_topCoord->getTerm());
-            auto ts = LogicalClock::get(getServiceContext())->reserveTicks(1).asTimestamp();
-            _topCoord->setElectionInfo(_electionId, ts);
+            if (_memberState.primary()) {
+                invariant(newConfig.getProtocolVersion() == 1);
+                // The term is only set to "uninitialized" at startup or in PV0.
+                invariant(_topCoord->getTerm() != OpTime::kUninitializedTerm);
+                _electionId = OID::fromTerm(_topCoord->getTerm());
+                // Allow anything to commit, because, technically, this node is also the previous
+                // primary.
+                OpTime firstOpTimeOfTerm(Timestamp(), _topCoord->getTerm());
+                invariantOK(_topCoord->completeTransitionToPrimary(firstOpTimeOfTerm));
+                auto ts = LogicalClock::get(getServiceContext())->reserveTicks(1).asTimestamp();
+                _topCoord->setElectionInfo(_electionId, ts);
+            }
         }
     }
+
+    // Update commit point for the primary. Called by every reconfig because the config
+    // may change the definition of majority.
+    //
+    // On PV downgrade, commit point is probably still from PV1 but will advance to an OpTime with
+    // term -1 once any write gets committed in PV0.
+    _updateLastCommittedOpTime_inlock();
 
     return action;
 }
@@ -2979,29 +2981,6 @@ void ReplicationCoordinatorImpl::_wakeReadyWaiters_inlock() {
         return _doneWaitingForReplication_inlock(
             waiter->opTime, Timestamp(), *waiter->writeConcern);
     });
-}
-
-Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(
-    const OldUpdatePositionArgs& updates, long long* configVersion) {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
-    Status status = Status::OK();
-    bool somethingChanged = false;
-    for (OldUpdatePositionArgs::UpdateIterator update = updates.updatesBegin();
-         update != updates.updatesEnd();
-         ++update) {
-        status = _setLastOptime_inlock(*update, configVersion);
-        if (!status.isOK()) {
-            break;
-        }
-        somethingChanged = true;
-    }
-
-    if (somethingChanged && !_getMemberState_inlock().primary()) {
-        lock.unlock();
-        // Must do this outside _mutex
-        _externalState->forwardSlaveProgress();
-    }
-    return status;
 }
 
 Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(const UpdatePositionArgs& updates,
@@ -3488,12 +3467,6 @@ EventHandle ReplicationCoordinatorImpl::updateTerm_forTest(
 
     EventHandle finishEvh;
     finishEvh = _updateTerm_inlock(term, updateResult);
-    if (!finishEvh) {
-        auto finishEvhStatus = _replExecutor->makeEvent();
-        invariantOK(finishEvhStatus.getStatus());
-        finishEvh = finishEvhStatus.getValue();
-        _replExecutor->signalEvent(finishEvh);
-    }
     return finishEvh;
 }
 
@@ -3552,6 +3525,9 @@ EventHandle ReplicationCoordinatorImpl::_updateTerm_inlock(
     }
 
     if (localUpdateTermResult == TopologyCoordinator::UpdateTermResult::kTriggerStepDown) {
+        if (!_pendingTermUpdateDuringStepDown || *_pendingTermUpdateDuringStepDown < term) {
+            _pendingTermUpdateDuringStepDown = term;
+        }
         if (_topCoord->prepareForUnconditionalStepDown()) {
             log() << "stepping down from primary, because a new term has begun: " << term;
             return _stepDownStart();

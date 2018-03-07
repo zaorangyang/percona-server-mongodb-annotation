@@ -37,6 +37,7 @@
 
 #include "mongo/db/audit.h"
 #include "mongo/db/client.h"
+#include "mongo/db/mongod_options.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/heartbeat_response_action.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -2022,7 +2023,6 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
 }
 
 StatusWith<BSONObj> TopologyCoordinator::prepareReplSetUpdatePositionCommand(
-    ReplicationCoordinator::ReplSetUpdatePositionCommandStyle commandStyle,
     OpTime currentCommittedSnapshotOpTime) const {
     BSONObjBuilder cmdBuilder;
     invariant(_rsConfig.isInitialized());
@@ -2045,33 +2045,19 @@ StatusWith<BSONObj> TopologyCoordinator::prepareReplSetUpdatePositionCommand(
         }
 
         BSONObjBuilder entry(arrayBuilder.subobjStart());
-        switch (commandStyle) {
-            case ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle:
-                memberData.getLastDurableOpTime().append(
-                    &entry, UpdatePositionArgs::kDurableOpTimeFieldName);
-                memberData.getLastAppliedOpTime().append(
-                    &entry, UpdatePositionArgs::kAppliedOpTimeFieldName);
-                break;
-            case ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kOldStyle:
-                entry.append("_id", memberData.getRid());
-                if (_rsConfig.getProtocolVersion() == 1) {
-                    memberData.getLastDurableOpTime().append(&entry, "optime");
-                } else {
-                    entry.append("optime", memberData.getLastDurableOpTime().getTimestamp());
-                }
-                break;
-        }
+        memberData.getLastDurableOpTime().append(&entry,
+                                                 UpdatePositionArgs::kDurableOpTimeFieldName);
+        memberData.getLastAppliedOpTime().append(&entry,
+                                                 UpdatePositionArgs::kAppliedOpTimeFieldName);
         entry.append(UpdatePositionArgs::kMemberIdFieldName, memberData.getMemberId());
         entry.append(UpdatePositionArgs::kConfigVersionFieldName, _rsConfig.getConfigVersion());
     }
     arrayBuilder.done();
 
-    // Add metadata to command. Old style parsing logic will reject the metadata.
-    if (commandStyle == ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle) {
-        prepareReplSetMetadata(currentCommittedSnapshotOpTime)
-            .writeToMetadata(&cmdBuilder)
-            .transitional_ignore();
-    }
+    // Add metadata to command
+    prepareReplSetMetadata(currentCommittedSnapshotOpTime)
+        .writeToMetadata(&cmdBuilder)
+        .transitional_ignore();
     return cmdBuilder.obj();
 }
 
@@ -2637,7 +2623,7 @@ MemberState TopologyCoordinator::getMemberState() const {
     }
 
     if (_rsConfig.isConfigServer()) {
-        if (_options.clusterRole != ClusterRole::ConfigServer) {
+        if (_options.clusterRole != ClusterRole::ConfigServer && !skipShardingConfigurationChecks) {
             return MemberState::RS_REMOVED;
         } else {
             invariant(_storageEngineSupportsReadCommitted != ReadCommittedSupport::kUnknown);
@@ -2646,7 +2632,7 @@ MemberState TopologyCoordinator::getMemberState() const {
             }
         }
     } else {
-        if (_options.clusterRole == ClusterRole::ConfigServer) {
+        if (_options.clusterRole == ClusterRole::ConfigServer && !skipShardingConfigurationChecks) {
             return MemberState::RS_REMOVED;
         }
     }
@@ -2911,6 +2897,10 @@ bool TopologyCoordinator::advanceLastCommittedOpTime(const OpTime& committedOpTi
     return true;
 }
 
+void TopologyCoordinator::resetLastCommittedOpTime() {
+    _lastCommittedOpTime = OpTime();
+}
+
 OpTime TopologyCoordinator::getLastCommittedOpTime() const {
     return _lastCommittedOpTime;
 }
@@ -2922,7 +2912,9 @@ bool TopologyCoordinator::canCompleteTransitionToPrimary(long long termWhenDrain
     }
     // Allow completing the transition to primary even when in the middle of a stepdown attempt,
     // in case the stepdown attempt fails.
-    if (_leaderMode != LeaderMode::kLeaderElect && _leaderMode != LeaderMode::kAttemptingStepDown) {
+    // Allow calling this function even if the node is already primary on PV upgrade.
+    if (_leaderMode != LeaderMode::kLeaderElect && _leaderMode != LeaderMode::kAttemptingStepDown &&
+        _leaderMode != LeaderMode::kMaster) {
         return false;
     }
 

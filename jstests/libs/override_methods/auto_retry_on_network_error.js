@@ -11,6 +11,7 @@
 (function() {
     "use strict";
 
+    load("jstests/libs/override_methods/override_helpers.js");
     load("jstests/libs/retryable_writes_util.js");
 
     const kMaxNumRetries = 3;
@@ -140,6 +141,7 @@
         "profile",       // Not replicated, so can't tolerate failovers.
         "setParameter",  // Not replicated, so can't tolerate failovers.
         "stageDebug",
+        "startSession",  // Sessions are flushed to disk asynchronously.
     ]);
 
     // Several commands that use the plan executor swallow the actual error code from a failed plan
@@ -186,23 +188,38 @@
                 "Refusing to run a test that issues commands that may return different values" +
                 " after a failover, cmdName: " + cmdName);
         } else if (cmdName === "aggregate") {
+            var stages = cmdObj.pipeline;
+
+            // $listLocalCursors and $listLocalSessions must be the first stage in the pipeline.
+            const firstStage =
+                stages && Array.isArray(stages) && (stages.length > 0) ? stages[0] : undefined;
+            const hasListLocalStage = firstStage && (typeof firstStage === "object") &&
+                (firstStage.hasOwnProperty("$listLocalCursors") ||
+                 firstStage.hasOwnProperty("$listLocalSessions"));
+            if (hasListLocalStage) {
+                throw new Error(
+                    "Refusing to run a test that issues an aggregation command with" +
+                    " $listLocalCursors or $listLocalSessions because they rely on in-memory" +
+                    " state that may not survive failovers.");
+            }
+
             // Aggregate can be either a read or a write depending on whether it has a $out stage.
             // $out is required to be the last stage of the pipeline.
-            var stages = cmdObj.pipeline;
             const lastStage = stages && Array.isArray(stages) && (stages.length !== 0)
                 ? stages[stages.length - 1]
                 : undefined;
             const hasOut =
-                lastStage && (typeof lastStage === 'object') && lastStage.hasOwnProperty('$out');
+                lastStage && (typeof lastStage === "object") && lastStage.hasOwnProperty("$out");
+            if (hasOut) {
+                throw new Error("Refusing to run a test that issues an aggregation command" +
+                                " with $out because it is not retryable.");
+            }
+
             const hasExplain = cmdObj.hasOwnProperty("explain");
             if (hasExplain) {
                 throw new Error(
                     "Refusing to run a test that issues an aggregation command with explain" +
                     " because it may return incomplete results if interrupted by a stepdown.");
-            }
-            if (hasOut) {
-                throw new Error("Refusing to run a test that issues an aggregation command" +
-                                " with $out because it is not retryable.");
             }
         } else if (cmdName === "mapReduce" || cmdName === "mapreduce") {
             throw new Error(
@@ -314,20 +331,8 @@
         } while (numRetries >= 0);
     }
 
-    const startParallelShellOriginal = startParallelShell;
-
-    startParallelShell = function(jsCode, port, noConnect) {
-        let newCode;
-        const overridesFile = "jstests/libs/override_methods/auto_retry_on_network_error.js";
-        if (typeof(jsCode) === "function") {
-            // Load the override file and immediately invoke the supplied function.
-            newCode = `load("${overridesFile}"); (${jsCode})();`;
-        } else {
-            newCode = `load("${overridesFile}"); ${jsCode};`;
-        }
-
-        return startParallelShellOriginal(newCode, port, noConnect);
-    };
+    OverrideHelpers.prependOverrideInParallelShell(
+        "jstests/libs/override_methods/auto_retry_on_network_error.js");
 
     const connectOriginal = connect;
 

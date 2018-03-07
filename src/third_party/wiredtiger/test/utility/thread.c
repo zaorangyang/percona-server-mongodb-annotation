@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -226,8 +226,8 @@ op_cursor(void *arg)
 {
 	TEST_OPTS *opts;
 	TEST_PER_THREAD_OPTS *args;
-	WT_SESSION *session;
 	WT_CURSOR *cursor;
+	WT_SESSION *session;
 	int ret;
 
 	args = (TEST_PER_THREAD_OPTS *)arg;
@@ -321,8 +321,8 @@ op_create_unique(void *arg)
 void
 op_drop(void *arg)
 {
-	TEST_PER_THREAD_OPTS *args;
 	TEST_OPTS *opts;
+	TEST_PER_THREAD_OPTS *args;
 	WT_RAND_STATE rnd;
 	WT_SESSION *session;
 	int ret;

@@ -36,6 +36,7 @@
 #include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/migration_chunk_cloner_source_legacy.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/shard_metadata_util.h"
@@ -168,7 +169,7 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                 "cannot move chunks for a collection that doesn't exist",
                 autoColl.getCollection());
 
-        UUID collectionUUID;
+        boost::optional<UUID> collectionUUID;
         if (autoColl.getCollection()->uuid()) {
             collectionUUID = autoColl.getCollection()->uuid().value();
         }
@@ -359,7 +360,7 @@ Status MigrationSourceManager::commitChunkOnRecipient(OperationContext* opCtx) {
     auto scopedGuard = MakeGuard([&] { cleanupOnError(opCtx); });
 
     // Tell the recipient shard to fetch the latest changes.
-    Status commitCloneStatus = _cloneDriver->commitClone(opCtx);
+    auto commitCloneStatus = _cloneDriver->commitClone(opCtx);
 
     if (MONGO_FAIL_POINT(failMigrationCommit) && commitCloneStatus.isOK()) {
         commitCloneStatus = {ErrorCodes::InternalError,
@@ -367,9 +368,10 @@ Status MigrationSourceManager::commitChunkOnRecipient(OperationContext* opCtx) {
     }
 
     if (!commitCloneStatus.isOK()) {
-        return {commitCloneStatus.code(),
-                str::stream() << "commit clone failed due to " << commitCloneStatus.toString()};
+        return commitCloneStatus.getStatus().withContext("commit clone failed");
     }
+
+    _recipientCloneCounts = commitCloneStatus.getValue()["counts"].Obj().getOwned();
 
     _state = kCloneCompleted;
     scopedGuard.Dismiss();
@@ -476,6 +478,25 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
             shutdown(waitForShutdown());
         }
 
+        // If we failed to get the latest config optime because we stepped down as primary, then it
+        // is safe to fail without crashing because the new primary will fetch the latest optime
+        // when it recovers the sharding state recovery document, as long as we also clear the
+        // metadata for this collection, forcing subsequent callers to do a full refresh. Check if
+        // this node can accept writes for this collection as a proxy for it being primary.
+        if (!status.isOK()) {
+            AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_X);
+            if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, getNss())) {
+                CollectionShardingState::get(opCtx, getNss())->refreshMetadata(opCtx, nullptr);
+                uassertStatusOK(status.withContext(
+                    str::stream() << "Unable to verify migration commit for chunk: "
+                                  << redact(_args.toString())
+                                  << " because the node's replication role changed. Metadata "
+                                     "was cleared for: "
+                                  << getNss().ns()
+                                  << ", so it will get a full refresh when accessed again."));
+            }
+        }
+
         fassertStatusOK(
             40137,
             {status.code(),
@@ -555,7 +576,9 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
                     BSON("min" << _args.getMinKey() << "max" << _args.getMaxKey() << "from"
                                << _args.getFromShardId()
                                << "to"
-                               << _args.getToShardId()),
+                               << _args.getToShardId()
+                               << "counts"
+                               << _recipientCloneCounts),
                     ShardingCatalogClient::kMajorityWriteConcern)
         .ignore();
 
@@ -613,7 +636,12 @@ void MigrationSourceManager::cleanupOnError(OperationContext* opCtx) {
                     ShardingCatalogClient::kMajorityWriteConcern)
         .ignore();
 
-    _cleanup(opCtx);
+    try {
+        _cleanup(opCtx);
+    } catch (const ExceptionForCat<ErrorCategory::NotMasterError>& ex) {
+        warning() << "Failed to clean up migration: " << redact(_args.toString())
+                  << "due to: " << redact(ex);
+    }
 }
 
 void MigrationSourceManager::_notifyChangeStreamsOnRecipientFirstChunk(
@@ -675,6 +703,10 @@ void MigrationSourceManager::_cleanup(OperationContext* opCtx) {
     // The cleanup operations below are potentially blocking or acquire other locks, so perform them
     // outside of the collection X lock
 
+    if (cloneDriver) {
+        cloneDriver->cancelClone(opCtx);
+    }
+
     if (_state == kCriticalSection || _state == kCloneCompleted) {
         // NOTE: The order of the operations below is important and the comments explain the
         // reasoning behind it
@@ -693,10 +725,6 @@ void MigrationSourceManager::_cleanup(OperationContext* opCtx) {
         // Clear the 'minOpTime recovery' document so that the next time a node from this shard
         // becomes a primary, it won't have to recover the config server optime.
         ShardingStateRecovery::endMetadataOp(opCtx);
-    }
-
-    if (cloneDriver) {
-        cloneDriver->cancelClone(opCtx);
     }
 
     _state = kDone;

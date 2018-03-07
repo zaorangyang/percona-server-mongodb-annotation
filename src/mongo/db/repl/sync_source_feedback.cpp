@@ -49,11 +49,13 @@ namespace repl {
 
 namespace {
 
+const Milliseconds maximumKeepAliveIntervalMS(30 * 1000);
+
 /**
  * Calculates the keep alive interval based on the given ReplSetConfig.
  */
 Milliseconds calculateKeepAliveInterval(const ReplSetConfig& rsConfig) {
-    return rsConfig.getElectionTimeoutPeriod() / 2;
+    return std::min((rsConfig.getElectionTimeoutPeriod() / 2), maximumKeepAliveIntervalMS);
 }
 
 /**
@@ -61,8 +63,7 @@ Milliseconds calculateKeepAliveInterval(const ReplSetConfig& rsConfig) {
  */
 Reporter::PrepareReplSetUpdatePositionCommandFn makePrepareReplSetUpdatePositionCommandFn(
     ReplicationCoordinator* replCoord, const HostAndPort& syncTarget, BackgroundSync* bgsync) {
-    return [syncTarget, replCoord, bgsync](ReplicationCoordinator::ReplSetUpdatePositionCommandStyle
-                                               commandStyle) -> StatusWith<BSONObj> {
+    return [syncTarget, replCoord, bgsync]() -> StatusWith<BSONObj> {
         auto currentSyncTarget = bgsync->getSyncTarget();
         if (currentSyncTarget != syncTarget) {
             if (currentSyncTarget.empty()) {
@@ -84,7 +85,7 @@ Reporter::PrepareReplSetUpdatePositionCommandFn makePrepareReplSetUpdatePosition
                           "Currently primary - no one to send updates to");
         }
 
-        return replCoord->prepareReplSetUpdatePositionCommand(commandStyle);
+        return replCoord->prepareReplSetUpdatePositionCommand();
     };
 }
 

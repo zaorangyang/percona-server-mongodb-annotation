@@ -41,7 +41,6 @@
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/is_master_response.h"
-#include "mongo/db/repl/old_update_position_args.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -1468,13 +1467,8 @@ TEST_F(ReplCoordTest, NodeChangesTermAndStepsDownWhenAndOnlyWhenUpdateTermSuppli
     // higher term, step down and change term
     executor::TaskExecutor::CallbackHandle cbHandle;
     ASSERT_EQUALS(ErrorCodes::StaleTerm, getReplCoord()->updateTerm(opCtx.get(), 2).code());
-    // Term hasn't been incremented yet, as we need another try to update it after stepdown.
-    ASSERT_EQUALS(1, getReplCoord()->getTerm());
-    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
-
-    // Now update term should actually update the term, as stepdown is complete.
-    ASSERT_EQUALS(ErrorCodes::StaleTerm, getReplCoord()->updateTerm(opCtx.get(), 2).code());
     ASSERT_EQUALS(2, getReplCoord()->getTerm());
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
 }
 
 TEST_F(ReplCoordTest, ConcurrentStepDownShouldNotSignalTheSameFinishEventMoreThanOnce) {
@@ -1513,41 +1507,24 @@ TEST_F(ReplCoordTest, ConcurrentStepDownShouldNotSignalTheSameFinishEventMoreTha
 
     TopologyCoordinator::UpdateTermResult termUpdated2;
     auto updateTermEvh2 = getReplCoord()->updateTerm_forTest(2, &termUpdated2);
+    ASSERT(termUpdated2 == TopologyCoordinator::UpdateTermResult::kTriggerStepDown);
     ASSERT(updateTermEvh2.isValid());
 
     TopologyCoordinator::UpdateTermResult termUpdated3;
     auto updateTermEvh3 = getReplCoord()->updateTerm_forTest(3, &termUpdated3);
-    ASSERT(updateTermEvh3.isValid());
+    ASSERT(termUpdated3 == TopologyCoordinator::UpdateTermResult::kTriggerStepDown);
+    // Although term 3 can trigger stepdown, a stepdown has already been scheduled,
+    // so no other stepdown can be scheduled again. Term 3 will be remembered and
+    // installed once stepdown finishes.
+    ASSERT(!updateTermEvh3.isValid());
 
     // Unblock the tasks for updateTerm and _stepDownFinish.
     globalExclusiveLock.reset();
 
-    // Both _updateTerm_incallback tasks should be scheduled.
+    // Wait stepdown to finish and term 3 to be installed.
     replExec->waitForEvent(updateTermEvh2);
-    ASSERT(termUpdated2 == TopologyCoordinator::UpdateTermResult::kTriggerStepDown);
-
-    replExec->waitForEvent(updateTermEvh3);
-    if (termUpdated3 == TopologyCoordinator::UpdateTermResult::kTriggerStepDown) {
-        // Term hasn't updated yet.
-        ASSERT_EQUALS(1, getReplCoord()->getTerm());
-
-        // Update term event handles will wait for potential stepdown.
-        ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
-
-        TopologyCoordinator::UpdateTermResult termUpdated4;
-        auto updateTermEvh4 = getReplCoord()->updateTerm_forTest(3, &termUpdated4);
-        ASSERT(updateTermEvh4.isValid());
-        replExec->waitForEvent(updateTermEvh4);
-        ASSERT(termUpdated4 == TopologyCoordinator::UpdateTermResult::kUpdatedTerm);
-        ASSERT_EQUALS(3, getReplCoord()->getTerm());
-    } else {
-        // Term already updated.
-        ASSERT(termUpdated3 == TopologyCoordinator::UpdateTermResult::kUpdatedTerm);
-        ASSERT_EQUALS(3, getReplCoord()->getTerm());
-
-        // Update term event handles will wait for potential stepdown.
-        ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
-    }
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+    ASSERT_EQUALS(3, getReplCoord()->getTerm());
 }
 
 TEST_F(ReplCoordTest, DrainCompletionMidStepDown) {
@@ -2270,8 +2247,7 @@ TEST_F(ReplCoordTest, NodeIncludesOtherMembersProgressInUpdatePositionCommand) {
     ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(1, 3, optime1));
 
     // Check that the proper BSON is generated for the replSetUpdatePositionCommand
-    BSONObj cmd = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
-        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle));
+    BSONObj cmd = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand());
 
     ASSERT_EQUALS(3, cmd.nFields());
     ASSERT_EQUALS(UpdatePositionArgs::kCommandFieldName, cmd.firstElement().fieldNameStringData());
@@ -2319,60 +2295,6 @@ TEST_F(ReplCoordTest, NodeIncludesOtherMembersProgressInUpdatePositionCommand) {
         }
     }
     ASSERT_EQUALS(4U, memberIds.size());  // Make sure we saw all 4 nodes
-}
-
-TEST_F(ReplCoordTest, NodeIncludesOtherMembersProgressInOldUpdatePositionCommand) {
-    init("mySet/test1:1234,test2:1234,test3:1234");
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version"
-                            << 1
-                            << "members"
-                            << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                     << "test1:1234")
-                                          << BSON("_id" << 1 << "host"
-                                                        << "test2:1234")
-                                          << BSON("_id" << 2 << "host"
-                                                        << "test3:1234"))),
-                       HostAndPort("test1", 1234));
-    OpTimeWithTermOne optime1(100, 1);
-    OpTimeWithTermOne optime2(100, 2);
-    OpTimeWithTermOne optime3(2, 1);
-    getReplCoord()->setMyLastAppliedOpTime(optime1);
-    getReplCoord()->setMyLastDurableOpTime(optime1);
-    ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(1, 1, optime2));
-    ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(1, 1, optime2));
-    ASSERT_OK(getReplCoord()->setLastAppliedOptime_forTest(1, 2, optime3));
-    ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(1, 2, optime3));
-
-    // Check that the proper BSON is generated for the replSetUpdatePositionCommand
-    BSONObj cmd = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
-        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kOldStyle));
-
-    ASSERT_EQUALS(2, cmd.nFields());
-    ASSERT_EQUALS(OldUpdatePositionArgs::kCommandFieldName,
-                  cmd.firstElement().fieldNameStringData());
-
-    std::set<long long> memberIds;
-    BSONForEach(entryElement, cmd[OldUpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
-        BSONObj entry = entryElement.Obj();
-        long long memberId = entry[OldUpdatePositionArgs::kMemberIdFieldName].Number();
-        memberIds.insert(memberId);
-        if (memberId == 0) {
-            // TODO(siyuan) Update when we change replSetUpdatePosition format
-            ASSERT_EQUALS(optime1.timestamp,
-                          entry[OldUpdatePositionArgs::kOpTimeFieldName]["ts"].timestamp());
-        } else if (memberId == 1) {
-            ASSERT_EQUALS(optime2.timestamp,
-                          entry[OldUpdatePositionArgs::kOpTimeFieldName]["ts"].timestamp());
-        } else {
-            ASSERT_EQUALS(2, memberId);
-            ASSERT_EQUALS(optime3.timestamp,
-                          entry[OldUpdatePositionArgs::kOpTimeFieldName]["ts"].timestamp());
-        }
-        ASSERT_EQUALS(1, entry[OldUpdatePositionArgs::kOpTimeFieldName]["t"].Number());
-    }
-    ASSERT_EQUALS(3U, memberIds.size());  // Make sure we saw all 3 nodes
 }
 
 TEST_F(ReplCoordTest,
@@ -2947,63 +2869,6 @@ TEST_F(ReplCoordTest, DoNotProcessSelfWhenUpdatePositionContainsInfoAboutSelf) {
                   getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
 }
 
-TEST_F(ReplCoordTest, DoNotProcessSelfWhenOldUpdatePositionContainsInfoAboutSelf) {
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version"
-                            << 2
-                            << "members"
-                            << BSON_ARRAY(BSON("host"
-                                               << "node1:12345"
-                                               << "_id"
-                                               << 0)
-                                          << BSON("host"
-                                                  << "node2:12345"
-                                                  << "_id"
-                                                  << 1)
-                                          << BSON("host"
-                                                  << "node3:12345"
-                                                  << "_id"
-                                                  << 2))),
-                       HostAndPort("node1", 12345));
-    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    getReplCoord()->setMyLastAppliedOpTime(OpTimeWithTermOne(100, 0));
-    getReplCoord()->setMyLastDurableOpTime(OpTimeWithTermOne(100, 0));
-    simulateSuccessfulV1Election();
-
-    OpTimeWithTermOne time1(100, 1);
-    OpTimeWithTermOne time2(100, 2);
-    OpTimeWithTermOne staleTime(10, 0);
-    getReplCoord()->setMyLastAppliedOpTime(time1);
-    getReplCoord()->setMyLastDurableOpTime(time1);
-
-    WriteConcernOptions writeConcern;
-    writeConcern.wTimeout = WriteConcernOptions::kNoWaiting;
-    writeConcern.wNumNodes = 1;
-
-    auto opCtx = makeOperationContext();
-
-
-    ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
-                  getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
-
-    // receive updatePosition containing ourself, should not process the update for self
-    OldUpdatePositionArgs args;
-    ASSERT_OK(args.initialize(BSON(OldUpdatePositionArgs::kCommandFieldName
-                                   << 1
-                                   << OldUpdatePositionArgs::kUpdateArrayFieldName
-                                   << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                      << 2
-                                                      << OldUpdatePositionArgs::kMemberIdFieldName
-                                                      << 0
-                                                      << OldUpdatePositionArgs::kOpTimeFieldName
-                                                      << time2.timestamp)))));
-
-    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, 0));
-    ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
-                  getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
-}
-
 TEST_F(ReplCoordTest, DoNotProcessUpdatePositionWhenItsConfigVersionIsIncorrect) {
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3050,62 +2915,6 @@ TEST_F(ReplCoordTest, DoNotProcessUpdatePositionWhenItsConfigVersionIsIncorrect)
                                                       << time2.toBSON()
                                                       << UpdatePositionArgs::kAppliedOpTimeFieldName
                                                       << time2.toBSON())))));
-
-    auto opCtx = makeOperationContext();
-
-
-    long long cfgver;
-    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
-                  getReplCoord()->processReplSetUpdatePosition(args, &cfgver));
-    ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
-                  getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
-}
-
-TEST_F(ReplCoordTest, DoNotProcessOldUpdatePositionWhenItsConfigVersionIsIncorrect) {
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version"
-                            << 2
-                            << "members"
-                            << BSON_ARRAY(BSON("host"
-                                               << "node1:12345"
-                                               << "_id"
-                                               << 0)
-                                          << BSON("host"
-                                                  << "node2:12345"
-                                                  << "_id"
-                                                  << 1)
-                                          << BSON("host"
-                                                  << "node3:12345"
-                                                  << "_id"
-                                                  << 2))),
-                       HostAndPort("node1", 12345));
-    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    getReplCoord()->setMyLastAppliedOpTime(OpTimeWithTermOne(100, 0));
-    getReplCoord()->setMyLastDurableOpTime(OpTimeWithTermOne(100, 0));
-    simulateSuccessfulV1Election();
-
-    OpTimeWithTermOne time1(100, 1);
-    OpTimeWithTermOne time2(100, 2);
-    OpTimeWithTermOne staleTime(10, 0);
-    getReplCoord()->setMyLastAppliedOpTime(time1);
-    getReplCoord()->setMyLastDurableOpTime(time1);
-
-    WriteConcernOptions writeConcern;
-    writeConcern.wTimeout = WriteConcernOptions::kNoWaiting;
-    writeConcern.wNumNodes = 1;
-
-    // receive updatePosition with incorrect config version
-    OldUpdatePositionArgs args;
-    ASSERT_OK(args.initialize(BSON(OldUpdatePositionArgs::kCommandFieldName
-                                   << 1
-                                   << OldUpdatePositionArgs::kUpdateArrayFieldName
-                                   << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                      << 3
-                                                      << OldUpdatePositionArgs::kMemberIdFieldName
-                                                      << 1
-                                                      << OldUpdatePositionArgs::kOpTimeFieldName
-                                                      << time2.timestamp)))));
 
     auto opCtx = makeOperationContext();
 
@@ -3172,60 +2981,6 @@ TEST_F(ReplCoordTest, DoNotProcessUpdatePositionOfMembersWhoseIdsAreNotInTheConf
                   getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
 }
 
-TEST_F(ReplCoordTest, DoNotProcessOldUpdatePositionOfMembersWhoseIdsAreNotInTheConfig) {
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version"
-                            << 2
-                            << "members"
-                            << BSON_ARRAY(BSON("host"
-                                               << "node1:12345"
-                                               << "_id"
-                                               << 0)
-                                          << BSON("host"
-                                                  << "node2:12345"
-                                                  << "_id"
-                                                  << 1)
-                                          << BSON("host"
-                                                  << "node3:12345"
-                                                  << "_id"
-                                                  << 2))),
-                       HostAndPort("node1", 12345));
-    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-    getReplCoord()->setMyLastAppliedOpTime(OpTimeWithTermOne(100, 0));
-    getReplCoord()->setMyLastDurableOpTime(OpTimeWithTermOne(100, 0));
-    simulateSuccessfulV1Election();
-
-    OpTimeWithTermOne time1(100, 1);
-    OpTimeWithTermOne time2(100, 2);
-    OpTimeWithTermOne staleTime(10, 0);
-    getReplCoord()->setMyLastAppliedOpTime(time1);
-    getReplCoord()->setMyLastDurableOpTime(time1);
-
-    WriteConcernOptions writeConcern;
-    writeConcern.wTimeout = WriteConcernOptions::kNoWaiting;
-    writeConcern.wNumNodes = 1;
-
-    // receive updatePosition with nonexistent member id
-    OldUpdatePositionArgs args;
-    ASSERT_OK(args.initialize(BSON(OldUpdatePositionArgs::kCommandFieldName
-                                   << 1
-                                   << OldUpdatePositionArgs::kUpdateArrayFieldName
-                                   << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                      << 2
-                                                      << OldUpdatePositionArgs::kMemberIdFieldName
-                                                      << 9
-                                                      << OldUpdatePositionArgs::kOpTimeFieldName
-                                                      << time2.timestamp)))));
-
-    auto opCtx = makeOperationContext();
-
-
-    ASSERT_EQUALS(ErrorCodes::NodeNotFound, getReplCoord()->processReplSetUpdatePosition(args, 0));
-    ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
-                  getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
-}
-
 TEST_F(ReplCoordTest,
        ProcessUpdateWhenUpdatePositionContainsOnlyConfigVersionAndMemberIdsWithoutRIDs) {
     assertStartSuccess(BSON("_id"
@@ -3264,23 +3019,27 @@ TEST_F(ReplCoordTest,
     // receive a good update position
     getReplCoord()->setMyLastAppliedOpTime(time2);
     getReplCoord()->setMyLastDurableOpTime(time2);
-    OldUpdatePositionArgs args;
+    UpdatePositionArgs args;
     ASSERT_OK(
-        args.initialize(BSON(OldUpdatePositionArgs::kCommandFieldName
+        args.initialize(BSON(UpdatePositionArgs::kCommandFieldName
                              << 1
-                             << OldUpdatePositionArgs::kUpdateArrayFieldName
-                             << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                             << UpdatePositionArgs::kUpdateArrayFieldName
+                             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
                                                 << 2
-                                                << OldUpdatePositionArgs::kMemberIdFieldName
+                                                << UpdatePositionArgs::kMemberIdFieldName
                                                 << 1
-                                                << OldUpdatePositionArgs::kOpTimeFieldName
-                                                << time2.timestamp)
-                                           << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                                << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                                << time2.asOpTime().toBSON()
+                                                << UpdatePositionArgs::kDurableOpTimeFieldName
+                                                << time2.asOpTime().toBSON())
+                                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
                                                    << 2
-                                                   << OldUpdatePositionArgs::kMemberIdFieldName
+                                                   << UpdatePositionArgs::kMemberIdFieldName
                                                    << 2
-                                                   << OldUpdatePositionArgs::kOpTimeFieldName
-                                                   << time2.timestamp)))));
+                                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                                   << time2.asOpTime().toBSON()
+                                                   << UpdatePositionArgs::kDurableOpTimeFieldName
+                                                   << time2.asOpTime().toBSON())))));
 
     auto opCtx = makeOperationContext();
 
@@ -5198,8 +4957,7 @@ TEST_F(ReplCoordTest, OnlyForwardSyncProgressForOtherNodesWhenTheNodesAreBelieve
     ASSERT_OK(getReplCoord()->setLastDurableOptime_forTest(1, 1, optime));
 
     // Check that we have two entries in our UpdatePosition (us and node 1).
-    BSONObj cmd = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
-        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle));
+    BSONObj cmd = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand());
     std::set<long long> memberIds;
     BSONForEach(entryElement, cmd[UpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
         BSONObj entry = entryElement.Obj();
@@ -5216,21 +4974,6 @@ TEST_F(ReplCoordTest, OnlyForwardSyncProgressForOtherNodesWhenTheNodesAreBelieve
     }
     ASSERT_EQUALS(2U, memberIds.size());
 
-    // Check that this true for old style (pre-3.2.4) UpdatePosition as well.
-    BSONObj cmd2 = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
-        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kOldStyle));
-    std::set<long long> memberIds2;
-    BSONForEach(entryElement, cmd2[OldUpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
-        BSONObj entry = entryElement.Obj();
-        long long memberId = entry[OldUpdatePositionArgs::kMemberIdFieldName].Number();
-        memberIds2.insert(memberId);
-        OpTime entryOpTime;
-        bsonExtractOpTimeField(entry, OldUpdatePositionArgs::kOpTimeFieldName, &entryOpTime)
-            .transitional_ignore();
-        ASSERT_EQUALS(optime, entryOpTime);
-    }
-    ASSERT_EQUALS(2U, memberIds2.size());
-
     // Advance the clock far enough to cause the other node to be marked as DOWN.
     const Date_t startDate = getNet()->now();
     const Date_t endDate = startDate + Milliseconds(2000);
@@ -5245,13 +4988,12 @@ TEST_F(ReplCoordTest, OnlyForwardSyncProgressForOtherNodesWhenTheNodesAreBelieve
 
     // Check there is one entry in our UpdatePosition, since we shouldn't forward for a
     // DOWN node.
-    BSONObj cmd3 = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
-        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle));
-    std::set<long long> memberIds3;
-    BSONForEach(entryElement, cmd3[UpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
+    BSONObj cmd2 = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand());
+    std::set<long long> memberIds2;
+    BSONForEach(entryElement, cmd2[UpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
         BSONObj entry = entryElement.Obj();
         long long memberId = entry[UpdatePositionArgs::kMemberIdFieldName].Number();
-        memberIds3.insert(memberId);
+        memberIds2.insert(memberId);
         OpTime appliedOpTime;
         OpTime durableOpTime;
         bsonExtractOpTimeField(entry, UpdatePositionArgs::kAppliedOpTimeFieldName, &appliedOpTime)
@@ -5261,25 +5003,10 @@ TEST_F(ReplCoordTest, OnlyForwardSyncProgressForOtherNodesWhenTheNodesAreBelieve
             .transitional_ignore();
         ASSERT_EQUALS(optime, durableOpTime);
     }
-    ASSERT_EQUALS(1U, memberIds3.size());
-
-    // Check that this true for old style (pre-3.2.4) UpdatePosition as well.
-    BSONObj cmd4 = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
-        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kOldStyle));
-    std::set<long long> memberIds4;
-    BSONForEach(entryElement, cmd4[OldUpdatePositionArgs::kUpdateArrayFieldName].Obj()) {
-        BSONObj entry = entryElement.Obj();
-        long long memberId = entry[OldUpdatePositionArgs::kMemberIdFieldName].Number();
-        memberIds4.insert(memberId);
-        OpTime entryOpTime;
-        bsonExtractOpTimeField(entry, OldUpdatePositionArgs::kOpTimeFieldName, &entryOpTime)
-            .transitional_ignore();
-        ASSERT_EQUALS(optime, entryOpTime);
-    }
-    ASSERT_EQUALS(1U, memberIds4.size());
+    ASSERT_EQUALS(1U, memberIds2.size());
 }
 
-TEST_F(ReplCoordTest, NewStyleUpdatePositionCmdHasMetadata) {
+TEST_F(ReplCoordTest, UpdatePositionCmdHasMetadata) {
     assertStartSuccess(
         BSON("_id"
              << "mySet"
@@ -5307,8 +5034,7 @@ TEST_F(ReplCoordTest, NewStyleUpdatePositionCmdHasMetadata) {
     getReplCoord()->processReplSetMetadata(syncSourceMetadata);
     getReplCoord()->advanceCommitPoint(optime);
 
-    BSONObj cmd = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand(
-        ReplicationCoordinator::ReplSetUpdatePositionCommandStyle::kNewStyle));
+    BSONObj cmd = unittest::assertGet(getReplCoord()->prepareReplSetUpdatePositionCommand());
     auto metadata = unittest::assertGet(rpc::ReplSetMetadata::readFromMetadata(cmd));
     ASSERT_EQUALS(metadata.getTerm(), getReplCoord()->getTerm());
     ASSERT_EQUALS(metadata.getLastOpVisible(), optime);
@@ -5355,58 +5081,70 @@ TEST_F(ReplCoordTest, StepDownWhenHandleLivenessTimeoutMarksAMajorityOfVotingNod
     getReplCoord()->setMyLastDurableOpTime(startingOpTime);
 
     // Receive notification that every node is up.
-    OldUpdatePositionArgs args;
+    UpdatePositionArgs args;
     ASSERT_OK(
-        args.initialize(BSON(OldUpdatePositionArgs::kCommandFieldName
+        args.initialize(BSON(UpdatePositionArgs::kCommandFieldName
                              << 1
-                             << OldUpdatePositionArgs::kUpdateArrayFieldName
-                             << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                             << UpdatePositionArgs::kUpdateArrayFieldName
+                             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
                                                 << 2
-                                                << OldUpdatePositionArgs::kMemberIdFieldName
+                                                << UpdatePositionArgs::kMemberIdFieldName
                                                 << 1
-                                                << OldUpdatePositionArgs::kOpTimeFieldName
-                                                << startingOpTime.getTimestamp())
-                                           << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                                << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                                << startingOpTime.toBSON()
+                                                << UpdatePositionArgs::kDurableOpTimeFieldName
+                                                << startingOpTime.toBSON())
+                                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
                                                    << 2
-                                                   << OldUpdatePositionArgs::kMemberIdFieldName
+                                                   << UpdatePositionArgs::kMemberIdFieldName
                                                    << 2
-                                                   << OldUpdatePositionArgs::kOpTimeFieldName
-                                                   << startingOpTime.getTimestamp())
-                                           << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                                   << startingOpTime.toBSON()
+                                                   << UpdatePositionArgs::kDurableOpTimeFieldName
+                                                   << startingOpTime.toBSON())
+                                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
                                                    << 2
-                                                   << OldUpdatePositionArgs::kMemberIdFieldName
+                                                   << UpdatePositionArgs::kMemberIdFieldName
                                                    << 3
-                                                   << OldUpdatePositionArgs::kOpTimeFieldName
-                                                   << startingOpTime.getTimestamp())
-                                           << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                                   << startingOpTime.toBSON()
+                                                   << UpdatePositionArgs::kDurableOpTimeFieldName
+                                                   << startingOpTime.toBSON())
+                                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
                                                    << 2
-                                                   << OldUpdatePositionArgs::kMemberIdFieldName
+                                                   << UpdatePositionArgs::kMemberIdFieldName
                                                    << 4
-                                                   << OldUpdatePositionArgs::kOpTimeFieldName
-                                                   << startingOpTime.getTimestamp())))));
+                                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                                   << startingOpTime.toBSON()
+                                                   << UpdatePositionArgs::kDurableOpTimeFieldName
+                                                   << startingOpTime.toBSON())))));
 
     ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, 0));
     // Become PRIMARY.
     simulateSuccessfulV1Election();
 
     // Keep two nodes alive.
-    OldUpdatePositionArgs args1;
+    UpdatePositionArgs args1;
     ASSERT_OK(
-        args1.initialize(BSON(OldUpdatePositionArgs::kCommandFieldName
+        args1.initialize(BSON(UpdatePositionArgs::kCommandFieldName
                               << 1
-                              << OldUpdatePositionArgs::kUpdateArrayFieldName
-                              << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                              << UpdatePositionArgs::kUpdateArrayFieldName
+                              << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
                                                  << 2
-                                                 << OldUpdatePositionArgs::kMemberIdFieldName
+                                                 << UpdatePositionArgs::kMemberIdFieldName
                                                  << 1
-                                                 << OldUpdatePositionArgs::kOpTimeFieldName
-                                                 << startingOpTime.getTimestamp())
-                                            << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                                                 << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                                 << startingOpTime.toBSON()
+                                                 << UpdatePositionArgs::kDurableOpTimeFieldName
+                                                 << startingOpTime.toBSON())
+                                            << BSON(UpdatePositionArgs::kConfigVersionFieldName
                                                     << 2
-                                                    << OldUpdatePositionArgs::kMemberIdFieldName
+                                                    << UpdatePositionArgs::kMemberIdFieldName
                                                     << 2
-                                                    << OldUpdatePositionArgs::kOpTimeFieldName
-                                                    << startingOpTime.getTimestamp())))));
+                                                    << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                                    << startingOpTime.toBSON()
+                                                    << UpdatePositionArgs::kDurableOpTimeFieldName
+                                                    << startingOpTime.toBSON())))));
     ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args1, 0));
 
     // Confirm that the node remains PRIMARY after the other two nodes are marked DOWN.
@@ -5417,17 +5155,19 @@ TEST_F(ReplCoordTest, StepDownWhenHandleLivenessTimeoutMarksAMajorityOfVotingNod
     ASSERT_EQUALS(MemberState::RS_PRIMARY, getReplCoord()->getMemberState().s);
 
     // Keep one node alive via two methods (UpdatePosition and requestHeartbeat).
-    OldUpdatePositionArgs args2;
+    UpdatePositionArgs args2;
     ASSERT_OK(
-        args2.initialize(BSON(OldUpdatePositionArgs::kCommandFieldName
+        args2.initialize(BSON(UpdatePositionArgs::kCommandFieldName
                               << 1
-                              << OldUpdatePositionArgs::kUpdateArrayFieldName
-                              << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
+                              << UpdatePositionArgs::kUpdateArrayFieldName
+                              << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
                                                  << 2
-                                                 << OldUpdatePositionArgs::kMemberIdFieldName
+                                                 << UpdatePositionArgs::kMemberIdFieldName
                                                  << 1
-                                                 << OldUpdatePositionArgs::kOpTimeFieldName
-                                                 << startingOpTime.getTimestamp())))));
+                                                 << UpdatePositionArgs::kDurableOpTimeFieldName
+                                                 << startingOpTime.toBSON()
+                                                 << UpdatePositionArgs::kAppliedOpTimeFieldName
+                                                 << startingOpTime.toBSON())))));
     ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args2, 0));
 
     ReplSetHeartbeatArgsV1 hbArgs;
@@ -5528,150 +5268,6 @@ TEST_F(ReplCoordTest, WaitForDrainFinish) {
 
     // Zero timeout is fine.
     ASSERT_OK(replCoord->waitForDrainFinish(Milliseconds(0)));
-}
-
-TEST_F(ReplCoordTest, UpdatePositionArgsReturnsNoSuchKeyWhenParsingOldUpdatePositionArgs) {
-    OldUpdatePositionArgs args;
-    UpdatePositionArgs args2;
-    OpTime opTime = OpTime(Timestamp(100, 1), 0);
-    ASSERT_EQUALS(
-        ErrorCodes::NoSuchKey,
-        args2.initialize(BSON(OldUpdatePositionArgs::kCommandFieldName
-                              << 1
-                              << OldUpdatePositionArgs::kUpdateArrayFieldName
-                              << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                 << 2
-                                                 << OldUpdatePositionArgs::kMemberIdFieldName
-                                                 << 1
-                                                 << OldUpdatePositionArgs::kOpTimeFieldName
-                                                 << opTime.getTimestamp())
-                                            << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                    << 2
-                                                    << OldUpdatePositionArgs::kMemberIdFieldName
-                                                    << 2
-                                                    << OldUpdatePositionArgs::kOpTimeFieldName
-                                                    << opTime.getTimestamp())
-                                            << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                    << 2
-                                                    << OldUpdatePositionArgs::kMemberIdFieldName
-                                                    << 3
-                                                    << OldUpdatePositionArgs::kOpTimeFieldName
-                                                    << opTime.getTimestamp())
-                                            << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                    << 2
-                                                    << OldUpdatePositionArgs::kMemberIdFieldName
-                                                    << 4
-                                                    << OldUpdatePositionArgs::kOpTimeFieldName
-                                                    << opTime.getTimestamp())))));
-
-    ASSERT_OK(
-        args.initialize(BSON(OldUpdatePositionArgs::kCommandFieldName
-                             << 1
-                             << OldUpdatePositionArgs::kUpdateArrayFieldName
-                             << BSON_ARRAY(BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                << 2
-                                                << OldUpdatePositionArgs::kMemberIdFieldName
-                                                << 1
-                                                << OldUpdatePositionArgs::kOpTimeFieldName
-                                                << opTime.getTimestamp())
-                                           << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                   << 2
-                                                   << OldUpdatePositionArgs::kMemberIdFieldName
-                                                   << 2
-                                                   << OldUpdatePositionArgs::kOpTimeFieldName
-                                                   << opTime.getTimestamp())
-                                           << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                   << 2
-                                                   << OldUpdatePositionArgs::kMemberIdFieldName
-                                                   << 3
-                                                   << OldUpdatePositionArgs::kOpTimeFieldName
-                                                   << opTime.getTimestamp())
-                                           << BSON(OldUpdatePositionArgs::kConfigVersionFieldName
-                                                   << 2
-                                                   << OldUpdatePositionArgs::kMemberIdFieldName
-                                                   << 4
-                                                   << OldUpdatePositionArgs::kOpTimeFieldName
-                                                   << opTime.getTimestamp())))));
-}
-
-
-TEST_F(ReplCoordTest, OldUpdatePositionArgsReturnsBadValueWhenParsingUpdatePositionArgs) {
-    OldUpdatePositionArgs args;
-    UpdatePositionArgs args2;
-    OpTime opTime = OpTime(Timestamp(100, 1), 0);
-    ASSERT_EQUALS(ErrorCodes::BadValue,
-                  args.initialize(BSON(
-                      UpdatePositionArgs::kCommandFieldName
-                      << 1
-                      << UpdatePositionArgs::kUpdateArrayFieldName
-                      << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
-                                         << 2
-                                         << UpdatePositionArgs::kMemberIdFieldName
-                                         << 1
-                                         << UpdatePositionArgs::kDurableOpTimeFieldName
-                                         << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                         << UpdatePositionArgs::kAppliedOpTimeFieldName
-                                         << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                                    << BSON(UpdatePositionArgs::kConfigVersionFieldName
-                                            << 2
-                                            << UpdatePositionArgs::kMemberIdFieldName
-                                            << 2
-                                            << UpdatePositionArgs::kDurableOpTimeFieldName
-                                            << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                            << UpdatePositionArgs::kAppliedOpTimeFieldName
-                                            << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                                    << BSON(UpdatePositionArgs::kConfigVersionFieldName
-                                            << 2
-                                            << UpdatePositionArgs::kMemberIdFieldName
-                                            << 3
-                                            << UpdatePositionArgs::kDurableOpTimeFieldName
-                                            << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                            << UpdatePositionArgs::kAppliedOpTimeFieldName
-                                            << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                                    << BSON(UpdatePositionArgs::kConfigVersionFieldName
-                                            << 2
-                                            << UpdatePositionArgs::kMemberIdFieldName
-                                            << 4
-                                            << UpdatePositionArgs::kDurableOpTimeFieldName
-                                            << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                            << UpdatePositionArgs::kAppliedOpTimeFieldName
-                                            << BSON("ts" << opTime.getTimestamp() << "t" << 3))))));
-    ASSERT_OK(args2.initialize(
-        BSON(UpdatePositionArgs::kCommandFieldName
-             << 1
-             << UpdatePositionArgs::kUpdateArrayFieldName
-             << BSON_ARRAY(BSON(UpdatePositionArgs::kConfigVersionFieldName
-                                << 2
-                                << UpdatePositionArgs::kMemberIdFieldName
-                                << 1
-                                << UpdatePositionArgs::kDurableOpTimeFieldName
-                                << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                << UpdatePositionArgs::kAppliedOpTimeFieldName
-                                << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
-                                   << 2
-                                   << UpdatePositionArgs::kMemberIdFieldName
-                                   << 2
-                                   << UpdatePositionArgs::kDurableOpTimeFieldName
-                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
-                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
-                                   << 2
-                                   << UpdatePositionArgs::kMemberIdFieldName
-                                   << 3
-                                   << UpdatePositionArgs::kDurableOpTimeFieldName
-                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
-                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3))
-                           << BSON(UpdatePositionArgs::kConfigVersionFieldName
-                                   << 2
-                                   << UpdatePositionArgs::kMemberIdFieldName
-                                   << 4
-                                   << UpdatePositionArgs::kDurableOpTimeFieldName
-                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3)
-                                   << UpdatePositionArgs::kAppliedOpTimeFieldName
-                                   << BSON("ts" << opTime.getTimestamp() << "t" << 3))))));
 }
 
 TEST_F(

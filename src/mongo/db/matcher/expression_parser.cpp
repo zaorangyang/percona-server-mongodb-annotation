@@ -43,6 +43,7 @@
 #include "mongo/db/matcher/expression_array.h"
 #include "mongo/db/matcher/expression_expr.h"
 #include "mongo/db/matcher/expression_geo.h"
+#include "mongo/db/matcher/expression_internal_expr_eq.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
 #include "mongo/db/matcher/expression_type.h"
@@ -1502,6 +1503,8 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
                                         const ExtensionsCallback* extensionsCallback,
                                         MatchExpressionParser::AllowedFeatureSet allowedFeatures,
                                         DocumentParseLevel currentLevel) {
+    invariant(e);
+
     if ("$eq"_sd == e.fieldNameStringData()) {
         return parseComparison(name, new EqualityMatchExpression(), e, expCtx, allowedFeatures);
     }
@@ -1665,6 +1668,22 @@ StatusWithMatchExpression parseSubField(const BSONObj& context,
             return {Status(ErrorCodes::BadValue,
                            str::stream() << "near must be first in: " << context)};
 
+        case PathAcceptingKeyword::INTERNAL_EXPR_EQ: {
+            if (e.type() == BSONType::Undefined || e.type() == BSONType::Array) {
+                return {Status(ErrorCodes::BadValue,
+                               str::stream() << InternalExprEqMatchExpression::kName
+                                             << " cannot be used to compare to type: "
+                                             << typeName(e.type()))};
+            }
+
+            auto exprEqExpr = stdx::make_unique<InternalExprEqMatchExpression>();
+            auto status = exprEqExpr->init(name, e);
+            if (!status.isOK()) {
+                return status;
+            }
+            exprEqExpr->setCollator(expCtx->getCollator());
+            return {std::move(exprEqExpr)};
+        }
 
         // Handles bitwise query operators.
         case PathAcceptingKeyword::BITS_ALL_SET: {
@@ -1966,6 +1985,7 @@ MONGO_INITIALIZER(MatchExpressionParser)(InitializerContext* context) {
     queryOperatorMap =
         stdx::make_unique<StringMap<PathAcceptingKeyword>>(StringMap<PathAcceptingKeyword>{
             // TODO: SERVER-19565 Add $eq after auditing callers.
+            {"_internalExprEq", PathAcceptingKeyword::INTERNAL_EXPR_EQ},
             {"_internalSchemaAllElemMatchFromIndex",
              PathAcceptingKeyword::INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX},
             {"_internalSchemaEq", PathAcceptingKeyword::INTERNAL_SCHEMA_EQ},
