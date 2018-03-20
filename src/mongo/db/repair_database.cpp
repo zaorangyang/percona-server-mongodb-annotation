@@ -49,6 +49,7 @@
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/namespace_uuid_cache.h"
 #include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_engine.h"
@@ -57,6 +58,13 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+namespace {
+
+const auto kMsgObj = BSON("msg"
+                          << "noop to force sync replication state after repairDatabase");
+
+}  // namespace
 
 using std::endl;
 using std::string;
@@ -271,6 +279,21 @@ Status repairDatabase(OperationContext* opCtx,
             // Open the db after everything finishes.
             auto db = dbHolder().openDb(opCtx, dbName);
 
+            // Restore oplog Collection pointer cache.
+            repl::acquireOplogCollectionForLogging(opCtx);
+
+            // Write Noop into the oplog just to increment timestamp value returned by following call
+            // to reserveSnapshotName. Thus setMinimumVisibleSnapshot will be guaranteed to record value
+            // that is greater than current majority committed snapshot.
+            repl::ReplicatedWritesBlock rwb(opCtx);
+            writeConflictRetry(
+                opCtx, "writeNoop", NamespaceString::kRsOplogNamespace.ns(), [&opCtx] {
+                    WriteUnitOfWork uow(opCtx);
+                    opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(opCtx,
+                                                                                          kMsgObj);
+                    uow.commit();
+                });
+
             // Set the minimum snapshot for all Collections in this db. This ensures that readers
             // using majority readConcern level can only use the collections after their repaired
             // versions are in the committed view.
@@ -280,9 +303,6 @@ Status repairDatabase(OperationContext* opCtx,
             for (auto&& collection : *db) {
                 collection->setMinimumVisibleSnapshot(snapshotName);
             }
-
-            // Restore oplog Collection pointer cache.
-            repl::acquireOplogCollectionForLogging(opCtx);
         } catch (...) {
             severe() << "Unexpected exception encountered while reopening database after repair.";
             std::terminate();  // Logs additional info about the specific error.
