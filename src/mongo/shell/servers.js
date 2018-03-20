@@ -1126,6 +1126,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                             argArray.push(...['--rocksdbCacheSizeGB',
                                               jsTest.options().storageEngineCacheSizeGB]);
                         }
+                        argArray.push(...['--useDeprecatedMongoRocks']);
                     }
                     // apply setParameters for mongod
                     if (jsTest.options().setParameters) {

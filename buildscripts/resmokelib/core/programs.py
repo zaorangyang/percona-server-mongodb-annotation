@@ -73,11 +73,12 @@ def mongod_program(logger, executable=None, process_kwargs=None, **kwargs):
 
     if config.STORAGE_ENGINE == "rocksdb":
         shortcut_opts["rocksdbCacheSizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
+        shortcut_opts["useDeprecatedMongoRocks"] = True
     elif config.STORAGE_ENGINE == "wiredTiger" or config.STORAGE_ENGINE is None:
         shortcut_opts["wiredTigerCacheSizeGB"] = config.STORAGE_ENGINE_CACHE_SIZE
 
     # These options are just flags, so they should not take a value.
-    opts_without_vals = ("nojournal", "nopreallocj")
+    opts_without_vals = ("nojournal", "nopreallocj", "useDeprecatedMongoRocks")
 
     # Have the --nojournal command line argument to resmoke.py unset the journal option.
     if shortcut_opts["nojournal"] and "journal" in kwargs:
