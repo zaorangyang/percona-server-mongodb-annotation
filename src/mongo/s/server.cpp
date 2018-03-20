@@ -488,6 +488,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion36, ("EndStar
 (InitializerContext* context) {
     mongo::serverGlobalParams.featureCompatibility.setVersion(
         ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
+        //ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34);
     return Status::OK();
 }
 

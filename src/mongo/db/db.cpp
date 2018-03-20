@@ -244,7 +244,11 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
         log() << "Re-creating featureCompatibilityVersion document that was deleted.";
         BSONObjBuilder bob;
         bob.append("_id", FeatureCompatibilityVersion::kParameterName);
-        if (allCollsHaveUuids) {
+        if (!opCtx->getServiceContext()->getGlobalStorageEngine()->isFcv36Supported()) {
+            // If FCV 3.6 is not supported set it to 3.4
+            bob.append(FeatureCompatibilityVersion::kVersionField,
+                       FeatureCompatibilityVersionCommandParser::kVersion34);
+        } else if (allCollsHaveUuids) {
             // If all collections have UUIDs, create a featureCompatibilityVersion document with
             // version equal to 3.6.
             bob.append(FeatureCompatibilityVersion::kVersionField,
@@ -1023,6 +1027,10 @@ ExitCode _initAndListen(int listenPort) {
     if (!start.isOK()) {
         error() << "Failed to start the listener: " << start.toString();
         return EXIT_NET_ERROR;
+    }
+
+    if (!serviceContext->getGlobalStorageEngine()->isFcv36Supported()) {
+        serverGlobalParams.featureCompatibility.reset();
     }
 
     serviceContext->notifyStartupComplete();

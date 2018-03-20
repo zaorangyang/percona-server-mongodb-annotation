@@ -144,6 +144,11 @@ public:
                     serverGlobalParams.featureCompatibility.getVersion() !=
                         ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo34);
 
+            uassert(ErrorCodes::IllegalOperation,
+                    "storage engine does not support upgrading featureCompatibilityVersion "
+                    "to " + requestedVersion,
+                    opCtx->getServiceContext()->getGlobalStorageEngine()->isFcv36Supported());
+
             if (serverGlobalParams.featureCompatibility.getVersion() ==
                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
                 // Set the client's last opTime to the system last opTime so no-ops wait for

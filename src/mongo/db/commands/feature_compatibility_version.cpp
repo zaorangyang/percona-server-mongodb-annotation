@@ -237,7 +237,7 @@ void FeatureCompatibilityVersion::setIfCleanStartup(OperationContext* opCtx,
         repl::TimestampedBSONObj{
             BSON("_id" << FeatureCompatibilityVersion::kParameterName
                        << FeatureCompatibilityVersion::kVersionField
-                       << (storeUpgradeVersion
+                       << (storeUpgradeVersion && opCtx->getServiceContext()->getGlobalStorageEngine()->isFcv36Supported()
                                ? FeatureCompatibilityVersionCommandParser::kVersion36
                                : FeatureCompatibilityVersionCommandParser::kVersion34)),
             Timestamp()},
@@ -317,6 +317,18 @@ void uassertDuringInvalidUpgradeOp(OperationContext* opCtx,
             fcvUUID.getValue());
 }
 
+// If FCV 3.6 is not supported then we cannot upgrade
+void uassertInvalidUpgradeTo36(OperationContext* opCtx,
+                               ServerGlobalParams::FeatureCompatibility::Version newVersion,
+                               std::string msg) {
+    if (!opCtx->getServiceContext()->getGlobalStorageEngine()->isFcv36Supported()) {
+        const bool is36 = newVersion == ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo36
+            || newVersion == ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36;
+        uassert(ErrorCodes::IllegalOperation,
+                msg,
+                !is36);
+    }
+}
 }  // namespace
 
 void FeatureCompatibilityVersion::onInsertOrUpdate(OperationContext* opCtx, const BSONObj& doc) {
@@ -334,6 +346,11 @@ void FeatureCompatibilityVersion::onInsertOrUpdate(OperationContext* opCtx, cons
                                               "downgrade feature compatibility version document: "
                                            << redact(doc));
     uassertDuringInvalidUpgradeOp(opCtx, newVersion);
+    uassertInvalidUpgradeTo36(opCtx,
+                              newVersion,
+                              str::stream()
+                                  << "Error setting featureCompatibilityVersion to " << toString(newVersion) << " "
+                                  << "FCV 3.6 is not supported by this node");
 
     // To avoid extra log messages when the targetVersion is set/unset, only log when the version
     // changes.
