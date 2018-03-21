@@ -134,6 +134,7 @@ baseSource=[
     'util/text.cpp',
     'util/time_support.cpp',
     'util/timer.cpp',
+    'util/uuid.cpp',
     'util/version.cpp',
 ]
 
@@ -285,7 +286,6 @@ env.Library(
         "db/mongod_options_init.cpp",
     ],
     LIBDEPS=[
-        'db/catalog/catalog',
         'db/clientcursor',
         'db/commands/core',
         'db/conn_pool_options',
@@ -303,7 +303,7 @@ env.Library(
         'db/repair_database',
         'db/repl/repl_set_commands',
         'db/repl/storage_interface_impl',
-        'db/repl/topology_coordinator_impl',
+        'db/repl/topology_coordinator',
         'db/s/balancer',
         'db/serveronly',
         'db/service_context_d',

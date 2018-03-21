@@ -709,6 +709,22 @@ TEST(ExpressionAlgoIsSubsetOf, NonMatchingCollationsNoStringComparison) {
     ASSERT_TRUE(expression::isSubsetOf(lhs.get(), rhs.get()));
 }
 
+TEST(ExpressionAlgoIsSubsetOf, InternalExprEqIsSubsetOfNothing) {
+    ParsedMatchExpression exprEq("{a: {$_internalExprEq: 0}}");
+    ParsedMatchExpression regularEq("{a: {$eq: 0}}");
+    {
+        ParsedMatchExpression rhs("{a: {$gte: 0}}");
+        ASSERT_FALSE(expression::isSubsetOf(exprEq.get(), rhs.get()));
+        ASSERT_TRUE(expression::isSubsetOf(regularEq.get(), rhs.get()));
+    }
+
+    {
+        ParsedMatchExpression rhs("{a: {$lte: 0}}");
+        ASSERT_FALSE(expression::isSubsetOf(exprEq.get(), rhs.get()));
+        ASSERT_TRUE(expression::isSubsetOf(regularEq.get(), rhs.get()));
+    }
+}
+
 TEST(IsIndependent, AndIsIndependentOnlyIfChildrenAre) {
     BSONObj matchPredicate = fromjson("{$and: [{a: 1}, {b: 1}]}");
     boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
@@ -1166,6 +1182,25 @@ TEST(SplitMatchExpression, ShouldMoveMaxLengthAcrossRename) {
     BSONObjBuilder firstBob;
     splitExpr.first->serialize(&firstBob);
     ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{c: {$_internalSchemaMaxLength: 3}}"));
+
+    ASSERT_FALSE(splitExpr.second.get());
+}
+
+TEST(SplitMatchExpression, ShouldMoveIndependentPredicateWhenThereAreMultipleRenames) {
+    // Designed to reproduce SERVER-32690.
+    BSONObj matchPredicate = fromjson("{y: 3}");
+    boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto matcher = MatchExpressionParser::parse(matchPredicate, std::move(expCtx));
+    ASSERT_OK(matcher.getStatus());
+
+    StringMap<std::string> renames{{"y", "x"}, {"x", "x"}};
+    std::pair<unique_ptr<MatchExpression>, unique_ptr<MatchExpression>> splitExpr =
+        expression::splitMatchExpressionBy(std::move(matcher.getValue()), {}, renames);
+
+    ASSERT_TRUE(splitExpr.first.get());
+    BSONObjBuilder firstBob;
+    splitExpr.first->serialize(&firstBob);
+    ASSERT_BSONOBJ_EQ(firstBob.obj(), fromjson("{x: {$eq: 3}}"));
 
     ASSERT_FALSE(splitExpr.second.get());
 }

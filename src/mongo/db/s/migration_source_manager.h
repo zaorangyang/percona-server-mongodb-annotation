@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
+
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/s/move_chunk_request.h"
@@ -220,7 +222,7 @@ private:
 
     // The UUID of the the collection whose chunks are being moved. Default to empty if the
     // collection doesn't have UUID.
-    UUID _collectionUuid;
+    boost::optional<UUID> _collectionUuid;
 
     // The chunk cloner source. Only available if there is an active migration going on. To set and
     // remove it, global S lock needs to be acquired first in order to block all logOp calls and
@@ -240,6 +242,9 @@ private:
     // The transition from false to true is protected by the collection X-lock, which happens just
     // before the config server metadata commit is scheduled.
     bool _readsShouldWaitOnCritSec{false};
+
+    // The statistics about a chunk migration to be included in moveChunk.commit
+    BSONObj _recipientCloneCounts;
 };
 
 }  // namespace mongo

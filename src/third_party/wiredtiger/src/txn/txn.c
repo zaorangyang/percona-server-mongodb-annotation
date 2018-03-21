@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -367,7 +367,6 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, uint32_t flags)
 	if (WT_TXNID_LT(txn_global->last_running, last_running)) {
 		txn_global->last_running = last_running;
 
-#ifdef HAVE_VERBOSE
 		/* Output a verbose message about long-running transactions,
 		 * but only when some progress is being made. */
 		if (WT_VERBOSE_ISSET(session, WT_VERB_TRANSACTION) &&
@@ -380,7 +379,6 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, uint32_t flags)
 			    oldest_session->lastop,
 			    oldest_session->txn.snap_min);
 		}
-#endif
 	}
 
 done:	__wt_writeunlock(session, &txn_global->rwlock);
@@ -444,11 +442,19 @@ __wt_txn_config(WT_SESSION_IMPL *session, const char *cfg[])
 #ifdef HAVE_TIMESTAMPS
 		wt_timestamp_t ts;
 		WT_TXN_GLOBAL *txn_global;
-		char timestamp_buf[2 * WT_TIMESTAMP_SIZE + 1];
+		char hex_timestamp[2][2 * WT_TIMESTAMP_SIZE + 1];
 		bool round_to_oldest;
 
 		txn_global = &S2C(session)->txn_global;
 		WT_RET(__wt_txn_parse_timestamp(session, "read", &ts, &cval));
+
+		/*
+		 * Prepare transactions are supported only in timestamp build.
+		 */
+		WT_RET(__wt_config_gets_def(session,
+		    cfg, "ignore_prepare", 0, &cval));
+		if (cval.val)
+			F_SET(txn, WT_TXN_IGNORE_PREPARE);
 
 		/*
 		 * Read the configuration here to reduce the span of the
@@ -462,11 +468,13 @@ __wt_txn_config(WT_SESSION_IMPL *session, const char *cfg[])
 		 * avoid a race between checking and setting transaction
 		 * timestamp.
 		 */
+		WT_RET(__wt_timestamp_to_hex_string(session,
+		    hex_timestamp[0], &ts));
 		__wt_readlock(session, &txn_global->rwlock);
 		if (__wt_timestamp_cmp(&ts, &txn_global->oldest_timestamp) < 0)
 		{
 			WT_RET(__wt_timestamp_to_hex_string(session,
-			    timestamp_buf, &ts));
+			    hex_timestamp[1], &txn_global->oldest_timestamp));
 			/*
 			 * If given read timestamp is earlier than oldest
 			 * timestamp then round the read timestamp to
@@ -478,8 +486,8 @@ __wt_txn_config(WT_SESSION_IMPL *session, const char *cfg[])
 			else {
 				__wt_readunlock(session, &txn_global->rwlock);
 				WT_RET_MSG(session, EINVAL, "read timestamp "
-				    "%s older than oldest timestamp",
-				    timestamp_buf);
+				    "%s older than oldest timestamp %s",
+				    hex_timestamp[0], hex_timestamp[1]);
 			}
 		} else {
 			__wt_timestamp_set(&txn->read_timestamp, &ts);
@@ -499,8 +507,8 @@ __wt_txn_config(WT_SESSION_IMPL *session, const char *cfg[])
 			 * critical section.
 			 */
 			__wt_verbose(session, WT_VERB_TIMESTAMP, "Read "
-			    "timestamp %s : Rounded to oldest timestamp",
-			    timestamp_buf);
+			    "timestamp %s : Rounded to oldest timestamp %s",
+			    hex_timestamp[0], hex_timestamp[1]);
 		}
 #else
 		WT_RET_MSG(session, EINVAL, "read_timestamp requires a "
@@ -594,9 +602,107 @@ __wt_txn_release(WT_SESSION_IMPL *session)
 	__wt_txn_release_snapshot(session);
 	txn->isolation = session->isolation;
 
+	txn->rollback_reason = NULL;
+
 	/* Ensure the transaction flags are cleared on exit */
 	txn->flags = 0;
 }
+
+#ifdef	HAVE_TIMESTAMPS
+/*
+ * __txn_commit_timestamp_validate --
+ *	Validate that timestamp provided to commit is legal.
+ */
+static inline int
+__txn_commit_timestamp_validate(WT_SESSION_IMPL *session)
+{
+	WT_DECL_TIMESTAMP(op_timestamp)
+	WT_TXN *txn;
+	WT_TXN_OP *op;
+	WT_UPDATE *upd;
+	u_int i;
+	bool op_zero_ts, upd_zero_ts;
+
+	txn = &session->txn;
+
+	/*
+	 * Debugging checks on timestamps, if user requested them.
+	 */
+	if (F_ISSET(txn, WT_TXN_TS_COMMIT_ALWAYS) &&
+	    !F_ISSET(txn, WT_TXN_HAS_TS_COMMIT) &&
+	    txn->mod_count != 0)
+		WT_RET_MSG(session, EINVAL, "commit_timestamp required and "
+		    "none set on this transaction");
+	if (F_ISSET(txn, WT_TXN_TS_COMMIT_NEVER) &&
+	    F_ISSET(txn, WT_TXN_HAS_TS_COMMIT) &&
+	    txn->mod_count != 0)
+		WT_RET_MSG(session, EINVAL, "no commit_timestamp required and "
+		    "timestamp set on this transaction");
+
+	/*
+	 * If we're not doing any key consistency checking, we're done.
+	 */
+	if (!F_ISSET(txn, WT_TXN_TS_COMMIT_KEYS))
+		return (0);
+
+	/*
+	 * Error on any valid update structures for the same key that
+	 * are at a later timestamp or use timestamps inconsistently.
+	 */
+	for (i = 0, op = txn->mod; i < txn->mod_count; i++, op++)
+		if (op->type == WT_TXN_OP_BASIC_TS ||
+		    op->type == WT_TXN_OP_BASIC) {
+			/*
+			 * Skip over any aborted update structures or ones
+			 * from our own transaction.
+			 */
+			upd = op->u.upd->next;
+			while (upd != NULL && (upd->txnid == WT_TXN_ABORTED ||
+			    upd->txnid == txn->id))
+				upd = upd->next;
+
+			/*
+			 * Check the timestamp on this update with the
+			 * first valid update in the chain. They're in
+			 * most recent order.
+			 */
+			if (upd == NULL)
+				continue;
+			/*
+			 * Check for consistent per-key timestamp usage.
+			 * If timestamps are or are not used originally then
+			 * they should be used the same way always. For this
+			 * transaction, timestamps are in use anytime the
+			 * commit timestamp is set.
+			 * Check timestamps are used in order.
+			 */
+			op_zero_ts = !F_ISSET(txn, WT_TXN_HAS_TS_COMMIT);
+			upd_zero_ts = __wt_timestamp_iszero(&upd->timestamp);
+			if (op_zero_ts != upd_zero_ts)
+				WT_RET_MSG(session, EINVAL,
+				    "per-key timestamps used inconsistently");
+			/*
+			 * If we aren't using timestamps for this transaction
+			 * then we are done checking. Don't check the timestamp
+			 * because the one in the transaction is not cleared.
+			 */
+			if (op_zero_ts)
+				continue;
+			op_timestamp = op->u.upd->timestamp;
+			/*
+			 * Only if the update structure doesn't have a timestamp
+			 * then use the one in the transaction structure.
+			 */
+			if (__wt_timestamp_iszero(&op->u.upd->timestamp))
+				op_timestamp = txn->commit_timestamp;
+			if (__wt_timestamp_cmp(&op_timestamp,
+			    &upd->timestamp) < 0)
+				WT_RET_MSG(session, EINVAL,
+				    "out of order timestamps");
+		}
+	return (0);
+}
+#endif
 
 /*
  * __wt_txn_commit --
@@ -647,20 +753,9 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 	}
 
 #ifdef HAVE_TIMESTAMPS
-	/*
-	 * Debugging checks on timestamps, if user requested them.
-	 */
-	if (F_ISSET(txn, WT_TXN_TS_COMMIT_ALWAYS) &&
-	    !F_ISSET(txn, WT_TXN_HAS_TS_COMMIT) &&
-	    txn->mod_count != 0)
-		WT_ERR_MSG(session, EINVAL, "commit_timestamp required and "
-		    "none set on this transaction");
-	if (F_ISSET(txn, WT_TXN_TS_COMMIT_NEVER) &&
-	    F_ISSET(txn, WT_TXN_HAS_TS_COMMIT) &&
-	    txn->mod_count != 0)
-		WT_ERR_MSG(session, EINVAL, "no commit_timestamp required and "
-		    "timestamp set on this transaction");
+	WT_ERR(__txn_commit_timestamp_validate(session));
 #endif
+
 	/*
 	 * The default sync setting is inherited from the connection, but can
 	 * be overridden by an explicit "sync" setting for this transaction.
@@ -749,7 +844,7 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 			 * Switch reserved operations to abort to
 			 * simplify obsolete update list truncation.
 			 */
-			if (op->u.upd->type == WT_UPDATE_RESERVED) {
+			if (op->u.upd->type == WT_UPDATE_RESERVE) {
 				op->u.upd->txnid = WT_TXN_ABORTED;
 				break;
 			}
@@ -872,6 +967,22 @@ err:	/*
 }
 
 /*
+ * __wt_txn_prepare --
+ *	Prepare the current transaction.
+ */
+int
+__wt_txn_prepare(WT_SESSION_IMPL *session, const char *cfg[])
+{
+	WT_UNUSED(cfg);
+
+#ifdef HAVE_TIMESTAMPS
+	WT_RET_MSG(session, ENOTSUP, "prepare_transaction is not supported");
+#else
+	WT_RET_MSG(session, ENOTSUP, "prepare_transaction requires a version "
+	    "of WiredTiger built with timestamp support");
+#endif
+}
+/*
  * __wt_txn_rollback --
  *	Roll back the current transaction.
  */
@@ -939,6 +1050,18 @@ __wt_txn_rollback(WT_SESSION_IMPL *session, const char *cfg[])
 	if (!readonly)
 		(void)__wt_cache_eviction_check(session, false, false, NULL);
 	return (ret);
+}
+
+/*
+ * __wt_txn_rollback_required --
+ *	Prepare to log a reason if the user attempts to use the transaction to
+ * do anything other than rollback.
+ */
+int
+__wt_txn_rollback_required(WT_SESSION_IMPL *session, const char *reason)
+{
+	session->txn.rollback_reason = reason;
+	return (WT_ROLLBACK);
 }
 
 /*
@@ -1061,13 +1184,15 @@ __wt_txn_global_init(WT_SESSION_IMPL *session, const char *cfg[])
 
 	WT_RET(__wt_spin_init(
 	    session, &txn_global->id_lock, "transaction id lock"));
-	WT_RET(__wt_rwlock_init(session, &txn_global->rwlock));
+	WT_RWLOCK_INIT_TRACKED(session, &txn_global->rwlock, txn_global);
 	WT_RET(__wt_rwlock_init(session, &txn_global->visibility_rwlock));
 
-	WT_RET(__wt_rwlock_init(session, &txn_global->commit_timestamp_rwlock));
+	WT_RWLOCK_INIT_TRACKED(session,
+	    &txn_global->commit_timestamp_rwlock, commit_timestamp);
 	TAILQ_INIT(&txn_global->commit_timestamph);
 
-	WT_RET(__wt_rwlock_init(session, &txn_global->read_timestamp_rwlock));
+	WT_RWLOCK_INIT_TRACKED(session,
+	    &txn_global->read_timestamp_rwlock, read_timestamp);
 	TAILQ_INIT(&txn_global->read_timestamph);
 
 	WT_RET(__wt_rwlock_init(session, &txn_global->nsnap_rwlock));
@@ -1158,6 +1283,7 @@ __wt_verbose_dump_txn_one(WT_SESSION_IMPL *session, WT_TXN *txn)
 	const char *iso_tag;
 
 	iso_tag = "INVALID";
+	WT_NOT_READ(iso_tag);
 	switch (txn->isolation) {
 	case WT_ISO_READ_COMMITTED:
 		iso_tag = "WT_ISO_READ_COMMITTED";

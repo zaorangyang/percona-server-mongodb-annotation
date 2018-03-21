@@ -33,13 +33,11 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/metadata_manager.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
@@ -51,9 +49,8 @@
 namespace mongo {
 
 using std::string;
-using std::stringstream;
-using std::shared_ptr;
 using std::vector;
+using str::stream;
 
 namespace {
 
@@ -322,7 +319,7 @@ class MergeChunksCommand : public ErrmsgCommandDeprecated {
 public:
     MergeChunksCommand() : ErrmsgCommandDeprecated("mergeChunks") {}
 
-    void help(stringstream& h) const override {
+    void help(std::stringstream& h) const override {
         h << "Merge Chunks command\n"
           << "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ],"
           << " (opt) epoch : <epoch> }";
@@ -349,7 +346,8 @@ public:
     bool slaveOk() const override {
         return false;
     }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 

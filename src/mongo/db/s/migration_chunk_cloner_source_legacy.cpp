@@ -34,9 +34,8 @@
 
 #include "mongo/base/status.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/concurrency/locker.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -335,7 +334,7 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
     return {ErrorCodes::ExceededTimeLimit, "Timed out waiting for the cloner to catch up"};
 }
 
-Status MigrationChunkClonerSourceLegacy::commitClone(OperationContext* opCtx) {
+StatusWith<BSONObj> MigrationChunkClonerSourceLegacy::commitClone(OperationContext* opCtx) {
     invariant(_state == kCloning);
     invariant(!opCtx->lockState()->isLocked());
 
@@ -349,7 +348,8 @@ Status MigrationChunkClonerSourceLegacy::commitClone(OperationContext* opCtx) {
                     "destination shard finished committing but there are still some session "
                     "metadata that needs to be transferred"};
         }
-        return Status::OK();
+
+        return responseStatus;
     }
 
     cancelClone(opCtx);

@@ -85,28 +85,6 @@ public:
         kFailedUnitOfWork   // in a unit of work that has failed and must be aborted
     };
 
-    /**
-     * An RAII type that will temporarily suspend any deadline on this operation. Resets the
-     * deadline to the previous value upon destruction.
-     */
-    class DeadlineStash {
-    public:
-        /**
-         * Clears any deadline set on this operation.
-         */
-        DeadlineStash(OperationContext* opCtx);
-
-        /**
-         * Resets the deadline on '_opCtx' to the original deadline present at the time this
-         * DeadlineStash was constructed.
-         */
-        ~DeadlineStash();
-
-    private:
-        OperationContext* _opCtx;
-        Date_t _originalDeadline;
-    };
-
     OperationContext(Client* client, unsigned int opId);
 
     virtual ~OperationContext() = default;
@@ -412,6 +390,14 @@ public:
     }
 
     /**
+     * Reset the deadline for this operation.
+     */
+    void clearDeadline() {
+        _deadline = Date_t::max();
+        _maxTime = computeMaxTimeFromDeadline(_deadline);
+    }
+
+    /**
      * Returns the number of milliseconds remaining for this operation's time limit or
      * Milliseconds::max() if the operation has no time limit.
      */
@@ -457,7 +443,6 @@ private:
         _writesAreReplicated = writesAreReplicated;
     }
 
-    friend class DeadlineStash;
     friend class WriteUnitOfWork;
     friend class repl::UnreplicatedWritesBlock;
     friend class repl::ReplicatedWritesBlock;

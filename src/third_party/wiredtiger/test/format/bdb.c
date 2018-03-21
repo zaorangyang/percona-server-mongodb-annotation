@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -116,7 +116,7 @@ bdb_insert(
 }
 
 void
-bdb_np(int next,
+bdb_np(bool next,
     void *keyp, size_t *keysizep,
     void *valuep, size_t *valuesizep, int *notfoundp)
 {

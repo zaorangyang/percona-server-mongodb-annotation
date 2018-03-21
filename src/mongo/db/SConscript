@@ -422,8 +422,8 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/storage/mmap_v1/mmap_v1_options',
-        'commands/test_commands_enabled',
         'repl/repl_settings',
+        'repl/replica_set_messages',
         'server_options',
         'storage/storage_options',
     ],
@@ -515,7 +515,6 @@ env.Library(
         'commands/server_status_core',
         'commands/test_commands_enabled',
         'service_context',
-        '$BUILD_DIR/mongo/util/uuid',
         '$BUILD_DIR/mongo/db/catalog/uuid_catalog',
     ],
 )
@@ -541,13 +540,10 @@ env.Library(
         'db_raii.cpp',
     ],
     LIBDEPS=[
+        'catalog/catalog_raii',
         'curop',
+        's/sharding',
         'stats/top',
-        'views/views',
-        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
-        '$BUILD_DIR/mongo/db/s/sharding',
-        '$BUILD_DIR/mongo/db/catalog/database',
-        '$BUILD_DIR/mongo/db/catalog/database_holder',
     ],
 )
 
@@ -801,7 +797,7 @@ env.Library(
         "auth/authmongod",
         "authz_manager_external_state_factory_d",
         "background",
-        "catalog/catalog",
+        "catalog/catalog_impl",
         "catalog/collection_options",
         "catalog/document_validation",
         "catalog/index_key_validate",
@@ -848,7 +844,7 @@ env.Library(
         "repl/serveronly",
         "repl/storage_interface",
         "repl/sync_tail",
-        "repl/topology_coordinator_impl",
+        "repl/topology_coordinator",
         "rw_concern_d",
         "s/collection_metadata",
         "s/commands",
@@ -888,7 +884,6 @@ env.Library(
         '$BUILD_DIR/mongo/crypto/sha256_block',
         '$BUILD_DIR/mongo/crypto/sha_block_${MONGO_CRYPTO}',
         '$BUILD_DIR/mongo/idl/idl_parser',
-        '$BUILD_DIR/mongo/util/uuid',
         'server_parameters',
     ],
 )
@@ -1629,11 +1624,13 @@ env.Library(
         'ops/update_lifecycle_impl.cpp',
         'ops/update_result.cpp',
         'ops/write_ops_retryability.cpp',
+        'retryable_writes_stats.cpp',
         'session.cpp',
         'session_catalog.cpp',
         'transaction_history_iterator.cpp',
         env.Idlc('ops/single_write_result.idl')[0],
         env.Idlc('session_txn_record.idl')[0],
+        env.Idlc('transactions_stats.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',

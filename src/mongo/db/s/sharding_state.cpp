@@ -37,16 +37,14 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/repl/optime.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/s/collection_metadata.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
@@ -66,11 +64,6 @@
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-
-#include <chrono>
-#include <ctime>
-#include <iomanip>
-#include <iostream>
 
 namespace mongo {
 
@@ -100,7 +93,7 @@ void updateShardIdentityConfigStringCB(const string& setName, const string& newC
     }
 
     Client::initThread("updateShardIdentityConfigConnString");
-    auto uniqOpCtx = getGlobalServiceContext()->makeOperationContext(&cc());
+    auto uniqOpCtx = Client::getCurrent()->makeOperationContext();
 
     auto status = ShardingState::get(uniqOpCtx.get())
                       ->updateShardIdentityConfigString(uniqOpCtx.get(), newConnectionString);
@@ -190,21 +183,6 @@ Status ShardingState::updateConfigServerOpTimeFromMetadata(OperationContext* opC
     return Status::OK();
 }
 
-CollectionShardingState* ShardingState::getNS(const std::string& ns, OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    CollectionShardingStateMap::iterator it = _collections.find(ns);
-    if (it == _collections.end()) {
-        auto inserted =
-            _collections.insert(make_pair(ns,
-                                          stdx::make_unique<CollectionShardingState>(
-                                              opCtx->getServiceContext(), NamespaceString(ns))));
-        invariant(inserted.second);
-        it = std::move(inserted.first);
-    }
-
-    return it->second.get();
-}
-
 ChunkSplitter* ShardingState::getChunkSplitter() {
     return _chunkSplitter.get();
 }
@@ -215,14 +193,6 @@ void ShardingState::initiateChunkSplitter() {
 
 void ShardingState::interruptChunkSplitter() {
     _chunkSplitter->interruptChunkSplitter();
-}
-
-void ShardingState::markCollectionsNotShardedAtStepdown() {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    for (auto& coll : _collections) {
-        auto& css = coll.second;
-        css->markNotShardedAtStepdown();
-    }
 }
 
 void ShardingState::setGlobalInitMethodForTest(GlobalInitFunc func) {
@@ -579,20 +549,6 @@ void ShardingState::appendInfo(OperationContext* opCtx, BSONObjBuilder& builder)
                    Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
     builder.append("shardName", _shardName);
     builder.append("clusterId", _clusterId);
-
-    BSONObjBuilder versionB(builder.subobjStart("versions"));
-    for (CollectionShardingStateMap::const_iterator it = _collections.begin();
-         it != _collections.end();
-         ++it) {
-        ScopedCollectionMetadata metadata = it->second->getMetadata();
-        if (metadata) {
-            versionB.appendTimestamp(it->first, metadata->getShardVersion().toLong());
-        } else {
-            versionB.appendTimestamp(it->first, ChunkVersion::UNSHARDED().toLong());
-        }
-    }
-
-    versionB.done();
 }
 
 bool ShardingState::needCollectionMetadata(OperationContext* opCtx, const string& ns) {

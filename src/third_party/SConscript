@@ -15,7 +15,7 @@ icuSuffix = '-57.1'
 gperftoolsSuffix = '-2.5'
 lz4Suffix = '-r131'
 timelibSuffix = '-2017.05'
-tomcryptSuffix = '-1.18.0-rc2'
+tomcryptSuffix = '-1.18.1'
 
 thirdPartyIncludePathList = [
     ('percona_incl', '#/src/third_party/install/include'),

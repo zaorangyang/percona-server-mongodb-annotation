@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -477,10 +477,10 @@ static WT_EVENT_HANDLER event_handler = {
 static void
 subtest_main(int argc, char *argv[], bool close_test)
 {
+	struct rlimit rlim;
 	TEST_OPTS *opts, _opts;
 	WT_SESSION *session;
 	char config[1024], filename[1024];
-	struct rlimit rlim;
 
 	opts = &_opts;
 	memset(opts, 0, sizeof(*opts));
