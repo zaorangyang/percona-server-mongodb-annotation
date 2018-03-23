@@ -109,6 +109,14 @@ public:
         return _cursorsOut;
     }
 
+    bool isDropQueuedIdentsAtSessionEndAllowed() const {
+        return _dropQueuedIdentsAtSessionEnd;
+    }
+
+    void dropQueuedIdentsAtSessionEndAllowed(bool dropQueuedIdentsAtSessionEnd) {
+        _dropQueuedIdentsAtSessionEnd = dropQueuedIdentsAtSessionEnd;
+    }
+
     static uint64_t genTableId();
 
     /**
@@ -138,7 +146,8 @@ private:
     WT_SESSION* _session;            // owned
     CursorCache _cursors;            // owned
     uint64_t _cursorGen;
-    int _cursorsCached, _cursorsOut;
+    int _cursorsOut;
+    bool _dropQueuedIdentsAtSessionEnd = true;
 };
 
 /**
