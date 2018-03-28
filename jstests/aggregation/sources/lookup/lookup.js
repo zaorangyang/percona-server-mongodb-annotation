@@ -1,4 +1,5 @@
 // Basic $lookup regression tests.
+// @tags: [rocks_requires_fcv36]
 
 load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.
 

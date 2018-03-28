@@ -1,4 +1,5 @@
 // test that enableSharding gets audited
+// @tags: [rocks_requires_fcv36]
 
 if (TestData.testData !== undefined) {
     load(TestData.testData + '/audit/_audit_helpers.js');

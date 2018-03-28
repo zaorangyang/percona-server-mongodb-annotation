@@ -2,6 +2,7 @@
 // Ensures GLE correctly reports basic write stats and failures
 // Note that test should work correctly with and without write commands.
 //
+// @tags: [rocks_requires_fcv36]
 
 // Checking UUID consistency involves talking to shards, but this test shuts down one shard.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;

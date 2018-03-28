@@ -1,4 +1,4 @@
-// @tags: [requires_non_retryable_commands]
+// @tags: [requires_non_retryable_commands, rocks_requires_fcv36]
 
 /**
  * Tests for the non-standard 'bsonType' keyword in JSON Schema, as well as some tests for 'type'.

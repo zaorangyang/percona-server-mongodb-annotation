@@ -1,5 +1,7 @@
 /**
  * Test that adding invalid or duplicate shards will fail.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
 

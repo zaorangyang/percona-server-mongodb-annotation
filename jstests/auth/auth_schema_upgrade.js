@@ -1,4 +1,5 @@
 // Standalone test of authSchemaUpgrade
+// @tags: [rocks_requires_fcv36]
 load('./jstests/multiVersion/libs/auth_helpers.js');
 
 var setupCRUsers = function(conn) {

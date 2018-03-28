@@ -17,6 +17,7 @@
  *   requires_eval_command,
  *   requires_non_retryable_commands,
  *   requires_non_retryable_writes,
+ *   rocks_requires_fcv36,
  * ]
  */
 (function() {

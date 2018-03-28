@@ -14,6 +14,8 @@
  * Each operation is tested on a single node, and (if supported) through mongos on both sharded and
  * unsharded collections. Mongos doesn't directly handle readConcern majority, but these tests
  * should ensure that it correctly propagates the setting to the shards when running commands.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

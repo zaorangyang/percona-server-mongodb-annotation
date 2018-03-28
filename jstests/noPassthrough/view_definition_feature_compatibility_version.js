@@ -1,6 +1,7 @@
 // Test that query and aggregation syntax introduced in 3.6 is restricted from view definitions when
 // the featureCompatibilityVersion is 3.4.
 // TODO SERVER-31588: Remove FCV 3.4 validation during the 3.7 development cycle.
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     "use strict";

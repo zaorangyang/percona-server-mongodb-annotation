@@ -1,6 +1,8 @@
 /**
  * Tests authorization special cases with views. These are special exceptions that prohibit certain
  * operations on views even if the user has an explicit privilege on that view.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

@@ -1,6 +1,8 @@
 /**
  * Test that setting the query knob 'internalQueryIgnoreUnknownJSONSchemaKeywords' correctly
  * ignores unknown keywords within $jsonSchema.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

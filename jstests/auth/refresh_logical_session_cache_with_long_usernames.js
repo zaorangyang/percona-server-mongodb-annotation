@@ -1,5 +1,6 @@
 // Verifies that we've fixed SERVER-33158 by creating large user lsid refresh records (via large
 // usernames)
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     'use strict';

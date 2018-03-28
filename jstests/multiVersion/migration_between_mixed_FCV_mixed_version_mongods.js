@@ -1,6 +1,8 @@
 /**
  * Test that it is not possible to move a chunk from an upgrade featureCompatibilityVersion node to
  * a downgrade binary version node.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 // This test will not end with consistent UUIDs, since there is inconsistent

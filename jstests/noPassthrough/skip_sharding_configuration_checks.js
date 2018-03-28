@@ -1,6 +1,6 @@
 /**
  *  Starts standalone RS with skipShardingConfigurationChecks.
- *  @tags: [requires_persistence]
+ *  @tags: [requires_persistence, rocks_requires_fcv36]
  */
 (function() {
     'use strict';

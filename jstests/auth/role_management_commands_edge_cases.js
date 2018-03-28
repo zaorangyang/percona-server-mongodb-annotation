@@ -1,6 +1,8 @@
 /**
  * This tests that all the different commands for role manipulation all properly handle invalid
  * and atypical inputs.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 function runTest(conn) {

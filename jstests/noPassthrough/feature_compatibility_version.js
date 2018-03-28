@@ -1,5 +1,6 @@
 // Tests that manipulating the featureCompatibilityVersion document in admin.system.version changes
 // the value of the featureCompatibilityVersion server parameter.
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     "use strict";

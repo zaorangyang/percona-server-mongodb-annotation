@@ -1,3 +1,4 @@
+// @tags: [rocks_requires_fcv36]
 load('jstests/replsets/rslib.js');
 (function() {
     "use strict";

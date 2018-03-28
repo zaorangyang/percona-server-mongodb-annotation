@@ -1,5 +1,6 @@
 // SERVER-30665 Ensure that a non-empty collMod with a nonexistent UUID is not applied
 // in applyOps.
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     "use strict";

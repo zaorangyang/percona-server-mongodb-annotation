@@ -1,5 +1,7 @@
 /**
  * $replaceRoot can be used to extract parts of a document; here we test a simple address case.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

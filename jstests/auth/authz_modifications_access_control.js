@@ -1,5 +1,7 @@
 /**
  * This tests that the proper access control is enforced around modifications to user and role data.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 function runTest(conn) {

@@ -1,4 +1,5 @@
 // Auth tests for the $listSessions {allUsers:true} aggregation stage.
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     'use strict';

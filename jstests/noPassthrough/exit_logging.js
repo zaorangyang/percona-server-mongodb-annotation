@@ -1,5 +1,7 @@
 /**
  * Tests that various forms of normal and abnormal shutdown write to the log files as expected.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

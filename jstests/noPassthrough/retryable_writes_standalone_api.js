@@ -1,5 +1,7 @@
 /*
  * Verify behavior of retryable write commands on a standalone mongod.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

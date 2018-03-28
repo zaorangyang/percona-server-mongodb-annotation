@@ -1,4 +1,5 @@
 // Test the killCursors command.
+// @tags: [rocks_requires_fcv36]
 (function() {
     'use strict';
 

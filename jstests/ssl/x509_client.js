@@ -1,4 +1,5 @@
 // Check if this build supports the authenticationMechanisms startup parameter.
+// @tags: [rocks_requires_fcv36]
 var conn = MongoRunner.runMongod({
     smallfiles: "",
     auth: "",

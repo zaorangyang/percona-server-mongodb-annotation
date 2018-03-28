@@ -1,5 +1,6 @@
 // Tests basic sharding with x509 cluster auth. The purpose is to verify the connectivity between
 // mongos and the shards.
+// @tags: [rocks_requires_fcv36]
 (function() {
     'use strict';
 

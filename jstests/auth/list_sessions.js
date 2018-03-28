@@ -1,4 +1,5 @@
 // Auth tests for the $listSessions aggregation pipeline.
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     'use strict';

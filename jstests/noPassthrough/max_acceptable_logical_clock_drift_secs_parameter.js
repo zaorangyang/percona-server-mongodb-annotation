@@ -2,6 +2,8 @@
  * Tests what values are accepted for the maxAcceptableLogicalClockDriftSecs startup parameter, and
  * that servers in a sharded clusters reject cluster times more than
  * maxAcceptableLogicalClockDriftSecs ahead of their wall clocks.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

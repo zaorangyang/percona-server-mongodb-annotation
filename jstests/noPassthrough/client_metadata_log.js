@@ -1,5 +1,7 @@
 /**
  * Test that verifies client metadata is logged into log file on new connections.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     'use strict';

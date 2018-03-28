@@ -1,6 +1,7 @@
 // Test that a user is not allowed to getMore a cursor they did not create, and that such a failed
 // getMore will leave the cursor unaffected, so that a subsequent getMore by the original author
 // will work.
+// @tags: [rocks_requires_fcv36]
 (function() {
     const st = new ShardingTest({shards: 2, config: 1, other: {keyFile: "jstests/libs/key1"}});
     const kDBName = "test";

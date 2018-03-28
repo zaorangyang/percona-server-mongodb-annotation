@@ -2,6 +2,8 @@
  * Tests that applyOps correctly respects the 'oplogApplicationMode' and 'alwaysUpsert' flags.
  * 'alwaysUpsert' defaults to true and 'oplogApplicationMode' defaults to 'ApplyOps'. We test
  * that these default values do not lead to command failure.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

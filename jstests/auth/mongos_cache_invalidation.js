@@ -1,6 +1,8 @@
 /**
  * This tests that updates to user and role definitions made on one mongos propagate properly
  * to other mongoses.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 var authzErrorCode = 13;

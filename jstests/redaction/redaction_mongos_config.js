@@ -1,5 +1,6 @@
 // test that security.redactClientLogData configuration parameter is
 // correctly loaded from config file
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     'use strict';
