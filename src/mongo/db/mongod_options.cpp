@@ -229,7 +229,7 @@ Status addMongodOptions(moe::OptionSection* options) {
                            "There are known issues with MongoDB 3.6 and MongoRocks. To learn "
                            "about these issues and how to enable MongoRocks with "
                            "Percona Server for MongoDB 3.6, please read "
-                           "http://docs.percona.com/percona-server-mongodb/3.6/MongoRocksInstall")
+                           "https://www.percona.com/doc/percona-server-for-mongodb/3.6/mongorocks.html")
         .hidden();
 
     general_options

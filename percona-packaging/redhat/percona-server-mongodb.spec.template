@@ -325,7 +325,7 @@ print_message() {
   reset=`tput sgr0`
   echo "${red} [ERROR] There are known issues with MongoDB 3.6 and MongoRocks. To learn about"
   echo "${red}        these issues and how to enable MongoRocks with Percona Server for MongoDB 3.6,"
-  echo "${red}        please read http://docs.percona.com/percona-server-mongodb/3.6/MongoRocksInstall${reset}"
+  echo "${red}        please read https://www.percona.com/doc/percona-server-for-mongodb/3.6/mongorocks.html${reset}"
 }
 RESTART=1
 ENGINE=$(grep 'engine:' /etc/mongod.conf | grep -v '#' | awk '{print $2}')
