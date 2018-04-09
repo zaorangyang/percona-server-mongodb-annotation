@@ -1,4 +1,5 @@
 // Do parallel ops with migrates occurring
+// @tags: [rocks_requires_fcv36]
 (function() {
     'use strict';
 

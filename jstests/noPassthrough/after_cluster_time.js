@@ -1,4 +1,5 @@
 // This test verifies readConcern:afterClusterTime behavior on a standalone mongod.
+// @tags: [rocks_requires_fcv36]
 (function() {
     "use strict";
     var standalone =

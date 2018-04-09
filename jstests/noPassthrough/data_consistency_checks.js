@@ -2,7 +2,7 @@
  * Verifies that the data consistency checks work against the variety of cluster types we use in our
  * testing.
  *
- * @tags: [requires_replication, requires_sharding]
+ * @tags: [requires_replication, requires_sharding, rocks_requires_fcv36]
  */
 
 // The global 'db' variable is used by the data consistency hooks.

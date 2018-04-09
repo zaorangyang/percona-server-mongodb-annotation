@@ -3,6 +3,7 @@
  *
  * Do not add more tests here but instead add C++ unit tests in db/ops/modifier*_test files
  *
+ * @tags: [rocks_requires_fcv36]
  */
 
 "use strict";

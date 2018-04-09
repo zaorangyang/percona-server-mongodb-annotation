@@ -1,6 +1,7 @@
 /**
  * Tests that write operations executed through the mongo shell's CRUD API are assigned a
  * transaction number so that they can be retried.
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

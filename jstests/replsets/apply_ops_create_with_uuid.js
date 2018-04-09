@@ -1,3 +1,4 @@
+// @tags: [rocks_requires_fcv36]
 (function() {
     // Test applyOps behavior for collection creation with explicit UUIDs.
     "use strict";

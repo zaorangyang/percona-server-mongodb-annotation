@@ -1,7 +1,7 @@
 // Tests authentication with replica sets using key files.
 //
 // This test requires users to persist across a restart.
-// @tags: [requires_persistence]
+// @tags: [requires_persistence, rocks_requires_fcv36]
 
 // We turn off gossiping the mongo shell's clusterTime because this test connects to replica sets
 // and sharded clusters as a user other than __system. Attempting to advance the clusterTime while

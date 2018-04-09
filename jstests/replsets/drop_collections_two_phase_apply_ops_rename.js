@@ -1,6 +1,7 @@
 /**
  * Test to ensure that using applyOps to rename a drop-pending collection is a no-op. The collection
  * remains in a drop-pending state. This is the same behavior as renaming a non-existent collection.
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

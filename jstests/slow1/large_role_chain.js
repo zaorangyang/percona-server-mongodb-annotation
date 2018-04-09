@@ -1,5 +1,6 @@
 // Tests SERVER-11475 - Make sure server does't crash when many user defined roles are created where
 // each role is a member of the next, creating a large chain.
+// @tags: [rocks_requires_fcv36]
 
 function runTest(conn) {
     var testdb = conn.getDB("rolechain");

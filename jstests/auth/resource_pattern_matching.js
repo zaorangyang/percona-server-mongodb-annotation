@@ -1,5 +1,6 @@
 /*
  * Tests that resource pattern matching rules work as expected.
+ * @tags: [rocks_requires_fcv36]
  */
 
 function setup_users(granter) {

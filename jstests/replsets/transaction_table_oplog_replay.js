@@ -1,5 +1,7 @@
 /**
  * Tests that the transaction table is properly updated on secondaries through oplog replay.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

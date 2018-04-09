@@ -1,4 +1,5 @@
 // Tests that the $changeStream requires read concern majority.
+// @tags: [rocks_requires_fcv36]
 (function() {
     "use strict";
 

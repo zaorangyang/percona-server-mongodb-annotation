@@ -4,7 +4,7 @@
  *
  * We restart the secondary as part of this test with the expecation that it still has the same
  * data after the restart.
- * @tags: [requires_persistence]
+ * @tags: [requires_persistence, rocks_requires_fcv36]
  */
 
 load("jstests/replsets/rslib.js");

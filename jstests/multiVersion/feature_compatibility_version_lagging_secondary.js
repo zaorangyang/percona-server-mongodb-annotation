@@ -1,5 +1,6 @@
 // Tests that a primary with upgrade featureCompatibilityVersion cannot connect with a secondary
 // with a lower binary version.
+// @tags: [rocks_requires_fcv36]
 (function() {
     "use strict";
 

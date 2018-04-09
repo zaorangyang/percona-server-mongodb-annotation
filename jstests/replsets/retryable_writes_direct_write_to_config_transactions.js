@@ -1,4 +1,5 @@
 // Validates the expected behaviour of direct writes against the `config.transactions` collection
+// @tags: [rocks_requires_fcv36]
 (function() {
     'use strict';
 

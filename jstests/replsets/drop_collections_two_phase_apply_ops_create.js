@@ -3,6 +3,7 @@
  * drop-pending collection, is a no-op. The existing collection remains in a drop-pending state.
  * This is the same behavior as trying to creating a collection with the same name as an existing
  * collection.
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

@@ -16,6 +16,7 @@
  *  - There is no record for the second session id.
  *  - A record for the third session id was created during oplog replay.
  *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

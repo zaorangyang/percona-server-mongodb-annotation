@@ -1,6 +1,8 @@
 /**
  * Test that rollback via refetch with no UUID support succeeds during downgrade. This runs various
  * ddl commands that are expected to cause different UUID conflicts among the two nodes.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

@@ -4,7 +4,7 @@
  *
  * This test does not work with non-persistent storage engines because it checks for the presence of
  * drop-pending collections across server restarts.
- * @tags: [requires_persistence]
+ * @tags: [requires_persistence, rocks_requires_fcv36]
  */
 
 (function() {

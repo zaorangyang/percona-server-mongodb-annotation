@@ -1,5 +1,6 @@
 // Test copyDatabase command with various combinations of authed/unauthed and single node/replica
 // set source and dest.
+// @tags: [rocks_requires_fcv36]
 
 TestData.authMechanism = "SCRAM-SHA-1";                        // SERVER-11428
 DB.prototype._defaultAuthenticationMechanism = "SCRAM-SHA-1";  // SERVER-11428

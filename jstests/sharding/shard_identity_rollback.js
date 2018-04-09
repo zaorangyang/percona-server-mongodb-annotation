@@ -1,7 +1,7 @@
 /**
  * Tests that rolling back the insertion of the shardIdentity document on a shard causes the node
  * rolling it back to shut down.
- * @tags: [requires_persistence, requires_journaling]
+ * @tags: [requires_persistence, requires_journaling, rocks_requires_fcv36]
  */
 
 (function() {

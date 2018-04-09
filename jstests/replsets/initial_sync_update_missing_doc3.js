@@ -11,6 +11,7 @@
  * collection on which the document to be fetched resides as drop pending, thus effectively
  * renaming the collection but preserving the UUID. This ensures the secondary fetches the
  * document by UUID rather than namespace.
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

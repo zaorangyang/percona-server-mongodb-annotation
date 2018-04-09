@@ -1,3 +1,4 @@
+// @tags: [rocks_requires_fcv36]
 var name = "sharding_rs_arb1";
 var replTest = new ReplSetTest({name: name, nodes: 3});
 replTest.startSet();
