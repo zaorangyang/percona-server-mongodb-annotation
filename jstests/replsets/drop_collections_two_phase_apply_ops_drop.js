@@ -1,6 +1,7 @@
 /**
  * Test to ensure that using applyOps to drop a drop-pending collection is a no-op.
  * By definition, a drop-pending collection will be removed by the server eventually.
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

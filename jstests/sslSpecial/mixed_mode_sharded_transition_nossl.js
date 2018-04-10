@@ -4,6 +4,8 @@
  *
  * NOTE: This test is similar to the mixed_mode_sharded_transition.js in the ssl
  * test suite. This suite does not use ssl so it cannot test modes with ssl.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 load('jstests/ssl/libs/ssl_helpers.js');

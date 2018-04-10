@@ -1,4 +1,5 @@
 // perform basic js tests in parallel
+// @tags: [rocks_requires_fcv36]
 load('jstests/libs/parallelTester.js');
 
 Random.setRandomSeed();

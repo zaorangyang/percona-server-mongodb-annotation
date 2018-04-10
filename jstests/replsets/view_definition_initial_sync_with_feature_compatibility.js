@@ -4,7 +4,7 @@
  *
  * We restart the secondary as part of this test with the expectation that it still has the same
  * data after the restart.
- * @tags: [requires_persistence]
+ * @tags: [requires_persistence, rocks_requires_fcv36]
  *
  * TODO SERVER-31588: Remove FCV 3.4 validation during the 3.7 development cycle.
  */

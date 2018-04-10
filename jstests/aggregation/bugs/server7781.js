@@ -1,4 +1,5 @@
 // SERVER-7781 $geoNear pipeline stage
+// @tags: [rocks_requires_fcv36]
 (function() {
     'use strict';
 

@@ -2,6 +2,7 @@
  * Tests that setting the feature compatibility version during initial sync leads to initial sync
  * restarting. This test also ensures that even if initial sync takes two attempts to complete,
  * that the fCV is reset between attempts.
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

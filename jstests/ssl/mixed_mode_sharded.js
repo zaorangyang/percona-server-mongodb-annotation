@@ -1,6 +1,8 @@
 /**
  * This test checks if different mixtures of ssl modes
  * in a sharded cluster can or cannot function
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 load("jstests/ssl/libs/ssl_helpers.js");
 

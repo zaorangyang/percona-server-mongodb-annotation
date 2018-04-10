@@ -1,4 +1,5 @@
 // Test that arrayFilters usage is restricted when the featureCompatibilityVersion is 3.4.
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     "use strict";

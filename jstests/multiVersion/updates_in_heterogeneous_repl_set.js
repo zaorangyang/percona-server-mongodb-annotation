@@ -3,6 +3,7 @@
 // primary. Finally, upgrade the 3.4 member to 3.6, upgrade the replica set to
 // feature compatibility version 3.6, and again update documents with each
 // member as the primary.
+// @tags: [rocks_requires_fcv36]
 
 const testName = "updates_in_heterogeneous_repl_set";
 

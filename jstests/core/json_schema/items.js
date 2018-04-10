@@ -1,4 +1,4 @@
-// @tags: [requires_non_retryable_commands]
+// @tags: [requires_non_retryable_commands, rocks_requires_fcv36]
 
 /**
  * Tests the JSON Schema "items" keyword.

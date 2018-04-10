@@ -1,6 +1,8 @@
 /**
  * Test the upgrade of a standalone replica set from the last-stable to the version succeeds,
  * verifying behavior related to causal consistency at each stage.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

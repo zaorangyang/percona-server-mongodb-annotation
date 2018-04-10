@@ -1,5 +1,7 @@
 /**
  * Test that verifies FTDC works in mongos.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 load('jstests/libs/ftdc.js');
 

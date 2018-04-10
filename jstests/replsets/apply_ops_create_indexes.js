@@ -1,6 +1,7 @@
 /* This test ensures that indexes created by running applyOps are successfully replicated (see
  * SERVER-31435). Both insertion into system.indexes and createIndexes style oplog entries are
  * passed to applyOps here.
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

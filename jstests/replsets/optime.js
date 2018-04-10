@@ -1,4 +1,5 @@
 // Tests tracking of latestOptime and earliestOptime in serverStatus.oplog
+// @tags: [rocks_requires_fcv36]
 
 function timestampCompare(o1, o2) {
     if (o1.t < o2.t) {

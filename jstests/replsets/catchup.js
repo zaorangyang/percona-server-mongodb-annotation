@@ -1,4 +1,5 @@
 // Test the catch-up behavior of new primaries.
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     "use strict";

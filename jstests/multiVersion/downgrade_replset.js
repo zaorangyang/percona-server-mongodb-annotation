@@ -1,5 +1,6 @@
 // Test the downgrade of a replica set from latest version
 // to last-stable version succeeds, while reads and writes continue.
+// @tags: [rocks_requires_fcv36]
 
 load('./jstests/multiVersion/libs/multi_rs.js');
 load('./jstests/libs/test_background_ops.js');

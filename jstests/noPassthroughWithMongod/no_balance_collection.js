@@ -1,4 +1,5 @@
 // Tests whether the noBalance flag disables balancing for collections
+// @tags: [rocks_requires_fcv36]
 
 var st = new ShardingTest({shards: 2, mongos: 1});
 

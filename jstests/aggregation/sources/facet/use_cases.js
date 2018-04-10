@@ -1,5 +1,7 @@
 /**
  * Tests some practical use cases of the $facet stage.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

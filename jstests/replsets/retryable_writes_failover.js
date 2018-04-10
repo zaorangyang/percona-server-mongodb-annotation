@@ -1,6 +1,7 @@
 /**
  * Tests that a retryable write started on one primary can be continued on a different node after
  * failover.
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

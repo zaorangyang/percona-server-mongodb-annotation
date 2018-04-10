@@ -1,6 +1,8 @@
 /**
  * This file tests basic authorization for different roles in stand alone and sharded
  * environment. This file covers all types of operations except commands.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 /**

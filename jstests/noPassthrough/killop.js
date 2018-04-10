@@ -1,4 +1,5 @@
 // Confirms basic killOp execution via mongod and mongos.
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     "use strict";

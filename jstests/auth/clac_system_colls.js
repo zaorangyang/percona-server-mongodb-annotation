@@ -1,5 +1,7 @@
 /**
  * This tests that CLAC (collection level access control) handles system collections properly.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 // Verify that system collections are treated correctly

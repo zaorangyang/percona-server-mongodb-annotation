@@ -1,5 +1,6 @@
 /**
  * Test to ensure that it is OK to run convertToCapped using applyOps on a drop-pending collection.
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

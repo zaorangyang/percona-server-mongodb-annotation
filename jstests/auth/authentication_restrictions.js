@@ -1,5 +1,7 @@
 /**
  * This test checks that authentication restrictions can be set and respected.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 (function() {

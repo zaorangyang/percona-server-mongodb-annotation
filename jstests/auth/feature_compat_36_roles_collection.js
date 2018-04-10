@@ -1,4 +1,5 @@
 // Verify custom roles still exist after a FeatureCompatability upgrade from 3.4 to 3.6
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     'use strict';

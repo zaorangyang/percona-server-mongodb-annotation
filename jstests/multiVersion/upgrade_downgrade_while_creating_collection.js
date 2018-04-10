@@ -1,5 +1,6 @@
 /*
  * Tests that upgrade/downgrade works correctly even while creating a new collection.
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

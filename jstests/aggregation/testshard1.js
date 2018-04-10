@@ -1,3 +1,5 @@
+// @tags: [rocks_requires_fcv36]
+
 load('jstests/aggregation/extras/utils.js');
 load('jstests/libs/analyze_plan.js');  // For planHasStage.
 

@@ -1,6 +1,7 @@
 //
 // Tests migration behavior of large documents
 //
+// @tags: [rocks_requires_fcv36]
 
 var st = new ShardingTest({shards: 2, mongos: 1});
 

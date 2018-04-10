@@ -1,4 +1,4 @@
-
+// @tags: [rocks_requires_fcv36]
 // Checking UUID consistency involves talking to a shard node, which in this test is shutdown
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 

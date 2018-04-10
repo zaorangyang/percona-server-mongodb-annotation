@@ -1,5 +1,6 @@
 /**
  * Tests that a no-op setFeatureCompatibilityVersion request still waits for write concern.
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

@@ -1,4 +1,5 @@
 // validate command line parameter parsing
+// @tags: [rocks_requires_fcv36]
 
 var baseName = "jstests_slowNightly_command_line_parsing";
 

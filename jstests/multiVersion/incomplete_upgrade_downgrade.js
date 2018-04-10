@@ -1,6 +1,8 @@
 /**
  * This test verifies that if mongod exits after setting the FCV document to 3.4 before the
  * collection UUIDs are removed, that re-running the downgrade to 3.4 is possible.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

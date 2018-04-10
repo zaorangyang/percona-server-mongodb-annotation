@@ -2,6 +2,7 @@
 // isMaster with internalClient returns a response with minWireVersion=maxWireVersion. This ensures
 // that an older version mongod/mongos will fail to connect to the node when it is upgraded,
 // upgrading, or downgrading.
+// @tags: [rocks_requires_fcv36]
 (function() {
     "use strict";
 

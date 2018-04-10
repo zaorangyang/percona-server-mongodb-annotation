@@ -1,6 +1,7 @@
 /**
  * Verifies mismatching cluster time objects are rejected by a sharded cluster when auth is on. In
  * noPassthrough because auth is manually set.
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

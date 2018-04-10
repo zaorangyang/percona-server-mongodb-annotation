@@ -1,5 +1,7 @@
 /**
  * Tests the behavior of the _mergeAuthzCollections command.
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 function assertUsersAndRolesHaveRole(admin, role) {

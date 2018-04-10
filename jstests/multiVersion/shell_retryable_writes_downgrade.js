@@ -1,6 +1,7 @@
 /**
  * Tests that the mongo shell doesn't attempt to retry its write operations after downgrading from
  * 3.6 to 3.4.
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";

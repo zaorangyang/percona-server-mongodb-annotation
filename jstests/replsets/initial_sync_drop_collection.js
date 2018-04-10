@@ -1,4 +1,5 @@
 // Test that CollectionCloner completes without error when a collection is dropped during cloning.
+// @tags: [rocks_requires_fcv36]
 
 (function() {
     "use strict";

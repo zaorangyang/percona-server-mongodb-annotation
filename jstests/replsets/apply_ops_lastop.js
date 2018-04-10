@@ -1,6 +1,7 @@
 //
 // Test that last optime is updated properly when the applyOps command fails and there's a no-op.
 // lastOp is used as the optime to wait for when write concern waits for replication.
+// @tags: [rocks_requires_fcv36]
 //
 
 (function() {

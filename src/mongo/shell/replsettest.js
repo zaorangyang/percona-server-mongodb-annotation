@@ -922,6 +922,10 @@ var ReplSetTest = function(opts) {
                     print("Set shouldWaitForKeys from start options: " + shouldWaitForKeys);
                 }
             }
+            if (jsTest.options().storageEngine === "rocksdb") {
+                shouldWaitForKeys = false;
+                print("Set shouldWaitForKeys to false because running tests for MongoRocks!");
+            }
         }
         /**
          * Blocks until the primary node generates cluster time sign keys.

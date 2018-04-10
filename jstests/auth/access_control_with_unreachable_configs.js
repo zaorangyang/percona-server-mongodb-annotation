@@ -2,6 +2,7 @@
 // localhost exception does not apply.  That is, if mongos cannot verify that there
 // are user documents stored in the configuration information, it must assume that
 // there are.
+// @tags: [rocks_requires_fcv36]
 
 var dopts = {smallfiles: "", nopreallocj: ""};
 var st = new ShardingTest({

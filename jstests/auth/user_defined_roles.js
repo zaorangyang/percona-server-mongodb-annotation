@@ -1,6 +1,8 @@
 /**
  * This tests that user defined roles actually grant users the ability to perform the actions they
  * should, and that changing the privileges assigned to roles changes the access granted to the user
+ *
+ * @tags: [rocks_requires_fcv36]
  */
 
 function runTest(conn) {

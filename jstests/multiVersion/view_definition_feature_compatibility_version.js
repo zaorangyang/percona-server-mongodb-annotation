@@ -3,7 +3,7 @@
  * compatibility version is older than 3.6.
  *
  * We restart mongod during the test and expect it to have the same data after restarting.
- * @tags: [requires_persistence]
+ * @tags: [requires_persistence, rocks_requires_fcv36]
  */
 
 (function() {

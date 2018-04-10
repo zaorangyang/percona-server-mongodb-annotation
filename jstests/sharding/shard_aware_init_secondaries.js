@@ -1,7 +1,7 @@
 /**
  * Tests for shard aware initialization on secondaries during startup and shard
  * identity document creation.
- * @tags: [requires_persistence]
+ * @tags: [requires_persistence, rocks_requires_fcv36]
  */
 
 (function() {
