@@ -51,7 +51,6 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/wire_version.h"
@@ -172,9 +171,9 @@ public:
         BSONObjBuilder result;
         appendReplicationInfo(opCtx, result, level);
 
-        auto rbid = ReplicationProcess::get(opCtx)->getRollbackID(opCtx);
-        if (rbid.isOK()) {
-            result.append("rbid", rbid.getValue());
+        auto rbid = ReplicationProcess::get(opCtx)->getRollbackID();
+        if (ReplicationProcess::kUninitializedRollbackId != rbid) {
+            result.append("rbid", rbid);
         }
 
         return result.obj();

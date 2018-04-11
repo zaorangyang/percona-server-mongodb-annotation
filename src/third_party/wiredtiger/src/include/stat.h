@@ -419,6 +419,7 @@ struct __wt_connection_stats {
 	int64_t cache_eviction_pages_queued_urgent;
 	int64_t cache_eviction_pages_queued_oldest;
 	int64_t cache_read;
+	int64_t cache_read_deleted;
 	int64_t cache_read_lookaside;
 	int64_t cache_read_lookaside_skipped;
 	int64_t cache_read_lookaside_delay;
@@ -458,7 +459,13 @@ struct __wt_connection_stats {
 	int64_t cursor_restart;
 	int64_t cursor_search;
 	int64_t cursor_search_near;
+	int64_t cursor_sweep_buckets;
+	int64_t cursor_sweep_closed;
+	int64_t cursor_sweep_examined;
+	int64_t cursor_sweep;
 	int64_t cursor_update;
+	int64_t cursor_cache;
+	int64_t cursor_reopen;
 	int64_t cursor_truncate;
 	int64_t dh_conn_handle_count;
 	int64_t dh_sweep_ref;
@@ -609,7 +616,6 @@ struct __wt_connection_stats {
 	int64_t page_sleep;
 	int64_t page_del_rollback_blocked;
 	int64_t child_modify_blocked_page;
-	int64_t tree_descend_blocked;
 	int64_t txn_commit_queue_empty;
 	int64_t txn_commit_queue_tail;
 	int64_t txn_commit_queue_inserts;
@@ -621,6 +627,9 @@ struct __wt_connection_stats {
 	int64_t txn_read_queue_head;
 	int64_t txn_read_queue_inserts;
 	int64_t txn_read_queue_len;
+	int64_t txn_rollback_to_stable;
+	int64_t txn_rollback_upd_aborted;
+	int64_t txn_rollback_las_removed;
 	int64_t txn_set_ts;
 	int64_t txn_set_ts_commit;
 	int64_t txn_set_ts_commit_upd;
@@ -727,6 +736,7 @@ struct __wt_dsrc_stats {
 	int64_t cache_eviction_deepen;
 	int64_t cache_write_lookaside;
 	int64_t cache_read;
+	int64_t cache_read_deleted;
 	int64_t cache_read_lookaside;
 	int64_t cache_pages_requested;
 	int64_t cache_eviction_pages_seen;
@@ -767,6 +777,8 @@ struct __wt_dsrc_stats {
 	int64_t cursor_insert_bytes;
 	int64_t cursor_remove_bytes;
 	int64_t cursor_update_bytes;
+	int64_t cursor_cache;
+	int64_t cursor_reopen;
 	int64_t cursor_insert;
 	int64_t cursor_modify;
 	int64_t cursor_next;
@@ -793,6 +805,7 @@ struct __wt_dsrc_stats {
 	int64_t rec_pages;
 	int64_t rec_pages_eviction;
 	int64_t rec_page_delete;
+	int64_t session_cursor_cached;
 	int64_t session_compact;
 	int64_t session_cursor_open;
 	int64_t txn_update_conflict;

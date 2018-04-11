@@ -46,7 +46,6 @@
 #include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context_noop.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/service_liason_mock.h"
 #include "mongo/db/sessions_collection_mock.h"
@@ -70,8 +69,6 @@ public:
     AuthorizationSessionForTest* authzSession;
 
     void setUp() {
-        serverGlobalParams.featureCompatibility.setVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
         session = transportLayer.createSession();
         client = serviceContext.makeClient("testClient", session);
         RestrictionEnvironment::set(
@@ -103,6 +100,8 @@ public:
             std::move(localServiceLiason), std::move(localSessionsCollection), nullptr);
 
         LogicalSessionCache::set(&serviceContext, std::move(localLogicalSessionCache));
+        serverGlobalParams.featureCompatibility.setVersion(
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
     }
 
     User* addSimpleUser(UserName un) {
@@ -344,6 +343,26 @@ TEST_F(LogicalSessionIdTest, ConstructorFromClientWithTooLongName) {
     req.setId(id);
 
     ASSERT_THROWS(makeLogicalSessionId(req, _opCtx.get()), AssertionException);
+}
+
+TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_IncompatibleFCV) {
+    serverGlobalParams.featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34);
+
+    addSimpleUser(UserName("simple", "test"));
+    LogicalSessionFromClient lsid;
+    lsid.setId(UUID::gen());
+
+    ASSERT_THROWS_CODE(
+        initializeOperationSessionInfo(
+            _opCtx.get(),
+            BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber" << 100LL << "OtherField"
+                           << "TestField"),
+            true,
+            true,
+            true),
+        AssertionException,
+        ErrorCodes::InvalidOptions);
 }
 
 }  // namespace

@@ -388,8 +388,8 @@ void _logOpsInner(OperationContext* opCtx,
     auto replCoord = ReplicationCoordinator::get(opCtx);
     if (nss.size() && replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet &&
         !replCoord->canAcceptWritesFor(opCtx, nss)) {
-        severe() << "logOp() but can't accept write to collection " << nss.ns();
-        fassertFailed(17405);
+        uasserted(17405,
+                  str::stream() << "logOp() but can't accept write to collection " << nss.ns());
     }
 
     // we jump through a bunch of hoops here to avoid copying the obj buffer twice --
@@ -894,10 +894,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-          BSONObjBuilder resultWeDontCareAbout;
-          return applyOps(opCtx, nsToDatabase(ns), cmd, mode, &resultWeDontCareAbout);
-      },
-      {ErrorCodes::UnknownError}}},
+         BSONObjBuilder resultWeDontCareAbout;
+         return applyOps(opCtx, nsToDatabase(ns), cmd, mode, &resultWeDontCareAbout);
+     }}},
     {"convertToCapped",
      {[](OperationContext* opCtx,
          const char* ns,
@@ -1320,7 +1319,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 UpdateLifecycleImpl updateLifecycle(requestNss);
                 request.setLifecycle(&updateLifecycle);
 
-                const StringData ns = fieldNs.valueStringData();
+                const StringData ns = fieldNs.valuestrsafe();
                 writeConflictRetry(opCtx, "applyOps_upsert", ns, [&] {
                     WriteUnitOfWork wuow(opCtx);
                     // If this is an atomic applyOps (i.e: `haveWrappingWriteUnitOfWork` is true),
@@ -1370,7 +1369,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             timestamp = fieldTs.timestamp();
         }
 
-        const StringData ns = fieldNs.valueStringData();
+        const StringData ns = fieldNs.valuestrsafe();
         auto status = writeConflictRetry(opCtx, "applyOps_update", ns, [&] {
             WriteUnitOfWork wuow(opCtx);
             if (timestamp != Timestamp::min()) {
@@ -1445,7 +1444,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             timestamp = fieldTs.timestamp();
         }
 
-        const StringData ns = fieldNs.valueStringData();
+        const StringData ns = fieldNs.valuestrsafe();
         writeConflictRetry(opCtx, "applyOps_delete", ns, [&] {
             WriteUnitOfWork wuow(opCtx);
             if (timestamp != Timestamp::min()) {
@@ -1599,11 +1598,8 @@ Status applyCommand_inlock(OperationContext* opCtx,
                 break;
             }
             default:
-                if (_oplogCollectionName == masterSlaveOplogName) {
-                    error() << "Failed command " << redact(o) << " on " << nss.db()
-                            << " with status " << status << " during oplog application";
-                } else if (curOpToApply.acceptableErrors.find(status.code()) ==
-                           curOpToApply.acceptableErrors.end()) {
+                if (curOpToApply.acceptableErrors.find(status.code()) ==
+                    curOpToApply.acceptableErrors.end()) {
                     error() << "Failed command " << redact(o) << " on " << nss.db()
                             << " with status " << status << " during oplog application";
                     return status;

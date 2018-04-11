@@ -67,100 +67,6 @@ __row_instantiate(WT_SESSION_IMPL *session,
 }
 
 /*
- * __las_page_skip_locked --
- *	 Check if we can skip reading a locked page with lookaside entries.
- */
-static inline bool
-__las_page_skip_locked(WT_SESSION_IMPL *session, WT_REF *ref)
-{
-	WT_TXN *txn;
-
-	txn = &session->txn;
-
-	/*
-	 * Skip lookaside pages if reading without a timestamp and all the
-	 * updates in lookaside are in the past.
-	 *
-	 * Lookaside eviction preferentially chooses the newest updates when
-	 * creating page images with no stable timestamp. If a stable timestamp
-	 * has been set, we have to visit the page because eviction chooses old
-	 * version of records in that case.
-	 *
-	 * One case where we may need to visit the page is if lookaside eviction
-	 * is active in tree 2 when a checkpoint has started and is working its
-	 * way through tree 1. In that case, lookaside may have created a page
-	 * image with updates in the future of the checkpoint.
-	 *
-	 * We also need to instantiate a lookaside page if this is an update
-	 * operation in progress.
-	 */
-	if (ref->page_las->invalid)
-		return (false);
-
-	if (F_ISSET(txn, WT_TXN_UPDATE))
-		return (false);
-
-	if (!F_ISSET(txn, WT_TXN_HAS_SNAPSHOT))
-		return (false);
-
-	if (WT_TXNID_LE(txn->snap_min, ref->page_las->las_max_txn))
-		return (false);
-
-	if (!F_ISSET(txn, WT_TXN_HAS_TS_READ) && ref->page_las->las_skew_newest)
-		return (true);
-
-#ifdef HAVE_TIMESTAMPS
-	/*
-	 * Skip lookaside pages if reading as of a timestamp, we evicted new
-	 * versions of data and all the updates are in the past.
-	 */
-	if (F_ISSET(&session->txn, WT_TXN_HAS_TS_READ) &&
-	    ref->page_las->las_skew_newest &&
-	    __wt_timestamp_cmp(
-	    &ref->page_las->onpage_timestamp, &session->txn.read_timestamp) < 0)
-		return (true);
-
-	/*
-	 * Skip lookaside pages if reading as of a timestamp, we evicted old
-	 * versions of data and all the updates are in the future.
-	 */
-	if (F_ISSET(&session->txn, WT_TXN_HAS_TS_READ) &&
-	    !ref->page_las->las_skew_newest &&
-	    __wt_timestamp_cmp(
-	    &ref->page_las->min_timestamp, &session->txn.read_timestamp) > 0)
-		return (true);
-#endif
-
-	return (false);
-}
-
-/*
- * __las_page_skip --
- *	 Check if we can skip reading a page with lookaside entries.
- */
-static inline bool
-__las_page_skip(WT_SESSION_IMPL *session, WT_REF *ref)
-{
-	uint32_t previous_state;
-	bool skip;
-
-	if ((previous_state = ref->state) != WT_REF_LIMBO &&
-	    previous_state != WT_REF_LOOKASIDE)
-		return (false);
-
-	if (!__wt_atomic_casv32(&ref->state, previous_state, WT_REF_LOCKED))
-		return (false);
-
-	skip = __las_page_skip_locked(session, ref);
-
-	/* Restore the state and push the change. */
-	ref->state = previous_state;
-	WT_FULL_BARRIER();
-
-	return (skip);
-}
-
-/*
  * __las_page_instantiate_verbose --
  *	Create a verbose message to display at most once per checkpoint when
  *	performing a lookaside table read.
@@ -464,7 +370,7 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	WT_BTREE *btree;
 	WT_DECL_RET;
 	WT_ITEM tmp;
-	WT_PAGE *page;
+	WT_PAGE *notused;
 	size_t addr_size;
 	uint64_t time_start, time_stop;
 	uint32_t page_flags, final_state, new_state, previous_state;
@@ -472,7 +378,6 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	bool timer;
 
 	btree = S2BT(session);
-	page = NULL;
 	time_start = time_stop = 0;
 
 	/*
@@ -521,11 +426,8 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	if (addr == NULL) {
 		WT_ASSERT(session, previous_state != WT_REF_DISK);
 
-		WT_ERR(__wt_btree_new_leaf_page(session, &page));
-		ref->page = page;
-		if (previous_state == WT_REF_LOOKASIDE)
-			goto skip_read;
-		goto done;
+		WT_ERR(__wt_btree_new_leaf_page(session, &ref->page));
+		goto skip_read;
 	}
 
 	/*
@@ -558,7 +460,7 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	    WT_DATA_IN_ITEM(&tmp) ? WT_PAGE_DISK_ALLOC : WT_PAGE_DISK_MAPPED;
 	if (LF_ISSET(WT_READ_IGNORE_CACHE_SIZE))
 		FLD_SET(page_flags, WT_PAGE_EVICT_NO_PROGRESS);
-	WT_ERR(__wt_page_inmem(session, ref, tmp.data, page_flags, &page));
+	WT_ERR(__wt_page_inmem(session, ref, tmp.data, page_flags, &notused));
 	tmp.mem = NULL;
 
 	/*
@@ -571,23 +473,25 @@ __page_read(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags)
 	    ref->page->dsk == NULL ||
 	    F_ISSET(ref->page->dsk, WT_PAGE_LAS_UPDATE));
 
-	/*
-	 * If reading for a checkpoint, there's no additional work to do, the
-	 * page on disk is correct as written.
-	 */
-	if (session->dhandle->checkpoint != NULL) {
-		WT_ASSERT(session, previous_state == WT_REF_DISK);
-		goto done;
-	}
-
 skip_read:
 	switch (previous_state) {
 	case WT_REF_DELETED:
-		/* If the page was deleted, instantiate that information. */
+		/*
+		 * A truncated page may also have lookaside information. The
+		 * delete happened after page eviction (writing the lookaside
+		 * information), first update based on the lookaside table and
+		 * then apply the delete.
+		 */
+		if (ref->page_las != NULL) {
+			WT_ERR(__las_page_instantiate(session, ref, btree->id));
+			ref->page_las->eviction_to_lookaside = false;
+		}
+
+		/* Move all records to a deleted state. */
 		WT_ERR(__wt_delete_page_instantiate(session, ref));
 		break;
 	case WT_REF_LOOKASIDE:
-		if (__las_page_skip_locked(session, ref)) {
+		if (__wt_las_page_skip_locked(session, ref)) {
 			WT_STAT_CONN_INCR(
 			    session, cache_read_lookaside_skipped);
 			ref->page_las->eviction_to_lookaside = true;
@@ -601,22 +505,22 @@ skip_read:
 			WT_STAT_CONN_INCR(session, cache_read_lookaside_delay);
 
 		WT_ERR(__las_page_instantiate(session, ref, btree->id));
-
-		/*
-		 * The page is instantiated so we no longer need the lookaside
-		 * entries. Note we are discarding updates so the page must be
-		 * marked available even if these operations fail.
-		 *
-		 * Don't free WT_REF.page_las, there may be concurrent readers.
-		 */
-		WT_TRET(__wt_las_remove_block(
-		    session, btree->id, ref->page_las->las_pageid));
-
 		ref->page_las->eviction_to_lookaside = false;
 		break;
 	}
 
-done:	WT_PUBLISH(ref->state, final_state);
+	/*
+	 * We no longer need lookaside entries once the page is instantiated.
+	 * There's no reason for the lookaside remove to fail, but ignore it
+	 * if for some reason it fails, we've got a valid page.
+	 *
+	 * Don't free WT_REF.page_las, there may be concurrent readers.
+	 */
+	if (final_state == WT_REF_MEM && ref->page_las != NULL)
+		WT_IGNORE_RET(__wt_las_remove_block(
+		    session, btree->id, ref->page_las->las_pageid));
+
+	WT_PUBLISH(ref->state, final_state);
 	return (ret);
 
 err:	/*
@@ -658,6 +562,13 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 	if (F_ISSET(session, WT_SESSION_IGNORE_CACHE_SIZE))
 		LF_SET(WT_READ_IGNORE_CACHE_SIZE);
 
+	/* Sanity check flag combinations. */
+	WT_ASSERT(session, !LF_ISSET(
+	    WT_READ_DELETED_SKIP | WT_READ_NO_WAIT | WT_READ_LOOKASIDE) ||
+	    LF_ISSET(WT_READ_CACHE));
+	WT_ASSERT(session, !LF_ISSET(WT_READ_DELETED_CHECK) ||
+	    !LF_ISSET(WT_READ_DELETED_SKIP));
+
 	/*
 	 * Ignore reads of pages already known to be in cache, otherwise the
 	 * eviction server can dominate these statistics.
@@ -671,7 +582,9 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 	    force_attempts = 0, sleep_cnt = wait_cnt = 0;;) {
 		switch (current_state = ref->state) {
 		case WT_REF_DELETED:
-			if (LF_ISSET(WT_READ_NO_EMPTY) &&
+			if (LF_ISSET(WT_READ_DELETED_SKIP | WT_READ_NO_WAIT))
+				return (WT_NOTFOUND);
+			if (LF_ISSET(WT_READ_DELETED_CHECK) &&
 			    __wt_delete_page_skip(session, ref, false))
 				return (WT_NOTFOUND);
 			goto read;
@@ -685,7 +598,7 @@ __wt_page_in_func(WT_SESSION_IMPL *session, WT_REF *ref, uint32_t flags
 				 * must be resolved before the tree can be
 				 * discarded.
 				 */
-				if (__las_page_skip(session, ref)) {
+				if (__wt_las_page_skip(session, ref)) {
 					__wt_tree_modify_set(session);
 					return (WT_NOTFOUND);
 				}
@@ -778,7 +691,7 @@ read:			/*
 			if (current_state == WT_REF_LIMBO &&
 			    ((!LF_ISSET(WT_READ_CACHE) ||
 			    LF_ISSET(WT_READ_LOOKASIDE)) &&
-			    !__las_page_skip_locked(session, ref))) {
+			    !__wt_las_page_skip_locked(session, ref))) {
 				WT_RET(__wt_hazard_clear(session, ref));
 				goto read;
 			}
@@ -812,8 +725,7 @@ read:			/*
 				ret = __wt_page_release_evict(session, ref);
 				/* If forced eviction fails, stall. */
 				if (ret == EBUSY) {
-					ret = 0;
-					WT_NOT_READ(ret);
+					WT_NOT_READ(ret, 0);
 					WT_STAT_CONN_INCR(session,
 					    page_forcible_evict_blocked);
 					stalled = true;
@@ -896,7 +808,7 @@ skip_evict:		/*
 			if (cache_work)
 				continue;
 		}
-		__wt_ref_state_yield_sleep(&wait_cnt, &sleep_cnt);
+		__wt_state_yield_sleep(&wait_cnt, &sleep_cnt);
 		WT_STAT_CONN_INCRV(session, page_sleep, sleep_cnt);
 	}
 }

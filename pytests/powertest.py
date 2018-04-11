@@ -623,6 +623,11 @@ def call_remote_operation(local_ops, remote_python, script_name, client_args, op
     return ret, output
 
 
+def is_instance_running(ret, aws_status):
+    """ Return true if instance is in a running state. """
+    return ret == 0 and aws_status.state["Name"] == "running"
+
+
 class Processes(object):
     """Class to create and kill spawned processes."""
 
@@ -1379,12 +1384,16 @@ def wait_for_mongod_shutdown(data_dir, timeout=120):
     return 0
 
 
-def get_mongo_client_args(host=None, port=None, options=None):
+def get_mongo_client_args(host=None,
+                          port=None,
+                          options=None,
+                          server_selection_timeout_ms=600000,
+                          socket_timeout_ms=600000):
     """ Returns keyword arg dict used in PyMongo client. """
-    # Set the serverSelectionTimeoutMS & socketTimeoutMS to 10 minutes
+    # Set the default serverSelectionTimeoutMS & socketTimeoutMS to 10 minutes.
     mongo_args = {
-        "serverSelectionTimeoutMS": 600000,
-        "socketTimeoutMS": 600000
+        "serverSelectionTimeoutMS": server_selection_timeout_ms,
+        "socketTimeoutMS": socket_timeout_ms
     }
     if host:
         mongo_args["host"] = host
@@ -2051,8 +2060,8 @@ Examples:
         save_options = {}
         for opt_group in parser.option_groups:
             for opt in opt_group.option_list:
-                if getattr(options, opt.dest) != opt.default:
-                    save_options[opt.dest] = getattr(options, opt.dest)
+                if getattr(options, opt.dest, None) != opt.default:
+                    save_options[opt.dest] = getattr(options, opt.dest, None)
         LOGGER.info("Config options being saved %s", save_options)
         with open(save_config_options, "w") as ystream:
             yaml.safe_dump(save_options, ystream, default_flow_style=False)
@@ -2127,10 +2136,6 @@ Examples:
     # Required option for non-remote commands.
     if options.ssh_user_host is None and not options.remote_operation:
         parser.error("Missing required argument --sshUserHost")
-
-    # Establish EC2 connection if an instance_id is specified.
-    if options.instance_id:
-        ec2 = aws_ec2.AwsEc2()
 
     secret_port = options.usable_ports[1]
     standard_port = options.usable_ports[0]
@@ -2219,6 +2224,9 @@ Examples:
     orig_canary_doc = canary_doc = ""
     validate_canary_cmd = ""
 
+    # Set the Pymongo connection timeout to 1 hour for canary insert & validation.
+    one_hour_ms = 60 * 60 * 1000
+
     # The remote mongod host comes from the ssh_user_host,
     # which may be specified as user@host.
     ssh_user, ssh_host = get_user_host(options.ssh_user_host)
@@ -2231,6 +2239,20 @@ Examples:
     # see https://stackoverflow.com/questions/10310299/proper-way-to-sudo-over-ssh.
     # Note - the ssh option RequestTTY was added in OpenSSH 5.9, so we use '-tt'.
     ssh_options = "-tt" if options.remote_sudo else None
+
+    # Establish EC2 connection if an instance_id is specified.
+    if options.instance_id:
+        ec2 = aws_ec2.AwsEc2()
+        # Determine address_type if not using 'aws_ec2' crash_method.
+        if options.crash_method != "aws_ec2":
+            address_type = "public_ip_address"
+            ret, aws_status = ec2.control_instance(mode="status", image_id=options.instance_id)
+            if not is_instance_running(ret, aws_status):
+                LOGGER.error("AWS instance is not running:  %d %s", ret, aws_status)
+                sys.exit(1)
+            if (ssh_host == aws_status.private_ip_address or
+                    ssh_host == aws_status.private_dns_name):
+                address_type = "private_ip_address"
 
     # Instantiate the local handler object.
     local_ops = LocalToRemoteOperations(
@@ -2249,7 +2271,7 @@ Examples:
     client_args = ""
     for option in parser._get_all_options():
         if option.dest:
-            option_value = getattr(options, option.dest)
+            option_value = getattr(options, option.dest, None)
             if option_value != option.default:
                 # The boolean options do not require the option_value.
                 if isinstance(option_value, bool):
@@ -2358,10 +2380,10 @@ Examples:
 
         # Optionally validate canary document locally.
         if validate_canary_local:
-            mongo = pymongo.MongoClient(
-                **get_mongo_client_args(host=mongod_host, port=secret_port))
-            ret = mongo_validate_canary(
-                mongo, options.db_name, options.collection_name, canary_doc)
+            mongo = pymongo.MongoClient(**get_mongo_client_args(
+                host=mongod_host, port=secret_port, server_selection_timeout_ms=one_hour_ms,
+                socket_timeout_ms=one_hour_ms))
+            ret = mongo_validate_canary(mongo, options.db_name, options.collection_name, canary_doc)
             LOGGER.info("Local canary validation: %d", ret)
             if ret:
                 sys.exit(ret)
@@ -2472,8 +2494,9 @@ Examples:
         if options.canary:
             canary_doc = {"x": time.time()}
             orig_canary_doc = copy.deepcopy(canary_doc)
-            mongo = pymongo.MongoClient(
-                **get_mongo_client_args(host=mongod_host, port=standard_port))
+            mongo = pymongo.MongoClient(**get_mongo_client_args(
+                host=mongod_host, port=standard_port, server_selection_timeout_ms=one_hour_ms,
+                socket_timeout_ms=one_hour_ms))
             crash_canary["function"] = mongo_insert_canary
             crash_canary["args"] = [
                 mongo,
@@ -2498,7 +2521,7 @@ Examples:
         if options.instance_id:
             ret, aws_status = ec2.control_instance(mode="status", image_id=options.instance_id)
             LOGGER.info("AWS EC2 instance status: %d %s****", ret, aws_status)
-            instance_running = ret == 0 and getattr(aws_status, "state")["Name"] == "running"
+            instance_running = is_instance_running(ret, aws_status)
 
         # The EC2 instance address changes if the instance is restarted.
         if options.crash_method == "aws_ec2" or not instance_running:

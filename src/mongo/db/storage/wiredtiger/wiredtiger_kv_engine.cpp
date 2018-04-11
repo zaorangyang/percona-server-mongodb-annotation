@@ -354,6 +354,9 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     ss << "config_base=false,";
     ss << "statistics=(fast),";
 
+    // We are still using MongoDB's cursor cache, don't double up.
+    ss << "cache_cursors=false,";
+
     // The setting may have a later setting override it if not using the journal.  We make it
     // unconditional here because even nojournal may need this setting if it is a transition
     // from using the journal.
@@ -997,12 +1000,13 @@ bool WiredTigerKVEngine::_hasUri(WT_SESSION* session, const std::string& uri) co
 
 std::vector<std::string> WiredTigerKVEngine::getAllIdents(OperationContext* opCtx) const {
     std::vector<std::string> all;
+    int ret;
     WiredTigerCursor cursor("metadata:", WiredTigerSession::kMetadataTableId, false, opCtx);
     WT_CURSOR* c = cursor.get();
     if (!c)
         return all;
 
-    while (c->next(c) == 0) {
+    while ((ret = c->next(c)) == 0) {
         const char* raw;
         c->get_key(c, &raw);
         StringData key(raw);
@@ -1019,6 +1023,8 @@ std::vector<std::string> WiredTigerKVEngine::getAllIdents(OperationContext* opCt
 
         all.push_back(ident.toString());
     }
+
+    fassert(50663, ret == WT_NOTFOUND);
 
     return all;
 }

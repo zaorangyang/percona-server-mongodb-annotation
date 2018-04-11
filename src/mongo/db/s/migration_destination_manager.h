@@ -87,7 +87,7 @@ public:
     /**
      * Reports the state of the migration manager as a BSON document.
      */
-    void report(BSONObjBuilder& b);
+    void report(BSONObjBuilder& b, OperationContext* opCtx, bool waitForSteadyOrDone);
 
     /**
      * Returns a report on the active migration, if the migration is active. Otherwise return an
@@ -109,6 +109,14 @@ public:
                  const BSONObj& shardKeyPattern,
                  const OID& epoch,
                  const WriteConcernOptions& writeConcern);
+
+    /**
+     * Clones documents from a donor shard.
+     */
+    static void cloneDocumentsFromDonor(
+        OperationContext* opCtx,
+        stdx::function<void(OperationContext*, BSONObjIterator)> insertBatchFn,
+        stdx::function<BSONObj(OperationContext*)> fetchBatchFn);
 
     /**
      * Idempotent method, which causes the current ongoing migration to abort only if it has the
@@ -216,6 +224,9 @@ private:
     std::string _errmsg;
 
     std::unique_ptr<SessionCatalogMigrationDestination> _sessionMigration;
+
+    // Condition variable, which is signalled every time the state of the migration changes.
+    stdx::condition_variable _stateChangedCV;
 };
 
 }  // namespace mongo

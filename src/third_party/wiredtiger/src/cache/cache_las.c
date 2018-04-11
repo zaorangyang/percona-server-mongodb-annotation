@@ -354,6 +354,102 @@ __wt_las_cursor_close(
 }
 
 /*
+ * __wt_las_page_skip_locked --
+ *	 Check if we can skip reading a page with lookaside entries, where
+ * the page is already locked.
+ */
+bool
+__wt_las_page_skip_locked(WT_SESSION_IMPL *session, WT_REF *ref)
+{
+	WT_TXN *txn;
+
+	txn = &session->txn;
+
+	/*
+	 * Skip lookaside pages if reading without a timestamp and all the
+	 * updates in lookaside are in the past.
+	 *
+	 * Lookaside eviction preferentially chooses the newest updates when
+	 * creating page images with no stable timestamp. If a stable timestamp
+	 * has been set, we have to visit the page because eviction chooses old
+	 * version of records in that case.
+	 *
+	 * One case where we may need to visit the page is if lookaside eviction
+	 * is active in tree 2 when a checkpoint has started and is working its
+	 * way through tree 1. In that case, lookaside may have created a page
+	 * image with updates in the future of the checkpoint.
+	 *
+	 * We also need to instantiate a lookaside page if this is an update
+	 * operation in progress.
+	 */
+	if (ref->page_las->invalid)
+		return (false);
+
+	if (F_ISSET(txn, WT_TXN_UPDATE))
+		return (false);
+
+	if (!F_ISSET(txn, WT_TXN_HAS_SNAPSHOT))
+		return (false);
+
+	if (WT_TXNID_LE(txn->snap_min, ref->page_las->las_max_txn))
+		return (false);
+
+	if (!F_ISSET(txn, WT_TXN_HAS_TS_READ) && ref->page_las->las_skew_newest)
+		return (true);
+
+#ifdef HAVE_TIMESTAMPS
+	/*
+	 * Skip lookaside pages if reading as of a timestamp, we evicted new
+	 * versions of data and all the updates are in the past.
+	 */
+	if (F_ISSET(&session->txn, WT_TXN_HAS_TS_READ) &&
+	    ref->page_las->las_skew_newest &&
+	    __wt_timestamp_cmp(
+	    &ref->page_las->onpage_timestamp, &session->txn.read_timestamp) < 0)
+		return (true);
+
+	/*
+	 * Skip lookaside pages if reading as of a timestamp, we evicted old
+	 * versions of data and all the updates are in the future.
+	 */
+	if (F_ISSET(&session->txn, WT_TXN_HAS_TS_READ) &&
+	    !ref->page_las->las_skew_newest &&
+	    __wt_timestamp_cmp(
+	    &ref->page_las->min_timestamp, &session->txn.read_timestamp) > 0)
+		return (true);
+#endif
+
+	return (false);
+}
+
+/*
+ * __wt_las_page_skip --
+ *	 Check if we can skip reading a page with lookaside entries, where the
+ * page needs to be locked before checking.
+ */
+bool
+__wt_las_page_skip(WT_SESSION_IMPL *session, WT_REF *ref)
+{
+	uint32_t previous_state;
+	bool skip;
+
+	if ((previous_state = ref->state) != WT_REF_LIMBO &&
+	    previous_state != WT_REF_LOOKASIDE)
+		return (false);
+
+	if (!__wt_atomic_casv32(&ref->state, previous_state, WT_REF_LOCKED))
+		return (false);
+
+	skip = __wt_las_page_skip_locked(session, ref);
+
+	/* Restore the state and push the change. */
+	ref->state = previous_state;
+	WT_FULL_BARRIER();
+
+	return (skip);
+}
+
+/*
  * __las_remove_block --
  *	Remove all records for a given page from the lookaside store.
  */
@@ -709,7 +805,7 @@ __wt_las_cursor_position(WT_CURSOR *cursor, uint32_t btree_id, uint64_t pageid)
 			 * Because of the special visibility rules for
 			 * lookaside, a new block can appear in between our
 			 * search and the block of interest.  Keep trying while
-			 * we have a key lower that we expect.
+			 * we have a key lower than we expect.
 			 *
 			 * There may be no block of lookaside entries if they
 			 * have been removed by
@@ -897,7 +993,8 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 #else
 	wt_timestamp_t *val_ts;
 #endif
-	uint64_t cnt, decrement_cnt, las_counter, las_pageid, txnid;
+	uint64_t cnt, decrement_cnt, las_counter, las_pageid, saved_pageid;
+	uint64_t las_txnid;
 	uint32_t las_id, session_flags;
 	uint8_t upd_type;
 	int notused;
@@ -911,6 +1008,7 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 	local_txn = locked = false;
 
 	WT_RET(__wt_scr_alloc(session, 0, &saved_key));
+	saved_pageid = 0;
 
 	/*
 	 * Allocate a cursor and wrap all the updates in a transaction.
@@ -963,6 +1061,20 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 
 	/* Walk the file. */
 	while ((ret = cursor->next(cursor)) == 0) {
+		WT_ERR(cursor->get_key(cursor,
+		    &las_pageid, &las_id, &las_counter, &las_key));
+
+		/*
+		 * If we have switched to a different page, clear the saved key.
+		 * Otherwise, sweep could incorrectly remove records after
+		 * seeing a birthmark for a key in one block if the same key is
+		 * at the beginning of the next block.  See WT-3982 for details.
+		 */
+		if (las_pageid != saved_pageid) {
+			saved_key->size = 0;
+			saved_pageid = las_pageid;
+		}
+
 		/*
 		 * Stop if the cache is stuck: we are ignoring the cache size
 		 * while scanning the lookaside table, so we're making things
@@ -979,9 +1091,6 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 			--cnt;
 		else if (saved_key->size == 0)
 			break;
-
-		WT_ERR(cursor->get_key(cursor,
-		    &las_pageid, &las_id, &las_counter, &las_key));
 
 		/*
 		 * If the entry belongs to a dropped tree, discard it.
@@ -1006,7 +1115,7 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 		 * now no longer needed.
 		 */
 		WT_ERR(cursor->get_value(cursor,
-		    &txnid, &las_timestamp, &upd_type, &las_value));
+		    &las_txnid, &las_timestamp, &upd_type, &las_value));
 #ifdef HAVE_TIMESTAMPS
 		WT_ASSERT(session, las_timestamp.size == WT_TIMESTAMP_SIZE);
 		memcpy(&timestamp, las_timestamp.data, las_timestamp.size);
@@ -1020,7 +1129,7 @@ __wt_las_sweep(WT_SESSION_IMPL *session)
 		 * If it is visible then perform additional checks to see
 		 * whether it has aged out of a live file.
 		 */
-		if (!__wt_txn_visible_all(session, txnid, val_ts)) {
+		if (!__wt_txn_visible_all(session, las_txnid, val_ts)) {
 			saved_key->size = 0;
 			continue;
 		}

@@ -115,7 +115,7 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
 
     log(LogComponent::kQuery) << "assertion " << exception->toString() << " ns:" << queryMessage.ns
                               << " query:" << (queryMessage.query.valid(BSONVersion::kLatest)
-                                                   ? queryMessage.query.toString()
+                                                   ? redact(queryMessage.query)
                                                    : "query object is corrupt");
     if (queryMessage.ntoskip || queryMessage.ntoreturn) {
         log(LogComponent::kQuery) << " ntoskip:" << queryMessage.ntoskip
@@ -291,7 +291,7 @@ void appendReplyMetadata(OperationContext* opCtx,
         // Attach our own last opTime.
         repl::OpTime lastOpTimeFromClient =
             repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-        replCoord->prepareReplMetadata(opCtx, request.body, lastOpTimeFromClient, metadataBob);
+        replCoord->prepareReplMetadata(request.body, lastOpTimeFromClient, metadataBob);
         // For commands from mongos, append some info to help getLastError(w) work.
         // TODO: refactor out of here as part of SERVER-18236
         if (isShardingAware || isConfig) {

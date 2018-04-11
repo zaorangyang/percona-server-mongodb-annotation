@@ -72,6 +72,7 @@ static const char * const __stats_dsrc_desc[] = {
 	"cache: page split during eviction deepened the tree",
 	"cache: page written requiring lookaside records",
 	"cache: pages read into cache",
+	"cache: pages read into cache after truncate",
 	"cache: pages read into cache requiring lookaside entries",
 	"cache: pages requested from the cache",
 	"cache: pages seen by eviction walk",
@@ -112,6 +113,8 @@ static const char * const __stats_dsrc_desc[] = {
 	"cursor: cursor-insert key and value bytes inserted",
 	"cursor: cursor-remove key bytes removed",
 	"cursor: cursor-update value bytes updated",
+	"cursor: cursors cached on close",
+	"cursor: cursors reused from cache",
 	"cursor: insert calls",
 	"cursor: modify calls",
 	"cursor: next calls",
@@ -138,6 +141,7 @@ static const char * const __stats_dsrc_desc[] = {
 	"reconciliation: page reconciliation calls",
 	"reconciliation: page reconciliation calls for eviction",
 	"reconciliation: pages deleted",
+	"session: cached cursor count",
 	"session: object compaction",
 	"session: open cursor count",
 	"transaction: update conflicts",
@@ -252,6 +256,7 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
 	stats->cache_eviction_deepen = 0;
 	stats->cache_write_lookaside = 0;
 	stats->cache_read = 0;
+	stats->cache_read_deleted = 0;
 	stats->cache_read_lookaside = 0;
 	stats->cache_pages_requested = 0;
 	stats->cache_eviction_pages_seen = 0;
@@ -292,6 +297,8 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
 	stats->cursor_insert_bytes = 0;
 	stats->cursor_remove_bytes = 0;
 	stats->cursor_update_bytes = 0;
+	stats->cursor_cache = 0;
+	stats->cursor_reopen = 0;
 	stats->cursor_insert = 0;
 	stats->cursor_modify = 0;
 	stats->cursor_next = 0;
@@ -318,6 +325,7 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
 	stats->rec_pages = 0;
 	stats->rec_pages_eviction = 0;
 	stats->rec_page_delete = 0;
+		/* not clearing session_cursor_cached */
 	stats->session_compact = 0;
 		/* not clearing session_cursor_open */
 	stats->txn_update_conflict = 0;
@@ -429,6 +437,7 @@ __wt_stat_dsrc_aggregate_single(
 	to->cache_eviction_deepen += from->cache_eviction_deepen;
 	to->cache_write_lookaside += from->cache_write_lookaside;
 	to->cache_read += from->cache_read;
+	to->cache_read_deleted += from->cache_read_deleted;
 	to->cache_read_lookaside += from->cache_read_lookaside;
 	to->cache_pages_requested += from->cache_pages_requested;
 	to->cache_eviction_pages_seen += from->cache_eviction_pages_seen;
@@ -473,6 +482,8 @@ __wt_stat_dsrc_aggregate_single(
 	to->cursor_insert_bytes += from->cursor_insert_bytes;
 	to->cursor_remove_bytes += from->cursor_remove_bytes;
 	to->cursor_update_bytes += from->cursor_update_bytes;
+	to->cursor_cache += from->cursor_cache;
+	to->cursor_reopen += from->cursor_reopen;
 	to->cursor_insert += from->cursor_insert;
 	to->cursor_modify += from->cursor_modify;
 	to->cursor_next += from->cursor_next;
@@ -500,6 +511,7 @@ __wt_stat_dsrc_aggregate_single(
 	to->rec_pages += from->rec_pages;
 	to->rec_pages_eviction += from->rec_pages_eviction;
 	to->rec_page_delete += from->rec_page_delete;
+	to->session_cursor_cached += from->session_cursor_cached;
 	to->session_compact += from->session_compact;
 	to->session_cursor_open += from->session_cursor_open;
 	to->txn_update_conflict += from->txn_update_conflict;
@@ -624,6 +636,7 @@ __wt_stat_dsrc_aggregate(
 	to->cache_write_lookaside +=
 	    WT_STAT_READ(from, cache_write_lookaside);
 	to->cache_read += WT_STAT_READ(from, cache_read);
+	to->cache_read_deleted += WT_STAT_READ(from, cache_read_deleted);
 	to->cache_read_lookaside += WT_STAT_READ(from, cache_read_lookaside);
 	to->cache_pages_requested +=
 	    WT_STAT_READ(from, cache_pages_requested);
@@ -686,6 +699,8 @@ __wt_stat_dsrc_aggregate(
 	to->cursor_insert_bytes += WT_STAT_READ(from, cursor_insert_bytes);
 	to->cursor_remove_bytes += WT_STAT_READ(from, cursor_remove_bytes);
 	to->cursor_update_bytes += WT_STAT_READ(from, cursor_update_bytes);
+	to->cursor_cache += WT_STAT_READ(from, cursor_cache);
+	to->cursor_reopen += WT_STAT_READ(from, cursor_reopen);
 	to->cursor_insert += WT_STAT_READ(from, cursor_insert);
 	to->cursor_modify += WT_STAT_READ(from, cursor_modify);
 	to->cursor_next += WT_STAT_READ(from, cursor_next);
@@ -719,6 +734,8 @@ __wt_stat_dsrc_aggregate(
 	to->rec_pages += WT_STAT_READ(from, rec_pages);
 	to->rec_pages_eviction += WT_STAT_READ(from, rec_pages_eviction);
 	to->rec_page_delete += WT_STAT_READ(from, rec_page_delete);
+	to->session_cursor_cached +=
+	    WT_STAT_READ(from, session_cursor_cached);
 	to->session_compact += WT_STAT_READ(from, session_compact);
 	to->session_cursor_open += WT_STAT_READ(from, session_cursor_open);
 	to->txn_update_conflict += WT_STAT_READ(from, txn_update_conflict);
@@ -831,6 +848,7 @@ static const char * const __stats_connection_desc[] = {
 	"cache: pages queued for urgent eviction",
 	"cache: pages queued for urgent eviction during walk",
 	"cache: pages read into cache",
+	"cache: pages read into cache after truncate",
 	"cache: pages read into cache requiring lookaside entries",
 	"cache: pages read into cache skipping older lookaside entries",
 	"cache: pages read into cache with skipped lookaside entries needed later",
@@ -870,7 +888,13 @@ static const char * const __stats_connection_desc[] = {
 	"cursor: cursor restarted searches",
 	"cursor: cursor search calls",
 	"cursor: cursor search near calls",
+	"cursor: cursor sweep buckets",
+	"cursor: cursor sweep cursors closed",
+	"cursor: cursor sweep cursors examined",
+	"cursor: cursor sweeps",
 	"cursor: cursor update calls",
+	"cursor: cursors cached on close",
+	"cursor: cursors reused from cache",
 	"cursor: truncate calls",
 	"data-handle: connection data handles currently active",
 	"data-handle: connection sweep candidate became referenced",
@@ -1021,7 +1045,6 @@ static const char * const __stats_connection_desc[] = {
 	"thread-yield: page acquire time sleeping (usecs)",
 	"thread-yield: page delete rollback time sleeping for state change (usecs)",
 	"thread-yield: page reconciliation yielded due to child modification",
-	"thread-yield: tree descend one level yielded for split page index update",
 	"transaction: commit timestamp queue insert to empty",
 	"transaction: commit timestamp queue inserts to tail",
 	"transaction: commit timestamp queue inserts total",
@@ -1033,6 +1056,9 @@ static const char * const __stats_connection_desc[] = {
 	"transaction: read timestamp queue inserts to head",
 	"transaction: read timestamp queue inserts total",
 	"transaction: read timestamp queue length",
+	"transaction: rollback to stable calls",
+	"transaction: rollback to stable updates aborted",
+	"transaction: rollback to stable updates removed from lookaside",
 	"transaction: set timestamp calls",
 	"transaction: set timestamp commit calls",
 	"transaction: set timestamp commit updates",
@@ -1211,6 +1237,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
 	stats->cache_eviction_pages_queued_urgent = 0;
 	stats->cache_eviction_pages_queued_oldest = 0;
 	stats->cache_read = 0;
+	stats->cache_read_deleted = 0;
 	stats->cache_read_lookaside = 0;
 	stats->cache_read_lookaside_skipped = 0;
 	stats->cache_read_lookaside_delay = 0;
@@ -1250,7 +1277,13 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
 	stats->cursor_restart = 0;
 	stats->cursor_search = 0;
 	stats->cursor_search_near = 0;
+	stats->cursor_sweep_buckets = 0;
+	stats->cursor_sweep_closed = 0;
+	stats->cursor_sweep_examined = 0;
+	stats->cursor_sweep = 0;
 	stats->cursor_update = 0;
+	stats->cursor_cache = 0;
+	stats->cursor_reopen = 0;
 	stats->cursor_truncate = 0;
 		/* not clearing dh_conn_handle_count */
 	stats->dh_sweep_ref = 0;
@@ -1401,7 +1434,6 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
 	stats->page_sleep = 0;
 	stats->page_del_rollback_blocked = 0;
 	stats->child_modify_blocked_page = 0;
-	stats->tree_descend_blocked = 0;
 	stats->txn_commit_queue_empty = 0;
 	stats->txn_commit_queue_tail = 0;
 	stats->txn_commit_queue_inserts = 0;
@@ -1413,6 +1445,9 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
 	stats->txn_read_queue_head = 0;
 	stats->txn_read_queue_inserts = 0;
 	stats->txn_read_queue_len = 0;
+	stats->txn_rollback_to_stable = 0;
+	stats->txn_rollback_upd_aborted = 0;
+	stats->txn_rollback_las_removed = 0;
 	stats->txn_set_ts = 0;
 	stats->txn_set_ts_commit = 0;
 	stats->txn_set_ts_commit_upd = 0;
@@ -1627,6 +1662,7 @@ __wt_stat_connection_aggregate(
 	to->cache_eviction_pages_queued_oldest +=
 	    WT_STAT_READ(from, cache_eviction_pages_queued_oldest);
 	to->cache_read += WT_STAT_READ(from, cache_read);
+	to->cache_read_deleted += WT_STAT_READ(from, cache_read_deleted);
 	to->cache_read_lookaside += WT_STAT_READ(from, cache_read_lookaside);
 	to->cache_read_lookaside_skipped +=
 	    WT_STAT_READ(from, cache_read_lookaside_skipped);
@@ -1670,7 +1706,14 @@ __wt_stat_connection_aggregate(
 	to->cursor_restart += WT_STAT_READ(from, cursor_restart);
 	to->cursor_search += WT_STAT_READ(from, cursor_search);
 	to->cursor_search_near += WT_STAT_READ(from, cursor_search_near);
+	to->cursor_sweep_buckets += WT_STAT_READ(from, cursor_sweep_buckets);
+	to->cursor_sweep_closed += WT_STAT_READ(from, cursor_sweep_closed);
+	to->cursor_sweep_examined +=
+	    WT_STAT_READ(from, cursor_sweep_examined);
+	to->cursor_sweep += WT_STAT_READ(from, cursor_sweep);
 	to->cursor_update += WT_STAT_READ(from, cursor_update);
+	to->cursor_cache += WT_STAT_READ(from, cursor_cache);
+	to->cursor_reopen += WT_STAT_READ(from, cursor_reopen);
 	to->cursor_truncate += WT_STAT_READ(from, cursor_truncate);
 	to->dh_conn_handle_count += WT_STAT_READ(from, dh_conn_handle_count);
 	to->dh_sweep_ref += WT_STAT_READ(from, dh_sweep_ref);
@@ -1906,7 +1949,6 @@ __wt_stat_connection_aggregate(
 	    WT_STAT_READ(from, page_del_rollback_blocked);
 	to->child_modify_blocked_page +=
 	    WT_STAT_READ(from, child_modify_blocked_page);
-	to->tree_descend_blocked += WT_STAT_READ(from, tree_descend_blocked);
 	to->txn_commit_queue_empty +=
 	    WT_STAT_READ(from, txn_commit_queue_empty);
 	to->txn_commit_queue_tail +=
@@ -1924,6 +1966,12 @@ __wt_stat_connection_aggregate(
 	to->txn_read_queue_inserts +=
 	    WT_STAT_READ(from, txn_read_queue_inserts);
 	to->txn_read_queue_len += WT_STAT_READ(from, txn_read_queue_len);
+	to->txn_rollback_to_stable +=
+	    WT_STAT_READ(from, txn_rollback_to_stable);
+	to->txn_rollback_upd_aborted +=
+	    WT_STAT_READ(from, txn_rollback_upd_aborted);
+	to->txn_rollback_las_removed +=
+	    WT_STAT_READ(from, txn_rollback_las_removed);
 	to->txn_set_ts += WT_STAT_READ(from, txn_set_ts);
 	to->txn_set_ts_commit += WT_STAT_READ(from, txn_set_ts_commit);
 	to->txn_set_ts_commit_upd +=
