@@ -210,7 +210,8 @@ void FeatureCompatibilityVersion::setIfCleanStartup(OperationContext* opCtx,
     // featureCompatibilityVersion is the downgrade version, so that it can be safely added to a
     // downgrade version cluster. The config server will run setFeatureCompatibilityVersion as part
     // of addShard.
-    const bool storeUpgradeVersion = serverGlobalParams.clusterRole != ClusterRole::ShardServer;
+    const bool storeUpgradeVersion = serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
+                                     opCtx->getServiceContext()->getGlobalStorageEngine()->isFcv36Supported();
 
     UnreplicatedWritesBlock unreplicatedWritesBlock(opCtx);
     NamespaceString nss(FeatureCompatibilityVersion::kCollection);
@@ -237,7 +238,7 @@ void FeatureCompatibilityVersion::setIfCleanStartup(OperationContext* opCtx,
         repl::TimestampedBSONObj{
             BSON("_id" << FeatureCompatibilityVersion::kParameterName
                        << FeatureCompatibilityVersion::kVersionField
-                       << (storeUpgradeVersion && opCtx->getServiceContext()->getGlobalStorageEngine()->isFcv36Supported()
+                       << (storeUpgradeVersion
                                ? FeatureCompatibilityVersionCommandParser::kVersion36
                                : FeatureCompatibilityVersionCommandParser::kVersion34)),
             Timestamp()},
