@@ -421,7 +421,8 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
         // need to have UUIDs added to each collection. These UUIDs are added during InitialSync,
         // because the new node is a secondary.
         if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
-            FeatureCompatibilityVersion::isCleanStartUp()) {
+            FeatureCompatibilityVersion::isCleanStartUp() &&
+            opCtx->getServiceContext()->getGlobalStorageEngine()->isFcv36Supported()) {
             auto schemaStatus = updateUUIDSchemaVersionNonReplicated(opCtx, true);
             if (!schemaStatus.isOK()) {
                 return schemaStatus;
