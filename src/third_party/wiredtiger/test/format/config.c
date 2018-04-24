@@ -149,16 +149,18 @@ config_setup(void)
 	if (DATASOURCE("kvsbdb") && access(KVS_BDB_PATH, R_OK) != 0)
 		testutil_die(errno, "kvsbdb shared library: %s", KVS_BDB_PATH);
 
-	/* Some data-sources don't support user-specified collations. */
-	if (DATASOURCE("kvsbdb"))
+	/*
+	 * Only row-store tables support collation order.
+	 * Some data-sources don't support user-specified collations.
+	 */
+	if (g.type != ROW || DATASOURCE("kvsbdb"))
 		config_single("reverse=off", 0);
 
 	/*
 	 * Periodically, run single-threaded so we can compare the results to
 	 * a Berkeley DB copy, as long as the thread-count isn't nailed down.
-	 * Don't do it on the first run, all our smoke tests would hit it.
 	 */
-	if (!g.replay && g.run_cnt % 20 == 19 && !config_is_perm("threads"))
+	if (!config_is_perm("threads") && mmrand(NULL, 1, 20) == 1)
 		g.c_threads = 1;
 
 	config_checkpoint();
@@ -184,6 +186,13 @@ config_setup(void)
 	/* Check if a minimum cache size has been specified. */
 	if (g.c_cache_minimum != 0 && g.c_cache < g.c_cache_minimum)
 		g.c_cache = g.c_cache_minimum;
+
+	/*
+	 * Turn off truncate for LSM runs (some configurations with truncate
+	 * always results in a timeout).
+	 */
+	if (!config_is_perm("truncate") && DATASOURCE("lsm"))
+			config_single("truncate=off", 0);
 
 	/* Give Helium configuration a final review. */
 	if (DATASOURCE("helium"))
@@ -588,7 +597,7 @@ config_pct(void)
 
 	/* Cursor modify isn't possible for fixed-length column store. */
 	if (g.type == FIX) {
-		if (config_is_perm("modify_pct"))
+		if (config_is_perm("modify_pct") && g.c_modify_pct != 0)
 			testutil_die(EINVAL,
 			    "WT_CURSOR.modify not supported by fixed-length "
 			    "column store");
@@ -603,7 +612,7 @@ config_pct(void)
 	 */
 	if (g.c_isolation_flag == ISOLATION_READ_UNCOMMITTED) {
 		if (config_is_perm("isolation")) {
-			if (config_is_perm("modify_pct"))
+			if (config_is_perm("modify_pct") && g.c_modify_pct != 0)
 				testutil_die(EINVAL,
 				    "WT_CURSOR.modify not supported with "
 				    "read-uncommitted transactions");
@@ -615,10 +624,10 @@ config_pct(void)
 
 	/*
 	 * If the delete percentage isn't nailed down, periodically set it to
-	 * 0 so salvage gets run. Don't do it on the first run, all our smoke
-	 * tests would hit it.
+	 * 0 so salvage gets run and so we can perform stricter sanity checks
+	 * on key ordering.
 	 */
-	if (!config_is_perm("delete_pct") && !g.replay && g.run_cnt % 10 == 9) {
+	if (!config_is_perm("delete_pct") && mmrand(NULL, 1, 10) == 1) {
 		list[CONFIG_DELETE_ENTRY].order = 0;
 		*list[CONFIG_DELETE_ENTRY].vp = 0;
 	}

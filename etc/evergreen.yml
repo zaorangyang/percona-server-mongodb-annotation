@@ -157,7 +157,7 @@ variables:
   ec2_monitor_files: proc.json system.json
   monitor_proc_file: proc.json
   monitor_system_file: system.json
-  remote_dir: powercycle
+  remote_dir: /log/powercycle
   secret_port: "20001"
   security_group_ids: ${powercycle_aws_security_group_id}
   security_groups: mci powercycle_testing
@@ -176,16 +176,16 @@ variables:
   params:
      updates:
      - key: backup_path_after
-       value: /data/afterrecovery
+       value: ${remote_dir}/afterrecovery
      - key: backup_path_before
-       value: /data/beforerecovery
+       value: ${remote_dir}/beforerecovery
      - key: db_path
        value: /data/db
      - key: log_path
        value: ${remote_dir}/mongod.log
 
 - &powercycle_test
-  ec2_artifacts: ${log_path} ${backup_path_after} ${backup_path_before}
+  ec2_artifacts: ${log_path} ${db_path} ${backup_path_after} ${backup_path_before}
   program_options: --logLevel=info --backupPathBefore=${backup_path_before} --backupPathAfter=${backup_path_after}
   connection_options: --sshUserHost=${ip_address} --sshConnection=\"${ssh_identity} ${ssh_connection_options}\"
   test_options: --testLoops=15 --seedDocNum=10000 --rsync --rsyncExcludeFiles=diagnostic.data/metrics.interim* --validate=local --canary=local
@@ -416,26 +416,6 @@ functions:
         git clone https://github.com/facebook/rocksdb.git
         cd rocksdb
         make USE_RTTI=1 CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ static_lib
-        fi
-
-  "build cdriver" :
-    command: shell.exec
-    params:
-      script: |
-        set -o errexit
-        set -o verbose
-        if [ "${build_cdriver|}" = "true" ]; then
-        CDRIVER_VERSION=1.6.3
-        rm -rf mongo-c-driver-$CDRIVER_VERSION
-        rm -rf mongo-c-driver
-        curl -LO https://github.com/mongodb/mongo-c-driver/releases/download/$CDRIVER_VERSION/mongo-c-driver-$CDRIVER_VERSION.tar.gz
-        tar xzf mongo-c-driver-$CDRIVER_VERSION.tar.gz
-        mv mongo-c-driver-$CDRIVER_VERSION mongo-c-driver
-        cd mongo-c-driver
-        export ${compile_env|}
-        ./configure --prefix=$(pwd)/install --build x86_64-apple-darwin --with-libbson=bundled --disable-automatic-init-and-cleanup --disable-ssl --disable-sasl --disable-examples --disable-man-pages --disable-html-docs --disable-shm-counters --disable-shared --enable-static ${cdriver_configure_flags|}
-        make
-        make install
         fi
 
   "build new tools" :
@@ -838,19 +818,6 @@ functions:
 
           ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/idl/run_tests.py
 
-  "run ios sim embedded tests" :
-    command: shell.exec
-    type: test
-    params:
-      working_dir: src
-      script: |
-        set -o verbose
-        set -o errexit
-        if [ ${enable_ios_sim_tests|false} = "true" ]; then
-            ${compile_env|} ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/runiossim.py --test "build/debug/mongo/client/embedded/mongo_embedded_capi_test"
-            ${compile_env|} ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/runiossim.py --test "build/debug/mongo/client/embedded/mongo_embedded_transport_test"
-        fi
-
   "run powercycle test" :
     - command: shell.exec
       params:
@@ -929,10 +896,30 @@ functions:
             ${mongod_extra_options}"
           set +o errexit
           $python -u pytests/powertest.py --configFile=$config_file
+          # SERVER-34033: Figure out why shell.exec exits at this point.
           test_status=$?
-          aws_ec2=$(python buildscripts/aws_ec2.py --imageId ${instance_id} --mode status)
-          echo "Test completed, AMI EC2 instance ${instance_id} status: $aws_ec2"
+          echo "Completed pytests/powertest.py, status: $test_status"
           exit $test_status
+
+    - command: shell.exec
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          if [ ! -f report.json ]; then
+            exit 0
+          fi
+          grep -q "pass" report.json
+          pass=$?
+          # On test success, we only archive mongod.log.
+          if [ $pass -eq 0 ]; then
+            echo "ec2_artifacts: ${log_path}" > ec2_artifacts.yml
+          fi
+
+    - command: expansions.update
+      params:
+        ignore_missing_file: true
+        file: src/ec2_artifacts.yml
 
   "do multiversion setup" :
     command: shell.exec
@@ -947,11 +934,12 @@ functions:
         pip install 'pyOpenSSL ; sys_platform == "win32" or sys_platform == "cygwin"'
 
         rm -rf /data/install /data/multiversion
-        $python buildscripts/setup_multiversion_mongodb.py                  \
-          --installDir /data/install                                        \
-          --linkDir /data/multiversion                                      \
-          --edition ${multiversion_edition|base}                            \
-          --platformArchitecture ${multiversion_platform_arch|linux/x86_64} \
+        $python buildscripts/setup_multiversion_mongodb.py   \
+          --installDir /data/install                         \
+          --linkDir /data/multiversion                       \
+          --edition ${multiversion_edition|base}             \
+          --platform ${multiversion_platform|linux}          \
+          --architecture ${multiversion_architecture|x86_64} \
           --useLatest 3.0 3.2 3.4
 
   "do snmp setup" :
@@ -1188,7 +1176,7 @@ functions:
 
           set -o errexit
           ${activate_virtualenv}
-          pip install boto3
+          pip install boto3==1.5.27
 
           if [ ! -z "${subnet_id}" ]; then
             subnet_id="-n ${subnet_id}"
@@ -1230,7 +1218,7 @@ functions:
         working_dir: src
         script: |
           set -o errexit
-          # Copy mount_data_drive.sh script to remote host.
+          # Copy mount_drives.sh script to remote host.
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
             --verbose                                        \
@@ -1238,7 +1226,7 @@ functions:
             --operation "copy_to"                            \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
-            --file buildscripts/mount_data_drive.sh
+            --file buildscripts/mount_drives.sh
 
     - command: shell.exec
       params:
@@ -1248,9 +1236,9 @@ functions:
           set -o errexit
           # Mount /data on the attached drive(s), more than 1 indicates a RAID set.
           ${set_sudo}
-          script_opts="-d '${device_names}'"
-          if [ ! -z "${raid_device_name}" ]; then
-            script_opts="$script_opts -r ${raid_device_name}"
+          script_opts="-d '${data_device_names}'"
+          if [ ! -z "${raid_data_device_name}" ]; then
+            script_opts="$script_opts -r ${raid_data_device_name}"
           fi
           if [ ! -z "${fstype}" ]; then
             script_opts="$script_opts -t ${fstype}"
@@ -1258,15 +1246,16 @@ functions:
           if [ ! -z "${fs_options}" ]; then
             script_opts="$script_opts -o '${fs_options}'"
           fi
+          # Mount /log on the attached drive.
+          if [ ! -z "${log_device_name}" ]; then
+            script_opts="$script_opts -l '${log_device_name}'"
+            log="/log"
+          fi
           group=$(id -Gn $USER | cut -f1 -d ' ') || true
           user_group="$USER:$group"
           script_opts="$script_opts -u $user_group"
           data_db=/data/db
-          set_permission="chmod 777 $data_db"
-          if [ "Windows_NT" = "$OS" ]; then
-            set_permission="setfacl -s user::rwx,group::rwx,other::rwx $data_db"
-          fi
-          cmds="$sudo bash mount_data_drive.sh $script_opts; $set_permission; ls -ld $data_db; df; mount"
+          cmds="$sudo bash mount_drives.sh $script_opts; ls -ld $data_db $log; df; mount"
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
             --verbose                                        \
@@ -1360,9 +1349,9 @@ functions:
           else
              variant=ubuntu1604
           fi
-          # Download latest version of curator
-          latest_curator_hash=$(git ls-remote https://github.com/mongodb/curator.git | grep HEAD | cut -f1)
-          curator_url="https://s3.amazonaws.com/boxes.10gen.com/build/curator/curator-dist-$variant-$latest_curator_hash.tar.gz"
+          # Download stable version of curator
+          curator_hash=117d1a65256ff78b6d15ab79a1c7088443b936d0
+          curator_url="https://s3.amazonaws.com/boxes.10gen.com/build/curator/curator-dist-$variant-$curator_hash.tar.gz"
           cmds="curl -s $curator_url | tar -xzv"
           if [ "Windows_NT" = "$OS" ]; then
             # Since curator runs as SYSTEM user, ensure the output files can be accessed.
@@ -1643,7 +1632,8 @@ post:
         cmds="$cmds; do base_name=\$(echo \$core_file | sed 's/.*\///')"
         cmds="$cmds;   if [ ! -f \$base_name ]; then mv \$core_file .; fi"
         cmds="$cmds; done"
-        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
+        ${activate_virtualenv}
+        $python buildscripts/remote_operations.py          \
           --verbose                                        \
           --userHost $USER@${ip_address}                   \
           --sshConnectionOptions "$ssh_connection_options" \
@@ -1659,7 +1649,8 @@ post:
         fi
         ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
         remote_dir=${remote_dir|.}
-        ${python|/opt/mongodbtoolchain/v2/bin/python2} buildscripts/remote_operations.py \
+        ${activate_virtualenv}
+        $python buildscripts/remote_operations.py          \
           --verbose                                        \
           --userHost $USER@${ip_address}                   \
           --operation "copy_from"                          \
@@ -1791,13 +1782,32 @@ post:
     params:
       working_dir: src
       script: |
+        set +o errexit
         if [ -d "./build" ]; then
-            file_list=$(find ./build -type f -name "*.gcda")
-            if [ -n "$file_list" ]; then
-                for gcda_file in $file_list; do
-                    /opt/mongodbtoolchain/v2/bin/gcov -i $gcda_file
-                done
-            fi
+          file_list=$(find ./build -type f -name "*.gcda")
+          if [ -n "$file_list" ]; then
+            for gcda_file in $file_list; do
+              echo "Processing file $gcda_file"
+              /opt/mongodbtoolchain/v2/bin/gcov -i $gcda_file
+              base_name=$(echo $gcda_file | rev | cut -f1 -d '/' | cut -f2 -d '.' | rev)
+              gcov_file=$base_name.gcda.gcov
+              if [ -f "$gcov_file" ]; then
+                # Add a prefix to the intermediate file, since it does not have a unique name.
+                # Convert the '/' to '#' in the file path.
+                file_prefix=$(echo $gcda_file | sed -e 's,^\./,,' | rev | cut -f2- -d '/' | rev | tr -s '/' '#')
+                new_gcov_file=$file_prefix#$base_name.gcda.gcov
+                if [ ! -f $new_gcov_file ]; then
+                  echo "Renaming gcov intermediate file $gcov_file to $new_gcov_file"
+                  mv $gcov_file $new_gcov_file
+                else
+                  # We treat this as a fatal condition and remove all of the coverage files.
+                  echo "Not renaming $gcov_file as $new_gcov_file already exists!"
+                  rm -f *.gcda.gcov
+                  exit 1
+                fi
+              fi
+            done
+          fi
         fi
   - command: archive.targz_pack
     params:
@@ -2304,7 +2314,6 @@ tasks:
     - func: "setup credentials"
     - func: "build new tools" # noop if ${newtools} is not "true"
     - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
-    - func: "build cdriver" # noop if ${build_cdriver} is not "true"
     - *generate_compile_expansions
     # Then we load the generated version data into the agent so we can use it in task definitions.
     - *apply_compile_expansions
@@ -2346,10 +2355,6 @@ tasks:
       vars:
         resmoke_args: --suites=unittests
         run_multiple_jobs: true
-
-    # Run the iOS embedded CAPI tests in the iOS simulator
-    # noop if ${run_ios_embedded_tests} is not "true"
-    - func: "run ios sim embedded tests"
 
 ## lint ##
 - name: lint
@@ -2506,6 +2511,8 @@ tasks:
   name: aggregation_fuzzer
   commands:
   - func: "do setup"
+  - func: "set up virtualenv"
+  - func: "do multiversion setup"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 50
@@ -2513,6 +2520,7 @@ tasks:
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
+      task_path_suffix: /data/multiversion
       resmoke_args: --suites=generational_fuzzer --storageEngine=mmapv1
 
 ## jstestfuzz standalone aggregation generational fuzzer WT ##
@@ -2520,6 +2528,8 @@ tasks:
   name: aggregation_fuzzer_WT
   commands:
   - func: "do setup"
+  - func: "set up virtualenv"
+  - func: "do multiversion setup"
   - func: "run jstestfuzz"
     vars:
       jstestfuzz_vars: --numGeneratedFiles 50
@@ -2527,6 +2537,7 @@ tasks:
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
+      task_path_suffix: /data/multiversion
       resmoke_args: --suites=generational_fuzzer --storageEngine=wiredTiger
 
 ## jstestfuzz standalone update generational fuzzer mmapv1 ##
@@ -2773,6 +2784,19 @@ tasks:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=jstestfuzz_sharded_causal_consistency --storageEngine=wiredTiger --numClientsPerFixture=10
 
+## jstestfuzz concurrent sharded cluster continuous stepdown ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_concurrent_sharded_continuous_stepdown
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 25
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz_sharded_continuous_stepdown --storageEngine=wiredTiger --numClientsPerFixture=10
+
 ## jstestfuzz concurrent sharded cluster with logical session mmapv1 ##
 - <<: *jstestfuzz_template
   name: jstestfuzz_concurrent_sharded_session
@@ -2938,6 +2962,19 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=jstestfuzz_sharded_causal_consistency --storageEngine=wiredTiger
+
+## jstestfuzz sharded cluster continuous stepdown ##
+- <<: *jstestfuzz_template
+  name: jstestfuzz_sharded_continuous_stepdown
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 50
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz_sharded_continuous_stepdown --storageEngine=wiredTiger
 
 ## jstestfuzz sharded cluster with logical session mmapv1 ##
 - <<: *jstestfuzz_template
@@ -3980,15 +4017,6 @@ tasks:
       resmoke_args: --suites=concurrency_sharded_causal_consistency_and_balancer --storageEngine=wiredTiger
 
 - <<: *task_template
-  name: concurrency_sharded_with_stepdowns
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    timeout_secs: 21600 # 6 hour timeout for each test
-    vars:
-      resmoke_args: --suites=concurrency_sharded_with_stepdowns --storageEngine=mmapv1
-
-- <<: *task_template
   name: concurrency_sharded_with_stepdowns_WT
   commands:
   - func: "do setup"
@@ -3996,15 +4024,6 @@ tasks:
     timeout_secs: 21600 # 6 hour timeout for each test
     vars:
       resmoke_args: --suites=concurrency_sharded_with_stepdowns --storageEngine=wiredTiger
-
-- <<: *task_template
-  name: concurrency_sharded_with_stepdowns_and_balancer
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    timeout_secs: 21600 # 6 hour timeout for each test
-    vars:
-      resmoke_args: --suites=concurrency_sharded_with_stepdowns_and_balancer --storageEngine=mmapv1
 
 - <<: *task_template
   name: concurrency_sharded_with_stepdowns_and_balancer_WT
@@ -4473,6 +4492,7 @@ tasks:
 
 - name: powercycle_WT
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4493,6 +4513,7 @@ tasks:
 
 - name: powercycle_fcv3.4_WT
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4515,6 +4536,7 @@ tasks:
 
 - name: powercycle_replication_WT
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4535,6 +4557,7 @@ tasks:
 
 - name: powercycle_replication_smalloplog_WT
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4555,6 +4578,7 @@ tasks:
 
 - name: powercycle_syncdelay_WT
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4575,6 +4599,7 @@ tasks:
 
 - name: powercycle_write_concern_majority_WT
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -5105,17 +5130,19 @@ tasks:
 
         # Create the jira credentials configuration file
         cat > ~/.jira.yml <<END_OF_CREDS
-        user: "${testlifecycle_jira_user}"
-        password: "${testlifecycle_jira_password}"
         server: "https://jira.mongodb.org"
+        access_token: "${testlifecycle_jira_access_token}"
+        access_token_secret: "${testlifecycle_jira_access_token_secret}"
+        consumer_key: "${testlifecycle_jira_consumer_key}"
+        key_cert: |
+        $(echo "${testlifecycle_jira_key_certificate}" | sed  's/^/  /')
         END_OF_CREDS
 
         set -o verbose
 
         ${activate_virtualenv}
-
-        # Install Python jira client with pip until it is available in the toolchain
-        pip install jira==1.0.10
+        # Install Python modules to support OAuth with pip until it is available in the toolchain.
+        pip install cryptography==1.7.2 pyjwt==1.5.3
 
         # We use a small batch size to avoid hitting the load balancer timeout if the Evergreen
         # API query is not fast enough.
@@ -5469,91 +5496,6 @@ buildvariants:
   - name: sharding_jscore_passthrough_wire_ops_WT
   - name: tool_WT
 
-- name: ubuntu1204
-  display_name: SSL Ubuntu 12.04
-  run_on:
-  - ubuntu1204-test
-  batchtime: 1440 # 1 day
-  expansions:
-    tooltags: "-tags ssl"
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: x86_64-ubuntu1204
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1204 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform_arch: "ubuntu1204"
-    multiversion_edition: "targeted"
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: x86_64
-    packager_distro: ubuntu1204
-    repo_edition: org
-    use_scons_cache: true
-    build_mongoreplay: true
-  tasks:
-  - name: compile
-    distros:
-    - ubuntu1204-build
-  - name: compile_all
-    distros:
-    - ubuntu1204-build
-  - name: aggregation_WT
-  - name: aggregation_auth
-  - name: auth_WT
-  - name: dbtest_WT
-  - name: disk_WT
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth_WT
-  - name: gle_auth_write_cmd_WT
-  - name: gle_auth_basics_passthrough_WT
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: jsCore # TODO SERVER-32036: Remove when jsCore_auth depends on jsCore_WT.
-  - name: jsCore_WT
-  - name: jsCore_auth
-  - name: jsCore_compatibility_WT
-  - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded_WT
-  - name: mongosTest
-  - name: multiversion_WT
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough_WT
-  - name: parallel_WT
-  - name: parallel_compatibility_WT
-  - name: concurrency_WT
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous_WT
-  - name: replica_sets_WT
-  - name: replica_sets_auth
-  - name: replica_sets_jscore_passthrough_WT
-  - name: master_slave_WT
-  - name: master_slave_auth
-  - name: master_slave_jscore_passthrough_WT
-  - name: sharding_WT
-  - name: sharding_auth
-  - name: sharding_last_stable_mongos_and_mixed_shards
-  - name: slow1_WT
-  - name: serial_run_WT
-  - name: sharding_jscore_passthrough_WT
-  - name: ssl
-  - name: sslSpecial
-  - name: tool_WT
-  - name: package
-    distros:
-    - ubuntu1604-packer
-  - name: push
-
 - name: ubuntu1404
   display_name: SSL Ubuntu 14.04
   run_on:
@@ -5566,8 +5508,8 @@ buildvariants:
     push_name: linux
     push_arch: x86_64-ubuntu1404
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform_arch: "ubuntu1404"
-    multiversion_edition: "targeted"
+    multiversion_platform: ubuntu1404
+    multiversion_edition: targeted
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -5679,8 +5621,8 @@ buildvariants:
     push_arch: x86_64-ubuntu1604
     lang_environment: LANG=C
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform_arch: "ubuntu1604"
-    multiversion_edition: "targeted"
+    multiversion_platform: ubuntu1604
+    multiversion_edition: targeted
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -5757,7 +5699,6 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-arm64-small
   - ubuntu1604-arm64-large
   batchtime: 1440 # 1 day
   expansions:
@@ -5777,13 +5718,12 @@ buildvariants:
     packager_distro: ubuntu1604
     repo_edition: enterprise
     build_mongoreplay: true
+    multiversion_platform: ubuntu1604
+    multiversion_architecture: arm64
+    multiversion_edition: targeted
   tasks:
   - name: compile
-    distros:
-    - ubuntu1604-arm64-large
   - name: compile_all
-    distros:
-    - ubuntu1604-arm64-large
   - name: aggregation_WT
   - name: aggregation_auth
   - name: auth_WT
@@ -5848,7 +5788,6 @@ buildvariants:
 - name: ubuntu1604-arm64
   display_name: SSL Ubuntu 16.04 arm64
   run_on:
-  - ubuntu1604-arm64-small
   - ubuntu1604-arm64-large
   batchtime: 1440 # 1 day
   expansions:
@@ -5868,13 +5807,12 @@ buildvariants:
     packager_distro: ubuntu1604
     repo_edition: org
     build_mongoreplay: true
+    multiversion_platform: ubuntu1604
+    multiversion_architecture: arm64
+    multiversion_edition: targeted
   tasks:
   - name: compile
-    distros:
-    - ubuntu1604-arm64-large
   - name: compile_all
-    distros:
-    - ubuntu1604-arm64-large
   - name: dbtest_WT
   - name: jsCore_WT
   - name: push
@@ -5886,7 +5824,6 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-power8-build
   - ubuntu1604-power8-test
   batchtime: 1440 # 1 day
   expansions:
@@ -5905,6 +5842,9 @@ buildvariants:
     packager_distro: ubuntu1604
     repo_edition: enterprise
     build_mongoreplay: true
+    multiversion_platform: ubuntu1604
+    multiversion_architecture: ppc64le
+    multiversion_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -5967,7 +5907,6 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-zseries-large
   - ubuntu1604-zseries-small
   batchtime: 1440 # 1 day
   stepback: false
@@ -5978,7 +5917,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: s390x-enterprise-ubuntu1604
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: 2
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
@@ -5987,6 +5926,9 @@ buildvariants:
     packager_distro: ubuntu1604
     repo_edition: enterprise
     build_mongoreplay: true
+    multiversion_platform: ubuntu1604
+    multiversion_architecture: s390x
+    multiversion_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -6156,8 +6098,8 @@ buildvariants:
     push_name: linux
     push_arch: x86_64-amazon
     compile_flags: --ssl MONGO_DISTMOD=amazon -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform_arch: "amzn64"
-    multiversion_edition: "enterprise"
+    multiversion_platform: amzn64
+    multiversion_edition: enterprise
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -6388,6 +6330,8 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
+    multiversion_platform: windows
+    multiversion_edition: enterprise
   tasks:
   - name: compile
     requires:
@@ -6466,7 +6410,9 @@ buildvariants:
   - name: compile
     distros:
     - windows-64-vs2015-large
-  # - name: jsCore TODO SERVER-32036: Replace jsCore with jsCore_WT.
+  - name: jsCore_WT
+  - name: replica_sets_WT
+  - name: sharding_WT
 
 - name: windows-64-2k8-ssl-legacy-transportlayer
   display_name: SSL Windows 2008R2 Legacy Transport
@@ -6482,7 +6428,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: win32
     push_arch: x86_64-2008plus-ssl
-    multiversion_platform_arch: windows/x86_64-2008plus-ssl
+    multiversion_platform: windows_x86_64-2008plus-ssl
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=2008plus-ssl CPPPATH="c:/openssl/include" LIBPATH="c:/openssl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
@@ -6588,6 +6534,8 @@ buildvariants:
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling
     ext: zip
     use_scons_cache: true
+    multiversion_platform: windows
+    multiversion_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -6643,7 +6591,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: win32
     push_arch: x86_64-2008plus-ssl
-    multiversion_platform_arch: windows/x86_64-2008plus-ssl
+    multiversion_platform: windows_x86_64-2008plus-ssl
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=2008plus-ssl CPPPATH="c:/openssl/include" LIBPATH="c:/openssl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
@@ -6688,11 +6636,13 @@ buildvariants:
   - name: jstestfuzz_concurrent_replication_session_WT
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_concurrent_sharded_causal_consistency_WT
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_replication_session_WT
   - name: jstestfuzz_sharded_WT
   - name: jstestfuzz_sharded_causal_consistency_WT
+  - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session_WT
   - name: master_slave_WT
   - name: master_slave_jscore_passthrough_WT
@@ -6705,17 +6655,9 @@ buildvariants:
   - name: parallel_WT
   - name: parallel_compatibility_WT
   - name: powercycle_WT
-    distros:
-    - windows-64-vs2015-large
   - name: powercycle_fcv3.4_WT
-    distros:
-    - windows-64-vs2015-large
   - name: powercycle_replication_WT
-    distros:
-    - windows-64-vs2015-large
   - name: powercycle_syncdelay_WT
-    distros:
-    - windows-64-vs2015-large
   - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: replica_sets_WT
@@ -6793,7 +6735,7 @@ buildvariants:
     gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
-    multiversion_platform_arch: "osx-ssl"
+    multiversion_platform: osx-ssl
     num_jobs_available: 1
     build_mongoreplay: true
   tasks:
@@ -6835,11 +6777,13 @@ buildvariants:
   - name: jstestfuzz_concurrent_replication_session_WT
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_concurrent_sharded_causal_consistency_WT
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_replication_session_WT
   - name: jstestfuzz_sharded_WT
   - name: jstestfuzz_sharded_causal_consistency_WT
+  - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session_WT
   - name: master_slave_WT
   - name: master_slave_jscore_passthrough_WT
@@ -6922,6 +6866,8 @@ buildvariants:
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
     num_jobs_available: 1
     build_mongoreplay: true
+    multiversion_platform: osx
+    multiversion_edition: enterprise
   tasks:
   - name: compile
   - name: compile_all
@@ -6946,59 +6892,6 @@ buildvariants:
     distros:
     - rhel70-small
 
-- name: ios-102-debug
-  display_name: "iOS 10.2 DEBUG"
-  run_on:
-  - macos-1012
-  batchtime: 1440 # 1 day
-  expansions:
-    build_cdriver: true
-    cdriver_configure_flags: --host arm-apple-darwin CC="$(xcrun -f --sdk iphoneos clang)" CXX="$(xcrun -f --sdk iphoneos clang++)" CPPFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 -fembed-bitcode"  CFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 -fembed-bitcode" CXXFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 -fembed-bitcode" LDFLAGS="-miphoneos-version-min=10.2 -arch arm64"
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_ios.vars  CPPPATH="$(dirname $PWD)/mongo-c-driver/install/include/libbson-1.0 $(dirname $PWD)/mongo-c-driver/install/include/libmongoc-1.0" LIBPATH="$(dirname $PWD)/mongo-c-driver/install/lib" all
-    disable_unit_tests: true
-  tasks:
-  - name: compile_all
-
-- name: ios-sim-102-debug
-  display_name: "iOS Simulator 10.2 DEBUG"
-  run_on:
-  - macos-1012
-  batchtime: 1440 # 1 day
-  expansions:
-    build_cdriver: true
-    cdriver_configure_flags: --host x86_64-apple-darwin16.6.0 CC="$(xcrun -f --sdk iphonesimulator clang)" CXX="$(xcrun -f --sdk iphonesimulator clang++)" CPPFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"  CFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2" CXXFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2" LDFLAGS="-miphoneos-version-min=10.2"
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_ios_sim.vars CPPPATH="$(dirname $PWD)/mongo-c-driver/install/include/libbson-1.0 $(dirname $PWD)/mongo-c-driver/install/include/libmongoc-1.0" LIBPATH="$(dirname $PWD)/mongo-c-driver/install/lib" all
-    disable_unit_tests: true
-    enable_ios_sim_tests: true
-  tasks:
-  - name: compile_all
-
-- name: tvos-101-debug
-  display_name: "tvOS 10.1 DEBUG"
-  run_on:
-  - macos-1012
-  batchtime: 1440 # 1 day
-  expansions:
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_tvos.vars all
-    disable_unit_tests: true
-  tasks:
-  - name: compile_all
-
-- name: tvos-sim-101-debug
-  display_name: "tvOS Simulator 10.1 DEBUG"
-  run_on:
-  - macos-1012
-  batchtime: 1440 # 1 day
-  expansions:
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_tvos_sim.vars all
-    disable_unit_tests: true
-  tasks:
-  - name: compile_all
-
 ###########################################
 #          Redhat buildvariants           #
 ###########################################
@@ -7018,8 +6911,8 @@ buildvariants:
     push_arch: x86_64-enterprise-rhel62
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
-    multiversion_platform_arch: "rhel62"
-    multiversion_edition: "targeted"
+    multiversion_platform: rhel62
+    multiversion_edition: targeted
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager-enterprise.py
@@ -7095,12 +6988,14 @@ buildvariants:
   - name: jstestfuzz_concurrent_replication_session_WT
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_concurrent_sharded_causal_consistency_WT
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_replication_initsync_WT
   - name: jstestfuzz_replication_session_WT
   - name: jstestfuzz_sharded_WT
   - name: jstestfuzz_sharded_causal_consistency_WT
+  - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session_WT
   - name: master_slave_WT
   - name: master_slave_auth
@@ -7218,8 +7113,8 @@ buildvariants:
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     tooltags: "-tags 'ssl sasl'"
     compile_flags: --dbg=on --gcov --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform_arch: "rhel62"
-    multiversion_edition: "targeted"
+    multiversion_platform: rhel62
+    multiversion_edition: targeted
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 2)) # Avoid starting too many mongod's
     # The gcov instrumentation saves the path the .gcno files were created in as the default path
     # for the .gcda files. In Evergreen the path will start with /data/mci/[Hashed ID]/src/... where
@@ -7415,8 +7310,8 @@ buildvariants:
     push_name: linux
     push_arch: x86_64-rhel62
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform_arch: "rhel62"
-    multiversion_edition: "targeted"
+    multiversion_platform: rhel62
+    multiversion_edition: targeted
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -7501,8 +7396,8 @@ buildvariants:
     push_name: linux
     push_arch: x86_64-rhel70
     compile_flags: --ssl MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform_arch: "rhel70"
-    multiversion_edition: "targeted"
+    multiversion_platform: rhel70
+    multiversion_edition: targeted
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -7587,7 +7482,6 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel71-power8-build
   - rhel71-power8-test
   batchtime: 1440 # 1 day
   stepback: false
@@ -7608,6 +7502,9 @@ buildvariants:
     push_arch: ppc64le-enterprise-rhel71
     repo_edition: enterprise
     build_mongoreplay: true
+    multiversion_platform: rhel71
+    multiversion_architecture: ppc64le
+    multiversion_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -7695,7 +7592,6 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel72-zseries-build
   - rhel72-zseries-test
   batchtime: 2880 # 2 days
   stepback: false
@@ -7715,6 +7611,9 @@ buildvariants:
     push_arch: s390x-enterprise-rhel72
     repo_edition: enterprise
     build_mongoreplay: true
+    multiversion_platform: rhel72
+    multiversion_architecture: s390x
+    multiversion_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -7802,7 +7701,6 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel67-zseries-build
   - rhel67-zseries-test
   batchtime: 1440 # 1 day
   stepback: false
@@ -7933,66 +7831,11 @@ buildvariants:
   - name: write_concern_majority_passthrough_WT
   - name: push
     distros:
-    - rhel70
     - rhel62-large
 
 ###########################################
 #          Ubuntu buildvariants           #
 ###########################################
-
-- name: enterprise-ubuntu1204-64
-  display_name: Enterprise Ubuntu 12.04
-  modules:
-  - enterprise
-  run_on:
-  - ubuntu1204-test
-  batchtime: 1440 # 1 day
-  expansions:
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
-    push_path: linux
-    push_bucket: downloads.10gen.com
-    push_name: linux
-    push_arch: x86_64-enterprise-ubuntu1204
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1204 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    has_packages: true
-    packager_script: packager-enterprise.py
-    packager_arch: x86_64
-    packager_distro: ubuntu1204
-    repo_edition: enterprise
-    use_scons_cache: true
-    build_mongoreplay: true
-  tasks:
-  - name: compile
-    distros:
-    - ubuntu1204-build
-  - name: compile_all
-    distros:
-    - ubuntu1204-build
-  - name: audit_WT
-  - name: dbtest_WT
-  - name: ese_WT
-  - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
-  - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded_WT
-  - name: replica_sets_auth
-  - name: sasl
-  - name: sharding_auth
-  - name: snmp_WT
-  - name: ssl
-  - name: sslSpecial
-  - name: package
-    distros:
-    - ubuntu1604-packer
-  - name: push
-
 
 - name: enterprise-ubuntu1404-64
   display_name: Enterprise Ubuntu 14.04
@@ -8211,7 +8054,6 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - suse12-zseries-build
   - suse12-zseries-test
   batchtime: 1440 # 1 day
   stepback: false
@@ -8222,7 +8064,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: s390x-enterprise-suse12
-    compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
@@ -8231,6 +8073,9 @@ buildvariants:
     packager_distro: suse12
     repo_edition: enterprise
     build_mongoreplay: true
+    multiversion_platform: suse12
+    multiversion_architecture: s390x
+    multiversion_edition: targeted
   tasks:
   - name: compile
     distros:
@@ -8327,8 +8172,8 @@ buildvariants:
     push_arch: x86_64-suse12
     compile_flags: --ssl MONGO_DISTMOD=suse12 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    multiversion_platform_arch: "suse12"
-    multiversion_edition: "targeted"
+    multiversion_platform: suse12
+    multiversion_edition: targeted
     has_packages: true
     packager_script: packager.py
     packager_arch: x86_64
@@ -8343,244 +8188,6 @@ buildvariants:
   - name: compile_all
     distros:
     - suse12-build
-  - name: aggregation_WT
-  - name: aggregation_auth
-  - name: auth_WT
-  - name: dbtest_WT
-  - name: disk_WT
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth_WT
-  - name: gle_auth_write_cmd_WT
-  - name: gle_auth_basics_passthrough_WT
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: jsCore # TODO SERVER-32036: Remove when jsCore_auth depends on jsCore_WT.
-  - name: jsCore_WT
-  - name: jsCore_auth
-  - name: jsCore_compatibility_WT
-  - name: aggregation_fuzzer_WT
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded_WT
-  - name: mongosTest
-  - name: multiversion_WT
-  - name: noPassthrough_WT
-  - name: noPassthroughWithMongod_WT
-  - name: bulk_gle_passthrough_WT
-  - name: parallel_WT
-  - name: parallel_compatibility_WT
-  - name: concurrency_WT
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous_WT
-  - name: replica_sets_WT
-  - name: replica_sets_auth
-  - name: replica_sets_jscore_passthrough_WT
-  - name: master_slave_WT
-  - name: master_slave_auth
-  - name: master_slave_jscore_passthrough_WT
-  - name: sharding_WT
-  - name: sharding_auth
-  - name: sharding_last_stable_mongos_and_mixed_shards
-  - name: slow1_WT
-  - name: serial_run_WT
-  - name: sharding_jscore_passthrough_WT
-  - name: ssl
-  - name: sslSpecial
-  - name: tool_WT
-  - name: package
-    distros:
-    - ubuntu1604-packer
-  - name: push
-
-
-- name: enterprise-suse11-64
-  display_name: Enterprise SLES 11
-  modules:
-  - enterprise
-  run_on:
-  - suse11-test
-  batchtime: 1440 # 1 day
-  expansions:
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
-    push_path: linux
-    push_bucket: downloads.10gen.com
-    push_name: linux
-    push_arch: x86_64-enterprise-suse11
-    compile_flags: --ssl MONGO_DISTMOD=suse11 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    has_packages: true
-    packager_script: packager-enterprise.py
-    packager_arch: x86_64
-    packager_distro: suse11
-    repo_edition: enterprise
-    use_scons_cache: true
-  tasks:
-  - name: compile
-    distros:
-    - suse11-build
-  - name: compile_all
-    distros:
-    - suse11-build
-  - name: audit_WT
-  - name: dbtest_WT
-  - name: ese_WT
-  - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
-  - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded_WT
-  - name: replica_sets_auth
-  - name: sasl
-  - name: sharding_auth
-  - name: snmp_WT
-  - name: ssl
-  - name: sslSpecial
-  - name: package
-    distros:
-    - ubuntu1604-packer
-  - name: push
-
-- name: enterprise-suse11-s390x
-  display_name: Enterprise SLES 11 s390x
-  modules:
-  - enterprise
-  run_on:
-  - suse11-zseries-build
-  batchtime: 1440 # 1 day
-  stepback: false
-  expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
-    push_path: linux
-    push_bucket: downloads.10gen.com
-    push_name: linux
-    push_arch: s390x-enterprise-suse11
-    compile_flags: --ssl MONGO_DISTMOD=suse11 --release -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_gcc.vars --use-s390x-crc32=off
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    has_packages: true
-    packager_script: packager-enterprise.py
-    packager_arch: s390x
-    packager_distro: suse11
-    repo_edition: enterprise
-  tasks:
-  - name: compile
-  - name: compile_all
-  - name: aggregation_WT
-  - name: aggregation_WT_ese
-  - name: aggregation_auth
-  - name: aggregation_read_concern_majority_passthrough_WT
-  - name: aggregation_sharded_collections_passthrough_WT
-  - name: audit_WT
-  - name: auth_WT
-  - name: auth_audit_WT
-  - name: bulk_gle_passthrough_WT
-  - name: concurrency_WT
-  - name: concurrency_replication_WT
-  - name: concurrency_sharded_WT
-  - name: concurrency_simultaneous_WT
-  - name: dbtest_WT
-  - name: ese_WT
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth_WT
-  - name: gle_auth_basics_passthrough_WT
-  - name: gle_auth_basics_passthrough_write_cmd_WT
-  - name: gle_auth_write_cmd_WT
-  - name: integration_tests_replset
-  - name: integration_tests_sharded
-  - name: integration_tests_standalone
-  - name: jsCore_WT
-  - name: jsCore_WT_ese
-  - name: jsCore_compatibility_WT
-  - name: jsCore_decimal_WT
-  - name: jsCore_op_query_WT
-  - name: aggregation_fuzzer_WT
-  - name: jstestfuzz_WT
-  - name: jstestfuzz_concurrent_WT
-  - name: jstestfuzz_concurrent_replication_WT
-  - name: jstestfuzz_concurrent_sharded_WT
-  - name: jstestfuzz_replication_WT
-  - name: jstestfuzz_sharded_WT
-  - name: mongosTest
-  - name: noPassthroughWithMongod_WT
-  - name: noPassthrough_WT
-  - name: parallel_WT
-  - name: parallel_compatibility_WT
-  - name: read_concern_linearizable_passthrough_WT
-  - name: read_concern_majority_passthrough_WT
-  - name: replica_sets_WT
-  - name: replica_sets_WT_ese
-  - name: replica_sets_auth
-  - name: replica_sets_pv0
-  - name: replica_sets_jscore_passthrough_WT
-  - name: master_slave_WT
-  - name: master_slave_auth
-  - name: master_slave_jscore_passthrough_WT
-  - name: sasl
-  - name: sharded_collections_jscore_passthrough_WT
-  - name: sharding_WT
-  - name: sharding_WT_ese
-  - name: sharding_auth
-  - name: sharding_auth_audit_WT
-  - name: sharding_csrs_continuous_config_stepdown_WT
-  - name: sharding_gle_auth_basics_passthrough_WT
-  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
-  - name: sharding_jscore_passthrough_WT
-  - name: sharding_jscore_op_query_passthrough_WT
-  - name: sharding_jscore_passthrough_wire_ops_WT
-  - name: sharding_op_query_WT
-  - name: slow1_WT
-  - name: serial_run_WT
-  - name: snmp_WT
-  - name: ssl
-  - name: sslSpecial
-  - name: tool_WT
-  - name: write_concern_majority_passthrough_WT
-  - name: push
-    distros:
-    - suse11-test
-
-- name: suse11
-  display_name: SSL SUSE 11
-  run_on:
-  - suse11-test
-  batchtime: 1440 # 1 day
-  expansions:
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags ssl"
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: x86_64-suse11
-    compile_flags: --ssl MONGO_DISTMOD=suse11 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform_arch: "suse11"
-    multiversion_edition: "targeted"
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: x86_64
-    packager_distro: suse11
-    repo_edition: org
-    use_scons_cache: true
-  tasks:
-  - name: compile
-    distros:
-    - suse11-build
-  - name: compile_all
-    distros:
-    - suse11-build
   - name: aggregation_WT
   - name: aggregation_auth
   - name: auth_WT
@@ -8762,8 +8369,8 @@ buildvariants:
     push_name: linux
     push_arch: x86_64-debian71
     compile_flags: --ssl MONGO_DISTMOD=debian71 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform_arch: "debian71"
-    multiversion_edition: "targeted"
+    multiversion_platform: debian71
+    multiversion_edition: targeted
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -8851,8 +8458,8 @@ buildvariants:
     push_name: linux
     push_arch: x86_64-debian81
     compile_flags: --ssl MONGO_DISTMOD=debian81 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform_arch: "debian81"
-    multiversion_edition: "targeted"
+    multiversion_platform: debian81
+    multiversion_edition: targeted
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -8944,8 +8551,8 @@ buildvariants:
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
-    multiversion_platform_arch: "rhel62"
-    multiversion_edition: "enterprise"
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     use_scons_cache: true
     build_mongoreplay: true
@@ -8977,8 +8584,8 @@ buildvariants:
   - name: concurrency_sharded
   - name: concurrency_sharded_causal_consistency
   - name: concurrency_sharded_causal_consistency_and_balancer
-  - name: concurrency_sharded_with_stepdowns
-  - name: concurrency_sharded_with_stepdowns_and_balancer
+  - name: concurrency_sharded_with_stepdowns_WT
+  - name: concurrency_sharded_with_stepdowns_and_balancer_WT
   - name: concurrency_simultaneous
   - name: dbtest
   - name: failpoints
@@ -9002,10 +8609,12 @@ buildvariants:
   - name: jstestfuzz_concurrent_replication_session_WT
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_concurrent_sharded_causal_consistency_WT
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_replication_session_WT
   - name: jstestfuzz_sharded_WT
+  - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session_WT
   - name: jstestfuzz_sharded_causal_consistency_WT
   - name: master_slave_WT
@@ -9136,7 +8745,6 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel71-power8-build
   - rhel71-power8-test
   batchtime: 10080 # 7 days
   stepback: false
@@ -9220,7 +8828,6 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel72-zseries-build
   - rhel72-zseries-test
   batchtime: 10080 # 7 days
   stepback: false
@@ -9347,8 +8954,8 @@ buildvariants:
     lang_environment: LANG=C
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
-    multiversion_platform_arch: "ubuntu1604"
-    multiversion_edition: "targeted"
+    multiversion_platform: ubuntu1604
+    multiversion_edition: targeted
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
     build_mongoreplay: true
     hang_analyzer_dump_core: false
@@ -9479,11 +9086,13 @@ buildvariants:
   - name: jstestfuzz_concurrent_replication_session_WT
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_concurrent_sharded_causal_consistency_WT
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_replication_session_WT
   - name: jstestfuzz_sharded_WT
   - name: jstestfuzz_sharded_causal_consistency_WT
+  - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session_WT
 
 - name: ubuntu1604-debug-ubsan
@@ -9502,8 +9111,8 @@ buildvariants:
     lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
-    multiversion_platform_arch: "ubuntu1604"
-    multiversion_edition: "targeted"
+    multiversion_platform: ubuntu1604
+    multiversion_edition: targeted
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under UBSAN build.
     build_mongoreplay: true
   tasks:
@@ -9894,7 +9503,7 @@ buildvariants:
       --variables-files=etc/scons/mongodbtoolchain_gcc.vars
       CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include"
       --use-basis-tech-rosette-linguistics-platform=on
-    multiversion_platform_arch: rhel62
+    multiversion_platform: rhel62
     multiversion_edition: targeted
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
@@ -9916,8 +9525,6 @@ buildvariants:
   - name: concurrency_sharded
   - name: concurrency_sharded_causal_consistency
   - name: concurrency_sharded_causal_consistency_and_balancer
-  - name: concurrency_sharded_with_stepdowns
-  - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
   - name: dbtest
   - name: disk
@@ -9937,6 +9544,7 @@ buildvariants:
   - name: jstestfuzz_concurrent_replication_session
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_causal_consistency
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_initsync
@@ -9944,6 +9552,7 @@ buildvariants:
   - name: jstestfuzz_replication_session
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_causal_consistency
+  - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session
   - name: master_slave
   - name: master_slave_jscore_passthrough
@@ -10008,8 +9617,8 @@ buildvariants:
     gorootvars: >-
       PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH"
       CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"
-    multiversion_platform_arch: windows
-    multiversion_edition: "enterprise"
+    multiversion_platform: windows
+    multiversion_edition: enterprise
     msi_target: msi
     content_type: application/zip
     compile_flags: >-
@@ -10044,12 +9653,6 @@ buildvariants:
   - name: concurrency_sharded_causal_consistency_and_balancer
     distros:
     - windows-64-vs2015-large
-  - name: concurrency_sharded_with_stepdowns
-    distros:
-    - windows-64-vs2015-large
-  - name: concurrency_sharded_with_stepdowns_and_balancer
-    distros:
-    - windows-64-vs2015-large
   - name: concurrency_simultaneous
     distros:
     - windows-64-vs2015-large
@@ -10071,6 +9674,7 @@ buildvariants:
   - name: jstestfuzz_concurrent_replication_session
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_causal_consistency
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_initsync
@@ -10078,6 +9682,7 @@ buildvariants:
   - name: jstestfuzz_replication_session
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_causal_consistency
+  - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session
   - name: master_slave
   - name: master_slave_jscore_passthrough
@@ -10141,8 +9746,8 @@ buildvariants:
     compile_flags: >-
       --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10"
       LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
-    multiversion_platform_arch: "osx"
-    multiversion_edition: "enterprise"
+    multiversion_platform: osx
+    multiversion_edition: enterprise
     num_jobs_available: 1
     build_mongoreplay: true
   tasks:
@@ -10157,8 +9762,6 @@ buildvariants:
   - name: concurrency_sharded
   - name: concurrency_sharded_causal_consistency
   - name: concurrency_sharded_causal_consistency_and_balancer
-  - name: concurrency_sharded_with_stepdowns
-  - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
   - name: dbtest
   - name: disk
@@ -10178,6 +9781,7 @@ buildvariants:
   - name: jstestfuzz_concurrent_replication_session
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_causal_consistency
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_initsync
@@ -10185,6 +9789,7 @@ buildvariants:
   - name: jstestfuzz_replication_session
   - name: jstestfuzz_sharded
   - name: jstestfuzz_sharded_causal_consistency
+  - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session
   - name: master_slave
   - name: master_slave_jscore_passthrough
@@ -10211,3 +9816,65 @@ buildvariants:
   - name: slow1
   - name: tool
   - name: update_fuzzer
+
+- name: linux-64-duroff-mmapv1
+  display_name: Linux (No Journal) MMAPv1
+  run_on:
+  - rhel62-small
+  batchtime: 1440 # 1 day
+  expansions:
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux-duroff
+    push_arch: x86_64
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    test_flags: --nojournal --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,requires_journaling
+    use_scons_cache: true
+    build_mongoreplay: false
+  tasks:
+  - name: compile
+    distros:
+    - rhel62-large
+  - name: compile_all
+    distros:
+    - rhel62-large
+  - name: aggregation
+  - name: aggregation_fuzzer
+  - name: auth
+  - name: bulk_gle_passthrough
+  - name: concurrency
+  - name: concurrency_replication
+  - name: concurrency_sharded
+  - name: concurrency_simultaneous
+  - name: dbtest
+  - name: disk
+  - name: durability
+  - name: dur_jscore_passthrough
+  - name: failpoints
+  - name: failpoints_auth
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jstestfuzz
+  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_concurrent_replication
+  - name: jstestfuzz_concurrent_sharded
+  - name: jstestfuzz_replication
+  - name: jstestfuzz_sharded
+  - name: master_slave
+  - name: master_slave_jscore_passthrough
+  - name: mmap
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: replica_sets
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: serial_run
+  - name: sharding
+  - name: sharding_auth
+  - name: sharding_jscore_passthrough
+  - name: slow1
+  - name: tool

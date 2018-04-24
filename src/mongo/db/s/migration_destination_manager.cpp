@@ -62,12 +62,10 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/producer_consumer_queue.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-using std::string;
-using str::stream;
-
 namespace {
 
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
@@ -82,7 +80,7 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
 /**
  * Returns a human-readabale name of the migration manager's state.
  */
-string stateToString(MigrationDestinationManager::State state) {
+std::string stateToString(MigrationDestinationManager::State state) {
     switch (state) {
         case MigrationDestinationManager::READY:
             return "ready";
@@ -222,6 +220,7 @@ MigrationDestinationManager::State MigrationDestinationManager::getState() const
 void MigrationDestinationManager::setState(State newState) {
     stdx::lock_guard<stdx::mutex> sl(_mutex);
     _state = newState;
+    _stateChangedCV.notify_all();
 }
 
 void MigrationDestinationManager::setStateFail(std::string msg) {
@@ -230,6 +229,7 @@ void MigrationDestinationManager::setStateFail(std::string msg) {
         stdx::lock_guard<stdx::mutex> sl(_mutex);
         _errmsg = std::move(msg);
         _state = FAIL;
+        _stateChangedCV.notify_all();
     }
 
     _sessionMigration->forceFail(msg);
@@ -241,6 +241,7 @@ void MigrationDestinationManager::setStateFailWarn(std::string msg) {
         stdx::lock_guard<stdx::mutex> sl(_mutex);
         _errmsg = std::move(msg);
         _state = FAIL;
+        _stateChangedCV.notify_all();
     }
 
     _sessionMigration->forceFail(msg);
@@ -255,7 +256,21 @@ bool MigrationDestinationManager::_isActive(WithLock) const {
     return _sessionId.is_initialized();
 }
 
-void MigrationDestinationManager::report(BSONObjBuilder& b) {
+void MigrationDestinationManager::report(BSONObjBuilder& b,
+                                         OperationContext* opCtx,
+                                         bool waitForSteadyOrDone) {
+    if (waitForSteadyOrDone) {
+        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        try {
+            opCtx->waitForConditionOrInterruptFor(_stateChangedCV, lock, Seconds(1), [&]() -> bool {
+                return _state != READY && _state != CLONE && _state != CATCHUP;
+            });
+        } catch (...) {
+            // Ignoring this error because this is an optional parameter and we catch timeout
+            // exceptions later.
+        }
+        b.append("waited", true);
+    }
     stdx::lock_guard<stdx::mutex> sl(_mutex);
 
     b.appendBool("active", _sessionId.is_initialized());
@@ -311,6 +326,7 @@ Status MigrationDestinationManager::start(const NamespaceString& nss,
     invariant(!_scopedRegisterReceiveChunk);
 
     _state = READY;
+    _stateChangedCV.notify_all();
     _errmsg = "";
 
     _nss = nss;
@@ -349,8 +365,52 @@ Status MigrationDestinationManager::start(const NamespaceString& nss,
     return Status::OK();
 }
 
-Status MigrationDestinationManager::abort(const MigrationSessionId& sessionId) {
+void MigrationDestinationManager::cloneDocumentsFromDonor(
+    OperationContext* opCtx,
+    stdx::function<void(OperationContext*, BSONObjIterator)> insertBatchFn,
+    stdx::function<BSONObj(OperationContext*)> fetchBatchFn) {
 
+    ProducerConsumerQueue<BSONObj> batches(1);
+    stdx::thread inserterThread{[&] {
+        Client::initThreadIfNotAlready("chunkInserter");
+        auto inserterOpCtx = Client::getCurrent()->makeOperationContext();
+        auto consumerGuard = MakeGuard([&] { batches.closeConsumerEnd(); });
+        try {
+            while (true) {
+                auto nextBatch = batches.pop(inserterOpCtx.get());
+                auto arr = nextBatch["objects"].Obj();
+                if (arr.isEmpty()) {
+                    return;
+                }
+                insertBatchFn(inserterOpCtx.get(), BSONObjIterator(arr));
+            }
+        } catch (...) {
+            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            opCtx->getServiceContext()->killOperation(opCtx, exceptionToStatus().code());
+            log() << "Batch insertion failed " << causedBy(redact(exceptionToStatus()));
+        }
+    }};
+    auto inserterThreadJoinGuard = MakeGuard([&] {
+        batches.closeProducerEnd();
+        inserterThread.join();
+    });
+
+    while (true) {
+        opCtx->checkForInterrupt();
+
+        auto res = fetchBatchFn(opCtx);
+        batches.push(res.getOwned(), opCtx);
+        auto arr = res["objects"].Obj();
+        if (arr.isEmpty()) {
+            inserterThreadJoinGuard.Dismiss();
+            inserterThread.join();
+            opCtx->checkForInterrupt();
+            break;
+        }
+    }
+}
+
+Status MigrationDestinationManager::abort(const MigrationSessionId& sessionId) {
     stdx::lock_guard<stdx::mutex> sl(_mutex);
 
     if (!_sessionId) {
@@ -366,6 +426,7 @@ Status MigrationDestinationManager::abort(const MigrationSessionId& sessionId) {
     }
 
     _state = ABORT;
+    _stateChangedCV.notify_all();
     _errmsg = "aborted";
 
     return Status::OK();
@@ -374,6 +435,7 @@ Status MigrationDestinationManager::abort(const MigrationSessionId& sessionId) {
 void MigrationDestinationManager::abortWithoutSessionIdCheck() {
     stdx::lock_guard<stdx::mutex> sl(_mutex);
     _state = ABORT;
+    _stateChangedCV.notify_all();
     _errmsg = "aborted without session id check";
 }
 
@@ -406,6 +468,7 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
 
     _sessionMigration->finish();
     _state = COMMIT_START;
+    _stateChangedCV.notify_all();
 
     auto const deadline = Date_t::now() + Seconds(30);
     while (_sessionId) {
@@ -413,6 +476,7 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
             _isActiveCV.wait_until(lock, deadline.toSystemTimePoint())) {
             _errmsg = str::stream() << "startCommit timed out waiting, " << _sessionId->toString();
             _state = FAIL;
+            _stateChangedCV.notify_all();
             return {ErrorCodes::CommandFailed, _errmsg};
         }
     }
@@ -440,10 +504,8 @@ void MigrationDestinationManager::_migrateThread(BSONObj min,
     try {
         _migrateDriver(
             opCtx.get(), min, max, shardKeyPattern, fromShardConnString, epoch, writeConcern);
-    } catch (std::exception& e) {
-        setStateFail(str::stream() << "migrate failed: " << redact(e.what()));
     } catch (...) {
-        setStateFail("migrate failed with unknown exception: UNKNOWN ERROR");
+        setStateFail(str::stream() << "migrate failed: " << redact(exceptionToStatus()));
     }
 
     if (getState() != DONE && !MONGO_FAIL_POINT(failMigrationLeaveOrphans)) {
@@ -698,32 +760,19 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
 
         _chunkMarkedPending = true;  // no lock needed, only the migrate thread looks.
 
-        while (true) {
-            BSONObj res;
-            if (!conn->runCommand("admin",
-                                  migrateCloneRequest,
-                                  res)) {  // gets array of objects to copy, in disk order
-                setStateFail(str::stream() << "_migrateClone failed: " << redact(res.toString()));
-                conn.done();
-                return;
-            }
-
-            BSONObj arr = res["objects"].Obj();
-            int thisTime = 0;
-
-            BSONObjIterator i(arr);
-            while (i.more()) {
+        auto insertBatchFn = [&](OperationContext* opCtx, BSONObjIterator docs) {
+            while (docs.more()) {
                 opCtx->checkForInterrupt();
 
                 if (getState() == ABORT) {
-                    log() << "Migration aborted while copying documents";
-                    return;
+                    auto message = "Migration aborted while copying documents";
+                    log() << message;
+                    uasserted(50664, message);
                 }
 
-                BSONObj docToClone = i.next().Obj();
+                BSONObj docToClone = docs.next().Obj();
                 {
                     OldClientWriteContext cx(opCtx, _nss.ns());
-
                     BSONObj localDoc;
                     if (willOverrideLocalId(opCtx,
                                             _nss,
@@ -733,27 +782,22 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
                                             cx.db(),
                                             docToClone,
                                             &localDoc)) {
-                        string errMsg = str::stream() << "cannot migrate chunk, local document "
-                                                      << redact(localDoc)
-                                                      << " has same _id as cloned "
-                                                      << "remote document " << redact(docToClone);
-
+                        const std::string errMsg = str::stream()
+                            << "cannot migrate chunk, local document " << redact(localDoc)
+                            << " has same _id as cloned "
+                            << "remote document " << redact(docToClone);
                         warning() << errMsg;
 
                         // Exception will abort migration cleanly
                         uasserted(16976, errMsg);
                     }
-
                     Helpers::upsert(opCtx, _nss.ns(), docToClone, true);
                 }
-                thisTime++;
-
                 {
                     stdx::lock_guard<stdx::mutex> statsLock(_mutex);
                     _numCloned++;
                     _clonedBytes += docToClone.objsize();
                 }
-
                 if (writeConcern.shouldWaitForOtherNodes()) {
                     repl::ReplicationCoordinator::StatusAndDuration replStatus =
                         repl::getGlobalReplicationCoordinator()->awaitReplication(
@@ -768,10 +812,22 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
                     }
                 }
             }
+        };
 
-            if (thisTime == 0)
-                break;
-        }
+        auto fetchBatchFn = [&](OperationContext* opCtx) {
+            BSONObj res;
+            if (!conn->runCommand("admin",
+                                  migrateCloneRequest,
+                                  res)) {  // gets array of objects to copy, in disk order
+                conn.done();
+                const std::string errMsg = str::stream() << "_migrateClone failed: "
+                                                         << redact(res.toString());
+                uasserted(50665, errMsg);
+            }
+            return res;
+        };
+
+        cloneDocumentsFromDonor(opCtx, insertBatchFn, fetchBatchFn);
 
         timing.done(3);
         MONGO_FAIL_POINT_PAUSE_WHILE_SET(migrateThreadHangAtStep3);
@@ -1008,10 +1064,9 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx,
             BSONObj localDoc;
             if (willOverrideLocalId(
                     opCtx, nss, min, max, shardKeyPattern, cx.db(), updatedDoc, &localDoc)) {
-                string errMsg = str::stream() << "cannot migrate chunk, local document " << localDoc
-                                              << " has same _id as reloaded remote document "
-                                              << updatedDoc;
-
+                const std::string errMsg = str::stream()
+                    << "cannot migrate chunk, local document " << localDoc
+                    << " has same _id as reloaded remote document " << updatedDoc;
                 warning() << errMsg;
 
                 // Exception will abort migration cleanly

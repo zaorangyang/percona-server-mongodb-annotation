@@ -189,6 +189,24 @@ __wt_snprintf_len_incr(
 }
 
 /*
+ * __wt_txn_context_prepare_check --
+ *	Return an error if the current transaction is in the prepare state.
+ */
+static inline int
+__wt_txn_context_prepare_check( WT_SESSION_IMPL *session)
+{
+#ifdef HAVE_TIMESTAMPS
+	if (F_ISSET(&session->txn, WT_TXN_PREPARE))
+		WT_RET_MSG(session, EINVAL,
+		    "%s: not permitted in a prepared transaction",
+		    session->name);
+#else
+	WT_UNUSED(session);
+#endif
+	return (0);
+}
+
+/*
  * __wt_txn_context_check --
  *	Complain if a transaction is/isn't running.
  */
@@ -204,4 +222,25 @@ __wt_txn_context_check(WT_SESSION_IMPL *session, bool requires_txn)
 		    "%s: not permitted in a running transaction",
 		    session->name);
 	return (0);
+}
+
+/*
+ * __wt_state_yield_sleep --
+ *	Sleep while waiting, after a thousand yields.
+ */
+static inline void
+__wt_state_yield_sleep(uint64_t *yield_count, uint64_t *sleep_count)
+{
+	/*
+	 * We yield before retrying, and if we've yielded enough times, start
+	 * sleeping so we don't burn CPU to no purpose.
+	 */
+	if ((*yield_count) < WT_THOUSAND) {
+		(*yield_count)++;
+		__wt_yield();
+		return;
+	}
+
+	(*sleep_count) = WT_MIN((*sleep_count) + 100, WT_THOUSAND);
+	__wt_sleep(0, (*sleep_count));
 }

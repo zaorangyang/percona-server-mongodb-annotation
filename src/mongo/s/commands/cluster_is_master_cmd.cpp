@@ -33,7 +33,6 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/rpc/metadata/client_metadata.h"
@@ -66,6 +65,10 @@ public:
                                const BSONObj& cmdObj,
                                std::vector<Privilege>* out) override {
         // No auth required
+    }
+
+    bool requiresAuth() const override {
+        return false;
     }
 
     bool run(OperationContext* opCtx,

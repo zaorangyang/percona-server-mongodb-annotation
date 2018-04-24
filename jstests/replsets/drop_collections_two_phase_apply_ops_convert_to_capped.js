@@ -55,7 +55,7 @@
             'Attempting to convert collection using applyOps with system.drop namespace: ' +
             tojson(applyOpsCmdWithName));
         assert.commandFailedWithCode(primary.adminCommand(applyOpsCmdWithName),
-                                     ErrorCodes.UnknownError);
+                                     ErrorCodes.NamespaceNotFound);
         assert(twoPhaseDropTest.collectionIsPendingDrop(collName),
                'applyOps using collection name ' + dropPendingCollName +
                    ' affected drop-pending collection state unexpectedly');
@@ -74,7 +74,7 @@
             'Attempting to convert collection using applyOps with UUID: ' +
             tojson(applyOpsCmdWithUuid));
         assert.commandFailedWithCode(primary.adminCommand(applyOpsCmdWithUuid),
-                                     ErrorCodes.UnknownError);
+                                     ErrorCodes.NamespaceNotFound);
         dropPendingCollInfo = twoPhaseDropTest.collectionIsPendingDrop(collName);
         assert(dropPendingCollInfo,
                'applyOps using UUID ' + dropPendingCollUuid +

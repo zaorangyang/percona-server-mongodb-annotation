@@ -361,6 +361,12 @@ public:
         result.append("ratelimit", serverGlobalParams.rateLimit);
         result.append("sampleRate", serverGlobalParams.sampleRate);
 
+        if (!serverGlobalParams.featureCompatibility.isVersionInitialized()) {
+            errmsg =
+                "profiling level cannot be set when featureCompatibilityVersion is uninitialized";
+            return false;
+        }
+
         if (!readOnly) {
             if (!db) {
                 // When setting the profiling level, create the database if it didn't already exist.
@@ -716,10 +722,8 @@ public:
 
             if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
                 return appendCommandStatus(result,
-                                           Status(ErrorCodes::OperationFailed,
-                                                  str::stream()
-                                                      << "Executor error during filemd5 command: "
-                                                      << WorkingSetCommon::toStatusString(obj)));
+                                           WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                                               "Executor error during filemd5 command"));
             }
 
             if (partialOk)
@@ -884,11 +888,9 @@ public:
 
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
             warning() << "Internal error while reading " << ns;
-            return appendCommandStatus(
-                result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream() << "Executor error while reading during dataSize command: "
-                                     << WorkingSetCommon::toStatusString(obj)));
+            return appendCommandStatus(result,
+                                       WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                                           "Executor error while reading during dataSize command"));
         }
 
         ostringstream os;
