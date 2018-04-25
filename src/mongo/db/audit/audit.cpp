@@ -386,7 +386,9 @@ namespace audit {
         return Status::OK();
     }
 
-    MONGO_INITIALIZER(AuditInit)(InitializerContext *context) {
+    MONGO_INITIALIZER_WITH_PREREQUISITES(AuditInit,
+                                         ("default", "PathlessOperatorMap", "MatchExpressionParser"))
+        (InitializerContext *context) {
         return initialize();
     }
 
