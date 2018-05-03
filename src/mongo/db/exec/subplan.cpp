@@ -71,29 +71,8 @@ SubplanStage::SubplanStage(OperationContext* opCtx,
       _plannerParams(params),
       _query(cq) {
     invariant(_collection);
+    invariant(_query->root()->matchType() == MatchExpression::OR);
 }
-
-namespace {
-
-/**
- * Returns true if 'expr' is an AND that contains a single OR child.
- */
-bool isContainedOr(const MatchExpression* expr) {
-    if (MatchExpression::AND != expr->matchType()) {
-        return false;
-    }
-
-    size_t numOrs = 0;
-    for (size_t i = 0; i < expr->numChildren(); ++i) {
-        if (MatchExpression::OR == expr->getChild(i)->matchType()) {
-            ++numOrs;
-        }
-    }
-
-    return (numOrs == 1U);
-}
-
-}  // namespace
 
 bool SubplanStage::canUseSubplanning(const CanonicalQuery& query) {
     const QueryRequest& qr = query.getQueryRequest();
@@ -126,54 +105,12 @@ bool SubplanStage::canUseSubplanning(const CanonicalQuery& query) {
         return false;
     }
 
-    // TODO: For now we only allow rooted OR. We should consider also allowing contained OR that
-    // does not have a TEXT or GEO_NEAR node.
+    // We can only subplan rooted $or queries.
     return MatchExpression::OR == expr->matchType();
-}
-
-std::unique_ptr<MatchExpression> SubplanStage::rewriteToRootedOr(
-    std::unique_ptr<MatchExpression> root) {
-    dassert(isContainedOr(root.get()));
-
-    // Detach the OR from the root.
-    std::vector<MatchExpression*>& rootChildren = *root->getChildVector();
-    std::unique_ptr<MatchExpression> orChild;
-    for (size_t i = 0; i < rootChildren.size(); ++i) {
-        if (MatchExpression::OR == rootChildren[i]->matchType()) {
-            orChild.reset(rootChildren[i]);
-            rootChildren.erase(rootChildren.begin() + i);
-            break;
-        }
-    }
-
-    // We should have found an OR, and the OR should have at least 2 children.
-    invariant(orChild);
-    invariant(orChild->getChildVector());
-    invariant(orChild->getChildVector()->size() > 1U);
-
-    // AND the existing root with each OR child.
-    std::vector<MatchExpression*>& orChildren = *orChild->getChildVector();
-    for (size_t i = 0; i < orChildren.size(); ++i) {
-        std::unique_ptr<AndMatchExpression> ama = stdx::make_unique<AndMatchExpression>();
-        ama->add(orChildren[i]);
-        ama->add(root->shallowClone().release());
-        orChildren[i] = ama.release();
-    }
-
-    // Normalize and sort the resulting match expression.
-    orChild = MatchExpression::optimize(std::move(orChild));
-    CanonicalQuery::sortTree(orChild.get());
-
-    return orChild;
 }
 
 Status SubplanStage::planSubqueries() {
     _orExpression = _query->root()->shallowClone();
-    if (isContainedOr(_orExpression.get())) {
-        _orExpression = rewriteToRootedOr(std::move(_orExpression));
-        invariant(CanonicalQuery::isValid(_orExpression.get(), _query->getQueryRequest()).isOK());
-    }
-
     for (size_t i = 0; i < _plannerParams.indices.size(); ++i) {
         const IndexEntry& ie = _plannerParams.indices[i];
         _indexMap[ie.name] = i;
@@ -218,17 +155,15 @@ Status SubplanStage::planSubqueries() {
             // We don't set NO_TABLE_SCAN because peeking at the cache data will keep us from
             // considering any plan that's a collscan.
             invariant(branchResult->solutions.empty());
-            std::vector<QuerySolution*> rawSolutions;
-            Status status =
-                QueryPlanner::plan(*branchResult->canonicalQuery, _plannerParams, &rawSolutions);
-            branchResult->solutions = transitional_tools_do_not_use::spool_vector(rawSolutions);
-
-            if (!status.isOK()) {
+            auto solutions = QueryPlanner::plan(*branchResult->canonicalQuery, _plannerParams);
+            if (!solutions.isOK()) {
                 mongoutils::str::stream ss;
                 ss << "Can't plan for subchild " << branchResult->canonicalQuery->toString() << " "
-                   << status.reason();
+                   << solutions.getStatus().reason();
                 return Status(ErrorCodes::BadValue, ss);
             }
+            branchResult->solutions = std::move(solutions.getValue());
+
             LOG(5) << "Subplanner: got " << branchResult->solutions.size() << " solutions";
 
             if (0 == branchResult->solutions.size()) {
@@ -344,8 +279,8 @@ Status SubplanStage::choosePlanForSubqueries(PlanYieldPolicy* yieldPolicy) {
                                               _ws,
                                               &nextPlanRoot));
 
-                // Takes ownership of solution with index 'ix' and 'nextPlanRoot'.
-                multiPlanStage->addPlan(branchResult->solutions[ix].release(), nextPlanRoot, _ws);
+                // Takes ownership of 'nextPlanRoot'.
+                multiPlanStage->addPlan(std::move(branchResult->solutions[ix]), nextPlanRoot, _ws);
             }
 
             Status planSelectStat = multiPlanStage->pickBestPlan(yieldPolicy);
@@ -406,8 +341,8 @@ Status SubplanStage::choosePlanForSubqueries(PlanYieldPolicy* yieldPolicy) {
     LOG(5) << "Subplanner: fully tagged tree is " << redact(solnRoot->toString());
 
     // Takes ownership of 'solnRoot'
-    _compositeSolution.reset(
-        QueryPlannerAnalysis::analyzeDataAccess(*_query, _plannerParams, std::move(solnRoot)));
+    _compositeSolution =
+        QueryPlannerAnalysis::analyzeDataAccess(*_query, _plannerParams, std::move(solnRoot));
 
     if (NULL == _compositeSolution.get()) {
         mongoutils::str::stream ss;
@@ -434,15 +369,14 @@ Status SubplanStage::choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy) {
     _ws->clear();
 
     // Use the query planning module to plan the whole query.
-    std::vector<QuerySolution*> rawSolutions;
-    Status status = QueryPlanner::plan(*_query, _plannerParams, &rawSolutions);
-    std::vector<std::unique_ptr<QuerySolution>> solutions =
-        transitional_tools_do_not_use::spool_vector(rawSolutions);
-    if (!status.isOK()) {
+    auto statusWithSolutions = QueryPlanner::plan(*_query, _plannerParams);
+    if (!statusWithSolutions.isOK()) {
         return Status(ErrorCodes::BadValue,
                       "error processing query: " + _query->toString() +
-                          " planner returned error: " + status.reason());
+                          " planner returned error: " + statusWithSolutions.getStatus().reason());
     }
+
+    auto solutions = std::move(statusWithSolutions.getValue());
 
     // We cannot figure out how to answer the query.  Perhaps it requires an index
     // we do not have?
@@ -481,8 +415,8 @@ Status SubplanStage::choosePlanWholeQuery(PlanYieldPolicy* yieldPolicy) {
             verify(StageBuilder::build(
                 getOpCtx(), _collection, *_query, *solutions[ix], _ws, &nextPlanRoot));
 
-            // Takes ownership of 'solutions[ix]' and 'nextPlanRoot'.
-            multiPlanStage->addPlan(solutions[ix].release(), nextPlanRoot, _ws);
+            // Takes ownership of 'nextPlanRoot'.
+            multiPlanStage->addPlan(std::move(solutions[ix]), nextPlanRoot, _ws);
         }
 
         // Delegate the the MultiPlanStage's plan selection facility.

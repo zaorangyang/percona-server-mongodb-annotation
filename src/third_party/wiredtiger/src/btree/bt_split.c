@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -720,6 +720,7 @@ __split_parent(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF **ref_new,
 
 	/* Start making real changes to the tree, errors are fatal. */
 	complete = WT_ERR_PANIC;
+	WT_NOT_READ(complete);
 
 	/* Encourage a race */
 	__page_split_timing_stress(session,
@@ -1476,6 +1477,12 @@ __split_multi_inmem(
 			WT_ERR(__wt_row_search(
 			    session, key, ref, &cbt, true, true));
 
+			/*
+			 * Birthmarks should only be applied to on-page values.
+			 */
+			WT_ASSERT(session, cbt.compare == 0 ||
+			    upd->type != WT_UPDATE_BIRTHMARK);
+
 			/* Apply the modification. */
 			WT_ERR(__wt_row_modify(session,
 			    &cbt, key, NULL, upd, WT_UPDATE_INVALID, true));
@@ -1493,10 +1500,13 @@ __split_multi_inmem(
 	page->modify->first_dirty_txn = WT_TXN_FIRST;
 
 	/*
-	 * If the new page is modified, save the oldest ID from reconciliation
-	 * to avoid repeatedly attempting eviction on the same page.
+	 * If the new page is modified, save the eviction generation to avoid
+	 * repeatedly attempting eviction on the same page.
 	 */
+	page->modify->last_evict_pass_gen = orig->modify->last_evict_pass_gen;
 	page->modify->last_eviction_id = orig->modify->last_eviction_id;
+	__wt_timestamp_set(&page->modify->last_eviction_timestamp,
+	    &orig->modify->last_eviction_timestamp);
 	page->modify->update_restored = 1;
 
 err:	/* Free any resources that may have been cached in the cursor. */
@@ -2257,6 +2267,7 @@ __wt_split_rewrite(WT_SESSION_IMPL *session, WT_REF *ref, WT_MULTI *multi)
 
 	/* Swap the new page into place. */
 	ref->page = new->page;
+
 	WT_PUBLISH(ref->state, WT_REF_MEM);
 
 	__wt_free(session, new);

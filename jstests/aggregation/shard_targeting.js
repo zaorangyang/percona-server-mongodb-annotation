@@ -20,7 +20,7 @@
  * and will therefore invalidate the results of the test cases below, we tag this test to prevent it
  * running under the 'aggregation_facet_unwind' passthrough.
  *
- * @tags: [do_not_wrap_aggregations_in_facets]
+ * @tags: [do_not_wrap_aggregations_in_facets, requires_sharding]
  */
 (function() {
     load("jstests/libs/profiler.js");  // For profilerHas*OrThrow helper functions.
@@ -37,6 +37,13 @@
 
     const shard0DB = primaryShardDB = st.shard0.getDB(jsTestName());
     const shard1DB = st.shard1.getDB(jsTestName());
+
+    // Turn off best-effort recipient metadata refresh post-migration commit on both shards because
+    // it creates non-determinism for the profiler.
+    assert.commandWorked(st.shard0.getDB('admin').runCommand(
+        {configureFailPoint: 'doNotRefreshRecipientAfterCommit', mode: 'alwaysOn'}));
+    assert.commandWorked(st.shard1.getDB('admin').runCommand(
+        {configureFailPoint: 'doNotRefreshRecipientAfterCommit', mode: 'alwaysOn'}));
 
     assert.commandWorked(mongosDB.dropDatabase());
 

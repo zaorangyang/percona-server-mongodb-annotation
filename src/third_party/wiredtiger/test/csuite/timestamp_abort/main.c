@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2017 MongoDB, Inc.
+ * Public Domain 2014-2018 MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -476,7 +476,7 @@ print_missing(REPORT *r, const char *fname, const char *msg)
 		    ". Then keys %" PRIu64 "-%" PRIu64 " exist."
 		    " Key range %" PRIu64 "-%" PRIu64 "\n",
 		    fname, msg,
-		    r->exist_key - r->first_miss - 1,
+		    (r->exist_key - r->first_miss) - 1,
 		    r->first_miss, r->exist_key - 1,
 		    r->exist_key, r->last_key,
 		    r->first_key, r->last_key);

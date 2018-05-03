@@ -33,13 +33,11 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/metadata_manager.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
@@ -51,23 +49,23 @@
 namespace mongo {
 
 using std::string;
-using std::stringstream;
-using std::shared_ptr;
 using std::vector;
+using str::stream;
 
 namespace {
 
-bool _checkMetadataForSuccess(OperationContext* opCtx,
-                              const NamespaceString& nss,
-                              const BSONObj& minKey,
-                              const BSONObj& maxKey) {
-    ScopedCollectionMetadata metadataAfterMerge;
-    {
+bool checkMetadataForSuccess(OperationContext* opCtx,
+                             const NamespaceString& nss,
+                             const BSONObj& minKey,
+                             const BSONObj& maxKey) {
+    const auto metadataAfterMerge = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+        return CollectionShardingState::get(opCtx, nss.ns())->getMetadata();
+    }();
 
-        // Get collection metadata
-        metadataAfterMerge = CollectionShardingState::get(opCtx, nss.ns())->getMetadata();
-    }
+    uassert(ErrorCodes::StaleEpoch,
+            str::stream() << "Collection " << nss.ns() << " became unsharded",
+            metadataAfterMerge);
 
     ChunkType chunk;
     if (!metadataAfterMerge->getNextChunk(minKey, &chunk)) {
@@ -100,15 +98,14 @@ Status mergeChunks(OperationContext* opCtx,
         return Status(scopedDistLock.getStatus().code(), errmsg);
     }
 
-    ShardingState* shardingState = ShardingState::get(opCtx);
+    auto const shardingState = ShardingState::get(opCtx);
 
     //
     // We now have the collection lock, refresh metadata to latest version and sanity check
     //
 
-    ChunkVersion shardVersion;
-    Status refreshStatus = shardingState->refreshMetadataNow(opCtx, nss, &shardVersion);
-
+    ChunkVersion unusedShardVersion;
+    Status refreshStatus = shardingState->refreshMetadataNow(opCtx, nss, &unusedShardVersion);
     if (!refreshStatus.isOK()) {
         std::string errmsg = str::stream()
             << "could not merge chunks, failed to refresh metadata for " << nss.ns()
@@ -118,43 +115,41 @@ Status mergeChunks(OperationContext* opCtx,
         return Status(refreshStatus.code(), errmsg);
     }
 
-    if (epoch.isSet() && shardVersion.epoch() != epoch) {
-        std::string errmsg = stream()
-            << "could not merge chunks, collection " << nss.ns() << " has changed"
-            << " since merge was sent"
-            << "(sent epoch : " << epoch.toString()
-            << ", current epoch : " << shardVersion.epoch().toString() << ")";
+    const auto metadata = [&] {
+        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+        return CollectionShardingState::get(opCtx, nss.ns())->getMetadata();
+    }();
+
+    if (!metadata) {
+        std::string errmsg = stream() << "could not merge chunks, collection " << nss.ns()
+                                      << " is not sharded";
 
         warning() << errmsg;
-        return Status(ErrorCodes::StaleEpoch, errmsg);
+        return {ErrorCodes::StaleEpoch, errmsg};
     }
 
-    ScopedCollectionMetadata metadata;
-    {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+    const auto shardVersion = metadata->getShardVersion();
 
-        metadata = CollectionShardingState::get(opCtx, nss.ns())->getMetadata();
-        if (!metadata) {
-            std::string errmsg = stream() << "could not merge chunks, collection " << nss.ns()
-                                          << " is not sharded";
+    if (epoch.isSet() && shardVersion.epoch() != epoch) {
+        std::string errmsg = stream()
+            << "could not merge chunks, collection " << nss.ns()
+            << " has changed since merge was sent (sent epoch: " << epoch.toString()
+            << ", current epoch: " << shardVersion.epoch() << ")";
 
-            warning() << errmsg;
-            return Status(ErrorCodes::IllegalOperation, errmsg);
-        }
+        warning() << errmsg;
+        return {ErrorCodes::StaleEpoch, errmsg};
     }
-
-    dassert(metadata->getShardVersion().equals(shardVersion));
 
     if (!metadata->isValidKey(minKey) || !metadata->isValidKey(maxKey)) {
         std::string errmsg = stream() << "could not merge chunks, the range "
-                                      << redact(rangeToString(minKey, maxKey)) << " is not valid"
+                                      << redact(ChunkRange(minKey, maxKey).toString())
+                                      << " is not valid"
                                       << " for collection " << nss.ns() << " with key pattern "
                                       << metadata->getKeyPattern().toString();
 
         warning() << errmsg;
         return Status(ErrorCodes::IllegalOperation, errmsg);
     }
-
 
     //
     // Get merged chunk information
@@ -166,15 +161,12 @@ Status mergeChunks(OperationContext* opCtx,
     ChunkType itChunk;
     itChunk.setMin(minKey);
     itChunk.setMax(minKey);
-    itChunk.setNS(nss.ns());
-    itChunk.setShard(shardingState->getShardName());
 
     while (itChunk.getMax().woCompare(maxKey) < 0 &&
            metadata->getNextChunk(itChunk.getMax(), &itChunk)) {
         chunkBoundaries.push_back(itChunk.getMax());
         chunksToMerge.push_back(itChunk);
     }
-
 
     if (chunksToMerge.empty()) {
         std::string errmsg = stream()
@@ -235,7 +227,7 @@ Status mergeChunks(OperationContext* opCtx,
     if (chunksToMerge.size() == 1) {
         std::string errmsg = stream() << "could not merge chunks, collection " << nss.ns()
                                       << " already contains chunk for "
-                                      << redact(rangeToString(minKey, maxKey));
+                                      << redact(ChunkRange(minKey, maxKey).toString());
 
         warning() << errmsg;
         return Status(ErrorCodes::IllegalOperation, errmsg);
@@ -247,8 +239,9 @@ Status mergeChunks(OperationContext* opCtx,
         if (chunksToMerge[i - 1].getMax().woCompare(chunksToMerge[i].getMin()) != 0) {
             std::string errmsg = stream()
                 << "could not merge chunks, collection " << nss.ns() << " has a hole in the range "
-                << redact(rangeToString(minKey, maxKey)) << " at "
-                << redact(rangeToString(chunksToMerge[i - 1].getMax(), chunksToMerge[i].getMin()));
+                << redact(ChunkRange(minKey, maxKey).toString()) << " at "
+                << redact(ChunkRange(chunksToMerge[i - 1].getMax(), chunksToMerge[i].getMin())
+                              .toString());
 
             warning() << errmsg;
             return Status(ErrorCodes::IllegalOperation, errmsg);
@@ -275,8 +268,8 @@ Status mergeChunks(OperationContext* opCtx,
     // running _configsvrCommitChunkMerge).
     //
     {
-        ChunkVersion shardVersionAfterMerge;
-        refreshStatus = shardingState->refreshMetadataNow(opCtx, nss, &shardVersionAfterMerge);
+        ChunkVersion unusedShardVersion;
+        refreshStatus = shardingState->refreshMetadataNow(opCtx, nss, &unusedShardVersion);
 
         if (!refreshStatus.isOK()) {
             std::string errmsg = str::stream() << "failed to refresh metadata for merge chunk ["
@@ -302,7 +295,7 @@ Status mergeChunks(OperationContext* opCtx,
     auto writeConcernStatus = std::move(cmdResponseStatus.getValue().writeConcernStatus);
 
     if ((!commandStatus.isOK() || !writeConcernStatus.isOK()) &&
-        _checkMetadataForSuccess(opCtx, nss, minKey, maxKey)) {
+        checkMetadataForSuccess(opCtx, nss, minKey, maxKey)) {
 
         LOG(1) << "mergeChunk [" << redact(minKey) << "," << redact(maxKey)
                << ") has already been committed.";
@@ -323,7 +316,7 @@ class MergeChunksCommand : public ErrmsgCommandDeprecated {
 public:
     MergeChunksCommand() : ErrmsgCommandDeprecated("mergeChunks") {}
 
-    void help(stringstream& h) const override {
+    void help(std::stringstream& h) const override {
         h << "Merge Chunks command\n"
           << "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ],"
           << " (opt) epoch : <epoch> }";
@@ -350,7 +343,8 @@ public:
     bool slaveOk() const override {
         return false;
     }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
@@ -412,6 +406,7 @@ public:
         auto mergeStatus = mergeChunks(opCtx, NamespaceString(ns), minKey, maxKey, epoch);
         return appendCommandStatus(result, mergeStatus);
     }
+
 } mergeChunksCmd;
 
 BSONField<string> MergeChunksCommand::nsField("mergeChunks");

@@ -202,16 +202,8 @@ void FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(OperationContext
 
 void FeatureCompatibilityVersion::setIfCleanStartup(OperationContext* opCtx,
                                                     repl::StorageInterface* storageInterface) {
-    // A clean startup means there are no databases on disk besides the local database.
-    std::vector<std::string> dbNames;
-    StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
-    storageEngine->listDatabases(&dbNames);
-
-    for (auto&& dbName : dbNames) {
-        if (dbName != "local") {
-            return;
-        }
-    }
+    if (!isCleanStartUp())
+        return;
 
     // If the server was not started with --shardsvr, the default featureCompatibilityVersion on
     // clean startup is the upgrade version. If it was started with --shardsvr, the default
@@ -248,9 +240,22 @@ void FeatureCompatibilityVersion::setIfCleanStartup(OperationContext* opCtx,
                        << (storeUpgradeVersion
                                ? FeatureCompatibilityVersionCommandParser::kVersion36
                                : FeatureCompatibilityVersionCommandParser::kVersion34)),
-            SnapshotName()},
+            Timestamp()},
         repl::OpTime::kUninitializedTerm));  // No timestamp or term because this write is not
                                              // replicated.
+}
+
+bool FeatureCompatibilityVersion::isCleanStartUp() {
+    std::vector<std::string> dbNames;
+    StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
+    storageEngine->listDatabases(&dbNames);
+
+    for (auto&& dbName : dbNames) {
+        if (dbName != "local") {
+            return false;
+        }
+    }
+    return true;
 }
 
 namespace {
@@ -396,21 +401,19 @@ void FeatureCompatibilityVersion::onDropCollection(OperationContext* opCtx) {
 void FeatureCompatibilityVersion::updateMinWireVersion() {
     WireSpec& spec = WireSpec::instance();
 
+    // The 3.7 development branch will temporarily have LATEST_WIRE_VERSION == the 3.8 wireVersion,
+    // but the supported FCV's will be 3.4/3.6. TODO: SERVER-32412 to put FCV 3.8 in place here,
+    // setting the minWireVersion to the latest wire VERSION for that FCV shift.
     switch (serverGlobalParams.featureCompatibility.getVersion()) {
         case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36:
         case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo36:
         case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingTo34:
-            spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION;
-            spec.outgoing.minWireVersion = LATEST_WIRE_VERSION;
+            spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION - 1;
+            spec.outgoing.minWireVersion = LATEST_WIRE_VERSION - 1;
             return;
         case ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34:
-            // It would be preferable to set 'incomingInternalClient.minWireVersion' and
-            // 'outgoing.minWireVersion' to LATEST_WIRE_VERSION - 1, but this is not possible due to
-            // a bug in 3.4, where if the receiving node says it supports wire version range
-            // [COMMANDS_ACCEPT_WRITE_CONCERN, SUPPORTS_OP_MSG], the initiating node will think it
-            // only supports OP_QUERY.
-            spec.incomingInternalClient.minWireVersion = RELEASE_2_4_AND_BEFORE;
-            spec.outgoing.minWireVersion = RELEASE_2_4_AND_BEFORE;
+            spec.incomingInternalClient.minWireVersion = LATEST_WIRE_VERSION - 2;
+            spec.outgoing.minWireVersion = LATEST_WIRE_VERSION - 2;
             return;
         case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault34Behavior:
             // getVersion() does not return this value.

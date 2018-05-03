@@ -344,6 +344,7 @@ env.Library(
         'document_source',
         'pipeline',
         '$BUILD_DIR/mongo/db/catalog/uuid_catalog',
+        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
     ],
 )
 
@@ -505,23 +506,6 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         'document_value_test_util',
         'parsed_aggregation_projection',
-    ],
-)
-
-env.Library(
-    target='serveronly',
-    source=[
-        'document_source_cursor.cpp',
-        'pipeline_d.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/catalog/document_validation',
-        '$BUILD_DIR/mongo/db/catalog/index_catalog',
-        '$BUILD_DIR/mongo/db/db_raii',
-        '$BUILD_DIR/mongo/db/dbdirectclient',
-        '$BUILD_DIR/mongo/db/index/index_access_methods',
-        '$BUILD_DIR/mongo/db/matcher/expressions_mongod_only',
-        '$BUILD_DIR/mongo/db/stats/serveronly',
     ],
 )
 

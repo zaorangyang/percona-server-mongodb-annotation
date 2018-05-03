@@ -143,10 +143,6 @@ DBCollection.prototype.help = function() {
         ".unsetWriteConcern( <write concern doc> ) - unsets the write concern for writes to the collection");
     print("\tdb." + shortName +
           ".latencyStats() - display operation latency histograms for this collection");
-    // print("\tdb." + shortName + ".getDiskStorageStats({...}) - prints a summary of disk usage
-    // statistics");
-    // print("\tdb." + shortName + ".getPagesInRAM({...}) - prints a summary of storage pages
-    // currently in physical memory");
     return __magicNoPrint;
 };
 
@@ -265,6 +261,9 @@ DBCollection.prototype.findOne = function(query, fields, options, readConcern, c
     return ret;
 };
 
+// Returns a WriteResult for a single insert or a BulkWriteResult for a multi-insert if write
+// command succeeded, but may contain write errors.
+// Returns a WriteCommandError if the write command responded with ok:0.
 DBCollection.prototype.insert = function(obj, options) {
     if (!obj)
         throw Error("no object passed to insert!");
@@ -321,7 +320,7 @@ DBCollection.prototype.insert = function(obj, options) {
             if (ex instanceof BulkWriteError) {
                 result = isMultiInsert ? ex.toResult() : ex.toSingleResult();
             } else if (ex instanceof WriteCommandError) {
-                result = isMultiInsert ? ex : ex.toSingleResult();
+                result = ex;
             } else {
                 // Other exceptions rethrown as-is.
                 throw ex;
@@ -378,6 +377,8 @@ DBCollection.prototype._parseRemove = function(t, justOne) {
     return {"query": query, "justOne": justOne, "wc": wc, "collation": collation};
 };
 
+// Returns a WriteResult if write command succeeded, but may contain write errors.
+// Returns a WriteCommandError if the write command responded with ok:0.
 DBCollection.prototype.remove = function(t, justOne) {
     var parsed = this._parseRemove(t, justOne);
     var query = parsed.query;
@@ -406,8 +407,10 @@ DBCollection.prototype.remove = function(t, justOne) {
         try {
             result = bulk.execute(wc).toSingleResult();
         } catch (ex) {
-            if (ex instanceof BulkWriteError || ex instanceof WriteCommandError) {
+            if (ex instanceof BulkWriteError) {
                 result = ex.toSingleResult();
+            } else if (ex instanceof WriteCommandError) {
+                result = ex;
             } else {
                 // Other exceptions thrown
                 throw Error(ex);
@@ -479,6 +482,8 @@ DBCollection.prototype._parseUpdate = function(query, obj, upsert, multi) {
     };
 };
 
+// Returns a WriteResult if write command succeeded, but may contain write errors.
+// Returns a WriteCommandError if the write command responded with ok:0.
 DBCollection.prototype.update = function(query, obj, upsert, multi) {
     var parsed = this._parseUpdate(query, obj, upsert, multi);
     var query = parsed.query;
@@ -518,8 +523,10 @@ DBCollection.prototype.update = function(query, obj, upsert, multi) {
         try {
             result = bulk.execute(wc).toSingleResult();
         } catch (ex) {
-            if (ex instanceof BulkWriteError || ex instanceof WriteCommandError) {
+            if (ex instanceof BulkWriteError) {
                 result = ex.toSingleResult();
+            } else if (ex instanceof WriteCommandError) {
+                result = ex;
             } else {
                 // Other exceptions thrown
                 throw Error(ex);
@@ -805,168 +812,6 @@ DBCollection.prototype.validate = function(full) {
     }
 
     return res;
-};
-
-/**
- * Invokes the storageDetails command to provide aggregate and (if requested) detailed information
- * regarding the layout of records and deleted records in the collection extents.
- * getDiskStorageStats provides a human-readable summary of the command output
- */
-DBCollection.prototype.diskStorageStats = function(opt) {
-    var cmd = {storageDetails: this.getName(), analyze: 'diskStorage'};
-    if (typeof(opt) == 'object')
-        Object.extend(cmd, opt);
-
-    var res = this._db.runCommand(cmd);
-    if (!res.ok && res.errmsg.match(/no such cmd/)) {
-        print("this command requires starting mongod with --enableExperimentalStorageDetailsCmd");
-    }
-    return res;
-};
-
-// Refer to diskStorageStats
-DBCollection.prototype.getDiskStorageStats = function(params) {
-    var stats = this.diskStorageStats(params);
-    if (!stats.ok) {
-        print("error executing storageDetails command: " + stats.errmsg);
-        return;
-    }
-
-    print("\n    " + "size".pad(9) + " " + "# recs".pad(10) + " " +
-          "[===occupied by BSON=== ---occupied by padding---       free           ]" + "  " +
-          "bson".pad(8) + " " + "rec".pad(8) + " " + "padding".pad(8));
-    print();
-
-    var BAR_WIDTH = 70;
-
-    var formatSliceData = function(data) {
-        var bar = _barFormat(
-            [
-              [data.bsonBytes / data.onDiskBytes, "="],
-              [(data.recBytes - data.bsonBytes) / data.onDiskBytes, "-"]
-            ],
-            BAR_WIDTH);
-
-        return sh._dataFormat(data.onDiskBytes).pad(9) + " " + data.numEntries.toFixed(0).pad(10) +
-            " " + bar + "  " + (data.bsonBytes / data.onDiskBytes).toPercentStr().pad(8) + " " +
-            (data.recBytes / data.onDiskBytes).toPercentStr().pad(8) + " " +
-            (data.recBytes / data.bsonBytes).toFixed(4).pad(8);
-    };
-
-    var printExtent = function(ex, rng) {
-        print("--- extent " + rng + " ---");
-        print("tot " + formatSliceData(ex));
-        print();
-        if (ex.slices) {
-            for (var c = 0; c < ex.slices.length; c++) {
-                var slice = ex.slices[c];
-                print(("" + c).pad(3) + " " + formatSliceData(slice));
-            }
-            print();
-        }
-    };
-
-    if (stats.extents) {
-        print("--- extent overview ---\n");
-        for (var i = 0; i < stats.extents.length; i++) {
-            var ex = stats.extents[i];
-            print(("" + i).pad(3) + " " + formatSliceData(ex));
-        }
-        print();
-        if (params && (params.granularity || params.numberOfSlices)) {
-            for (var i = 0; i < stats.extents.length; i++) {
-                printExtent(stats.extents[i], i);
-            }
-        }
-    } else {
-        printExtent(stats, "range " + stats.range);
-    }
-
-};
-
-/**
- * Invokes the storageDetails command to report the percentage of virtual memory pages of the
- * collection storage currently in physical memory (RAM).
- * getPagesInRAM provides a human-readable summary of the command output
- */
-DBCollection.prototype.pagesInRAM = function(opt) {
-    var cmd = {storageDetails: this.getName(), analyze: 'pagesInRAM'};
-    if (typeof(opt) == 'object')
-        Object.extend(cmd, opt);
-
-    var res = this._db.runCommand(cmd);
-    if (!res.ok && res.errmsg.match(/no such cmd/)) {
-        print("this command requires starting mongod with --enableExperimentalStorageDetailsCmd");
-    }
-    return res;
-};
-
-// Refer to pagesInRAM
-DBCollection.prototype.getPagesInRAM = function(params) {
-    var stats = this.pagesInRAM(params);
-    if (!stats.ok) {
-        print("error executing storageDetails command: " + stats.errmsg);
-        return;
-    }
-
-    var BAR_WIDTH = 70;
-    var formatExtentData = function(data) {
-        return "size".pad(8) + " " + _barFormat([[data.inMem, '=']], BAR_WIDTH) + "  " +
-            data.inMem.toPercentStr().pad(7);
-    };
-
-    var printExtent = function(ex, rng) {
-        print("--- extent " + rng + " ---");
-        print("tot " + formatExtentData(ex));
-        print();
-        if (ex.slices) {
-            print("\tslices, percentage of pages in memory (< .1% : ' ', <25% : '.', " +
-                  "<50% : '_', <75% : '=', >75% : '#')");
-            print();
-            print("\t" + "offset".pad(8) + "  [slices...] (each slice is " +
-                  sh._dataFormat(ex.sliceBytes) + ")");
-            line = "\t" + ("" + 0).pad(8) + "  [";
-            for (var c = 0; c < ex.slices.length; c++) {
-                if (c % 80 == 0 && c != 0) {
-                    print(line + "]");
-                    line = "\t" + sh._dataFormat(ex.sliceBytes * c).pad(8) + "  [";
-                }
-                var inMem = ex.slices[c];
-                if (inMem <= .001)
-                    line += " ";
-                else if (inMem <= .25)
-                    line += ".";
-                else if (inMem <= .5)
-                    line += "_";
-                else if (inMem <= .75)
-                    line += "=";
-                else
-                    line += "#";
-            }
-            print(line + "]");
-            print();
-        }
-    };
-
-    if (stats.extents) {
-        print("--- extent overview ---\n");
-        for (var i = 0; i < stats.extents.length; i++) {
-            var ex = stats.extents[i];
-            print(("" + i).pad(3) + " " + formatExtentData(ex));
-        }
-        print();
-        if (params && (params.granularity || params.numberOfSlices)) {
-            for (var i = 0; i < stats.extents.length; i++) {
-                printExtent(stats.extents[i], i);
-            }
-        } else {
-            print("use getPagesInRAM({granularity: _bytes_}) or " +
-                  "getPagesInRAM({numberOfSlices: _num_} for details");
-            print("use pagesInRAM(...) for json output, same parameters apply");
-        }
-    } else {
-        printExtent(stats, "range " + stats.range);
-    }
 };
 
 DBCollection.prototype.getShardVersion = function() {
@@ -1639,6 +1484,25 @@ DBCollection.prototype._distinct = function(keyString, query) {
 DBCollection.prototype.latencyStats = function(options) {
     options = options || {};
     return this.aggregate([{$collStats: {latencyStats: options}}]);
+};
+
+DBCollection.prototype.watch = function(pipeline, options) {
+    pipeline = pipeline || [];
+    options = options || {};
+    assert(pipeline instanceof Array, "'pipeline' argument must be an array");
+    assert(options instanceof Object, "'options' argument must be an object");
+
+    let changeStreamStage = {fullDocument: options.fullDocument || "default"};
+    delete options.fullDocument;
+
+    if (options.hasOwnProperty("resumeAfter")) {
+        changeStreamStage.resumeAfter = options.resumeAfter;
+        delete options.resumeAfter;
+    }
+
+    pipeline.unshift({$changeStream: changeStreamStage});
+    // Pass options "batchSize", "collation" and "maxAwaitTimeMS" down to aggregate().
+    return this.aggregate(pipeline, options);
 };
 
 /**

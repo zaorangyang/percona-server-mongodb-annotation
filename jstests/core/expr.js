@@ -1,3 +1,5 @@
+// @tags: [does_not_support_stepdowns, requires_getmore, requires_non_retryable_writes]
+
 // Tests for $expr in the CRUD commands.
 (function() {
     "use strict";
@@ -294,7 +296,7 @@
         delete: coll.getName(),
         deletes: [{q: {_id: 0}, limit: 1}, {q: {$expr: "$$unbound"}, limit: 1}]
     });
-    assert.commandWorked(writeRes);
+    assert.commandWorkedIgnoringWriteErrors(writeRes);
     assert.eq(writeRes.writeErrors[0].code, 17276, tojson(writeRes));
     assert.eq(writeRes.n, 1, tojson(writeRes));
 
@@ -342,7 +344,7 @@
         update: coll.getName(),
         updates: [{q: {_id: 0}, u: {$set: {b: 6}}}, {q: {$expr: "$$unbound"}, u: {$set: {b: 6}}}]
     });
-    assert.commandWorked(writeRes);
+    assert.commandWorkedIgnoringWriteErrors(writeRes);
     assert.eq(writeRes.writeErrors[0].code, 17276, tojson(writeRes));
     assert.eq(writeRes.n, 1, tojson(writeRes));
 })();

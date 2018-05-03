@@ -70,7 +70,7 @@ constexpr size_t DocumentSourceLookUp::kMaxSubPipelineDepth;
 DocumentSourceLookUp::DocumentSourceLookUp(NamespaceString fromNs,
                                            std::string as,
                                            const boost::intrusive_ptr<ExpressionContext>& pExpCtx)
-    : DocumentSourceNeedsMongoProcessInterface(pExpCtx),
+    : DocumentSource(pExpCtx),
       _fromNs(std::move(fromNs)),
       _as(std::move(as)),
       _variables(pExpCtx->variables),
@@ -249,7 +249,7 @@ DocumentSource::GetNextResult DocumentSourceLookUp::getNext() {
     return output.freeze();
 }
 
-std::unique_ptr<Pipeline, Pipeline::Deleter> DocumentSourceLookUp::buildPipeline(
+std::unique_ptr<Pipeline, PipelineDeleter> DocumentSourceLookUp::buildPipeline(
     const Document& inputDoc) {
     // Copy all 'let' variables into the foreign pipeline's expression context.
     copyVariablesToExpCtx(_variables, _variablesParseState, _fromExpCtx.get());
@@ -260,21 +260,18 @@ std::unique_ptr<Pipeline, Pipeline::Deleter> DocumentSourceLookUp::buildPipeline
     // If we don't have a cache, build and return the pipeline immediately.
     if (!_cache || _cache->isAbandoned()) {
         return uassertStatusOK(
-            _mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx));
+            pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx));
     }
 
     // Tailor the pipeline construction for our needs. We want a non-optimized pipeline without a
-    // cursor source. If the cache is present and serving, then we will not be adding a cursor
-    // source later, so inject a MongoProcessInterface into all stages that need one.
+    // cursor source.
     MongoProcessInterface::MakePipelineOptions pipelineOpts;
-
     pipelineOpts.optimize = false;
     pipelineOpts.attachCursorSource = false;
-    pipelineOpts.forceInjectMongoProcessInterface = _cache->isServing();
 
     // Construct the basic pipeline without a cache stage.
     auto pipeline = uassertStatusOK(
-        _mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts));
+        pExpCtx->mongoProcessInterface->makePipeline(_resolvedPipeline, _fromExpCtx, pipelineOpts));
 
     // Add the cache stage at the end and optimize. During the optimization process, the cache will
     // either move itself to the correct position in the pipeline, or will abandon itself if no
@@ -286,8 +283,8 @@ std::unique_ptr<Pipeline, Pipeline::Deleter> DocumentSourceLookUp::buildPipeline
 
     if (!_cache->isServing()) {
         // The cache has either been abandoned or has not yet been built. Attach a cursor.
-        uassertStatusOK(
-            _mongoProcessInterface->attachCursorSourceToPipeline(_fromExpCtx, pipeline.get()));
+        pipeline = uassertStatusOK(pExpCtx->mongoProcessInterface->attachCursorSourceToPipeline(
+            _fromExpCtx, pipeline.release()));
     }
 
     // If the cache has been abandoned, release it.
@@ -600,7 +597,7 @@ void DocumentSourceLookUp::resolveLetVariables(const Document& localDoc, Variabl
 
     for (auto& letVar : _letVariables) {
         auto value = letVar.expression->evaluate(localDoc);
-        variables->setValue(letVar.id, value);
+        variables->setConstantValue(letVar.id, value);
     }
 }
 
@@ -615,6 +612,39 @@ void DocumentSourceLookUp::initializeIntrospectionPipeline() {
     uassert(ErrorCodes::IllegalOperation,
             "$changeStream is not allowed within a $lookup foreign pipeline",
             sources.empty() || !sources.front()->constraints().isChangeStreamStage());
+}
+
+DocumentSource::StageConstraints DocumentSourceLookUp::constraints(
+    Pipeline::SplitState pipeState) const {
+
+    const bool mayUseDisk = wasConstructedWithPipelineSyntax() &&
+        std::any_of(_parsedIntrospectionPipeline->getSources().begin(),
+                    _parsedIntrospectionPipeline->getSources().end(),
+                    [](const auto& source) {
+                        return source->constraints().diskRequirement ==
+                            DiskUseRequirement::kWritesTmpData;
+                    });
+
+    // If executing on mongos and the foreign collection is sharded, then this stage can run on
+    // mongos.
+    HostTypeRequirement hostReq;
+    if (pExpCtx->inMongos) {
+        hostReq = pExpCtx->mongoProcessInterface->isSharded(pExpCtx->opCtx, _fromNs)
+            ? HostTypeRequirement::kMongoS
+            : HostTypeRequirement::kPrimaryShard;
+    } else {
+        hostReq = HostTypeRequirement::kPrimaryShard;
+    }
+
+    StageConstraints constraints(StreamType::kStreaming,
+                                 PositionRequirement::kNone,
+                                 hostReq,
+                                 mayUseDisk ? DiskUseRequirement::kWritesTmpData
+                                            : DiskUseRequirement::kNoDiskUse,
+                                 FacetRequirement::kAllowed);
+
+    constraints.canSwapWithMatch = true;
+    return constraints;
 }
 
 void DocumentSourceLookUp::serializeToArray(
@@ -712,7 +742,7 @@ DocumentSource::GetDepsReturn DocumentSourceLookUp::getDependencies(DepsTracker*
     return SEE_NEXT;
 }
 
-void DocumentSourceLookUp::doDetachFromOperationContext() {
+void DocumentSourceLookUp::detachFromOperationContext() {
     if (_pipeline) {
         // We have a pipeline we're going to be executing across multiple calls to getNext(), so we
         // use Pipeline::detachFromOperationContext() to take care of updating '_fromExpCtx->opCtx'.
@@ -723,7 +753,7 @@ void DocumentSourceLookUp::doDetachFromOperationContext() {
     }
 }
 
-void DocumentSourceLookUp::doReattachToOperationContext(OperationContext* opCtx) {
+void DocumentSourceLookUp::reattachToOperationContext(OperationContext* opCtx) {
     if (_pipeline) {
         // We have a pipeline we're going to be executing across multiple calls to getNext(), so we
         // use Pipeline::reattachToOperationContext() to take care of updating '_fromExpCtx->opCtx'.

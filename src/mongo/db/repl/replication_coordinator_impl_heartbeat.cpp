@@ -39,7 +39,6 @@
 #include "mongo/db/repl/elect_cmd_runner.h"
 #include "mongo/db/repl/freshness_checker.h"
 #include "mongo/db/repl/heartbeat_response_action.h"
-#include "mongo/db/repl/member_data.h"
 #include "mongo/db/repl/repl_set_config_checks.h"
 #include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
@@ -112,10 +111,9 @@ void ReplicationCoordinatorImpl::_doMemberHeartbeat(executor::TaskExecutor::Call
     const RemoteCommandRequest request(
         target, "admin", heartbeatObj, BSON(rpc::kReplSetMetadataFieldName << 1), nullptr, timeout);
     const executor::TaskExecutor::RemoteCommandCallbackFn callback =
-        stdx::bind(&ReplicationCoordinatorImpl::_handleHeartbeatResponse,
-                   this,
-                   stdx::placeholders::_1,
-                   targetIndex);
+        [=](const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
+            return _handleHeartbeatResponse(cbData, targetIndex);
+        };
 
     LOG_FOR_HEARTBEATS(2) << "Sending heartbeat (requestId: " << request.id << ") to " << target
                           << ", " << heartbeatObj;
@@ -127,13 +125,10 @@ void ReplicationCoordinatorImpl::_scheduleHeartbeatToTarget_inlock(const HostAnd
                                                                    Date_t when) {
     LOG_FOR_HEARTBEATS(2) << "Scheduling heartbeat to " << target << " at "
                           << dateToISOStringUTC(when);
-    _trackHeartbeatHandle_inlock(
-        _replExecutor->scheduleWorkAt(when,
-                                      stdx::bind(&ReplicationCoordinatorImpl::_doMemberHeartbeat,
-                                                 this,
-                                                 stdx::placeholders::_1,
-                                                 target,
-                                                 targetIndex)));
+    _trackHeartbeatHandle_inlock(_replExecutor->scheduleWorkAt(
+        when, [=](const executor::TaskExecutor::CallbackArgs& cbData) {
+            _doMemberHeartbeat(cbData, target, targetIndex);
+        }));
 }
 
 void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
@@ -232,6 +227,16 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         _catchupState->signalHeartbeatUpdate_inlock();
     }
 
+    // Cancel catchup takeover if the last applied write by any node in the replica set was made
+    // in the current term, which implies that the primary has caught up.
+    bool catchupTakeoverScheduled = _catchupTakeoverCbh.isValid();
+    if (responseStatus.isOK() && catchupTakeoverScheduled && hbResponse.hasAppliedOpTime()) {
+        const auto& hbLastAppliedOpTime = hbResponse.getAppliedOpTime();
+        if (hbLastAppliedOpTime.getTerm() == _topCoord->getTerm()) {
+            _cancelCatchupTakeover_inlock();
+        }
+    }
+
     _scheduleHeartbeatToTarget_inlock(
         target, targetIndex, std::max(now, action.getNextHeartbeatStartDate()));
 
@@ -287,10 +292,10 @@ stdx::unique_lock<stdx::mutex> ReplicationCoordinatorImpl::_handleHeartbeatRespo
                 _priorityTakeoverWhen = _replExecutor->now() + priorityTakeoverDelay + randomOffset;
                 log() << "Scheduling priority takeover at " << _priorityTakeoverWhen;
                 _priorityTakeoverCbh = _scheduleWorkAt(
-                    _priorityTakeoverWhen,
-                    stdx::bind(&ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1,
-                               this,
-                               TopologyCoordinator::StartElectionReason::kPriorityTakeover));
+                    _priorityTakeoverWhen, [=](const mongo::executor::TaskExecutor::CallbackArgs&) {
+                        _startElectSelfIfEligibleV1(
+                            TopologyCoordinator::StartElectionReason::kPriorityTakeover);
+                    });
             }
             break;
         }
@@ -301,10 +306,10 @@ stdx::unique_lock<stdx::mutex> ReplicationCoordinatorImpl::_handleHeartbeatRespo
                 _catchupTakeoverWhen = _replExecutor->now() + catchupTakeoverDelay;
                 log() << "Scheduling catchup takeover at " << _catchupTakeoverWhen;
                 _catchupTakeoverCbh = _scheduleWorkAt(
-                    _catchupTakeoverWhen,
-                    stdx::bind(&ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1,
-                               this,
-                               TopologyCoordinator::StartElectionReason::kCatchupTakeover));
+                    _catchupTakeoverWhen, [=](const mongo::executor::TaskExecutor::CallbackArgs&) {
+                        _startElectSelfIfEligibleV1(
+                            TopologyCoordinator::StartElectionReason::kCatchupTakeover);
+                    });
             }
             break;
         }
@@ -356,10 +361,9 @@ executor::TaskExecutor::EventHandle ReplicationCoordinatorImpl::_stepDownStart()
     }
 
     _replExecutor
-        ->scheduleWork(stdx::bind(&ReplicationCoordinatorImpl::_stepDownFinish,
-                                  this,
-                                  stdx::placeholders::_1,
-                                  finishEvent))
+        ->scheduleWork([=](const executor::TaskExecutor::CallbackArgs& cbData) {
+            _stepDownFinish(cbData, finishEvent);
+        })
         .status_with_transitional_ignore();
     return finishEvent;
 }
@@ -398,6 +402,14 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
 
     _topCoord->finishUnconditionalStepDown();
     const auto action = _updateMemberStateFromTopologyCoordinator_inlock(opCtx.get());
+    if (_pendingTermUpdateDuringStepDown) {
+        TopologyCoordinator::UpdateTermResult result;
+        _updateTerm_inlock(*_pendingTermUpdateDuringStepDown, &result);
+        // We've just stepped down due to the "term", so it's impossible to step down again
+        // for the same term.
+        invariant(result != TopologyCoordinator::UpdateTermResult::kTriggerStepDown);
+        _pendingTermUpdateDuringStepDown = boost::none;
+    }
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
     _replExecutor->signalEvent(finishedEvent);
@@ -438,18 +450,16 @@ void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig_inlock(const ReplSet
 
         _replExecutor
             ->onEvent(electionFinishedEvent,
-                      stdx::bind(&ReplicationCoordinatorImpl::_heartbeatReconfigStore,
-                                 this,
-                                 stdx::placeholders::_1,
-                                 newConfig))
+                      [=](const executor::TaskExecutor::CallbackArgs& cbData) {
+                          _heartbeatReconfigStore(cbData, newConfig);
+                      })
             .status_with_transitional_ignore();
         return;
     }
     _replExecutor
-        ->scheduleWork(stdx::bind(&ReplicationCoordinatorImpl::_heartbeatReconfigStore,
-                                  this,
-                                  stdx::placeholders::_1,
-                                  newConfig))
+        ->scheduleWork([=](const executor::TaskExecutor::CallbackArgs& cbData) {
+            _heartbeatReconfigStore(cbData, newConfig);
+        })
         .status_with_transitional_ignore();
 }
 
@@ -543,11 +553,9 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
                                  "_heartbeatReconfigFinish until fail point is disabled.";
         _replExecutor
             ->scheduleWorkAt(_replExecutor->now() + Milliseconds{10},
-                             stdx::bind(&ReplicationCoordinatorImpl::_heartbeatReconfigFinish,
-                                        this,
-                                        stdx::placeholders::_1,
-                                        newConfig,
-                                        myIndex))
+                             [=](const executor::TaskExecutor::CallbackArgs& cbData) {
+                                 _heartbeatReconfigFinish(cbData, newConfig, myIndex);
+                             })
             .status_with_transitional_ignore();
         return;
     }
@@ -576,11 +584,9 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
         // Wait for the election to complete and the node's Role to be set to follower.
         _replExecutor
             ->onEvent(electionFinishedEvent,
-                      stdx::bind(&ReplicationCoordinatorImpl::_heartbeatReconfigFinish,
-                                 this,
-                                 stdx::placeholders::_1,
-                                 newConfig,
-                                 myIndex))
+                      [=](const executor::TaskExecutor::CallbackArgs& cbData) {
+                          _heartbeatReconfigFinish(cbData, newConfig, myIndex);
+                      })
             .status_with_transitional_ignore();
         return;
     }
@@ -635,10 +641,9 @@ void ReplicationCoordinatorImpl::_untrackHeartbeatHandle_inlock(
 void ReplicationCoordinatorImpl::_cancelHeartbeats_inlock() {
     LOG_FOR_HEARTBEATS(2) << "Cancelling all heartbeats.";
 
-    std::for_each(
-        _heartbeatHandles.begin(),
-        _heartbeatHandles.end(),
-        stdx::bind(&executor::TaskExecutor::cancel, _replExecutor.get(), stdx::placeholders::_1));
+    for (const auto& handle : _heartbeatHandles) {
+        _replExecutor->cancel(handle);
+    }
     // Heartbeat callbacks will remove themselves from _heartbeatHandles when they execute with
     // CallbackCanceled status, so it's better to leave the handles in the list, for now.
 
@@ -725,10 +730,10 @@ void ReplicationCoordinatorImpl::_scheduleNextLivenessUpdate_inlock() {
     // just barely fresh and it has become stale since then. We must schedule another liveness
     // check to continue conducting liveness checks and be able to step down from primary if we
     // lose contact with a majority of nodes.
-    auto cbh = _scheduleWorkAt(nextTimeout,
-                               stdx::bind(&ReplicationCoordinatorImpl::_handleLivenessTimeout,
-                                          this,
-                                          stdx::placeholders::_1));
+    auto cbh =
+        _scheduleWorkAt(nextTimeout, [=](const executor::TaskExecutor::CallbackArgs& cbData) {
+            _handleLivenessTimeout(cbData);
+        });
     if (!cbh) {
         return;
     }
@@ -799,10 +804,9 @@ void ReplicationCoordinatorImpl::_cancelAndRescheduleElectionTimeout_inlock() {
     LOG(4) << "Scheduling election timeout callback at " << when;
     _handleElectionTimeoutWhen = when;
     _handleElectionTimeoutCbh =
-        _scheduleWorkAt(when,
-                        stdx::bind(&ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1,
-                                   this,
-                                   TopologyCoordinator::StartElectionReason::kElectionTimeout));
+        _scheduleWorkAt(when, [=](const mongo::executor::TaskExecutor::CallbackArgs&) {
+            _startElectSelfIfEligibleV1(TopologyCoordinator::StartElectionReason::kElectionTimeout);
+        });
 }
 
 void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(

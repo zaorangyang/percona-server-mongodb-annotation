@@ -16,8 +16,8 @@
  * - checkResults: A function that asserts whether the command should succeed or fail. If the
  *                 command is expected to succeed, the function should assert the expected results
  *                 *when the range has been deleted on the donor.*
- * - behavior: Must be one of "unshardedOnly", "unversioned", or "versioned". Determines what
- *             checks the test performs against the system profilers of the secondaries.
+ * - behavior: Must be one of "unshardedOnly", "targetsPrimaryUsesConnectionVersioning",
+ *             "unversioned", or "versioned". Determines what system profiler checks are performed.
  */
 (function() {
     "use strict";
@@ -31,8 +31,17 @@
     // Given a command, build its expected shape in the system profiler.
     let buildCommandProfile = function(command) {
         let commandProfile = {ns: nss};
-        for (let key in command) {
-            commandProfile["command." + key] = command[key];
+        if (command.mapReduce) {
+            // Unlike other read commands, mapReduce is rewritten to a different format when sent to
+            // shards if the input collection is sharded, because it is executed in two phases.
+            // We do not check for the 'map' and 'reduce' fields, because they are functions, and
+            // we cannot compaare functions for equality.
+            commandProfile["command.out"] = {$regex: "^tmp.mrs"};
+            commandProfile["command.shardedFirstPass"] = true;
+        } else {
+            for (let key in command) {
+                commandProfile["command." + key] = command[key];
+            }
         }
         return commandProfile;
     };
@@ -43,6 +52,7 @@
         assert(test.command && typeof(test.command) === "object");
         assert(test.checkResults && typeof(test.checkResults) === "function");
         assert(test.behavior === "unshardedOnly" || test.behavior === "unversioned" ||
+               test.behavior === "targetsPrimaryUsesConnectionVersioning" ||
                test.behavior === "versioned");
     };
 
@@ -55,12 +65,15 @@
         _configsvrCommitChunkMerge: {skip: "primary only"},
         _configsvrCommitChunkMigration: {skip: "primary only"},
         _configsvrCommitChunkSplit: {skip: "primary only"},
+        _configsvrDropCollection: {skip: "primary only"},
+        _configsvrDropDatabase: {skip: "primary only"},
         _configsvrMoveChunk: {skip: "primary only"},
         _configsvrMovePrimary: {skip: "primary only"},
         _configsvrRemoveShardFromZone: {skip: "primary only"},
         _configsvrShardCollection: {skip: "primary only"},
         _configsvrSetFeatureCompatibilityVersion: {skip: "primary only"},
         _configsvrUpdateZoneKeyRange: {skip: "primary only"},
+        _flushRoutingTableCacheUpdates: {skip: "does not return user data"},
         _getUserCacheGeneration: {skip: "does not return user data"},
         _hashBSONElement: {skip: "does not return user data"},
         _isSelf: {skip: "does not return user data"},
@@ -87,7 +100,6 @@
         },
         appendOplogNote: {skip: "primary only"},
         applyOps: {skip: "primary only"},
-        authSchemaUpgrade: {skip: "primary only"},
         authenticate: {skip: "does not return user data"},
         availableQueryOptions: {skip: "does not return user data"},
         balancerStart: {skip: "primary only"},
@@ -110,7 +122,6 @@
         connectionStatus: {skip: "does not return user data"},
         convertToCapped: {skip: "primary only"},
         copydb: {skip: "primary only"},
-        copydbgetnonce: {skip: "primary only"},
         copydbsaslstart: {skip: "primary only"},
         count: {
             setUp: function(mongosConn) {
@@ -176,7 +187,6 @@
         findAndModify: {skip: "primary only"},
         flushRouterConfig: {skip: "does not return user data"},
         forceerror: {skip: "does not return user data"},
-        forceRoutingTableRefresh: {skip: "does not return user data"},
         fsync: {skip: "does not return user data"},
         fsyncUnlock: {skip: "does not return user data"},
         geoNear: {
@@ -244,7 +254,29 @@
         logRotate: {skip: "does not return user data"},
         logout: {skip: "does not return user data"},
         makeSnapshot: {skip: "does not return user data"},
-        mapReduce: {skip: "TODO SERVER-30068"},
+        mapReduce: {
+            setUp: function(mongosConn) {
+                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1}));
+                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1}));
+            },
+            command: {
+                mapReduce: coll,
+                map: function() {
+                    emit(this.x, 1);
+                },
+                reduce: function(key, values) {
+                    return Array.sum(values);
+                },
+                out: {inline: 1}
+            },
+            checkResults: function(res) {
+                assert.commandWorked(res);
+                assert.eq(1, res.results.length, tojson(res));
+                assert.eq(1, res.results[0]._id, tojson(res));
+                assert.eq(2, res.results[0].value, tojson(res));
+            },
+            behavior: "targetsPrimaryUsesConnectionVersioning"
+        },
         mergeChunks: {skip: "primary only"},
         moveChunk: {skip: "primary only"},
         movePrimary: {skip: "primary only"},
@@ -330,6 +362,7 @@
     let rsOpts = {nodes: [{rsConfig: {votes: 1}}, {rsConfig: {priority: 0, votes: 0}}]};
     let st = new ShardingTest({mongos: 2, shards: {rs0: rsOpts, rs1: rsOpts}});
 
+    let recipientShardPrimary = st.rs1.getPrimary();
     let donorShardSecondary = st.rs0.getSecondary();
     let recipientShardSecondary = st.rs1.getSecondary();
 
@@ -369,7 +402,7 @@
         // Do any test-specific setup.
         test.setUp(staleMongos);
 
-        // Turn on system profiler on secondaries to collect data on all database operations.
+        assert.commandWorked(recipientShardPrimary.getDB(db).setProfilingLevel(2));
         assert.commandWorked(donorShardSecondary.getDB(db).setProfilingLevel(2));
         assert.commandWorked(recipientShardSecondary.getDB(db).setProfilingLevel(2));
 
@@ -409,7 +442,7 @@
                     "command.shardVersion": {"$exists": false},
                     "command.$readPreference": {"mode": "secondary"},
                     "command.readConcern": {"level": "local"},
-                    "exceptionCode": {"$exists": false}
+                    "exceptionCode": {"$ne": ErrorCodes.StaleConfig},
                 },
                                       commandProfile)
             });
@@ -417,6 +450,19 @@
             // Check that the recipient shard secondary did not receive the request.
             profilerHasZeroMatchingEntriesOrThrow(
                 {profileDB: recipientShardSecondary.getDB(db), filter: commandProfile});
+        } else if (test.behavior === "targetsPrimaryUsesConnectionVersioning") {
+            // Check that the recipient shard primary received the request without a shardVersion
+            // field and returned success.
+            profilerHasSingleMatchingEntryOrThrow({
+                profileDB: recipientShardPrimary.getDB(db),
+                filter: Object.extend({
+                    "command.shardVersion": {"$exists": false},
+                    "command.$readPreference": {$exists: false},
+                    "command.readConcern": {"level": "local"},
+                    "exceptionCode": {"$exists": false},
+                },
+                                      commandProfile)
+            });
         } else if (test.behavior === "versioned") {
             // Check that the donor shard secondary returned stale shardVersion.
             profilerHasSingleMatchingEntryOrThrow({
@@ -452,7 +498,7 @@
                     "command.shardVersion": {"$exists": true},
                     "command.$readPreference": {"mode": "secondary"},
                     "command.readConcern": {"level": "local"},
-                    "exceptionCode": {"$exists": false}
+                    "exceptionCode": {"$ne": ErrorCodes.StaleConfig},
                 },
                                       commandProfile)
             });

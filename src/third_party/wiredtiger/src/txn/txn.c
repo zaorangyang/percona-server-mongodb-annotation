@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2017 MongoDB, Inc.
+ * Copyright (c) 2014-2018 MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -287,7 +287,7 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, uint32_t flags)
 #ifdef HAVE_TIMESTAMPS
 	/* Try to move the pinned timestamp forward. */
 	if (strict)
-		WT_RET(__wt_txn_update_pinned_timestamp(session));
+		WT_RET(__wt_txn_update_pinned_timestamp(session, false));
 #endif
 
 	/*
@@ -367,7 +367,6 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, uint32_t flags)
 	if (WT_TXNID_LT(txn_global->last_running, last_running)) {
 		txn_global->last_running = last_running;
 
-#ifdef HAVE_VERBOSE
 		/* Output a verbose message about long-running transactions,
 		 * but only when some progress is being made. */
 		if (WT_VERBOSE_ISSET(session, WT_VERB_TRANSACTION) &&
@@ -380,7 +379,6 @@ __wt_txn_update_oldest(WT_SESSION_IMPL *session, uint32_t flags)
 			    oldest_session->lastop,
 			    oldest_session->txn.snap_min);
 		}
-#endif
 	}
 
 done:	__wt_writeunlock(session, &txn_global->rwlock);
@@ -612,7 +610,7 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_TXN_GLOBAL *txn_global;
 	WT_TXN_OP *op;
 	u_int i;
-	bool locked;
+	bool locked, readonly;
 #ifdef HAVE_TIMESTAMPS
 	wt_timestamp_t prev_commit_timestamp, ts;
 	bool update_timestamp;
@@ -627,6 +625,7 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_ASSERT(session, !F_ISSET(txn, WT_TXN_ERROR) ||
 	    txn->mod_count == 0);
 
+	readonly = txn->mod_count == 0;
 	/*
 	 * Look for a commit timestamp.
 	 */
@@ -748,7 +747,7 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 			 * Switch reserved operations to abort to
 			 * simplify obsolete update list truncation.
 			 */
-			if (op->u.upd->type == WT_UPDATE_RESERVED) {
+			if (op->u.upd->type == WT_UPDATE_RESERVE) {
 				op->u.upd->txnid = WT_TXN_ABORTED;
 				break;
 			}
@@ -849,6 +848,13 @@ __wt_txn_commit(WT_SESSION_IMPL *session, const char *cfg[])
 	}
 #endif
 
+	/*
+	 * We're between transactions, if we need to block for eviction, it's
+	 * a good time to do so.  Note that we must ignore any error return
+	 * because the user's data is committed.
+	 */
+	if (!readonly)
+		(void)__wt_cache_eviction_check(session, false, false, NULL);
 	return (0);
 
 err:	/*
@@ -874,10 +880,12 @@ __wt_txn_rollback(WT_SESSION_IMPL *session, const char *cfg[])
 	WT_TXN *txn;
 	WT_TXN_OP *op;
 	u_int i;
+	bool readonly;
 
 	WT_UNUSED(cfg);
 
 	txn = &session->txn;
+	readonly = txn->mod_count == 0;
 	WT_ASSERT(session, F_ISSET(txn, WT_TXN_RUNNING));
 
 	/* Rollback notification. */
@@ -921,6 +929,13 @@ __wt_txn_rollback(WT_SESSION_IMPL *session, const char *cfg[])
 	txn->mod_count = 0;
 
 	__wt_txn_release(session);
+	/*
+	 * We're between transactions, if we need to block for eviction, it's
+	 * a good time to do so.  Note that we must ignore any error return
+	 * because the user's data is committed.
+	 */
+	if (!readonly)
+		(void)__wt_cache_eviction_check(session, false, false, NULL);
 	return (ret);
 }
 
@@ -1044,13 +1059,15 @@ __wt_txn_global_init(WT_SESSION_IMPL *session, const char *cfg[])
 
 	WT_RET(__wt_spin_init(
 	    session, &txn_global->id_lock, "transaction id lock"));
-	WT_RET(__wt_rwlock_init(session, &txn_global->rwlock));
+	WT_RWLOCK_INIT_TRACKED(session, &txn_global->rwlock, txn_global);
 	WT_RET(__wt_rwlock_init(session, &txn_global->visibility_rwlock));
 
-	WT_RET(__wt_rwlock_init(session, &txn_global->commit_timestamp_rwlock));
+	WT_RWLOCK_INIT_TRACKED(session,
+	    &txn_global->commit_timestamp_rwlock, commit_timestamp);
 	TAILQ_INIT(&txn_global->commit_timestamph);
 
-	WT_RET(__wt_rwlock_init(session, &txn_global->read_timestamp_rwlock));
+	WT_RWLOCK_INIT_TRACKED(session,
+	    &txn_global->read_timestamp_rwlock, read_timestamp);
 	TAILQ_INIT(&txn_global->read_timestamph);
 
 	WT_RET(__wt_rwlock_init(session, &txn_global->nsnap_rwlock));
@@ -1141,6 +1158,7 @@ __wt_verbose_dump_txn_one(WT_SESSION_IMPL *session, WT_TXN *txn)
 	const char *iso_tag;
 
 	iso_tag = "INVALID";
+	WT_NOT_READ(iso_tag);
 	switch (txn->isolation) {
 	case WT_ISO_READ_COMMITTED:
 		iso_tag = "WT_ISO_READ_COMMITTED";

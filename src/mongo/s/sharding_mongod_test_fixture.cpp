@@ -36,9 +36,9 @@
 #include "mongo/base/status_with.h"
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db_raii.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/query/cursor_response.h"
@@ -145,6 +145,11 @@ void ShardingMongodTestFixture::setUp() {
     service->setOpObserver(stdx::make_unique<OpObserverImpl>());
     repl::setOplogCollectionName();
     repl::createOplog(_opCtx.get());
+
+    // Set the highest FCV because otherwise it defaults to the lower FCV. This way we default to
+    // testing this release's code, not backwards compatibility code.
+    serverGlobalParams.featureCompatibility.setVersion(
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
 }
 
 std::unique_ptr<ReplicationCoordinatorMock> ShardingMongodTestFixture::makeReplicationCoordinator(
