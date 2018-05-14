@@ -2,6 +2,7 @@
  * Test that setting profiling level is not allowed when FCV is unset; otherwise
  * system.profile might be created without a UUID.
  */
+// @tags: [rocks_requires_fcv36]
 (function() {
     "use strict";
 
