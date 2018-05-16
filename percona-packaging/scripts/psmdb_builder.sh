@@ -531,7 +531,7 @@ build_source_deb(){
     #
     mv ${TARFILE} ${PRODUCT}-36_${VERSION}.orig.tar.gz
     cd ${BUILDDIR}
-    #pip install -r buildscripts/requirements.txt
+    pip install --user -r buildscripts/requirements.txt
 
     set_compiler
     fix_rules
