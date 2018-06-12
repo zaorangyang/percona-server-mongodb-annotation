@@ -8,6 +8,7 @@
     const rst = new ReplSetTest({nodes: 2, nodeOptions: {enableMajorityReadConcern: ""}});
     if (!startSetIfSupportsReadMajority(rst)) {
         jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
+        rst.stopSet();
         return;
     }
     rst.initiate();
@@ -113,4 +114,5 @@
     let doc = getOneDoc(cursor);
     assert.docEq(doc.operationType, "insert");
     assert.docEq(doc.fullDocument, {_id: 2});
+    rst.stopSet();
 }());

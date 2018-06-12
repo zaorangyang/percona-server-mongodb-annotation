@@ -37,6 +37,32 @@ function _getErrorWithCode(codeOrObj, message) {
     return e;
 }
 
+/**
+ * Executes the specified function and retries it if it fails due to exception related to network
+ * error. If it exhausts the number of allowed retries, it simply throws the last exception.
+ *
+ * Returns the return value of the input call.
+ */
+function retryOnNetworkError(func, numRetries, sleepMs) {
+    numRetries = numRetries || 1;
+    sleepMs = sleepMs || 1000;
+
+    while (true) {
+        try {
+            return func();
+        } catch (e) {
+            if (isNetworkError(e) && numRetries > 0) {
+                print("Network error occurred and the call will be retried: " +
+                      tojson({error: e.toString(), stack: e.stack}));
+                numRetries--;
+                sleep(sleepMs);
+            } else {
+                throw e;
+            }
+        }
+    }
+}
+
 // Checks if a javascript exception is a network error.
 function isNetworkError(error) {
     return error.message.indexOf("network error") >= 0 ||
@@ -271,6 +297,7 @@ jsTestOptions = function() {
             overrideRetryAttempts: TestData.overrideRetryAttempts || 0,
             logRetryAttempts: TestData.logRetryAttempts || false,
             connectionString: TestData.connectionString || "",
+            skipCheckDBHashes: TestData.skipCheckDBHashes || false,
         });
     }
     return _jsTestOptions;
@@ -281,7 +308,9 @@ setJsTestOption = function(name, value) {
 };
 
 jsTestLog = function(msg) {
-    print("\n\n----\n" + msg + "\n----\n\n");
+    assert.eq(typeof(msg), "string", "Received: " + msg);
+    const msgs = ["----", ...msg.split("\n"), "----"].map(s => `[jsTest] ${s}`);
+    print(`\n\n${msgs.join("\n")}\n\n`);
 };
 
 jsTest = {};

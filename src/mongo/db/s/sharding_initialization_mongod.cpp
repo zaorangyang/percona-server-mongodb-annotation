@@ -36,8 +36,6 @@
 #include "mongo/client/connection_string.h"
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
-#include "mongo/db/logical_session_cache.h"
-#include "mongo/db/logical_session_cache_factory_mongod.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
@@ -54,6 +52,7 @@
 #include "mongo/s/client/shard_local.h"
 #include "mongo/s/client/shard_remote.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
+#include "mongo/s/grid.h"
 #include "mongo/s/sharding_initialization.h"
 #include "mongo/stdx/memory.h"
 
@@ -109,7 +108,7 @@ Status initializeGlobalShardingStateForMongod(OperationContext* opCtx,
         validator->resetKeyManager();
     }
 
-    auto initializeStatus = initializeGlobalShardingState(
+    Status initStatus = initializeGlobalShardingState(
         opCtx,
         configCS,
         distLockProcessId,
@@ -127,19 +126,11 @@ Status initializeGlobalShardingStateForMongod(OperationContext* opCtx,
         // queries in mongod.
         1);
 
-    if (!initializeStatus.isOK()) {
-        return initializeStatus;
+    if (initStatus.isOK()) {
+        Grid::get(opCtx)->setShardingInitialized();
     }
 
-    const auto serverType = serverGlobalParams.clusterRole == ClusterRole::ConfigServer
-        ? LogicalSessionCacheServer::kConfigServer
-        : LogicalSessionCacheServer::kSharded;
-
-    invariant(LogicalSessionCache::get(opCtx) == nullptr);
-    auto sessionCache = makeLogicalSessionCacheD(opCtx->getServiceContext(), serverType);
-    LogicalSessionCache::set(opCtx->getServiceContext(), std::move(sessionCache));
-
-    return Status::OK();
+    return initStatus;
 }
 
 }  // namespace mongo

@@ -9,6 +9,7 @@
 // Checking UUID consistency involves talking to the config server primary, but there is no config
 // server primary by the end of this test.
 TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
+TestData.skipCheckDBHashes = true;
 
 (function() {
     'use strict';
@@ -51,4 +52,5 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
     assert.eq('world', res.hello);
 
     st.stop();
+    MongoRunner.stopMongos(otherMongos);
 })();

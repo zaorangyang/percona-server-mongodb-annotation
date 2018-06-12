@@ -24,6 +24,7 @@
 
     if (!startSetIfSupportsReadMajority(replTest)) {
         jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
+        replTest.stopSet();
         return;
     }
     replTest.initiate();

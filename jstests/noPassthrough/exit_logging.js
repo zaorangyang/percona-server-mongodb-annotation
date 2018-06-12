@@ -111,6 +111,7 @@
         };
 
         runAllTests(mongosLauncher);
+        st.stop();
     }());
 
 }());

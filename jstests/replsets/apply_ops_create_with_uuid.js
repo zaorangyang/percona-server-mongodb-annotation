@@ -48,4 +48,5 @@
     assert.eq(db.getCollectionInfos({name: "foo"}).length,
               0,
               "expected foo collection to no longer exist");
+    replTest.stopSet();
 }());

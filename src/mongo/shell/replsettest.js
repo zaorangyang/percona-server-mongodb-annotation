@@ -1323,7 +1323,7 @@ var ReplSetTest = function(opts) {
         assert.commandWorked(primary.adminCommand({fsync: 1, lock: 1}),
                              'failed to lock the primary');
         try {
-            this.awaitReplication(60 * 1000 * 5);
+            this.awaitReplication();
             checkerFunction.apply(this, checkerFunctionArgs);
         } catch (e) {
             activeException = true;
@@ -1434,7 +1434,7 @@ var ReplSetTest = function(opts) {
             var primary = rst.liveNodes.master;
             var combinedDBs = new Set(primary.getDBNames());
 
-            rst.getSecondaries().forEach(secondary => {
+            rst.liveNodes.slaves.forEach(secondary => {
                 secondary.getDBNames().forEach(dbName => combinedDBs.add(dbName));
             });
 
@@ -1445,10 +1445,15 @@ var ReplSetTest = function(opts) {
 
                 var dbHashes = rst.getHashes(dbName);
                 var primaryDBHash = dbHashes.master;
+                var primaryCollections = Object.keys(primaryDBHash.collections);
                 assert.commandWorked(primaryDBHash);
 
                 try {
-                    var primaryCollInfo = primary.getDB(dbName).getCollectionInfos();
+                    // Filter only collections that were retrieved by the dbhash. listCollections
+                    // may include non-replicated collections like system.profile.
+                    var primaryCollInfo =
+                        primary.getDB(dbName).getCollectionInfos({name: {$in: primaryCollections}});
+
                 } catch (e) {
                     if (jsTest.options().skipValidationOnInvalidViewDefinitions) {
                         assert.commandFailedWithCode(e, ErrorCodes.InvalidViewDefinition);
@@ -1464,8 +1469,6 @@ var ReplSetTest = function(opts) {
                     assert.commandWorked(secondaryDBHash);
 
                     var secondary = secondaryDBHash._mongo;
-
-                    var primaryCollections = Object.keys(primaryDBHash.collections);
                     var secondaryCollections = Object.keys(secondaryDBHash.collections);
 
                     if (primaryCollections.length !== secondaryCollections.length) {
@@ -1500,7 +1503,9 @@ var ReplSetTest = function(opts) {
 
                     // Check that collection information is consistent on the primary and
                     // secondaries.
-                    var secondaryCollInfo = secondary.getDB(dbName).getCollectionInfos();
+                    var secondaryCollInfo = secondary.getDB(dbName).getCollectionInfos(
+                        {name: {$in: secondaryCollections}});
+
                     secondaryCollInfo.forEach(secondaryInfo => {
                         primaryCollInfo.forEach(primaryInfo => {
                             if (secondaryInfo.name === primaryInfo.name &&
@@ -1924,6 +1929,23 @@ var ReplSetTest = function(opts) {
      * @param {Object} opts @see MongoRunner.stopMongod
      */
     this.stopSet = function(signal, forRestart, opts) {
+        // Check to make sure data is the same on all nodes.
+        if (!jsTest.options().skipCheckDBHashes) {
+            // To skip this check add TestData.skipCheckDBHashes = true;
+            // Reasons to skip this test include:
+            // - the primary goes down and none can be elected (so fsync lock/unlock commands fail)
+            // - the replica set is in an unrecoverable inconsistent state. E.g. the replica set
+            //   is partitioned.
+            //
+            if (_callIsMaster() &&
+                this.liveNodes.slaves.length > 0) {  // skip for single node replsets.
+                // Auth only on live nodes because authutil.assertAuthenticate
+                // refuses to log in live connections if some secondaries are down.
+                asCluster([this.liveNodes.master, ...this.liveNodes.slaves],
+                          () => this.checkReplicatedDataHashes());
+            }
+        }
+
         for (var i = 0; i < this.ports.length; i++) {
             this.stop(i, signal, opts);
         }
@@ -2051,7 +2073,12 @@ var ReplSetTest = function(opts) {
     }
 
     if (typeof opts === 'string' || opts instanceof String) {
-        _constructFromExistingSeedNode(opts);
+        retryOnNetworkError(function() {
+            // The primary may unexpectedly step down during startup if under heavy load
+            // and too slowly processing heartbeats. When it steps down, it closes all of
+            // its connections.
+            _constructFromExistingSeedNode(opts);
+        }, 10);
     } else {
         _constructStartNewInstances(opts);
     }

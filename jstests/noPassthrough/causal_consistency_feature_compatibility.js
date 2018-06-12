@@ -39,6 +39,7 @@
 
     if (!startSetIfSupportsReadMajority(rst)) {
         jsTestLog("Skipping test since storage engine doesn't support majority read concern.");
+        rst.stopSet();
         return;
     }
     rst.initiate();
@@ -95,4 +96,5 @@
     assert(logicalTimeCanBeProcessed(st.configRS.getPrimary().getDB("test")));
 
     st.stop();
+    rst.stopSet();
 })();

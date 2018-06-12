@@ -37,4 +37,5 @@
     assert.eq(1, res.cursor.firstBatch.length);
     assert.eq(newUUID, res.cursor.firstBatch[0].info.uuid);
 
+    MongoRunner.stopMongod(standalone);
 })();

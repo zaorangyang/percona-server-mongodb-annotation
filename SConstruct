@@ -331,6 +331,11 @@ add_option('use-system-valgrind',
     nargs=0,
 )
 
+add_option('use-system-google-benchmark',
+    help='use system version of Google benchmark library',
+    nargs=0,
+)
+
 add_option('use-system-zlib',
     help='use system version of zlib library',
     nargs=0,
@@ -577,6 +582,7 @@ def variable_tools_converter(val):
         'idl_tool',
         "jsheader",
         "mergelib",
+        "mongo_benchmark",
         "mongo_integrationtest",
         "mongo_unittest",
         "textfile",
@@ -916,6 +922,8 @@ envDict = dict(BUILD_ROOT=buildDir,
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
                INTEGRATION_TEST_ALIAS='integration_tests',
                INTEGRATION_TEST_LIST='$BUILD_ROOT/integration_tests.txt',
+               BENCHMARK_ALIAS='benchmarks',
+               BENCHMARK_LIST='$BUILD_ROOT/benchmarks.txt',
                CONFIGUREDIR='$BUILD_ROOT/scons/$VARIANT_DIR/sconf_temp',
                CONFIGURELOG='$BUILD_ROOT/scons/config.log',
                INSTALL_DIR=installDir,
@@ -2736,9 +2744,13 @@ def doConfigure(myenv):
     if has_option( "ssl" ):
         sslLibName = "ssl"
         cryptoLibName = "crypto"
+        sslLinkDependencies = ["crypto", "dl"]
+        if conf.env.TargetOSIs('freebsd'):
+            sslLinkDependencies = ["crypto"]
         if conf.env.TargetOSIs('windows'):
             sslLibName = "ssleay32"
             cryptoLibName = "libeay32"
+            sslLinkDependencies = ["libeay32"]
 
             # Add the SSL binaries to the zip file distribution
             files = ['ssleay32.dll', 'libeay32.dll']
@@ -2784,15 +2796,6 @@ def doConfigure(myenv):
                         pass
 
         if not conf.CheckLibWithHeader(
-                sslLibName,
-                ["openssl/ssl.h"],
-                "C",
-                "SSL_version(NULL);",
-                autoadd=True):
-            maybeIssueDarwinSSLAdvice(conf.env)
-            conf.env.ConfError("Couldn't find OpenSSL ssl.h header and library")
-
-        if not conf.CheckLibWithHeader(
                 cryptoLibName,
                 ["openssl/crypto.h"],
                 "C",
@@ -2800,6 +2803,23 @@ def doConfigure(myenv):
                 autoadd=True):
             maybeIssueDarwinSSLAdvice(conf.env)
             conf.env.ConfError("Couldn't find OpenSSL crypto.h header and library")
+
+        def CheckLibSSL(context):
+            res = SCons.Conftest.CheckLib(context,
+                     libs=[sslLibName],
+                     extra_libs=sslLinkDependencies,
+                     header='#include "openssl/ssl.h"',
+                     language="C",
+                     call="SSL_version(NULL);",
+                     autoadd=True)
+            context.did_show_result = 1
+            return not res
+
+        conf.AddTest("CheckLibSSL", CheckLibSSL)
+
+        if not conf.CheckLibSSL():
+           maybeIssueDarwinSSLAdvice(conf.env)
+           conf.env.ConfError("Couldn't find OpenSSL ssl.h header and library")
 
         def CheckLinkSSL(context):
             test_body = """
@@ -3265,7 +3285,7 @@ env.SConscript(
     variant_dir='$BUILD_DIR',
 )
 
-all = env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests'])
+all = env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests', 'benchmarks'])
 
 # run the Dagger tool if it's installed
 if should_dagger:

@@ -593,7 +593,6 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/logical_session_cache_factory_mongod',
         '$BUILD_DIR/mongo/transport/service_entry_point',
         'auth/authmongod',
         'commands/dcommands_fsync',
@@ -1060,6 +1059,7 @@ env.Library(
         'sessions_collection_config_server.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/commands/feature_compatibility_version',
         '$BUILD_DIR/mongo/s/client/sharding_client',
         '$BUILD_DIR/mongo/s/commands/shared_cluster_commands',
         '$BUILD_DIR/mongo/s/coreshard',
