@@ -401,7 +401,7 @@ void _logOpsInner(OperationContext* opCtx,
 
         auto lastAppliedTimestamp = finalOpTime.getTimestamp();
         const auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
-        if (storageEngine->supportsDocLocking()) {
+        if (storageEngine->isFcv36Supported() && storageEngine->supportsDocLocking()) {
             // If the storage engine supports document level locking, then it is possible for
             // oplog writes to commit out of order. In that case, we only want to set our last
             // applied optime to the all committed timestamp to ensure that all operations earlier
