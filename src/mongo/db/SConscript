@@ -24,6 +24,7 @@ env.SConscript(
         'catalog',
         'commands',
         'concurrency',
+        'encryption',
         'exec',
         'free_mon',
         'fts',
@@ -478,6 +479,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/storage/mmap_v1/mmap_v1_options',
+        'encryption/encryption_options',
         'repl/repl_settings',
         'repl/replica_set_messages',
         'server_options_servers',

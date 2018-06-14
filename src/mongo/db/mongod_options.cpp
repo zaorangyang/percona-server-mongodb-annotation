@@ -42,6 +42,7 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
 #include "mongo/db/db.h"
+#include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/server_options.h"
@@ -88,6 +89,7 @@ Status addMongodOptions(moe::OptionSection* options) {
     moe::OptionSection replication_options("Replication options");
     moe::OptionSection sharding_options("Sharding options");
     moe::OptionSection storage_options("Storage options");
+    moe::OptionSection encryption_options("Encryption options");
 
     // Authentication Options
 
@@ -357,6 +359,31 @@ Status addMongodOptions(moe::OptionSection* options) {
 
 #endif
 
+    // Encryption Options
+
+    encryption_options.addOptionChaining(
+        "security.enableEncryption",
+        "enableEncryption",
+        moe::Switch,
+        "enable encryption for the WiredTiger storage engine");
+
+    encryption_options
+        .addOptionChaining(
+            "security.encryptionCipherMode",
+            "encryptionCipherMode",
+            moe::String,
+            "the cipher mode to use for encryption at rest")
+        .format("(:?AES256-CBC)|(:?AES256-GCM)", "(AES256-CBC/AES256-GCM)")
+        .requires("security.enableEncryption");
+
+    encryption_options
+        .addOptionChaining(
+            "security.encryptionKeyFile",
+            "encryptionKeyFile",
+            moe::String,
+            "the path to the local keyfile")
+        .requires("security.enableEncryption");
+
     // Replication Options
 
     replication_options.addOptionChaining(
@@ -483,6 +510,7 @@ Status addMongodOptions(moe::OptionSection* options) {
     options->addSection(ssl_options).transitional_ignore();
 #endif
     options->addSection(storage_options).transitional_ignore();
+    options->addSection(encryption_options).transitional_ignore();
 
     // The following are legacy options that are disallowed in the JSON config file
 
@@ -931,6 +959,18 @@ Status storeMongodOptions(const moe::Environment& params) {
 
     if (params.count("storage.groupCollections")) {
         storageGlobalParams.groupCollections = params["storage.groupCollections"].as<bool>();
+    }
+
+    if (params.count("security.enableEncryption")) {
+        encryptionGlobalParams.enableEncryption = params["security.enableEncryption"].as<bool>();
+    }
+
+    if (params.count("security.encryptionCipherMode")) {
+        encryptionGlobalParams.encryptionCipherMode = params["security.encryptionCipherMode"].as<std::string>();
+    }
+
+    if (params.count("security.encryptionKeyFile")) {
+        encryptionGlobalParams.encryptionKeyFile = params["security.encryptionKeyFile"].as<std::string>();
     }
 
     if (params.count("cpu")) {
