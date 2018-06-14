@@ -24,6 +24,7 @@ env.SConscript(
         'catalog',
         'commands',
         'concurrency',
+        'encryption',
         'exec',
         'free_mon',
         'fts',
@@ -480,6 +481,7 @@ env.Library(
         "ratelimit_parameter.cpp",
     ],
     LIBDEPS=[
+        'encryption/encryption_options',
         'repl/repl_settings',
         'repl/replica_set_messages',
         'server_options_servers',
