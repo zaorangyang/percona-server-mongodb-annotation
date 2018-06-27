@@ -1,7 +1,7 @@
 /**
  * Tests that the mongo shell retries exactly once on retryable errors.
  *
- * @tags: [requires_replication]
+ * @tags: [requires_replication, rocks_requires_fcv36]
  */
 (function() {
     "use strict";
