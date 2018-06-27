@@ -1,5 +1,6 @@
 /**
  * Tests for making sure that retried writes will wait properly for writeConcern.
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
 
