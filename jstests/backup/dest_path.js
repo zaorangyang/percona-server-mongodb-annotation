@@ -17,4 +17,6 @@
 
     // Relative path
     assert.commandFailed(adminDB.runCommand({createBackup: 1, backupDir: '../usr'}));
+
+    MongoRunner.stopMongod(conn);
 })();
