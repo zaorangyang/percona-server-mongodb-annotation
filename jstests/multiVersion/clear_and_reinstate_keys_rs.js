@@ -1,5 +1,6 @@
 // Tests that the keys collection is correctly handled on downgrade and re-upgrade for a standalone
 // replica set.
+// @tags: [rocks_requires_fcv36]
 (function() {
     "use strict";
 
