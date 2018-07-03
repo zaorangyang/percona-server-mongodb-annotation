@@ -219,22 +219,26 @@ public:
             wunit.commit();
         }
 
-        // Write Noop into the oplog just to increment timestamp value returned by following call
-        // to reserveSnapshotName. Thus setMinimumVisibleSnapshot will be guaranteed to record value
-        // that is greater than current majority committed snapshot.
-        writeConflictRetry(
-            opCtx, "writeNoop", NamespaceString::kRsOplogNamespace.ns(), [&opCtx] {
-                WriteUnitOfWork uow(opCtx);
-                opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(opCtx,
-                                                                                      kMsgObj);
-                uow.commit();
-            });
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+
+        // Only if this instance is a primary
+        if (replCoord->canAcceptWritesForDatabase(opCtx, "admin")) {
+            // Write Noop into the oplog just to increment timestamp value returned by following call
+            // to reserveSnapshotName. Thus setMinimumVisibleSnapshot will be guaranteed to record value
+            // that is greater than current majority committed snapshot.
+            writeConflictRetry(
+                opCtx, "writeNoop", NamespaceString::kRsOplogNamespace.ns(), [&opCtx] {
+                    WriteUnitOfWork uow(opCtx);
+                    opCtx->getClient()->getServiceContext()->getOpObserver()->onOpMessage(opCtx,
+                                                                                          kMsgObj);
+                    uow.commit();
+                });
+        }
 
         // Do not allow majority reads from this collection until all original indexes are visible.
         // This was also done when dropAllIndexes() committed, but we need to ensure that no one
         // tries to read in the intermediate state where all indexes are newer than the current
         // snapshot so are unable to be used.
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         auto snapshotName = replCoord->reserveSnapshotName(opCtx);
         collection->setMinimumVisibleSnapshot(snapshotName);
 
