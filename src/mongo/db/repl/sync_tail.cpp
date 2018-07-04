@@ -66,6 +66,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/session_update_tracker.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
@@ -593,10 +594,15 @@ private:
  * ops - This only modifies the isForCappedCollection field on each op. It does not alter the ops
  *      vector in any other way.
  * writerVectors - Set of operations for each worker thread to apply.
+ * derivedOps - If provided, this function inserts a decomposition of applyOps operations
+ *      and instructions for updating the transactions table.
+ * sessionUpdateTracker - if provided, keeps track of session info from ops.
  */
 void fillWriterVectors(OperationContext* opCtx,
                        MultiApplier::Operations* ops,
-                       std::vector<MultiApplier::OperationPtrs>* writerVectors) {
+                       std::vector<MultiApplier::OperationPtrs>* writerVectors,
+                       std::vector<MultiApplier::Operations>* derivedOps,
+                       SessionUpdateTracker* sessionUpdateTracker) {
     const auto serviceContext = opCtx->getServiceContext();
     const auto storageEngine = serviceContext->getGlobalStorageEngine();
 
@@ -608,6 +614,15 @@ void fillWriterVectors(OperationContext* opCtx,
     for (auto&& op : *ops) {
         StringMapTraits::HashedKey hashedNs(op.getNamespace().ns());
         uint32_t hash = hashedNs.hash();
+
+        // We need to track all types of ops, including type 'n' (these are generated from chunk
+        // migrations).
+        if (sessionUpdateTracker) {
+            if (auto newOplogWrites = sessionUpdateTracker->updateOrFlush(op)) {
+                derivedOps->emplace_back(std::move(*newOplogWrites));
+                fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
+            }
+        }
 
         if (op.isCrudOpType()) {
             auto collProperties = collPropertiesCache.getCollectionProperties(opCtx, hashedNs);
@@ -637,6 +652,20 @@ void fillWriterVectors(OperationContext* opCtx,
             writer.reserve(8);  // Skip a few growth rounds
         }
         writer.push_back(&op);
+    }
+}
+
+void fillWriterVectors(OperationContext* opCtx,
+                       MultiApplier::Operations* ops,
+                       std::vector<MultiApplier::OperationPtrs>* writerVectors,
+                       std::vector<MultiApplier::Operations>* derivedOps) {
+    SessionUpdateTracker sessionUpdateTracker;
+    fillWriterVectors(opCtx, ops, writerVectors, derivedOps, &sessionUpdateTracker);
+
+    auto newOplogWrites = sessionUpdateTracker.flushAll();
+    if (!newOplogWrites.empty()) {
+        derivedOps->emplace_back(std::move(newOplogWrites));
+        fillWriterVectors(opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
     }
 }
 
@@ -872,19 +901,18 @@ void SyncTail::oplogApplication(ReplicationCoordinator* replCoord) {
         }
 
         // Extract some info from ops that we'll need after releasing the batch below.
-        const auto firstOpTimeInBatch =
-            fassertStatusOK(40299, OpTime::parseFromOplogEntry(ops.front().raw));
-        const auto lastOpTimeInBatch =
-            fassertStatusOK(28773, OpTime::parseFromOplogEntry(ops.back().raw));
+        const auto firstOpTimeInBatch = ops.front().getOpTime();
+        const auto lastOpTimeInBatch = ops.back().getOpTime();
+        const auto lastAppliedOpTimeAtStartOfBatch = replCoord->getMyLastAppliedOpTime();
 
         // Make sure the oplog doesn't go back in time or repeat an entry.
-        if (firstOpTimeInBatch <= replCoord->getMyLastAppliedOpTime()) {
+        if (firstOpTimeInBatch <= lastAppliedOpTimeAtStartOfBatch) {
             fassert(34361,
                     Status(ErrorCodes::OplogOutOfOrder,
                            str::stream() << "Attempted to apply an oplog entry ("
                                          << firstOpTimeInBatch.toString()
                                          << ") which is not greater than our last applied OpTime ("
-                                         << replCoord->getMyLastAppliedOpTime().toString()
+                                         << lastAppliedOpTimeAtStartOfBatch.toString()
                                          << ")."));
         }
 
@@ -913,7 +941,11 @@ void SyncTail::oplogApplication(ReplicationCoordinator* replCoord) {
         // 2. Persist our "applied through" optime to disk.
         consistencyMarkers->setAppliedThrough(&opCtx, lastOpTimeInBatch);
 
-        // 3. Finalize this batch. We are at a consistent optime if our current optime is >= the
+        // 3. Ensure that the last applied op time hasn't changed since the start of this batch.
+        const auto lastAppliedOpTimeAtEndOfBatch = replCoord->getMyLastAppliedOpTime();
+        invariant(lastAppliedOpTimeAtStartOfBatch == lastAppliedOpTimeAtEndOfBatch);
+
+        // 4. Finalize this batch. We are at a consistent optime if our current optime is >= the
         // current 'minValid' optime.
         auto consistency = (lastOpTimeInBatch >= minValid)
             ? ReplicationCoordinator::DataConsistency::Consistent
@@ -1497,15 +1529,16 @@ StatusWith<OpTime> multiApply(OperationContext* opCtx,
         consistencyMarkers->setOplogTruncateAfterPoint(opCtx, ops.front().getTimestamp());
         scheduleWritesToOplog(opCtx, workerPool, ops);
 
-        // Normal writes to config.transactions in the primary don't create an oplog entry.
-        // Reconstruct these ops so config.transactions will be replicated correctly.
-        // Need to create a new copy of ops vector because the workerPool is also concurrently
-        // reading it and we don't want the new oplog entries to get written to the actual
-        // oplog.rs collection.
-        auto opsWithTxnUpdates = Session::addOpsForReplicatingTxnTable(ops);
+        // Holds 'pseudo operations' generated by secondaries to aid in replication.
+        // Keep in scope until all operations in 'ops' and 'derivedOps' have been applied.
+        // Pseudo operations include:
+        // - ops to update config.transactions. Normal writes to config.transactions in the
+        //   primary don't create an oplog entry, so extract info from writes with transactions
+        //   and create a pseudo oplog.
+        std::vector<MultiApplier::Operations> derivedOps;
 
         std::vector<MultiApplier::OperationPtrs> writerVectors(workerPool->getStats().numThreads);
-        fillWriterVectors(opCtx, &opsWithTxnUpdates, &writerVectors);
+        fillWriterVectors(opCtx, &ops, &writerVectors, &derivedOps);
 
         // Wait for writes to finish before applying ops.
         workerPool->join();

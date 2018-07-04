@@ -47,6 +47,9 @@
     rst.initiate();
     assert.commandWorked(st.s.adminCommand({addShard: rst.getURL()}));
 
+    // TODO: SERVER-34964
+    sleep(30000);
+
     const testDB = st.s.getDB("test");
 
     // Unsharded collections reject mismatching cluster times and accept valid ones.
@@ -69,4 +72,5 @@
     assertAcceptsValidLogicalTime(st.configRS.getPrimary().getDB("admin"));
 
     st.stop();
+    rst.stopSet();
 })();

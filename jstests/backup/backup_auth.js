@@ -47,4 +47,6 @@
     var backupPath3 = MongoRunner.dataPath + 'backup3';
     mkdir(backupPath3);
     assert.commandWorked(adminDB.runCommand({createBackup: 1, backupDir: backupPath3}));
+
+    MongoRunner.stopMongod(conn);
 })();

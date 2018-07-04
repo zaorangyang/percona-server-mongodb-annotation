@@ -139,14 +139,6 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
     uassert(
         ErrorCodes::InvalidOptions, "cannot have empty shard key", !request->getKey().isEmpty());
 
-    // Ensure the proposed shard key is valid.
-    uassert(ErrorCodes::InvalidOptions,
-            str::stream()
-                << "Unsupported shard key pattern "
-                << shardKeyPattern.toString()
-                << ". Pattern must either be a single hashed field, or a list of ascending fields",
-            shardKeyPattern.isValid());
-
     // Ensure that hashed and unique are not both set.
     uassert(ErrorCodes::InvalidOptions,
             "Hashed shard keys cannot be declared unique. It's possible to ensure uniqueness on "
@@ -744,7 +736,7 @@ public:
 
         // Do not allow sharding collections while a featureCompatibilityVersion upgrade or
         // downgrade is in progress (see SERVER-31231 for details).
-        Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+        Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
 
         const NamespaceString nss(parseNs(dbname, cmdObj));
         auto request = ConfigsvrShardCollectionRequest::parse(

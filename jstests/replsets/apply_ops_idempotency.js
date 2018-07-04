@@ -195,4 +195,6 @@
 
     for (let f in tests)
         testIdempotency(rst.getPrimary(), tests[f], f);
+
+    rst.stopSet();
 })();

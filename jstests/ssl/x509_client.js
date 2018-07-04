@@ -106,3 +106,4 @@ var st = new ShardingTest({
 });
 
 authAndTest(new Mongo("localhost:" + st.s0.port));
+st.stop();

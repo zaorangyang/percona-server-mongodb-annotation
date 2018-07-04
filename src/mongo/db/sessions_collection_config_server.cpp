@@ -34,6 +34,8 @@
 
 #include "mongo/client/query.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
@@ -63,8 +65,7 @@ Status SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext
 
     // First, shard the sessions collection to create it.
     ConfigsvrShardCollectionRequest shardCollection;
-    shardCollection.set_configsvrShardCollection(
-        NamespaceString(SessionsCollection::kSessionsFullNS.toString()));
+    shardCollection.set_configsvrShardCollection(SessionsCollection::kSessionsNamespaceString);
     shardCollection.setKey(BSON("_id" << 1));
 
     DBDirectClient client(opCtx);
@@ -78,23 +79,34 @@ Status SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext
 }
 
 Status SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* opCtx) {
-    auto res =
-        scatterGatherOnlyVersionIfUnsharded(opCtx,
-                                            SessionsCollection::kSessionsDb.toString(),
-                                            NamespaceString(SessionsCollection::kSessionsFullNS),
-                                            SessionsCollection::generateCreateIndexesCmd(),
-                                            ReadPreferenceSetting::get(opCtx),
-                                            Shard::RetryPolicy::kNoRetry);
+    auto res = scatterGatherOnlyVersionIfUnsharded(opCtx,
+                                                   SessionsCollection::kSessionsDb.toString(),
+                                                   SessionsCollection::kSessionsNamespaceString,
+                                                   SessionsCollection::generateCreateIndexesCmd(),
+                                                   ReadPreferenceSetting::get(opCtx),
+                                                   Shard::RetryPolicy::kNoRetry);
     return res.getStatus();
 }
 
 Status SessionsCollectionConfigServer::setupSessionsCollection(OperationContext* opCtx) {
+    // If the sharding state is not yet initialized, fail.
+    if (!Grid::get(opCtx)->isShardingInitialized()) {
+        return {ErrorCodes::ShardingStateNotInitialized, "sharding state is not yet initialized"};
+    }
+
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     {
         // Only try to set up this collection until we have done so successfully once.
         // Note: if there is a config server election, it's possible that two different
         // primaries could both run the createIndexes scatter-gather query; this is ok.
         if (_collectionSetUp) {
+            return Status::OK();
+        }
+
+        Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+        // Prevent recreating the collection on downgrade.
+        if (serverGlobalParams.featureCompatibility.getVersion() !=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
             return Status::OK();
         }
 

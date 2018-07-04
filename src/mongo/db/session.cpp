@@ -210,59 +210,6 @@ void updateSessionEntry(OperationContext* opCtx, const UpdateRequest& updateRequ
     wuow.commit();
 }
 
-/**
- * Returns a new oplog entry if the given entry has transaction state embedded within in.
- * The new oplog entry will contain the operation needed to replicate the transaction
- * table.
- * Returns boost::none if the given oplog doesn't have any transaction state or does not
- * support update to the transaction table.
- */
-boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
-    const repl::OplogEntry& entry) {
-    auto sessionInfo = entry.getOperationSessionInfo();
-    if (!sessionInfo.getTxnNumber()) {
-        return boost::none;
-    }
-
-    // Do not write session table entries for applyOps, as multi-document transactions
-    // and retryable writes do not work together.
-    // TODO(SERVER-33501): Make multi-docunment transactions work with retryable writes.
-    if (entry.isCommand() && entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps) {
-        return boost::none;
-    }
-
-    invariant(sessionInfo.getSessionId());
-    invariant(entry.getWallClockTime());
-
-    const auto updateBSON = [&] {
-        SessionTxnRecord newTxnRecord;
-        newTxnRecord.setSessionId(*sessionInfo.getSessionId());
-        newTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
-        newTxnRecord.setLastWriteOpTime(entry.getOpTime());
-        newTxnRecord.setLastWriteDate(*entry.getWallClockTime());
-        return newTxnRecord.toBSON();
-    }();
-
-    return repl::OplogEntry(
-        entry.getOpTime(),
-        0,  // hash
-        repl::OpTypeEnum::kUpdate,
-        NamespaceString::kSessionTransactionsTableNamespace,
-        boost::none,  // uuid
-        false,        // fromMigrate
-        repl::OplogEntry::kOplogVersion,
-        updateBSON,
-        BSON(SessionTxnRecord::kSessionIdFieldName << sessionInfo.getSessionId()->toBSON()),
-        {},    // sessionInfo
-        true,  // upsert
-        *entry.getWallClockTime(),
-        boost::none,  // statementId
-        boost::none,  // prevWriteOpTime
-        boost::none,  // preImangeOpTime
-        boost::none   // postImageOpTime
-        );
-}
-
 // Failpoint which allows different failure actions to happen after each write. Supports the
 // parameters below, which can be combined with each other (unless explicitly disallowed):
 //
@@ -597,19 +544,43 @@ void Session::_registerUpdateCacheOnCommit(OperationContext* opCtx,
     }
 }
 
-std::vector<repl::OplogEntry> Session::addOpsForReplicatingTxnTable(
-    const std::vector<repl::OplogEntry>& ops) {
-    std::vector<repl::OplogEntry> newOps;
-
-    for (auto&& op : ops) {
-        newOps.push_back(op);
-
-        if (auto updateTxnTableOp = createMatchingTransactionTableUpdate(op)) {
-            newOps.push_back(*updateTxnTableOp);
-        }
+boost::optional<repl::OplogEntry> Session::createMatchingTransactionTableUpdate(
+    const repl::OplogEntry& entry) {
+    auto sessionInfo = entry.getOperationSessionInfo();
+    if (!sessionInfo.getTxnNumber()) {
+        return boost::none;
     }
 
-    return newOps;
+    invariant(sessionInfo.getSessionId());
+    invariant(entry.getWallClockTime());
+
+    const auto updateBSON = [&] {
+        SessionTxnRecord newTxnRecord;
+        newTxnRecord.setSessionId(*sessionInfo.getSessionId());
+        newTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
+        newTxnRecord.setLastWriteOpTime(entry.getOpTime());
+        newTxnRecord.setLastWriteDate(*entry.getWallClockTime());
+        return newTxnRecord.toBSON();
+    }();
+
+    return repl::OplogEntry(
+        entry.getOpTime(),
+        0,  // hash
+        repl::OpTypeEnum::kUpdate,
+        NamespaceString::kSessionTransactionsTableNamespace,
+        boost::none,  // uuid
+        false,        // fromMigrate
+        repl::OplogEntry::kOplogVersion,
+        updateBSON,
+        BSON(SessionTxnRecord::kSessionIdFieldName << sessionInfo.getSessionId()->toBSON()),
+        {},    // sessionInfo
+        true,  // upsert
+        *entry.getWallClockTime(),
+        boost::none,  // statementId
+        boost::none,  // prevWriteOpTime
+        boost::none,  // preImangeOpTime
+        boost::none   // postImageOpTime
+        );
 }
 
 }  // namespace mongo

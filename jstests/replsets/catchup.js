@@ -207,4 +207,5 @@
     rst.awaitReplication();
     checkOpInOplog(steppedDownPrimary, stepUpResults.latestOpOnOldPrimary, 1);
 
+    rst.stopSet();
 })();

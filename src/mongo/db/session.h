@@ -159,11 +159,14 @@ public:
     bool checkStatementExecutedNoOplogEntryFetch(TxnNumber txnNumber, StmtId stmtId) const;
 
     /**
-     * Scan through the list of operations and add new oplog entries for updating
-     * config.transactions if needed.
+     * Returns a new oplog entry if the given entry has transaction state embedded within in.
+     * The new oplog entry will contain the operation needed to replicate the transaction
+     * table.
+     * Returns boost::none if the given oplog doesn't have any transaction state or does not
+     * support update to the transaction table.
      */
-    static std::vector<repl::OplogEntry> addOpsForReplicatingTxnTable(
-        const std::vector<repl::OplogEntry>& ops);
+    static boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
+        const repl::OplogEntry& entry);
 
 private:
     void _beginTxn(WithLock, TxnNumber txnNumber);

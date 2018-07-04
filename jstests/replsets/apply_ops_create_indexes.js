@@ -98,4 +98,6 @@
 
     localDB = rst.getPrimary().getDB("local");
     ensureOplogEntryExists(localDB, insertFormatIndexName);
+
+    rst.stopSet();
 }());

@@ -91,4 +91,5 @@
         applyOps: [collModOp],
     }));
 
+    MongoRunner.stopMongod(standalone);
 })();

@@ -45,10 +45,13 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/sessions_collection.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/scopeguard.h"
@@ -246,9 +249,8 @@ public:
                 exitCleanly(EXIT_CLEAN);
             }
 
-            // If config server, downgrade shards *before* downgrading self; and clear the keys
-            // collection to ensure all shards will have the same key information on re-upgrade.
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                // If config server, downgrade shards *before* downgrading self.
                 uassertStatusOK(
                     ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
                         opCtx,
@@ -256,23 +258,65 @@ public:
                             cmdObj,
                             BSON(FeatureCompatibilityVersion::kCommandName << requestedVersion)))));
 
-                // Stop the background key generator thread from running before trying to drop the
-                // collection so we know the key won't just be recreated.
-                //
-                // Note: no need to restart the key generator if downgrade doesn't succeed at once
-                // because downgrade must be completed before upgrade is allowed; and clusterTime
-                // auth is inactive unless fully upgraded.
-                LogicalTimeValidator::get(opCtx)->enableKeyGenerator(opCtx, false);
+                // Drop config.system.sessions collection on downgrade.
+                auto const catalogClient = Grid::get(opCtx)->catalogClient();
+                auto const catalogCache = Grid::get(opCtx)->catalogCache();
+                Seconds waitFor(DistLockManager::kDefaultLockTimeout);
 
-                DBDirectClient client(opCtx);
-                BSONObj result;
-                if (!client.dropCollection(NamespaceString::kSystemKeysCollectionName.toString(),
-                                           ShardingCatalogClient::kMajorityWriteConcern,
-                                           &result)) {
-                    Status status = getStatusFromCommandResult(result);
-                    if (status != ErrorCodes::NamespaceNotFound) {
-                        uassertStatusOK(status);
-                    }
+                auto backwardsCompatibleDbDistLock =
+                    uassertStatusOK(catalogClient->getDistLockManager()->lock(
+                        opCtx,
+                        SessionsCollection::kSessionsNamespaceString.db() + "-movePrimary",
+                        "dropCollection",
+                        waitFor));
+
+                auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+                    opCtx,
+                    SessionsCollection::kSessionsNamespaceString.db(),
+                    "dropCollection",
+                    waitFor));
+
+                auto collDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+                    opCtx,
+                    SessionsCollection::kSessionsNamespaceString.ns(),
+                    "dropCollection",
+                    waitFor));
+
+                ON_BLOCK_EXIT([&catalogCache] {
+                    catalogCache->invalidateShardedCollection(
+                        SessionsCollection::kSessionsNamespaceString);
+                });
+
+                auto dropCollStatus = catalogClient->dropCollection(
+                    opCtx, SessionsCollection::kSessionsNamespaceString);
+                if (dropCollStatus != ErrorCodes::NamespaceNotFound) {
+                    uassertStatusOK(dropCollStatus);
+                }
+            }
+
+            // Stop the background key generator thread from running before trying to drop the
+            // collection so we know the key won't just be recreated.
+            //
+            // The key generator runs on the config server primary in a sharded cluster and on the
+            // primary node in a standalone replica set. This will be a noop on any other server.
+            //
+            // Note: no need to restart the key generator if downgrade doesn't succeed at once
+            // because downgrade must be completed before upgrade is allowed; and clusterTime auth
+            // is inactive unless fully upgraded.
+            if (LogicalTimeValidator::get(opCtx)) {
+                LogicalTimeValidator::get(opCtx)->enableKeyGenerator(opCtx, false);
+            }
+
+            // Clear the keys collection to ensure all shards will have the same key information on
+            // re-upgrade.
+            DBDirectClient client(opCtx);
+            BSONObj result;
+            if (!client.dropCollection(NamespaceString::kSystemKeysCollectionName.toString(),
+                                       ShardingCatalogClient::kMajorityWriteConcern,
+                                       &result)) {
+                Status status = getStatusFromCommandResult(result);
+                if (status != ErrorCodes::NamespaceNotFound) {
+                    uassertStatusOK(status);
                 }
             }
 
