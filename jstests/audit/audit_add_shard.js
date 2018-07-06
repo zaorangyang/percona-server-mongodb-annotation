@@ -23,6 +23,8 @@ auditTestShard(
             'param.connectionString': hostandport,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
+
+        MongoRunner.stopMongod(conn1);
     },
     { /* no special mongod options */ }
 );
