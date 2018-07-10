@@ -280,11 +280,13 @@ Status addMongodOptions(moe::OptionSection* options) {
 
     // Encryption Options
 
-    encryption_options.addOptionChaining(
-        "security.enableEncryption",
-        "enableEncryption",
-        moe::Switch,
-        "enable encryption for the WiredTiger storage engine");
+    encryption_options
+        .addOptionChaining(
+            "security.enableEncryption",
+            "enableEncryption",
+            moe::Switch,
+            "enable encryption for the WiredTiger storage engine")
+        .requires("security.encryptionKeyFile");
 
     encryption_options
         .addOptionChaining(
