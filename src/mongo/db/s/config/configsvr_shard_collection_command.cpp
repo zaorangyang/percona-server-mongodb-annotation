@@ -148,7 +148,7 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
     // Ensure the namespace is valid.
     uassert(ErrorCodes::IllegalOperation,
             "can't shard system namespaces",
-            !nss.isSystem() || nss.ns() == SessionsCollection::kSessionsFullNS);
+            !nss.isSystem() || nss == SessionsCollection::kSessionsNamespaceString);
 
     // Ensure the collation is valid. Currently we only allow the simple collation.
     bool simpleCollationSpecified = false;
@@ -789,11 +789,10 @@ public:
 
         // Handle collections in the config db separately.
         if (nss.db() == NamespaceString::kConfigDb) {
-            // Only whitelisted collections in config may be sharded
-            // (unless we are in test mode)
+            // Only whitelisted collections in config may be sharded (unless we are in test mode)
             uassert(ErrorCodes::IllegalOperation,
                     "only special collections in the config db may be sharded",
-                    nss.ns() == SessionsCollection::kSessionsFullNS ||
+                    nss == SessionsCollection::kSessionsNamespaceString ||
                         Command::testCommandsEnabled);
 
             auto configShard = uassertStatusOK(
@@ -844,7 +843,12 @@ public:
             opCtx, nss, proposedKey, shardKeyPattern, primaryShard, conn, request);
 
         // Step 4.
-        auto uuid = getUUIDFromPrimaryShard(nss, conn);
+        boost::optional<UUID> uuid;
+        if (request.getGetUUIDfromPrimaryShard()) {
+            uuid = getUUIDFromPrimaryShard(nss, conn);
+        } else {
+            uuid = UUID::gen();
+        }
 
         // isEmpty is used by multiple steps below.
         bool isEmpty = (conn->count(nss.ns()) == 0);

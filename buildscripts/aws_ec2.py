@@ -4,6 +4,7 @@
 
 from __future__ import print_function
 
+import base64
 import collections
 import datetime
 import optparse
@@ -15,6 +16,24 @@ import botocore
 import yaml
 
 _MODES = ("status", "create", "start", "stop", "force-stop", "reboot", "terminate")
+
+
+def write_binary_file(path, string_buffer):
+    """Write string_buffer to path in binary format."""
+    with open(path, "wb") as fh:
+        fh.write(string_buffer)
+
+
+def write_utf8_file(path, string_buffer):
+    """Write string_buffer to path in utf-8 format."""
+    with open(path, "w") as fh:
+        fh.write(string_buffer.encode("utf-8"))
+
+
+def write_yaml_file(path, dictionary):
+    """Write dictionary to path in YML format."""
+    with open(path, "w") as ystream:
+        yaml.safe_dump(dictionary, ystream)
 
 
 class AwsEc2(object):
@@ -80,8 +99,10 @@ class AwsEc2(object):
             sys.stdout.flush()
         return 0 if reached_state else 1
 
-    def control_instance(self, mode, image_id, wait_time_secs=0, show_progress=False):
-        """Controls an AMI instance. Returns 0 & status information, if successful."""
+    def control_instance(  #pylint: disable=too-many-arguments,too-many-branches
+            self, mode, image_id, wait_time_secs=0, show_progress=False, console_output_file=None,
+            console_screenshot_file=None):
+        """Control an AMI instance. Returns 0 & status information, if successful."""
         if mode not in _MODES:
             raise ValueError(
                 "Invalid mode '{}' specified, choose from {}.".format(mode, _MODES))
@@ -127,8 +148,30 @@ class AwsEc2(object):
                 getattr(instance, "private_ip_address", None),
                 getattr(instance, "public_ip_address", None),
                 getattr(instance, "private_dns_name", None),
-                getattr(instance, "public_dns_name", None),
-                getattr(instance, "tags", None))
+                getattr(instance, "public_dns_name", None), getattr(instance, "tags", None))
+
+            if console_output_file:
+                try:
+                    console_ouput = instance.console_output()
+                    if console_ouput and "Output" in console_ouput:
+                        write_utf8_file(console_output_file, console_ouput["Output"])
+                    else:
+                        print("Unable to generate console_ouptut file, data not available")
+                except botocore.exceptions.ClientError as err:
+                    print("Unable to generate console_ouptut file: {}".format(err.message))
+
+            if console_screenshot_file:
+                client = boto3.client("ec2")
+                try:
+                    console_screenshot = client.get_console_screenshot(InstanceId=image_id)
+                    if console_screenshot and "ImageData" in console_screenshot:
+                        write_binary_file(console_screenshot_file,
+                                          base64.decodestring(console_screenshot["ImageData"]))
+                    else:
+                        print("Unable to generate console_screenshot file, data not available")
+                except botocore.exceptions.ClientError as err:
+                    print("Unable to generate console_screenshot file: {}".format(err.message))
+
         except botocore.exceptions.ClientError as err:
             return 1, err.message
 
@@ -151,21 +194,14 @@ class AwsEc2(object):
                 time.sleep(i + 1)
             instance.create_tags(Tags=tags)
 
-    def launch_instance(self,
-                        ami,
-                        instance_type,
-                        block_devices=None,
-                        key_name=None,
-                        security_group_ids=None,
-                        security_groups=None,
-                        subnet_id=None,
-                        tags=None,
-                        wait_time_secs=0,
-                        show_progress=False,
-                        **kwargs):
-        """Launches and tags an AMI instance.
+    def launch_instance(  # pylint: disable=too-many-arguments,too-many-locals
+            self, ami, instance_type, block_devices=None, key_name=None, security_group_ids=None,
+            security_groups=None, subnet_id=None, tags=None, wait_time_secs=0, show_progress=False,
+            console_output_file=None, console_screenshot_file=None, **kwargs):
+        """Launch and tag an AMI instance.
 
-           Returns the tuple (0, status_information), if successful."""
+        Return the tuple (0, status_information), if successful.
+        """
 
         bdms = []
         if block_devices is None:
@@ -206,7 +242,9 @@ class AwsEc2(object):
 
         self.tag_instance(instance.instance_id, tags)
 
-        return self.control_instance("status", instance.instance_id)
+        return self.control_instance("status", instance.instance_id,
+                                     console_output_file=console_output_file,
+                                     console_screenshot_file=console_screenshot_file)
 
 
 def main():
@@ -217,6 +255,7 @@ def main():
     parser = optparse.OptionParser(description=__doc__)
     control_options = optparse.OptionGroup(parser, "Control options")
     create_options = optparse.OptionGroup(parser, "Create options")
+    status_options = optparse.OptionGroup(parser, "Status options")
 
     parser.add_option("--mode",
                       dest="mode",
@@ -306,8 +345,23 @@ def main():
                                    " bracketed YAML - i.e. JSON with support for single quoted"
                                    " and unquoted keys. Example, '{DryRun: True}'")
 
+    status_options.add_option("--yamlFile",
+                              dest="yaml_file",
+                              default=None,
+                              help="Save the status into the specified YAML file.")
+
+    status_options.add_option("--consoleOutputFile", dest="console_output_file", default=None,
+                              help="Save the console output into the specified file, if"
+                              " available.")
+
+    status_options.add_option("--consoleScreenshotFile", dest="console_screenshot_file",
+                              default=None,
+                              help="Save the console screenshot (JPG format) into the specified"
+                              " file, if available.")
+
     parser.add_option_group(control_options)
     parser.add_option_group(create_options)
+    parser.add_option_group(status_options)
 
     (options, _) = parser.parse_args()
 
@@ -339,36 +393,35 @@ def main():
             my_kwargs = yaml.safe_load(options.extra_args)
 
         (ret_code, instance_status) = aws_ec2.launch_instance(
-            ami=options.ami,
-            instance_type=options.instance_type,
-            block_devices=block_devices,
-            key_name=options.key_name,
-            security_group_ids=options.security_group_ids,
-            security_groups=options.security_groups,
-            subnet_id=options.subnet_id,
-            tags=tags,
-            wait_time_secs=options.wait_time_secs,
-            show_progress=True,
-            **my_kwargs)
+            ami=options.ami, instance_type=options.instance_type, block_devices=block_devices,
+            key_name=options.key_name, security_group_ids=options.security_group_ids,
+            security_groups=options.security_groups, subnet_id=options.subnet_id, tags=tags,
+            wait_time_secs=options.wait_time_secs, show_progress=True,
+            console_output_file=options.console_output_file,
+            console_screenshot_file=options.console_screenshot_file, **my_kwargs)
     else:
         if not getattr(options, "image_id", None):
             parser.print_help()
             parser.error("Missing required control option")
 
         (ret_code, instance_status) = aws_ec2.control_instance(
-            mode=options.mode,
-            image_id=options.image_id,
-            wait_time_secs=options.wait_time_secs,
-            show_progress=True)
+            mode=options.mode, image_id=options.image_id, wait_time_secs=options.wait_time_secs,
+            show_progress=True, console_output_file=options.console_output_file,
+            console_screenshot_file=options.console_screenshot_file)
 
-    print("Return code: {}, Instance status:".format(ret_code))
     if ret_code:
-        print(instance_status)
-    else:
-        for field in instance_status._fields:
-            print("\t{}: {}".format(field, getattr(instance_status, field)))
+        print("Return code: {}, {}".format(ret_code, instance_status))
+        sys.exit(ret_code)
 
-    sys.exit(ret_code)
+    status_dict = {}
+    for field in getattr(instance_status, "_fields", []):
+        status_dict[field] = getattr(instance_status, field)
+
+    if options.yaml_file:
+        print("Saving status to {}".format(options.yaml_file))
+        write_yaml_file(options.yaml_file, status_dict)
+
+    print(yaml.safe_dump(status_dict))
 
 if __name__ == "__main__":
     main()

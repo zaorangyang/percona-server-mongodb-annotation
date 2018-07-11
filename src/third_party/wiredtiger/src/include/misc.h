@@ -28,6 +28,8 @@
 #define	WT_MILLION	(1000000)
 #define	WT_BILLION	(1000000000)
 
+#define	WT_MINUTE	(60)
+
 #define	WT_KILOBYTE	(1024)
 #define	WT_MEGABYTE	(1048576)
 #define	WT_GIGABYTE	(1073741824)
@@ -334,3 +336,6 @@ union __wt_rand_state {
 			continue;					\
 		}
 #define	WT_TAILQ_SAFE_REMOVE_END }
+
+/* Sleep time to uncover race conditions during timing stress test. */
+#define	TIMING_STRESS_TEST_SLEEP	(100 * WT_THOUSAND)

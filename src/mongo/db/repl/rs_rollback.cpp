@@ -52,6 +52,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_lifecycle_impl.h"
@@ -1026,7 +1027,11 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             // If the collection turned into a view, we might get an error trying to
             // refetch documents, but these errors should be ignored, as we'll be creating
             // the view during oplog replay.
-            if (ex.code() == ErrorCodes::CommandNotSupportedOnView)
+            // Collection may be dropped on the sync source, in which case it will be dropped during
+            // oplog replay. So it is safe to ignore NamespaceNotFound errors while trying to
+            // refetch documents.
+            if (ex.code() == ErrorCodes::CommandNotSupportedOnView ||
+                ex.code() == ErrorCodes::NamespaceNotFound)
                 continue;
 
             log() << "Rollback couldn't re-fetch from uuid: " << uuid << " _id: " << redact(doc._id)
@@ -1415,6 +1420,10 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
     // If necessary, clear the memory of existing sessions.
     if (fixUpInfo.refetchTransactionDocs) {
         SessionCatalog::get(opCtx)->invalidateSessions(opCtx, boost::none);
+    }
+
+    if (auto validator = LogicalTimeValidator::get(opCtx)) {
+        validator->resetKeyManagerCache();
     }
 
     // Reload the lastAppliedOpTime and lastDurableOpTime value in the replcoord and the

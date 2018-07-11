@@ -93,6 +93,8 @@ using std::string;
 
 namespace dps = ::mongo::dotted_path_support;
 
+const int WiredTigerKVEngine::kDefaultJournalDelayMillis = 100;
+
 class WiredTigerKVEngine::WiredTigerJournalFlusher : public BackgroundJob {
 public:
     explicit WiredTigerJournalFlusher(WiredTigerSessionCache* sessionCache)
@@ -118,7 +120,7 @@ public:
 
             int ms = storageGlobalParams.journalCommitIntervalMs.load();
             if (!ms) {
-                ms = 100;
+                ms = kDefaultJournalDelayMillis;
             }
 
             MONGO_IDLE_THREAD_BLOCK;
@@ -356,6 +358,9 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
 
     // We are still using MongoDB's cursor cache, don't double up.
     ss << "cache_cursors=false,";
+    // Ensure WiredTiger creates data in the expected format and attempting to start with a
+    // data directory created using a newer version will fail.
+    ss << "compatibility=(release=\"3.0\",require_max=\"3.0\"),";
 
     // The setting may have a later setting override it if not using the journal.  We make it
     // unconditional here because even nojournal may need this setting if it is a transition

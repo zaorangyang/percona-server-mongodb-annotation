@@ -50,7 +50,7 @@ class ShardedClusterFixture(interface.Fixture):
         the mongod and mongos processes.
         """
 
-        interface.Fixture.__init__(self, logger, job_num)
+        interface.Fixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
 
         if "dbpath" in mongod_options:
             raise ValueError("Cannot specify mongod_options.dbpath")
@@ -68,11 +68,7 @@ class ShardedClusterFixture(interface.Fixture):
         self.configsvr_options = utils.default_if_none(configsvr_options, {})
         self.shard_options = utils.default_if_none(shard_options, {})
 
-        # Command line options override the YAML configuration.
-        dbpath_prefix = utils.default_if_none(config.DBPATH_PREFIX, dbpath_prefix)
-        dbpath_prefix = utils.default_if_none(dbpath_prefix, config.DEFAULT_DBPATH_PREFIX)
-        self._dbpath_prefix = os.path.join(dbpath_prefix, "job{}".format(self.job_num),
-                                           config.FIXTURE_SUBDIR)
+        self._dbpath_prefix = os.path.join(self._dbpath_prefix, config.FIXTURE_SUBDIR)
 
         self.configsvr = None
         self.mongos = None
@@ -119,11 +115,7 @@ class ShardedClusterFixture(interface.Fixture):
         self.mongos.await_ready()
 
         client = self.mongo_client()
-        if self.auth_options is not None:
-            auth_db = client[self.auth_options["authenticationDatabase"]]
-            auth_db.authenticate(self.auth_options["username"],
-                                 password=self.auth_options["password"],
-                                 mechanism=self.auth_options["authenticationMechanism"])
+        self._auth_to_db(client)
 
         # Inform mongos about each of the shards
         for shard in self.shards:
@@ -139,6 +131,21 @@ class ShardedClusterFixture(interface.Fixture):
             primary = self.configsvr.get_primary().mongo_client()
             primary.admin.command({ "refreshLogicalSessionCacheNow" : 1 })
 
+
+    def _auth_to_db(self, client):
+        """Authenticate client for the 'authenticationDatabase'."""
+        if self.auth_options is not None:
+            auth_db = client[self.auth_options["authenticationDatabase"]]
+            auth_db.authenticate(self.auth_options["username"],
+                                 password=self.auth_options["password"],
+                                 mechanism=self.auth_options["authenticationMechanism"])
+
+    def _stop_balancer(self, timeout_ms=60000):
+        """Stop the balancer."""
+        client = self.mongo_client()
+        self._auth_to_db(client)
+        client.admin.command({"balancerStop": 1}, maxTimeMS=timeout_ms)
+
     def _do_teardown(self):
         """
         Shuts down the sharded cluster.
@@ -149,6 +156,8 @@ class ShardedClusterFixture(interface.Fixture):
         if not running_at_start:
             self.logger.info(
                 "Sharded cluster was expected to be running in _do_teardown(), but wasn't.")
+
+        self._stop_balancer()
 
         if self.configsvr is not None:
             if running_at_start:

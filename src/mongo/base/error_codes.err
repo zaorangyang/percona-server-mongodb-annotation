@@ -233,8 +233,10 @@ error_code("MaxSubPipelineDepthExceeded", 232)
 error_code("TooManyDocumentSequences", 233)
 error_code("RetryChangeStream", 234)
 error_code("DNSRecordTypeMismatch", 240)
+error_code("BrokenPromise", 245)
 error_code("ProducerConsumerQueueBatchTooLarge", 247)
 error_code("ProducerConsumerQueueEndClosed", 248)
+error_code("KeyedExecutorRetry", 259);
 
 # Error codes 4000-8999 are reserved.
 

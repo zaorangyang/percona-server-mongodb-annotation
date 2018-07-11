@@ -65,15 +65,9 @@ var blacklist = [
     'findAndModify_update_queue_unindexed.js',  // findAndModify requires a shard key
     'group.js',                // the group command cannot be issued against a sharded cluster
     'group_cond.js',           // the group command cannot be issued against a sharded cluster
+    'group_killop.js',         // the group command cannot be issued against a sharded cluster
     'indexed_insert_eval.js',  // eval doesn't work with sharded collections
     'indexed_insert_eval_nolock.js',  // eval doesn't work with sharded collections
-
-    // These workloads sometimes triggers an 'unable to target write op for collection ... caused by
-    // ... database not found' error. Further investigation still needs to be done, but these
-    // failures may be due to SERVER-17397 'drops in a sharded cluster may not fully succeed'
-    // because it drops and reuses the same namespaces.
-    'kill_multicollection_aggregation.js',
-    'invalidated_cursors.js',
 
     'plan_cache_drop_database.js',  // cannot ensureIndex after dropDatabase without sharding first
     'remove_single_document.js',    // our .remove(query, {justOne: true}) calls lack shard keys

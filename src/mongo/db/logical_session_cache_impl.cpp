@@ -55,7 +55,7 @@ MONGO_EXPORT_STARTUP_SERVER_PARAMETER(disableLogicalSessionCacheRefresh, bool, f
 constexpr Minutes LogicalSessionCacheImpl::kLogicalSessionDefaultRefresh;
 
 LogicalSessionCacheImpl::LogicalSessionCacheImpl(
-    std::unique_ptr<ServiceLiason> service,
+    std::unique_ptr<ServiceLiaison> service,
     std::shared_ptr<SessionsCollection> collection,
     std::shared_ptr<TransactionReaper> transactionReaper,
     Options options)
@@ -64,14 +64,17 @@ LogicalSessionCacheImpl::LogicalSessionCacheImpl(
       _service(std::move(service)),
       _sessionsColl(std::move(collection)),
       _transactionReaper(std::move(transactionReaper)) {
+    _stats.setLastSessionsCollectionJobTimestamp(now());
+    _stats.setLastTransactionReaperJobTimestamp(now());
+
     if (!disableLogicalSessionCacheRefresh) {
         _service->scheduleJob(
             {[this](Client* client) { _periodicRefresh(client); }, _refreshInterval});
-        _service->scheduleJob(
-            {[this](Client* client) { _periodicReap(client); }, _refreshInterval});
+        if (_transactionReaper) {
+            _service->scheduleJob(
+                {[this](Client* client) { _periodicReap(client); }, _refreshInterval});
+        }
     }
-    _stats.setLastSessionsCollectionJobTimestamp(now());
-    _stats.setLastTransactionReaperJobTimestamp(now());
 }
 
 LogicalSessionCacheImpl::~LogicalSessionCacheImpl() {
@@ -205,6 +208,13 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
             return uniqueCtx->get();
         }();
 
+        auto res = _sessionsColl->setupSessionsCollection(opCtx);
+        if (!res.isOK()) {
+            log() << "Sessions collection is not set up; "
+                  << "waiting until next sessions reap interval: " << res.reason();
+            return Status::OK();
+        }
+
         stdx::lock_guard<stdx::mutex> lk(_reaperMutex);
         numReaped = _transactionReaper->reap(opCtx);
     } catch (...) {
@@ -334,13 +344,24 @@ void LogicalSessionCacheImpl::_refresh(Client* client) {
         _stats.setLastSessionsCollectionJobEntriesEnded(explicitlyEndingSessions.size());
     }
 
-
     // Find which running, but not recently active sessions, are expired, and add them
     // to the list of sessions to kill cursors for
 
     KillAllSessionsByPatternSet patterns;
 
     auto openCursorSessions = _service->getOpenCursorSessions();
+    // Exclude sessions added to _activeSessions from the openCursorSession to avoid race between
+    // killing cursors on the removed sessions and creating sessions.
+    {
+        stdx::lock_guard<stdx::mutex> lk(_cacheMutex);
+
+        for (const auto& it : _activeSessions) {
+            auto newSessionIt = openCursorSessions.find(it.first);
+            if (newSessionIt != openCursorSessions.end()) {
+                openCursorSessions.erase(newSessionIt);
+            }
+        }
+    }
 
     // think about pruning ending and active out of openCursorSessions
     auto statusAndRemovedSessions = _sessionsColl->findRemovedSessions(opCtx, openCursorSessions);

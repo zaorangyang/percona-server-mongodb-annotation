@@ -441,9 +441,9 @@ __cursor_row_modify(
  */
 static void
 __cursor_restart(
-    WT_SESSION_IMPL *session, uint64_t *yield_count, uint64_t *sleep_count)
+    WT_SESSION_IMPL *session, uint64_t *yield_count, uint64_t *sleep_usecs)
 {
-	__wt_state_yield_sleep(yield_count, sleep_count);
+	__wt_spin_backoff(yield_count, sleep_usecs);
 
 	WT_STAT_CONN_INCR(session, cursor_restart);
 	WT_STAT_DATA_INCR(session, cursor_restart);
@@ -733,13 +733,13 @@ __wt_btcur_insert(WT_CURSOR_BTREE *cbt)
 	WT_CURSOR *cursor;
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
-	uint64_t yield_count, sleep_count;
+	uint64_t yield_count, sleep_usecs;
 	bool append_key, valid;
 
 	btree = cbt->btree;
 	cursor = &cbt->iface;
 	session = (WT_SESSION_IMPL *)cursor->session;
-	yield_count = sleep_count = 0;
+	yield_count = sleep_usecs = 0;
 
 	WT_STAT_CONN_INCR(session, cursor_insert);
 	WT_STAT_DATA_INCR(session, cursor_insert);
@@ -856,7 +856,7 @@ retry:	WT_ERR(__cursor_func_init(cbt, true));
 	}
 
 err:	if (ret == WT_RESTART) {
-		__cursor_restart(session, &yield_count, &sleep_count);
+		__cursor_restart(session, &yield_count, &sleep_usecs);
 		goto retry;
 	}
 
@@ -919,12 +919,12 @@ __wt_btcur_insert_check(WT_CURSOR_BTREE *cbt)
 	WT_CURSOR *cursor;
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
-	uint64_t yield_count, sleep_count;
+	uint64_t yield_count, sleep_usecs;
 
 	cursor = &cbt->iface;
 	btree = cbt->btree;
 	session = (WT_SESSION_IMPL *)cursor->session;
-	yield_count = sleep_count = 0;
+	yield_count = sleep_usecs = 0;
 
 	/*
 	 * The pinned page goes away if we do a search, get a local copy of any
@@ -946,7 +946,7 @@ retry:	WT_ERR(__cursor_func_init(cbt, true));
 		WT_ERR(__wt_illegal_value(session, NULL));
 
 err:	if (ret == WT_RESTART) {
-		__cursor_restart(session, &yield_count, &sleep_count);
+		__cursor_restart(session, &yield_count, &sleep_usecs);
 		goto retry;
 	}
 
@@ -971,13 +971,13 @@ __wt_btcur_remove(WT_CURSOR_BTREE *cbt)
 	WT_CURSOR *cursor;
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
-	uint64_t yield_count, sleep_count;
+	uint64_t yield_count, sleep_usecs;
 	bool iterating, valid;
 
 	btree = cbt->btree;
 	cursor = &cbt->iface;
 	session = (WT_SESSION_IMPL *)cursor->session;
-	yield_count = sleep_count = 0;
+	yield_count = sleep_usecs = 0;
 	iterating = F_ISSET(cbt, WT_CBT_ITERATE_NEXT | WT_CBT_ITERATE_PREV);
 
 	WT_STAT_CONN_INCR(session, cursor_remove);
@@ -1110,7 +1110,7 @@ retry:	if (positioned == POSITIONED)
 	}
 
 err:	if (ret == WT_RESTART) {
-		__cursor_restart(session, &yield_count, &sleep_count);
+		__cursor_restart(session, &yield_count, &sleep_usecs);
 		goto retry;
 	}
 
@@ -1189,13 +1189,13 @@ __btcur_update(WT_CURSOR_BTREE *cbt, WT_ITEM *value, u_int modify_type)
 	WT_CURSOR *cursor;
 	WT_DECL_RET;
 	WT_SESSION_IMPL *session;
-	uint64_t yield_count, sleep_count;
+	uint64_t yield_count, sleep_usecs;
 	bool valid;
 
 	btree = cbt->btree;
 	cursor = &cbt->iface;
 	session = (WT_SESSION_IMPL *)cursor->session;
-	yield_count = sleep_count = 0;
+	yield_count = sleep_usecs = 0;
 
 	/* It's no longer possible to bulk-load into the tree. */
 	__cursor_disable_bulk(session, btree);
@@ -1287,7 +1287,7 @@ retry:	WT_ERR(__cursor_func_init(cbt, true));
 	}
 
 err:	if (ret == WT_RESTART) {
-		__cursor_restart(session, &yield_count, &sleep_count);
+		__cursor_restart(session, &yield_count, &sleep_usecs);
 		goto retry;
 	}
 
@@ -1339,19 +1339,21 @@ done:		switch (modify_type) {
 
 /*
  * __cursor_chain_exceeded --
- *	Return if the update chain has exceeded the limit. Deleted or standard
- * updates are anticipated to be sufficient to base the modify (although that's
- * not guaranteed, they may not be visible or might abort before we read them).
- * Also, this is not a hard limit, threads can race modifying updates.
+ *	Return if the update chain has exceeded the limit.
  */
 static bool
 __cursor_chain_exceeded(WT_CURSOR_BTREE *cbt)
 {
+	WT_CURSOR *cursor;
 	WT_PAGE *page;
+	WT_SESSION_IMPL *session;
 	WT_UPDATE *upd;
+	size_t upd_size;
 	int i;
 
+	cursor = &cbt->iface;
 	page = cbt->ref->page;
+	session = (WT_SESSION_IMPL *)cursor->session;
 
 	upd = NULL;
 	if (cbt->ins != NULL)
@@ -1360,10 +1362,35 @@ __cursor_chain_exceeded(WT_CURSOR_BTREE *cbt)
 	    page->modify != NULL && page->modify->mod_row_update != NULL)
 		upd = page->modify->mod_row_update[cbt->slot];
 
-	for (i = 0; upd != NULL; ++i, upd = upd->next) {
-		if (WT_UPDATE_DATA_VALUE(upd))
-			return (false);
-		if (i >= WT_MAX_MODIFY_UPDATE)
+	/*
+	 * Step through the modify operations at the beginning of the chain.
+	 *
+	 * Deleted or standard updates are anticipated to be sufficient to base
+	 * the modify (although that's not guaranteed: they may not be visible
+	 * or might abort before we read them).  Also, this is not a hard
+	 * limit, threads can race modifying updates.
+	 *
+	 * If the total size in bytes of the updates exceeds some factor of the
+	 * underlying value size (which we know because the cursor is
+	 * positioned), create a new full copy of the value.  This limits the
+	 * cache pressure from creating full copies to that factor: with the
+	 * default factor of 1, the total size in memory of a set of modify
+	 * updates is limited to double the size of the modifies.
+	 *
+	 * Otherwise, limit the length of the update chain to a fixed size to
+	 * bound the cost of rebuilding the value during reads.  When history
+	 * has to be maintained, creating extra copies of large documents
+	 * multiplies cache pressure because the old ones cannot be freed, so
+	 * allow the modify chain to grow.
+	 */
+	for (i = 0, upd_size = 0;
+	    upd != NULL && upd->type == WT_UPDATE_MODIFY;
+	    ++i, upd = upd->next) {
+		upd_size += WT_UPDATE_MEMSIZE(upd);
+		if (upd_size >= WT_MODIFY_MEM_FACTOR * cursor->value.size)
+			return (true);
+		if (__wt_txn_upd_visible_all(session, upd) &&
+		    i >= WT_MAX_MODIFY_UPDATE)
 			return (true);
 	}
 	return (false);
@@ -1393,6 +1420,10 @@ __wt_btcur_modify(WT_CURSOR_BTREE *cbt, WT_MODIFY *entries, int nentries)
 	/* Save the cursor state. */
 	__cursor_state_save(cursor, &state);
 
+	if (session->txn.isolation == WT_ISO_READ_UNCOMMITTED)
+		WT_ERR_MSG(session, ENOTSUP,
+		    "not supported in read-uncommitted transactions");
+
 	/*
 	 * Get the current value and apply the modification to it, for a few
 	 * reasons: first, we set the updated value so the application can
@@ -1404,11 +1435,9 @@ __wt_btcur_modify(WT_CURSOR_BTREE *cbt, WT_MODIFY *entries, int nentries)
 	 * fifth reason, verify we're not in a read-uncommitted transaction,
 	 * that implies a value that might disappear out from under us.
 	 */
-	if (session->txn.isolation == WT_ISO_READ_UNCOMMITTED)
-		WT_ERR_MSG(session, ENOTSUP,
-		    "not supported in read-uncommitted transactions");
-
-	WT_ERR(__wt_btcur_search(cbt));
+	if (!F_ISSET(cursor, WT_CURSTD_KEY_INT) ||
+	    !F_ISSET(cursor, WT_CURSTD_VALUE_INT))
+		WT_ERR(__wt_btcur_search(cbt));
 	orig = cursor->value.size;
 	WT_ERR(__wt_modify_apply_api(session, cursor, entries, nentries));
 	new = cursor->value.size;
@@ -1626,9 +1655,9 @@ __cursor_truncate(WT_SESSION_IMPL *session,
     int (*rmfunc)(WT_SESSION_IMPL *, WT_CURSOR_BTREE *, u_int))
 {
 	WT_DECL_RET;
-	uint64_t yield_count, sleep_count;
+	uint64_t yield_count, sleep_usecs;
 
-	yield_count = sleep_count = 0;
+	yield_count = sleep_usecs = 0;
 
 	/*
 	 * First, call the cursor search method to re-position the cursor: we
@@ -1665,7 +1694,7 @@ retry:	WT_ERR(__wt_btcur_search(start));
 	}
 
 err:	if (ret == WT_RESTART) {
-		__cursor_restart(session, &yield_count, &sleep_count);
+		__cursor_restart(session, &yield_count, &sleep_usecs);
 		goto retry;
 	}
 
@@ -1683,10 +1712,10 @@ __cursor_truncate_fix(WT_SESSION_IMPL *session,
     int (*rmfunc)(WT_SESSION_IMPL *, WT_CURSOR_BTREE *, u_int))
 {
 	WT_DECL_RET;
-	uint64_t yield_count, sleep_count;
+	uint64_t yield_count, sleep_usecs;
 	const uint8_t *value;
 
-	yield_count = sleep_count = 0;
+	yield_count = sleep_usecs = 0;
 
 	/*
 	 * Handle fixed-length column-store objects separately: for row-store
@@ -1725,7 +1754,7 @@ retry:	WT_ERR(__wt_btcur_search(start));
 	}
 
 err:	if (ret == WT_RESTART) {
-		__cursor_restart(session, &yield_count, &sleep_count);
+		__cursor_restart(session, &yield_count, &sleep_usecs);
 		goto retry;
 	}
 

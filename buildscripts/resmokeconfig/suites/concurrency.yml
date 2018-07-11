@@ -12,6 +12,10 @@ selector:
   - jstests/concurrency/fsm_all_simultaneous.js
 
 executor:
+  archive:
+    hooks:
+      - ValidateCollections
+    tests: true
   config:
     shell_options:
       readMode: commands

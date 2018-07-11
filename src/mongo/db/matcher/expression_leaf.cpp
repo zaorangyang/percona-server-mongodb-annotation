@@ -208,6 +208,10 @@ Status RegexMatchExpression::init(StringData path, const BSONElement& e) {
 
 
 Status RegexMatchExpression::init(StringData path, StringData regex, StringData options) {
+    if (regex.size() > MaxPatternSize) {
+        return Status(ErrorCodes::BadValue, "Regular expression is too long");
+    }
+
     if (regex.find('\0') != std::string::npos) {
         return Status(ErrorCodes::BadValue,
                       "Regular expression cannot contain an embedded null byte");
@@ -221,11 +225,6 @@ Status RegexMatchExpression::init(StringData path, StringData regex, StringData 
     _regex = regex.toString();
     _flags = options.toString();
     _re.reset(new pcrecpp::RE(_regex.c_str(), flags2options(_flags.c_str())));
-
-    if (!_re->error().empty()) {
-        return Status(ErrorCodes::BadValue,
-                      str::stream() << "Regular expression is invalid: " << _re->error());
-    }
 
     return setPath(path);
 }
@@ -473,6 +472,11 @@ void InMatchExpression::_doSetCollator(const CollatorInterface* collator) {
     _collator = collator;
     _eltCmp = BSONElementComparator(BSONElementComparator::FieldNamesMode::kIgnore, _collator);
 
+    // Re-sort the list of equalities according to our current comparator. This is necessary to work
+    // around https://svn.boost.org/trac10/ticket/13140.
+    std::sort(
+        _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeLessThan());
+
     // We need to re-compute '_equalitySet', since our set comparator has changed.
     _equalitySet = _eltCmp.makeBSONEltFlatSet(_originalEqualityVector);
 }
@@ -492,7 +496,12 @@ Status InMatchExpression::setEqualities(std::vector<BSONElement> equalities) {
             _hasEmptyArray = true;
         }
     }
+
     _originalEqualityVector = std::move(equalities);
+
+    // Sort the list of equalities to work around https://svn.boost.org/trac10/ticket/13140.
+    std::sort(
+        _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeLessThan());
 
     _equalitySet = _eltCmp.makeBSONEltFlatSet(_originalEqualityVector);
 

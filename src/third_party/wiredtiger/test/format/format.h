@@ -213,6 +213,7 @@ typedef struct {
 	uint32_t c_threads;
 	uint32_t c_timer;
 	uint32_t c_timing_stress_checkpoint;
+	uint32_t c_timing_stress_lookaside_sweep;
 	uint32_t c_timing_stress_split_1;
 	uint32_t c_timing_stress_split_2;
 	uint32_t c_timing_stress_split_3;
@@ -264,6 +265,9 @@ typedef struct {
 #define	ISOLATION_SNAPSHOT		4
 	u_int c_isolation_flag;			/* Isolation flag value */
 
+	uint32_t intl_page_max;			/* Maximum page sizes */
+	uint32_t leaf_page_max;
+
 	uint64_t key_cnt;			/* Keys loaded so far */
 	uint64_t rows;				/* Total rows */
 
@@ -284,7 +288,6 @@ typedef struct {
 
 	uint64_t ops;				/* total operations */
 	uint64_t commit;			/* operation counts */
-	uint64_t deadlock;
 	uint64_t insert;
 	uint64_t prepare;
 	uint64_t remove;

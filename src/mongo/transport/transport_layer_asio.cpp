@@ -65,7 +65,7 @@ namespace transport {
 
 TransportLayerASIO::Options::Options(const ServerGlobalParams* params)
     : port(params->port),
-      ipList(params->bind_ip),
+      ipList(params->bind_ips),
 #ifndef _WIN32
       useUnixSockets(!params->noUnixSocket),
 #endif
@@ -136,8 +136,7 @@ Status TransportLayerASIO::setup() {
             listenAddrs.emplace_back("::1");
         }
     } else {
-        boost::split(
-            listenAddrs, _listenerOptions.ipList, boost::is_any_of(","), boost::token_compress_on);
+        listenAddrs = _listenerOptions.ipList;
     }
 
 #ifndef _WIN32
@@ -309,9 +308,13 @@ void TransportLayerASIO::_acceptConnection(GenericAcceptor& acceptor) {
             return;
         }
 
-        std::shared_ptr<ASIOSession> session(new ASIOSession(this, std::move(peerSocket)));
+        try {
+            std::shared_ptr<ASIOSession> session(new ASIOSession(this, std::move(peerSocket)));
+            _sep->startSession(std::move(session));
+        } catch (const DBException& e) {
+            warning() << "Error accepting new connection " << e;
+        }
 
-        _sep->startSession(std::move(session));
         _acceptConnection(acceptor);
     };
 

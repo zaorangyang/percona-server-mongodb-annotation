@@ -157,6 +157,9 @@ __wt_session_release_resources(WT_SESSION_IMPL *session)
 {
 	WT_DECL_RET;
 
+	/* Transaction cleanup */
+	__wt_txn_release_resources(session);
+
 	/* Block manager cleanup */
 	if (session->block_manager_cleanup != NULL)
 		WT_TRET(session->block_manager_cleanup(session));
@@ -1779,9 +1782,11 @@ __session_timestamp_transaction(WT_SESSION *wt_session, const char *config)
 
 	session = (WT_SESSION_IMPL *)wt_session;
 #ifdef HAVE_DIAGNOSTIC
-	SESSION_API_CALL(session, timestamp_transaction, config, cfg);
+	SESSION_API_CALL_PREPARE_ALLOWED(session,
+	    timestamp_transaction, config, cfg);
 #else
-	SESSION_API_CALL(session, timestamp_transaction, NULL, cfg);
+	SESSION_API_CALL_PREPARE_ALLOWED(session,
+	    timestamp_transaction, NULL, cfg);
 	cfg[1] = config;
 #endif
 	WT_TRET(__wt_txn_set_timestamp(session, cfg));

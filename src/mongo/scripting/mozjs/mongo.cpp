@@ -529,6 +529,9 @@ void MongoBase::Functions::cursorHandleFromId::call(JSContext* cx, JS::CallArgs 
         uasserted(ErrorCodes::BadValue, "2nd arg must be a NumberLong");
     }
 
+    // getConnectionRef verifies that the connection is still open
+    getConnectionRef(args);
+
     std::string ns = ValueWriter(cx, args.get(0)).toString();
     long long cursorId = NumberLongInfo::ToNumberLong(cx, args.get(1));
 
@@ -769,6 +772,15 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
     o.setString(InternedString::host, cs.toString());
     auto defaultDB = cs.getDatabase() == "" ? "test" : cs.getDatabase();
     o.setString(InternedString::defaultDB, defaultDB);
+
+    // Adds a property to the Mongo connection object.
+    boost::optional<bool> retryWrites = cs.getRetryWrites();
+    // If retryWrites is not explicitly set in uri, sessions created on this connection default to
+    // the global retryWrites value. This is checked in sessions.js by using the injected
+    // _shouldRetryWrites() function, which returns true if the --retryWrites flag was passed.
+    if (retryWrites) {
+        o.setBoolean(InternedString::_retryWrites, retryWrites.get());
+    }
 
     args.rval().setObjectOrNull(thisv);
 }

@@ -657,6 +657,7 @@ __wt_txn_set_timestamp(WT_SESSION_IMPL *session, const char *cfg[])
 
 	/* Look for a commit timestamp. */
 	ret = __wt_config_gets_def(session, cfg, "commit_timestamp", 0, &cval);
+	WT_RET_NOTFOUND_OK(ret);
 	if (ret == 0 && cval.len != 0) {
 #ifdef HAVE_TIMESTAMPS
 		WT_TXN *txn = &session->txn;
@@ -671,8 +672,12 @@ __wt_txn_set_timestamp(WT_SESSION_IMPL *session, const char *cfg[])
 		WT_RET_MSG(session, ENOTSUP, "commit_timestamp requires a "
 		    "version of WiredTiger built with timestamp support");
 #endif
-	}
-	WT_RET_NOTFOUND_OK(ret);
+	} else
+		/*
+		 * We allow setting the commit timestamp after a prepare
+		 * but no other timestamp.
+		 */
+		WT_RET(__wt_txn_context_prepare_check(session));
 
 	/* Look for a read timestamp. */
 	WT_RET(__wt_txn_parse_read_timestamp(session, cfg));
@@ -780,17 +785,10 @@ __wt_txn_parse_read_timestamp(WT_SESSION_IMPL *session, const char *cfg[])
 		txn_global = &S2C(session)->txn_global;
 		WT_RET(__wt_txn_parse_timestamp(session, "read", &ts, &cval));
 
-		/*
-		 * Read timestamps imply / require snapshot isolation.
-		 *
-		 * If we already have a snapshot, it may be too early
-		 * to match the timestamp.  Get a new one.
-		 */
+		/* Read timestamps imply / require snapshot isolation. */
 		if (!F_ISSET(txn, WT_TXN_RUNNING))
 			txn->isolation = WT_ISO_SNAPSHOT;
-		else if (txn->isolation == WT_ISO_SNAPSHOT)
-			__wt_txn_get_snapshot(session);
-		else
+		else if (txn->isolation != WT_ISO_SNAPSHOT)
 			WT_RET_MSG(session, EINVAL, "setting a read_timestamp"
 			    " requires a transaction running at snapshot"
 			    " isolation");
@@ -853,6 +851,15 @@ __wt_txn_parse_read_timestamp(WT_SESSION_IMPL *session, const char *cfg[])
 			    "timestamp %s : Rounded to oldest timestamp %s",
 			    hex_timestamp[0], hex_timestamp[1]);
 		}
+
+		/*
+		 * If we already have a snapshot, it may be too early to match
+		 * the timestamp (including the one we just read, if rounding
+		 * to oldest).  Get a new one.
+		 */
+		if (F_ISSET(txn, WT_TXN_RUNNING))
+			__wt_txn_get_snapshot(session);
+
 #else
 		WT_UNUSED(txn);
 		WT_RET_MSG(session, EINVAL, "read_timestamp requires a "

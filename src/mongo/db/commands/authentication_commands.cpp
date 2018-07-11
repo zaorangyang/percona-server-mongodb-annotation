@@ -162,13 +162,15 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
     if (mechanism.empty()) {
         mechanism = "MONGODB-CR";
     }
-    UserName user;
-    auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
-    if (mechanism == "MONGODB-X509" && !cmdObj.hasField("user")) {
-        user = UserName(sslPeerInfo.subjectName, dbname);
-    } else {
-        user = UserName(cmdObj.getStringField("user"), dbname);
+
+    UserName user(cmdObj.getStringField("user"), dbname);
+#ifdef MONGO_CONFIG_SSL
+    if (mechanism == "MONGODB-X509" && user.getUser().empty()) {
+        auto& sslPeerInfo = SSLPeerInfo::forSession(opCtx->getClient()->session());
+        user = UserName(sslPeerInfo.subjectName.toString(), dbname);
     }
+#endif
+    uassert(ErrorCodes::AuthenticationFailed, "No user name provided", !user.getUser().empty());
 
     if (Command::testCommandsEnabled && user.getDB() == "admin" &&
         user.getUser() == internalSecurity.user->getName().getUser()) {
@@ -320,11 +322,14 @@ Status CmdAuthenticate::_authenticateX509(OperationContext* opCtx,
     Client* client = Client::getCurrent();
     AuthorizationSession* authorizationSession = AuthorizationSession::get(client);
     auto clientName = SSLPeerInfo::forSession(client->session()).subjectName;
+    uassert(ErrorCodes::AuthenticationFailed,
+            "No verified subject name available from client",
+            !clientName.empty());
 
     if (!getSSLManager()->getSSLConfiguration().hasCA) {
         return Status(ErrorCodes::AuthenticationFailed,
                       "Unable to verify x.509 certificate, as no CA has been provided.");
-    } else if (user.getUser() != clientName) {
+    } else if (user.getUser() != clientName.toString()) {
         return Status(ErrorCodes::AuthenticationFailed,
                       "There is no x.509 client certificate matching the user.");
     } else {

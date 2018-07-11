@@ -228,11 +228,15 @@ void ReplicationCoordinatorExternalStateMock::setAreSnapshotsEnabled(bool val) {
     _areSnapshotsEnabled = val;
 }
 
+void ReplicationCoordinatorExternalStateMock::setElectionTimeoutOffsetLimitFraction(double val) {
+    _electionTimeoutOffsetLimitFraction = val;
+}
+
 void ReplicationCoordinatorExternalStateMock::notifyOplogMetadataWaiters(
     const OpTime& committedOpTime) {}
 
 double ReplicationCoordinatorExternalStateMock::getElectionTimeoutOffsetLimitFraction() const {
-    return 0.15;
+    return _electionTimeoutOffsetLimitFraction;
 }
 
 bool ReplicationCoordinatorExternalStateMock::isReadCommittedSupportedByStorageEngine(
@@ -266,6 +270,13 @@ std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateMock::makeSteady
 
 std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherMaxFetcherRestarts() const {
     return 0;
+}
+
+SyncTail::BatchLimits ReplicationCoordinatorExternalStateMock::getInitialSyncBatchLimits() const {
+    SyncTail::BatchLimits batchLimits;
+    batchLimits.bytes = 512 * 1024 * 1024U;
+    batchLimits.ops = 5000U;
+    return batchLimits;
 }
 
 void ReplicationCoordinatorExternalStateMock::setIsReadCommittedEnabled(bool val) {

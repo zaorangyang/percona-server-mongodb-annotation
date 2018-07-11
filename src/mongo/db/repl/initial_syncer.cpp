@@ -318,30 +318,38 @@ BSONObj InitialSyncer::getInitialSyncProgress() const {
     return _getInitialSyncProgress_inlock();
 }
 
+void InitialSyncer::_appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob) const {
+    _stats.append(bob);
+    if (!_initialSyncState) {
+        return;
+    }
+    bob->appendNumber("fetchedMissingDocs", _initialSyncState->fetchedMissingDocs);
+    bob->appendNumber("appliedOps", _initialSyncState->appliedOps);
+    if (!_initialSyncState->beginTimestamp.isNull()) {
+        bob->append("initialSyncOplogStart", _initialSyncState->beginTimestamp);
+    }
+    if (!_initialSyncState->stopTimestamp.isNull()) {
+        bob->append("initialSyncOplogEnd", _initialSyncState->stopTimestamp);
+    }
+}
+
 BSONObj InitialSyncer::_getInitialSyncProgress_inlock() const {
-    BSONObjBuilder bob;
     try {
-        _stats.append(&bob);
+        BSONObjBuilder bob;
+        _appendInitialSyncProgressMinimal_inlock(&bob);
         if (_initialSyncState) {
-            bob.appendNumber("fetchedMissingDocs", _initialSyncState->fetchedMissingDocs);
-            bob.appendNumber("appliedOps", _initialSyncState->appliedOps);
-            if (!_initialSyncState->beginTimestamp.isNull()) {
-                bob.append("initialSyncOplogStart", _initialSyncState->beginTimestamp);
-            }
-            if (!_initialSyncState->stopTimestamp.isNull()) {
-                bob.append("initialSyncOplogEnd", _initialSyncState->stopTimestamp);
-            }
             if (_initialSyncState->dbsCloner) {
                 BSONObjBuilder dbsBuilder(bob.subobjStart("databases"));
                 _initialSyncState->dbsCloner->getStats().append(&dbsBuilder);
                 dbsBuilder.doneFast();
             }
         }
+        return bob.obj();
     } catch (const DBException& e) {
-        bob.resetToEmpty();
-        bob.append("error", e.toString());
         log() << "Error creating initial sync progress object: " << e.toString();
     }
+    BSONObjBuilder bob;
+    _appendInitialSyncProgressMinimal_inlock(&bob);
     return bob.obj();
 }
 
@@ -1501,10 +1509,10 @@ StatusWith<Operations> InitialSyncer::_getNextApplierBatch_inlock() {
         }
 
         // Apply replication batch limits.
-        if (ops.size() >= _opts.replBatchLimitOperations) {
+        if (ops.size() >= _opts.batchLimits.ops) {
             return std::move(ops);
         }
-        if (totalBytes + entry.raw.objsize() >= _opts.replBatchLimitBytes) {
+        if (totalBytes + entry.raw.objsize() >= _opts.batchLimits.bytes) {
             return std::move(ops);
         }
 

@@ -69,7 +69,6 @@
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/connection_pool_stats.h"
@@ -322,7 +321,7 @@ InitialSyncerOptions createInitialSyncerOptions(
     options.resetOptimes = [replCoord]() { replCoord->resetMyLastOpTimes(); };
     options.getSlaveDelay = [replCoord]() { return replCoord->getSlaveDelaySecs(); };
     options.syncSourceSelector = replCoord;
-    options.replBatchLimitBytes = dur::UncommittedBytesLimit;
+    options.batchLimits = externalState->getInitialSyncBatchLimits();
     options.oplogFetcherMaxFetcherRestarts = externalState->getOplogFetcherMaxFetcherRestarts();
     return options;
 }
@@ -1246,6 +1245,11 @@ Status ReplicationCoordinatorImpl::waitUntilOpTimeForReadUntil(OperationContext*
                 "node needs to be a replica set member to use read concern"};
     }
 
+    if (_rsConfigState == kConfigUninitialized || _rsConfigState == kConfigInitiating) {
+        return {ErrorCodes::NotYetInitialized,
+                "Cannot use non-local read concern until replica set is finished initializing."};
+    }
+
     if (readConcern.getArgsClusterTime()) {
         return _waitUntilClusterTimeForRead(opCtx, readConcern, deadline);
     } else {
@@ -1817,6 +1821,14 @@ void ReplicationCoordinatorImpl::_handleTimePassing(
         return;
     }
 
+    // For election protocol v1, call _startElectSelfIfEligibleV1 to avoid race
+    // against other elections caused by events like election timeout, replSetStepUp etc.
+    if (isV1ElectionProtocol()) {
+        _startElectSelfIfEligibleV1(
+            TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout);
+        return;
+    }
+
     bool wonSingleNodeElection = [this]() {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         return _topCoord->becomeCandidateIfStepdownPeriodOverAndSingleNodeSet(_replExecutor->now());
@@ -2019,14 +2031,22 @@ Status ReplicationCoordinatorImpl::processReplSetGetStatus(
     BSONObjBuilder* response, ReplSetGetStatusResponseStyle responseStyle) {
 
     BSONObj initialSyncProgress;
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (responseStyle == ReplSetGetStatusResponseStyle::kInitialSync) {
-        if (_initialSyncer) {
-            initialSyncProgress = _initialSyncer->getInitialSyncProgress();
+        std::shared_ptr<InitialSyncer> initialSyncerCopy;
+        {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            initialSyncerCopy = _initialSyncer;
+        }
+
+        // getInitialSyncProgress must be called outside the ReplicationCoordinatorImpl::_mutex
+        // lock. Else it might deadlock with InitialSyncer::_multiApplierCallback where it first
+        // acquires InitialSyncer::_mutex and then ReplicationCoordinatorImpl::_mutex.
+        if (initialSyncerCopy) {
+            initialSyncProgress = initialSyncerCopy->getInitialSyncProgress();
         }
     }
 
-
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     Status result(ErrorCodes::InternalError, "didn't set status in prepareStatusResponse");
     _topCoord->prepareStatusResponse(
         TopologyCoordinator::ReplSetStatusArgs{
@@ -3562,6 +3582,9 @@ void ReplicationCoordinatorImpl::waitUntilSnapshotCommitted(OperationContext* op
                                                             const Timestamp& untilSnapshot) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
 
+    uassert(ErrorCodes::NotYetInitialized,
+            "Cannot use snapshots until replica set is finished initializing.",
+            _rsConfigState != kConfigUninitialized && _rsConfigState != kConfigInitiating);
     while (!_currentCommittedSnapshot ||
            _currentCommittedSnapshot->getTimestamp() < untilSnapshot) {
         opCtx->waitForConditionOrInterrupt(_currentCommittedSnapshotCond, lock);

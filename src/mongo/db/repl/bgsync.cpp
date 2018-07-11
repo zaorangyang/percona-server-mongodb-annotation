@@ -79,6 +79,22 @@ const auto defaultBatchSize = (16 * 1024 * 1024) / 12 * 10;
 // The batchSize to use for the find/getMore queries called by the OplogFetcher
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(bgSyncOplogFetcherBatchSize, int, defaultBatchSize);
 
+// The batchSize to use for the find/getMore queries called by the rollback common point resolver.
+// A batchSize of 0 means that the 'find' and 'getMore' commands will be given no batchSize.
+// We set the default to 2000 to prevent the sync source from having to read too much data at once,
+// and reduce the chance of a socket timeout.
+// We choose 2000 for (10 minute timeout) * (60 sec / min) * (50 MB / second) / (16 MB / document).
+constexpr int defaultRollbackBatchSize = 2000;
+MONGO_EXPORT_SERVER_PARAMETER(rollbackRemoteOplogQueryBatchSize, int, defaultRollbackBatchSize)
+    ->withValidator([](const auto& potentialNewValue) {
+        if (potentialNewValue < 0) {
+            return Status(ErrorCodes::BadValue,
+                          "rollbackRemoteOplogQueryBatchSize cannot be negative.");
+        }
+
+        return Status::OK();
+    });
+
 /**
  * Extends DataReplicatorExternalStateImpl to be member state aware.
  */
@@ -678,7 +694,9 @@ void BackgroundSync::_runRollbackViaRecoverToCheckpoint(
     StorageInterface* storageInterface,
     OplogInterfaceRemote::GetConnectionFn getConnection) {
 
-    OplogInterfaceRemote remoteOplog(getConnection, NamespaceString::kRsOplogNamespace.ns());
+    OplogInterfaceRemote remoteOplog(getConnection,
+                                     NamespaceString::kRsOplogNamespace.ns(),
+                                     rollbackRemoteOplogQueryBatchSize.load());
 
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -709,8 +727,10 @@ void BackgroundSync::_fallBackOnRollbackViaRefetch(
     bool useUUID,
     OplogInterfaceRemote::GetConnectionFn getConnection) {
 
-    RollbackSourceImpl rollbackSource(
-        getConnection, source, NamespaceString::kRsOplogNamespace.ns());
+    RollbackSourceImpl rollbackSource(getConnection,
+                                      source,
+                                      NamespaceString::kRsOplogNamespace.ns(),
+                                      rollbackRemoteOplogQueryBatchSize.load());
 
     if (useUUID) {
         rollback(opCtx, *localOplog, rollbackSource, requiredRBID, _replCoord, _replicationProcess);

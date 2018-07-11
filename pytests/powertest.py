@@ -292,6 +292,13 @@ def get_extension(filename):
     return os.path.splitext(filename)[-1]
 
 
+def executable_extension():
+    """Return executable file extension."""
+    if _IS_WINDOWS:
+        return ".exe"
+    return ""
+
+
 def abs_path(path):
     """Returns absolute path for 'path'. Raises an exception on failure."""
     if _IS_WINDOWS:
@@ -968,9 +975,10 @@ class PosixService(object):
 class MongodControl(object):
     """ Control mongod process. """
 
-    def __init__(self, bin_dir, db_path, log_path, port, options=None):
-        extension = ".exe" if _IS_WINDOWS else ""
-        self.process_name = "mongod{}".format(extension)
+    def __init__(  # pylint: disable=too-many-arguments
+            self, bin_dir, db_path, log_path, port, options=None):
+        """Initialize MongodControl."""
+        self.process_name = "mongod{}".format(executable_extension())
 
         self.bin_dir = bin_dir
         if self.bin_dir:
@@ -1061,6 +1069,10 @@ class MongodControl(object):
         """ Returns tuple (ret, ouput). """
         return self.service.stop()
 
+    def status(self):
+        """Return status of the process."""
+        return self.service.status()
+
     def get_pids(self):
         """ Return list of pids for process. """
         return self.service.get_pids()
@@ -1114,11 +1126,11 @@ def remote_handler(options, operations):
 
     print_uptime()
     LOGGER.info("Operations to perform %s", operations)
-    host_port = "localhost:{}".format(options.port)
+    host = options.host if options.host else "localhost"
+    host_port = "{}:{}".format(host, options.port)
 
-    if options.use_replica_set and options.repl_set:
-        options.mongod_options = "{} --replSet {}".format(
-            options.mongod_options, options.repl_set)
+    if options.repl_set:
+        options.mongod_options = "{} --replSet {}".format(options.mongod_options, options.repl_set)
 
     # For MongodControl, the file references should be fully specified.
     if options.mongodb_bin_dir:
@@ -1135,7 +1147,7 @@ def remote_handler(options, operations):
         port=options.port,
         options=options.mongod_options)
 
-    mongo_client_opts = get_mongo_client_args(host="localhost", port=options.port, options=options)
+    mongo_client_opts = get_mongo_client_args(host=host, port=options.port, options=options)
 
     # Perform the sequence of operations specified. If any operation fails
     # then return immediately.
@@ -1149,6 +1161,10 @@ def remote_handler(options, operations):
                 time.sleep(30)
             except IOError:
                 pass
+
+        elif operation == "kill_mongod":
+            # Unconditional kill of mongod
+            ret, output = kill_mongod()
 
         elif operation == "install_mongod":
             ret, output = mongod.install(root_dir, options.tarball_url)
@@ -1187,14 +1203,14 @@ def remote_handler(options, operations):
             mongo = pymongo.MongoClient(**mongo_client_opts)
             LOGGER.info("Server buildinfo: %s", mongo.admin.command("buildinfo"))
             LOGGER.info("Server serverStatus: %s", mongo.admin.command("serverStatus"))
-            if options.use_replica_set and options.repl_set:
+            if options.repl_set:
                 ret = mongo_reconfig_replication(mongo, host_port, options.repl_set)
             ret = 0 if not ret else 1
 
         elif operation == "stop_mongod":
             ret, output = mongod.stop()
             LOGGER.info(output)
-            ret = wait_for_mongod_shutdown(options.db_path)
+            ret = wait_for_mongod_shutdown(mongod)
 
         elif operation == "shutdown_mongod":
             mongo = pymongo.MongoClient(**mongo_client_opts)
@@ -1202,7 +1218,7 @@ def remote_handler(options, operations):
                 mongo.admin.command("shutdown", force=True)
             except pymongo.errors.AutoReconnect:
                 pass
-            ret = wait_for_mongod_shutdown(options.db_path)
+            ret = wait_for_mongod_shutdown(mongod)
 
         elif operation == "rsync_data":
             ret, output = rsync(options.db_path, options.rsync_dest, options.rsync_exclude_files)
@@ -1278,6 +1294,16 @@ def rsync(src_dir, dest_dir, exclude_files=None):
     return ret, output
 
 
+def kill_mongod():
+    """Kill all mongod processes uncondtionally."""
+    if _IS_WINDOWS:
+        cmds = "taskkill /f /im mongod.exe"
+    else:
+        cmds = "pkill -9 mongod"
+    ret, output = execute_cmd(cmds, use_file=True)
+    return ret, output
+
+
 def internal_crash(use_sudo=False, crash_option=None):
     """ Internally crash the host this excutes on. """
 
@@ -1311,12 +1337,13 @@ def internal_crash(use_sudo=False, crash_option=None):
     return 1, "Crash did not occur"
 
 
-def crash_server(options, crash_canary, canary_port, local_ops, script_name, client_args):
-    """ Crashes server and optionally writes canary doc before crash.
-        Returns tuple (ret, output). """
+def crash_server_or_kill_mongod(  # pylint: disable=too-many-arguments,,too-many-locals
+        options, crash_canary, canary_port, local_ops, script_name, client_args):
+    """Crash server or kill mongod and optionally write canary doc. Return tuple (ret, output)."""
 
     crash_wait_time = options.crash_wait_time + random.randint(0, options.crash_wait_time_jitter)
-    LOGGER.info("Crashing server in %d seconds", crash_wait_time)
+    message_prefix = "Killing mongod" if options.crash_method == "kill" else "Crashing server"
+    LOGGER.info("%s in %d seconds", message_prefix, crash_wait_time)
     time.sleep(crash_wait_time)
 
     if options.crash_method == "mpower":
@@ -1331,7 +1358,8 @@ def crash_server(options, crash_canary, canary_port, local_ops, script_name, cli
             ssh_connection_options=options.ssh_crash_option,
             shell_binary="/bin/sh")
 
-    elif options.crash_method == "internal":
+    elif options.crash_method == "internal" or options.crash_method == "kill":
+        crash_cmd = "crash_server" if options.crash_method == "internal" else "kill_mongod"
         if options.canary == "remote":
             # The crash canary function executes remotely, only if the
             # crash_method is 'internal'.
@@ -1342,12 +1370,13 @@ def crash_server(options, crash_canary, canary_port, local_ops, script_name, cli
             canary = ""
             canary_cmd = ""
         crash_func = local_ops.shell
-        crash_args = ["{} {} --remoteOperation {} {} {} crash_server".format(
+        crash_args = ["{} {} --remoteOperation {} {} {} {}".format(
             options.remote_python,
             script_name,
             client_args,
             canary,
-            canary_cmd)]
+            canary_cmd,
+            crash_cmd)]
 
     elif options.crash_method == "aws_ec2":
         ec2 = aws_ec2.AwsEc2()
@@ -1367,20 +1396,23 @@ def crash_server(options, crash_canary, canary_port, local_ops, script_name, cli
     return ret, output
 
 
-def wait_for_mongod_shutdown(data_dir, timeout=120):
-    """ Waits for for mongod to shutdown.
-
-        Returns 0 if shutdown occurs within 'timeout', else 1. """
-
-    lock_file = os.path.join(data_dir, "mongod.lock")
-    LOGGER.info("Waiting for mongod to release lockfile %s", lock_file)
+def wait_for_mongod_shutdown(mongod_control, timeout=120):
+    """Wait for for mongod to shutdown; return 0 if shutdown occurs within 'timeout', else 1."""
     start = time.time()
-    while os.path.exists(lock_file) and os.stat(lock_file).st_size:
-        time.sleep(3)
+    status = mongod_control.status()
+    while status != "stopped":
         if time.time() - start >= timeout:
-            LOGGER.error("The mongod lockfile %s has not been released, exiting", lock_file)
+            LOGGER.error("The mongod process has not stopped, current status is %s", status)
             return 1
-    LOGGER.info("The mongod lockfile %s has been released", lock_file)
+        LOGGER.info("Waiting for mongod process to stop, current status is %s ", status)
+        time.sleep(3)
+        status = mongod_control.status()
+    LOGGER.info("The mongod process has stopped")
+
+    # We wait a bit, since files could still be flushed to disk, which was causing
+    # rsync "file has vanished" errors.
+    time.sleep(5)
+
     return 0
 
 
@@ -1454,31 +1486,44 @@ def mongo_reconfig_replication(mongo, host_port, repl_set):
     # The side affect of using force=True are large jumps in the config
     # version, which after many reconfigs may exceed the 'int' value.
 
+    LOGGER.info("Reconfiguring replication %s %s", host_port, repl_set)
     database = pymongo.database.Database(mongo, "local")
     system_replset = database.get_collection("system.replset")
     # Check if replica set has already been initialized
     if not system_replset or not system_replset.find_one():
         rs_config = {"_id": repl_set, "members": [{"_id": 0, "host": host_port}]}
         ret = mongo.admin.command("replSetInitiate", rs_config)
+        LOGGER.info("Replication initialized: %s %s", ret, rs_config)
     else:
         # Wait until replication is initialized.
         while True:
             try:
                 ret = mongo.admin.command("replSetGetConfig")
                 if ret["ok"] != 1:
+                    LOGGER.error("Failed replSetGetConfig: %s", ret)
                     return 1
+
+                rs_config = ret["config"]
+                # We only reconfig if there is a change to 'host'.
+                if rs_config["members"][0]["host"] != host_port:
+                    # With force=True, version is ignored.
+                    # rs_config["version"] = rs_config["version"] + 1
+                    rs_config["members"][0]["host"] = host_port
+                    ret = mongo.admin.command("replSetReconfig", rs_config, force=True)
+                    if ret["ok"] != 1:
+                        LOGGER.error("Failed replSetReconfig: %s", ret)
+                        return 1
+                    LOGGER.info("Replication reconfigured: %s", ret)
                 break
+
+            except pymongo.errors.AutoReconnect:
+                pass
             except pymongo.errors.OperationFailure as err:
                 # src/mongo/base/error_codes.err: error_code("NotYetInitialized", 94)
                 if err.code != 94:
+                    LOGGER.error("Replication failed to initialize: %s", ret)
                     return 1
-        rs_config = ret["config"]
-        # We only reconfig if there is a change to 'host'.
-        if rs_config["members"][0]["host"] != host_port:
-            # With force=True, version is ignored.
-            # rs_config["version"] = rs_config["version"] + 1
-            rs_config["members"][0]["host"] = host_port
-            ret = mongo.admin.command("replSetReconfig", rs_config, force=True)
+
     primary_available = mongod_wait_for_primary(mongo)
     LOGGER.debug("isMaster: %s", mongo.admin.command("isMaster"))
     LOGGER.debug("replSetGetStatus: %s", mongo.admin.command("replSetGetStatus"))
@@ -1754,12 +1799,20 @@ Examples:
                             default=None)
 
     # Crash options
-    crash_methods = ["aws_ec2", "internal", "mpower"]
+    crash_methods = ["aws_ec2", "internal", "kill", "mpower"]
     crash_options.add_option("--crashMethod",
                              dest="crash_method",
                              choices=crash_methods,
-                             help="Crash methods: {} [default: '%default']".format(crash_methods),
+                             help="Crash methods: {} [default: '%default']."
+                                  " Select 'aws_ec2' to force-stop/start an AWS instance."
+                                  " Select 'internal' to crash the remote server through an"
+                                  " internal command, i.e., sys boot (Linux) or notmyfault"
+                                  " (Windows). Select 'kill' to perform an unconditional kill of"
+                                  " mongod, which will keep the remote server running."
+                                  " Select 'mpower' to use the mFi mPower to cutoff power to"
+                                  " the remote server.".format(crash_methods),
                              default="internal")
+
 
     aws_address_types = [
         "private_ip_address", "public_ip_address", "private_dns_name", "public_dns_name"]
@@ -1844,6 +1897,11 @@ Examples:
                                    " defaults to standalone node",
                               default=None)
 
+    # The current host used to start and connect to mongod. Not meant to be specified
+    # by the user.
+    mongod_options.add_option("--mongodHost", dest="host", help=optparse.SUPPRESS_HELP,
+                              default=None)
+
     # The current port used to start and connect to mongod. Not meant to be specified
     # by the user.
     mongod_options.add_option("--mongodPort",
@@ -1851,12 +1909,6 @@ Examples:
                               help=optparse.SUPPRESS_HELP,
                               type="int",
                               default=None)
-
-    mongod_options.add_option("--useReplicaSet",
-                              dest="use_replica_set",
-                              help=optparse.SUPPRESS_HELP,
-                              action="store_true",
-                              default=False)
 
     # The ports used on the 'server' side when in standard or secret mode.
     mongod_options.add_option("--mongodUsablePorts",
@@ -2218,9 +2270,11 @@ Examples:
         LOGGER.error("Cannot create and validate canary documents if the mongod option"
                      " '--nojournal' is used.")
         sys.exit(1)
+
+    internal_crash_options = ["internal", "kill"]
     if options.canary == "remote" and options.crash_method != "internal":
         parser.error("The option --canary can only be specified as 'remote' if --crashMethod"
-                     " is 'internal'")
+                     " is one of {}".format(internal_crash_options))
     orig_canary_doc = canary_doc = ""
     validate_canary_cmd = ""
 
@@ -2349,6 +2403,7 @@ Examples:
         remote_operation = ("--remoteOperation"
                             " {rsync_opt}"
                             " {canary_opt}"
+                            " --mongodHost {host}"
                             " --mongodPort {port}"
                             " {rsync_cmd}"
                             " {remove_lock_file_cmd}"
@@ -2357,12 +2412,10 @@ Examples:
                             " {validate_collections_cmd}"
                             " {validate_canary_cmd}"
                             " {seed_docs}").format(
-                                rsync_opt=rsync_opt,
-                                canary_opt=canary_opt,
-                                port=secret_port,
-                                rsync_cmd=rsync_cmd,
-                                remove_lock_file_cmd=remove_lock_file_cmd,
-                                set_fcv_cmd=set_fcv_cmd if loop_num == 1 else "",
+                                rsync_opt=rsync_opt, canary_opt=canary_opt, host=mongod_host,
+                                port=secret_port, rsync_cmd=rsync_cmd,
+                                remove_lock_file_cmd=remove_lock_file_cmd, set_fcv_cmd=set_fcv_cmd
+                                if loop_num == 1 else "",
                                 validate_collections_cmd=validate_collections_cmd,
                                 validate_canary_cmd=validate_canary_cmd,
                                 seed_docs=seed_docs if loop_num == 1 else "")
@@ -2425,21 +2478,14 @@ Examples:
 
         # Optionally, rsync the post-recovery database.
         # Start monogd on the standard port.
-        # Replica sets are optionally used in this mode.
-        use_replica_set = "--useReplicaSet" if options.repl_set else ""
         remote_op = ("--remoteOperation"
                      " {}"
+                     " --mongodHost {}"
                      " --mongodPort {}"
                      " {}"
-                     " {}"
-                     " start_mongod").format(
-                         rsync_opt, standard_port, use_replica_set, rsync_cmd)
-        ret, output = call_remote_operation(
-            local_ops,
-            options.remote_python,
-            script_name,
-            client_args,
-            remote_op)
+                     " start_mongod").format(rsync_opt, mongod_host, standard_port, rsync_cmd)
+        ret, output = call_remote_operation(local_ops, options.remote_python, script_name,
+                                            client_args, remote_op)
         rsync_text = "rsync_data afterrecovery & " if options.rsync_data else ""
         LOGGER.info("****%s start mongod: %d %s****", rsync_text, ret, output)
         if ret:
@@ -2502,14 +2548,16 @@ Examples:
                 options.db_name,
                 options.collection_name,
                 canary_doc]
-        ret, output = crash_server(
+        ret, output = crash_server_or_kill_mongod(
             options, crash_canary, standard_port, local_ops, script_name, client_args)
         # For internal crashes 'ret' is non-zero, because the ssh session unexpectedly terminates.
         if options.crash_method != "internal" and ret:
             raise Exception("Crash of server failed: {}", format(output))
-        # Wait a bit after sending command to crash the server to avoid connecting to the
-        # server before the actual crash occurs.
-        time.sleep(10)
+
+        if options.crash_method != "kill":
+            # Wait a bit after sending command to crash the server to avoid connecting to the
+            # server before the actual crash occurs.
+            time.sleep(10)
 
         # Kill any running clients and cleanup temporary files.
         Processes.kill_all()

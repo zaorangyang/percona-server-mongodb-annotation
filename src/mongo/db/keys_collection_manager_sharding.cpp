@@ -339,6 +339,7 @@ void KeysCollectionManagerSharding::PeriodicRunner::stop() {
         }
 
         _inShutdown = true;
+        _hasSeenKeys = false;
         _refreshNeededCV.notify_all();
     }
 
@@ -348,6 +349,10 @@ void KeysCollectionManagerSharding::PeriodicRunner::stop() {
 bool KeysCollectionManagerSharding::PeriodicRunner::hasSeenKeys() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     return _hasSeenKeys;
+}
+
+void KeysCollectionManagerSharding::clearCache() {
+    _keysCache.resetCache();
 }
 
 }  // namespace mongo

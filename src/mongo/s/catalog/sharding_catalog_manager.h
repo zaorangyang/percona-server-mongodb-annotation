@@ -33,6 +33,7 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/executor/task_executor.h"
+#include "mongo/s/catalog/namespace_serializer.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -201,6 +202,14 @@ public:
      * Throws DatabaseDifferCase if the database already exists with a different case.
      */
     DatabaseType createDatabase(OperationContext* opCtx, const std::string& dbName);
+
+    /**
+     * Creates a ScopedLock on the database name in _namespaceSerializer. This is to prevent
+     * timeouts waiting on the dist lock if multiple threads attempt to create the same db.
+     */
+    auto serializeCreateDatabase(OperationContext* opCtx, StringData dbName) {
+        return _namespaceSerializer.lock(opCtx, dbName);
+    }
 
     /**
      * Creates the database if it does not exist, then marks its entry in config.databases as
@@ -390,7 +399,7 @@ private:
      */
     StatusWith<Shard::CommandResponse> _runCommandForAddShard(OperationContext* opCtx,
                                                               RemoteCommandTargeter* targeter,
-                                                              const std::string& dbName,
+                                                              StringData dbName,
                                                               const BSONObj& cmdObj);
 
     /**
@@ -412,16 +421,6 @@ private:
      * Appends a read committed read concern to the request object.
      */
     void _appendReadConcern(BSONObjBuilder* builder);
-
-    /**
-     * Creates the first chunks of a new sharded collection.
-     */
-    ChunkVersion _createFirstChunks(OperationContext* opCtx,
-                                    const NamespaceString& nss,
-                                    const ShardKeyPattern& shardKeyPattern,
-                                    const ShardId& primaryShardId,
-                                    const std::vector<BSONObj>& initPoints,
-                                    const bool distributeInitialChunks);
 
     // The owning service context
     ServiceContext* const _serviceContext;
@@ -478,6 +477,8 @@ private:
      * be removed while they are running (such as removeShardFromZone) to take this in shared mode.
      */
     Lock::ResourceMutex _kShardMembershipLock;
+
+    NamespaceSerializer _namespaceSerializer;
 };
 
 }  // namespace mongo

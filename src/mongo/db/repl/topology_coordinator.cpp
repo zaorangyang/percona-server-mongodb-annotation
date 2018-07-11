@@ -1348,6 +1348,10 @@ HeartbeatResponseAction TopologyCoordinator::_updatePrimaryFromHBDataV1(
         bool catchupTakeoverDisabled =
             ReplSetConfig::kCatchUpDisabled == _rsConfig.getCatchUpTimeoutPeriod() ||
             ReplSetConfig::kCatchUpTakeoverDisabled == _rsConfig.getCatchUpTakeoverDelay();
+
+        bool scheduleCatchupTakeover = false;
+        bool schedulePriorityTakeover = false;
+
         if (!catchupTakeoverDisabled && (_memberData.at(primaryIndex).getLastAppliedOpTime() <
                                          _memberData.at(_selfIndex).getLastAppliedOpTime())) {
             LOG(2) << "I can take over the primary due to fresher data."
@@ -1357,15 +1361,37 @@ HeartbeatResponseAction TopologyCoordinator::_updatePrimaryFromHBDataV1(
                    << _memberData.at(primaryIndex).getLastAppliedOpTime()
                    << " My optime: " << _memberData.at(_selfIndex).getLastAppliedOpTime();
 
-            return HeartbeatResponseAction::makeCatchupTakeoverAction();
+            scheduleCatchupTakeover = true;
         }
 
         if (_rsConfig.getMemberAt(primaryIndex).getPriority() <
             _rsConfig.getMemberAt(_selfIndex).getPriority()) {
-            LOG(4) << "I can take over the primary due to higher priority."
+            LOG(2) << "I can take over the primary due to higher priority."
                    << " Current primary index: " << primaryIndex << " in term "
                    << _memberData.at(primaryIndex).getTerm();
 
+            schedulePriorityTakeover = true;
+        }
+
+        // Calculate rank of current node. A rank of 0 indicates that it has the highest priority.
+        auto currentNodePriority = _rsConfig.getMemberAt(_selfIndex).getPriority();
+
+        // Schedule a priority takeover early only if we know that the current node has the highest
+        // priority in the replica set, has a higher priority than the primary, and is the most
+        // up to date node.
+        // Otherwise, prefer to schedule a catchup takeover over a priority takeover
+        if (scheduleCatchupTakeover && schedulePriorityTakeover &&
+            _rsConfig.calculatePriorityRank(currentNodePriority) == 0) {
+            LOG(2) << "I can take over the primary because I have a higher priority, the highest "
+                   << "priority in the replica set, and fresher data."
+                   << " Current primary index: " << primaryIndex << " in term "
+                   << _memberData.at(primaryIndex).getTerm();
+            return HeartbeatResponseAction::makePriorityTakeoverAction();
+        }
+        if (scheduleCatchupTakeover) {
+            return HeartbeatResponseAction::makeCatchupTakeoverAction();
+        }
+        if (schedulePriorityTakeover) {
             return HeartbeatResponseAction::makePriorityTakeoverAction();
         }
     }
@@ -1880,9 +1906,12 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
         if (_maintenanceModeCalls) {
             response->append("maintenanceMode", _maintenanceModeCalls);
         }
-        std::string s = _getHbmsg(now);
-        if (!s.empty())
-            response->append("infoMessage", s);
+        response->append("lastHeartbeatMessage", "");
+        response->append("syncingTo", "");
+        response->append("syncSourceHost", "");
+        response->append("syncSourceId", -1);
+
+        response->append("infoMessage", _getHbmsg(now));
         *result = Status(ErrorCodes::InvalidReplicaSetConfig,
                          "Our replica set config is invalid or we are not a member of it");
         return;
@@ -1908,15 +1937,20 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
 
             if (!_syncSource.empty() && !_iAmPrimary()) {
                 bb.append("syncingTo", _syncSource.toString());
+                bb.append("syncSourceHost", _syncSource.toString());
+                const MemberConfig* member = _rsConfig.findMemberByHostAndPort(_syncSource);
+                bb.append("syncSourceId", member ? member->getId() : -1);
+            } else {
+                bb.append("syncingTo", "");
+                bb.append("syncSourceHost", "");
+                bb.append("syncSourceId", -1);
             }
 
             if (_maintenanceModeCalls) {
                 bb.append("maintenanceMode", _maintenanceModeCalls);
             }
 
-            std::string s = _getHbmsg(now);
-            if (!s.empty())
-                bb.append("infoMessage", s);
+            bb.append("infoMessage", _getHbmsg(now));
 
             if (myState.primary()) {
                 bb.append("electionTime", _electionTime);
@@ -1925,6 +1959,7 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             }
             bb.appendIntOrLL("configVersion", _rsConfig.getConfigVersion());
             bb.append("self", true);
+            bb.append("lastHeartbeatMessage", "");
             membersOut.push_back(bb.obj());
         } else {
             // add non-self member
@@ -1966,16 +2001,23 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             bb.appendDate("lastHeartbeatRecv", it->getLastHeartbeatRecv());
             Milliseconds ping = _getPing(itConfig.getHostAndPort());
             bb.append("pingMs", durationCount<Milliseconds>(ping));
-            std::string s = it->getLastHeartbeatMsg();
-            if (!s.empty())
-                bb.append("lastHeartbeatMessage", s);
+            bb.append("lastHeartbeatMessage", it->getLastHeartbeatMsg());
             if (it->hasAuthIssue()) {
                 bb.append("authenticated", false);
             }
             const HostAndPort& syncSource = it->getSyncSource();
             if (!syncSource.empty() && !state.primary()) {
                 bb.append("syncingTo", syncSource.toString());
+                bb.append("syncSourceHost", syncSource.toString());
+                const MemberConfig* member = _rsConfig.findMemberByHostAndPort(syncSource);
+                bb.append("syncSourceId", member ? member->getId() : -1);
+            } else {
+                bb.append("syncingTo", "");
+                bb.append("syncSourceHost", "");
+                bb.append("syncSourceId", -1);
             }
+
+            bb.append("infoMessage", "");
 
             if (state == MemberState::RS_PRIMARY) {
                 bb.append("electionTime", it->getElectionTime());
@@ -1999,6 +2041,13 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     // Add sync source info
     if (!_syncSource.empty() && !myState.primary() && !myState.removed()) {
         response->append("syncingTo", _syncSource.toString());
+        response->append("syncSourceHost", _syncSource.toString());
+        const MemberConfig* member = _rsConfig.findMemberByHostAndPort(_syncSource);
+        response->append("syncSourceId", member ? member->getId() : -1);
+    } else {
+        response->append("syncingTo", "");
+        response->append("syncSourceHost", "");
+        response->append("syncSourceId", -1);
     }
 
     if (_rsConfig.isConfigServer()) {
