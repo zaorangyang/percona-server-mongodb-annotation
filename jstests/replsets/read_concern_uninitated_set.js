@@ -1,6 +1,7 @@
 /**
  * Test to ensure that specifying non-local read concern with an uninitiated set does not crash
  * node.
+ * @tags: [rocks_requires_fcv36]
  */
 (function() {
     "use strict";
