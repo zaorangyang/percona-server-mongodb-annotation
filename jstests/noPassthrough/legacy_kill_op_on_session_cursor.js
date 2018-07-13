@@ -1,6 +1,7 @@
 // This tests the fix for SERVER-33553. It creates a situation where a cursor created as part of a
 // session is killed using a legacy OP_KILL_CURSORS request. This is not "normal" behavior that's
 // expected from a driver, so there is a certain amount of set up work that needs to happen.
+// @tags: [rocks_requires_fcv36]
 (function() {
     "use strict";
 
