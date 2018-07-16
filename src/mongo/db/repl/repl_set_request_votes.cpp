@@ -51,22 +51,22 @@ private:
              const std::string&,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
-        Status status = getGlobalReplicationCoordinator()->checkReplEnabledForCommand(&result);
+        Status status = ReplicationCoordinator::get(opCtx)->checkReplEnabledForCommand(&result);
         if (!status.isOK()) {
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         ReplSetRequestVotesArgs parsedArgs;
         status = parsedArgs.initialize(cmdObj);
         if (!status.isOK()) {
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         ReplSetRequestVotesResponse response;
-        status = getGlobalReplicationCoordinator()->processReplSetRequestVotes(
+        status = ReplicationCoordinator::get(opCtx)->processReplSetRequestVotes(
             opCtx, parsedArgs, &response);
         response.addToBSON(&result);
-        return appendCommandStatus(result, status);
+        return CommandHelpers::appendCommandStatus(result, status);
     }
 } cmdReplSetRequestVotes;
 

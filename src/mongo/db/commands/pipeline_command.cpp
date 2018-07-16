@@ -48,26 +48,24 @@ class PipelineCommand : public BasicCommand {
 public:
     PipelineCommand() : BasicCommand("aggregate") {}
 
-    void help(std::stringstream& help) const override {
-        help << "Runs the aggregation command. See http://dochub.mongodb.org/core/aggregation for "
-                "more details.";
+    std::string help() const override {
+        return "Runs the aggregation command. See http://dochub.mongodb.org/core/aggregation for "
+               "more details.";
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return Pipeline::aggSupportsWriteConcern(cmd);
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kOptIn;
     }
 
-    bool slaveOverrideOk() const override {
-        return true;
-    }
-
-    bool supportsNonLocalReadConcern(const std::string& dbName,
-                                     const BSONObj& cmdObj) const override {
-        return !AggregationRequest::parseNs(dbName, cmdObj).isCollectionlessAggregateNS();
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const override {
+        return level == repl::ReadConcernLevel::kLocalReadConcern ||
+            !AggregationRequest::parseNs(dbName, cmdObj).isCollectionlessAggregateNS();
     }
 
     ReadWriteType getReadWriteType() const {
@@ -76,7 +74,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         const NamespaceString nss(AggregationRequest::parseNs(dbname, cmdObj));
         return AuthorizationSession::get(client)->checkAuthForAggregate(nss, cmdObj, false);
     }
@@ -88,12 +86,13 @@ public:
         const auto aggregationRequest =
             uassertStatusOK(AggregationRequest::parseFromBSON(dbname, cmdObj, boost::none));
 
-        return appendCommandStatus(result,
-                                   runAggregate(opCtx,
-                                                aggregationRequest.getNamespaceString(),
-                                                aggregationRequest,
-                                                cmdObj,
-                                                result));
+        return CommandHelpers::appendCommandStatus(
+            result,
+            runAggregate(opCtx,
+                         aggregationRequest.getNamespaceString(),
+                         aggregationRequest,
+                         cmdObj,
+                         result));
     }
 
     Status explain(OperationContext* opCtx,

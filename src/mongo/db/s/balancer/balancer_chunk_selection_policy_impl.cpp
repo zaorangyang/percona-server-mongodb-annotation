@@ -32,12 +32,10 @@
 
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy_impl.h"
 
-#include <set>
 #include <vector>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj_comparator_interface.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_tags.h"
@@ -86,15 +84,12 @@ StatusWith<DistributionStatus> createCollectionDistributionStatus(
     const auto swCollectionTags =
         Grid::get(opCtx)->catalogClient()->getTagsForCollection(opCtx, chunkMgr->getns());
     if (!swCollectionTags.isOK()) {
-        return {swCollectionTags.getStatus().code(),
-                str::stream() << "Unable to load tags for collection " << chunkMgr->getns()
-                              << " due to "
-                              << swCollectionTags.getStatus().toString()};
+        return swCollectionTags.getStatus().withContext(
+            str::stream() << "Unable to load tags for collection " << chunkMgr->getns().ns());
     }
     const auto& collectionTags = swCollectionTags.getValue();
 
-    DistributionStatus distribution(NamespaceString(chunkMgr->getns()),
-                                    std::move(shardToChunksMap));
+    DistributionStatus distribution(chunkMgr->getns(), std::move(shardToChunksMap));
 
     // Cache the collection tags
     const auto& keyPattern = chunkMgr->getShardKeyPattern().getKeyPattern();
@@ -257,6 +252,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToMo
     }
 
     MigrateInfoVector candidateChunks;
+    std::set<ShardId> usedShards;
 
     for (const auto& coll : collections) {
         if (coll.getDropped()) {
@@ -270,8 +266,8 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToMo
             continue;
         }
 
-        auto candidatesStatus =
-            _getMigrateCandidatesForCollection(opCtx, nss, shardStats, aggressiveBalanceHint);
+        auto candidatesStatus = _getMigrateCandidatesForCollection(
+            opCtx, nss, shardStats, aggressiveBalanceHint, &usedShards);
         if (candidatesStatus == ErrorCodes::NamespaceNotFound) {
             // Namespace got dropped before we managed to get to it, so just skip it
             continue;
@@ -300,8 +296,8 @@ BalancerChunkSelectionPolicyImpl::selectSpecificChunkToMove(OperationContext* op
     const auto& shardStats = shardStatsStatus.getValue();
 
     auto routingInfoStatus =
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
-            opCtx, NamespaceString(chunk.getNS()));
+        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
+                                                                                     chunk.getNS());
     if (!routingInfoStatus.isOK()) {
         return routingInfoStatus.getStatus();
     }
@@ -329,8 +325,8 @@ Status BalancerChunkSelectionPolicyImpl::checkMoveAllowed(OperationContext* opCt
     auto shardStats = std::move(shardStatsStatus.getValue());
 
     auto routingInfoStatus =
-        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(
-            opCtx, NamespaceString(chunk.getNS()));
+        Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
+                                                                                     chunk.getNS());
     if (!routingInfoStatus.isOK()) {
         return routingInfoStatus.getStatus();
     }
@@ -413,7 +409,8 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
     OperationContext* opCtx,
     const NamespaceString& nss,
     const ShardStatisticsVector& shardStats,
-    bool aggressiveBalanceHint) {
+    bool aggressiveBalanceHint,
+    std::set<ShardId>* usedShards) {
     auto routingInfoStatus =
         Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx, nss);
     if (!routingInfoStatus.isOK()) {
@@ -470,7 +467,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::_getMigrateCandi
         }
     }
 
-    return BalancerPolicy::balance(shardStats, distribution, aggressiveBalanceHint);
+    return BalancerPolicy::balance(shardStats, distribution, aggressiveBalanceHint, usedShards);
 }
 
 }  // namespace mongo

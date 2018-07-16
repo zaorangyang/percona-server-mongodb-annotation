@@ -134,6 +134,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/storage/mmap_v1/storage_mmapv1',
     ],
+    LIBDEPS_PRIVATE=[
+        'fsync_locked',
+    ]
 )
 
 env.Library(
@@ -145,6 +148,15 @@ env.Library(
         'core',
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/dbdirectclient',
+    ],
+)
+
+env.Library(
+    target='fsync_locked',
+    source=[
+        'fsync_locked.cpp',
+    ],
+    LIBDEPS=[
     ],
 )
 
@@ -195,6 +207,7 @@ env.Library(
         "rename_collection_cmd.cpp",
         "repair_cursor.cpp",
         "resize_oplog.cpp",
+        "restart_catalog_command.cpp",
         "run_aggregate.cpp",
         "set_feature_compatibility_version_command.cpp",
         "snapshot_management.cpp",
@@ -211,9 +224,11 @@ env.Library(
         '$BUILD_DIR/mongo/db/auth/authmongod',
         '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
+        '$BUILD_DIR/mongo/db/catalog/catalog_impl',
         '$BUILD_DIR/mongo/db/catalog/collection',
         '$BUILD_DIR/mongo/db/catalog/index_key_validate',
         '$BUILD_DIR/mongo/db/cloner',
+        '$BUILD_DIR/mongo/db/command_can_run_here',
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/exec/stagedebug_cmd',
         '$BUILD_DIR/mongo/db/index/index_access_method',
@@ -225,18 +240,17 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/dbcheck',
         '$BUILD_DIR/mongo/db/repl/isself',
         '$BUILD_DIR/mongo/db/repl/oplog',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_impl',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/rw_concern_d',
+        '$BUILD_DIR/mongo/db/s/sharding_catalog_manager',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/stats/serveronly_stats',
-        '$BUILD_DIR/mongo/db/storage/mmap_v1/storage_mmapv1',
         '$BUILD_DIR/mongo/db/views/views_mongod',
-        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_manager',
         '$BUILD_DIR/mongo/s/client/parallel',
         'core',
         'current_op_common',
         'dcommands_fcv',
-        'dcommands_fsync',
+        'fsync_locked',
         'killcursors_common',
         'write_commands_common',
     ],
@@ -301,6 +315,7 @@ env.CppUnitTest(
         "$BUILD_DIR/mongo/db/query/query_planner",
         "$BUILD_DIR/mongo/db/query/query_test_service_context",
         "$BUILD_DIR/mongo/db/serveronly",
+        "$BUILD_DIR/mongo/db/service_context_d",
         "dcommands",
     ],
 )
@@ -312,6 +327,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/serveronly",
+        "$BUILD_DIR/mongo/db/service_context_d",
         "dcommands",
     ],
 )
@@ -325,6 +341,7 @@ env.CppUnitTest(
         "$BUILD_DIR/mongo/db/query/query_planner",
         "$BUILD_DIR/mongo/db/query/query_test_service_context",
         "$BUILD_DIR/mongo/db/serveronly",
+        "$BUILD_DIR/mongo/db/service_context_d",
         "dcommands",
     ],
 )

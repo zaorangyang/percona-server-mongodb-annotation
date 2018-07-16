@@ -179,8 +179,9 @@ rpc::UniqueReply DBClientBase::parseCommandReplyMessage(const std::string& host,
         uassertStatusOK(_metadataReader(opCtx, commandReply->getMetadata(), host));
     }
 
-    if (ErrorCodes::StaleConfig == getStatusFromCommandResult(commandReply->getCommandReply())) {
-        throw StaleConfigException("stale config in runCommand", commandReply->getCommandReply());
+    auto status = getStatusFromCommandResult(commandReply->getCommandReply());
+    if (status == ErrorCodes::StaleConfig) {
+        uassertStatusOK(status.withContext("stale config in runCommand"));
     }
 
     return rpc::UniqueReply(replyMsg, std::move(commandReply));
@@ -683,7 +684,7 @@ void DBClientBase::findN(vector<BSONObj>& out,
     if (c->hasResultFlag(ResultFlag_ShardConfigStale)) {
         BSONObj error;
         c->peekError(&error);
-        throw StaleConfigException("findN stale config", error);
+        uasserted(StaleConfigInfo(error), "findN stale config");
     }
 
     for (int i = 0; i < nToReturn; i++) {
@@ -731,9 +732,10 @@ std::pair<BSONObj, NamespaceString> DBClientBase::findOneByUUID(const std::strin
         }
         return {results.front(), resNss};
     }
-    uasserted(
-        40586,
-        str::stream() << "find command using UUID failed. Command: " << cmd << " Result: " << res);
+
+    uassertStatusOKWithContext(getStatusFromCommandResult(res),
+                               str::stream() << "find command using UUID failed. Command: " << cmd);
+    MONGO_UNREACHABLE;
 }
 
 namespace {
@@ -1036,7 +1038,7 @@ void DBClientConnection::_checkConnection() {
         return;
 
     if (!autoReconnect)
-        throw SocketException(SocketException::FAILED_STATE, toString());
+        throwSocketError(SocketErrorKind::FAILED_STATE, toString());
 
     // Don't hammer reconnects, backoff if needed
     autoReconnectBackoff.nextSleepMillis();
@@ -1051,7 +1053,7 @@ void DBClientConnection::_checkConnection() {
         if (connectStatus == ErrorCodes::IncompatibleCatalogManager) {
             uassertStatusOK(connectStatus);  // Will always throw
         } else {
-            throw SocketException(SocketException::CONNECT_ERROR, connectStatus.reason());
+            throwSocketError(SocketErrorKind::CONNECT_ERROR, connectStatus.reason());
         }
     }
 
@@ -1376,8 +1378,9 @@ void DBClientConnection::say(Message& toSend, bool isRetry, string* actualServer
         auto swm = _compressorManager.compressMessage(toSend);
         uassertStatusOK(swm.getStatus());
         port().say(swm.getValue());
-    } catch (SocketException&) {
+    } catch (const DBException&) {
         _failed = true;
+        _port->shutdown();
         throw;
     }
 }
@@ -1441,21 +1444,7 @@ bool DBClientConnection::call(Message& toSend,
 }
 
 BSONElement getErrField(const BSONObj& o) {
-    BSONElement first = o.firstElement();
-    if (strcmp(first.fieldName(), "$err") == 0)
-        return first;
-
-    // temp - will be DEV only later
-    /*DEV*/
-    if (1) {
-        BSONElement e = o["$err"];
-        if (!e.eoo()) {
-            wassert(false);
-        }
-        return e;
-    }
-
-    return BSONElement();
+    return o["$err"];
 }
 
 bool hasErrField(const BSONObj& o) {

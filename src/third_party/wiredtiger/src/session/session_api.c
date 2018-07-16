@@ -109,6 +109,37 @@ __wt_session_release_resources(WT_SESSION_IMPL *session)
 }
 
 /*
+ * __session_clear_commit_queue --
+ *	We're about to clear the session and overwrite the txn structure.
+ *	Remove ourselves from the commit timestamp queue if we're on it.
+ */
+static void
+__session_clear_commit_queue(WT_SESSION_IMPL *session)
+{
+	WT_TXN *txn;
+	WT_TXN_GLOBAL *txn_global;
+
+	txn = &session->txn;
+	txn_global = &S2C(session)->txn_global;
+
+	if (!txn->clear_ts_queue)
+		return;
+
+	__wt_writelock(session, &txn_global->commit_timestamp_rwlock);
+	/*
+	 * Recheck after acquiring the lock.
+	 */
+	if (txn->clear_ts_queue) {
+		TAILQ_REMOVE(
+		    &txn_global->commit_timestamph, txn, commit_timestampq);
+		--txn_global->commit_timestampq_len;
+		txn->clear_ts_queue = false;
+	}
+	__wt_writeunlock(session, &txn_global->commit_timestamp_rwlock);
+
+}
+
+/*
  * __session_clear --
  *	Clear a session structure.
  */
@@ -127,6 +158,7 @@ __session_clear(WT_SESSION_IMPL *session)
 	 *
 	 * For these reasons, be careful when clearing the session structure.
 	 */
+	__session_clear_commit_queue(session);
 	memset(session, 0, WT_SESSION_CLEAR_SIZE);
 
 	WT_INIT_LSN(&session->bg_sync_lsn);
@@ -1467,7 +1499,9 @@ __session_commit_transaction(WT_SESSION *wt_session, const char *config)
 	txn = &session->txn;
 	if (F_ISSET(txn, WT_TXN_ERROR) && txn->mod_count != 0)
 		WT_ERR_MSG(session, EINVAL,
-		    "failed transaction requires rollback");
+		    "failed transaction requires rollback%s%s",
+		    txn->rollback_reason == NULL ? "" : ": ",
+		    txn->rollback_reason == NULL ? "" : txn->rollback_reason);
 
 	if (ret == 0)
 		ret = __wt_txn_commit(session, cfg);
@@ -1477,6 +1511,31 @@ __session_commit_transaction(WT_SESSION *wt_session, const char *config)
 	}
 
 err:	API_END_RET(session, ret);
+}
+
+/*
+ * __session_prepare_transaction --
+ *	WT_SESSION->prepare_transaction method.
+ */
+static int
+__session_prepare_transaction(WT_SESSION *wt_session, const char *config)
+{
+	WT_DECL_RET;
+	WT_SESSION_IMPL *session;
+
+	session = (WT_SESSION_IMPL *)wt_session;
+	SESSION_API_CALL(session, prepare_transaction, config, cfg);
+
+	WT_ERR(__wt_txn_context_check(session, true));
+
+	WT_TRET(__wt_txn_prepare(session, cfg));
+
+	/*
+	 * Below code to be corrected as part of prepare functionality
+	 * implementation, coded as below to avoid setting error to transaction.
+	 */
+
+err:	API_END_RET_NO_TXN_ERROR(session, ret);
 }
 
 /*
@@ -1628,14 +1687,14 @@ __session_transaction_sync(WT_SESSION *wt_session, const char *config)
 	 * Keep checking the LSNs until we find it is stable or we reach
 	 * our timeout, or there's some other reason to quit.
 	 */
-	time_start = __wt_rdtsc(session);
+	time_start = __wt_clock(session);
 	while (__wt_log_cmp(&session->bg_sync_lsn, &log->sync_lsn) > 0) {
 		if (!__transaction_sync_run_chk(session))
 			WT_ERR(ETIMEDOUT);
 
 		__wt_cond_signal(session, conn->log_file_cond);
-		time_stop = __wt_rdtsc(session);
-		waited_ms = WT_TSCDIFF_MS(time_stop, time_start);
+		time_stop = __wt_clock(session);
+		waited_ms = WT_CLOCKDIFF_MS(time_stop, time_start);
 		if (waited_ms < timeout_ms) {
 			remaining_usec = (timeout_ms - waited_ms) * WT_THOUSAND;
 			__wt_cond_wait(session, log->log_sync_cond,
@@ -1823,6 +1882,7 @@ __open_session(WT_CONNECTION_IMPL *conn,
 		__session_verify,
 		__session_begin_transaction,
 		__session_commit_transaction,
+		__session_prepare_transaction,
 		__session_rollback_transaction,
 		__session_timestamp_transaction,
 		__session_checkpoint,
@@ -1853,6 +1913,7 @@ __open_session(WT_CONNECTION_IMPL *conn,
 		__session_verify,
 		__session_begin_transaction,
 		__session_commit_transaction,
+		__session_prepare_transaction,
 		__session_rollback_transaction,
 		__session_timestamp_transaction,
 		__session_checkpoint_readonly,

@@ -89,8 +89,8 @@ public:
         return false;
     }
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool maintenanceOk() const override {
@@ -101,17 +101,19 @@ public:
         return false;
     }
 
-    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const final {
         // Uses the readConcern setting from whatever created the cursor.
-        return false;
+        return level == repl::ReadConcernLevel::kLocalReadConcern;
     }
 
     ReadWriteType getReadWriteType() const {
         return ReadWriteType::kRead;
     }
 
-    void help(std::stringstream& help) const override {
-        help << "retrieve more results from an existing cursor";
+    std::string help() const override {
+        return "retrieve more results from an existing cursor";
     }
 
     LogicalOp getLogicalOp() const override {
@@ -138,7 +140,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         StatusWith<GetMoreRequest> parseStatus = GetMoreRequest::parseFromBSON(dbname, cmdObj);
         if (!parseStatus.isOK()) {
             return parseStatus.getStatus();
@@ -164,7 +166,7 @@ public:
             Status status = replCoord->updateTerm(opCtx, *request.term);
             // Note: updateTerm returns ok if term stayed the same.
             if (!status.isOK()) {
-                return appendCommandStatus(result, status);
+                return CommandHelpers::appendCommandStatus(result, status);
             }
         }
 
@@ -211,16 +213,17 @@ public:
 
             Collection* collection = readLock->getCollection();
             if (!collection) {
-                return appendCommandStatus(result,
-                                           Status(ErrorCodes::OperationFailed,
-                                                  "collection dropped between getMore calls"));
+                return CommandHelpers::appendCommandStatus(
+                    result,
+                    Status(ErrorCodes::OperationFailed,
+                           "collection dropped between getMore calls"));
             }
             cursorManager = collection->getCursorManager();
         }
 
         auto ccPin = cursorManager->pinCursor(opCtx, request.cursorid);
         if (!ccPin.isOK()) {
-            return appendCommandStatus(result, ccPin.getStatus());
+            return CommandHelpers::appendCommandStatus(result, ccPin.getStatus());
         }
 
         ClientCursor* cursor = ccPin.getValue().getCursor();
@@ -241,7 +244,7 @@ public:
         // authenticated in order to run getMore on the cursor.
         if (!AuthorizationSession::get(opCtx->getClient())
                  ->isCoauthorizedWith(cursor->getAuthenticatedUsers())) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::Unauthorized,
                        str::stream() << "cursor id " << request.cursorid
@@ -249,7 +252,7 @@ public:
         }
 
         if (request.nss != cursor->nss()) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::Unauthorized,
                        str::stream() << "Requested getMore on namespace '" << request.nss.ns()
@@ -258,7 +261,7 @@ public:
         }
 
         if (request.nss.isOplog() && MONGO_FAIL_POINT(rsStopGetMoreCmd)) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::CommandFailed,
                        str::stream() << "getMore on " << request.nss.ns()
@@ -273,7 +276,7 @@ public:
         if (request.awaitDataTimeout && !cursor->isAwaitData()) {
             Status status(ErrorCodes::BadValue,
                           "cannot set maxTimeMS on getMore command for a non-awaitData cursor");
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         // On early return, get rid of the cursor.
@@ -343,7 +346,7 @@ public:
 
         Status batchStatus = generateBatch(opCtx, cursor, request, &nextBatch, &state, &numResults);
         if (!batchStatus.isOK()) {
-            return appendCommandStatus(result, batchStatus);
+            return CommandHelpers::appendCommandStatus(result, batchStatus);
         }
 
         PlanSummaryStats postExecutionStats;
@@ -397,7 +400,7 @@ public:
 
         StatusWith<GetMoreRequest> parsedRequest = GetMoreRequest::parseFromBSON(dbname, cmdObj);
         if (!parsedRequest.isOK()) {
-            return appendCommandStatus(result, parsedRequest.getStatus());
+            return CommandHelpers::appendCommandStatus(result, parsedRequest.getStatus());
         }
         auto request = parsedRequest.getValue();
         return runParsed(opCtx, request.nss, request, cmdObj, result);

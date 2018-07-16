@@ -94,10 +94,20 @@ void serializeReply(OperationContext* opCtx,
                     ReplyStyle replyStyle,
                     bool continueOnError,
                     size_t opsInBatch,
-                    const WriteResult& result,
+                    WriteResult result,
                     BSONObjBuilder* out) {
     if (shouldSkipOutput(opCtx))
         return;
+
+    if (continueOnError && !result.results.empty() &&
+        result.results.back() == ErrorCodes::StaleConfig) {
+        // For ordered:false commands we need to duplicate the StaleConfig result for all ops
+        // after we stopped. See handleError() in write_ops_exec.cpp for more info.
+        auto err = result.results.back();
+        while (result.results.size() < opsInBatch) {
+            result.results.emplace_back(err);
+        }
+    }
 
     long long n = 0;
     long long nModified = 0;
@@ -137,27 +147,17 @@ void serializeReply(OperationContext* opCtx,
         const auto& status = result.results[i].getStatus();
         BSONObjBuilder error(errorsSizeTracker);
         error.append("index", int(i));
-        error.append("code", int(status.code()));
-        error.append("errmsg", errorMessage(status.reason()));
-        errors.push_back(error.obj());
-    }
-
-    if (result.staleConfigException) {
-        // For ordered:false commands we need to duplicate the StaleConfig result for all ops
-        // after we stopped. result.results doesn't include the staleConfigException.
-        // See the comment on WriteResult::staleConfigException for more info.
-        int endIndex = continueOnError ? opsInBatch : result.results.size() + 1;
-        for (int i = result.results.size(); i < endIndex; i++) {
-            BSONObjBuilder error(errorsSizeTracker);
-            error.append("index", i);
+        if (auto staleInfo = status.extraInfo<StaleConfigInfo>()) {
             error.append("code", int(ErrorCodes::StaleShardVersion));  // Different from exception!
-            error.append("errmsg", errorMessage(result.staleConfigException->reason()));
             {
                 BSONObjBuilder errInfo(error.subobjStart("errInfo"));
-                result.staleConfigException->getVersionWanted().addToBSON(errInfo, "vWanted");
+                staleInfo->getVersionWanted().addToBSON(errInfo, "vWanted");
             }
-            errors.push_back(error.obj());
+        } else {
+            error.append("code", int(status.code()));
         }
+        error.append("errmsg", errorMessage(status.reason()));
+        errors.push_back(error.obj());
     }
 
     out->appendNumber("n", n);
@@ -198,12 +198,19 @@ class WriteCommand : public Command {
 public:
     explicit WriteCommand(StringData name) : Command(name) {}
 
-    bool slaveOk() const final {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const final {
+        return AllowedOnSecondary::kNever;
     }
 
     bool shouldAffectCommandCounter() const final {
         return false;
+    }
+
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const final {
+        return level == repl::ReadConcernLevel::kLocalReadConcern ||
+            level == repl::ReadConcernLevel::kSnapshotReadConcern;
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const {
@@ -235,15 +242,15 @@ class CmdInsert final : public WriteCommand {
 public:
     CmdInsert() : WriteCommand("insert") {}
 
-    void redactForLogging(mutablebson::Document* cmdObj) final {
+    void redactForLogging(mutablebson::Document* cmdObj) const final {
         redactTooLongLog(cmdObj, "documents");
     }
 
-    void help(std::stringstream& help) const final {
-        help << "insert documents";
+    std::string help() const final {
+        return "insert documents";
     }
 
-    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) final {
+    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) const final {
         return checkAuthForWriteCommand(
             opCtx->getClient(), BatchedCommandRequest::BatchType_Insert, request);
     }
@@ -252,12 +259,12 @@ public:
                  const OpMsgRequest& request,
                  BSONObjBuilder& result) final {
         const auto batch = InsertOp::parse(request);
-        const auto reply = performInserts(opCtx, batch);
+        auto reply = performInserts(opCtx, batch);
         serializeReply(opCtx,
                        ReplyStyle::kNotUpdate,
                        !batch.getWriteCommandBase().getOrdered(),
                        batch.getDocuments().size(),
-                       reply,
+                       std::move(reply),
                        &result);
     }
 } cmdInsert;
@@ -266,15 +273,15 @@ class CmdUpdate final : public WriteCommand {
 public:
     CmdUpdate() : WriteCommand("update") {}
 
-    void redactForLogging(mutablebson::Document* cmdObj) final {
+    void redactForLogging(mutablebson::Document* cmdObj) const final {
         redactTooLongLog(cmdObj, "updates");
     }
 
-    void help(std::stringstream& help) const final {
-        help << "update documents";
+    std::string help() const final {
+        return "update documents";
     }
 
-    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) final {
+    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) const final {
         return checkAuthForWriteCommand(
             opCtx->getClient(), BatchedCommandRequest::BatchType_Update, request);
     }
@@ -283,12 +290,12 @@ public:
                  const OpMsgRequest& request,
                  BSONObjBuilder& result) final {
         const auto batch = UpdateOp::parse(request);
-        const auto reply = performUpdates(opCtx, batch);
+        auto reply = performUpdates(opCtx, batch);
         serializeReply(opCtx,
                        ReplyStyle::kUpdate,
                        !batch.getWriteCommandBase().getOrdered(),
                        batch.getUpdates().size(),
-                       reply,
+                       std::move(reply),
                        &result);
     }
 
@@ -333,15 +340,15 @@ class CmdDelete final : public WriteCommand {
 public:
     CmdDelete() : WriteCommand("delete") {}
 
-    void redactForLogging(mutablebson::Document* cmdObj) final {
+    void redactForLogging(mutablebson::Document* cmdObj) const final {
         redactTooLongLog(cmdObj, "deletes");
     }
 
-    void help(std::stringstream& help) const final {
-        help << "delete documents";
+    std::string help() const final {
+        return "delete documents";
     }
 
-    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) final {
+    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) const final {
         return checkAuthForWriteCommand(
             opCtx->getClient(), BatchedCommandRequest::BatchType_Delete, request);
     }
@@ -350,12 +357,12 @@ public:
                  const OpMsgRequest& request,
                  BSONObjBuilder& result) final {
         const auto batch = DeleteOp::parse(request);
-        const auto reply = performDeletes(opCtx, batch);
+        auto reply = performDeletes(opCtx, batch);
         serializeReply(opCtx,
                        ReplyStyle::kNotUpdate,
                        !batch.getWriteCommandBase().getOrdered(),
                        batch.getDeletes().size(),
-                       reply,
+                       std::move(reply),
                        &result);
     }
 

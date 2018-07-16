@@ -70,7 +70,7 @@ Status SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext
     DBDirectClient client(opCtx);
     BSONObj info;
     if (!client.runCommand(
-            "admin", Command::appendMajorityWriteConcern(shardCollection.toBSON()), info)) {
+            "admin", CommandHelpers::appendMajorityWriteConcern(shardCollection.toBSON()), info)) {
         return getStatusFromCommandResult(info);
     }
 
@@ -78,14 +78,17 @@ Status SessionsCollectionConfigServer::_shardCollectionIfNeeded(OperationContext
 }
 
 Status SessionsCollectionConfigServer::_generateIndexesIfNeeded(OperationContext* opCtx) {
-    auto res =
+    try {
         scatterGatherOnlyVersionIfUnsharded(opCtx,
                                             SessionsCollection::kSessionsDb.toString(),
                                             NamespaceString(SessionsCollection::kSessionsFullNS),
                                             SessionsCollection::generateCreateIndexesCmd(),
                                             ReadPreferenceSetting::get(opCtx),
                                             Shard::RetryPolicy::kNoRetry);
-    return res.getStatus();
+        return Status::OK();
+    } catch (const DBException& ex) {
+        return ex.toStatus();
+    }
 }
 
 Status SessionsCollectionConfigServer::setupSessionsCollection(OperationContext* opCtx) {

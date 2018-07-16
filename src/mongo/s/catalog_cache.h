@@ -30,9 +30,11 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/string_data.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/chunk_manager.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/database_version_gen.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/notification.h"
@@ -41,6 +43,7 @@
 
 namespace mongo {
 
+class BSONObjBuilder;
 class CachedDatabaseInfo;
 class CachedCollectionRoutingInfo;
 class OperationContext;
@@ -70,11 +73,27 @@ public:
     StatusWith<CachedDatabaseInfo> getDatabase(OperationContext* opCtx, StringData dbName);
 
     /**
-     * Blocking shortcut method to get a specific sharded collection from a given database using the
-     * complete namespace. If the collection is sharded returns a ScopedChunkManager initialized
-     * with ChunkManager. If the collection is not sharded, returns a ScopedChunkManager initialized
-     * with the primary shard for the specified database. If an error occurs loading the metadata
-     * returns a failed status.
+     * Blocking method to get the routing information for a specific collection at a given cluster
+     * time.
+     *
+     * If the collection is sharded, returns routing info initialized with a ChunkManager. If the
+     * collection is not sharded, returns routing info initialized with the primary shard for the
+     * specified database. If an error occurs while loading the metadata, returns a failed status.
+     *
+     * If the given atClusterTime is so far in the past that it is not possible to construct routing
+     * info, returns a StaleClusterTime error.
+     */
+    StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoAt(OperationContext* opCtx,
+                                                                       const NamespaceString& nss,
+                                                                       Timestamp atClusterTime);
+
+    /**
+     * Same as the getCollectionRoutingInfoAt call above, but returns the latest known routing
+     * information for the specified namespace.
+     *
+     * While this method may fail under the same circumstances as getCollectionRoutingInfoAt, it is
+     * guaranteed to never return StaleClusterTime, because the latest routing information should
+     * always be available.
      */
     StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfo(OperationContext* opCtx,
                                                                      const NamespaceString& nss);
@@ -118,6 +137,11 @@ public:
      */
     void purgeAllDatabases();
 
+    /**
+     * Reports statistics about the catalog cache to be used by serverStatus
+     */
+    void report(BSONObjBuilder* builder) const;
+
 private:
     // Make the cache entries friends so they can access the private classes below
     friend class CachedDatabaseInfo;
@@ -148,6 +172,9 @@ private:
         bool shardingEnabled;
 
         StringMap<CollectionRoutingInfoEntry> collections;
+
+        // Optional while featureCompatibilityVersion 3.6 is supported.
+        boost::optional<DatabaseVersion> databaseVersion;
     };
 
     using DatabaseInfoMap = StringMap<std::shared_ptr<DatabaseInfoEntry>>;
@@ -171,8 +198,42 @@ private:
     // Interface from which chunks will be retrieved
     CatalogCacheLoader& _cacheLoader;
 
+    // Encapsulates runtime statistics across all collections in the catalog cache
+    struct Stats {
+        // Counts how many times threads hit stale config exception (which is what triggers metadata
+        // refreshes)
+        AtomicInt64 countStaleConfigErrors{0};
+
+        // Cumulative, always-increasing counter of how much time threads waiting for refresh
+        // combined
+        AtomicInt64 totalRefreshWaitTimeMicros{0};
+
+        // Tracks how many incremental refreshes are waiting to complete currently
+        AtomicInt64 numActiveIncrementalRefreshes{0};
+
+        // Cumulative, always-increasing counter of how many incremental refreshes have been kicked
+        // off
+        AtomicInt64 countIncrementalRefreshesStarted{0};
+
+        // Tracks how many full refreshes are waiting to complete currently
+        AtomicInt64 numActiveFullRefreshes{0};
+
+        // Cumulative, always-increasing counter of how many full refreshes have been kicked off
+        AtomicInt64 countFullRefreshesStarted{0};
+
+        // Cumulative, always-increasing counter of how many full or incremental refreshes failed
+        // for whatever reason
+        AtomicInt64 countFailedRefreshes{0};
+
+        /**
+         * Reports the accumulated statistics for serverStatus.
+         */
+        void report(BSONObjBuilder* builder) const;
+
+    } _stats;
+
     // Mutex to serialize access to the structures below
-    stdx::mutex _mutex;
+    mutable stdx::mutex _mutex;
 
     // Map from DB name to the info for that database
     DatabaseInfoMap _databases;
@@ -187,6 +248,8 @@ public:
     const ShardId& primaryId() const;
 
     bool shardingEnabled() const;
+
+    boost::optional<DatabaseVersion> databaseVersion() const;
 
 private:
     friend class CatalogCache;

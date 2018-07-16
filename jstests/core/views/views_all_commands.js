@@ -69,6 +69,7 @@
         _configsvrCommitChunkMerge: {skip: isAnInternalCommand},
         _configsvrCommitChunkMigration: {skip: isAnInternalCommand},
         _configsvrCommitChunkSplit: {skip: isAnInternalCommand},
+        _configsvrCreateCollection: {skip: isAnInternalCommand},
         _configsvrCreateDatabase: {skip: isAnInternalCommand},
         _configsvrDropCollection: {skip: isAnInternalCommand},
         _configsvrDropDatabase: {skip: isAnInternalCommand},
@@ -78,7 +79,6 @@
         _configsvrRemoveShard: {skip: isAnInternalCommand},
         _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
         _configsvrShardCollection: {skip: isAnInternalCommand},
-        _configsvrSetFeatureCompatibilityVersion: {skip: isAnInternalCommand},
         _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
         _flushRoutingTableCacheUpdates: {skip: isUnrelated},
         _getNextSessionMods: {skip: isAnInternalCommand},
@@ -188,6 +188,8 @@
         doTxn: {
             command: {doTxn: [{op: "i", o: {_id: 1}, ns: "test.view"}]},
             expectFailure: true,
+            expectedErrorCode:
+                [ErrorCodes.CommandNotSupportedOnView, ErrorCodes.CommandNotSupported],
             skipSharded: true,
         },
         driverOIDTest: {skip: isUnrelated},
@@ -223,7 +225,6 @@
             expectFailure: true
         },
         flushRouterConfig: {skip: isUnrelated},
-        forceerror: {skip: isUnrelated},
         fsync: {skip: isUnrelated},
         fsyncUnlock: {skip: isUnrelated},
         geoNear: {
@@ -310,14 +311,19 @@
             },
             command: function(conn) {
                 // First get and check a partial result for an aggregate command.
-                let aggCmd = {aggregate: "view", pipeline: [], cursor: {batchSize: 2}};
+                let aggCmd = {
+                    aggregate: "view",
+                    pipeline: [{$sort: {_id: 1}}],
+                    cursor: {batchSize: 2}
+                };
                 let res = conn.runCommand(aggCmd);
                 assert.commandWorked(res, aggCmd);
                 let cursor = res.cursor;
                 assert.eq(
                     cursor.ns, "test.view", "expected view namespace in cursor: " + tojson(cursor));
                 let expectedFirstBatch = [{_id: 1}, {_id: 2}];
-                assert.eq(cursor.firstBatch, expectedFirstBatch, "find returned wrong firstBatch");
+                assert.eq(
+                    cursor.firstBatch, expectedFirstBatch, "aggregate returned wrong firstBatch");
 
                 // Then check correct execution of the killCursors command.
                 let killCursorsCmd = {killCursors: "view", cursors: [cursor.id]};
@@ -386,6 +392,7 @@
         reapLogicalSessionCacheNow: {skip: isAnInternalCommand},
         refreshSessions: {skip: isUnrelated},
         refreshSessionsInternal: {skip: isAnInternalCommand},
+        restartCatalog: {skip: isAnInternalCommand},
         reIndex: {command: {reIndex: "view"}, expectFailure: true},
         removeShard: {skip: isUnrelated},
         removeShardFromZone: {skip: isUnrelated},

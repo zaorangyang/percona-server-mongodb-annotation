@@ -56,14 +56,14 @@ class ClusterMergeChunksCommand : public ErrmsgCommandDeprecated {
 public:
     ClusterMergeChunksCommand() : ErrmsgCommandDeprecated("mergeChunks") {}
 
-    void help(std::stringstream& h) const override {
-        h << "Merge Chunks command\n"
-          << "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ] }";
+    std::string help() const override {
+        return "Merge Chunks command\n"
+               "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ] }";
     }
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                 ActionType::splitChunk)) {
@@ -73,15 +73,15 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
     }
 
     bool adminOnly() const override {
         return true;
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -167,7 +167,7 @@ public:
         const auto shardStatus =
             Grid::get(opCtx)->shardRegistry()->getShard(opCtx, firstChunk->getShardId());
         if (!shardStatus.isOK()) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::ShardNotFound,
                        str::stream() << "Can't find shard for chunk: " << firstChunk->toString()));
@@ -179,7 +179,7 @@ public:
 
         Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(routingInfo));
 
-        filterCommandReplyForPassthrough(remoteResult, &result);
+        CommandHelpers::filterCommandReplyForPassthrough(remoteResult, &result);
         return ok;
     }
 

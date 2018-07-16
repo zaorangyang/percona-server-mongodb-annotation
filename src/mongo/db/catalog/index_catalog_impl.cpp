@@ -458,7 +458,7 @@ void IndexCatalogImpl::IndexBuildBlock::success() {
         // collection. This means that any snapshot created after this must include the full index,
         // and no one can try to read this index before we set the visibility.
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        auto snapshotName = replCoord->reserveSnapshotName(opCtx);
+        auto snapshotName = replCoord->getMinimumVisibleSnapshot(opCtx);
         entry->setMinimumVisibleSnapshot(snapshotName);
 
         // TODO remove this once SERVER-20439 is implemented. It is a stopgap solution for
@@ -711,7 +711,7 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
     } else {
         // for non _id indexes, we check to see if replication has turned off all indexes
         // we _always_ created _id index
-        if (!repl::getGlobalReplicationCoordinator()->buildsIndexes()) {
+        if (!repl::ReplicationCoordinator::get(opCtx)->buildsIndexes()) {
             // this is not exactly the right error code, but I think will make the most sense
             return Status(ErrorCodes::IndexAlreadyExists, "no indexes per repl");
         }
@@ -962,7 +962,7 @@ public:
     void commit() final {
         // Ban reading from this collection on committed reads on snapshots before now.
         auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
-        auto snapshotName = replCoord->reserveSnapshotName(_opCtx);
+        auto snapshotName = replCoord->getMinimumVisibleSnapshot(_opCtx);
         _collection->setMinimumVisibleSnapshot(snapshotName);
 
         delete _entry;

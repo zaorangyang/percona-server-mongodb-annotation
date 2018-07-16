@@ -44,8 +44,8 @@ class DBStatsCmd : public ErrmsgCommandDeprecated {
 public:
     DBStatsCmd() : ErrmsgCommandDeprecated("dbStats", "dbstats") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     bool adminOnly() const override {
         return false;
@@ -53,7 +53,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::dbStats);
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
@@ -68,13 +68,13 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& output) override {
-        auto shardResponses = uassertStatusOK(
-            scatterGatherUnversionedTargetAllShards(opCtx,
-                                                    dbName,
-                                                    boost::none,
-                                                    filterCommandRequestForPassthrough(cmdObj),
-                                                    ReadPreferenceSetting::get(opCtx),
-                                                    Shard::RetryPolicy::kIdempotent));
+        auto shardResponses = scatterGatherUnversionedTargetAllShards(
+            opCtx,
+            dbName,
+            boost::none,
+            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+            ReadPreferenceSetting::get(opCtx),
+            Shard::RetryPolicy::kIdempotent);
         if (!appendRawResponses(opCtx, &errmsg, &output, shardResponses)) {
             return false;
         }

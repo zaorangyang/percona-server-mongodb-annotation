@@ -53,7 +53,6 @@
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/async_requests_sender.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
@@ -62,6 +61,7 @@
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/store_possible_cursor.h"
+#include "mongo/s/request_types/create_collection_gen.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/log.h"
@@ -90,25 +90,25 @@ bool cursorCommandPassthrough(OperationContext* opCtx,
                               BSONObjBuilder* out) {
     const auto shardStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId);
     if (!shardStatus.isOK()) {
-        return Command::appendCommandStatus(*out, shardStatus.getStatus());
+        return CommandHelpers::appendCommandStatus(*out, shardStatus.getStatus());
     }
     const auto shard = shardStatus.getValue();
     ScopedDbConnection conn(shard->getConnString());
     auto cursor = conn->query(str::stream() << dbName << ".$cmd",
-                              Command::filterCommandRequestForPassthrough(cmdObj),
+                              CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
                               /* nToReturn=*/-1);
     if (!cursor || !cursor->more()) {
-        return Command::appendCommandStatus(
+        return CommandHelpers::appendCommandStatus(
             *out, {ErrorCodes::OperationFailed, "failed to read command response from shard"});
     }
     BSONObj response = cursor->nextSafe().getOwned();
     conn.done();
     Status status = getStatusFromCommandResult(response);
     if (ErrorCodes::StaleConfig == status) {
-        throw StaleConfigException("command failed because of stale config", response);
+        uassertStatusOK(status.withContext("command failed because of stale config"));
     }
     if (!status.isOK()) {
-        return Command::appendCommandStatus(*out, status);
+        return CommandHelpers::appendCommandStatus(*out, status);
     }
 
     StatusWith<BSONObj> transformedResponse =
@@ -120,9 +120,9 @@ bool cursorCommandPassthrough(OperationContext* opCtx,
                             Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
                             Grid::get(opCtx)->getCursorManager());
     if (!transformedResponse.isOK()) {
-        return Command::appendCommandStatus(*out, transformedResponse.getStatus());
+        return CommandHelpers::appendCommandStatus(*out, transformedResponse.getStatus());
     }
-    Command::filterCommandReplyForPassthrough(transformedResponse.getValue(), out);
+    CommandHelpers::filterCommandReplyForPassthrough(transformedResponse.getValue(), out);
 
     return true;
 }
@@ -151,8 +151,8 @@ class PublicGridCommand : public BasicCommand {
 protected:
     PublicGridCommand(const char* n, const char* oldname = NULL) : BasicCommand(n, oldname) {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     virtual bool adminOnly() const {
@@ -177,7 +177,8 @@ protected:
         ShardConnection conn(shard->getConnString(), "");
 
         BSONObj res;
-        bool ok = conn->runCommand(db, filterCommandRequestForPassthrough(cmdObj), res);
+        bool ok =
+            conn->runCommand(db, CommandHelpers::filterCommandRequestForPassthrough(cmdObj), res);
         conn.done();
 
         // First append the properly constructed writeConcernError. It will then be skipped
@@ -185,7 +186,7 @@ protected:
         if (auto wcErrorElem = res["writeConcernError"]) {
             appendWriteConcernErrorToCmdResponse(shard->getId(), wcErrorElem, result);
         }
-        result.appendElementsUnique(filterCommandReplyForPassthrough(res));
+        result.appendElementsUnique(CommandHelpers::filterCommandReplyForPassthrough(res));
         return ok;
     }
 };
@@ -212,7 +213,7 @@ protected:
 
         // Here, we first filter the command before appending an UNSHARDED shardVersion, because
         // "shardVersion" is one of the fields that gets filtered out.
-        BSONObj filteredCmdObj(Command::filterCommandRequestForPassthrough(cmdObj));
+        BSONObj filteredCmdObj(CommandHelpers::filterCommandRequestForPassthrough(cmdObj));
         BSONObj filteredCmdObjWithVersion(
             appendShardVersion(filteredCmdObj, ChunkVersion::UNSHARDED()));
 
@@ -234,7 +235,7 @@ protected:
                 primaryShardId, commandResponse.response["writeConcernError"], result);
         }
         result.appendElementsUnique(
-            filterCommandReplyForPassthrough(std::move(commandResponse.response)));
+            CommandHelpers::filterCommandReplyForPassthrough(std::move(commandResponse.response)));
 
         return true;
     }
@@ -246,8 +247,8 @@ class DropIndexesCmd : public ErrmsgCommandDeprecated {
 public:
     DropIndexesCmd() : ErrmsgCommandDeprecated("dropIndexes", "deleteIndexes") {}
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -256,7 +257,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::dropIndex);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -271,18 +272,28 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& output) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         LOG(1) << "dropIndexes: " << nss << " cmd:" << redact(cmdObj);
 
-        auto shardResponses = uassertStatusOK(
-            scatterGatherOnlyVersionIfUnsharded(opCtx,
-                                                dbName,
-                                                nss,
-                                                filterCommandRequestForPassthrough(cmdObj),
-                                                ReadPreferenceSetting::get(opCtx),
-                                                Shard::RetryPolicy::kNotIdempotent));
-        return appendRawResponses(
-            opCtx, &errmsg, &output, std::move(shardResponses), {ErrorCodes::NamespaceNotFound});
+        // If the collection is sharded, we target all shards rather than just shards that own
+        // chunks for the collection, because some shard may have previously owned chunks but no
+        // longer does (and so, may have the index). However, we ignore NamespaceNotFound errors
+        // from individual shards, because some shards may have never owned chunks for the
+        // collection. We additionally ignore IndexNotFound errors, because the index may not have
+        // been built on a shard if the earlier createIndexes command coincided with the shard
+        // receiving its first chunk for the collection (see SERVER-31715).
+        auto shardResponses = scatterGatherOnlyVersionIfUnsharded(
+            opCtx,
+            dbName,
+            nss,
+            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+            ReadPreferenceSetting::get(opCtx),
+            Shard::RetryPolicy::kNotIdempotent);
+        return appendRawResponses(opCtx,
+                                  &errmsg,
+                                  &output,
+                                  std::move(shardResponses),
+                                  {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound});
     }
 } dropIndexesCmd;
 
@@ -290,8 +301,8 @@ class CreateIndexesCmd : public ErrmsgCommandDeprecated {
 public:
     CreateIndexesCmd() : ErrmsgCommandDeprecated("createIndexes") {}
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -300,7 +311,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::createIndex);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -315,18 +326,18 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& output) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         LOG(1) << "createIndexes: " << nss << " cmd:" << redact(cmdObj);
 
         uassertStatusOK(createShardDatabase(opCtx, dbName));
 
-        auto shardResponses = uassertStatusOK(
-            scatterGatherOnlyVersionIfUnsharded(opCtx,
-                                                dbName,
-                                                nss,
-                                                filterCommandRequestForPassthrough(cmdObj),
-                                                ReadPreferenceSetting::get(opCtx),
-                                                Shard::RetryPolicy::kNoRetry));
+        auto shardResponses = scatterGatherOnlyVersionIfUnsharded(
+            opCtx,
+            dbName,
+            nss,
+            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+            ReadPreferenceSetting::get(opCtx),
+            Shard::RetryPolicy::kNoRetry);
         return appendRawResponses(opCtx,
                                   &errmsg,
                                   &output,
@@ -339,8 +350,8 @@ class ReIndexCmd : public ErrmsgCommandDeprecated {
 public:
     ReIndexCmd() : ErrmsgCommandDeprecated("reIndex") {}
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -349,7 +360,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::reIndex);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -364,16 +375,16 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& output) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         LOG(1) << "reIndex: " << nss << " cmd:" << redact(cmdObj);
 
-        auto shardResponses = uassertStatusOK(
-            scatterGatherOnlyVersionIfUnsharded(opCtx,
-                                                dbName,
-                                                nss,
-                                                filterCommandRequestForPassthrough(cmdObj),
-                                                ReadPreferenceSetting::get(opCtx),
-                                                Shard::RetryPolicy::kNoRetry));
+        auto shardResponses = scatterGatherOnlyVersionIfUnsharded(
+            opCtx,
+            dbName,
+            nss,
+            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+            ReadPreferenceSetting::get(opCtx),
+            Shard::RetryPolicy::kNoRetry);
         return appendRawResponses(
             opCtx, &errmsg, &output, std::move(shardResponses), {ErrorCodes::NamespaceNotFound});
     }
@@ -383,8 +394,8 @@ class CollectionModCmd : public ErrmsgCommandDeprecated {
 public:
     CollectionModCmd() : ErrmsgCommandDeprecated("collMod") {}
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -393,8 +404,8 @@ public:
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+                                       const BSONObj& cmdObj) const {
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
         return AuthorizationSession::get(client)->checkAuthForCollMod(nss, cmdObj, true);
     }
 
@@ -407,16 +418,16 @@ public:
                    const BSONObj& cmdObj,
                    std::string& errmsg,
                    BSONObjBuilder& output) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
         LOG(1) << "collMod: " << nss << " cmd:" << redact(cmdObj);
 
-        auto shardResponses = uassertStatusOK(
-            scatterGatherOnlyVersionIfUnsharded(opCtx,
-                                                dbName,
-                                                nss,
-                                                filterCommandRequestForPassthrough(cmdObj),
-                                                ReadPreferenceSetting::get(opCtx),
-                                                Shard::RetryPolicy::kNoRetry));
+        auto shardResponses = scatterGatherOnlyVersionIfUnsharded(
+            opCtx,
+            dbName,
+            nss,
+            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+            ReadPreferenceSetting::get(opCtx),
+            Shard::RetryPolicy::kNoRetry);
         return appendRawResponses(
             opCtx, &errmsg, &output, std::move(shardResponses), {ErrorCodes::NamespaceNotFound});
     }
@@ -428,7 +439,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::validate);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -442,7 +453,7 @@ public:
              const string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& output) {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
@@ -456,8 +467,8 @@ public:
         const BSONObj query;
         Strategy::commandOp(opCtx,
                             dbName,
-                            filterCommandRequestForPassthrough(cmdObj),
-                            cm->getns(),
+                            CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+                            cm->getns().ns(),
                             query,
                             CollationSpec::kSimpleSpec,
                             &results);
@@ -504,8 +515,8 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+                               const BSONObj& cmdObj) const override {
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
         return AuthorizationSession::get(client)->checkAuthForCreate(nss, cmdObj, true);
     }
 
@@ -519,9 +530,28 @@ public:
              BSONObjBuilder& result) override {
         uassertStatusOK(createShardDatabase(opCtx, dbName));
 
-        const auto dbInfo =
-            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName));
-        return passthrough(opCtx, dbName, dbInfo.primaryId(), cmdObj, result);
+        BSONObjIterator cmdIter(cmdObj);
+        invariant(cmdIter.more());
+
+        const NamespaceString ns(dbName, cmdIter.next().str());
+
+        ConfigsvrCreateCollection configCreateCmd;
+        configCreateCmd.setNs(ns);
+
+        BSONObjBuilder optionsBuilder;
+        CommandHelpers::filterCommandRequestForPassthrough(&cmdIter, &optionsBuilder);
+        configCreateCmd.setOptions(optionsBuilder.obj());
+
+        auto response =
+            Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                "admin",
+                CommandHelpers::appendMajorityWriteConcern(configCreateCmd.toBSON()),
+                Shard::RetryPolicy::kIdempotent);
+
+        uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(response));
+        return true;
     }
 
 } createCmd;
@@ -532,7 +562,7 @@ public:
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         return rename_collection::checkAuthForRenameCollectionCommand(client, dbname, cmdObj);
     }
 
@@ -593,7 +623,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         return copydb::checkAuthForCopydbCommand(client, dbname, cmdObj);
     }
 
@@ -640,7 +670,7 @@ public:
                 !fromDbInfo.shardingEnabled());
 
         BSONObjBuilder b;
-        BSONForEach(e, filterCommandRequestForPassthrough(cmdObj)) {
+        BSONForEach(e, CommandHelpers::filterCommandRequestForPassthrough(cmdObj)) {
             if (strcmp(e.fieldName(), "fromhost") != 0) {
                 b.append(e);
             }
@@ -663,7 +693,7 @@ public:
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::collStats);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -677,7 +707,7 @@ public:
              const string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
@@ -713,7 +743,8 @@ public:
             BSONObj res;
             {
                 ScopedDbConnection conn(shard->getConnString());
-                if (!conn->runCommand(dbName, filterCommandRequestForPassthrough(cmdObj), res)) {
+                if (!conn->runCommand(
+                        dbName, CommandHelpers::filterCommandRequestForPassthrough(cmdObj), res)) {
                     if (!res["code"].eoo()) {
                         result.append(res["code"]);
                     }
@@ -837,12 +868,12 @@ public:
     DataSizeCmd() : PublicGridCommand("dataSize", "datasize") {}
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
     }
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -900,11 +931,12 @@ public:
 
             ScopedDbConnection conn(shardStatus.getValue()->getConnString());
             BSONObj res;
-            bool ok = conn->runCommand(dbName, filterCommandRequestForPassthrough(cmdObj), res);
+            bool ok = conn->runCommand(
+                dbName, CommandHelpers::filterCommandRequestForPassthrough(cmdObj), res);
             conn.done();
 
             if (!ok) {
-                filterCommandReplyForPassthrough(res, &result);
+                CommandHelpers::filterCommandReplyForPassthrough(res, &result);
                 return false;
             }
 
@@ -927,7 +959,7 @@ public:
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::convertToCapped);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -938,7 +970,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsCollectionRequired(dbname, cmdObj).ns();
+        return CommandHelpers::parseNsCollectionRequired(dbname, cmdObj).ns();
     }
 
 } convertToCappedCmd;
@@ -949,7 +981,7 @@ public:
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -1031,7 +1063,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                 ActionType::splitVector)) {
@@ -1041,7 +1073,7 @@ public:
     }
 
     std::string parseNs(const string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
     }
 
     bool run(OperationContext* opCtx,
@@ -1062,13 +1094,13 @@ class DistinctCmd : public PublicGridCommand {
 public:
     DistinctCmd() : PublicGridCommand("distinct") {}
 
-    void help(stringstream& help) const override {
-        help << "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
+    std::string help() const override {
+        return "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
     }
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -1082,7 +1114,7 @@ public:
              const string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         auto query = getQuery(cmdObj);
 
@@ -1109,58 +1141,47 @@ public:
         const auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
 
-        BSONObj viewDefinition;
-        auto swShardResponses =
-            scatterGatherVersionedTargetByRoutingTable(opCtx,
-                                                       dbName,
-                                                       nss,
-                                                       filterCommandRequestForPassthrough(cmdObj),
-                                                       ReadPreferenceSetting::get(opCtx),
-                                                       Shard::RetryPolicy::kIdempotent,
-                                                       query,
-                                                       collation,
-                                                       &viewDefinition);
-
-        if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == swShardResponses.getStatus()) {
-            uassert(ErrorCodes::InternalError,
-                    str::stream() << "Missing resolved view definition, but remote returned "
-                                  << ErrorCodes::errorString(swShardResponses.getStatus().code()),
-                    !viewDefinition.isEmpty());
-
-            auto resolvedView = ResolvedView::fromBSON(viewDefinition);
+        std::vector<AsyncRequestsSender::Response> shardResponses;
+        try {
+            shardResponses = scatterGatherVersionedTargetByRoutingTable(
+                opCtx,
+                dbName,
+                nss,
+                CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+                ReadPreferenceSetting::get(opCtx),
+                Shard::RetryPolicy::kIdempotent,
+                query,
+                collation);
+        } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
             auto parsedDistinct = ParsedDistinct::parse(
-                opCtx, resolvedView.getNamespace(), cmdObj, ExtensionsCallbackNoop(), true);
+                opCtx, ex->getNamespace(), cmdObj, ExtensionsCallbackNoop(), true);
             if (!parsedDistinct.isOK()) {
-                return appendCommandStatus(result, parsedDistinct.getStatus());
+                return CommandHelpers::appendCommandStatus(result, parsedDistinct.getStatus());
             }
 
             auto aggCmdOnView = parsedDistinct.getValue().asAggregationCommand();
             if (!aggCmdOnView.isOK()) {
-                return appendCommandStatus(result, aggCmdOnView.getStatus());
+                return CommandHelpers::appendCommandStatus(result, aggCmdOnView.getStatus());
             }
 
             auto aggRequestOnView = AggregationRequest::parseFromBSON(nss, aggCmdOnView.getValue());
             if (!aggRequestOnView.isOK()) {
-                return appendCommandStatus(result, aggRequestOnView.getStatus());
+                return CommandHelpers::appendCommandStatus(result, aggRequestOnView.getStatus());
             }
 
-            auto resolvedAggRequest =
-                resolvedView.asExpandedViewAggregation(aggRequestOnView.getValue());
+            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView.getValue());
             auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
 
-            BSONObj aggResult = Command::runCommandDirectly(
+            BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbName, std::move(resolvedAggCmd)));
 
             ViewResponseFormatter formatter(aggResult);
             auto formatStatus = formatter.appendAsDistinctResponse(&result);
             if (!formatStatus.isOK()) {
-                return appendCommandStatus(result, formatStatus);
+                return CommandHelpers::appendCommandStatus(result, formatStatus);
             }
             return true;
         }
-
-        uassertStatusOK(swShardResponses.getStatus());
-        auto shardResponses = std::move(swShardResponses.getValue());
 
         BSONObjComparator bsonCmp(
             BSONObj(),
@@ -1201,7 +1222,7 @@ public:
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
         // Extract the targeting query.
         BSONObj targetingQuery;
@@ -1227,29 +1248,20 @@ public:
         // We will time how long it takes to run the commands on the shards.
         Timer timer;
 
-        BSONObj viewDefinition;
-        auto swShardResponses =
-            scatterGatherVersionedTargetByRoutingTable(opCtx,
-                                                       dbname,
-                                                       nss,
-                                                       explainCmd,
-                                                       ReadPreferenceSetting::get(opCtx),
-                                                       Shard::RetryPolicy::kIdempotent,
-                                                       targetingQuery,
-                                                       targetingCollation,
-                                                       &viewDefinition);
-
-        long long millisElapsed = timer.millis();
-
-        if (ErrorCodes::CommandOnShardedViewNotSupportedOnMongod == swShardResponses.getStatus()) {
-            uassert(ErrorCodes::InternalError,
-                    str::stream() << "Missing resolved view definition, but remote returned "
-                                  << ErrorCodes::errorString(swShardResponses.getStatus().code()),
-                    !viewDefinition.isEmpty());
-
-            auto resolvedView = ResolvedView::fromBSON(viewDefinition);
+        std::vector<AsyncRequestsSender::Response> shardResponses;
+        try {
+            shardResponses =
+                scatterGatherVersionedTargetByRoutingTable(opCtx,
+                                                           dbname,
+                                                           nss,
+                                                           explainCmd,
+                                                           ReadPreferenceSetting::get(opCtx),
+                                                           Shard::RetryPolicy::kIdempotent,
+                                                           targetingQuery,
+                                                           targetingCollation);
+        } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
             auto parsedDistinct = ParsedDistinct::parse(
-                opCtx, resolvedView.getNamespace(), cmdObj, ExtensionsCallbackNoop(), true);
+                opCtx, ex->getNamespace(), cmdObj, ExtensionsCallbackNoop(), true);
             if (!parsedDistinct.isOK()) {
                 return parsedDistinct.getStatus();
             }
@@ -1265,8 +1277,7 @@ public:
                 return aggRequestOnView.getStatus();
             }
 
-            auto resolvedAggRequest =
-                resolvedView.asExpandedViewAggregation(aggRequestOnView.getValue());
+            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView.getValue());
             auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
 
             ClusterAggregate::Namespaces nsStruct;
@@ -1277,8 +1288,7 @@ public:
                 opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, out);
         }
 
-        uassertStatusOK(swShardResponses.getStatus());
-        auto shardResponses = std::move(swShardResponses.getValue());
+        long long millisElapsed = timer.millis();
 
         const char* mongosStageName =
             ClusterExplain::getStageNameForReadOp(shardResponses.size(), cmdObj);
@@ -1297,8 +1307,8 @@ class FileMD5Cmd : public PublicGridCommand {
 public:
     FileMD5Cmd() : PublicGridCommand("filemd5") {}
 
-    void help(stringstream& help) const override {
-        help << " example: { filemd5 : ObjectId(aaaaaaa) , root : \"fs\" }";
+    std::string help() const override {
+        return " example: { filemd5 : ObjectId(aaaaaaa) , root : \"fs\" }";
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
@@ -1317,7 +1327,7 @@ public:
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::find));
     }
 
@@ -1346,7 +1356,7 @@ public:
             vector<Strategy::CommandResult> results;
             Strategy::commandOp(opCtx,
                                 dbName,
-                                filterCommandRequestForPassthrough(cmdObj),
+                                CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
                                 nss.ns(),
                                 finder,
                                 CollationSpec::kSimpleSpec,
@@ -1354,7 +1364,7 @@ public:
             verify(results.size() == 1);  // querying on shard key so should only talk to one shard
             BSONObj res = results.begin()->result;
 
-            filterCommandReplyForPassthrough(res, &result);
+            CommandHelpers::filterCommandReplyForPassthrough(res, &result);
             return res["ok"].trueValue();
         } else if (SimpleBSONObjComparator::kInstance.evaluate(cm->getShardKeyPattern().toBSON() ==
                                                                BSON("files_id" << 1 << "n" << 1))) {
@@ -1370,7 +1380,7 @@ public:
                 // long as we keep getting more chunks. The end condition is when we go to
                 // look for chunk n and it doesn't exist. This means that the file's last
                 // chunk is n-1, so we return the computed md5 results.
-                BSONObjBuilder bb(filterCommandRequestForPassthrough(cmdObj));
+                BSONObjBuilder bb(CommandHelpers::filterCommandRequestForPassthrough(cmdObj));
                 bb.appendBool("partialOk", true);
                 bb.append("startAt", n);
                 if (!lastResult.isEmpty()) {
@@ -1431,7 +1441,7 @@ public:
 
                 if (n == nNext) {
                     // no new data means we've reached the end of the file
-                    filterCommandReplyForPassthrough(res, &result);
+                    CommandHelpers::filterCommandReplyForPassthrough(res, &result);
                     return true;
                 }
 
@@ -1460,13 +1470,13 @@ class Geo2dFindNearCmd : public PublicGridCommand {
 public:
     Geo2dFindNearCmd() : PublicGridCommand("geoNear") {}
 
-    void help(stringstream& h) const override {
-        h << "http://dochub.mongodb.org/core/geo#GeospatialIndexing-geoNearCommand";
+    std::string help() const override {
+        return "http://dochub.mongodb.org/core/geo#GeospatialIndexing-geoNearCommand";
     }
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -1487,7 +1497,7 @@ public:
                          "http://dochub.mongodb.org/core/geoNear-deprecation.";
         }
 
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
 
         auto routingInfo =
@@ -1516,7 +1526,8 @@ public:
         vector<AsyncRequestsSender::Request> requests;
         BSONArrayBuilder shardArray;
         for (const ShardId& shardId : shardIds) {
-            requests.emplace_back(shardId, filterCommandRequestForPassthrough(cmdObj));
+            requests.emplace_back(shardId,
+                                  CommandHelpers::filterCommandRequestForPassthrough(cmdObj));
             shardArray.append(shardId.toString());
         }
 
@@ -1600,7 +1611,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         // $eval can do pretty much anything, so require all privileges.
         RoleGraph::generateUniversalPrivileges(out);
     }
@@ -1632,7 +1643,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) final {
+                               const BSONObj& cmdObj) const final {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
 
         // Check for the listCollections ActionType on the database
@@ -1677,12 +1688,12 @@ public:
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
 
         // Check for the listIndexes ActionType on the database, or find on system.indexes for pre
         // 3.0 systems.
-        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
         if (authzSession->isAuthorizedForActionsOnResource(ResourcePattern::forExactNamespace(ns),
                                                            ActionType::listIndexes) ||
@@ -1705,7 +1716,7 @@ public:
              const string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) final {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         const auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));

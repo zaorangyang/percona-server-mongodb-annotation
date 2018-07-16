@@ -55,7 +55,7 @@ mongo::Status mongo::emptyCapped(OperationContext* opCtx, const NamespaceString&
     AutoGetDb autoDb(opCtx, collectionName.db(), MODE_X);
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, collectionName);
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, collectionName);
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::NotMaster,
@@ -78,13 +78,13 @@ mongo::Status mongo::emptyCapped(OperationContext* opCtx, const NamespaceString&
                                     << collectionName.ns());
     }
 
-    if (NamespaceString::virtualized(collectionName.ns())) {
+    if (collectionName.isVirtualized()) {
         return Status(ErrorCodes::IllegalOperation,
                       str::stream() << "Cannot truncate a virtual collection: "
                                     << collectionName.ns());
     }
 
-    if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+    if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
          repl::ReplicationCoordinator::modeNone) &&
         collectionName.isOplog()) {
         return Status(ErrorCodes::OplogOperationUnsupported,
@@ -258,7 +258,7 @@ mongo::Status mongo::convertToCapped(OperationContext* opCtx,
     AutoGetDb autoDb(opCtx, collectionName.db(), MODE_X);
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, collectionName);
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, collectionName);
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::NotMaster,
@@ -278,11 +278,10 @@ mongo::Status mongo::convertToCapped(OperationContext* opCtx,
     auto tmpNameResult =
         db->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.convertToCapped." + shortSource);
     if (!tmpNameResult.isOK()) {
-        return Status(tmpNameResult.getStatus().code(),
-                      str::stream() << "Cannot generate temporary collection namespace to convert "
-                                    << collectionName.ns()
-                                    << " to a capped collection: "
-                                    << tmpNameResult.getStatus().reason());
+        return tmpNameResult.getStatus().withContext(
+            str::stream() << "Cannot generate temporary collection namespace to convert "
+                          << collectionName.ns()
+                          << " to a capped collection");
     }
     const auto& longTmpName = tmpNameResult.getValue();
     const auto shortTmpName = longTmpName.coll().toString();

@@ -199,13 +199,6 @@ public:
                                                const WriteConcernOptions& writeConcern) = 0;
 
     /**
-     * Like awaitReplication(), above, but waits for the replication of the last operation
-     * performed on the client associated with "opCtx".
-     */
-    virtual StatusAndDuration awaitReplicationOfLastOpForClient(
-        OperationContext* opCtx, const WriteConcernOptions& writeConcern) = 0;
-
-    /**
      * Causes this node to relinquish being primary for at least 'stepdownTime'.  If 'force' is
      * false, before doing so it will wait for 'waitTime' for one other node to be within 10
      * seconds of this node's optime before stepping down. Returns a Status with the code
@@ -804,20 +797,19 @@ public:
     virtual Status updateTerm(OperationContext* opCtx, long long term) = 0;
 
     /**
-     * Reserves a unique SnapshotName.
+     * Returns the minimum visible snapshot for this operation.
      *
      * This name is guaranteed to compare > all names reserved before and < all names reserved
      * after.
      *
      * This method will not take any locks or attempt to access storage using the passed-in
-     * OperationContext. It will only be used to track reserved SnapshotNames by each operation so
-     * that awaitReplicationOfLastOpForClient() can correctly wait for the reserved snapshot to be
-     * visible.
+     * OperationContext. It will only be used to return reserved SnapshotNames by each operation so
+     * callers can correctly wait for the reserved snapshot to be visible.
      *
      * A null OperationContext can be used in cases where the snapshot to wait for should not be
      * adjusted.
      */
-    virtual Timestamp reserveSnapshotName(OperationContext* opCtx) = 0;
+    virtual Timestamp getMinimumVisibleSnapshot(OperationContext* opCtx) = 0;
 
     /**
      * Blocks until either the current committed snapshot is at least as high as 'untilSnapshot',

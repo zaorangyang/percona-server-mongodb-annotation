@@ -40,7 +40,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
@@ -51,9 +51,6 @@
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-using std::string;
-
 namespace {
 
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
@@ -67,8 +64,8 @@ class ConfigSvrMovePrimaryCommand : public BasicCommand {
 public:
     ConfigSvrMovePrimaryCommand() : BasicCommand("_configsvrMovePrimary") {}
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -79,14 +76,14 @@ public:
         return true;
     }
 
-    virtual void help(std::stringstream& help) const override {
-        help << "Internal command, which is exported by the sharding config server. Do not call "
-                "directly. Reassigns the primary shard of a database.";
+    std::string help() const override {
+        return "Internal command, which is exported by the sharding config server. Do not call "
+               "directly. Reassigns the primary shard of a database.";
     }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) override {
+                                       const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -109,7 +106,7 @@ public:
              BSONObjBuilder& result) override {
 
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::IllegalOperation,
                        "_configsvrMovePrimary can only be run on config servers"));
@@ -117,7 +114,7 @@ public:
 
         auto movePrimaryRequest =
             MovePrimary::parse(IDLParserErrorContext("ConfigSvrMovePrimary"), cmdObj);
-        const string dbname = parseNs("", cmdObj);
+        const auto dbname = parseNs("", cmdObj);
 
         uassert(
             ErrorCodes::InvalidNamespace,
@@ -126,7 +123,7 @@ public:
 
         if (dbname == NamespaceString::kAdminDb || dbname == NamespaceString::kConfigDb ||
             dbname == NamespaceString::kLocalDb) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 {ErrorCodes::InvalidOptions,
                  str::stream() << "Can't move primary for " << dbname << " database"});
@@ -139,6 +136,7 @@ public:
 
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
         auto const catalogCache = Grid::get(opCtx)->catalogCache();
+        auto const catalogManager = ShardingCatalogManager::get(opCtx);
         auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
 
         // Remove the backwards compatible lock after 3.6 ships.
@@ -157,7 +155,7 @@ public:
         const std::string to = movePrimaryRequest.getTo().toString();
 
         if (to.empty()) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 {ErrorCodes::InvalidOptions,
                  str::stream() << "you have to specify where you want to move it"});
@@ -168,12 +166,12 @@ public:
         const auto toShard = [&]() {
             auto toShardStatus = shardRegistry->getShard(opCtx, to);
             if (!toShardStatus.isOK()) {
-                const std::string msg(
+                log() << "Could not move database '" << dbname << "' to shard '" << to
+                      << causedBy(toShardStatus.getStatus());
+                uassertStatusOKWithContext(
+                    toShardStatus.getStatus(),
                     str::stream() << "Could not move database '" << dbname << "' to shard '" << to
-                                  << "' due to "
-                                  << toShardStatus.getStatus().reason());
-                log() << msg;
-                uasserted(toShardStatus.getStatus().code(), msg);
+                                  << "'");
             }
 
             return toShardStatus.getValue();
@@ -193,7 +191,7 @@ public:
         log() << "Moving " << dbname << " primary from: " << fromShard->toString()
               << " to: " << toShard->toString();
 
-        const auto shardedColls = getAllShardedCollectionsForDb(opCtx, dbname);
+        const auto shardedColls = catalogManager->getAllShardedCollectionsForDb(opCtx, dbname);
 
         // Record start in changelog
         uassertStatusOK(catalogClient->logChange(
@@ -229,7 +227,7 @@ public:
 
             if (!worked) {
                 log() << "clone failed" << redact(cloneRes);
-                return appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result, {ErrorCodes::OperationFailed, str::stream() << "clone failed"});
             }
 
@@ -247,7 +245,7 @@ public:
         // reload
         catalogCache->purgeDatabase(dbname);
 
-        const string oldPrimary = fromShard->getConnString().toString();
+        const auto oldPrimary = fromShard->getConnString().toString();
 
         ScopedDbConnection fromconn(fromShard->getConnString());
         ON_BLOCK_EXIT([&fromconn] { fromconn.done(); });

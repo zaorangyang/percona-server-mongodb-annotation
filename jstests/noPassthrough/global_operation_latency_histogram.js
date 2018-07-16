@@ -1,4 +1,5 @@
 // Checks that global histogram counters for collections are updated as we expect.
+// @tags: [requires_replication]
 
 (function() {
     "use strict";
@@ -165,4 +166,5 @@
     // Test non-command.
     assert.commandFailed(testColl.runCommand("IHopeNobodyEverMakesThisACommand"));
     lastHistogram = checkHistogramDiff(0, 0, 1);
+    MongoRunner.stopMongod(mongo);
 }());

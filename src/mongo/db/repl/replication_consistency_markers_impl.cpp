@@ -38,6 +38,7 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/timestamp_block.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -359,12 +360,6 @@ Timestamp ReplicationConsistencyMarkersImpl::getOplogTruncateAfterPoint(
     OperationContext* opCtx) const {
     auto doc = _getOplogTruncateAfterPointDocument(opCtx);
     if (!doc) {
-        if (serverGlobalParams.featureCompatibility.getVersion() !=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            LOG(3) << "Falling back on old oplog delete from point because there is no oplog "
-                      "truncate after point and we are in FCV 3.4.";
-            return _getOldOplogDeleteFromPoint(opCtx);
-        }
         LOG(3) << "Returning empty oplog truncate after point since document did not exist";
         return {};
     }
@@ -391,7 +386,10 @@ Timestamp ReplicationConsistencyMarkersImpl::_getOldOplogDeleteFromPoint(
 }
 
 void ReplicationConsistencyMarkersImpl::_upsertCheckpointTimestampDocument(
-    OperationContext* opCtx, const BSONObj& updateSpec) {
+    OperationContext* opCtx, const BSONObj& updateSpec, const Timestamp& ts) {
+    // Do all writes in this function at the timestamp 'ts'. This will also prevent any lower
+    // level functions from setting their own timestamps that are not 'ts'.
+    TimestampBlock tsBlock(opCtx, ts);
     auto status = _storageInterface->upsertById(
         opCtx, _checkpointTimestampNss, kCheckpointTimestampId["_id"], updateSpec);
 
@@ -415,9 +413,7 @@ void ReplicationConsistencyMarkersImpl::writeCheckpointTimestamp(OperationContex
     auto timestampField = CheckpointTimestampDocument::kCheckpointTimestampFieldName;
     auto spec = BSON("$set" << BSON(timestampField << timestamp));
 
-    // TODO: When SERVER-28602 is completed, utilize RecoveryUnit::setTimestamp so that this
-    // write operation itself is committed with a timestamp that is included in the checkpoint.
-    _upsertCheckpointTimestampDocument(opCtx, spec);
+    _upsertCheckpointTimestampDocument(opCtx, spec, timestamp);
 }
 
 boost::optional<CheckpointTimestampDocument>

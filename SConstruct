@@ -139,6 +139,14 @@ add_option('ssl',
     nargs=0
 )
 
+add_option('ssl-provider',
+    choices=['auto', 'openssl', 'native'],
+    default='auto',
+    help='Select the SSL engine to use',
+    nargs=1,
+    type='choice',
+)
+
 add_option('mmapv1',
     choices=['auto', 'on', 'off'],
     default='auto',
@@ -319,6 +327,11 @@ add_option('use-system-lz4',
 
 add_option('use-system-valgrind',
     help='use system version of valgrind library',
+    nargs=0,
+)
+
+add_option('use-system-google-benchmark',
+    help='use system version of Google benchmark library',
     nargs=0,
 )
 
@@ -573,6 +586,7 @@ def variable_tools_converter(val):
         'idl_tool',
         "jsheader",
         "mergelib",
+        "mongo_benchmark",
         "mongo_integrationtest",
         "mongo_unittest",
         "textfile",
@@ -917,6 +931,8 @@ envDict = dict(BUILD_ROOT=buildDir,
                UNITTEST_LIST='$BUILD_ROOT/unittests.txt',
                INTEGRATION_TEST_ALIAS='integration_tests',
                INTEGRATION_TEST_LIST='$BUILD_ROOT/integration_tests.txt',
+               BENCHMARK_ALIAS='benchmarks',
+               BENCHMARK_LIST='$BUILD_ROOT/benchmarks.txt',
                CONFIGUREDIR='$BUILD_ROOT/scons/$VARIANT_DIR/sconf_temp',
                CONFIGURELOG='$BUILD_ROOT/scons/config.log',
                INSTALL_DIR=installDir,
@@ -1783,9 +1799,11 @@ mongo_modules = moduleconfig.discover_modules('src/mongo/db/modules', get_option
 env['MONGO_MODULES'] = [m.name for m in mongo_modules]
 
 # --- check system ---
-
+ssl_provider = None
+ 
 def doConfigure(myenv):
     global wiredtiger
+    global ssl_provider
 
     # Check that the compilers work.
     #
@@ -2723,19 +2741,8 @@ def doConfigure(myenv):
 
     libdeps.setup_conftests(conf)
 
-    def addOpenSslLibraryToDistArchive(file_name):
-        openssl_bin_path = os.path.normpath(env['WINDOWS_OPENSSL_BIN'].lower())
-        full_file_name = os.path.join(openssl_bin_path, file_name)
-        if os.path.exists(full_file_name):
-            env.Append(ARCHIVE_ADDITIONS=[full_file_name])
-            env.Append(ARCHIVE_ADDITION_DIR_MAP={
-                    openssl_bin_path: "bin"
-                    })
-            return True
-        else:
-            return False
-
-    if has_option( "ssl" ):
+    ### --ssl and --ssl-provider checks
+    def checkOpenSSL(conf):
         sslLibName = "ssl"
         cryptoLibName = "crypto"
         if conf.env.TargetOSIs('windows'):
@@ -2743,6 +2750,18 @@ def doConfigure(myenv):
             cryptoLibName = "libeay32"
 
             # Add the SSL binaries to the zip file distribution
+            def addOpenSslLibraryToDistArchive(file_name):
+                openssl_bin_path = os.path.normpath(env['WINDOWS_OPENSSL_BIN'].lower())
+                full_file_name = os.path.join(openssl_bin_path, file_name)
+                if os.path.exists(full_file_name):
+                    env.Append(ARCHIVE_ADDITIONS=[full_file_name])
+                    env.Append(ARCHIVE_ADDITION_DIR_MAP={
+                            openssl_bin_path: "bin"
+                            })
+                    return True
+                else:
+                    return False
+
             files = ['ssleay32.dll', 'libeay32.dll']
             for extra_file in files:
                 if not addOpenSslLibraryToDistArchive(extra_file):
@@ -2831,9 +2850,6 @@ def doConfigure(myenv):
             maybeIssueDarwinSSLAdvice(conf.env)
             conf.env.ConfError("SSL is enabled, but is unavailable")
 
-        env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
-        env.Append( MONGO_CRYPTO=["openssl"] )
-
         if conf.CheckDeclaration(
             "FIPS_mode_set",
             includes="""
@@ -2848,7 +2864,6 @@ def doConfigure(myenv):
                 #include <openssl/asn1.h>
             """):
             conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAVE_ASN1_ANY_DEFINITIONS')
-
 
         def CheckOpenSSL_EC_DH(context):
             compile_test_body = textwrap.dedent("""
@@ -2870,8 +2885,40 @@ def doConfigure(myenv):
         if conf.CheckOpenSSL_EC_DH():
             conf.env.SetConfigHeaderDefine('MONGO_CONFIG_HAS_SSL_SET_ECDH_AUTO')
 
+    ssl_provider = get_option("ssl-provider")
+    if ssl_provider == 'auto':
+        # TODO: When native platforms are implemented, make them the default
+        # if conf.env.TargetOSIs('windows', 'darwin', 'macOS'):
+        #     ssl_provider = 'native'
+        # else:
+        ssl_provider = 'openssl'
+
+    if ssl_provider == 'native':
+        if conf.env.TargetOSIs('windows'):
+            # TODO: Implement native crypto for windows
+            ssl_provider = 'openssl'
+        elif conf.env.TargetOSIs('darwin', 'macOS'):
+            conf.env.Append( MONGO_CRYPTO=["apple"] )
+            if has_option("ssl"):
+                # TODO: Replace SSL implementation as well.
+                # For now, let openssl fill that role.
+                checkOpenSSL(conf)
+
+    if ssl_provider == 'openssl':
+        if has_option("ssl"):
+            checkOpenSSL(conf)
+            # Working OpenSSL available, use it.
+            conf.env.Append( MONGO_CRYPTO=["openssl"] )
+        else:
+            # If we don't need an SSL build, we can get by with TomCrypt.
+            conf.env.Append( MONGO_CRYPTO=["tom"] )
+
+    if has_option( "ssl" ):
+        # Either crypto engine is native,
+        # or it's OpenSSL and has been checked to be working.
+        conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
     else:
-        env.Append( MONGO_CRYPTO=["tom"] )
+        ssl_provider = "none"
 
     if use_system_version_of_library("pcre"):
         conf.FindSysLibDep("pcre", ["pcre"])
@@ -3225,6 +3272,7 @@ Export("wiredtiger")
 Export("mmapv1")
 Export("endian")
 Export("inmemory")
+Export("ssl_provider")
 
 def injectMongoIncludePaths(thisEnv):
     thisEnv.AppendUnique(CPPPATH=['$BUILD_DIR'])

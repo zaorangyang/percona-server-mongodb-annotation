@@ -60,8 +60,8 @@ public:
         return false;
     }
 
-    bool slaveOk() const final {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const final {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool adminOnly() const final {
@@ -70,7 +70,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) final {
+                               const BSONObj& cmdObj) const final {
         bool isAuthorized = AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
             ResourcePattern::forClusterResource(), ActionType::killop);
         return isAuthorized ? Status::OK() : Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -103,7 +103,7 @@ public:
         // Will throw if shard id is not found
         auto shardStatus = grid.shardRegistry()->getShard(opCtx, shardIdent);
         if (!shardStatus.isOK()) {
-            return appendCommandStatus(result, shardStatus.getStatus());
+            return CommandHelpers::appendCommandStatus(result, shardStatus.getStatus());
         }
         auto shard = shardStatus.getValue();
 

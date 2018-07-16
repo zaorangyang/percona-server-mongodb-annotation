@@ -33,12 +33,14 @@
 #include "mongo/db/service_entry_point_mongod.h"
 
 #include "mongo/base/checked_cast.h"
+#include "mongo/bson/mutable/document.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/impersonation_session.h"
 #include "mongo/db/client.h"
+#include "mongo/db/command_can_run_here.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/fsync.h"
+#include "mongo/db/commands/fsync_locked.h"
 #include "mongo/db/concurrency/global_lock_acquisition_tracker.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/curop_metrics.h"
@@ -63,11 +65,11 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/rpc/factory.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/logical_time_metadata.h"
@@ -107,11 +109,19 @@ const StringMap<int> cmdWhitelist = {{"delete", 1},
                                      {"refreshLogicalSessionCacheNow", 1},
                                      {"update", 1}};
 
+BSONObj getRedactedCopyForLogging(const Command* command, const BSONObj& cmdObj) {
+    mutablebson::Document cmdToLog(cmdObj, mutablebson::Document::kInPlaceDisabled);
+    command->redactForLogging(&cmdToLog);
+    BSONObjBuilder bob;
+    cmdToLog.writeTo(&bob);
+    return bob.obj();
+}
+
 void generateLegacyQueryErrorResponse(const AssertionException* exception,
                                       const QueryMessage& queryMessage,
                                       CurOp* curop,
                                       Message* response) {
-    curop->debug().exceptionInfo = exception->toStatus();
+    curop->debug().errInfo = exception->toStatus();
 
     log(LogComponent::kQuery) << "assertion " << exception->toString() << " ns:" << queryMessage.ns
                               << " query:" << (queryMessage.query.valid(BSONVersion::kLatest)
@@ -122,9 +132,7 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
                                   << " ntoreturn:" << queryMessage.ntoreturn;
     }
 
-    const StaleConfigException* scex = (exception->code() == ErrorCodes::StaleConfig)
-        ? checked_cast<const StaleConfigException*>(exception)
-        : NULL;
+    auto scex = exception->extraInfo<StaleConfigInfo>();
 
     BSONObjBuilder err;
     err.append("$err", exception->reason());
@@ -162,7 +170,7 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
 
 void registerError(OperationContext* opCtx, const DBException& exception) {
     LastError::get(opCtx->getClient()).setLastError(exception.code(), exception.reason());
-    CurOp::get(opCtx)->debug().exceptionInfo = exception.toStatus();
+    CurOp::get(opCtx)->debug().errInfo = exception.toStatus();
 }
 
 void _generateErrorResponse(OperationContext* opCtx,
@@ -174,19 +182,7 @@ void _generateErrorResponse(OperationContext* opCtx,
     // We could have thrown an exception after setting fields in the builder,
     // so we need to reset it to a clean state just to be sure.
     replyBuilder->reset();
-
-    // We need to include some extra information for StaleConfig.
-    if (exception.code() == ErrorCodes::StaleConfig) {
-        const StaleConfigException& scex = checked_cast<const StaleConfigException&>(exception);
-        replyBuilder->setCommandReply(scex.toStatus(),
-                                      BSON("ns" << scex.getns() << "vReceived"
-                                                << BSONArray(scex.getVersionReceived().toBSON())
-                                                << "vWanted"
-                                                << BSONArray(scex.getVersionWanted().toBSON())));
-    } else {
-        replyBuilder->setCommandReply(exception.toStatus());
-    }
-
+    replyBuilder->setCommandReply(exception.toStatus());
     replyBuilder->setMetadata(replyMetadata);
 }
 
@@ -200,22 +196,8 @@ void _generateErrorResponse(OperationContext* opCtx,
     // We could have thrown an exception after setting fields in the builder,
     // so we need to reset it to a clean state just to be sure.
     replyBuilder->reset();
-
-    // We need to include some extra information for StaleConfig.
-    if (exception.code() == ErrorCodes::StaleConfig) {
-        const StaleConfigException& scex = checked_cast<const StaleConfigException&>(exception);
-        replyBuilder->setCommandReply(scex.toStatus(),
-                                      BSON("ns" << scex.getns() << "vReceived"
-                                                << BSONArray(scex.getVersionReceived().toBSON())
-                                                << "vWanted"
-                                                << BSONArray(scex.getVersionWanted().toBSON())
-                                                << "operationTime"
-                                                << operationTime.asTimestamp()));
-    } else {
-        replyBuilder->setCommandReply(exception.toStatus(),
-                                      BSON("operationTime" << operationTime.asTimestamp()));
-    }
-
+    replyBuilder->setCommandReply(exception.toStatus(),
+                                  BSON("operationTime" << operationTime.asTimestamp()));
     replyBuilder->setMetadata(replyMetadata);
 }
 
@@ -260,20 +242,17 @@ void appendReplyMetadataOnError(OperationContext* opCtx, BSONObjBuilder* metadat
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
 
     if (isReplSet) {
-        if (serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            if (LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
-                // No need to sign cluster times for internal clients.
-                SignedLogicalTime currentTime(
-                    LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
-                rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
-                logicalTimeMetadata.writeToMetadata(metadataBob);
-            } else if (auto validator = LogicalTimeValidator::get(opCtx)) {
-                auto currentTime =
-                    validator->trySignLogicalTime(LogicalClock::get(opCtx)->getClusterTime());
-                rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
-                logicalTimeMetadata.writeToMetadata(metadataBob);
-            }
+        if (LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
+            // No need to sign cluster times for internal clients.
+            SignedLogicalTime currentTime(
+                LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
+            rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
+            logicalTimeMetadata.writeToMetadata(metadataBob);
+        } else if (auto validator = LogicalTimeValidator::get(opCtx)) {
+            auto currentTime =
+                validator->trySignLogicalTime(LogicalClock::get(opCtx)->getClusterTime());
+            rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
+            logicalTimeMetadata.writeToMetadata(metadataBob);
         }
     }
 }
@@ -299,20 +278,17 @@ void appendReplyMetadata(OperationContext* opCtx,
                 .writeToMetadata(metadataBob)
                 .transitional_ignore();
         }
-        if (serverGlobalParams.featureCompatibility.getVersion() ==
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-            if (LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
-                // No need to sign cluster times for internal clients.
-                SignedLogicalTime currentTime(
-                    LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
-                rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
-                logicalTimeMetadata.writeToMetadata(metadataBob);
-            } else if (auto validator = LogicalTimeValidator::get(opCtx)) {
-                auto currentTime =
-                    validator->trySignLogicalTime(LogicalClock::get(opCtx)->getClusterTime());
-                rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
-                logicalTimeMetadata.writeToMetadata(metadataBob);
-            }
+        if (LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
+            // No need to sign cluster times for internal clients.
+            SignedLogicalTime currentTime(
+                LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
+            rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
+            logicalTimeMetadata.writeToMetadata(metadataBob);
+        } else if (auto validator = LogicalTimeValidator::get(opCtx)) {
+            auto currentTime =
+                validator->trySignLogicalTime(LogicalClock::get(opCtx)->getClusterTime());
+            rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
+            logicalTimeMetadata.writeToMetadata(metadataBob);
         }
     }
 
@@ -324,22 +300,23 @@ void appendReplyMetadata(OperationContext* opCtx,
 }
 
 /**
- * Given the specified command and whether it supports read concern, returns an effective read
- * concern which should be used.
+ * Given the specified command, returns an effective read concern which should be used or an error
+ * if the read concern is not valid for the command.
  */
-StatusWith<repl::ReadConcernArgs> _extractReadConcern(const BSONObj& cmdObj,
-                                                      bool supportsNonLocalReadConcern) {
+StatusWith<repl::ReadConcernArgs> _extractReadConcern(const Command* command,
+                                                      const std::string& dbName,
+                                                      const BSONObj& cmdObj) {
     repl::ReadConcernArgs readConcernArgs;
 
-    auto readConcernParseStatus = readConcernArgs.initialize(cmdObj, Command::testCommandsEnabled);
+    auto readConcernParseStatus = readConcernArgs.initialize(cmdObj);
     if (!readConcernParseStatus.isOK()) {
         return readConcernParseStatus;
     }
 
-    if (!supportsNonLocalReadConcern &&
-        readConcernArgs.getLevel() != repl::ReadConcernLevel::kLocalReadConcern) {
+    if (!command->supportsReadConcern(dbName, cmdObj, readConcernArgs.getLevel())) {
         return {ErrorCodes::InvalidOptions,
-                str::stream() << "Command does not support non local read concern"};
+                str::stream() << "Command does not support read concern "
+                              << readConcernArgs.toString()};
     }
 
     return readConcernArgs;
@@ -362,14 +339,14 @@ void _waitForWriteConcernAndAddToCommandResponse(OperationContext* opCtx,
     WriteConcernResult res;
     auto waitForWCStatus =
         waitForWriteConcern(opCtx, lastOpAfterRun, opCtx->getWriteConcern(), &res);
-    Command::appendCommandWCStatus(*commandResponseBuilder, waitForWCStatus, res);
+    CommandHelpers::appendCommandWCStatus(*commandResponseBuilder, waitForWCStatus, res);
 
     // SERVER-22421: This code is to ensure error response backwards compatibility with the
     // user management commands. This can be removed in 3.6.
-    if (!waitForWCStatus.isOK() && Command::isUserManagementCommand(commandName)) {
+    if (!waitForWCStatus.isOK() && CommandHelpers::isUserManagementCommand(commandName)) {
         BSONObj temp = commandResponseBuilder->asTempObj().copy();
         commandResponseBuilder->resetToEmpty();
-        Command::appendCommandStatus(*commandResponseBuilder, waitForWCStatus);
+        CommandHelpers::appendCommandStatus(*commandResponseBuilder, waitForWCStatus);
         commandResponseBuilder->appendElementsUnique(temp);
     }
 }
@@ -454,48 +431,28 @@ bool runCommandImpl(OperationContext* opCtx,
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 0 : 2;
             LOG(debugLevel) << "Command on database " << db
                             << " timed out waiting for read concern to be satisfied. Command: "
-                            << redact(command->getRedactedCopyForLogging(request.body));
+                            << redact(getRedactedCopyForLogging(command, request.body));
         }
 
-        auto result = Command::appendCommandStatus(inPlaceReplyBob, rcStatus);
-        inPlaceReplyBob.doneFast();
-        BSONObjBuilder metadataBob;
-        appendReplyMetadataOnError(opCtx, &metadataBob);
-        replyBuilder->setMetadata(metadataBob.done());
-        return result;
+        uassertStatusOK(rcStatus);
     }
 
     bool result;
     if (!command->supportsWriteConcern(cmd)) {
         if (commandSpecifiesWriteConcern(cmd)) {
-            auto result = Command::appendCommandStatus(
-                inPlaceReplyBob,
-                {ErrorCodes::InvalidOptions, "Command does not support writeConcern"});
-            inPlaceReplyBob.doneFast();
-            BSONObjBuilder metadataBob;
-            appendReplyMetadataOnError(opCtx, &metadataBob);
-            replyBuilder->setMetadata(metadataBob.done());
-            return result;
+            uassertStatusOK({ErrorCodes::InvalidOptions, "Command does not support writeConcern"});
         }
 
         result = command->publicRun(opCtx, request, inPlaceReplyBob);
     } else {
-        auto wcResult = extractWriteConcern(opCtx, cmd, db);
-        if (!wcResult.isOK()) {
-            auto result = Command::appendCommandStatus(inPlaceReplyBob, wcResult.getStatus());
-            inPlaceReplyBob.doneFast();
-            BSONObjBuilder metadataBob;
-            appendReplyMetadataOnError(opCtx, &metadataBob);
-            replyBuilder->setMetadata(metadataBob.done());
-            return result;
-        }
+        auto wcResult = uassertStatusOK(extractWriteConcern(opCtx, cmd, db));
 
         auto lastOpBeforeRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
 
         // Change the write concern while running the command.
         const auto oldWC = opCtx->getWriteConcern();
         ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
-        opCtx->setWriteConcern(wcResult.getValue());
+        opCtx->setWriteConcern(wcResult);
         ON_BLOCK_EXIT([&] {
             _waitForWriteConcernAndAddToCommandResponse(
                 opCtx, command->getName(), lastOpBeforeRun, &inPlaceReplyBob);
@@ -505,39 +462,26 @@ bool runCommandImpl(OperationContext* opCtx,
 
         // Nothing in run() should change the writeConcern.
         dassert(SimpleBSONObjComparator::kInstance.evaluate(opCtx->getWriteConcern().toBSON() ==
-                                                            wcResult.getValue().toBSON()));
+                                                            wcResult.toBSON()));
     }
 
     // When a linearizable read command is passed in, check to make sure we're reading
     // from the primary.
-    if (command->supportsNonLocalReadConcern(db, cmd) &&
-        (repl::ReadConcernArgs::get(opCtx).getLevel() ==
-         repl::ReadConcernLevel::kLinearizableReadConcern) &&
-        (request.getCommandName() != "getMore")) {
+    if (repl::ReadConcernArgs::get(opCtx).getLevel() ==
+        repl::ReadConcernLevel::kLinearizableReadConcern) {
 
-        auto linearizableReadStatus = waitForLinearizableReadConcern(opCtx);
-
-        if (!linearizableReadStatus.isOK()) {
-            inPlaceReplyBob.resetToEmpty();
-            auto result = Command::appendCommandStatus(inPlaceReplyBob, linearizableReadStatus);
-            inPlaceReplyBob.doneFast();
-            BSONObjBuilder metadataBob;
-            appendReplyMetadataOnError(opCtx, &metadataBob);
-            replyBuilder->setMetadata(metadataBob.done());
-            return result;
-        }
+        uassertStatusOK(waitForLinearizableReadConcern(opCtx));
     }
 
-    Command::appendCommandStatus(inPlaceReplyBob, result);
+    CommandHelpers::appendCommandStatus(inPlaceReplyBob, result);
+    CurOp::get(opCtx)->debug().errInfo = getStatusFromCommandResult(inPlaceReplyBob.asTempObj());
 
     auto operationTime = computeOperationTime(
         opCtx, startOperationTime, repl::ReadConcernArgs::get(opCtx).getLevel());
 
     // An uninitialized operation time means the cluster time is not propagated, so the operation
     // time should not be attached to the response.
-    if (operationTime != LogicalTime::kUninitialized &&
-        (serverGlobalParams.featureCompatibility.getVersion() ==
-         ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36)) {
+    if (operationTime != LogicalTime::kUninitialized) {
         operationTime.appendAsOperationTime(&inPlaceReplyBob);
     }
 
@@ -607,7 +551,7 @@ void execCommandDatabase(OperationContext* opCtx,
                 cmdOptionMaxTimeMSField = element;
             } else if (fieldName == "allowImplicitCollectionCreation") {
                 allowImplicitCollectionCreationField = element;
-            } else if (fieldName == Command::kHelpFieldName) {
+            } else if (fieldName == CommandHelpers::kHelpFieldName) {
                 helpField = element;
             } else if (fieldName == ChunkVersion::kShardVersionField) {
                 shardVersionFieldIdx = element;
@@ -621,7 +565,7 @@ void execCommandDatabase(OperationContext* opCtx,
                     topLevelFields[fieldName]++ == 0);
         }
 
-        if (Command::isHelpRequest(helpField)) {
+        if (CommandHelpers::isHelpRequest(helpField)) {
             CurOp::get(opCtx)->ensureStarted();
             // We disable last-error for help requests due to SERVER-11492, because config servers
             // use help requests to determine which commands are database writes, and so must be
@@ -645,18 +589,13 @@ void execCommandDatabase(OperationContext* opCtx,
 
         if (!opCtx->getClient()->isInDirectClient() &&
             !MONGO_FAIL_POINT(skipCheckingForNotMasterInCommandDispatch)) {
-
-            bool commandCanRunOnSecondary = command->slaveOk();
-
-            bool commandIsOverriddenToRunOnSecondary =
-                command->slaveOverrideOk() && ReadPreferenceSetting::get(opCtx).canRunOnSecondary();
-
-            bool iAmStandalone = !opCtx->writesAreReplicated();
-            bool canRunHere = iAmPrimary || commandCanRunOnSecondary ||
-                commandIsOverriddenToRunOnSecondary || iAmStandalone;
-
-            // This logic is clearer if we don't have to invert it.
-            if (!canRunHere && command->slaveOverrideOk()) {
+            auto allowed = command->secondaryAllowed();
+            bool alwaysAllowed = allowed == Command::AllowedOnSecondary::kAlways;
+            bool couldHaveOptedIn = allowed == Command::AllowedOnSecondary::kOptIn;
+            bool optedIn =
+                couldHaveOptedIn && ReadPreferenceSetting::get(opCtx).canRunOnSecondary();
+            bool canRunHere = commandCanRunHere(opCtx, dbname, command);
+            if (!canRunHere && couldHaveOptedIn) {
                 uasserted(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
             }
 
@@ -680,7 +619,7 @@ void execCommandDatabase(OperationContext* opCtx,
                 // Check ticket SERVER-21432, slaveOk commands are allowed in drain mode
                 uassert(ErrorCodes::NotMasterOrSecondary,
                         "node is in drain mode",
-                        commandIsOverriddenToRunOnSecondary || commandCanRunOnSecondary);
+                        optedIn || alwaysAllowed);
             }
         }
 
@@ -712,17 +651,14 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-        readConcernArgs = uassertStatusOK(_extractReadConcern(
-            request.body, command->supportsNonLocalReadConcern(dbname, request.body)));
+        readConcernArgs = uassertStatusOK(_extractReadConcern(command, dbname, request.body));
 
         auto& oss = OperationShardingState::get(opCtx);
 
         if (!opCtx->getClient()->isInDirectClient() &&
             readConcernArgs.getLevel() != repl::ReadConcernLevel::kAvailableReadConcern &&
             (iAmPrimary ||
-             ((serverGlobalParams.featureCompatibility.getVersion() ==
-               ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) &&
-              (readConcernArgs.hasLevel() || readConcernArgs.getArgsClusterTime())))) {
+             (readConcernArgs.hasLevel() || readConcernArgs.getArgsAfterClusterTime()))) {
             oss.initializeShardVersion(NamespaceString(command->parseNs(dbname, request.body)),
                                        shardVersionFieldIdx);
 
@@ -761,10 +697,7 @@ void execCommandDatabase(OperationContext* opCtx,
         }
     } catch (const DBException& e) {
         // If we got a stale config, wait in case the operation is stuck in a critical section
-        if (e.code() == ErrorCodes::StaleConfig) {
-            auto sce = dynamic_cast<const StaleConfigException*>(&e);
-            invariant(sce);  // do not upcasts from DBException created by uassert variants.
-
+        if (auto sce = e.extraInfo<StaleConfigInfo>()) {
             if (!opCtx->getClient()->isInDirectClient()) {
                 ShardingState::get(opCtx)
                     ->onStaleShardVersion(
@@ -779,8 +712,7 @@ void execCommandDatabase(OperationContext* opCtx,
         // Note: the read concern may not have been successfully or yet placed on the opCtx, so
         // parsing it separately here.
         const std::string db = request.getDatabase().toString();
-        auto readConcernArgsStatus = _extractReadConcern(
-            request.body, command->supportsNonLocalReadConcern(db, request.body));
+        auto readConcernArgsStatus = _extractReadConcern(command, db, request.body);
         auto operationTime = readConcernArgsStatus.isOK()
             ? computeOperationTime(
                   opCtx, startOperationTime, readConcernArgsStatus.getValue().getLevel())
@@ -788,19 +720,17 @@ void execCommandDatabase(OperationContext* opCtx,
 
         // An uninitialized operation time means the cluster time is not propagated, so the
         // operation time should not be attached to the error response.
-        if (operationTime != LogicalTime::kUninitialized &&
-            (serverGlobalParams.featureCompatibility.getVersion() ==
-             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36)) {
+        if (operationTime != LogicalTime::kUninitialized) {
             LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
                    << "on database '" << request.getDatabase() << "' "
-                   << "with arguments '" << command->getRedactedCopyForLogging(request.body)
+                   << "with arguments '" << getRedactedCopyForLogging(command, request.body)
                    << "' and operationTime '" << operationTime.toString() << "': " << e.toString();
 
             _generateErrorResponse(opCtx, replyBuilder, e, metadataBob.obj(), operationTime);
         } else {
             LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
                    << "on database '" << request.getDatabase() << "' "
-                   << "with arguments '" << command->getRedactedCopyForLogging(request.body)
+                   << "with arguments '" << getRedactedCopyForLogging(command, request.body)
                    << "': " << e.toString();
 
             _generateErrorResponse(opCtx, replyBuilder, e, metadataBob.obj());
@@ -856,7 +786,7 @@ DbResponse runCommands(OperationContext* opCtx, const Message& message) {
             // to avoid displaying potentially sensitive information in the logs,
             // we restrict the log message to the name of the unrecognized command.
             // However, the complete command object will still be echoed to the client.
-            if (!(c = Command::findCommand(request.getCommandName()))) {
+            if (!(c = CommandHelpers::findCommand(request.getCommandName()))) {
                 globalCommandRegistry()->incrementUnknownCommands();
                 std::string msg = str::stream() << "no such command: '" << request.getCommandName()
                                                 << "'";
@@ -866,7 +796,7 @@ DbResponse runCommands(OperationContext* opCtx, const Message& message) {
             }
 
             LOG(2) << "run command " << request.getDatabase() << ".$cmd" << ' '
-                   << c->getRedactedCopyForLogging(request.body);
+                   << getRedactedCopyForLogging(c, request.body);
 
             {
                 // Try to set this as early as possible, as soon as we have figured out the command.
@@ -924,11 +854,13 @@ DbResponse receivedQuery(OperationContext* opCtx,
         dbResponse.exhaustNS = runQuery(opCtx, q, nss, dbResponse.response);
     } catch (const AssertionException& e) {
         // If we got a stale config, wait in case the operation is stuck in a critical section
-        if (!opCtx->getClient()->isInDirectClient() && e.code() == ErrorCodes::StaleConfig) {
-            auto& sce = static_cast<const StaleConfigException&>(e);
-            ShardingState::get(opCtx)
-                ->onStaleShardVersion(opCtx, NamespaceString(sce.getns()), sce.getVersionReceived())
-                .transitional_ignore();
+        if (auto sce = e.extraInfo<StaleConfigInfo>()) {
+            if (!opCtx->getClient()->isInDirectClient()) {
+                ShardingState::get(opCtx)
+                    ->onStaleShardVersion(
+                        opCtx, NamespaceString(sce->getns()), sce->getVersionReceived())
+                    .transitional_ignore();
+            }
         }
 
         dbResponse.response.reset();
@@ -1070,7 +1002,7 @@ DbResponse receivedGetMore(OperationContext* opCtx,
         err.append("code", e.code());
         BSONObj errObj = err.obj();
 
-        curop.debug().exceptionInfo = e.toStatus();
+        curop.debug().errInfo = e.toStatus();
 
         dbresponse = replyToQuery(errObj, ResultFlag_ErrSet);
         curop.debug().responseLength = dbresponse.response.header().dataLen();
@@ -1182,7 +1114,7 @@ DbResponse ServiceEntryPointMongod::handleRequest(OperationContext* opCtx, const
             LastError::get(c).setLastError(ue.code(), ue.reason());
             LOG(3) << " Caught Assertion in " << networkOpToString(op) << ", continuing "
                    << redact(ue);
-            debug.exceptionInfo = ue.toStatus();
+            debug.errInfo = ue.toStatus();
         }
     }
     currentOp.ensureStarted();

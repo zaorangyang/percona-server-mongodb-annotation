@@ -46,9 +46,9 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/sessions_collection.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
@@ -56,7 +56,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/util/log.h"
@@ -261,7 +261,7 @@ boost::optional<CollectionType> checkIfAlreadyShardedWithSameOptions(
                             opCtx,
                             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                             repl::ReadConcernLevel::kLocalReadConcern,
-                            NamespaceString(CollectionType::ConfigNS),
+                            CollectionType::ConfigNS,
                             BSON("_id" << nss.ns() << "dropped" << false),
                             BSONObj(),
                             1))
@@ -569,7 +569,7 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
         }
 
         ChunkType chunkType;
-        chunkType.setNS(nss.ns());
+        chunkType.setNS(nss);
         chunkType.setMin(chunk->getMin());
         chunkType.setMax(chunk->getMax());
         chunkType.setShard(chunk->getShardId());
@@ -698,7 +698,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -706,8 +706,8 @@ public:
         return Status::OK();
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -718,14 +718,14 @@ public:
         return true;
     }
 
-    void help(std::stringstream& help) const override {
-        help << "Internal command, which is exported by the sharding config server. Do not call "
-             << "directly. Shards a collection. Requires key. Optional unique. Sharding must "
-                "already be enabled for the database";
+    std::string help() const override {
+        return "Internal command, which is exported by the sharding config server. Do not call "
+               "directly. Shards a collection. Requires key. Optional unique. Sharding must "
+               "already be enabled for the database";
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
     }
 
     bool run(OperationContext* opCtx,
@@ -881,7 +881,7 @@ public:
 
         // Step 6. Actually shard the collection.
         catalogManager->shardCollection(opCtx,
-                                        nss.ns(),
+                                        nss,
                                         uuid,
                                         shardKeyPattern,
                                         *request.getCollation(),

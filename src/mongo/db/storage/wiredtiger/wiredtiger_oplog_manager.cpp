@@ -66,13 +66,16 @@ void WiredTigerOplogManager::start(OperationContext* opCtx,
         isMasterSlave =
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeMasterSlave;
     }
+
+    // Need to obtain the mutex before starting the thread, as otherwise it may race ahead
+    // see _shuttingDown as true and quit prematurely.
+    stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
     _oplogJournalThread = stdx::thread(&WiredTigerOplogManager::_oplogJournalThreadLoop,
                                        this,
                                        sessionCache,
                                        oplogRecordStore,
                                        isMasterSlave);
 
-    stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
     _isRunning = true;
     _shuttingDown = false;
 }
@@ -177,7 +180,10 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* ses
 
         const uint64_t newTimestamp = _fetchAllCommittedValue(sessionCache->conn());
 
-        if (newTimestamp == _oplogReadTimestamp.load()) {
+        // The newTimestamp may actually go backward during secondary batch application,
+        // where we commit data file changes separately from oplog changes, so ignore
+        // a non-incrementing timestamp.
+        if (newTimestamp <= _oplogReadTimestamp.load()) {
             LOG(2) << "no new oplog entries were made visible: " << newTimestamp;
             continue;
         }

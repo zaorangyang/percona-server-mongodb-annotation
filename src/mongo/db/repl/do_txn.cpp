@@ -36,12 +36,13 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
+#include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/op_observer.h"
@@ -117,7 +118,7 @@ Status _doTxn(OperationContext* opCtx,
         BSONElement e = i.next();
         const BSONObj& opObj = e.Obj();
 
-        const NamespaceString nss(opObj["ns"].String());
+        NamespaceString nss(opObj["ns"].String());
 
         // Need to check this here, or OldClientContext may fail an invariant.
         if (!nss.isValid())
@@ -125,9 +126,8 @@ Status _doTxn(OperationContext* opCtx,
 
         Status status(ErrorCodes::InternalError, "");
 
-        invariant(opCtx->lockState()->isW());
-
-        auto db = dbHolder().get(opCtx, nss.ns());
+        AutoGetDb autoDb(opCtx, nss.db(), MODE_IX);
+        auto db = autoDb.getDb();
         if (!db) {
             uasserted(ErrorCodes::NamespaceNotFound,
                       str::stream() << "cannot apply insert, delete, or update operation on a "
@@ -137,12 +137,23 @@ Status _doTxn(OperationContext* opCtx,
                                     << mongo::redact(opObj));
         }
 
+        if (opObj.hasField("ui")) {
+            auto uuidStatus = UUID::parse(opObj["ui"]);
+            uassertStatusOK(uuidStatus.getStatus());
+            // If "ui" is present, it overrides "nss" for the collection name.
+            nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(uuidStatus.getValue());
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "cannot find collection uuid " << uuidStatus.getValue(),
+                    !nss.isEmpty());
+        }
+        Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IX);
+        auto collection = db->getCollection(opCtx, nss);
+
         // When processing an update on a non-existent collection, applyOperation_inlock()
         // returns UpdateOperationFailed on updates and allows the collection to be
         // implicitly created on upserts. We detect both cases here and fail early with
         // NamespaceNotFound.
         // Additionally for inserts, we fail early on non-existent collections.
-        auto collection = db->getCollection(opCtx, nss);
         if (!collection && db->getViewCatalog()->lookup(opCtx, nss.ns())) {
             uasserted(ErrorCodes::CommandNotSupportedOnView,
                       str::stream() << "doTxn not supported on a view: " << redact(opObj));
@@ -161,13 +172,11 @@ Status _doTxn(OperationContext* opCtx,
                       "cannot apply an op with a timestamp with doTxn; ");
         }
 
-        OldClientContext ctx(opCtx, nss.ns());
-
         // Setting alwaysUpsert to true makes sense only during oplog replay, and doTxn commands
         // should not be executed during oplog replay.
         const bool alwaysUpsert = false;
         status = repl::applyOperation_inlock(
-            opCtx, ctx.db(), opObj, alwaysUpsert, repl::OplogApplication::Mode::kApplyOpsCmd);
+            opCtx, db, opObj, alwaysUpsert, repl::OplogApplication::Mode::kApplyOpsCmd);
         if (!status.isOK())
             return status;
 
@@ -226,7 +235,10 @@ bool _hasPrecondition(const BSONObj& doTxnCmd) {
 Status _checkPrecondition(OperationContext* opCtx,
                           const BSONObj& doTxnCmd,
                           BSONObjBuilder* result) {
-    invariant(opCtx->lockState()->isW());
+    // Precondition check must be done in a write unit of work to make sure it's
+    // sharing the same snapshot as the writes.
+    invariant(opCtx->lockState()->inAWriteUnitOfWork());
+
     invariant(_hasPrecondition(doTxnCmd));
 
     for (auto elem : doTxnCmd[DoTxn::kPreconditionFieldName].Obj()) {
@@ -241,22 +253,35 @@ Status _checkPrecondition(OperationContext* opCtx,
             return {ErrorCodes::InvalidNamespace, "invalid ns: " + nss.ns()};
         }
 
-        DBDirectClient db(opCtx);
-        BSONObj realres = db.findOne(nss.ns(), preCondition["q"].Obj());
+        // Even if snapshot isolation is provided, database catalog still needs locking.
+        // Only X and IX mode locks are stashed by the WriteUnitOfWork and IS->IX upgrade
+        // is not supported, so we can not use IS mode here.
+        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
 
-        // Get collection default collation.
-        Database* database = dbHolder().get(opCtx, nss.db());
+        Database* database = autoColl.getDb();
         if (!database) {
             return {ErrorCodes::NamespaceNotFound, "database in ns does not exist: " + nss.ns()};
         }
-        Collection* collection = database->getCollection(opCtx, nss);
+        Collection* collection = autoColl.getCollection();
         if (!collection) {
             return {ErrorCodes::NamespaceNotFound, "collection in ns does not exist: " + nss.ns()};
         }
+
+        BSONObj realres;
+        auto qrStatus = QueryRequest::fromLegacyQuery(nss, preCondition["q"].Obj(), {}, 0, 0, 0);
+        if (!qrStatus.isOK()) {
+            return qrStatus.getStatus();
+        }
+        auto recordId = Helpers::findOne(
+            opCtx, autoColl.getCollection(), std::move(qrStatus.getValue()), false);
+        if (!recordId.isNull()) {
+            realres = collection->docFor(opCtx, recordId).value();
+        }
+
+
+        // Get collection default collation.
         const CollatorInterface* collator = collection->getDefaultCollator();
 
-        // doTxn does not allow any extensions, such as $text, $where, $geoNear, $near,
-        // $nearSphere, or $expr.
         boost::intrusive_ptr<ExpressionContext> expCtx(new ExpressionContext(opCtx, collator));
         Matcher matcher(preCondition["res"].Obj(), std::move(expCtx));
         if (!matcher.matches(realres)) {
@@ -278,7 +303,8 @@ Status doTxn(OperationContext* opCtx,
         ErrorCodes::InvalidOptions, "doTxn supports only CRUD opts.", _areOpsCrudOnly(doTxnCmd));
     auto hasPrecondition = _hasPrecondition(doTxnCmd);
 
-    Lock::GlobalWrite globalWriteLock(opCtx);
+    // Acquire global lock in IX mode so that the replication state check will remain valid.
+    Lock::GlobalLock globalLock(opCtx, MODE_IX, Date_t::max());
 
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     bool userInitiatedWritesAndNotPrimary =
@@ -287,13 +313,6 @@ Status doTxn(OperationContext* opCtx,
     if (userInitiatedWritesAndNotPrimary)
         return Status(ErrorCodes::NotMaster,
                       str::stream() << "Not primary while applying ops to database " << dbName);
-
-    if (hasPrecondition) {
-        auto status = _checkPrecondition(opCtx, doTxnCmd, result);
-        if (!status.isOK()) {
-            return status;
-        }
-    }
 
     int numApplied = 0;
 
@@ -305,7 +324,16 @@ Status doTxn(OperationContext* opCtx,
                 repl::ReplicationCoordinator::modeMasterSlave != replCoord->getReplicationMode()) {
                 opsBuilder = stdx::make_unique<BSONArrayBuilder>();
             }
+            // The write unit of work guarantees snapshot isolation for precondition check and the
+            // write.
             WriteUnitOfWork wunit(opCtx);
+
+            // Check precondition in the same write unit of work so that they share the same
+            // snapshot.
+            if (hasPrecondition) {
+                uassertStatusOK(_checkPrecondition(opCtx, doTxnCmd, result));
+            }
+
             numApplied = 0;
             {
                 // Suppress replication for atomic operations until end of doTxn.

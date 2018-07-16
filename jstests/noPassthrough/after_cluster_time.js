@@ -1,4 +1,5 @@
 // This test verifies readConcern:afterClusterTime behavior on a standalone mongod.
+// @tags: [requires_replication]
 (function() {
     "use strict";
     var standalone =
@@ -68,4 +69,5 @@
         ErrorCodes.InvalidOptions,
         "expected afterClusterTime fail in serverStatus");
 
+    rst.stopSet();
 }());

@@ -123,9 +123,6 @@ public:
     virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern);
 
-    virtual ReplicationCoordinator::StatusAndDuration awaitReplicationOfLastOpForClient(
-        OperationContext* opCtx, const WriteConcernOptions& writeConcern);
-
     virtual Status stepDown(OperationContext* opCtx,
                             bool force,
                             const Milliseconds& waitTime,
@@ -301,7 +298,7 @@ public:
 
     virtual Status updateTerm(OperationContext* opCtx, long long term) override;
 
-    virtual Timestamp reserveSnapshotName(OperationContext* opCtx) override;
+    virtual Timestamp getMinimumVisibleSnapshot(OperationContext* opCtx) override;
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
 
@@ -617,7 +614,6 @@ private:
     Status _awaitReplication_inlock(stdx::unique_lock<stdx::mutex>* lock,
                                     OperationContext* opCtx,
                                     const OpTime& opTime,
-                                    Timestamp minSnapshot,
                                     const WriteConcernOptions& writeConcern);
 
     /**
@@ -627,7 +623,6 @@ private:
      * minSnapshot.
      */
     bool _doneWaitingForReplication_inlock(const OpTime& opTime,
-                                           Timestamp minSnapshot,
                                            const WriteConcernOptions& writeConcern);
 
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;

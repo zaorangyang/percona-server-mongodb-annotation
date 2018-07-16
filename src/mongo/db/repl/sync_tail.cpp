@@ -29,7 +29,6 @@
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
 #include "mongo/platform/basic.h"
-#include "mongo/platform/bits.h"
 
 #include "mongo/db/repl/sync_tail.h"
 
@@ -41,6 +40,7 @@
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -54,9 +54,11 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/prefetch.h"
 #include "mongo/db/query/query_knobs.h"
+#include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/initial_syncer.h"
 #include "mongo/db/repl/multiapplier.h"
@@ -91,17 +93,10 @@ AtomicInt32 SyncTail::replBatchLimitOperations{50 * 1000};
 namespace {
 
 /**
- * This variable determines the number of writer threads SyncTail will have. It has a default value,
- * which varies based on architecture and can be overridden using the "replWriterThreadCount" server
- * parameter.
+ * This variable determines the number of writer threads SyncTail will have. It can be overridden
+ * using the "replWriterThreadCount" server parameter.
  */
-#if defined(MONGO_PLATFORM_64)
 int replWriterThreadCount = 16;
-#elif defined(MONGO_PLATFORM_32)
-int replWriterThreadCount = 2;
-#else
-#error need to include something that defines MONGO_PLATFORM_XX
-#endif
 
 class ExportedWriterThreadCountParameter
     : public ExportedServerParameter<int, ServerParameterType::kStartupOnly> {
@@ -272,19 +267,26 @@ void ApplyBatchFinalizerForJournal::_run() {
     }
 }
 
-NamespaceString parseUUIDOrNs(OperationContext* opCtx, const BSONObj& o) {
-    auto statusWithUUID = UUID::parse(o.getField("ui"));
-    if (!statusWithUUID.isOK()) {
-        return NamespaceString(o.getStringField("ns"));
+NamespaceString parseUUIDOrNs(OperationContext* opCtx, const OplogEntry& oplogEntry) {
+    auto optionalUuid = oplogEntry.getUuid();
+    if (!optionalUuid) {
+        return oplogEntry.getNamespace();
     }
 
-    const auto& uuid = statusWithUUID.getValue();
+    const auto& uuid = optionalUuid.get();
     auto& catalog = UUIDCatalog::get(opCtx);
     auto nss = catalog.lookupNSSByUUID(uuid);
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "No namespace with UUID " << uuid.toString(),
             !nss.isEmpty());
     return nss;
+}
+
+NamespaceStringOrUUID getNsOrUUID(const NamespaceString& nss, const BSONObj& op) {
+    if (auto ui = op["ui"]) {
+        return {nss.db(), uassertStatusOK(UUID::parse(ui))};
+    }
+    return {nss};
 }
 
 }  // namespace
@@ -355,39 +357,24 @@ Status SyncTail::syncApply(OperationContext* opCtx,
 
     if (isCrudOpType(opType)) {
         return writeConflictRetry(opCtx, "syncApply_CRUD", nss.ns(), [&] {
-            // DB lock always acquires the global lock
-            Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
-            auto ui = op["ui"];
-            NamespaceString actualNss = nss;
-            if (ui) {
-                auto statusWithUUID = UUID::parse(ui);
-                if (!statusWithUUID.isOK())
-                    return statusWithUUID.getStatus();
-                // We may be replaying operations on a collection that was renamed since. If so,
-                // it must have been in the same database or it would have gotten a new UUID.
-                // Need to throw instead of returning a status for it to be properly ignored.
-                actualNss = UUIDCatalog::get(opCtx).lookupNSSByUUID(statusWithUUID.getValue());
-                uassert(ErrorCodes::NamespaceNotFound,
-                        str::stream() << "Failed to apply operation due to missing collection ("
-                                      << statusWithUUID.getValue()
-                                      << "): "
-                                      << redact(op.toString()),
-                        !actualNss.isEmpty());
-                dassert(actualNss.db() == nss.db());
-            }
-            Lock::CollectionLock collLock(opCtx->lockState(), actualNss.ns(), MODE_IX);
-
             // Need to throw instead of returning a status for it to be properly ignored.
-            Database* db = dbHolder().get(opCtx, actualNss.db());
-            uassert(ErrorCodes::NamespaceNotFound,
-                    str::stream() << "Failed to apply operation due to missing database ("
-                                  << actualNss.db()
-                                  << "): "
-                                  << redact(op.toString()),
-                    db);
-
-            OldClientContext ctx(opCtx, actualNss.ns(), db, /*justCreated*/ false);
-            return applyOp(ctx.db());
+            try {
+                AutoGetCollection autoColl(opCtx, getNsOrUUID(nss, op), MODE_IX);
+                auto db = autoColl.getDb();
+                uassert(ErrorCodes::NamespaceNotFound,
+                        str::stream() << "missing database (" << nss.db() << ")",
+                        db);
+                OldClientContext ctx(opCtx, autoColl.getNss().ns(), db, /*justCreated*/ false);
+                return applyOp(ctx.db());
+            } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
+                // Delete operations on non-existent namespaces can be treated as successful for
+                // idempotency reasons.
+                if (opType[0] == 'd') {
+                    return Status::OK();
+                }
+                ex.addContext(str::stream() << "Failed to apply operation: " << redact(op));
+                throw;
+            }
         });
     }
 
@@ -424,20 +411,20 @@ Status SyncTail::syncApply(OperationContext* opCtx,
 namespace {
 
 // The pool threads call this to prefetch each op
-void prefetchOp(const BSONObj& op) {
+void prefetchOp(const OplogEntry& oplogEntry) {
     initializePrefetchThread();
 
-    const char* ns = op.getStringField("ns");
-    if (ns && (ns[0] != '\0')) {
+    const auto& nss = oplogEntry.getNamespace();
+    if (!nss.isEmpty()) {
         try {
             // one possible tweak here would be to stay in the read lock for this database
             // for multiple prefetches if they are for the same database.
             const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
             OperationContext& opCtx = *opCtxPtr;
-            AutoGetCollectionForReadCommand ctx(&opCtx, NamespaceString(ns));
+            AutoGetCollectionForReadCommand ctx(&opCtx, nss);
             Database* db = ctx.getDb();
             if (db) {
-                prefetchPagesForReplicatedOp(&opCtx, db, op);
+                prefetchPagesForReplicatedOp(&opCtx, db, oplogEntry);
             }
         } catch (const DBException& e) {
             LOG(2) << "ignoring exception in prefetchOp(): " << redact(e) << endl;
@@ -452,7 +439,7 @@ void prefetchOp(const BSONObj& op) {
 void prefetchOps(const MultiApplier::Operations& ops, OldThreadPool* prefetcherPool) {
     invariant(prefetcherPool);
     for (auto&& op : ops) {
-        prefetcherPool->schedule([&] { prefetchOp(op.raw); });
+        prefetcherPool->schedule([&] { prefetchOp(op); });
     }
     prefetcherPool->join();
 }
@@ -625,15 +612,10 @@ private:
  * ops - This only modifies the isForCappedCollection field on each op. It does not alter the ops
  *      vector in any other way.
  * writerVectors - Set of operations for each worker thread to apply.
- * latestSessionRecords - Populated map of the "latest" transaction table records for each logical
- *      session id present in the given operations. Each record represents the final state of the
- *      transaction table entry for that session id after the operations are applied.
  */
-void fillWriterVectorsAndLatestSessionRecords(
-    OperationContext* opCtx,
-    MultiApplier::Operations* ops,
-    std::vector<MultiApplier::OperationPtrs>* writerVectors,
-    SessionRecordMap* latestSessionRecords) {
+void fillWriterVectors(OperationContext* opCtx,
+                       MultiApplier::Operations* ops,
+                       std::vector<MultiApplier::OperationPtrs>* writerVectors) {
     const auto serviceContext = opCtx->getServiceContext();
     const auto storageEngine = serviceContext->getGlobalStorageEngine();
 
@@ -669,6 +651,23 @@ void fillWriterVectorsAndLatestSessionRecords(
             }
         }
 
+        auto& writer = (*writerVectors)[hash % numWriters];
+        if (writer.empty()) {
+            writer.reserve(8);  // Skip a few growth rounds
+        }
+        writer.push_back(&op);
+    }
+}
+
+/**
+ * Returns a map of the "latest" transaction table records for each logical session id present in
+ * the given operations. Each record represents the final state of the transaction table entry for
+ * that session id after the operations are applied.
+ */
+SessionRecordMap getLatestSessionRecords(const MultiApplier::Operations& ops) {
+    SessionRecordMap latestSessionRecords;
+
+    for (auto&& op : ops) {
         const auto& sessionInfo = op.getOperationSessionInfo();
         if (sessionInfo.getTxnNumber()) {
             const auto& lsid = *sessionInfo.getSessionId();
@@ -680,24 +679,23 @@ void fillWriterVectorsAndLatestSessionRecords(
             invariant(op.getWallClockTime());
             record.setLastWriteDate(*op.getWallClockTime());
 
-            auto it = latestSessionRecords->find(lsid);
-            if (it == latestSessionRecords->end()) {
-                latestSessionRecords->emplace(lsid, std::move(record));
+            auto it = latestSessionRecords.find(lsid);
+            if (it == latestSessionRecords.end()) {
+                latestSessionRecords.emplace(lsid, std::move(record));
             } else if (isSessionTxnRecordLaterThan(record, it->second)) {
-                (*latestSessionRecords)[lsid] = std::move(record);
+                latestSessionRecords[lsid] = std::move(record);
             }
         }
-
-        auto& writer = (*writerVectors)[hash % numWriters];
-        if (writer.empty()) {
-            writer.reserve(8);  // Skip a few growth rounds
-        }
-        writer.push_back(&op);
     }
+
+    return latestSessionRecords;
 }
 
 }  // namespace
 
+OpTime SyncTail::multiApply_forTest(OperationContext* opCtx, MultiApplier::Operations ops) {
+    return multiApply(opCtx, ops);
+}
 /**
  * Applies a batch of oplog entries by writing the oplog entries to the local oplog and then using
  * a set of threads to apply the operations. If the batch application is successful, returns the
@@ -713,8 +711,26 @@ OpTime SyncTail::multiApply(OperationContext* opCtx, MultiApplier::Operations op
         // _applyFunc() will throw or abort on error, so we return OK here.
         return Status::OK();
     };
-    return fassertStatusOK(
+    Timestamp firstTimeInBatch = ops.front().getTimestamp();
+
+    OpTime finalOpTime = fassertStatusOK(
         34437, repl::multiApply(opCtx, _writerPool.get(), std::move(ops), applyOperation));
+
+    invariant(!MultikeyPathTracker::get(opCtx).isTrackingMultikeyPathInfo());
+    // Set any indexes to multikey that this batch ignored.
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    for (MultikeyPathInfo info : _multikeyPathInfo) {
+        // We timestamp every multikey write with the first timestamp in the batch. It is always
+        // safe to set an index as multikey too early, just not too late. We conservatively pick
+        // the first timestamp in the batch since we do not have enough information to find out
+        // the timestamp of the first write that set the given multikey path.
+        fassertStatusOK(50686,
+                        StorageInterface::get(opCtx)->setIndexIsMultikey(
+                            opCtx, info.nss, info.indexName, info.multikeyPaths, firstTimeInBatch));
+    }
+    _multikeyPathInfo.clear();
+
+    return finalOpTime;
 }
 
 namespace {
@@ -928,10 +944,8 @@ void SyncTail::oplogApplication(ReplicationCoordinator* replCoord) {
         }
 
         // Extract some info from ops that we'll need after releasing the batch below.
-        const auto firstOpTimeInBatch =
-            fassertStatusOK(40299, OpTime::parseFromOplogEntry(ops.front().raw));
-        const auto lastOpTimeInBatch =
-            fassertStatusOK(28773, OpTime::parseFromOplogEntry(ops.back().raw));
+        const auto firstOpTimeInBatch = ops.front().getOpTime();
+        const auto lastOpTimeInBatch = ops.back().getOpTime();
 
         // Make sure the oplog doesn't go back in time or repeat an entry.
         if (firstOpTimeInBatch <= replCoord->getMyLastAppliedOpTime()) {
@@ -1029,7 +1043,7 @@ bool SyncTail::tryPopAndWaitForMore(OperationContext* opCtx,
     int curVersion = entry.getVersion();
     if (curVersion != OplogEntry::kOplogVersion) {
         severe() << "expected oplog version " << OplogEntry::kOplogVersion << " but found version "
-                 << curVersion << " in oplog entry: " << redact(entry.raw);
+                 << curVersion << " in oplog entry: " << redact(entry.toBSON());
         fassertFailedNoTrace(18820);
     }
 
@@ -1079,7 +1093,7 @@ OldThreadPool* SyncTail::getWriterPool() {
     return _writerPool.get();
 }
 
-BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, const BSONObj& o) {
+BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, const OplogEntry& oplogEntry) {
     OplogReader missingObjReader;  // why are we using OplogReader to run a non-oplog query?
 
     if (MONGO_FAIL_POINT(initialSyncHangBeforeGettingMissingDocument)) {
@@ -1103,35 +1117,34 @@ BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, const BSONObj& o) {
                           << "sync source, attempt " << retryCount << " of " << retryMax << endl;
                 continue;  // try again
             }
-        } catch (const SocketException&) {
+        } catch (const NetworkException&) {
             warning() << "network problem detected while connecting to the "
                       << "sync source, attempt " << retryCount << " of " << retryMax << endl;
             continue;  // try again
         }
 
         // get _id from oplog entry to create query to fetch document.
-        const BSONElement opElem = o.getField("op");
-        const bool isUpdate = !opElem.eoo() && opElem.str() == "u";
-        const BSONElement idElem = o.getObjectField(isUpdate ? "o2" : "o")["_id"];
+        const auto idElem = oplogEntry.getIdElement();
 
         if (idElem.eoo()) {
-            severe() << "cannot fetch missing document without _id field: " << redact(o);
+            severe() << "cannot fetch missing document without _id field: "
+                     << redact(oplogEntry.toBSON());
             fassertFailedNoTrace(28742);
         }
 
         BSONObj query = BSONObjBuilder().append(idElem).obj();
         BSONObj missingObj;
-        const char* ns = o.getStringField("ns");
+        auto nss = oplogEntry.getNamespace();
         try {
-            if (o.getField("ui").eoo()) {
-                missingObj = missingObjReader.findOne(ns, query);
+            auto uuid = oplogEntry.getUuid();
+            if (!uuid) {
+                missingObj = missingObjReader.findOne(nss.ns().c_str(), query);
             } else {
-                auto uuid = uassertStatusOK(UUID::parse(o.getField("ui")));
-                auto dbname = nsToDatabaseSubstring(ns);
+                auto dbname = nss.db();
                 // If a UUID exists for the command object, find the document by UUID.
-                missingObj = missingObjReader.findOneByUUID(dbname.toString(), uuid, query);
+                missingObj = missingObjReader.findOneByUUID(dbname.toString(), *uuid, query);
             }
-        } catch (const SocketException&) {
+        } catch (const NetworkException&) {
             warning() << "network problem detected while fetching a missing document from the "
                       << "sync source, attempt " << retryCount << " of " << retryMax << endl;
             continue;  // try again
@@ -1148,11 +1161,12 @@ BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, const BSONObj& o) {
                 str::stream() << "Can no longer connect to initial sync source: " << _hostname);
 }
 
-bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx, const BSONObj& o) {
+bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx,
+                                             const OplogEntry& oplogEntry) {
     // Note that using the local UUID/NamespaceString mapping is sufficient for checking
     // whether the collection is capped on the remote because convertToCapped creates a
     // new collection with a different UUID.
-    const NamespaceString nss(parseUUIDOrNs(opCtx, o));
+    const NamespaceString nss(parseUUIDOrNs(opCtx, oplogEntry));
 
     {
         // If the document is in a capped collection then it's okay for it to be missing.
@@ -1164,14 +1178,17 @@ bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx, const BSON
         }
     }
 
-    log() << "Fetching missing document: " << redact(o);
-    BSONObj missingObj = getMissingDoc(opCtx, o);
+    log() << "Fetching missing document: " << redact(oplogEntry.toBSON());
+    BSONObj missingObj = getMissingDoc(opCtx, oplogEntry);
 
     if (missingObj.isEmpty()) {
+        BSONObj object2;
+        if (auto optionalObject2 = oplogEntry.getObject2()) {
+            object2 = *optionalObject2;
+        }
         log() << "Missing document not found on source; presumably deleted later in oplog. o first "
                  "field: "
-              << o.getObjectField("o").firstElementFieldName()
-              << ", o2: " << redact(o.getObjectField("o2"));
+              << redact(oplogEntry.getObject()) << ", o2: " << redact(object2);
 
         return false;
     }
@@ -1184,7 +1201,8 @@ bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx, const BSON
         WriteUnitOfWork wunit(opCtx);
 
         Collection* coll = nullptr;
-        if (o.getField("ui").eoo()) {
+        auto uuid = oplogEntry.getUuid();
+        if (!uuid) {
             if (!db) {
                 return false;
             }
@@ -1192,9 +1210,8 @@ bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx, const BSON
         } else {
             // If the oplog entry has a UUID, use it to find the collection in which to insert the
             // missing document.
-            auto uuid = uassertStatusOK(UUID::parse(o.getField("ui")));
             auto& catalog = UUIDCatalog::get(opCtx);
-            coll = catalog.lookupCollectionByUUID(uuid);
+            coll = catalog.lookupCollectionByUUID(*uuid);
             if (!coll) {
                 // TODO(SERVER-30819) insert this UUID into the missing UUIDs set.
                 return false;
@@ -1216,8 +1233,16 @@ bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx, const BSON
     });
 }
 
+void SyncTail::addMultikeyPathInfo(std::vector<MultikeyPathInfo> infoList) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    _multikeyPathInfo.reserve(_multikeyPathInfo.size() + infoList.size());
+    for (MultikeyPathInfo info : infoList) {
+        _multikeyPathInfo.emplace_back(info);
+    }
+}
+
 // This free function is used by the writer threads to apply each op
-void multiSyncApply(MultiApplier::OperationPtrs* ops, SyncTail*) {
+void multiSyncApply(MultiApplier::OperationPtrs* ops, SyncTail* st) {
     initializeWriterThread();
     auto opCtx = cc().makeOperationContext();
     auto syncApply = [](
@@ -1225,7 +1250,14 @@ void multiSyncApply(MultiApplier::OperationPtrs* ops, SyncTail*) {
         return SyncTail::syncApply(opCtx, op, oplogApplicationMode);
     };
 
+    ON_BLOCK_EXIT(
+        [&opCtx] { MultikeyPathTracker::get(opCtx.get()).stopTrackingMultikeyPathInfo(); });
+    MultikeyPathTracker::get(opCtx.get()).startTrackingMultikeyPathInfo();
     fassertNoTrace(16359, multiSyncApply_noAbort(opCtx.get(), ops, syncApply));
+
+    if (!MultikeyPathTracker::get(opCtx.get()).getMultikeyPathInfo().empty()) {
+        st->addMultikeyPathInfo(MultikeyPathTracker::get(opCtx.get()).getMultikeyPathInfo());
+    }
 }
 
 Status multiSyncApply_noAbort(OperationContext* opCtx,
@@ -1391,26 +1423,18 @@ Status multiSyncApply_noAbort(OperationContext* opCtx,
             const Status status = syncApply(opCtx, entry->raw, oplogApplicationMode);
 
             if (!status.isOK()) {
-                severe() << "Error applying operation (" << redact(entry->raw)
+                severe() << "Error applying operation (" << redact(entry->toBSON())
                          << "): " << causedBy(redact(status));
                 return status;
             }
         } catch (const DBException& e) {
             severe() << "writer worker caught exception: " << redact(e)
-                     << " on: " << redact(entry->raw);
+                     << " on: " << redact(entry->toBSON());
             return e.toStatus();
         }
     }
 
     return Status::OK();
-}
-
-// This free function is used by the initial sync writer threads to apply each op
-void multiInitialSyncApply_abortOnFailure(MultiApplier::OperationPtrs* ops, SyncTail* st) {
-    initializeWriterThread();
-    auto opCtx = cc().makeOperationContext();
-    AtomicUInt32 fetchCount(0);
-    fassertNoTrace(15915, multiInitialSyncApply_noAbort(opCtx.get(), ops, st, &fetchCount));
 }
 
 Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
@@ -1427,43 +1451,59 @@ Status multiInitialSyncApply_noAbort(OperationContext* opCtx,
                                      AtomicUInt32* fetchCount) {
     UnreplicatedWritesBlock uwb(opCtx);
     DisableDocumentValidation validationDisabler(opCtx);
+    {  // Ensure that the MultikeyPathTracker stops tracking paths.
+        ON_BLOCK_EXIT([opCtx] { MultikeyPathTracker::get(opCtx).stopTrackingMultikeyPathInfo(); });
+        MultikeyPathTracker::get(opCtx).startTrackingMultikeyPathInfo();
 
-    // allow us to get through the magic barrier
-    opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
+        // allow us to get through the magic barrier
+        opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
 
-    for (auto it = ops->begin(); it != ops->end(); ++it) {
-        auto& entry = **it;
-        try {
-            const Status s =
-                SyncTail::syncApply(opCtx, entry.raw, OplogApplication::Mode::kInitialSync);
-            if (!s.isOK()) {
-                // In initial sync, update operations can cause documents to be missed during
-                // collection cloning. As a result, it is possible that a document that we need to
-                // update is not present locally. In that case we fetch the document from the
-                // sync source.
-                if (s != ErrorCodes::UpdateOperationFailed) {
-                    error() << "Error applying operation: " << redact(s) << " ("
-                            << redact(entry.raw) << ")";
-                    return s;
+        for (auto it = ops->begin(); it != ops->end(); ++it) {
+            auto& entry = **it;
+            try {
+                const Status s =
+                    SyncTail::syncApply(opCtx, entry.raw, OplogApplication::Mode::kInitialSync);
+                if (!s.isOK()) {
+                    // In initial sync, update operations can cause documents to be missed during
+                    // collection cloning. As a result, it is possible that a document that we need
+                    // to update is not present locally. In that case we fetch the document from the
+                    // sync source.
+                    if (s != ErrorCodes::UpdateOperationFailed) {
+                        error() << "Error applying operation: " << redact(s) << " ("
+                                << redact(entry.toBSON()) << ")";
+                        return s;
+                    }
+
+                    // We might need to fetch the missing docs from the sync source.
+                    fetchCount->fetchAndAdd(1);
+                    st->fetchAndInsertMissingDocument(opCtx, entry);
+                }
+            } catch (const DBException& e) {
+                // SERVER-24927 If we have a NamespaceNotFound exception, then this document will be
+                // dropped before initial sync ends anyways and we should ignore it.
+                if (e.code() == ErrorCodes::NamespaceNotFound && entry.isCrudOpType()) {
+                    continue;
                 }
 
-                // We might need to fetch the missing docs from the sync source.
-                fetchCount->fetchAndAdd(1);
-                st->fetchAndInsertMissingDocument(opCtx, entry.raw);
+                severe() << "writer worker caught exception: " << causedBy(redact(e))
+                         << " on: " << redact(entry.toBSON());
+                return e.toStatus();
             }
-        } catch (const DBException& e) {
-            // SERVER-24927 If we have a NamespaceNotFound exception, then this document will be
-            // dropped before initial sync ends anyways and we should ignore it.
-            if (e.code() == ErrorCodes::NamespaceNotFound && entry.isCrudOpType()) {
-                continue;
-            }
-
-            severe() << "writer worker caught exception: " << causedBy(redact(e))
-                     << " on: " << redact(entry.raw);
-            return e.toStatus();
         }
     }
 
+    invariant(!MultikeyPathTracker::get(opCtx).isTrackingMultikeyPathInfo());
+    // Set any indexes to multikey that this batch ignored.
+    Timestamp firstTimeInBatch = ops->front()->getTimestamp();
+    for (MultikeyPathInfo info : MultikeyPathTracker::get(opCtx).getMultikeyPathInfo()) {
+        // We timestamp every multikey write with the first timestamp in the batch. It is always
+        // safe to set an index as multikey too early, just not too late. We conservatively pick
+        // the first timestamp in the batch since we do not have enough information to find out
+        // the timestamp of the first write that set the given multikey path.
+        fassertStatusOK(50685,
+                        StorageInterface::get(opCtx)->setIndexIsMultikey(
+                            opCtx, info.nss, info.indexName, info.multikeyPaths, firstTimeInBatch));
+    }
     return Status::OK();
 }
 
@@ -1517,10 +1557,29 @@ StatusWith<OpTime> multiApply(OperationContext* opCtx,
         consistencyMarkers->setOplogTruncateAfterPoint(opCtx, ops.front().getTimestamp());
         scheduleWritesToOplog(opCtx, workerPool, ops);
 
+        // Used by fillWriterVectors() only. May be overridden to point to extracted applyOps
+        // operations.
+        MultiApplier::Operations* opsPtr = &ops;
+
+        // Holds extracted applyOps operations.
+        // The operations in 'applyOpsOperations', rather than the original applyOps command, will
+        // be processed by the writer threads.
+        MultiApplier::Operations applyOpsOperations;
+        const auto& firstOplogEntry = ops.front();
+        if (storageEngine->supportsDocLocking() && firstOplogEntry.isCommand() &&
+            OplogEntry::CommandType::kApplyOps == firstOplogEntry.getCommandType()) {
+            try {
+                applyOpsOperations = ApplyOps::extractOperations(firstOplogEntry);
+                opsPtr = &applyOpsOperations;
+            } catch (...) {
+                warning() << "Unable to extract operations from applyOps "
+                          << redact(firstOplogEntry.toBSON()) << ": " << exceptionToStatus()
+                          << ". Applying as standalone command.";
+            }
+        }
+
         std::vector<MultiApplier::OperationPtrs> writerVectors(workerPool->getNumThreads());
-        SessionRecordMap latestSessionRecords;
-        fillWriterVectorsAndLatestSessionRecords(
-            opCtx, &ops, &writerVectors, &latestSessionRecords);
+        fillWriterVectors(opCtx, opsPtr, &writerVectors);
 
         // Wait for writes to finish before applying ops.
         workerPool->join();
@@ -1533,6 +1592,7 @@ StatusWith<OpTime> multiApply(OperationContext* opCtx,
         workerPool->join();
 
         // Update the transaction table to point to the latest oplog entries for each session id.
+        const auto latestSessionRecords = getLatestSessionRecords(ops);
         scheduleTxnTableUpdates(opCtx, workerPool, latestSessionRecords);
         workerPool->join();
 

@@ -68,21 +68,21 @@ public:
 
     virtual void addRequiredPrivileges(const std::string&,
                                        const BSONObj&,
-                                       std::vector<Privilege>*) {}
+                                       std::vector<Privilege>*) const {}
 
-    void redactForLogging(mutablebson::Document* cmdObj) override;
+    void redactForLogging(mutablebson::Document* cmdObj) const override;
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& db,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result);
 
-    virtual void help(stringstream& help) const;
+    virtual std::string help() const override;
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     bool requiresAuth() const override {
         return false;
@@ -96,19 +96,19 @@ public:
 
     virtual void addRequiredPrivileges(const std::string&,
                                        const BSONObj&,
-                                       std::vector<Privilege>*) {}
+                                       std::vector<Privilege>*) const {}
 
     virtual bool run(OperationContext* opCtx,
                      const std::string& db,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result);
 
-    virtual void help(stringstream& help) const;
+    std::string help() const override;
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     bool requiresAuth() const override {
         return false;
@@ -254,11 +254,11 @@ Status doSaslContinue(const Client* client,
 CmdSaslStart::CmdSaslStart() : BasicCommand(saslStartCommandName) {}
 CmdSaslStart::~CmdSaslStart() {}
 
-void CmdSaslStart::help(std::stringstream& os) const {
-    os << "First step in a SASL authentication conversation.";
+std::string CmdSaslStart::help() const {
+    return "First step in a SASL authentication conversation.";
 }
 
-void CmdSaslStart::redactForLogging(mutablebson::Document* cmdObj) {
+void CmdSaslStart::redactForLogging(mutablebson::Document* cmdObj) const {
     mutablebson::Element element = mutablebson::findFirstChildNamed(cmdObj->root(), "payload");
     if (element.ok()) {
         element.setValueString("xxx").transitional_ignore();
@@ -285,7 +285,7 @@ bool CmdSaslStart::run(OperationContext* opCtx,
     session->setOpCtxt(opCtx);
 
     Status status = doSaslStart(client, session, db, cmdObj, &result);
-    appendCommandStatus(result, status);
+    CommandHelpers::appendCommandStatus(result, status);
 
     if (session->isDone()) {
         audit::logAuthentication(client,
@@ -301,8 +301,8 @@ bool CmdSaslStart::run(OperationContext* opCtx,
 CmdSaslContinue::CmdSaslContinue() : BasicCommand(saslContinueCommandName) {}
 CmdSaslContinue::~CmdSaslContinue() {}
 
-void CmdSaslContinue::help(std::stringstream& os) const {
-    os << "Subsequent steps in a SASL authentication conversation.";
+std::string CmdSaslContinue::help() const {
+    return "Subsequent steps in a SASL authentication conversation.";
 }
 
 bool CmdSaslContinue::run(OperationContext* opCtx,
@@ -314,7 +314,7 @@ bool CmdSaslContinue::run(OperationContext* opCtx,
     AuthenticationSession::swap(client, sessionGuard);
 
     if (!sessionGuard || sessionGuard->getType() != AuthenticationSession::SESSION_TYPE_SASL) {
-        return appendCommandStatus(
+        return CommandHelpers::appendCommandStatus(
             result, Status(ErrorCodes::ProtocolError, "No SASL session state found"));
     }
 
@@ -324,7 +324,7 @@ bool CmdSaslContinue::run(OperationContext* opCtx,
     // Authenticating the __system@local user to the admin database on mongos is required
     // by the auth passthrough test suite.
     if (session->getAuthenticationDatabase() != db && !Command::testCommandsEnabled) {
-        return appendCommandStatus(
+        return CommandHelpers::appendCommandStatus(
             result,
             Status(ErrorCodes::ProtocolError,
                    "Attempt to switch database target during SASL authentication."));
@@ -333,7 +333,7 @@ bool CmdSaslContinue::run(OperationContext* opCtx,
     session->setOpCtxt(opCtx);
 
     Status status = doSaslContinue(client, session, cmdObj, &result);
-    appendCommandStatus(result, status);
+    CommandHelpers::appendCommandStatus(result, status);
 
     if (session->isDone()) {
         audit::logAuthentication(client,

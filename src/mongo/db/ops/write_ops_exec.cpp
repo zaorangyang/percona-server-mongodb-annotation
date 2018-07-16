@@ -60,6 +60,7 @@
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/session_catalog.h"
@@ -82,6 +83,12 @@ MONGO_FP_DECLARE(failAllInserts);
 MONGO_FP_DECLARE(failAllUpdates);
 MONGO_FP_DECLARE(failAllRemoves);
 
+void updateRetryStats(OperationContext* opCtx, bool containsRetry) {
+    if (containsRetry) {
+        RetryableWritesStats::get(opCtx)->incrementRetriedCommandsCount();
+    }
+}
+
 void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
     try {
         curOp->done();
@@ -99,9 +106,9 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
                     curOp->isCommand(),
                     curOp->getReadWriteType());
 
-        if (!curOp->debug().exceptionInfo.isOK()) {
+        if (!curOp->debug().errInfo.isOK()) {
             LOG(3) << "Caught Assertion in " << redact(logicalOpToString(curOp->getLogicalOp()))
-                   << ": " << curOp->debug().exceptionInfo.toString();
+                   << ": " << curOp->debug().errInfo.toString();
         }
 
         const bool logAll = logger::globalLogDomain()->shouldLog(logger::LogComponent::kCommand,
@@ -199,38 +206,25 @@ bool handleError(OperationContext* opCtx,
                  WriteResult* out) {
     LastError::get(opCtx->getClient()).setLastError(ex.code(), ex.reason());
     auto& curOp = *CurOp::get(opCtx);
-    curOp.debug().exceptionInfo = ex.toStatus();
+    curOp.debug().errInfo = ex.toStatus();
 
     if (ErrorCodes::isInterruption(ex.code())) {
         throw;  // These have always failed the whole batch.
     }
 
-    if (ErrorCodes::isStaleShardingError(ex.code())) {
-        auto staleConfigException = dynamic_cast<const StaleConfigException*>(&ex);
-        if (!staleConfigException) {
-            // We need to get extra info off of the SCE, but some common patterns can result in the
-            // exception being converted to a Status then rethrown as a AssertionException, losing
-            // the info we need. It would be a bug if this happens so we want to detect it in
-            // testing, but it isn't severe enough that we should bring down the server if it
-            // happens in production.
-            dassert(staleConfigException);
-            msgasserted(35475,
-                        str::stream()
-                            << "Got a StaleConfig error but exception was the wrong type: "
-                            << demangleName(typeid(ex)));
-        }
-
+    if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
         if (!opCtx->getClient()->isInDirectClient()) {
             ShardingState::get(opCtx)
-                ->onStaleShardVersion(opCtx, nss, staleConfigException->getVersionReceived())
-                .transitional_ignore();
+                ->onStaleShardVersion(opCtx, nss, staleInfo->getVersionReceived())
+                .ignore();  // We already have an error to report so ignore this one.
         }
-        out->staleConfigException = stdx::make_unique<StaleConfigException>(*staleConfigException);
+        // Don't try doing more ops since they will fail with the same error.
+        // Command reply serializer will handle repeating this error if needed.
+        out->results.emplace_back(ex.toStatus());
         return false;
     }
 
     out->results.emplace_back(ex.toStatus());
-
     return !wholeOp.getOrdered();
 }
 
@@ -255,7 +249,7 @@ SingleWriteResult createIndex(OperationContext* opCtx,
     cmdBuilder << "createIndexes" << ns.coll();
     cmdBuilder << "indexes" << BSON_ARRAY(spec);
 
-    auto cmdResult = Command::runCommandDirectly(
+    auto cmdResult = CommandHelpers::runCommandDirectly(
         opCtx, OpMsgRequest::fromDBAndBody(systemIndexes.db(), cmdBuilder.obj()));
     uassertStatusOK(getStatusFromCommandResult(cmdResult));
 
@@ -472,6 +466,9 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
     WriteResult out;
     out.results.reserve(wholeOp.getDocuments().size());
 
+    bool containsRetry = false;
+    ON_BLOCK_EXIT([&] { updateRetryStats(opCtx, containsRetry); });
+
     size_t stmtIdIndex = 0;
     size_t bytesInBatch = 0;
     std::vector<InsertStatement> batch;
@@ -491,6 +488,8 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
                 auto session = OperationContextSession::get(opCtx);
                 if (session->checkStatementExecutedNoOplogEntryFetch(*opCtx->getTxnNumber(),
                                                                      stmtId)) {
+                    containsRetry = true;
+                    RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
                     out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
                     continue;
                 }
@@ -630,6 +629,9 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
     LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
+    bool containsRetry = false;
+    ON_BLOCK_EXIT([&] { updateRetryStats(opCtx, containsRetry); });
+
     size_t stmtIdIndex = 0;
     WriteResult out;
     out.results.reserve(wholeOp.getUpdates().size());
@@ -640,6 +642,8 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
             auto session = OperationContextSession::get(opCtx);
             if (auto entry =
                     session->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {
+                containsRetry = true;
+                RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
                 out.results.emplace_back(parseOplogEntryForUpdate(*entry));
                 continue;
             }
@@ -758,6 +762,9 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
     LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
+    bool containsRetry = false;
+    ON_BLOCK_EXIT([&] { updateRetryStats(opCtx, containsRetry); });
+
     size_t stmtIdIndex = 0;
     WriteResult out;
     out.results.reserve(wholeOp.getDeletes().size());
@@ -767,6 +774,8 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
         if (opCtx->getTxnNumber()) {
             auto session = OperationContextSession::get(opCtx);
             if (session->checkStatementExecutedNoOplogEntryFetch(*opCtx->getTxnNumber(), stmtId)) {
+                containsRetry = true;
+                RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
                 out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
                 continue;
             }

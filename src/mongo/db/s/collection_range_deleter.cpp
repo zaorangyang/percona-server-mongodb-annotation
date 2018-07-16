@@ -188,10 +188,8 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
                 stdx::lock_guard<stdx::mutex> scopedLock(css->_metadataManager->_managerLock);
                 css->_metadataManager->_clearAllCleanups(
                     scopedLock,
-                    {e.code(),
-                     str::stream() << "cannot push startRangeDeletion record to Op Log,"
-                                      " abandoning scheduled range deletions: "
-                                   << e.what()});
+                    e.toStatus("cannot push startRangeDeletion record to Op Log,"
+                               " abandoning scheduled range deletions"));
                 return boost::none;
             }
         }
@@ -331,7 +329,7 @@ StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
         if (state == PlanExecutor::FAILURE || state == PlanExecutor::DEAD) {
             warning() << PlanExecutor::statestr(state) << " - cursor error while trying to delete "
                       << redact(min) << " to " << redact(max) << " in " << nss << ": "
-                      << WorkingSetCommon::toStatusString(obj)
+                      << redact(WorkingSetCommon::toStatusString(obj))
                       << ", stats: " << Explain::getWinningPlanStats(exec.get());
             break;
         }

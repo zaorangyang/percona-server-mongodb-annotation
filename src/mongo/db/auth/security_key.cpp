@@ -76,12 +76,12 @@ bool setUpSecurityKey(const string& filename) {
     const auto password =
         mongo::createPasswordDigest(internalSecurity.user->getName().getUser().toString(), str);
 
-    BSONObj creds =
-        scram::generateCredentials(password, saslGlobalParams.scramIterationCount.load());
-    credentials.scram.iterationCount = creds[scram::iterationCountFieldName].Int();
-    credentials.scram.salt = creds[scram::saltFieldName].String();
-    credentials.scram.storedKey = creds[scram::storedKeyFieldName].String();
-    credentials.scram.serverKey = creds[scram::serverKeyFieldName].String();
+    auto creds = scram::SHA1Secrets::generateCredentials(
+        password, saslGlobalParams.scramSHA1IterationCount.load());
+    credentials.scram_sha1.iterationCount = creds[scram::kIterationCountFieldName].Int();
+    credentials.scram_sha1.salt = creds[scram::kSaltFieldName].String();
+    credentials.scram_sha1.storedKey = creds[scram::kStoredKeyFieldName].String();
+    credentials.scram_sha1.serverKey = creds[scram::kServerKeyFieldName].String();
 
     internalSecurity.user->setCredentials(credentials);
 

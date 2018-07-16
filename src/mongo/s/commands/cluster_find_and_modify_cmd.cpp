@@ -42,10 +42,10 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
-#include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -78,8 +78,8 @@ class FindAndModifyCmd : public BasicCommand {
 public:
     FindAndModifyCmd() : BasicCommand("findAndModify", "findandmodify") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool adminOnly() const override {
@@ -92,7 +92,7 @@ public:
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         find_and_modify::addPrivilegesRequiredForFindAndModify(this, dbname, cmdObj, out);
     }
 
@@ -101,7 +101,7 @@ public:
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         auto routingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
@@ -152,7 +152,7 @@ public:
              const std::string& dbName,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(parseNsCollectionRequired(dbName, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         // findAndModify should only be creating database if upsert is true, but this would require
         // that the parsing be pulled into this function.
@@ -196,7 +196,8 @@ private:
             std::vector<AsyncRequestsSender::Request> requests;
             requests.emplace_back(
                 shardId,
-                appendShardVersion(filterCommandRequestForPassthrough(cmdObj), shardVersion));
+                appendShardVersion(CommandHelpers::filterCommandRequestForPassthrough(cmdObj),
+                                   shardVersion));
 
             AsyncRequestsSender ars(opCtx,
                                     Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
@@ -217,7 +218,7 @@ private:
         const auto responseStatus = getStatusFromCommandResult(response.data);
         if (ErrorCodes::isStaleShardingError(responseStatus.code())) {
             // Command code traps this exception and re-runs
-            throw StaleConfigException("findAndModify", response.data);
+            uassertStatusOK(responseStatus.withContext("findAndModify"));
         }
 
         // First append the properly constructed writeConcernError. It will then be skipped in
@@ -226,7 +227,8 @@ private:
             appendWriteConcernErrorToCmdResponse(shardId, wcErrorElem, *result);
         }
 
-        result->appendElementsUnique(filterCommandReplyForPassthrough(response.data));
+        result->appendElementsUnique(
+            CommandHelpers::filterCommandReplyForPassthrough(response.data));
     }
 
 } findAndModifyCmd;

@@ -95,8 +95,8 @@ public:
             const std::vector<BSONObj>& rawPipeline,
             const boost::intrusive_ptr<ExpressionContext>& expCtx,
             const MakePipelineOptions opts = MakePipelineOptions{}) final;
-        StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> attachCursorSourceToPipeline(
-            const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final;
+        Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                            Pipeline* pipeline) final;
         std::vector<BSONObj> getCurrentOps(OperationContext* opCtx,
                                            CurrentOpConnectionsMode connMode,
                                            CurrentOpUserMode userMode,
@@ -123,7 +123,7 @@ public:
          * collation.
          */
         std::unique_ptr<CollatorInterface> _getCollectionDefaultCollator(OperationContext* opCtx,
-                                                                         const NamespaceString& nss,
+                                                                         StringData dbName,
                                                                          UUID collectionUUID);
 
         DBDirectClient _client;

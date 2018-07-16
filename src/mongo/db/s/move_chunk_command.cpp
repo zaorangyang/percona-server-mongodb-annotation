@@ -43,8 +43,8 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
-#include "mongo/s/move_chunk_request.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
+#include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -76,12 +76,12 @@ class MoveChunkCommand : public BasicCommand {
 public:
     MoveChunkCommand() : BasicCommand("moveChunk") {}
 
-    void help(std::stringstream& help) const override {
-        help << "should not be calling this directly";
+    std::string help() const override {
+        return "should not be calling this directly";
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -94,7 +94,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -103,7 +103,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
     }
 
     bool run(OperationContext* opCtx,
@@ -151,7 +151,7 @@ public:
             // and the 3.4 shard, which failed to set the ChunkTooBig status code.
             // TODO: Remove after 3.6 is released.
             result.appendBool("chunkTooBig", true);
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         uassertStatusOK(status);

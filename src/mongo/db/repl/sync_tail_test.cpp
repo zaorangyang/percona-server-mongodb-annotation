@@ -107,7 +107,7 @@ repl::OplogEntry makeOplogEntry(StringData ns) {
 class SyncTailWithLocalDocumentFetcher : public SyncTail {
 public:
     SyncTailWithLocalDocumentFetcher(const BSONObj& document);
-    BSONObj getMissingDoc(OperationContext* opCtx, const BSONObj& o) override;
+    BSONObj getMissingDoc(OperationContext* opCtx, const OplogEntry& oplogEntry) override;
 
 private:
     BSONObj _document;
@@ -119,13 +119,14 @@ private:
 class SyncTailWithOperationContextChecker : public SyncTail {
 public:
     SyncTailWithOperationContextChecker();
-    bool fetchAndInsertMissingDocument(OperationContext* opCtx, const BSONObj& o) override;
+    bool fetchAndInsertMissingDocument(OperationContext* opCtx,
+                                       const OplogEntry& oplogEntry) override;
 };
 
 SyncTailWithLocalDocumentFetcher::SyncTailWithLocalDocumentFetcher(const BSONObj& document)
     : SyncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr), _document(document) {}
 
-BSONObj SyncTailWithLocalDocumentFetcher::getMissingDoc(OperationContext*, const BSONObj&) {
+BSONObj SyncTailWithLocalDocumentFetcher::getMissingDoc(OperationContext*, const OplogEntry&) {
     return _document;
 }
 
@@ -133,7 +134,7 @@ SyncTailWithOperationContextChecker::SyncTailWithOperationContextChecker()
     : SyncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr) {}
 
 bool SyncTailWithOperationContextChecker::fetchAndInsertMissingDocument(OperationContext* opCtx,
-                                                                        const BSONObj&) {
+                                                                        const OplogEntry&) {
     ASSERT_FALSE(opCtx->writesAreReplicated());
     ASSERT_FALSE(opCtx->lockState()->shouldConflictWithSecondaryBatchApplication());
     ASSERT_TRUE(documentValidationDisabled(opCtx));
@@ -168,6 +169,17 @@ void createCollection(OperationContext* opCtx,
         ASSERT_TRUE(coll);
         wuow.commit();
     });
+}
+
+/**
+ * Create test database.
+ */
+void createDatabase(OperationContext* opCtx, StringData dbName) {
+    Lock::GlobalWrite globalLock(opCtx);
+    bool justCreated;
+    Database* db = dbHolder().openDb(opCtx, dbName, &justCreated);
+    ASSERT_TRUE(db);
+    ASSERT_TRUE(justCreated);
 }
 
 auto parseFromOplogEntryArray(const BSONObj& obj, int elem) {
@@ -289,6 +301,40 @@ TEST_F(SyncTailTest, SyncApplyInsertDocumentDatabaseMissing) {
                        ErrorCodes::NamespaceNotFound);
 }
 
+TEST_F(SyncTailTest, SyncApplyDeleteDocumentDatabaseMissing) {
+    const BSONObj op = BSON("op"
+                            << "d"
+                            << "ns"
+                            << "test.othername");
+    _testSyncApplyCrudOperation(ErrorCodes::OK, op, false);
+}
+
+TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionLookupByUUIDFails) {
+    const NamespaceString nss("test.t");
+    createDatabase(_opCtx.get(), nss.db());
+    const BSONObj op = BSON("op"
+                            << "i"
+                            << "ns"
+                            << nss.getSisterNS("othername")
+                            << "ui"
+                            << UUID::gen());
+    ASSERT_THROWS_CODE(_testSyncApplyCrudOperation(ErrorCodes::OK, op, true),
+                       AssertionException,
+                       ErrorCodes::NamespaceNotFound);
+}
+
+TEST_F(SyncTailTest, SyncApplyDeleteDocumentCollectionLookupByUUIDFails) {
+    const NamespaceString nss("test.t");
+    createDatabase(_opCtx.get(), nss.db());
+    const BSONObj op = BSON("op"
+                            << "d"
+                            << "ns"
+                            << nss.getSisterNS("othername")
+                            << "ui"
+                            << UUID::gen());
+    _testSyncApplyCrudOperation(ErrorCodes::OK, op, false);
+}
+
 TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionMissing) {
     {
         Lock::GlobalWrite globalLock(_opCtx.get());
@@ -303,6 +349,19 @@ TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionMissing) {
     _testSyncApplyInsertDocument(ErrorCodes::OK);
 }
 
+TEST_F(SyncTailTest, SyncApplyDeleteDocumentCollectionMissing) {
+    const NamespaceString nss("test.t");
+    createDatabase(_opCtx.get(), nss.db());
+    // Even though the collection doesn't exist, this is handled in the actual application function,
+    // which in the case of this test just ignores such errors. This tests mostly that we don't
+    // implicitly create the collection and lock the database in MODE_X.
+    const BSONObj op = BSON("op"
+                            << "d"
+                            << "ns"
+                            << nss.ns());
+    _testSyncApplyCrudOperation(ErrorCodes::OK, op, true);
+}
+
 TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionExists) {
     {
         Lock::GlobalWrite globalLock(_opCtx.get());
@@ -314,6 +373,16 @@ TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionExists) {
         ASSERT_TRUE(collection);
     }
     _testSyncApplyInsertDocument(ErrorCodes::OK);
+}
+
+TEST_F(SyncTailTest, SyncApplyDeleteDocumentCollectionExists) {
+    const NamespaceString nss("test.t");
+    createCollection(_opCtx.get(), nss, {});
+    const BSONObj op = BSON("op"
+                            << "d"
+                            << "ns"
+                            << nss.ns());
+    _testSyncApplyCrudOperation(ErrorCodes::OK, op, true);
 }
 
 TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionLockedByUUID) {
@@ -336,7 +405,23 @@ TEST_F(SyncTailTest, SyncApplyInsertDocumentCollectionLockedByUUID) {
                             << "test.othername"
                             << "ui"
                             << options.uuid.get());
-    _testSyncApplyInsertDocument(ErrorCodes::OK, &op);
+    _testSyncApplyCrudOperation(ErrorCodes::OK, op, true);
+}
+
+TEST_F(SyncTailTest, SyncApplyDeleteDocumentCollectionLockedByUUID) {
+    const NamespaceString nss("test.t");
+    CollectionOptions options;
+    options.uuid = UUID::gen();
+    createCollection(_opCtx.get(), nss, options);
+
+    // Test that the collection to lock is determined by the UUID and not the 'ns' field.
+    auto op = BSON("op"
+                   << "d"
+                   << "ns"
+                   << nss.getSisterNS("othername")
+                   << "ui"
+                   << options.uuid.get());
+    _testSyncApplyCrudOperation(ErrorCodes::OK, op, true);
 }
 
 TEST_F(SyncTailTest, SyncApplyIndexBuild) {
@@ -1644,7 +1729,8 @@ TEST_F(IdempotencyTest, InsertToFCVCollectionBesidesFCVDocumentSucceeds) {
 }
 
 TEST_F(IdempotencyTest, DropDatabaseSucceeds) {
-    auto ns = NamespaceString("foo.bar");
+    // Choose `system.profile` so the storage engine doesn't expect the drop to be timestamped.
+    auto ns = NamespaceString("foo.system.profile");
     ::mongo::repl::createCollection(_opCtx.get(), ns, CollectionOptions());
     ASSERT_OK(
         ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
@@ -1653,156 +1739,9 @@ TEST_F(IdempotencyTest, DropDatabaseSucceeds) {
     ASSERT_OK(runOpInitialSync(op));
 }
 
-TEST_F(SyncTailTest, FailOnDropFCVCollectionInRecovering) {
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
-
-    auto cmd = BSON("drop" << fcvNS.coll());
-    auto op = makeCommandOplogEntry(nextOpTime(), fcvNS, cmd);
-    ASSERT_EQUALS(runOpSteadyState(op), ErrorCodes::OplogOperationUnsupported);
-}
-
-TEST_F(SyncTailTest, SuccessOnUpdateFCV34TargetVersionUnsetDocumentInRecovering) {
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
-
-    auto op = makeUpdateDocumentOplogEntry(
-        nextOpTime(),
-        fcvNS,
-        BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-        BSON("$set" << BSON(FeatureCompatibilityVersion::kVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion34)
-                    << "$unset"
-                    << BSON(FeatureCompatibilityVersion::kTargetVersionField << 1)));
-    ASSERT_OK(runOpSteadyState(op));
-}
-
-TEST_F(SyncTailTest, FailOnUpdateFCV34TargetVersion34DocumentInRecovering) {
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
-
-    auto op = makeUpdateDocumentOplogEntry(
-        nextOpTime(),
-        fcvNS,
-        BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-        BSON("$set" << BSON(FeatureCompatibilityVersion::kVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion34
-                            << FeatureCompatibilityVersion::kTargetVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion34)));
-    ASSERT_EQUALS(runOpSteadyState(op), ErrorCodes::OplogOperationUnsupported);
-}
-
-TEST_F(SyncTailTest, SuccessOnDropFCVCollectionInSecondary) {
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_SECONDARY));
-
-    auto cmd = BSON("drop" << fcvNS.coll());
-    auto op = makeCommandOplogEntry(nextOpTime(), fcvNS, cmd);
-    ASSERT_OK(runOpSteadyState(op));
-}
-
-TEST_F(SyncTailTest, SuccessOnUpdateFCV34TargetVersion34DocumentInSecondary) {
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_SECONDARY));
-
-    auto op = makeUpdateDocumentOplogEntry(
-        nextOpTime(),
-        fcvNS,
-        BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-        BSON("$set" << BSON(FeatureCompatibilityVersion::kVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion34
-                            << FeatureCompatibilityVersion::kTargetVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion34)));
-    ASSERT_OK(runOpSteadyState(op));
-}
-
-TEST_F(SyncTailTest, SuccessOnUpdateFCV36TargetVersionUnsetDocumentInRecovering) {
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    CollectionOptions options;
-    options.uuid = UUID::gen();
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, options);
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
-
-    auto op = makeUpdateDocumentOplogEntry(
-        nextOpTime(),
-        fcvNS,
-        BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-        BSON("$set" << BSON(FeatureCompatibilityVersion::kVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion36)
-                    << "$unset"
-                    << BSON(FeatureCompatibilityVersion::kTargetVersionField << 1)));
-    ASSERT_OK(runOpSteadyState(op));
-}
-
-TEST_F(SyncTailTest, SuccessOnUpdateFCV34TargetVersion36DocumentInRecovering) {
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
-
-    auto op = makeUpdateDocumentOplogEntry(
-        nextOpTime(),
-        fcvNS,
-        BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-        BSON("$set" << BSON(FeatureCompatibilityVersion::kVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion34
-                            << FeatureCompatibilityVersion::kTargetVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion36)));
-    ASSERT_OK(runOpSteadyState(op));
-}
-
-TEST_F(SyncTailTest, UpdateToFCVCollectionBesidesFCVDocumentSucceedsInRecovering) {
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
-
-    auto op = makeUpdateDocumentOplogEntry(
-        nextOpTime(),
-        fcvNS,
-        BSON("_id"
-             << "other"),
-        BSON("$set" << BSON(FeatureCompatibilityVersion::kVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion34
-                            << FeatureCompatibilityVersion::kTargetVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion34)));
-    ASSERT_OK(runOpSteadyState(op));
-}
-
-TEST_F(SyncTailTest, UpgradeWithNoUUIDFailsInSecondary) {
-    // Set fCV to 3.4 so the node does not create a UUID for the collection.
-    serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34);
-
-    auto fcvNS = NamespaceString(FeatureCompatibilityVersion::kCollection);
-    ::mongo::repl::createCollection(_opCtx.get(), fcvNS, CollectionOptions());
-    ASSERT_OK(
-        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_SECONDARY));
-
-    auto op = makeUpdateDocumentOplogEntry(
-        nextOpTime(),
-        fcvNS,
-        BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-        BSON("$set" << BSON(FeatureCompatibilityVersion::kVersionField
-                            << FeatureCompatibilityVersionCommandParser::kVersion36)
-                    << "$unset"
-                    << BSON(FeatureCompatibilityVersion::kTargetVersionField << 1)));
-    ASSERT_EQUALS(runOpSteadyState(op), ErrorCodes::IllegalOperation);
-}
-
 TEST_F(SyncTailTest, DropDatabaseSucceedsInRecovering) {
-    auto ns = NamespaceString("foo.bar");
+    // Choose `system.profile` so the storage engine doesn't expect the drop to be timestamped.
+    auto ns = NamespaceString("foo.system.profile");
     ::mongo::repl::createCollection(_opCtx.get(), ns, CollectionOptions());
     ASSERT_OK(
         ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));

@@ -32,7 +32,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/s/move_chunk_request.h"
+#include "mongo/s/request_types/move_chunk_request.h"
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/timer.h"
 
@@ -40,6 +40,7 @@ namespace mongo {
 
 class MigrationChunkClonerSource;
 class OperationContext;
+struct ShardingStatistics;
 
 /**
  * The donor-side migration state machine. This object must be created and owned by a single thread,
@@ -211,8 +212,15 @@ private:
     // The resolved primary of the recipient shard
     const HostAndPort _recipientHost;
 
-    // Gets initialized at creation time and will time the entire move chunk operation
-    const Timer _startTime;
+    // Stores a reference to the process sharding statistics object which needs to be updated
+    ShardingStatistics& _stats;
+
+    // Times the entire moveChunk operation
+    const Timer _entireOpTimer;
+
+    // Starts counting from creation time and is used to time various parts from the lifetime of the
+    // move chunk sequence
+    Timer _cloneAndCommitTimer;
 
     // The current state. Used only for diagnostics and validation.
     State _state{kCreated};
@@ -242,6 +250,9 @@ private:
     // The transition from false to true is protected by the collection X-lock, which happens just
     // before the config server metadata commit is scheduled.
     bool _readsShouldWaitOnCritSec{false};
+
+    // The statistics about a chunk migration to be included in moveChunk.commit
+    BSONObj _recipientCloneCounts;
 };
 
 }  // namespace mongo

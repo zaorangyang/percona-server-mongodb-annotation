@@ -175,7 +175,16 @@ public:
      */
     void setOldestTimestamp(Timestamp oldestTimestamp);
 
+    Timestamp getPreviousSetOldestTimestamp() const {
+        stdx::unique_lock<stdx::mutex> lock(_oplogManagerMutex);
+        return _previousSetOldestTimestamp;
+    }
+
     virtual bool supportsRecoverToStableTimestamp() const override;
+
+    virtual Status recoverToStableTimestamp() override;
+
+    bool supportsReadConcernSnapshot() const final;
 
     // wiredtiger specific
     // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
@@ -260,6 +269,8 @@ private:
 
     // Not threadsafe; callers must be serialized along with `setOldestTimestamp`.
     void _advanceOldestTimestamp(Timestamp oldestTimestamp);
+
+    // Protected by _oplogManagerMutex.
     Timestamp _previousSetOldestTimestamp;
 
     WT_CONNECTION* _conn;

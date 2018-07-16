@@ -4,9 +4,13 @@
  * It should *not* build an index on the secondary on restart.
  */
 
-// @tags: [requires_persistence, requires_journaling]
+// @tags: [requires_persistence, requires_journaling, requires_replication]
 (function() {
     'use strict';
+
+    // Skip db hash check because secondary will have different number of indexes due to the
+    // --noIndexBuildRetry command line option.
+    TestData.skipCheckDBHashes = true;
 
     // Set up replica set.
     var replTest = new ReplSetTest(

@@ -4,6 +4,18 @@
     "use strict";
 
     load("jstests/libs/get_index_helpers.js");
+    // For isMMAPv1.
+    load("jstests/concurrency/fsm_workload_helpers/server_types.js");
+
+    if (isMMAPv1(db)) {
+        assert.commandFailedWithCode(
+            db.adminCommand({doTxn: []}),
+            ErrorCodes.CommandNotSupported,
+            "doTxn should fail if document level locking isn't supported.");
+
+        jsTestLog("Skipping test as the storage engine does not support doTxn.");
+        return;
+    }
 
     var t = db.do_txn1;
     t.drop();
@@ -233,7 +245,7 @@
             }
         ]
     }));
-    assert.eq(res.code, 50659);
+    assert.eq(res.code, 40682);
 
     // When we explicitly specify {$v: 1}, we should get 'UpdateNode' update semantics, and $set
     // operations get performed in lexicographic order.

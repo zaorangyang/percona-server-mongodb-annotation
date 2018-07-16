@@ -14,12 +14,12 @@ post:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        local_file: work/reports.tgz
-        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/${task_name}-${build_id}-${execution}.${ext|tgz}
+        local_file: work/dsi-artifacts.tgz
+        remote_file: ${project}/${build_variant}/${revision}/${task_id}/${version_id}/logs/dsi-artifacts-${task_name}-${build_id}-${execution}.${ext|tgz}
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
-        display_name: test-log - Execution ${execution}
+        display_name: Dsi Artifacts - Execution ${execution}
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -42,9 +42,7 @@ post:
         working_dir: work
         script: |
           source ./dsienv.sh
-          if [ -e /data/infrastructure_provisioning/terraform/provisioned.${cluster} ]; then
-            mark_idle.sh
-          fi
+          infrastructure_teardown.py
 
     - command: shell.exec
       params:
@@ -85,6 +83,8 @@ functions:
           test: ${test}
           production: true
           mongodb_binary_archive: "https://s3.amazonaws.com/mciuploads/${project}/${version_id}/${revision}/${platform}/mongod-${version_id}.tar.gz"
+          workloads_dir: ../src/workloads/workloads
+          ycsb_dir: ../src/YCSB/YCSB
           EOF
 
           cat > runtime.yml <<EOF
@@ -156,6 +156,7 @@ functions:
           source ./dsienv.sh
           source ./venv/bin/activate
           infrastructure_provisioning.py
+          workload_setup.py
           mongodb_setup.py
 
   "run test":
@@ -173,14 +174,6 @@ functions:
       params:
          name: "perf"
          file: "work/perf.json"
-
-  "make test log artifact":
-    - command: shell.exec
-      params:
-        working_dir: work
-        script: |
-          source ./dsienv.sh
-          make_artifact.sh
 
   "analyze":
     - command: json.get_history
@@ -202,7 +195,7 @@ functions:
         silent: true
         script: |
           set -o errexit
-          TAGS="3.4.9-Baseline 3.2.17-Baseline"
+          TAGS="3.4.10-Baseline 3.2.17-Baseline 3.6.0-Baseline 3.6.1-Baseline"
           OVERRIDEFILE="../src/dsi/dsi/analysis/${branch_name}/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/dashboard_gen.py --rev ${revision} -f history.json -t tags.json --refTag $TAGS --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name} --jira-user ${perf_jira_user} --jira-password ${perf_jira_pw} || true
     - command: "json.send"
@@ -217,9 +210,9 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          TAG="3.4.9-Baseline"
+          TAG="3.4.10-Baseline"
           OVERRIDEFILE="../src/dsi/dsi/analysis/${branch_name}/system_perf_override.json"
-          python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file reports/perf.json --rev ${revision} -f history.json -t tags.json --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
+          python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file perf.json --rev ${revision} -f history.json -t tags.json --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
 
 #######################################
 #               Tasks                 #
@@ -292,8 +285,17 @@ tasks:
           then
             echo "Fetching JS test DB correctness checks from directory jstests"
             cp -a jstests/* mongodb/jstests
+
+            echo "Now adding our own special run_validate_collections.js wrapper"
+            mv mongodb/jstests/hooks/run_validate_collections.js mongodb/jstests/hooks/run_validate_collections.actual.js
+
+            cat << EOF > mongodb/jstests/hooks/run_validate_collections.js
+            print("NOTE: run_validate_collections.js will skip the oplog!");
+            TestData = { skipValidationNamespaces: ['local.oplog.rs'] };
+            load('jstests/hooks/run_validate_collections.actual.js');
+          EOF
           fi
-          tar cvf mongodb.tar mongodb
+          tar cf mongodb.tar mongodb
           gzip mongodb.tar
     - command: s3.put
       params:
@@ -310,6 +312,7 @@ tasks:
   depends_on:
     - name: compile
       variant: linux-standalone
+  priority: 5
   commands:
     - func: "prepare environment"
       vars:
@@ -317,13 +320,13 @@ tasks:
         test: "ycsb"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
       vars:
         # Disabling --ycsb-throughput-analysis until BF-7153 fixed
         # script_flags: --ycsb-throughput-analysis reports
 
 - name: industry_benchmarks_MMAPv1
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -334,12 +337,12 @@ tasks:
         test: "ycsb"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
       vars:
         script_flags: --ycsb-throughput-analysis reports
 
 - name: industry_benchmarks_wmajority_WT
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -350,12 +353,12 @@ tasks:
         test: "ycsb-wmajority"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
       vars:
         script_flags: --ycsb-throughput-analysis reports
 
 - name: industry_benchmarks_wmajority_MMAPv1
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -366,12 +369,12 @@ tasks:
         test: "ycsb-wmajority"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
       vars:
         script_flags: --ycsb-throughput-analysis reports
 
 - name: core_workloads_WT
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -383,10 +386,10 @@ tasks:
         test: "core"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: core_workloads_MMAPv1
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -398,10 +401,10 @@ tasks:
         test: "core"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: retryable_writes_workloads_WT
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -412,10 +415,10 @@ tasks:
         test: "retryable_writes"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: agg_query_comparison_bestbuy_WT
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -426,10 +429,10 @@ tasks:
         test: "agg_query_comparison_bestbuy"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: agg_query_comparison_bestbuy_MMAPv1
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -440,10 +443,10 @@ tasks:
         test: "agg_query_comparison_bestbuy"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: non_sharded_workloads_WT
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -454,10 +457,10 @@ tasks:
         test: "non_sharded"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: non_sharded_workloads_MMAPv1
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -468,10 +471,10 @@ tasks:
         test: "non_sharded"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: mongos_workloads_WT
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -482,10 +485,10 @@ tasks:
         test: "mongos"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: mongos_workloads_MMAPv1
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -497,10 +500,10 @@ tasks:
         test: "mongos"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: move_chunk_workloads_WT
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -511,10 +514,10 @@ tasks:
         test: "move_chunk"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: move_chunk_workloads_MMAPv1
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -525,10 +528,10 @@ tasks:
         test: "move_chunk"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: secondary_performance_WT
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -536,14 +539,15 @@ tasks:
     - func: "prepare environment"
       vars:
         storageEngine: "wiredTiger"
+        # Unfortunately the dash/underscore style is different for mongodb_setup and test_control
         test: "secondary_performance"
-        setup: "replica-2node"
+        setup: "secondary-performance"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: secondary_performance_MMAPv1
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -551,14 +555,15 @@ tasks:
     - func: "prepare environment"
       vars:
         storageEngine: "mmapv1"
+        # Unfortunately the dash/underscore style is different for mongodb_setup and test_control
         test: "secondary_performance"
-        setup: "replica-2node"
+        setup: "secondary-performance"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: initialsync_WT
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -569,10 +574,10 @@ tasks:
         test: "initialsync"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: initialsync_MMAPv1
+  priority: 5
   depends_on:
     - name: compile
       variant : linux-standalone
@@ -583,10 +588,10 @@ tasks:
         test: "initialsync"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: initialsync-logkeeper_WT
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -598,10 +603,10 @@ tasks:
         test: "initialsync-logkeeper"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
     - func: "analyze"
 
 - name: change_streams
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -612,9 +617,10 @@ tasks:
         test: "change_streams"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
+    - func: "analyze"
 
 - name: change_streams_multi_mongos
+  priority: 5
   depends_on:
     - name: compile
       variant: linux-standalone
@@ -625,7 +631,7 @@ tasks:
         test: "change_streams_multi_mongos"
     - func: "deploy cluster"
     - func: "run test"
-    - func: "make test log artifact"
+    - func: "analyze"
 
 
 #######################################

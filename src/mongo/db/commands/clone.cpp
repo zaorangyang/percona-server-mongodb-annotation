@@ -56,23 +56,22 @@ class CmdClone : public BasicCommand {
 public:
     CmdClone() : BasicCommand("clone") {}
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
-
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "clone this database from an instance of the db on another host\n";
-        help << "{clone: \"host13\"[, slaveOk: <bool>]}";
+    std::string help() const override {
+        return "clone this database from an instance of the db on another host\n"
+               "{clone: \"host13\"[, slaveOk: <bool>]}";
     }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         ActionSet actions;
         actions.addAction(ActionType::insert);
         actions.addAction(ActionType::createIndex);
@@ -116,6 +115,14 @@ public:
             }
         }
 
+        // If metadataOnly is set, we will copy collection options, indexes, and views,
+        // but not collection data.
+        if (cmdObj["metadataOnly"].booleanSafe()) {
+            opts.syncData = false;
+            opts.metadataOnly = true;
+        }
+
+        // Clone the non-ignored collections.
         set<string> clonedColls;
 
         Lock::DBLock dbXLock(opCtx, dbname, MODE_X);
@@ -125,10 +132,9 @@ public:
 
         BSONArrayBuilder barr;
         barr.append(clonedColls);
-
         result.append("clonedColls", barr.arr());
 
-        return appendCommandStatus(result, status);
+        return CommandHelpers::appendCommandStatus(result, status);
     }
 
 } cmdClone;

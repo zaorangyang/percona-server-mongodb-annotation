@@ -220,7 +220,6 @@ MONGO_COMPILER_NORETURN void invariantOKFailed(const char* expr,
                                                const Status& status,
                                                const char* file,
                                                unsigned line) noexcept;
-void wasserted(const char* expr, const char* file, unsigned line);
 
 #define fassertFailed MONGO_fassertFailed
 #define MONGO_fassertFailed(...) ::mongo::fassertFailedWithLocation(__VA_ARGS__, __FILE__, __LINE__)
@@ -362,6 +361,35 @@ inline T uassertStatusOKWithLocation(StatusWith<T> sw, const char* file, unsigne
 }
 
 /**
+ * Like uassertStatusOK(status), but also takes an expression that evaluates to  something
+ * convertible to std::string to add more context to error messages. This contextExpr is only
+ * evaluated if the status is not OK.
+ */
+#define uassertStatusOKWithContext(status, contextExpr) \
+    ::mongo::uassertStatusOKWithContextAndLocation(     \
+        status, [&]() -> std::string { return (contextExpr); }, __FILE__, __LINE__)
+template <typename ContextExpr>
+inline void uassertStatusOKWithContextAndLocation(const Status& status,
+                                                  ContextExpr&& contextExpr,
+                                                  const char* file,
+                                                  unsigned line) {
+    if (MONGO_unlikely(!status.isOK())) {
+        uassertedWithLocation(
+            status.withContext(std::forward<ContextExpr>(contextExpr)()), file, line);
+    }
+}
+
+template <typename T, typename ContextExpr>
+inline T uassertStatusOKWithContextAndLocation(StatusWith<T> sw,
+                                               ContextExpr&& contextExpr,
+                                               const char* file,
+                                               unsigned line) {
+    uassertStatusOKWithContextAndLocation(
+        sw.getStatus(), std::forward<ContextExpr>(contextExpr), file, line);
+    return std::move(sw.getValue());
+}
+
+/**
  * massert is like uassert but it logs the message before throwing.
  */
 #define massert(msgid, msg, expr) \
@@ -405,15 +433,6 @@ inline void fassertStatusOKWithLocation(int msgid,
         fassertFailedWithStatusWithLocation(msgid, s, file, line);
     }
 }
-
-/* warning only - keeps going */
-#define wassert MONGO_wassert
-#define MONGO_wassert(_Expression)                                \
-    do {                                                          \
-        if (MONGO_unlikely(!(_Expression))) {                     \
-            ::mongo::wasserted(#_Expression, __FILE__, __LINE__); \
-        }                                                         \
-    } while (false)
 
 /**
  * verify is deprecated. It is like invariant() in debug builds and massert() in release builds.

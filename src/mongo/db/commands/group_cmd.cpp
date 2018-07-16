@@ -71,15 +71,13 @@ private:
         return false;
     }
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kOptIn;
     }
 
-    virtual bool slaveOverrideOk() const {
-        return true;
-    }
-
-    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const final {
         return true;
     }
 
@@ -91,13 +89,13 @@ private:
         return FindCommon::kInitReplyBufferSize;
     }
 
-    virtual void help(std::stringstream& help) const {
-        help << "http://dochub.mongodb.org/core/aggregation";
+    std::string help() const override {
+        return "http://dochub.mongodb.org/core/aggregation";
     }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnNamespace(
@@ -159,7 +157,7 @@ private:
         GroupRequest groupRequest;
         Status parseRequestStatus = _parseRequest(dbname, cmdObj, &groupRequest);
         if (!parseRequestStatus.isOK()) {
-            return appendCommandStatus(result, parseRequestStatus);
+            return CommandHelpers::appendCommandStatus(result, parseRequestStatus);
         }
 
         AutoGetCollectionForReadCommand ctx(opCtx, groupRequest.ns);
@@ -168,7 +166,7 @@ private:
         auto statusWithPlanExecutor =
             getExecutorGroup(opCtx, coll, groupRequest, PlanExecutor::YIELD_AUTO);
         if (!statusWithPlanExecutor.isOK()) {
-            return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
+            return CommandHelpers::appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
 
         auto planExecutor = std::move(statusWithPlanExecutor.getValue());
@@ -186,13 +184,15 @@ private:
             invariant(PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state);
 
             if (WorkingSetCommon::isValidStatusMemberObject(retval)) {
-                return appendCommandStatus(result, WorkingSetCommon::getMemberObjectStatus(retval));
+                return CommandHelpers::appendCommandStatus(
+                    result, WorkingSetCommon::getMemberObjectStatus(retval));
             }
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::BadValue,
-                                              str::stream() << "error encountered during group "
-                                                            << "operation, executor returned "
-                                                            << PlanExecutor::statestr(state)));
+            return CommandHelpers::appendCommandStatus(
+                result,
+                Status(ErrorCodes::BadValue,
+                       str::stream() << "error encountered during group "
+                                     << "operation, executor returned "
+                                     << PlanExecutor::statestr(state)));
         }
 
         invariant(planExecutor->isEOF());

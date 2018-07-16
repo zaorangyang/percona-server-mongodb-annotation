@@ -49,7 +49,6 @@
 #include "mongo/db/catalog/namespace_uuid_cache.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/clientcursor.h"
-#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -118,7 +117,7 @@ public:
 
         // Ban reading from this collection on committed reads on snapshots before now.
         auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
-        auto snapshotName = replCoord->reserveSnapshotName(_opCtx);
+        auto snapshotName = replCoord->getMinimumVisibleSnapshot(_opCtx);
         it->second->setMinimumVisibleSnapshot(snapshotName);
     }
 
@@ -456,7 +455,7 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
                                   "turn off profiling before dropping system.profile collection");
             } else if (!(nss.isSystemDotViews() || nss.isHealthlog() ||
                          nss == SessionsCollection::kSessionsNamespaceString ||
-                         nss == NamespaceString::kSystemKeysCollectionName)) {
+                         nss.ns() == NamespaceString::kSystemKeysCollectionName)) {
                 return Status(ErrorCodes::IllegalOperation,
                               str::stream() << "can't drop system collection " << fullns);
             }
@@ -781,7 +780,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     if (enableCollectionUUIDs && !optionsWithUUID.uuid &&
         serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
         auto coordinator = repl::ReplicationCoordinator::get(opCtx);
-        bool fullyUpgraded = serverGlobalParams.featureCompatibility.getVersion() ==
+        bool fullyUpgraded = serverGlobalParams.featureCompatibility.getVersion() >=
             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36;
         bool canGenerateUUID =
             (coordinator->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) ||
@@ -856,6 +855,7 @@ void DatabaseImpl::dropDatabase(OperationContext* opCtx, Database* db) {
 
     // Store the name so we have if for after the db object is deleted
     const string name = db->name();
+
     LOG(1) << "dropDatabase " << name;
 
     invariant(opCtx->lockState()->isDbLockedForMode(name, MODE_X));
@@ -1042,24 +1042,10 @@ auto mongo::userCreateNSImpl(OperationContext* opCtx,
     }
 
     if (!collectionOptions.validator.isEmpty()) {
-        // Pre-parse the validator document to make sure there are no extensions that are not
-        // permitted in collection validators.
-        MatchExpressionParser::AllowedFeatureSet allowedFeatures =
-            MatchExpressionParser::kBanAllSpecialFeatures;
-        if (!serverGlobalParams.validateFeaturesAsMaster.load() ||
-            (serverGlobalParams.featureCompatibility.getVersion() ==
-             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36)) {
-            // Note that we don't enforce this feature compatibility check when we are on
-            // the secondary or on a backup instance, as indicated by !validateFeaturesAsMaster.
-            allowedFeatures |= MatchExpressionParser::kJSONSchema;
-            allowedFeatures |= MatchExpressionParser::kExpr;
-        }
         boost::intrusive_ptr<ExpressionContext> expCtx(
             new ExpressionContext(opCtx, collator.get()));
-        auto statusWithMatcher = MatchExpressionParser::parse(collectionOptions.validator,
-                                                              std::move(expCtx),
-                                                              ExtensionsCallbackNoop(),
-                                                              allowedFeatures);
+        auto statusWithMatcher =
+            MatchExpressionParser::parse(collectionOptions.validator, std::move(expCtx));
 
         // We check the status of the parse to see if there are any banned features, but we don't
         // actually need the result for now.

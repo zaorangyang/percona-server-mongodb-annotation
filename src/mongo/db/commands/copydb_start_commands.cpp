@@ -78,10 +78,9 @@ public:
         return true;
     }
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
-
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -89,14 +88,14 @@ public:
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         // No auth required
         return Status::OK();
     }
 
-    virtual void help(stringstream& help) const {
-        help << "Initialize a SASL auth session for subsequent copy db request "
-                "from secure server\n";
+    std::string help() const override {
+        return "Initialize a SASL auth session for subsequent copy db request "
+               "from secure server\n";
     }
 
     virtual bool errmsgRun(OperationContext* opCtx,
@@ -127,7 +126,7 @@ public:
         BSONElement mechanismElement;
         Status status = bsonExtractField(cmdObj, saslCommandMechanismFieldName, &mechanismElement);
         if (!status.isOK()) {
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         BSONElement payloadElement;
@@ -147,10 +146,10 @@ public:
         if (!authConn->runCommand(
                 fromDb, BSON("saslStart" << 1 << mechanismElement << payloadElement), ret)) {
             authConn.reset();
-            return appendCommandStatus(result, getStatusFromCommandResult(ret));
+            return CommandHelpers::appendCommandStatus(result, getStatusFromCommandResult(ret));
         }
 
-        filterCommandReplyForPassthrough(ret, &result);
+        CommandHelpers::filterCommandReplyForPassthrough(ret, &result);
         return true;
     }
 

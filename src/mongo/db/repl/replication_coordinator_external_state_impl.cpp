@@ -70,6 +70,7 @@
 #include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/balancer/balancer.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/server_options.h"
@@ -82,7 +83,6 @@
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
-#include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/client/shard_registry.h"
@@ -233,7 +233,7 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
     invariant(!_bgSync);
     log() << "Starting replication fetcher thread";
     _bgSync = stdx::make_unique<BackgroundSync>(
-        this, _replicationProcess, makeSteadyStateOplogBuffer(opCtx));
+        replCoord, this, _replicationProcess, makeSteadyStateOplogBuffer(opCtx));
     _bgSync->startup(opCtx);
 
     log() << "Starting replication applier thread";
@@ -348,7 +348,7 @@ void ReplicationCoordinatorExternalStateImpl::shutdown(OperationContext* opCtx) 
         // oplog. We record this update at the 'lastAppliedOpTime'. If there are any outstanding
         // checkpoints being taken, they should only reflect this write if they see all writes up
         // to our 'lastAppliedOpTime'.
-        auto lastAppliedOpTime = repl::getGlobalReplicationCoordinator()->getMyLastAppliedOpTime();
+        auto lastAppliedOpTime = repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime();
         _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(
             opCtx, lastAppliedOpTime.getTimestamp());
     }
@@ -466,7 +466,7 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
     // to our 'lastAppliedOpTime'.
     invariant(
         _replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx).isNull());
-    auto lastAppliedOpTime = repl::getGlobalReplicationCoordinator()->getMyLastAppliedOpTime();
+    auto lastAppliedOpTime = repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime();
     _replicationProcess->getConsistencyMarkers()->clearAppliedThrough(
         opCtx, lastAppliedOpTime.getTimestamp());
 
@@ -716,12 +716,10 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
                 return;
             }
 
-            fassertFailedWithStatus(40184,
-                                    Status(status.code(),
-                                           str::stream()
-                                               << "Failed to initialize config database on config "
-                                                  "server's first transition to primary"
-                                               << causedBy(status)));
+            fassertFailedWithStatus(
+                40184,
+                status.withContext("Failed to initialize config database on config server's "
+                                   "first transition to primary"));
         }
 
         if (status.isOK()) {
@@ -866,6 +864,14 @@ bool ReplicationCoordinatorExternalStateImpl::isReadCommittedSupportedByStorageE
     return storageEngine->getSnapshotManager();
 }
 
+bool ReplicationCoordinatorExternalStateImpl::isReadConcernSnapshotSupportedByStorageEngine(
+    OperationContext* opCtx) const {
+    auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    // This should never be called if the storage engine has not been initialized.
+    invariant(storageEngine);
+    return storageEngine->supportsReadConcernSnapshot();
+}
+
 StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::multiApply(
     OperationContext* opCtx,
     MultiApplier::Operations ops,
@@ -914,11 +920,11 @@ std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherMaxFetcherRe
 }
 
 JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken() {
-    return repl::getGlobalReplicationCoordinator()->getMyLastAppliedOpTime();
+    return repl::ReplicationCoordinator::get(_service)->getMyLastAppliedOpTime();
 }
 
 void ReplicationCoordinatorExternalStateImpl::onDurable(const JournalListener::Token& token) {
-    repl::getGlobalReplicationCoordinator()->setMyLastDurableOpTimeForward(token);
+    repl::ReplicationCoordinator::get(_service)->setMyLastDurableOpTimeForward(token);
 }
 
 void ReplicationCoordinatorExternalStateImpl::startNoopWriter(OpTime opTime) {

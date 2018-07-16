@@ -36,7 +36,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -50,8 +50,8 @@ const WriteConcernOptions kWriteConcernLocal(1,
                                              WriteConcernOptions::SyncMode::NONE,
                                              WriteConcernOptions::kNoTimeout);
 
-WriteConcernOptions getDefaultWriteConcernForMigration() {
-    repl::ReplicationCoordinator* replCoordinator = repl::getGlobalReplicationCoordinator();
+WriteConcernOptions getDefaultWriteConcernForMigration(OperationContext* opCtx) {
+    repl::ReplicationCoordinator* replCoordinator = repl::ReplicationCoordinator::get(opCtx);
     if (replCoordinator->getReplicationMode() == mongo::repl::ReplicationCoordinator::modeReplSet) {
         Status status =
             replCoordinator->checkIfWriteConcernCanBeSatisfied(kDefaultWriteConcernForMigration);
@@ -85,7 +85,7 @@ StatusWith<WriteConcernOptions> ChunkMoveWriteConcernOptions::getEffectiveWriteC
     if (options.isWriteConcernSpecified()) {
         writeConcern = options.getWriteConcern();
 
-        repl::ReplicationCoordinator* replCoordinator = repl::getGlobalReplicationCoordinator();
+        repl::ReplicationCoordinator* replCoordinator = repl::ReplicationCoordinator::get(opCtx);
 
         if (replCoordinator->getReplicationMode() ==
                 repl::ReplicationCoordinator::modeMasterSlave &&
@@ -100,7 +100,7 @@ StatusWith<WriteConcernOptions> ChunkMoveWriteConcernOptions::getEffectiveWriteC
             return status;
         }
     } else {
-        writeConcern = getDefaultWriteConcernForMigration();
+        writeConcern = getDefaultWriteConcernForMigration(opCtx);
     }
 
     if (writeConcern.shouldWaitForOtherNodes() &&

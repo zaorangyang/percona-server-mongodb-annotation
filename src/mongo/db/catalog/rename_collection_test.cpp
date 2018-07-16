@@ -226,7 +226,7 @@ void RenameCollectionTest::setUp() {
     auto replCoord = stdx::make_unique<repl::ReplicationCoordinatorMock>(service);
     _replCoord = replCoord.get();
     repl::ReplicationCoordinator::set(service, std::move(replCoord));
-    repl::setOplogCollectionName();
+    repl::setOplogCollectionName(service);
     repl::createOplog(_opCtx.get());
 
     // Ensure that we are primary.
@@ -438,13 +438,6 @@ TEST_F(RenameCollectionTest, IndexNameTooLongForTemporaryCollectionForRenameAcro
     _createIndex(_opCtx.get(), _sourceNss, indexName);
     ASSERT_EQUALS(ErrorCodes::InvalidLength,
                   renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
-}
-
-TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseWithoutUuid) {
-    _createCollection(_opCtx.get(), _sourceNss);
-    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
-    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss));
-    ASSERT_FALSE(_getCollectionOptions(_opCtx.get(), _targetNssDifferentDb).uuid);
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionAcrossDatabaseWithUuid) {

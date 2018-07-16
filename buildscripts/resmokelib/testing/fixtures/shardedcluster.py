@@ -42,6 +42,7 @@ class ShardedClusterFixture(interface.Fixture):
                  num_rs_nodes_per_shard=None,
                  separate_configsvr=True,
                  enable_sharding=None,
+                 enable_balancer=True,
                  auth_options=None,
                  configsvr_options=None,
                  shard_options=None):
@@ -64,6 +65,7 @@ class ShardedClusterFixture(interface.Fixture):
         self.num_rs_nodes_per_shard = num_rs_nodes_per_shard
         self.separate_configsvr = separate_configsvr
         self.enable_sharding = utils.default_if_none(enable_sharding, [])
+        self.enable_balancer = enable_balancer
         self.auth_options = auth_options
         self.configsvr_options = utils.default_if_none(configsvr_options, {})
         self.shard_options = utils.default_if_none(shard_options, {})
@@ -100,6 +102,9 @@ class ShardedClusterFixture(interface.Fixture):
         for shard in self.shards:
             shard.setup()
 
+    def get_dbpath(self):
+        return self._dbpath_prefix
+
     def await_ready(self):
         # Wait for the config server
         if self.configsvr is not None:
@@ -125,6 +130,10 @@ class ShardedClusterFixture(interface.Fixture):
                                  password=self.auth_options["password"],
                                  mechanism=self.auth_options["authenticationMechanism"])
 
+        # Turn off the balancer if it is not meant to be enabled.
+        if not self.enable_balancer:
+            client.admin.command({"balancerStop": 1});
+
         # Inform mongos about each of the shards
         for shard in self.shards:
             self._add_shard(client, shard)
@@ -137,7 +146,7 @@ class ShardedClusterFixture(interface.Fixture):
         # Ensure that the sessions collection gets auto-sharded by the config server
         if self.configsvr is not None:
             primary = self.configsvr.get_primary().mongo_client()
-            primary.admin.command({ "refreshLogicalSessionCacheNow" : 1 })
+            primary.admin.command({"refreshLogicalSessionCacheNow": 1})
 
     def _do_teardown(self):
         """
@@ -208,7 +217,7 @@ class ShardedClusterFixture(interface.Fixture):
         auth_options = configsvr_options.pop("auth_options", self.auth_options)
         mongod_executable = configsvr_options.pop("mongod_executable", self.mongod_executable)
         preserve_dbpath = configsvr_options.pop("preserve_dbpath", self.preserve_dbpath)
-        num_nodes = configsvr_options.pop("num_nodes", 3)
+        num_nodes = configsvr_options.pop("num_nodes", 1)
 
         replset_config_options = configsvr_options.pop("replset_config_options", {})
         replset_config_options["configsvr"] = True

@@ -45,10 +45,10 @@
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
+#include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
@@ -184,21 +184,6 @@ Status ShardingState::updateConfigServerOpTimeFromMetadata(OperationContext* opC
     return Status::OK();
 }
 
-CollectionShardingState* ShardingState::getNS(const std::string& ns, OperationContext* opCtx) {
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
-    CollectionShardingStateMap::iterator it = _collections.find(ns);
-    if (it == _collections.end()) {
-        auto inserted =
-            _collections.insert(make_pair(ns,
-                                          stdx::make_unique<CollectionShardingState>(
-                                              opCtx->getServiceContext(), NamespaceString(ns))));
-        invariant(inserted.second);
-        it = std::move(inserted.first);
-    }
-
-    return it->second.get();
-}
-
 ChunkSplitter* ShardingState::getChunkSplitter() {
     return _chunkSplitter.get();
 }
@@ -224,6 +209,8 @@ Status ShardingState::onStaleShardVersion(OperationContext* opCtx,
 
     LOG(2) << "metadata refresh requested for " << nss.ns() << " at shard version "
            << expectedVersion;
+
+    ShardingStatistics::get(opCtx).countStaleConfigErrors.addAndFetch(1);
 
     // Ensure any ongoing migrations have completed
     auto& oss = OperationShardingState::get(opCtx);
@@ -277,11 +264,8 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* opCtx,
 
     Status validationStatus = shardIdentity.validate();
     if (!validationStatus.isOK()) {
-        return Status(
-            validationStatus.code(),
-            str::stream()
-                << "Invalid shard identity document found when initializing sharding state: "
-                << validationStatus.reason());
+        return validationStatus.withContext(
+            "Invalid shard identity document found when initializing sharding state");
     }
 
     log() << "initializing sharding state with: " << shardIdentity;
@@ -565,20 +549,6 @@ void ShardingState::appendInfo(OperationContext* opCtx, BSONObjBuilder& builder)
                    Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
     builder.append("shardName", _shardName);
     builder.append("clusterId", _clusterId);
-
-    BSONObjBuilder versionB(builder.subobjStart("versions"));
-    for (CollectionShardingStateMap::const_iterator it = _collections.begin();
-         it != _collections.end();
-         ++it) {
-        ScopedCollectionMetadata metadata = it->second->getMetadata();
-        if (metadata) {
-            versionB.appendTimestamp(it->first, metadata->getShardVersion().toLong());
-        } else {
-            versionB.appendTimestamp(it->first, ChunkVersion::UNSHARDED().toLong());
-        }
-    }
-
-    versionB.done();
 }
 
 bool ShardingState::needCollectionMetadata(OperationContext* opCtx, const string& ns) {

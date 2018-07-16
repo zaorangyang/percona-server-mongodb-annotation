@@ -657,8 +657,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorFind(
     if (ShardingState::get(opCtx)->needCollectionMetadata(opCtx, nss.ns())) {
         plannerOptions |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
     }
-    return getExecutor(
-        opCtx, collection, std::move(canonicalQuery), PlanExecutor::YIELD_AUTO, plannerOptions);
+    return getExecutor(opCtx, collection, std::move(canonicalQuery), yieldPolicy, plannerOptions);
 }
 
 namespace {
@@ -734,7 +733,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
     }
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nss);
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss);
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::PrimarySteppedDown,
@@ -884,7 +883,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     // writes on a secondary. If this is an update to a secondary from the replication system,
     // however, then we make an exception and let the write proceed.
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, nss);
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss);
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::PrimarySteppedDown,

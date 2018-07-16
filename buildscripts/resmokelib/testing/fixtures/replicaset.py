@@ -38,7 +38,8 @@ class ReplicaSetFixture(interface.ReplFixture):
                  auth_options=None,
                  replset_config_options=None,
                  voting_secondaries=None,
-                 all_nodes_electable=False):
+                 all_nodes_electable=False,
+                 use_replica_set_connection_string=None):
 
         interface.ReplFixture.__init__(self, logger, job_num)
 
@@ -52,11 +53,17 @@ class ReplicaSetFixture(interface.ReplFixture):
         self.replset_config_options = utils.default_if_none(replset_config_options, {})
         self.voting_secondaries = voting_secondaries
         self.all_nodes_electable = all_nodes_electable
+        self.use_replica_set_connection_string = use_replica_set_connection_string
 
         # If voting_secondaries has not been set, set a default. By default, secondaries have zero
         # votes unless they are also nodes capable of being elected primary.
         if self.voting_secondaries is None:
             self.voting_secondaries = self.all_nodes_electable
+
+        # By default, we only use a replica set connection string if all nodes are capable of being
+        # elected primary.
+        if self.use_replica_set_connection_string is None:
+            self.use_replica_set_connection_string = self.all_nodes_electable
 
         # The dbpath in mongod_options is used as the dbpath prefix for replica set members and
         # takes precedence over other settings. The ShardedClusterFixture uses this parameter to
@@ -145,6 +152,13 @@ class ReplicaSetFixture(interface.ReplFixture):
         if self.replset_config_options.get("settings"):
             replset_settings = self.replset_config_options["settings"]
             config["settings"] = replset_settings
+
+        # If secondaries vote, all nodes are not electable, and no election timeout was specified,
+        # increase the election timeout to 24 hours to prevent elections.
+        if self.voting_secondaries and not self.all_nodes_electable:
+            config.setdefault("settings", {})
+            if "electionTimeoutMillis" not in config["settings"]:
+                config["settings"]["electionTimeoutMillis"] = 24 * 60 * 60 * 1000
 
         # Start up a single node replica set then reconfigure to the correct size (if the config
         # contains more than 1 node), so the primary is elected more quickly.
@@ -296,6 +310,9 @@ class ReplicaSetFixture(interface.ReplFixture):
     def get_initial_sync_node(self):
         return self.initial_sync_node
 
+    def get_dbpath(self):
+        return self._dbpath_prefix
+
     def _new_mongod(self, index, replset_name):
         """
         Returns a standalone.MongoDFixture configured to be used as a
@@ -344,7 +361,7 @@ class ReplicaSetFixture(interface.ReplFixture):
         if self.replset_name is None:
             raise ValueError("Must call setup() before calling get_driver_connection_url()")
 
-        if self.all_nodes_electable:
+        if self.use_replica_set_connection_string:
             # We use a replica set connection string when all nodes are electable because we
             # anticipate the client will want to gracefully handle any failovers.
             conn_strs = [node.get_internal_connection_string() for node in self.nodes]

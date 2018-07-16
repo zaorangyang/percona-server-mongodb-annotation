@@ -5,10 +5,21 @@ selector:
   - jstestfuzz/out/*.js
 
 executor:
+  archive:
+    hooks:
+      - CheckReplDBHash
+      - ValidateCollections
   config:
     shell_options:
       readMode: commands
   hooks:
+  - class: CheckReplDBHash
+    shell_options:
+      global_vars:
+        TestData:
+          excludedDBsFromDBHash:
+            - config
+          skipValidationOnInvalidViewDefinitions: true
   - class: ValidateCollections
     shell_options:
       global_vars:

@@ -97,12 +97,12 @@ class CmdGetNonce : public BasicCommand {
 public:
     CmdGetNonce() : BasicCommand("getnonce"), _random(SecureRandom::create()) {}
 
-    bool slaveOk() const final {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
 
-    void help(stringstream& h) const final {
-        h << "internal";
+    std::string help() const final {
+        return "internal";
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const final {
@@ -111,7 +111,7 @@ public:
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) final {
+                               std::vector<Privilege>* out) const final {
         // No auth required since this command was explicitly part
         // of an authentication workflow.
     }
@@ -147,7 +147,8 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
     }
     std::string mechanism = cmdObj.getStringField("mechanism");
     if (mechanism.empty()) {
-        appendCommandStatus(result, {ErrorCodes::BadValue, "Auth mechanism not specified"});
+        CommandHelpers::appendCommandStatus(result,
+                                            {ErrorCodes::BadValue, "Auth mechanism not specified"});
         return false;
     }
     UserName user;
@@ -178,9 +179,10 @@ bool CmdAuthenticate::run(OperationContext* opCtx,
         if (status.code() == ErrorCodes::AuthenticationFailed) {
             // Statuses with code AuthenticationFailed may contain messages we do not wish to
             // reveal to the user, so we return a status with the message "auth failed".
-            appendCommandStatus(result, Status(ErrorCodes::AuthenticationFailed, "auth failed"));
+            CommandHelpers::appendCommandStatus(
+                result, Status(ErrorCodes::AuthenticationFailed, "auth failed"));
         } else {
-            appendCommandStatus(result, status);
+            CommandHelpers::appendCommandStatus(result, status);
         }
         sleepmillis(saslGlobalParams.authFailedDelay.load());
         return false;
@@ -257,14 +259,14 @@ CmdAuthenticate cmdAuthenticate;
 
 class CmdLogout : public BasicCommand {
 public:
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
-    void help(stringstream& h) const {
-        h << "de-authenticate";
+                                       std::vector<Privilege>* out) const {}  // No auth required
+    std::string help() const override {
+        return "de-authenticate";
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;

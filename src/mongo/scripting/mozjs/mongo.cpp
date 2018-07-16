@@ -594,13 +594,7 @@ void MongoBase::Functions::copyDatabaseWithSCRAM::call(JSContext* cx, JS::CallAr
         BSONObj command = commandBuilder.obj();
 
         bool ok = conn->runCommand("admin", command, inputObj);
-
-        ErrorCodes::Error code = ErrorCodes::Error(inputObj[saslCommandCodeFieldName].numberInt());
-
-        if (!ok || code != ErrorCodes::OK) {
-            if (code == ErrorCodes::OK)
-                code = ErrorCodes::UnknownError;
-
+        if (!ok) {
             ValueReader(cx, args.rval()).fromBSON(inputObj, nullptr, true);
             return;
         }
@@ -705,8 +699,9 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
     auto statusWithHost = MongoURI::parse(host);
     auto cs = uassertStatusOK(statusWithHost);
 
+    boost::optional<std::string> appname = cs.getAppName();
     std::string errmsg;
-    std::unique_ptr<DBClientBase> conn(cs.connect("MongoDB Shell", errmsg));
+    std::unique_ptr<DBClientBase> conn(cs.connect(appname.value_or("MongoDB Shell"), errmsg));
 
     if (!conn.get()) {
         uasserted(ErrorCodes::InternalError, errmsg);
@@ -724,6 +719,15 @@ void MongoExternalInfo::construct(JSContext* cx, JS::CallArgs args) {
     o.setString(InternedString::host, cs.toString());
     auto defaultDB = cs.getDatabase() == "" ? "test" : cs.getDatabase();
     o.setString(InternedString::defaultDB, defaultDB);
+
+    // Adds a property to the Mongo connection object.
+    boost::optional<bool> retryWrites = cs.getRetryWrites();
+    // If retryWrites is not explicitly set in uri, sessions created on this connection default to
+    // the global retryWrites value. This is checked in sessions.js by using the injected
+    // _shouldRetryWrites() function, which returns true if the --retryWrites flag was passed.
+    if (retryWrites) {
+        o.setBoolean(InternedString::_retryWrites, retryWrites.get());
+    }
 
     args.rval().setObjectOrNull(thisv);
 }

@@ -122,6 +122,9 @@ public:
         //    which is being used to execute an aggregation pipeline.
         NO_YIELD,
 
+        // Will not yield locks or storage engine resources, but will check for interrupt.
+        INTERRUPT_ONLY,
+
         // Used for testing, this yield policy will cause the PlanExecutor to time out on the first
         // yield, returning DEAD with an error object encoding a ErrorCodes::ExceededTimeLimit
         // message.
@@ -269,7 +272,8 @@ public:
      * Generates a tree of stats objects with a separate lifetime from the execution
      * stage tree wrapped by this PlanExecutor.
      *
-     * This is OK even if we were killed.
+     * This may be called without holding any locks. It also may be called on a PlanExecutor that
+     * has been killed or has produced an error.
      */
     std::unique_ptr<PlanStageStats> getStats() const;
 
@@ -448,6 +452,10 @@ public:
     const std::string& getKillReason() {
         invariant(isMarkedAsKilled());
         return *_killReason;
+    }
+
+    bool isDisposed() const {
+        return _currentState == kDisposed;
     }
 
     /**

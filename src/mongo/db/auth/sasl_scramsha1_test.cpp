@@ -29,13 +29,13 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/native_sasl_client_session.h"
-#include "mongo/client/scram_sha1_client_cache.h"
+#include "mongo/client/scram_client_cache.h"
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
 #include "mongo/db/auth/native_sasl_authentication_session.h"
-#include "mongo/db/auth/sasl_scramsha1_server_conversation.h"
+#include "mongo/db/auth/sasl_scram_server_conversation.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
@@ -49,7 +49,7 @@ BSONObj generateSCRAMUserDocument(StringData username, StringData password) {
     auto database = "test"_sd;
 
     std::string digested = createPasswordDigest(username, password);
-    BSONObj scramCred = scram::generateCredentials(digested, scramIterationCount);
+    auto scramCred = scram::SHA1Secrets::generateCredentials(digested, scramIterationCount);
     return BSON("_id" << (str::stream() << database << "." << username).operator StringData()
                       << AuthorizationManager::USER_NAME_FIELD_NAME
                       << username
@@ -257,7 +257,7 @@ TEST_F(SCRAMSHA1Fixture, testServerStep1DoesNotIncludeNonceFromClientStep1) {
     });
     ASSERT_EQ(SCRAMStepsResult(SaslTestState(SaslTestState::kClient, 2),
                                Status(ErrorCodes::BadValue,
-                                      "Server SCRAM-SHA-1 nonce does not match client nonce: r=")),
+                                      "Server SCRAM nonce does not match client nonce: r=")),
               runSteps(saslServerSession.get(), saslClientSession.get(), mutator));
 }
 
@@ -279,10 +279,10 @@ TEST_F(SCRAMSHA1Fixture, testClientStep2DoesNotIncludeNonceFromServerStep1) {
         std::string::iterator nonceEnd = std::find(nonceBegin, clientMessage.end(), ',');
         clientMessage = clientMessage.replace(nonceBegin, nonceEnd, "r=");
     });
-    ASSERT_EQ(SCRAMStepsResult(
-                  SaslTestState(SaslTestState::kServer, 2),
-                  Status(ErrorCodes::BadValue, "Incorrect SCRAM-SHA-1 client|server nonce: r=")),
-              runSteps(saslServerSession.get(), saslClientSession.get(), mutator));
+    ASSERT_EQ(
+        SCRAMStepsResult(SaslTestState(SaslTestState::kServer, 2),
+                         Status(ErrorCodes::BadValue, "Incorrect SCRAM client|server nonce: r=")),
+        runSteps(saslServerSession.get(), saslClientSession.get(), mutator));
 }
 
 TEST_F(SCRAMSHA1Fixture, testClientStep2GivesBadProof) {
@@ -308,7 +308,8 @@ TEST_F(SCRAMSHA1Fixture, testClientStep2GivesBadProof) {
 
     ASSERT_EQ(SCRAMStepsResult(SaslTestState(SaslTestState::kServer, 2),
                                Status(ErrorCodes::AuthenticationFailed,
-                                      "SCRAM-SHA-1 authentication failed, storedKey mismatch")),
+                                      "SCRAM authentication failed, storedKey mismatch")),
+
               runSteps(saslServerSession.get(), saslClientSession.get(), mutator));
 }
 
@@ -339,13 +340,12 @@ TEST_F(SCRAMSHA1Fixture, testServerStep2GivesBadVerifier) {
 
     auto result = runSteps(saslServerSession.get(), saslClientSession.get(), mutator);
 
-    ASSERT_EQ(
-        SCRAMStepsResult(
-            SaslTestState(SaslTestState::kClient, 3),
-            Status(ErrorCodes::BadValue,
-                   str::stream() << "Client failed to verify SCRAM-SHA-1 ServerSignature, received "
-                                 << encodedVerifier)),
-        result);
+    ASSERT_EQ(SCRAMStepsResult(
+                  SaslTestState(SaslTestState::kClient, 3),
+                  Status(ErrorCodes::BadValue,
+                         str::stream() << "Client failed to verify SCRAM ServerSignature, received "
+                                       << encodedVerifier)),
+              result);
 }
 
 
@@ -424,11 +424,10 @@ TEST_F(SCRAMSHA1Fixture, testSCRAMWithInvalidChannelBinding) {
         clientMessage.replace(clientMessage.begin(), clientMessage.begin() + 1, "v=illegalGarbage");
     });
 
-    ASSERT_EQ(
-        SCRAMStepsResult(SaslTestState(SaslTestState::kServer, 1),
-                         Status(ErrorCodes::BadValue,
-                                "Incorrect SCRAM-SHA-1 client message prefix: v=illegalGarbage")),
-        runSteps(saslServerSession.get(), saslClientSession.get(), mutator));
+    ASSERT_EQ(SCRAMStepsResult(SaslTestState(SaslTestState::kServer, 1),
+                               Status(ErrorCodes::BadValue,
+                                      "Incorrect SCRAM client message prefix: v=illegalGarbage")),
+              runSteps(saslServerSession.get(), saslClientSession.get(), mutator));
 }
 
 TEST_F(SCRAMSHA1Fixture, testNULLInPassword) {
@@ -488,7 +487,7 @@ TEST_F(SCRAMSHA1Fixture, testIncorrectPassword) {
 
     ASSERT_EQ(SCRAMStepsResult(SaslTestState(SaslTestState::kServer, 2),
                                Status(ErrorCodes::AuthenticationFailed,
-                                      "SCRAM-SHA-1 authentication failed, storedKey mismatch")),
+                                      "SCRAM authentication failed, storedKey mismatch")),
               runSteps(saslServerSession.get(), saslClientSession.get()));
 }
 
@@ -498,7 +497,7 @@ TEST(SCRAMSHA1Cache, testGetFromEmptyCache) {
     std::vector<std::uint8_t> salt(saltStr.begin(), saltStr.end());
     HostAndPort host("localhost:27017");
 
-    ASSERT_FALSE(cache.getCachedSecrets(host, scram::SCRAMPresecrets("aaa", salt, 10000)));
+    ASSERT_FALSE(cache.getCachedSecrets(host, scram::SHA1Presecrets("aaa", salt, 10000)));
 }
 
 
@@ -510,13 +509,13 @@ TEST(SCRAMSHA1Cache, testSetAndGet) {
     std::vector<std::uint8_t> badSalt(badSaltStr.begin(), badSaltStr.end());
     HostAndPort host("localhost:27017");
 
-    auto secret = scram::generateSecrets(scram::SCRAMPresecrets("aaa", salt, 10000));
-    cache.setCachedSecrets(host, scram::SCRAMPresecrets("aaa", salt, 10000), secret);
-    auto cachedSecret = cache.getCachedSecrets(host, scram::SCRAMPresecrets("aaa", salt, 10000));
+    auto secret = scram::SHA1Secrets(scram::SHA1Presecrets("aaa", salt, 10000));
+    cache.setCachedSecrets(host, scram::SHA1Presecrets("aaa", salt, 10000), secret);
+    auto cachedSecret = cache.getCachedSecrets(host, scram::SHA1Presecrets("aaa", salt, 10000));
     ASSERT_TRUE(cachedSecret);
-    ASSERT_TRUE(secret->clientKey == cachedSecret->clientKey);
-    ASSERT_TRUE(secret->serverKey == cachedSecret->serverKey);
-    ASSERT_TRUE(secret->storedKey == cachedSecret->storedKey);
+    ASSERT_TRUE(secret.clientKey() == cachedSecret.clientKey());
+    ASSERT_TRUE(secret.serverKey() == cachedSecret.serverKey());
+    ASSERT_TRUE(secret.storedKey() == cachedSecret.storedKey());
 }
 
 
@@ -528,14 +527,14 @@ TEST(SCRAMSHA1Cache, testSetAndGetWithDifferentParameters) {
     std::vector<std::uint8_t> badSalt(badSaltStr.begin(), badSaltStr.end());
     HostAndPort host("localhost:27017");
 
-    auto secret = scram::generateSecrets(scram::SCRAMPresecrets("aaa", salt, 10000));
-    cache.setCachedSecrets(host, scram::SCRAMPresecrets("aaa", salt, 10000), secret);
+    auto secret = scram::SHA1Secrets(scram::SHA1Presecrets("aaa", salt, 10000));
+    cache.setCachedSecrets(host, scram::SHA1Presecrets("aaa", salt, 10000), secret);
 
     ASSERT_FALSE(cache.getCachedSecrets(HostAndPort("localhost:27018"),
-                                        scram::SCRAMPresecrets("aaa", salt, 10000)));
-    ASSERT_FALSE(cache.getCachedSecrets(host, scram::SCRAMPresecrets("aab", salt, 10000)));
-    ASSERT_FALSE(cache.getCachedSecrets(host, scram::SCRAMPresecrets("aaa", badSalt, 10000)));
-    ASSERT_FALSE(cache.getCachedSecrets(host, scram::SCRAMPresecrets("aaa", salt, 10001)));
+                                        scram::SHA1Presecrets("aaa", salt, 10000)));
+    ASSERT_FALSE(cache.getCachedSecrets(host, scram::SHA1Presecrets("aab", salt, 10000)));
+    ASSERT_FALSE(cache.getCachedSecrets(host, scram::SHA1Presecrets("aaa", badSalt, 10000)));
+    ASSERT_FALSE(cache.getCachedSecrets(host, scram::SHA1Presecrets("aaa", salt, 10001)));
 }
 
 
@@ -545,17 +544,17 @@ TEST(SCRAMSHA1Cache, testSetAndReset) {
     std::vector<std::uint8_t> salt(saltStr.begin(), saltStr.end());
     HostAndPort host("localhost:27017");
 
-    auto secret = scram::generateSecrets(scram::SCRAMPresecrets("aaa", salt, 10000));
-    cache.setCachedSecrets(host, scram::SCRAMPresecrets("aaa", salt, 10000), secret);
-    auto newSecret = scram::generateSecrets(scram::SCRAMPresecrets("aab", salt, 10000));
-    cache.setCachedSecrets(host, scram::SCRAMPresecrets("aab", salt, 10000), newSecret);
+    scram::SHA1Secrets secret(scram::SHA1Presecrets("aaa", salt, 10000));
+    cache.setCachedSecrets(host, scram::SHA1Presecrets("aaa", salt, 10000), secret);
+    scram::SHA1Secrets newSecret(scram::SHA1Presecrets("aab", salt, 10000));
+    cache.setCachedSecrets(host, scram::SHA1Presecrets("aab", salt, 10000), newSecret);
 
-    ASSERT_FALSE(cache.getCachedSecrets(host, scram::SCRAMPresecrets("aaa", salt, 10000)));
-    auto cachedSecret = cache.getCachedSecrets(host, scram::SCRAMPresecrets("aab", salt, 10000));
+    ASSERT_FALSE(cache.getCachedSecrets(host, scram::SHA1Presecrets("aaa", salt, 10000)));
+    auto cachedSecret = cache.getCachedSecrets(host, scram::SHA1Presecrets("aab", salt, 10000));
     ASSERT_TRUE(cachedSecret);
-    ASSERT_TRUE(newSecret->clientKey == cachedSecret->clientKey);
-    ASSERT_TRUE(newSecret->serverKey == cachedSecret->serverKey);
-    ASSERT_TRUE(newSecret->storedKey == cachedSecret->storedKey);
+    ASSERT_TRUE(newSecret.clientKey() == cachedSecret.clientKey());
+    ASSERT_TRUE(newSecret.serverKey() == cachedSecret.serverKey());
+    ASSERT_TRUE(newSecret.storedKey() == cachedSecret.storedKey());
 }
 
 }  // namespace mongo

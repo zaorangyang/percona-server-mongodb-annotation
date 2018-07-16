@@ -48,7 +48,6 @@
 #include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context_noop.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/service_context_noop.h"
 #include "mongo/db/service_liason_mock.h"
 #include "mongo/db/sessions_collection_mock.h"
@@ -72,8 +71,6 @@ public:
     AuthorizationSessionForTest* authzSession;
 
     void setUp() {
-        serverGlobalParams.featureCompatibility.setVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36);
         session = transportLayer.createSession();
         client = serviceContext.makeClient("testClient", session);
         RestrictionEnvironment::set(
@@ -108,8 +105,8 @@ public:
     }
 
     User* addSimpleUser(UserName un) {
-        const auto creds = BSON("SCRAM-SHA-1" << scram::generateCredentials(
-                                    "a", saslGlobalParams.scramIterationCount.load()));
+        const auto creds = BSON("SCRAM-SHA-1" << scram::SHA1Secrets::generateCredentials(
+                                    "a", saslGlobalParams.scramSHA1IterationCount.load()));
         ASSERT_OK(managerState->insertPrivilegeDocument(
             _opCtx.get(),
             BSON("user" << un.getUser() << "db" << un.getDB() << "credentials" << creds << "roles"
@@ -123,8 +120,8 @@ public:
     }
 
     User* addClusterUser(UserName un) {
-        const auto creds = BSON("SCRAM-SHA-1" << scram::generateCredentials(
-                                    "a", saslGlobalParams.scramIterationCount.load()));
+        const auto creds = BSON("SCRAM-SHA-1" << scram::SHA1Secrets::generateCredentials(
+                                    "a", saslGlobalParams.scramSHA1IterationCount.load()));
         ASSERT_OK(managerState->insertPrivilegeDocument(
             _opCtx.get(),
             BSON("user" << un.getUser() << "db" << un.getDB() << "credentials" << creds << "roles"
@@ -335,6 +332,17 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SupportsDocLockingFa
             false),
         AssertionException,
         ErrorCodes::IllegalOperation);
+}
+
+TEST_F(LogicalSessionIdTest, ConstructorFromClientWithTooLongName) {
+    auto id = UUID::gen();
+
+    addSimpleUser(UserName(std::string(kMaximumUserNameLengthForLogicalSessions + 1, 'x'), "test"));
+
+    LogicalSessionFromClient req;
+    req.setId(id);
+
+    ASSERT_THROWS(makeLogicalSessionId(req, _opCtx.get()), AssertionException);
 }
 
 }  // namespace

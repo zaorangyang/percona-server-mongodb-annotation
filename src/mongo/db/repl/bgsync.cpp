@@ -50,7 +50,6 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/rollback_source_impl.h"
 #include "mongo/db/repl/rs_rollback.h"
-#include "mongo/db/repl/rs_rollback_no_uuid.h"
 #include "mongo/db/repl/rs_sync.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
@@ -139,11 +138,12 @@ static ServerStatusMetricField<Counter64> displayBufferMaxSize("repl.buffer.maxS
 
 
 BackgroundSync::BackgroundSync(
+    ReplicationCoordinator* replicationCoordinator,
     ReplicationCoordinatorExternalState* replicationCoordinatorExternalState,
     ReplicationProcess* replicationProcess,
     std::unique_ptr<OplogBuffer> oplogBuffer)
     : _oplogBuffer(std::move(oplogBuffer)),
-      _replCoord(getGlobalReplicationCoordinator()),
+      _replCoord(replicationCoordinator),
       _replicationCoordinatorExternalState(replicationCoordinatorExternalState),
       _replicationProcess(replicationProcess) {
     // Update "repl.buffer.maxSizeBytes" server status metric to reflect the current oplog buffer's
@@ -645,23 +645,13 @@ void BackgroundSync::_runRollback(OperationContext* opCtx,
         return connection->get();
     };
 
-    // Run a rollback algorithm that either uses UUIDs or does not use UUIDs depending on
-    // the FCV. Since collection UUIDs were only added in 3.6, the 3.4 rollback algorithm
-    // remains in place to maintain backwards compatibility.
-    if (serverGlobalParams.featureCompatibility.getVersion() ==
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-        // If the user is fully upgraded to FCV 3.6, use the "rollbackViaRefetch" method.
-        log() << "Rollback using the 'rollbackViaRefetch' method because UUID support "
-                 "is feature compatible with featureCompatibilityVersion 3.6.";
-        _fallBackOnRollbackViaRefetch(
-            opCtx, source, requiredRBID, &localOplog, true, getConnection);
+    auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    if (storageEngine->supportsRecoverToStableTimestamp()) {
+        _runRollbackViaRecoverToCheckpoint(
+            opCtx, source, &localOplog, storageInterface, getConnection);
     } else {
-        // If the user is either fully downgraded to FCV 3.4, downgrading to FCV 3.4,
-        // or upgrading to FCV 3.6, use the "rollbackViaRefetchNoUUID" method.
-        log() << "Rollback using the 'rollbackViaRefetchNoUUID' method because UUID "
-                 "support is not feature compatible with featureCompatibilityVersion 3.4";
-        _fallBackOnRollbackViaRefetch(
-            opCtx, source, requiredRBID, &localOplog, false, getConnection);
+        log() << "Rollback using the 'rollbackViaRefetch' method.";
+        _fallBackOnRollbackViaRefetch(opCtx, source, requiredRBID, &localOplog, getConnection);
     }
 
     // Reset the producer to clear the sync source and the last optime fetched.
@@ -685,8 +675,6 @@ void BackgroundSync::_runRollbackViaRecoverToCheckpoint(
         }
     }
 
-    fassertFailedNoTrace(40651);
-
     _rollback = stdx::make_unique<RollbackImpl>(
         localOplog, &remoteOplog, storageInterface, _replicationProcess, _replCoord);
 
@@ -694,8 +682,11 @@ void BackgroundSync::_runRollbackViaRecoverToCheckpoint(
     auto status = _rollback->runRollback(opCtx);
     if (status.isOK()) {
         log() << "Rollback successful.";
+    } else if (status == ErrorCodes::UnrecoverableRollbackError) {
+        severe() << "Rollback failed with unrecoverable error: " << status;
+        fassertFailedWithStatusNoTrace(50666, status);
     } else {
-        warning() << "Rollback failed with error: " << status;
+        warning() << "Rollback failed with retryable error: " << status;
     }
 }
 
@@ -704,18 +695,12 @@ void BackgroundSync::_fallBackOnRollbackViaRefetch(
     const HostAndPort& source,
     int requiredRBID,
     OplogInterface* localOplog,
-    bool useUUID,
     OplogInterfaceRemote::GetConnectionFn getConnection) {
 
     RollbackSourceImpl rollbackSource(
         getConnection, source, NamespaceString::kRsOplogNamespace.ns());
 
-    if (useUUID) {
-        rollback(opCtx, *localOplog, rollbackSource, requiredRBID, _replCoord, _replicationProcess);
-    } else {
-        rollbackNoUUID(
-            opCtx, *localOplog, rollbackSource, requiredRBID, _replCoord, _replicationProcess);
-    }
+    rollback(opCtx, *localOplog, rollbackSource, requiredRBID, _replCoord, _replicationProcess);
 }
 
 HostAndPort BackgroundSync::getSyncTarget() const {

@@ -39,7 +39,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/s/catalog/sharding_catalog_manager.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
@@ -61,8 +61,8 @@ class ConfigSvrEnableShardingCommand : public BasicCommand {
 public:
     ConfigSvrEnableShardingCommand() : BasicCommand("_configsvrEnableSharding") {}
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -73,14 +73,14 @@ public:
         return true;
     }
 
-    virtual void help(std::stringstream& help) const override {
-        help << "Internal command, which is exported by the sharding config server. Do not call "
-                "directly. Enable sharding on a database.";
+    std::string help() const override {
+        return "Internal command, which is exported by the sharding config server. Do not call "
+               "directly. Enable sharding on a database.";
     }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) override {
+                                       const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forDatabaseName(parseNs(dbname, cmdObj)), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -99,7 +99,7 @@ public:
              BSONObjBuilder& result) {
 
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::IllegalOperation,
                        "_configsvrEnableSharding can only be run on config servers"));
@@ -113,9 +113,10 @@ public:
             NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
 
         if (dbname == NamespaceString::kAdminDb || dbname == NamespaceString::kLocalDb) {
-            return appendCommandStatus(result,
-                                       {ErrorCodes::InvalidOptions,
-                                        str::stream() << "can't shard " + dbname + " database"});
+            return CommandHelpers::appendCommandStatus(
+                result,
+                {ErrorCodes::InvalidOptions,
+                 str::stream() << "can't shard " + dbname + " database"});
         }
 
         uassert(ErrorCodes::InvalidOptions,

@@ -82,7 +82,6 @@
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/repl/timestamp_block.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
@@ -121,11 +120,6 @@ namespace {
  * the Collection instance is destroyed. See `oplogCheckCloseDatabase`.
  */
 Collection* _localOplogCollection = nullptr;
-
-// Specifies whether we abort initial sync when attempting to apply a renameCollection operation.
-// If set to true, users risk corrupting their data. This should only be enabled by expert users
-// of the server who understand the risks this poses.
-MONGO_EXPORT_SERVER_PARAMETER(allowUnsafeRenamesDuringInitialSync, bool, false);
 
 PseudoRandom hashGenerator(std::unique_ptr<SecureRandom>(SecureRandom::create())->nextInt64());
 
@@ -219,8 +213,8 @@ private:
 
 }  // namespace
 
-void setOplogCollectionName() {
-    switch (getGlobalReplicationCoordinator()->getReplicationMode()) {
+void setOplogCollectionName(ServiceContext* service) {
+    switch (ReplicationCoordinator::get(service)->getReplicationMode()) {
         case ReplicationCoordinator::modeReplSet:
             _oplogCollectionName = NamespaceString::kRsOplogNamespace.ns();
             break;
@@ -421,7 +415,10 @@ OpTime logOp(OperationContext* opCtx,
     // For commands, the test below is on the command ns and therefore does not check for
     // specific namespaces such as system.profile. This is the caller's responsibility.
     if (replCoord->isOplogDisabledFor(opCtx, nss)) {
-        invariant(statementId == kUninitializedStmtId);
+        uassert(ErrorCodes::IllegalOperation,
+                str::stream() << "retryable writes is not supported for unreplicated ns: "
+                              << nss.ns(),
+                statementId == kUninitializedStmtId);
         return {};
     }
 
@@ -465,7 +462,10 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
 
     auto replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->isOplogDisabledFor(opCtx, nss)) {
-        invariant(begin->stmtId == kUninitializedStmtId);
+        uassert(ErrorCodes::IllegalOperation,
+                str::stream() << "retryable writes is not supported for unreplicated ns: "
+                              << nss.ns(),
+                begin->stmtId == kUninitializedStmtId);
         return {};
     }
 
@@ -891,10 +891,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-          BSONObjBuilder resultWeDontCareAbout;
-          return applyOps(opCtx, nsToDatabase(ns), cmd, mode, &resultWeDontCareAbout);
-      },
-      {ErrorCodes::UnknownError}}},
+         BSONObjBuilder resultWeDontCareAbout;
+         return applyOps(opCtx, nsToDatabase(ns), cmd, mode, &resultWeDontCareAbout);
+     }}},
     {"convertToCapped",
      {[](OperationContext* opCtx,
          const char* ns,
@@ -1050,7 +1049,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 collection);
         requestNss = collection->ns();
         dassert(opCtx->lockState()->isCollectionLockedForMode(
-            requestNss.ns(), supportsDocLocking() ? MODE_IX : MODE_X));
+                    requestNss.ns(), supportsDocLocking() ? MODE_IX : MODE_X),
+                requestNss.ns());
     } else {
         uassert(ErrorCodes::InvalidNamespace,
                 "'ns' must be of type String",
@@ -1061,11 +1061,12 @@ Status applyOperation_inlock(OperationContext* opCtx,
             if (supportsDocLocking()) {
                 // WiredTiger, and others requires MODE_IX since the applier threads driving
                 // this allow writes to the same collection on any thread.
-                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_IX));
+                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_IX),
+                        requestNss.ns());
             } else {
                 // mmapV1 ensures that all operations to the same collection are executed from
                 // the same worker thread, so it takes an exclusive lock (MODE_X)
-                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_X));
+                dassert(opCtx->lockState()->isCollectionLockedForMode(ns, MODE_X), requestNss.ns());
             }
         }
         collection = db->getCollection(opCtx, requestNss);
@@ -1074,7 +1075,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
     // During upgrade from 3.4 to 3.6, the feature compatibility version cannot change during
     // initial sync because we cannot do some operations with UUIDs and others without.
     if ((mode == OplogApplication::Mode::kInitialSync) &&
-        requestNss == FeatureCompatibilityVersion::kCollection) {
+        requestNss.ns() == FeatureCompatibilityVersion::kCollection) {
         std::string oID;
         auto status = bsonExtractStringField(o, "_id", &oID);
         if (status.isOK() && oID == FeatureCompatibilityVersion::kParameterName) {
@@ -1502,21 +1503,6 @@ Status applyCommand_inlock(OperationContext* opCtx,
         }
     }
 
-    // Applying renameCollection during initial sync to a collection without UUID might lead to
-    // data corruption, so we restart the initial sync.
-    if (fieldUI.eoo() && (mode == OplogApplication::Mode::kInitialSync) &&
-        o.firstElementFieldName() == std::string("renameCollection")) {
-        if (!allowUnsafeRenamesDuringInitialSync.load()) {
-            return Status(ErrorCodes::OplogOperationUnsupported,
-                          str::stream()
-                              << "Applying renameCollection not supported in initial sync: "
-                              << redact(op));
-        }
-        warning() << "allowUnsafeRenamesDuringInitialSync set to true. Applying renameCollection "
-                     "operation during initial sync even though it may lead to data corruption: "
-                  << redact(op);
-    }
-
     // During upgrade from 3.4 to 3.6, the feature compatibility version cannot change during
     // initial sync because we cannot do some operations with UUIDs and others without.
     // We do not attempt to parse the whitelisted ops because they do not have a collection
@@ -1527,7 +1513,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
     if ((mode == OplogApplication::Mode::kInitialSync) &&
         (std::find(whitelistedOps.begin(), whitelistedOps.end(), o.firstElementFieldName()) ==
          whitelistedOps.end()) &&
-        parseNs(nss.ns(), o) == FeatureCompatibilityVersion::kCollection) {
+        parseNs(nss.ns(), o).ns() == FeatureCompatibilityVersion::kCollection) {
         return Status(ErrorCodes::OplogOperationUnsupported,
                       str::stream() << "Applying command to feature compatibility version "
                                        "collection not supported in initial sync: "
@@ -1616,7 +1602,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
             case ErrorCodes::BackgroundOperationInProgressForNamespace: {
                 Lock::TempRelease release(opCtx->lockState());
 
-                Command* cmd = Command::findCommand(o.firstElement().fieldName());
+                Command* cmd = CommandHelpers::findCommand(o.firstElement().fieldName());
                 invariant(cmd);
                 BackgroundOperation::awaitNoBgOpInProgForNs(cmd->parseNs(nss.db().toString(), o));
                 opCtx->recoveryUnit()->abandonSnapshot();
@@ -1681,6 +1667,12 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx) {
         _localOplogCollection = autoColl.getCollection();
         fassert(13347, _localOplogCollection);
     }
+}
+
+void establishOplogCollectionForLogging(OperationContext* opCtx, Collection* oplog) {
+    invariant(opCtx->lockState()->isW());
+    invariant(oplog);
+    _localOplogCollection = oplog;
 }
 
 void signalOplogWaiters() {

@@ -266,10 +266,8 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
         auto responseStatus = _callRecipient(
             createRequestWithSessionId(kRecvChunkStatus, _args.getNss(), _sessionId));
         if (!responseStatus.isOK()) {
-            return {responseStatus.getStatus().code(),
-                    str::stream()
-                        << "Failed to contact recipient shard to monitor data transfer due to "
-                        << responseStatus.getStatus().toString()};
+            return responseStatus.getStatus().withContext(
+                "Failed to contact recipient shard to monitor data transfer");
         }
 
         const BSONObj& res = responseStatus.getValue();
@@ -334,7 +332,7 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
     return {ErrorCodes::ExceededTimeLimit, "Timed out waiting for the cloner to catch up"};
 }
 
-Status MigrationChunkClonerSourceLegacy::commitClone(OperationContext* opCtx) {
+StatusWith<BSONObj> MigrationChunkClonerSourceLegacy::commitClone(OperationContext* opCtx) {
     invariant(_state == kCloning);
     invariant(!opCtx->lockState()->isLocked());
 
@@ -348,7 +346,8 @@ Status MigrationChunkClonerSourceLegacy::commitClone(OperationContext* opCtx) {
                     "destination shard finished committing but there are still some session "
                     "metadata that needs to be transferred"};
         }
-        return Status::OK();
+
+        return responseStatus;
     }
 
     cancelClone(opCtx);

@@ -61,6 +61,18 @@ public:
     // Current oplog version, should be the value of the v field in all oplog entries.
     static const int kOplogVersion;
 
+    // Helpers to generate ReplOperation.
+    static ReplOperation makeInsertOperation(const NamespaceString& nss,
+                                             boost::optional<UUID> uuid,
+                                             const BSONObj& docToInsert);
+    static ReplOperation makeUpdateOperation(const NamespaceString nss,
+                                             boost::optional<UUID> uuid,
+                                             const BSONObj& update,
+                                             const BSONObj& criteria);
+    static ReplOperation makeDeleteOperation(const NamespaceString& nss,
+                                             boost::optional<UUID> uuid,
+                                             const BSONObj& docToDelete);
+
     static StatusWith<OplogEntry> parse(const BSONObj& object);
 
     OplogEntry(OpTime opTime,
@@ -103,9 +115,22 @@ public:
     BSONElement getIdElement() const;
 
     /**
+     * Returns the document representing the operation to apply.
+     * For commands and insert/delete operations, this will be the document in the 'o' field.
+     * For update operations, this will be the document in the 'o2' field.
+     * An empty document returned by this function indicates that we have a malformed OplogEntry.
+     */
+    BSONObj getOperationToApply() const;
+
+    /**
      * Returns the type of command of the oplog entry. Must be called on a command op.
      */
     CommandType getCommandType() const;
+
+    /**
+     * Returns the size of the original document used to create this OplogEntry.
+     */
+    int getRawObjSizeBytes() const;
 
     /**
      * Returns the OpTime of the oplog entry.

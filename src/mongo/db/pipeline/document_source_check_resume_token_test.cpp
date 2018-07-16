@@ -41,6 +41,7 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/resume_token.h"
 #include "mongo/db/pipeline/stub_mongo_process_interface.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/death_test.h"
@@ -182,12 +183,12 @@ TEST_F(CheckResumeTokenTest, ShouldFailIfFirstDocHasWrongResumeToken) {
     ASSERT_THROWS_CODE(checkResumeToken->getNext(), AssertionException, 40585);
 }
 
-TEST_F(CheckResumeTokenTest, ShouldFailIfTokenHasWrongDocumentId) {
+TEST_F(CheckResumeTokenTest, ShouldIgnoreChangeWithEarlierTimestamp) {
     Timestamp resumeTimestamp(100, 1);
 
-    auto checkResumeToken = createCheckResumeToken(resumeTimestamp, "0");
-    addDocument(resumeTimestamp, "1");
-    ASSERT_THROWS_CODE(checkResumeToken->getNext(), AssertionException, 40585);
+    auto checkResumeToken = createCheckResumeToken(resumeTimestamp, "1");
+    addDocument(resumeTimestamp, "0");
+    ASSERT_TRUE(checkResumeToken->getNext().isEOF());
 }
 
 TEST_F(CheckResumeTokenTest, ShouldFailIfTokenHasWrongNamespace) {
@@ -198,6 +199,18 @@ TEST_F(CheckResumeTokenTest, ShouldFailIfTokenHasWrongNamespace) {
     auto otherUUID = UUID::gen();
     addDocument(resumeTimestamp, "1", otherUUID);
     ASSERT_THROWS_CODE(checkResumeToken->getNext(), AssertionException, 40585);
+}
+
+TEST_F(CheckResumeTokenTest, ShouldSucceedWithBinaryCollation) {
+    CollatorInterfaceMock collatorCompareLower(CollatorInterfaceMock::MockType::kToLowerString);
+    getExpCtx()->setCollator(&collatorCompareLower);
+
+    Timestamp resumeTimestamp(100, 1);
+
+    auto checkResumeToken = createCheckResumeToken(resumeTimestamp, "abc");
+    // We must not see the following document.
+    addDocument(resumeTimestamp, "ABC");
+    ASSERT_TRUE(checkResumeToken->getNext().isEOF());
 }
 
 /**
@@ -218,7 +231,7 @@ public:
     MockMongoInterface(deque<DocumentSource::GetNextResult> mockResults)
         : _mockResults(std::move(mockResults)) {}
 
-    bool isSharded(OperationContext* opCtx, const NamespaceString& nss) final {
+    bool isSharded(OperationContext* opCtx, const NamespaceString& ns) final {
         return false;
     }
 
@@ -236,16 +249,16 @@ public:
         }
 
         if (opts.attachCursorSource) {
-            pipeline = attachCursorSourceToPipeline(expCtx, pipeline.getValue().release());
+            uassertStatusOK(attachCursorSourceToPipeline(expCtx, pipeline.getValue().get()));
         }
 
         return pipeline;
     }
 
-    StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> attachCursorSourceToPipeline(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* pipeline) final {
+    Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                        Pipeline* pipeline) final {
         pipeline->addInitialSource(DocumentSourceMock::create(_mockResults));
-        return std::unique_ptr<Pipeline, PipelineDeleter>(pipeline, PipelineDeleter(expCtx->opCtx));
+        return Status::OK();
     }
 
 private:

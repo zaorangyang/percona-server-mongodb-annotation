@@ -270,6 +270,20 @@ public:
     }
 
     /**
+     * See `StorageEngine::recoverToStableTimestamp`
+     */
+    virtual Status recoverToStableTimestamp() {
+        fassertFailed(50664);
+    }
+
+    /**
+     * See `StorageEngine::supportsReadConcernSnapshot`
+     */
+    virtual bool supportsReadConcernSnapshot() const {
+        return false;
+    }
+
+    /**
      * See `StorageEngine::replicationBatchIsComplete()`
      */
     virtual void replicationBatchIsComplete() const {};

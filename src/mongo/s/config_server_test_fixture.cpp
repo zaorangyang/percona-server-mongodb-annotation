@@ -48,6 +48,7 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
@@ -57,7 +58,6 @@
 #include "mongo/s/catalog/dist_lock_catalog_impl.h"
 #include "mongo/s/catalog/replset_dist_lock_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
-#include "mongo/s/catalog/sharding_catalog_manager.h"
 #include "mongo/s/catalog/type_changelog.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -72,7 +72,7 @@
 #include "mongo/s/config_server_catalog_cache_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
-#include "mongo/s/set_shard_version_request.h"
+#include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/memory.h"
@@ -300,8 +300,8 @@ Status ConfigServerTestFixture::setupShards(const std::vector<ShardType>& shards
 
 StatusWith<ShardType> ConfigServerTestFixture::getShardDoc(OperationContext* opCtx,
                                                            const std::string& shardId) {
-    auto doc = findOneOnConfigCollection(
-        opCtx, NamespaceString(ShardType::ConfigNS), BSON(ShardType::name(shardId)));
+    auto doc =
+        findOneOnConfigCollection(opCtx, ShardType::ConfigNS, BSON(ShardType::name(shardId)));
     if (!doc.isOK()) {
         if (doc.getStatus() == ErrorCodes::NoMatchingDocument) {
             return {ErrorCodes::ShardNotFound,
@@ -327,8 +327,8 @@ Status ConfigServerTestFixture::setupChunks(const std::vector<ChunkType>& chunks
 
 StatusWith<ChunkType> ConfigServerTestFixture::getChunkDoc(OperationContext* opCtx,
                                                            const BSONObj& minKey) {
-    auto doc = findOneOnConfigCollection(
-        opCtx, NamespaceString(ChunkType::ConfigNS), BSON(ChunkType::min() << minKey));
+    auto doc =
+        findOneOnConfigCollection(opCtx, ChunkType::ConfigNS, BSON(ChunkType::min() << minKey));
     if (!doc.isOK())
         return doc.getStatus();
 
@@ -338,10 +338,7 @@ StatusWith<ChunkType> ConfigServerTestFixture::getChunkDoc(OperationContext* opC
 void ConfigServerTestFixture::setupDatabase(const std::string& dbName,
                                             const ShardId primaryShard,
                                             const bool sharded) {
-    DatabaseType db;
-    db.setName(dbName);
-    db.setPrimary(primaryShard);
-    db.setSharded(sharded);
+    DatabaseType db(dbName, primaryShard, sharded);
     ASSERT_OK(catalogClient()->insertConfigDocument(operationContext(),
                                                     DatabaseType::ConfigNS,
                                                     db.toBSON(),
@@ -374,14 +371,13 @@ StatusWith<std::vector<BSONObj>> ConfigServerTestFixture::getIndexes(OperationCo
 
 std::vector<KeysCollectionDocument> ConfigServerTestFixture::getKeys(OperationContext* opCtx) {
     auto config = getConfigShard();
-    auto findStatus =
-        config->exhaustiveFindOnConfig(opCtx,
-                                       kReadPref,
-                                       repl::ReadConcernLevel::kMajorityReadConcern,
-                                       NamespaceString(KeysCollectionDocument::ConfigNS),
-                                       BSONObj(),
-                                       BSON("expiresAt" << 1),
-                                       boost::none);
+    auto findStatus = config->exhaustiveFindOnConfig(opCtx,
+                                                     kReadPref,
+                                                     repl::ReadConcernLevel::kMajorityReadConcern,
+                                                     KeysCollectionDocument::ConfigNS,
+                                                     BSONObj(),
+                                                     BSON("expiresAt" << 1),
+                                                     boost::none);
     ASSERT_OK(findStatus.getStatus());
 
     std::vector<KeysCollectionDocument> keys;

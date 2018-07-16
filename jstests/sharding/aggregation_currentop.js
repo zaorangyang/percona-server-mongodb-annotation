@@ -17,6 +17,15 @@
 (function() {
     "use strict";
 
+    // Replica set nodes started with --shardsvr do not enable key generation until they are added
+    // to a sharded cluster and reject commands with gossiped clusterTime from users without the
+    // advanceClusterTime privilege. This causes ShardingTest setup to fail because the shell
+    // briefly authenticates as __system and recieves clusterTime metadata then will fail trying to
+    // gossip that time later in setup.
+    //
+    // TODO SERVER-32672: remove this flag.
+    TestData.skipGossipingClusterTime = true;
+
     const key = "jstests/libs/key1";
 
     // Create a new sharded cluster for testing. We set the internalQueryExecYieldIterations
@@ -532,6 +541,9 @@
 
     // Test that the allUsers parameter is ignored when authentication is disabled.
     restartReplSet(shardRS, {shardsvr: null, keyFile: null});
+    // Explicitly set the keyFile to null. If ReplSetTest#stopSet sees a keyFile property, it
+    // attempts to auth before dbhash checks.
+    shardRS.keyFile = null;
 
     // Ensure that there is at least one other connection present.
     const otherConn = new Mongo(shardConn.host);
@@ -614,4 +626,5 @@
     assert.commandWorked(shardAdminDB.killOp(op.opid));
 
     awaitShell();
+    st.stop();
 })();

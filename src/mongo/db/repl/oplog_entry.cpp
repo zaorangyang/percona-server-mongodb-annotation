@@ -136,6 +136,41 @@ BSONObj makeOplogEntryDoc(OpTime opTime,
 const int OplogEntry::kOplogVersion = 2;
 
 // Static
+ReplOperation OplogEntry::makeInsertOperation(const NamespaceString& nss,
+                                              boost::optional<UUID> uuid,
+                                              const BSONObj& docToInsert) {
+    ReplOperation op;
+    op.setOpType(OpTypeEnum::kInsert);
+    op.setNamespace(nss);
+    op.setUuid(uuid);
+    op.setObject(docToInsert);
+    return op;
+}
+
+ReplOperation OplogEntry::makeUpdateOperation(const NamespaceString nss,
+                                              boost::optional<UUID> uuid,
+                                              const BSONObj& update,
+                                              const BSONObj& criteria) {
+    ReplOperation op;
+    op.setOpType(OpTypeEnum::kUpdate);
+    op.setNamespace(nss);
+    op.setUuid(uuid);
+    op.setObject(update);
+    op.setObject2(criteria);
+    return op;
+}
+
+ReplOperation OplogEntry::makeDeleteOperation(const NamespaceString& nss,
+                                              boost::optional<UUID> uuid,
+                                              const BSONObj& docToDelete) {
+    ReplOperation op;
+    op.setOpType(OpTypeEnum::kDelete);
+    op.setNamespace(nss);
+    op.setUuid(uuid);
+    op.setObject(docToDelete);
+    return op;
+}
+
 StatusWith<OplogEntry> OplogEntry::parse(const BSONObj& object) {
     try {
         return OplogEntry(object);
@@ -208,16 +243,34 @@ bool OplogEntry::isCrudOpType() const {
 BSONElement OplogEntry::getIdElement() const {
     invariant(isCrudOpType());
     if (getOpType() == OpTypeEnum::kUpdate) {
+        // We cannot use getOperationToApply() here because the BSONObj will go out out of scope
+        // after we return the BSONElement.
         return getObject2()->getField("_id");
     } else {
         return getObject()["_id"];
     }
 }
 
+BSONObj OplogEntry::getOperationToApply() const {
+    if (getOpType() != OpTypeEnum::kUpdate) {
+        return getObject();
+    }
+
+    if (auto optionalObj = getObject2()) {
+        return *optionalObj;
+    }
+
+    return {};
+}
+
 OplogEntry::CommandType OplogEntry::getCommandType() const {
     invariant(isCommand());
     invariant(_commandType != OplogEntry::CommandType::kNotCommand);
     return _commandType;
+}
+
+int OplogEntry::getRawObjSizeBytes() const {
+    return raw.objsize();
 }
 
 OpTime OplogEntry::getOpTime() const {

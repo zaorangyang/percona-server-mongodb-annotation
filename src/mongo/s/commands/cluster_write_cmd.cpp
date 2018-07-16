@@ -41,12 +41,12 @@
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_last_error_info.h"
-#include "mongo/s/commands/chunk_manager_targeter.h"
 #include "mongo/s/commands/cluster_explain.h"
-#include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
+#include "mongo/s/write_ops/chunk_manager_targeter.h"
+#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
@@ -64,8 +64,7 @@ void batchErrorToLastError(const BatchedCommandRequest& request,
     if (!response.getOk()) {
         // Command-level error, all writes failed
         commandError.reset(new WriteErrorDetail);
-        commandError->setErrCode(response.getErrCode());
-        commandError->setErrMessage(response.getErrMessage());
+        commandError->setStatus(response.getTopLevelStatus());
 
         lastBatchError = commandError.get();
     } else if (response.isErrDetailsSet()) {
@@ -83,8 +82,8 @@ void batchErrorToLastError(const BatchedCommandRequest& request,
 
     // Record an error if one exists
     if (lastBatchError) {
-        const auto& errMsg = lastBatchError->getErrMessage();
-        error->setLastError(lastBatchError->getErrCode(),
+        const auto& errMsg = lastBatchError->toStatus().reason();
+        error->setLastError(lastBatchError->toStatus().code(),
                             errMsg.empty() ? "see code for details" : errMsg);
         return;
     }
@@ -140,15 +139,15 @@ class ClusterWriteCmd : public Command {
 public:
     virtual ~ClusterWriteCmd() {}
 
-    bool slaveOk() const final {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const final {
+        return AllowedOnSecondary::kNever;
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const final {
         return true;
     }
 
-    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) final {
+    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) const final {
         Status status = auth::checkAuthForWriteCommand(
             AuthorizationSession::get(opCtx->getClient()), _writeType, request);
 
@@ -337,8 +336,8 @@ class ClusterCmdInsert : public ClusterWriteCmd {
 public:
     ClusterCmdInsert() : ClusterWriteCmd("insert", BatchedCommandRequest::BatchType_Insert) {}
 
-    void help(std::stringstream& help) const {
-        help << "insert documents";
+    std::string help() const override {
+        return "insert documents";
     }
 
 } clusterInsertCmd;
@@ -347,8 +346,8 @@ class ClusterCmdUpdate : public ClusterWriteCmd {
 public:
     ClusterCmdUpdate() : ClusterWriteCmd("update", BatchedCommandRequest::BatchType_Update) {}
 
-    void help(std::stringstream& help) const {
-        help << "update documents";
+    std::string help() const override {
+        return "update documents";
     }
 
 } clusterUpdateCmd;
@@ -357,8 +356,8 @@ class ClusterCmdDelete : public ClusterWriteCmd {
 public:
     ClusterCmdDelete() : ClusterWriteCmd("delete", BatchedCommandRequest::BatchType_Delete) {}
 
-    void help(std::stringstream& help) const {
-        help << "delete documents";
+    std::string help() const override {
+        return "delete documents";
     }
 
 } clusterDeleteCmd;

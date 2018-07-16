@@ -61,12 +61,8 @@ public:
     /**
      * Running an explain on a secondary requires explicitly setting slaveOk.
      */
-    virtual bool slaveOk() const {
-        return false;
-    }
-
-    virtual bool slaveOverrideOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kOptIn;
     }
 
     virtual bool maintenanceOk() const {
@@ -77,8 +73,8 @@ public:
         return false;
     }
 
-    virtual void help(std::stringstream& help) const {
-        help << "explain database reads and writes";
+    std::string help() const override {
+        return "explain database reads and writes";
     }
 
     /**
@@ -88,14 +84,14 @@ public:
      */
     virtual Status checkAuthForOperation(OperationContext* opCtx,
                                          const std::string& dbname,
-                                         const BSONObj& cmdObj) {
+                                         const BSONObj& cmdObj) const {
         if (Object != cmdObj.firstElement().type()) {
             return Status(ErrorCodes::BadValue, "explain command requires a nested object");
         }
 
         BSONObj explainObj = cmdObj.firstElement().Obj();
 
-        Command* commToExplain = Command::findCommand(explainObj.firstElementFieldName());
+        Command* commToExplain = CommandHelpers::findCommand(explainObj.firstElementFieldName());
         if (NULL == commToExplain) {
             mongoutils::str::stream ss;
             ss << "unknown command: " << explainObj.firstElementFieldName();
@@ -112,7 +108,7 @@ public:
                      BSONObjBuilder& result) {
         auto verbosity = ExplainOptions::parseCmdBSON(cmdObj);
         if (!verbosity.isOK()) {
-            return appendCommandStatus(result, verbosity.getStatus());
+            return CommandHelpers::appendCommandStatus(result, verbosity.getStatus());
         }
 
         // This is the nested command which we are explaining. We need to propagate generic
@@ -134,7 +130,7 @@ public:
                 // If the argument is in both the inner and outer command, we currently let the
                 // inner version take precedence.
                 const auto name = outerElem.fieldNameStringData();
-                if (Command::isGenericArgument(name) && !innerObj.hasField(name)) {
+                if (CommandHelpers::isGenericArgument(name) && !innerObj.hasField(name)) {
                     bob.append(outerElem);
                 }
             }
@@ -142,9 +138,9 @@ public:
         }());
 
         const std::string cmdName = explainObj.firstElementFieldName();
-        Command* commToExplain = Command::findCommand(cmdName);
+        Command* commToExplain = CommandHelpers::findCommand(cmdName);
         if (!commToExplain) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status{ErrorCodes::CommandNotFound,
                        str::stream() << "Explain failed due to unknown command: " << cmdName});
@@ -154,7 +150,7 @@ public:
         Status explainStatus =
             commToExplain->explain(opCtx, dbName, explainObj, verbosity.getValue(), &result);
         if (!explainStatus.isOK()) {
-            return appendCommandStatus(result, explainStatus);
+            return CommandHelpers::appendCommandStatus(result, explainStatus);
         }
 
         return true;

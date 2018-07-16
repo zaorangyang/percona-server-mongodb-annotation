@@ -30,19 +30,11 @@
 #include <cstdint>
 #include <vector>
 
-#include "mongo/base/init.h"
-#include "mongo/client/connpool.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
 #include "mongo/dbtests/mock/mock_conn_registry.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/s/client/shard_connection.h"
-#include "mongo/stdx/memory.h"
-#include "mongo/stdx/thread.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/socket_exception.h"
 
@@ -182,7 +174,7 @@ TEST_F(ShardConnFixture, InvalidateBadConnInPool) {
 
     try {
         conn2.get()->query("test.user", mongo::Query());
-    } catch (const mongo::SocketException&) {
+    } catch (const mongo::NetworkException&) {
     }
 
     conn2.done();
@@ -201,7 +193,7 @@ TEST_F(ShardConnFixture, DontReturnKnownBadConnToPool) {
 
     try {
         conn3.get()->query("test.user", mongo::Query());
-    } catch (const mongo::SocketException&) {
+    } catch (const mongo::NetworkException&) {
     }
 
     restartServer();
@@ -224,7 +216,7 @@ TEST_F(ShardConnFixture, BadConnClearsPoolWhenKilled) {
 
     try {
         conn3.get()->query("test.user", mongo::Query());
-    } catch (const mongo::SocketException&) {
+    } catch (const mongo::NetworkException&) {
     }
 
     restartServer();
@@ -277,7 +269,7 @@ TEST_F(ShardConnFixture, InvalidateBadConnEvenWhenPoolIsFull) {
 
     try {
         conn2.get()->query("test.user", mongo::Query());
-    } catch (const mongo::SocketException&) {
+    } catch (const mongo::NetworkException&) {
     }
 
     conn2.done();

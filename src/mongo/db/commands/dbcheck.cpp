@@ -155,7 +155,7 @@ std::unique_ptr<DbCheckRun> getRun(OperationContext* opCtx,
 
     // Get rid of generic command fields.
     for (const auto& elem : obj) {
-        if (!Command::isGenericArgument(elem.fieldNameStringData())) {
+        if (!CommandHelpers::isGenericArgument(elem.fieldNameStringData())) {
             builder.append(elem);
         }
     }
@@ -489,8 +489,8 @@ class DbCheckCmd : public BasicCommand {
 public:
     DbCheckCmd() : BasicCommand("dbCheck") {}
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual bool adminOnly() const {
@@ -501,21 +501,21 @@ public:
         return false;
     }
 
-    virtual void help(std::stringstream& help) const {
-        help << "Validate replica set consistency.\n"
-             << "Invoke with { dbCheck: <collection name/uuid>,\n"
-             << "              minKey: <first key, exclusive>,\n"
-             << "              maxKey: <last key, inclusive>,\n"
-             << "              maxCount: <max number of docs>,\n"
-             << "              maxSize: <max size of docs>,\n"
-             << "              maxCountPerSecond: <max rate in docs/sec> } "
-             << "to check a collection.\n"
-             << "Invoke with {dbCheck: 1} to check all collections in the database.";
+    std::string help() const override {
+        return "Validate replica set consistency.\n"
+               "Invoke with { dbCheck: <collection name/uuid>,\n"
+               "              minKey: <first key, exclusive>,\n"
+               "              maxKey: <last key, inclusive>,\n"
+               "              maxCount: <max number of docs>,\n"
+               "              maxSize: <max size of docs>,\n"
+               "              maxCountPerSecond: <max rate in docs/sec> } "
+               "to check a collection.\n"
+               "Invoke with {dbCheck: 1} to check all collections in the database.";
     }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         // For now, just use `find` permissions.
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
@@ -550,7 +550,7 @@ public:
 
 private:
     bool _hasCorrectFCV(void) {
-        return serverGlobalParams.featureCompatibility.getVersion() ==
+        return serverGlobalParams.featureCompatibility.getVersion() >=
             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36;
     }
 };

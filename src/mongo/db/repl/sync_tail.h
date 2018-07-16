@@ -43,6 +43,7 @@ namespace mongo {
 
 class Database;
 class OperationContext;
+struct MultikeyPathInfo;
 
 namespace repl {
 class BackgroundSync;
@@ -149,7 +150,7 @@ public:
             _batch.emplace_back(std::move(obj));
         }
         void pop_back() {
-            _bytes -= back().raw.objsize();
+            _bytes -= back().getRawObjSizeBytes();
             _batch.pop_back();
         }
 
@@ -204,14 +205,15 @@ public:
     /**
      * Fetch a single document referenced in the operation from the sync source.
      */
-    virtual BSONObj getMissingDoc(OperationContext* opCtx, const BSONObj& o);
+    virtual BSONObj getMissingDoc(OperationContext* opCtx, const OplogEntry& oplogEntry);
 
     /**
      * If an update fails, fetches the missing document and inserts it into the local collection.
      *
      * Returns true if the document was fetched and inserted successfully.
      */
-    virtual bool fetchAndInsertMissingDocument(OperationContext* opCtx, const BSONObj& o);
+    virtual bool fetchAndInsertMissingDocument(OperationContext* opCtx,
+                                               const OplogEntry& oplogEntry);
 
     void setHostname(const std::string& hostname);
 
@@ -222,6 +224,17 @@ public:
     OldThreadPool* getWriterPool();
 
     static AtomicInt32 replBatchLimitOperations;
+
+    /**
+     * Adds the given multikey path information to the list of indexes to make multikey at the
+     * end of the current batch.
+     */
+    void addMultikeyPathInfo(std::vector<MultikeyPathInfo> infoList);
+
+    /**
+     * Passthrough function to test multiApply.
+     */
+    OpTime multiApply_forTest(OperationContext* opCtx, MultiApplier::Operations ops);
 
 protected:
     static const unsigned int replBatchLimitBytes = 100 * 1024 * 1024;
@@ -243,6 +256,12 @@ private:
 
     // persistent pool of worker threads for writing ops to the databases
     std::unique_ptr<OldThreadPool> _writerPool;
+
+    // Protects member variables below.
+    mutable stdx::mutex _mutex;
+
+    // Maintains the information for all indexes that must be set as multikey in the current batch.
+    std::vector<MultikeyPathInfo> _multikeyPathInfo;
 };
 
 /**
@@ -264,9 +283,6 @@ StatusWith<OpTime> multiApply(OperationContext* opCtx,
 // state of the container after calling. However, these functions cannot modify the pointed-to
 // operations because the OperationPtrs container contains const pointers.
 void multiSyncApply(MultiApplier::OperationPtrs* ops, SyncTail* st);
-
-// Used by 3.2 initial sync.
-void multiInitialSyncApply_abortOnFailure(MultiApplier::OperationPtrs* ops, SyncTail* st);
 
 // Used by 3.4 initial sync.
 Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,

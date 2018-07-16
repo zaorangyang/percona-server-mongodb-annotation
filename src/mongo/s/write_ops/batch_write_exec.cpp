@@ -61,9 +61,7 @@ typedef OwnedPointerMap<ShardId, TargetedWriteBatch> OwnedShardBatchMap;
 
 WriteErrorDetail errorFromStatus(const Status& status) {
     WriteErrorDetail error;
-    error.setErrCode(status.code());
-    error.setErrMessage(status.reason());
-
+    error.setStatus(status);
     return error;
 }
 
@@ -290,11 +288,8 @@ void BatchWriteExec::executeBatch(OperationContext* opCtx,
                                            : OID());
                 } else {
                     // Error occurred dispatching, note it
-                    const Status status(responseStatus.code(),
-                                        str::stream() << "Write results unavailable from "
-                                                      << shardHost
-                                                      << " due to "
-                                                      << responseStatus.reason());
+                    const Status status = responseStatus.withContext(
+                        str::stream() << "Write results unavailable from " << shardHost);
 
                     batchOp.noteBatchError(*batch, errorFromStatus(status));
 

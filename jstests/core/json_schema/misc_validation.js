@@ -13,11 +13,18 @@
  * - doTxn
  * - $elemMatch projection
  *
- * @tags: [assumes_no_implicit_collection_creation_after_drop, requires_non_retryable_commands,
- * requires_non_retryable_writes]
+ * @tags: [
+ *   assumes_no_implicit_collection_creation_after_drop,
+ *   requires_eval_command,
+ *   requires_non_retryable_commands,
+ *   requires_non_retryable_writes,
+ * ]
  */
 (function() {
     "use strict";
+
+    // For isMMAPv1.
+    load("jstests/concurrency/fsm_workload_helpers/server_types.js");
 
     const testName = "json_schema_misc_validation";
     const testDB = db.getSiblingDB(testName);
@@ -312,20 +319,21 @@
         coll.drop();
         assert.writeOK(coll.insert({_id: 1, a: true}));
 
-        // Test $jsonSchema in the precondition checking for doTxn.
-        res = testDB.adminCommand({
-            doTxn: [
-                {op: "u", ns: coll.getFullName(), o2: {_id: 1}, o: {$set: {a: false}}},
-            ],
-            preCondition: [{
-                ns: coll.getFullName(),
-                q: {$jsonSchema: {properties: {a: {type: "boolean"}}}},
-                res: {a: true}
-            }]
-        });
-        assert.commandWorked(res);
-        assert.eq(1, res.applied);
-
+        if (!isMMAPv1(db)) {
+            // Test $jsonSchema in the precondition checking for doTxn.
+            res = testDB.adminCommand({
+                doTxn: [
+                    {op: "u", ns: coll.getFullName(), o2: {_id: 1}, o: {$set: {a: false}}},
+                ],
+                preCondition: [{
+                    ns: coll.getFullName(),
+                    q: {$jsonSchema: {properties: {a: {type: "boolean"}}}},
+                    res: {a: true}
+                }]
+            });
+            assert.commandWorked(res);
+            assert.eq(1, res.applied);
+        }
         // Test $jsonSchema in an eval function.
         assert.eq(1,
                   testDB.eval(

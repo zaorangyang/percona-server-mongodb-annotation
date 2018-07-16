@@ -116,12 +116,6 @@ ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorMock::awaitRepli
     return _awaitReplicationReturnValueFunction(opTime);
 }
 
-ReplicationCoordinator::StatusAndDuration
-ReplicationCoordinatorMock::awaitReplicationOfLastOpForClient(
-    OperationContext* opCtx, const WriteConcernOptions& writeConcern) {
-    return _awaitReplicationReturnValueFunction({});
-}
-
 void ReplicationCoordinatorMock::setAwaitReplicationReturnValueFunction(
     AwaitReplicationReturnValueFunction returnValueFunction) {
     _awaitReplicationReturnValueFunction = std::move(returnValueFunction);
@@ -457,7 +451,7 @@ Status ReplicationCoordinatorMock::updateTerm(OperationContext* opCtx, long long
     return Status::OK();
 }
 
-Timestamp ReplicationCoordinatorMock::reserveSnapshotName(OperationContext* opCtx) {
+Timestamp ReplicationCoordinatorMock::getMinimumVisibleSnapshot(OperationContext* opCtx) {
     return Timestamp(_snapshotNameGenerator.addAndFetch(1));
 }
 

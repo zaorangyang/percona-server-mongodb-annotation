@@ -73,9 +73,11 @@ using std::vector;
 class CmdBuildInfo : public BasicCommand {
 public:
     CmdBuildInfo() : BasicCommand("buildInfo", "buildinfo") {}
-    virtual bool slaveOk() const {
-        return true;
+
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
+
     virtual bool adminOnly() const {
         return false;
     }
@@ -84,10 +86,10 @@ public:
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
-    virtual void help(stringstream& help) const {
-        help << "get version #, etc.\n";
-        help << "{ buildinfo:1 }";
+                                       std::vector<Privilege>* out) const {}  // No auth required
+    std::string help() const override {
+        return "get version #, etc.\n"
+               "{ buildinfo:1 }";
     }
 
     bool run(OperationContext* opCtx,
@@ -104,12 +106,13 @@ public:
 class PingCommand : public BasicCommand {
 public:
     PingCommand() : BasicCommand("ping") {}
-    virtual bool slaveOk() const {
-        return true;
+
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
-    virtual void help(stringstream& help) const {
-        help << "a way to check that the server is alive. responds immediately even if server is "
-                "in a db lock.";
+    std::string help() const override {
+        return "a way to check that the server is alive. responds immediately even if server is "
+               "in a db lock.";
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -119,7 +122,7 @@ public:
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
+                                       std::vector<Privilege>* out) const {}  // No auth required
     virtual bool requiresAuth() const override {
         return false;
     }
@@ -135,18 +138,18 @@ public:
 class FeaturesCmd : public BasicCommand {
 public:
     FeaturesCmd() : BasicCommand("features") {}
-    void help(stringstream& h) const {
-        h << "return build level feature settings";
+    std::string help() const override {
+        return "return build level feature settings";
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
+                                       std::vector<Privilege>* out) const {}  // No auth required
     virtual bool run(OperationContext* opCtx,
                      const string& ns,
                      const BSONObj& cmdObj,
@@ -169,21 +172,21 @@ public:
 class HostInfoCmd : public BasicCommand {
 public:
     HostInfoCmd() : BasicCommand("hostInfo") {}
-    virtual bool slaveOk() const {
-        return true;
-    }
 
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
+    }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "returns information about the daemon's host";
+    std::string help() const override {
+        return "returns information about the daemon's host";
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::hostInfo);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -221,15 +224,15 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
-    virtual bool adminOnly() const {
+    bool adminOnly() const override {
         return true;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::logRotate);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -240,7 +243,7 @@ public:
                      BSONObjBuilder& result) {
         bool didRotate = rotateLogs(serverGlobalParams.logRenameOnRotate);
         if (didRotate)
-            logProcessDetailsForLogRotate();
+            logProcessDetailsForLogRotate(opCtx->getServiceContext());
         return didRotate;
     }
 
@@ -248,22 +251,22 @@ public:
 
 class ListCommandsCmd : public BasicCommand {
 public:
-    virtual void help(stringstream& help) const {
-        help << "get a list of all db commands";
+    std::string help() const override {
+        return "get a list of all db commands";
     }
     ListCommandsCmd() : BasicCommand("listCommands") {}
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool adminOnly() const {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
+                                       std::vector<Privilege>* out) const {}  // No auth required
     virtual bool run(OperationContext* opCtx,
                      const string& ns,
                      const BSONObj& cmdObj,
@@ -282,17 +285,12 @@ public:
         BSONObjBuilder b(result.subobjStart("commands"));
         for (const auto& c : commands) {
             BSONObjBuilder temp(b.subobjStart(c->getName()));
-
-            {
-                stringstream help;
-                c->help(help);
-                temp.append("help", help.str());
-            }
-            temp.append("slaveOk", c->slaveOk());
+            temp.append("help", c->help());
+            temp.append("slaveOk", c->secondaryAllowed() == Command::AllowedOnSecondary::kAlways);
             temp.append("adminOnly", c->adminOnly());
             // optionally indicates that the command can be forced to run on a slave/secondary
-            if (c->slaveOverrideOk())
-                temp.append("slaveOverrideOk", c->slaveOverrideOk());
+            if (c->secondaryAllowed() == Command::AllowedOnSecondary::kOptIn)
+                temp.append("slaveOverrideOk", true);
             temp.done();
         }
         b.done();
@@ -302,37 +300,12 @@ public:
 
 } listCommandsCmd;
 
-/* for testing purposes only */
-class CmdForceError : public BasicCommand {
-public:
-    virtual void help(stringstream& help) const {
-        help << "for testing purposes only.  forces a user assertion exception";
-    }
-    virtual bool slaveOk() const {
-        return true;
-    }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
-    CmdForceError() : BasicCommand("forceerror") {}
-    bool run(OperationContext* opCtx,
-             const string& dbnamne,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        LastError::get(cc()).setLastError(10038, "forced error");
-        return false;
-    }
-} cmdForceError;
-
 class GetLogCmd : public ErrmsgCommandDeprecated {
 public:
     GetLogCmd() : ErrmsgCommandDeprecated("getLog") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -342,13 +315,13 @@ public:
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::getLog);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
-    virtual void help(stringstream& help) const {
-        help << "{ getLog : '*' }  OR { getLog : 'global' }";
+    std::string help() const override {
+        return "{ getLog : '*' }  OR { getLog : 'global' }";
     }
 
     virtual bool errmsgRun(OperationContext* opCtx,
@@ -358,7 +331,7 @@ public:
                            BSONObjBuilder& result) {
         BSONElement val = cmdObj.firstElement();
         if (val.type() != String) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::TypeMismatch,
                        str::stream() << "Argument to getLog must be of type String; found "
@@ -402,8 +375,8 @@ class ClearLogCmd : public BasicCommand {
 public:
     ClearLogCmd() : BasicCommand("clearLog") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -413,13 +386,13 @@ public:
     }
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         // No access control needed since this command is a testing-only command that must be
         // enabled at the command line.
         return Status::OK();
     }
-    virtual void help(stringstream& help) const {
-        help << "{ clearLog : 'global' }";
+    std::string help() const override {
+        return "{ clearLog : 'global' }";
     }
 
     virtual bool run(OperationContext* opCtx,
@@ -429,11 +402,11 @@ public:
         std::string logName;
         Status status = bsonExtractStringField(cmdObj, "clearLog", &logName);
         if (!status.isOK()) {
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         if (logName != "global") {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result, Status(ErrorCodes::InvalidOptions, "Only the 'global' log can be cleared"));
         }
         RamLog* ramlog = RamLog::getIfExists(logName);
@@ -454,8 +427,8 @@ MONGO_INITIALIZER(RegisterClearLogCmd)(InitializerContext* context) {
 class CmdGetCmdLineOpts : public BasicCommand {
 public:
     CmdGetCmdLineOpts() : BasicCommand("getCmdLineOpts") {}
-    void help(stringstream& h) const {
-        h << "get argv";
+    std::string help() const override {
+        return "get argv";
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -463,12 +436,12 @@ public:
     virtual bool adminOnly() const {
         return true;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::getCmdLineOpts);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -491,7 +464,7 @@ int* volatile illegalAddress;  // NOLINT - used for fail point only
 
 void CmdShutdown::addRequiredPrivileges(const std::string& dbname,
                                         const BSONObj& cmdObj,
-                                        std::vector<Privilege>* out) {
+                                        std::vector<Privilege>* out) const {
     ActionSet actions;
     actions.addAction(ActionType::shutdown);
     out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));

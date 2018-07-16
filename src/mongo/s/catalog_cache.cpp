@@ -34,16 +34,16 @@
 
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/optime_with.h"
-#include "mongo/platform/unordered_set.h"
-#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
@@ -126,6 +126,12 @@ StatusWith<CachedDatabaseInfo> CatalogCache::getDatabase(OperationContext* opCtx
     }
 }
 
+StatusWith<CachedCollectionRoutingInfo> CatalogCache::getCollectionRoutingInfoAt(
+    OperationContext* opCtx, const NamespaceString& nss, Timestamp atClusterTime) {
+    // TODO (GPiTR): Implement retrieving collection routing info at time
+    return getCollectionRoutingInfo(opCtx, nss);
+}
+
 StatusWith<CachedCollectionRoutingInfo> CatalogCache::getCollectionRoutingInfo(
     OperationContext* opCtx, const NamespaceString& nss) {
     while (true) {
@@ -169,7 +175,16 @@ StatusWith<CachedCollectionRoutingInfo> CatalogCache::getCollectionRoutingInfo(
             ul.unlock();
 
             auto refreshStatus = [&]() {
+                Timer t;
+                ON_BLOCK_EXIT([&] { _stats.totalRefreshWaitTimeMicros.addAndFetch(t.micros()); });
+
                 try {
+                    const Milliseconds kReportingInterval{250};
+                    while (!refreshNotification->waitFor(opCtx, kReportingInterval)) {
+                        _stats.totalRefreshWaitTimeMicros.addAndFetch(t.micros());
+                        t.reset();
+                    }
+
                     return refreshNotification->get(opCtx);
                 } catch (const DBException& ex) {
                     return ex.toStatus();
@@ -208,6 +223,8 @@ StatusWith<CachedCollectionRoutingInfo> CatalogCache::getShardedCollectionRoutin
 }
 
 void CatalogCache::onStaleConfigError(CachedCollectionRoutingInfo&& ccriToInvalidate) {
+    _stats.countStaleConfigErrors.addAndFetch(1);
+
     // Ensure the move constructor of CachedCollectionRoutingInfo is invoked in order to clear the
     // input argument so it can't be used anymore
     auto ccri(ccriToInvalidate);
@@ -222,7 +239,7 @@ void CatalogCache::onStaleConfigError(CachedCollectionRoutingInfo&& ccriToInvali
     // Here we received a stale config error for a collection which we previously though was sharded
     stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    auto it = _databases.find(NamespaceString(ccri._cm->getns()).db());
+    auto it = _databases.find(ccri._cm->getns().db());
     if (it == _databases.end()) {
         // If the database does not exist, the collection must have been dropped so there is
         // nothing to invalidate. The getCollectionRoutingInfo will handle the reload of the
@@ -232,7 +249,7 @@ void CatalogCache::onStaleConfigError(CachedCollectionRoutingInfo&& ccriToInvali
 
     auto& collections = it->second->collections;
 
-    auto itColl = collections.find(ccri._cm->getns());
+    auto itColl = collections.find(ccri._cm->getns().ns());
     if (itColl == collections.end()) {
         // If the collection does not exist, this means it must have been dropped since the last
         // time we retrieved a cache entry for it. Doing nothing in this case will cause the
@@ -269,6 +286,25 @@ void CatalogCache::purgeAllDatabases() {
     _databases.clear();
 }
 
+void CatalogCache::report(BSONObjBuilder* builder) const {
+    BSONObjBuilder cacheStatsBuilder(builder->subobjStart("catalogCache"));
+
+    size_t numDatabaseEntries;
+    size_t numCollectionEntries{0};
+    {
+        stdx::lock_guard<stdx::mutex> ul(_mutex);
+        numDatabaseEntries = _databases.size();
+        for (const auto& entry : _databases) {
+            numCollectionEntries += entry.second->collections.size();
+        }
+    }
+
+    cacheStatsBuilder.append("numDatabaseEntries", static_cast<long long>(numDatabaseEntries));
+    cacheStatsBuilder.append("numCollectionEntries", static_cast<long long>(numCollectionEntries));
+
+    _stats.report(&cacheStatsBuilder);
+}
+
 std::shared_ptr<CatalogCache::DatabaseInfoEntry> CatalogCache::_getDatabase(OperationContext* opCtx,
                                                                             StringData dbName) {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
@@ -301,8 +337,11 @@ std::shared_ptr<CatalogCache::DatabaseInfoEntry> CatalogCache::_getDatabase(Oper
         collectionEntries[coll.getNs().ns()].needsRefresh = true;
     }
 
-    return _databases[dbName] = std::shared_ptr<DatabaseInfoEntry>(new DatabaseInfoEntry{
-               dbDesc.getPrimary(), dbDesc.getSharded(), std::move(collectionEntries)});
+    return _databases[dbName] =
+               std::make_shared<DatabaseInfoEntry>(DatabaseInfoEntry{dbDesc.getPrimary(),
+                                                                     dbDesc.getSharded(),
+                                                                     std::move(collectionEntries),
+                                                                     dbDesc.getVersion()});
 }
 
 void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
@@ -310,15 +349,45 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
                                               std::shared_ptr<ChunkManager> existingRoutingInfo,
                                               NamespaceString const& nss,
                                               int refreshAttempt) {
-    Timer t;
+    // If we have an existing chunk manager, the refresh is considered "incremental", regardless of
+    // how many chunks are in the differential
+    const bool isIncremental(existingRoutingInfo);
 
-    const ChunkVersion startingCollectionVersion =
-        (existingRoutingInfo ? existingRoutingInfo->getVersion() : ChunkVersion::UNSHARDED());
+    if (isIncremental) {
+        _stats.numActiveIncrementalRefreshes.addAndFetch(1);
+        _stats.countIncrementalRefreshesStarted.addAndFetch(1);
+    } else {
+        _stats.numActiveFullRefreshes.addAndFetch(1);
+        _stats.countFullRefreshesStarted.addAndFetch(1);
+    }
 
-    const auto refreshFailed =
-        [ this, t, dbEntry, nss, refreshAttempt ](WithLock lk, const Status& status) noexcept {
-        log() << "Refresh for collection " << nss << " took " << t.millis() << " ms and failed"
-              << causedBy(redact(status));
+    // Invoked when one iteration of getChunksSince has completed, whether with success or error
+    const auto onRefreshCompleted = [ this, t = Timer(), nss, isIncremental ](
+        const Status& status, ChunkManager* routingInfoAfterRefresh) {
+        if (isIncremental) {
+            _stats.numActiveIncrementalRefreshes.subtractAndFetch(1);
+        } else {
+            _stats.numActiveFullRefreshes.subtractAndFetch(1);
+        }
+
+        if (!status.isOK()) {
+            _stats.countFailedRefreshes.addAndFetch(1);
+
+            log() << "Refresh for collection " << nss << " took " << t.millis() << " ms and failed"
+                  << causedBy(redact(status));
+        } else if (routingInfoAfterRefresh) {
+            log() << "Refresh for collection " << nss << " took " << t.millis()
+                  << " ms and found version " << routingInfoAfterRefresh->getVersion();
+        } else {
+            log() << "Refresh for collection " << nss << " took " << t.millis()
+                  << " ms and found the collection is not sharded";
+        }
+    };
+
+    // Invoked if getChunksSince resulted in error
+    const auto onRefreshFailed = [ this, dbEntry, nss, refreshAttempt, onRefreshCompleted ](
+        WithLock lk, const Status& status) noexcept {
+        onRefreshCompleted(status, nullptr);
 
         auto& collections = dbEntry->collections;
         auto it = collections.find(nss.ns());
@@ -338,20 +407,24 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
         }
     };
 
-    const auto refreshCallback = [ this, t, dbEntry, nss, existingRoutingInfo, refreshFailed ](
-        OperationContext * opCtx,
-        StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
+    const auto refreshCallback =
+        [ this, dbEntry, nss, existingRoutingInfo, onRefreshFailed, onRefreshCompleted ](
+            OperationContext * opCtx,
+            StatusWith<CatalogCacheLoader::CollectionAndChangedChunks> swCollAndChunks) noexcept {
         std::shared_ptr<ChunkManager> newRoutingInfo;
         try {
             newRoutingInfo = refreshCollectionRoutingInfo(
                 opCtx, nss, std::move(existingRoutingInfo), std::move(swCollAndChunks));
+
+            onRefreshCompleted(Status::OK(), newRoutingInfo.get());
         } catch (const DBException& ex) {
             stdx::lock_guard<stdx::mutex> lg(_mutex);
-            refreshFailed(lg, ex.toStatus());
+            onRefreshFailed(lg, ex.toStatus());
             return;
         }
 
         stdx::lock_guard<stdx::mutex> lg(_mutex);
+
         auto& collections = dbEntry->collections;
         auto it = collections.find(nss.ns());
         invariant(it != collections.end());
@@ -362,17 +435,14 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
         collEntry.refreshCompletionNotification = nullptr;
 
         if (!newRoutingInfo) {
-            log() << "Refresh for collection " << nss << " took " << t.millis()
-                  << " and found the collection is not sharded";
-
             collections.erase(it);
         } else {
-            log() << "Refresh for collection " << nss << " took " << t.millis()
-                  << " ms and found version " << newRoutingInfo->getVersion();
-
             collEntry.routingInfo = std::move(newRoutingInfo);
         }
     };
+
+    const ChunkVersion startingCollectionVersion =
+        (existingRoutingInfo ? existingRoutingInfo->getVersion() : ChunkVersion::UNSHARDED());
 
     log() << "Refreshing chunks for collection " << nss << " based on version "
           << startingCollectionVersion;
@@ -388,8 +458,22 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
         invariant(status != ErrorCodes::ConflictingOperationInProgress);
 
         stdx::lock_guard<stdx::mutex> lg(_mutex);
-        refreshFailed(lg, status);
+        onRefreshFailed(lg, status);
     }
+}
+
+void CatalogCache::Stats::report(BSONObjBuilder* builder) const {
+    builder->append("countStaleConfigErrors", countStaleConfigErrors.load());
+
+    builder->append("totalRefreshWaitTimeMicros", totalRefreshWaitTimeMicros.load());
+
+    builder->append("numActiveIncrementalRefreshes", numActiveIncrementalRefreshes.load());
+    builder->append("countIncrementalRefreshesStarted", countIncrementalRefreshesStarted.load());
+
+    builder->append("numActiveFullRefreshes", numActiveFullRefreshes.load());
+    builder->append("countFullRefreshesStarted", countFullRefreshesStarted.load());
+
+    builder->append("countFailedRefreshes", countFailedRefreshes.load());
 }
 
 CachedDatabaseInfo::CachedDatabaseInfo(std::shared_ptr<CatalogCache::DatabaseInfoEntry> db)
@@ -401,6 +485,10 @@ const ShardId& CachedDatabaseInfo::primaryId() const {
 
 bool CachedDatabaseInfo::shardingEnabled() const {
     return _db->shardingEnabled;
+}
+
+boost::optional<DatabaseVersion> CachedDatabaseInfo::databaseVersion() const {
+    return _db->databaseVersion;
 }
 
 CachedCollectionRoutingInfo::CachedCollectionRoutingInfo(ShardId primaryId,

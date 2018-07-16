@@ -123,17 +123,16 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
-    bool slaveOverrideOk() const {
-        return false;
+    std::string help() const override {
+        return {};
     }
-    void help(std::stringstream& h) const {}
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         // Command is testing-only, and can only be enabled at command line.  Hence, no auth
         // check needed.
     }
@@ -210,12 +209,12 @@ public:
                     << PlanExecutor::statestr(state)
                     << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::OperationFailed,
-                                              str::stream()
-                                                  << "Executor error during "
-                                                  << "StageDebug command: "
-                                                  << WorkingSetCommon::toStatusString(obj)));
+            return CommandHelpers::appendCommandStatus(
+                result,
+                Status(ErrorCodes::OperationFailed,
+                       str::stream() << "Executor error during "
+                                     << "StageDebug command: "
+                                     << WorkingSetCommon::toStatusString(obj)));
         }
 
         return true;

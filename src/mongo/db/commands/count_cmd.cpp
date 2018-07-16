@@ -59,49 +59,50 @@ class CmdCount : public BasicCommand {
 public:
     CmdCount() : BasicCommand("count") {}
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    std::string help() const override {
+        return "count objects in collection";
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    virtual bool slaveOk() const {
-        // ok on --slave setups
-        return repl::getGlobalReplicationCoordinator()->getSettings().isSlave();
+    AllowedOnSecondary secondaryAllowed() const override {
+        if (repl::getGlobalReplicationCoordinator()->getSettings().isSlave()) {
+            // ok on --slave setups
+            return Command::AllowedOnSecondary::kAlways;
+        }
+        return Command::AllowedOnSecondary::kOptIn;
     }
 
-    virtual bool slaveOverrideOk() const {
+    bool maintenanceOk() const override {
+        return false;
+    }
+
+    bool adminOnly() const override {
+        return false;
+    }
+
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const override {
         return true;
     }
 
-    virtual bool maintenanceOk() const {
-        return false;
-    }
-
-    virtual bool adminOnly() const {
-        return false;
-    }
-
-    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
-        return true;
-    }
-
-    ReadWriteType getReadWriteType() const {
+    ReadWriteType getReadWriteType() const override {
         return ReadWriteType::kRead;
-    }
-
-    virtual void help(stringstream& help) const {
-        help << "count objects in collection";
     }
 
     Status checkAuthForOperation(OperationContext* opCtx,
                                  const std::string& dbname,
-                                 const BSONObj& cmdObj) override {
+                                 const BSONObj& cmdObj) const override {
         AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
 
         if (!authSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
-        const NamespaceString nss(parseNsOrUUID(opCtx, dbname, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsOrUUID(opCtx, dbname, cmdObj));
         if (!authSession->isAuthorizedForActionsOnNamespace(nss, ActionType::find)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
@@ -109,14 +110,14 @@ public:
         return Status::OK();
     }
 
-    virtual Status explain(OperationContext* opCtx,
-                           const std::string& dbname,
-                           const BSONObj& cmdObj,
-                           ExplainOptions::Verbosity verbosity,
-                           BSONObjBuilder* out) const {
+    Status explain(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   ExplainOptions::Verbosity verbosity,
+                   BSONObjBuilder* out) const override {
         const bool isExplain = true;
         Lock::DBLock dbLock(opCtx, dbname, MODE_IS);
-        auto nss = parseNsOrUUID(opCtx, dbname, cmdObj);
+        auto nss = CommandHelpers::parseNsOrUUID(opCtx, dbname, cmdObj);
         auto request = CountRequest::parseFromBSON(nss, cmdObj, isExplain);
         if (!request.isOK()) {
             return request.getStatus();
@@ -168,16 +169,16 @@ public:
         return Status::OK();
     }
 
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
+    bool run(OperationContext* opCtx,
+             const string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
         const bool isExplain = false;
         Lock::DBLock dbLock(opCtx, dbname, MODE_IS);
-        auto nss = parseNsOrUUID(opCtx, dbname, cmdObj);
+        auto nss = CommandHelpers::parseNsOrUUID(opCtx, dbname, cmdObj);
         auto request = CountRequest::parseFromBSON(nss, cmdObj, isExplain);
         if (!request.isOK()) {
-            return appendCommandStatus(result, request.getStatus());
+            return CommandHelpers::appendCommandStatus(result, request.getStatus());
         }
 
         AutoGetCollectionOrViewForReadCommand ctx(
@@ -189,22 +190,13 @@ public:
 
             auto viewAggregation = request.getValue().asAggregationCommand();
             if (!viewAggregation.isOK()) {
-                return appendCommandStatus(result, viewAggregation.getStatus());
+                return CommandHelpers::appendCommandStatus(result, viewAggregation.getStatus());
             }
 
-            BSONObj aggResult = Command::runCommandDirectly(
+            BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregation.getValue())));
 
-            if (ResolvedView::isResolvedViewErrorResponse(aggResult)) {
-                result.appendElements(aggResult);
-                return false;
-            }
-
-            ViewResponseFormatter formatter(aggResult);
-            Status formatStatus = formatter.appendAsCountResponse(&result);
-            if (!formatStatus.isOK()) {
-                return appendCommandStatus(result, formatStatus);
-            }
+            uassertStatusOK(ViewResponseFormatter(aggResult).appendAsCountResponse(&result));
             return true;
         }
 
@@ -219,7 +211,7 @@ public:
                                                        false,  // !explain
                                                        PlanExecutor::YIELD_AUTO);
         if (!statusWithPlanExecutor.isOK()) {
-            return appendCommandStatus(result, statusWithPlanExecutor.getStatus());
+            return CommandHelpers::appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
 
         auto exec = std::move(statusWithPlanExecutor.getValue());
@@ -233,7 +225,7 @@ public:
 
         Status execPlanStatus = exec->executePlan();
         if (!execPlanStatus.isOK()) {
-            return appendCommandStatus(result, execPlanStatus);
+            return CommandHelpers::appendCommandStatus(result, execPlanStatus);
         }
 
         PlanSummaryStats summaryStats;

@@ -31,7 +31,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/master_slave.h"  // replSettings
 #include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/db/repl/replication_coordinator_impl.h"
 
 namespace mongo {
 
@@ -50,8 +49,8 @@ constexpr StringData kWaitFieldName = "wait"_sd;
 // operator requested resynchronization of replication (on a slave or secondary). {resync: 1}
 class CmdResync : public ErrmsgCommandDeprecated {
 public:
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool adminOnly() const {
         return true;
@@ -61,14 +60,14 @@ public:
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::resync);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
     }
 
-    void help(stringstream& h) const {
-        h << "resync (from scratch) a stale slave or replica set secondary node.\n";
+    std::string help() const override {
+        return "resync (from scratch) a stale slave or replica set secondary node.\n";
     }
 
     CmdResync() : ErrmsgCommandDeprecated(kResyncFieldName) {}
@@ -80,11 +79,11 @@ public:
         bool waitForResync = !cmdObj.hasField(kWaitFieldName) || cmdObj[kWaitFieldName].trueValue();
 
         // Replica set resync.
-        ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
-        if (getGlobalReplicationCoordinator()->getSettings().usingReplSets()) {
+        ReplicationCoordinator* replCoord = ReplicationCoordinator::get(opCtx);
+        if (replCoord->getSettings().usingReplSets()) {
             // Resync is disabled in production on replica sets until it stabilizes (SERVER-27081).
             if (!Command::testCommandsEnabled) {
-                return appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result,
                     Status(ErrorCodes::OperationFailed,
                            "Replica sets do not support the resync command"));
@@ -96,21 +95,19 @@ public:
 
                 const MemberState memberState = replCoord->getMemberState();
                 if (memberState.startup()) {
-                    return appendCommandStatus(
+                    return CommandHelpers::appendCommandStatus(
                         result, Status(ErrorCodes::NotYetInitialized, "no replication yet active"));
                 }
                 if (memberState.primary()) {
-                    return appendCommandStatus(
+                    return CommandHelpers::appendCommandStatus(
                         result, Status(ErrorCodes::NotSecondary, "primaries cannot resync"));
                 }
                 auto status = replCoord->setFollowerMode(MemberState::RS_STARTUP2);
                 if (!status.isOK()) {
-                    return appendCommandStatus(
+                    return CommandHelpers::appendCommandStatus(
                         result,
-                        Status(status.code(),
-                               str::stream()
-                                   << "Failed to transition to STARTUP2 state to perform resync: "
-                                   << status.reason()));
+                        status.withContext(
+                            "Failed to transition to STARTUP2 state to perform resync"));
                 }
             }
             uassertStatusOKWithLocation(replCoord->resyncData(opCtx, waitForResync), "resync", 0);

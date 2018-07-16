@@ -154,21 +154,21 @@ bool dbEval(OperationContext* opCtx,
 
 class CmdEval : public ErrmsgCommandDeprecated {
 public:
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "DEPRECATED\n"
-             << "Evaluate javascript at the server.\n"
-             << "http://dochub.mongodb.org/core/serversidecodeexecution";
+    std::string help() const override {
+        return "DEPRECATED\n"
+               "Evaluate javascript at the server.\n"
+               "http://dochub.mongodb.org/core/serversidecodeexecution";
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         RoleGraph::generateUniversalPrivileges(out);
     }
 

@@ -36,7 +36,7 @@
 #include <vector>
 
 #include "mongo/client/connpool.h"
-#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/document_validation.h"
@@ -47,15 +47,13 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/move_timing_helper.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/stdx/chrono.h"
 #include "mongo/util/concurrency/notification.h"
@@ -64,11 +62,10 @@
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
-
-using std::string;
-using str::stream;
-
 namespace {
+
+const auto getMigrationDestinationManager =
+    ServiceContext::declareDecoration<MigrationDestinationManager>();
 
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 // Note: Even though we're setting UNSET here,
@@ -82,7 +79,7 @@ const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
 /**
  * Returns a human-readabale name of the migration manager's state.
  */
-string stateToString(MigrationDestinationManager::State state) {
+std::string stateToString(MigrationDestinationManager::State state) {
     switch (state) {
         case MigrationDestinationManager::READY:
             return "ready";
@@ -213,6 +210,10 @@ MONGO_FP_DECLARE(failMigrationReceivedOutOfRangeOperation);
 MigrationDestinationManager::MigrationDestinationManager() = default;
 
 MigrationDestinationManager::~MigrationDestinationManager() = default;
+
+MigrationDestinationManager* MigrationDestinationManager::get(OperationContext* opCtx) {
+    return &getMigrationDestinationManager(opCtx->getServiceContext());
+}
 
 MigrationDestinationManager::State MigrationDestinationManager::getState() const {
     stdx::lock_guard<stdx::mutex> sl(_mutex);
@@ -350,7 +351,6 @@ Status MigrationDestinationManager::start(const NamespaceString& nss,
 }
 
 Status MigrationDestinationManager::abort(const MigrationSessionId& sessionId) {
-
     stdx::lock_guard<stdx::mutex> sl(_mutex);
 
     if (!_sessionId) {
@@ -433,7 +433,7 @@ void MigrationDestinationManager::_migrateThread(BSONObj min,
     auto opCtx = Client::getCurrent()->makeOperationContext();
 
 
-    if (getGlobalAuthorizationManager()->isAuthEnabled()) {
+    if (AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled()) {
         AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization();
     }
 
@@ -575,7 +575,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
         Lock::DBLock lk(opCtx, _nss.db(), MODE_X);
 
         OldClientWriteContext ctx(opCtx, _nss.ns());
-        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, _nss)) {
+        if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, _nss)) {
             setStateFailWarn(str::stream() << "Not primary during migration: " << _nss.ns()
                                            << ": checking if collection exists");
             return;
@@ -733,11 +733,10 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
                                             cx.db(),
                                             docToClone,
                                             &localDoc)) {
-                        string errMsg = str::stream() << "cannot migrate chunk, local document "
-                                                      << redact(localDoc)
-                                                      << " has same _id as cloned "
-                                                      << "remote document " << redact(docToClone);
-
+                        const std::string errMsg = str::stream()
+                            << "cannot migrate chunk, local document " << redact(localDoc)
+                            << " has same _id as cloned "
+                            << "remote document " << redact(docToClone);
                         warning() << errMsg;
 
                         // Exception will abort migration cleanly
@@ -756,7 +755,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
 
                 if (writeConcern.shouldWaitForOtherNodes()) {
                     repl::ReplicationCoordinator::StatusAndDuration replStatus =
-                        repl::getGlobalReplicationCoordinator()->awaitReplication(
+                        repl::ReplicationCoordinator::get(opCtx)->awaitReplication(
                             opCtx,
                             repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
                             writeConcern);
@@ -1008,10 +1007,9 @@ bool MigrationDestinationManager::_applyMigrateOp(OperationContext* opCtx,
             BSONObj localDoc;
             if (willOverrideLocalId(
                     opCtx, nss, min, max, shardKeyPattern, cx.db(), updatedDoc, &localDoc)) {
-                string errMsg = str::stream() << "cannot migrate chunk, local document " << localDoc
-                                              << " has same _id as reloaded remote document "
-                                              << updatedDoc;
-
+                const std::string errMsg = str::stream()
+                    << "cannot migrate chunk, local document " << localDoc
+                    << " has same _id as reloaded remote document " << updatedDoc;
                 warning() << errMsg;
 
                 // Exception will abort migration cleanly
@@ -1071,10 +1069,9 @@ CollectionShardingState::CleanupNotification MigrationDestinationManager::_noteP
     // Start clearing any leftovers that would be in the new chunk
     auto notification = css->beginReceive(range);
     if (notification.ready() && !notification.waitStatus(opCtx).isOK()) {
-        return Status{notification.waitStatus(opCtx).code(),
-                      str::stream() << "Collection " << nss.ns() << " range " << range.toString()
-                                    << " migration aborted: "
-                                    << notification.waitStatus(opCtx).reason()};
+        return notification.waitStatus(opCtx).withContext(
+            str::stream() << "Collection " << nss.ns() << " range " << range.toString()
+                          << " migration aborted");
     }
     return notification;
 }

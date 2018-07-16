@@ -57,19 +57,19 @@ class SplitChunkCommand : public ErrmsgCommandDeprecated {
 public:
     SplitChunkCommand() : ErrmsgCommandDeprecated("splitChunk") {}
 
-    void help(std::stringstream& help) const override {
-        help << "internal command usage only\n"
-                "example:\n"
-                " { splitChunk:\"db.foo\" , keyPattern: {a:1} , min : {a:100} , max: {a:200} { "
-                "splitKeys : [ {a:150} , ... ]}";
+    std::string help() const override {
+        return "internal command usage only\n"
+               "example:\n"
+               " { splitChunk:\"db.foo\" , keyPattern: {a:1} , min : {a:100} , max: {a:200} { "
+               "splitKeys : [ {a:150} , ... ]}";
     }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -78,7 +78,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::internal)) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
@@ -87,7 +87,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
     }
 
     bool errmsgRun(OperationContext* opCtx,
@@ -126,7 +126,7 @@ public:
         string shardName;
         auto parseShardNameStatus = bsonExtractStringField(cmdObj, "from", &shardName);
         if (!parseShardNameStatus.isOK())
-            return appendCommandStatus(result, parseShardNameStatus);
+            return CommandHelpers::appendCommandStatus(result, parseShardNameStatus);
 
         log() << "received splitChunk request: " << redact(cmdObj);
 

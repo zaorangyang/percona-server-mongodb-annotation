@@ -26,6 +26,8 @@ __wt_txn_timestamp_flags(WT_SESSION_IMPL *session)
 		return;
 	if (FLD_ISSET(btree->assert_flags, WT_ASSERT_COMMIT_TS_ALWAYS))
 		F_SET(&session->txn, WT_TXN_TS_COMMIT_ALWAYS);
+	if (FLD_ISSET(btree->assert_flags, WT_ASSERT_COMMIT_TS_KEYS))
+		F_SET(&session->txn, WT_TXN_TS_COMMIT_KEYS);
 	if (FLD_ISSET(btree->assert_flags, WT_ASSERT_COMMIT_TS_NEVER))
 		F_SET(&session->txn, WT_TXN_TS_COMMIT_NEVER);
 }
@@ -733,7 +735,8 @@ __wt_txn_update_check(WT_SESSION_IMPL *session, WT_UPDATE *upd)
 				    session, txn_update_conflict);
 				WT_STAT_DATA_INCR(
 				    session, txn_update_conflict);
-				return (WT_ROLLBACK);
+				return (__wt_txn_rollback_required(session,
+				    "conflict between concurrent operations"));
 			}
 			upd = upd->next;
 		}

@@ -122,10 +122,8 @@ bool handleCursorCommand(OperationContext* opCtx,
         }
 
         if (PlanExecutor::ADVANCED != state) {
-            auto status = WorkingSetCommon::getMemberObjectStatus(next);
-            uasserted(status.code(),
-                      "PlanExecutor error during aggregation: " +
-                          WorkingSetCommon::toStatusString(next));
+            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(next).withContext(
+                "PlanExecutor error during aggregation"));
         }
 
         // If adding this object will cause us to exceed the message size limit, then we stash it
@@ -422,16 +420,7 @@ Status runAggregate(OperationContext* opCtx,
                 }
             }
 
-            auto viewDefinition =
-                ViewShardingCheck::getResolvedViewIfSharded(opCtx, ctx->getDb(), ctx->getView());
-            if (!viewDefinition.isOK()) {
-                return viewDefinition.getStatus();
-            }
-
-            if (!viewDefinition.getValue().isEmpty()) {
-                return ViewShardingCheck::appendShardedViewResponse(viewDefinition.getValue(),
-                                                                    &result);
-            }
+            ViewShardingCheck::throwResolvedViewIfSharded(opCtx, ctx->getDb(), ctx->getView());
 
             auto resolvedView = ctx->getDb()->getViewCatalog()->resolveView(opCtx, nss);
             if (!resolvedView.isOK()) {
@@ -546,7 +535,8 @@ Status runAggregate(OperationContext* opCtx,
 
     // If both explain and cursor are specified, explain wins.
     if (expCtx->explain) {
-        result << "stages" << Value(unownedPipeline->writeExplainOps(*expCtx->explain));
+        Explain::explainPipelineExecutor(
+            pin.getCursor()->getExecutor(), *(expCtx->explain), &result);
     } else {
         // Cursor must be specified, if explain is not.
         const bool keepCursor =

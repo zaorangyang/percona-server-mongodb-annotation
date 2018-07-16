@@ -74,13 +74,12 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
-    bool slaveOverrideOk() const {
-        return true;
-    }
-    bool supportsNonLocalReadConcern(const std::string& dbName, const BSONObj& cmdObj) const final {
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const final {
         return true;
     }
 
@@ -92,13 +91,13 @@ public:
         return FindCommon::kInitReplyBufferSize;
     }
 
-    void help(stringstream& h) const {
-        h << "http://dochub.mongodb.org/core/geo#GeospatialIndexing-geoNearCommand";
+    std::string help() const override {
+        return "http://dochub.mongodb.org/core/geo#GeospatialIndexing-geoNearCommand";
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -123,7 +122,7 @@ public:
             return false;
         }
 
-        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
         AutoGetCollectionForReadCommand ctx(opCtx, nss);
 
         Collection* collection = ctx.getCollection();
@@ -178,7 +177,7 @@ public:
             Status collationEltStatus =
                 bsonExtractTypedField(cmdObj, "collation", BSONType::Object, &collationElt);
             if (!collationEltStatus.isOK() && (collationEltStatus != ErrorCodes::NoSuchKey)) {
-                return appendCommandStatus(result, collationEltStatus);
+                return CommandHelpers::appendCommandStatus(result, collationEltStatus);
             }
             if (collationEltStatus.isOK()) {
                 collation = collationElt.Obj();
@@ -303,11 +302,11 @@ public:
             log() << "Plan executor error during geoNear command: " << PlanExecutor::statestr(state)
                   << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::OperationFailed,
-                                              str::stream()
-                                                  << "Executor error during geoNear command: "
-                                                  << WorkingSetCommon::toStatusString(currObj)));
+            return CommandHelpers::appendCommandStatus(
+                result,
+                Status(ErrorCodes::OperationFailed,
+                       str::stream() << "Executor error during geoNear command: "
+                                     << WorkingSetCommon::toStatusString(currObj)));
         }
 
         PlanSummaryStats summary;

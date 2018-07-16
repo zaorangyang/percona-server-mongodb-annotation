@@ -102,7 +102,7 @@ Status renameCollectionCommon(OperationContext* opCtx,
     ctx.emplace(opCtx, source.ns());
 
     bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, source);
+        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, source);
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::NotMaster,
@@ -236,13 +236,10 @@ Status renameCollectionCommon(OperationContext* opCtx,
     auto tmpNameResult =
         targetDB->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.renameCollection");
     if (!tmpNameResult.isOK()) {
-        return Status(tmpNameResult.getStatus().code(),
-                      str::stream() << "Cannot generate temporary collection name to rename "
-                                    << source.ns()
-                                    << " to "
-                                    << target.ns()
-                                    << ": "
-                                    << tmpNameResult.getStatus().reason());
+        return tmpNameResult.getStatus().withContext(
+            str::stream() << "Cannot generate temporary collection name to rename " << source.ns()
+                          << " to "
+                          << target.ns());
     }
     const auto& tmpName = tmpNameResult.getValue();
 

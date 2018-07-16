@@ -38,15 +38,12 @@
 #include "mongo/db/repl/optime.h"
 #include "mongo/platform/hash_namespace.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
 
 const size_t MaxDatabaseNameLen = 128;  // max str len for the db name, including null char
 
-/* e.g.
-   NamespaceString ns("acme.orders");
-   cout << ns.coll; // "orders"
-*/
 class NamespaceString {
 public:
     // Reserved system namespaces
@@ -87,18 +84,45 @@ public:
     /**
      * Constructs an empty NamespaceString.
      */
-    NamespaceString();
+    NamespaceString() : _ns(), _dotIndex(std::string::npos) {}
 
     /**
      * Constructs a NamespaceString from the fully qualified namespace named in "ns".
      */
-    explicit NamespaceString(StringData ns);
+    explicit NamespaceString(StringData ns) {
+        _ns = ns.toString();  // copy to our buffer
+        _dotIndex = _ns.find('.');
+        uassert(ErrorCodes::InvalidNamespace,
+                "namespaces cannot have embedded null characters",
+                _ns.find('\0') == std::string::npos);
+    }
 
     /**
      * Constructs a NamespaceString for the given database and collection names.
      * "dbName" must not contain a ".", and "collectionName" must not start with one.
      */
-    NamespaceString(StringData dbName, StringData collectionName);
+    NamespaceString(StringData dbName, StringData collectionName)
+        : _ns(dbName.size() + collectionName.size() + 1, '\0') {
+        uassert(ErrorCodes::InvalidNamespace,
+                "'.' is an invalid character in a database name",
+                dbName.find('.') == std::string::npos);
+        uassert(ErrorCodes::InvalidNamespace,
+                "Collection names cannot start with '.'",
+                collectionName.empty() || collectionName[0] != '.');
+
+        std::string::iterator it = std::copy(dbName.begin(), dbName.end(), _ns.begin());
+        *it = '.';
+        ++it;
+        it = std::copy(collectionName.begin(), collectionName.end(), it);
+        _dotIndex = dbName.size();
+
+        dassert(it == _ns.end());
+        dassert(_ns[_dotIndex] == '.');
+
+        uassert(ErrorCodes::InvalidNamespace,
+                "namespaces cannot have embedded null characters",
+                _ns.find('\0') == std::string::npos);
+    }
 
     /**
      * Constructs the namespace '<dbName>.$cmd.aggregate', which we use as the namespace for
@@ -119,8 +143,8 @@ public:
     static NamespaceString makeListIndexesNSS(StringData dbName, StringData collectionName);
 
     /**
-     * Note that these values are derived from the mmap_v1 implementation and that
-     * is the only reason they are constrained as such.
+     * Note that these values are derived from the mmap_v1 implementation and that is the only
+     * reason they are constrained as such.
      */
     enum MaxNsLenValue {
         // Maximum possible length of name any namespace, including special ones like $extra.
@@ -136,7 +160,8 @@ public:
     };
 
     /**
-     * DollarInDbNameBehavior::allow is deprecated.
+     * NOTE: DollarInDbNameBehavior::allow is deprecated.
+     *
      * Please use DollarInDbNameBehavior::disallow and check explicitly for any DB names that must
      * contain a $.
      */
@@ -145,8 +170,15 @@ public:
         Allow,  // Deprecated
     };
 
-    StringData db() const;
-    StringData coll() const;
+    StringData db() const {
+        return _dotIndex == std::string::npos ? StringData() : StringData(_ns.c_str(), _dotIndex);
+    }
+
+    StringData coll() const {
+        return _dotIndex == std::string::npos
+            ? StringData()
+            : StringData(_ns.c_str() + _dotIndex + 1, _ns.size() - 1 - _dotIndex);
+    }
 
     const std::string& ns() const {
         return _ns;
@@ -181,7 +213,7 @@ public:
         return coll().startsWith("system.");
     }
     bool isLocal() const {
-        return db() == "local";
+        return db() == kLocalDb;
     }
     bool isSystemDotIndexes() const {
         return coll() == "system.indexes";
@@ -193,10 +225,10 @@ public:
         return coll() == kSystemDotViewsCollectionName;
     }
     bool isAdminDotSystemDotVersion() const {
-        return ((db() == "admin") && (coll() == "system.version"));
+        return (db() == kAdminDb) && (coll() == "system.version");
     }
     bool isConfigDB() const {
-        return db() == "config";
+        return db() == kConfigDb;
     }
     bool isCommand() const {
         return coll() == "$cmd";
@@ -208,17 +240,32 @@ public:
         return special(_ns);
     }
     bool isOnInternalDb() const {
-        return internalDb(db());
+        if (db() == kAdminDb)
+            return true;
+        if (db() == kLocalDb)
+            return true;
+        if (db() == kConfigDb)
+            return true;
+        return false;
     }
     bool isNormal() const {
         return normal(_ns);
     }
 
-    // Check if the NamespaceString references a special collection that cannot
-    // be used for generic data storage.
+    /**
+     * Returns whether the NamespaceString references a special collection that cannot be used for
+     * generic data storage.
+     */
     bool isVirtualized() const {
         return virtualized(_ns);
     }
+
+    /**
+     * Returns whether a namespace is replicated, based only on its string value. One notable
+     * omission is that map reduce `tmp.mr` collections may or may not be replicated. Callers must
+     * decide how to handle that case separately.
+     */
+    bool isReplicated() const;
 
     /**
      * Returns true if cursors for this namespace are registered with the global cursor manager.
@@ -279,77 +326,50 @@ public:
     NamespaceString getTargetNSForListIndexes() const;
 
     /**
-     * @return true if the namespace is valid. Special namespaces for internal use are considered as
+     * Returns true if the namespace is valid. Special namespaces for internal use are considered as
      * valid.
      */
     bool isValid() const {
         return validDBName(db(), DollarInDbNameBehavior::Allow) && !coll().empty();
     }
 
-    bool operator==(const std::string& nsIn) const {
-        return nsIn == _ns;
-    }
-    bool operator==(StringData nsIn) const {
-        return nsIn == _ns;
-    }
-    bool operator==(const NamespaceString& nsIn) const {
-        return nsIn._ns == _ns;
-    }
-
-    bool operator!=(const std::string& nsIn) const {
-        return nsIn != _ns;
-    }
-    bool operator!=(const NamespaceString& nsIn) const {
-        return nsIn._ns != _ns;
-    }
-
-    bool operator<(const NamespaceString& rhs) const {
-        return _ns < rhs._ns;
-    }
-
-    /** ( foo.bar ).getSisterNS( "blah" ) == foo.blah
+    /**
+     * NamespaceString("foo.bar").getSisterNS("blah") returns "foo.blah".
      */
     std::string getSisterNS(StringData local) const;
 
-    // @return db() + ".system.indexes"
-    std::string getSystemIndexesCollection() const;
+    std::string getSystemIndexesCollection() const {
+        return db().toString() + ".system.indexes";
+    }
 
-    // @return {db(), "$cmd"}
-    NamespaceString getCommandNS() const;
-
-    /**
-     * Function to escape most non-alpha characters from file names
-     */
-    static std::string escapeDbName(const StringData dbname);
+    NamespaceString getCommandNS() const {
+        return {db(), "$cmd"};
+    }
 
     /**
      * @return true if ns is 'normal'.  A "$" is used for namespaces holding index data,
      * which do not contain BSON objects in their records. ("oplog.$main" is the exception)
      */
-    static bool normal(StringData ns);
+    static bool normal(StringData ns) {
+        return !virtualized(ns);
+    }
 
     /**
      * @return true if the ns is an oplog one, otherwise false.
      */
-    static bool oplog(StringData ns);
+    static bool oplog(StringData ns) {
+        return ns.startsWith("local.oplog.");
+    }
 
-    static bool special(StringData ns);
-
-    // Check if `ns` references a special collection that cannot be used for
-    // generic data storage.
-    static bool virtualized(StringData ns);
+    static bool special(StringData ns) {
+        return !normal(ns) || ns.substr(ns.find('.')).startsWith(".system.");
+    }
 
     /**
-     * Returns true for DBs with special meaning to mongodb.
+     * Check if `ns` references a special collection that cannot be used for generic data storage.
      */
-    static bool internalDb(StringData db) {
-        if (db == "admin")
-            return true;
-        if (db == "local")
-            return true;
-        if (db == "config")
-            return true;
-        return false;
+    static bool virtualized(StringData ns) {
+        return ns.find('$') != std::string::npos && ns != "local.oplog.$main";
     }
 
     /**
@@ -398,14 +418,69 @@ public:
      */
     static bool validCollectionName(StringData coll);
 
+    // Relops among `NamespaceString`.
+    friend bool operator==(const NamespaceString& a, const NamespaceString& b) {
+        return a.ns() == b.ns();
+    }
+    friend bool operator!=(const NamespaceString& a, const NamespaceString& b) {
+        return a.ns() != b.ns();
+    }
+    friend bool operator<(const NamespaceString& a, const NamespaceString& b) {
+        return a.ns() < b.ns();
+    }
+    friend bool operator>(const NamespaceString& a, const NamespaceString& b) {
+        return a.ns() > b.ns();
+    }
+    friend bool operator<=(const NamespaceString& a, const NamespaceString& b) {
+        return a.ns() <= b.ns();
+    }
+    friend bool operator>=(const NamespaceString& a, const NamespaceString& b) {
+        return a.ns() >= b.ns();
+    }
+
 private:
     std::string _ns;
     size_t _dotIndex;
 };
 
-std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss);
+/**
+ * This class is intented to be used by commands which can accept either a collection name or
+ * database + collection UUID. It will never be initialized with both.
+ */
+class NamespaceStringOrUUID {
+public:
+    struct DBNameAndUUID {
+        std::string dbName;
+        UUID uuid;
+    };
 
-// "database.a.b.c" -> "database"
+    NamespaceStringOrUUID(NamespaceString nss) : _nss(std::move(nss)) {}
+    NamespaceStringOrUUID(StringData dbName, UUID uuid) : _dbAndUUID({dbName.toString(), uuid}) {}
+
+    StringData db() const;
+
+    const boost::optional<NamespaceString>& nss() const {
+        return _nss;
+    }
+
+    const boost::optional<DBNameAndUUID>& dbAndUUID() const {
+        return _dbAndUUID;
+    }
+
+    std::string toString() const;
+
+private:
+    // At any given time exactly one of these optionals will be initialized
+    boost::optional<NamespaceString> _nss;
+    boost::optional<DBNameAndUUID> _dbAndUUID;
+};
+
+std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss);
+std::ostream& operator<<(std::ostream& stream, const NamespaceStringOrUUID& nsOrUUID);
+
+/**
+ * "database.a.b.c" -> "database"
+ */
 inline StringData nsToDatabaseSubstring(StringData ns) {
     size_t i = ns.find('.');
     if (i == std::string::npos) {
@@ -416,18 +491,18 @@ inline StringData nsToDatabaseSubstring(StringData ns) {
     return ns.substr(0, i);
 }
 
-// "database.a.b.c" -> "database"
-inline void nsToDatabase(StringData ns, char* database) {
-    StringData db = nsToDatabaseSubstring(ns);
-    db.copyTo(database, true);
-}
-
-// TODO: make this return a StringData
+/**
+ * "database.a.b.c" -> "database"
+ *
+ * TODO: make this return a StringData
+ */
 inline std::string nsToDatabase(StringData ns) {
     return nsToDatabaseSubstring(ns).toString();
 }
 
-// "database.a.b.c" -> "a.b.c"
+/**
+ * "database.a.b.c" -> "a.b.c"
+ */
 inline StringData nsToCollectionSubstring(StringData ns) {
     size_t i = ns.find('.');
     massert(16886, "nsToCollectionSubstring: no .", i != std::string::npos);
@@ -460,14 +535,69 @@ inline bool nsIsDbOnly(StringData ns) {
     return false;
 }
 
-/**
- * this can change, do not store on disk
- */
-int nsDBHash(const std::string& ns);
+inline bool NamespaceString::validDBName(StringData db, DollarInDbNameBehavior behavior) {
+    if (db.size() == 0 || db.size() >= 64)
+        return false;
+
+    for (StringData::const_iterator iter = db.begin(), end = db.end(); iter != end; ++iter) {
+        switch (*iter) {
+            case '\0':
+            case '/':
+            case '\\':
+            case '.':
+            case ' ':
+            case '"':
+                return false;
+            case '$':
+                if (behavior == DollarInDbNameBehavior::Disallow)
+                    return false;
+                continue;
+#ifdef _WIN32
+            // We prohibit all FAT32-disallowed characters on Windows
+            case '*':
+            case '<':
+            case '>':
+            case ':':
+            case '|':
+            case '?':
+                return false;
+#endif
+            default:
+                continue;
+        }
+    }
+    return true;
+}
+
+inline bool NamespaceString::validCollectionComponent(StringData ns) {
+    size_t idx = ns.find('.');
+    if (idx == std::string::npos)
+        return false;
+
+    return validCollectionName(ns.substr(idx + 1)) || oplog(ns);
+}
+
+inline bool NamespaceString::validCollectionName(StringData coll) {
+    if (coll.empty())
+        return false;
+
+    if (coll[0] == '.')
+        return false;
+
+    for (StringData::const_iterator iter = coll.begin(), end = coll.end(); iter != end; ++iter) {
+        switch (*iter) {
+            case '\0':
+            case '$':
+                return false;
+            default:
+                continue;
+        }
+    }
+
+    return true;
+}
 
 }  // namespace mongo
-
-#include "mongo/db/namespace_string-inl.h"
 
 MONGO_HASH_NAMESPACE_START
 template <>

@@ -48,7 +48,6 @@
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_helpers.h"
-#include "mongo/s/commands/cluster_write.h"
 #include "mongo/s/commands/strategy.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
@@ -93,7 +92,7 @@ BSONObj fixForShards(const BSONObj& orig,
             b.append(e);
         } else if (fn == "out" || fn == "finalize" || fn == "writeConcern") {
             // We don't want to copy these
-        } else if (!Command::isGenericArgument(fn)) {
+        } else if (!CommandHelpers::isGenericArgument(fn)) {
             badShardedField = fn.toString();
             return BSONObj();
         }
@@ -151,8 +150,8 @@ class MRCmd : public ErrmsgCommandDeprecated {
 public:
     MRCmd() : ErrmsgCommandDeprecated("mapReduce", "mapreduce") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
 
     bool adminOnly() const override {
@@ -160,20 +159,20 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsCollectionRequired(dbname, cmdObj).ns();
+        return CommandHelpers::parseNsCollectionRequired(dbname, cmdObj).ns();
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return mr::mrSupportsWriteConcern(cmd);
     }
 
-    void help(std::stringstream& help) const override {
-        help << "Runs the sharded map/reduce command";
+    std::string help() const override {
+        return "Runs the sharded map/reduce command";
     }
 
     void addRequiredPrivileges(const std::string& dbname,
                                const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) override {
+                               std::vector<Privilege>* out) const override {
         mr::addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
     }
 
@@ -283,7 +282,8 @@ public:
             ShardConnection conn(inputRoutingInfo.primary()->getConnString(), "");
 
             BSONObj res;
-            bool ok = conn->runCommand(dbname, filterCommandRequestForPassthrough(cmdObj), res);
+            bool ok = conn->runCommand(
+                dbname, CommandHelpers::filterCommandRequestForPassthrough(cmdObj), res);
             conn.done();
 
             if (auto wcErrorElem = res["writeConcernError"]) {
@@ -291,7 +291,7 @@ public:
                     inputRoutingInfo.primary()->getId(), wcErrorElem, result);
             }
 
-            result.appendElementsUnique(filterCommandReplyForPassthrough(res));
+            result.appendElementsUnique(CommandHelpers::filterCommandReplyForPassthrough(res));
             return ok;
         }
 
@@ -475,7 +475,7 @@ public:
             } else {
                 // Collection is already sharded; read the collection's UUID from the config server.
                 const auto coll =
-                    uassertStatusOK(catalogClient->getCollection(opCtx, outputCollNss.ns())).value;
+                    uassertStatusOK(catalogClient->getCollection(opCtx, outputCollNss)).value;
                 shardedOutputCollUUID = coll.getUUID();
             }
 
@@ -493,7 +493,7 @@ public:
                 auto scopedDistLock = catalogClient->getDistLockManager()->lock(
                     opCtx, outputCollNss.ns(), "mr-post-process", kNoDistLockTimeout);
                 if (!scopedDistLock.isOK()) {
-                    return appendCommandStatus(result, scopedDistLock.getStatus());
+                    return CommandHelpers::appendCommandStatus(result, scopedDistLock.getStatus());
                 }
 
                 BSONObj finalCmdObj = finalCmd.obj();

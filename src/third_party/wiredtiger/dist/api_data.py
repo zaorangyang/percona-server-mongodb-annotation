@@ -149,8 +149,10 @@ file_runtime_config = [
         Config('commit_timestamp', 'none', r'''
             verify that timestamps should 'always' or 'never' be used
             on modifications with this table.  Verification is 'none'
-            if mixed update use is allowed.''',
-            choices=['always','never','none']),
+            if mixed update use is allowed. If 'key_consistent' is
+            set then all updates to a specific key must be the same
+            with respect to timestamp usage or not.''',
+            choices=['always','key_consistent', 'never','none']),
         Config('read_timestamp', 'none', r'''
             verify that timestamps should 'always' or 'never' be used
             on reads with this table.  Verification is 'none'
@@ -454,29 +456,36 @@ connection_runtime_config = [
             ]),
     Config('eviction_checkpoint_target', '5', r'''
         perform eviction at the beginning of checkpoints to bring the dirty
-        content in cache to this level, expressed as a percentage of the total
-        cache size.  Ignored if set to zero or \c in_memory is \c true''',
-        min=0, max=99),
+        content in cache to this level. It is a percentage of the cache size if
+        the value is within the range of 0 to 100 or an absolute size when
+        greater than 100. The value is not allowed to exceed the \c cache_size.
+        Ignored if set to zero or \c in_memory is \c true''',
+        min=0, max='10TB'),
     Config('eviction_dirty_target', '5', r'''
         perform eviction in worker threads when the cache contains at least
-        this much dirty content, expressed as a percentage of the total cache
-        size.''',
-        min=1, max=99),
+        this much dirty content. It is a percentage of the cache size if the
+        value is within the range of 1 to 100 or an absolute size when greater
+        than 100. The value is not allowed to exceed the \c cache_size.''',
+        min=1, max='10TB'),
     Config('eviction_dirty_trigger', '20', r'''
         trigger application threads to perform eviction when the cache contains
-        at least this much dirty content, expressed as a percentage of the
-        total cache size. This setting only alters behavior if it is lower than
-        eviction_trigger''',
-        min=1, max=99),
+        at least this much dirty content. It is a percentage of the cache size
+        if the value is within the range of 1 to 100 or an absolute size when
+        greater than 100. The value is not allowed to exceed the \c cache_size.
+        This setting only alters behavior if it is lower than eviction_trigger
+        ''', min=1, max='10TB'),
     Config('eviction_target', '80', r'''
         perform eviction in worker threads when the cache contains at least
-        this much content, expressed as a percentage of the total cache size.
-        Must be less than \c eviction_trigger''',
-        min=10, max=99),
+        this much content. It is a percentage of the cache size if the value is
+        within the range of 10 to 100 or an absolute size when greater than 100.
+        The value is not allowed to exceed the \c cache_size.''',
+        min=10, max='10TB'),
     Config('eviction_trigger', '95', r'''
         trigger application threads to perform eviction when the cache contains
-        at least this much content, expressed as a percentage of the
-        total cache size''', min=10, max=99),
+        at least this much content. It is a percentage of the cache size if the
+        value is within the range of 10 to 100 or an absolute size when greater
+        than 100.  The value is not allowed to exceed the \c cache_size.''',
+        min=10, max='10TB'),
     Config('file_manager', '', r'''
         control how file handles are managed''',
         type='category', subconfig=[
@@ -525,7 +534,9 @@ connection_runtime_config = [
     Config('shared_cache', '', r'''
         shared cache configuration options. A database should configure
         either a cache_size or a shared_cache not both. Enabling a
-        shared cache uses a session from the configured session_max''',
+        shared cache uses a session from the configured session_max. A
+        shared cache can not have absolute values configured for cache
+        eviction settings''',
         type='category', subconfig=[
         Config('chunk', '10MB', r'''
             the granularity that a shared cache is redistributed''',
@@ -1126,6 +1137,10 @@ methods = {
 ]),
 
 'WT_SESSION.begin_transaction' : Method([
+    Config('ignore_prepare', 'false', r'''
+        whether to ignore the updates by other prepared transactions as part of
+        read operations of this transaction''',
+        type='boolean'),
     Config('isolation', '', r'''
         the isolation level for this transaction; defaults to the
         session's isolation level''',
@@ -1169,6 +1184,14 @@ methods = {
         wait for record to be written or synchronized.  The
         \c on setting forces log records to be written to the storage device''',
         choices=['background', 'off', 'on']),
+]),
+
+'WT_SESSION.prepare_transaction' : Method([
+    Config('prepare_timestamp', '', r'''
+        set the prepare timestamp for the updates of the current transaction.
+        The supplied value should not be older than any active read timestamps.
+        This configuration option is mandatory.  See
+        @ref transaction_timestamps'''),
 ]),
 
 'WT_SESSION.timestamp_transaction' : Method([

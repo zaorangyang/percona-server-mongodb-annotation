@@ -43,7 +43,7 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands/fsync.h"
+#include "mongo/db/commands/fsync_locked.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
@@ -121,9 +121,9 @@ private:
         OperationContext& opCtx = *opCtxPtr;
 
         // If part of replSet but not in a readable state (e.g. during initial sync), skip.
-        if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
+        if (repl::ReplicationCoordinator::get(&opCtx)->getReplicationMode() ==
                 repl::ReplicationCoordinator::modeReplSet &&
-            !repl::getGlobalReplicationCoordinator()->getMemberState().readable())
+            !repl::ReplicationCoordinator::get(&opCtx)->getMemberState().readable())
             return;
 
         TTLCollectionCache& ttlCollectionCache = TTLCollectionCache::get(getGlobalServiceContext());
@@ -195,7 +195,7 @@ private:
             return;
         }
 
-        if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesFor(opCtx, collectionNSS)) {
+        if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, collectionNSS)) {
             return;
         }
 

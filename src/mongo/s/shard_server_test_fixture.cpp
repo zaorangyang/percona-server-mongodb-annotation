@@ -62,16 +62,8 @@ void ShardServerTestFixture::expectFindOnConfigSendErrorCode(ErrorCodes::Error c
         ASSERT_EQ(request.target, kConfigHostAndPort);
         ASSERT_EQ(request.dbname, "config");
         BSONObjBuilder responseBuilder;
-        Command::appendCommandStatus(responseBuilder, Status(code, ""));
+        CommandHelpers::appendCommandStatus(responseBuilder, Status(code, ""));
         return responseBuilder.obj();
-    });
-}
-
-void ShardServerTestFixture::expectFindOnConfigSendBSONObjVector(std::vector<BSONObj> obj) {
-    onFindCommand([&, obj](const executor::RemoteCommandRequest& request) {
-        ASSERT_EQ(request.target, kConfigHostAndPort);
-        ASSERT_EQ(request.dbname, "config");
-        return obj;
     });
 }
 

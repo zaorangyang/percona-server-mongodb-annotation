@@ -47,7 +47,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -77,7 +77,7 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
 
     {
         AutoGetCollection autoColl(opCtx, ns, MODE_IX);
-        const auto css = CollectionShardingState::get(opCtx, ns.toString());
+        const auto css = CollectionShardingState::get(opCtx, ns);
         auto metadata = css->getMetadata();
         if (!metadata) {
             log() << "skipping orphaned data cleanup for " << ns.toString()
@@ -164,8 +164,8 @@ class CleanupOrphanedCommand : public ErrmsgCommandDeprecated {
 public:
     CleanupOrphanedCommand() : ErrmsgCommandDeprecated("cleanupOrphaned") {}
 
-    bool slaveOk() const override {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     bool adminOnly() const override {
@@ -174,7 +174,7 @@ public:
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forClusterResource(), ActionType::cleanupOrphaned)) {
             return Status(ErrorCodes::Unauthorized, "Not authorized for cleanupOrphaned command.");

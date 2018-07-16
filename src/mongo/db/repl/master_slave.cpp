@@ -270,7 +270,7 @@ void ReplSource::loadAll(OperationContext* opCtx, SourceVector& v) {
     SourceVector old = v;
     v.clear();
 
-    const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
+    const ReplSettings& replSettings = ReplicationCoordinator::get(opCtx)->getSettings();
     if (!replSettings.getSource().empty()) {
         // --source <host> specified.
         // check that no items are in sources other than that
@@ -361,22 +361,22 @@ void ReplSource::forceResyncDead(OperationContext* opCtx, const char* requester)
 
 class HandshakeCmd : public BasicCommand {
 public:
-    void help(stringstream& h) const {
-        h << "internal";
+    std::string help() const override {
+        return "internal";
     }
     HandshakeCmd() : BasicCommand("handshake") {}
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool adminOnly() const {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::internal);
         out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
@@ -389,13 +389,13 @@ public:
         HandshakeArgs handshake;
         Status status = handshake.initialize(cmdObj);
         if (!status.isOK()) {
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         ReplClientInfo::forClient(opCtx->getClient()).setRemoteID(handshake.getRid());
 
-        status = getGlobalReplicationCoordinator()->processHandshake(opCtx, handshake);
-        return appendCommandStatus(result, status);
+        status = ReplicationCoordinator::get(opCtx)->processHandshake(opCtx, handshake);
+        return CommandHelpers::appendCommandStatus(result, status);
     }
 
 } handshakeCmd;
@@ -439,7 +439,7 @@ void ReplSource::forceResync(OperationContext* opCtx, const char* requester) {
 
         if (!_connect(&oplogReader,
                       HostAndPort(hostName),
-                      getGlobalReplicationCoordinator()->getMyRID())) {
+                      ReplicationCoordinator::get(opCtx)->getMyRID())) {
             msgasserted(14051, "unable to connect to resync");
         }
         bool ok = oplogReader.conn()->runCommand(
@@ -466,12 +466,12 @@ void ReplSource::forceResync(OperationContext* opCtx, const char* requester) {
     save(opCtx);
 }
 
-Status ReplSource::_updateIfDoneWithInitialSync() {
+Status ReplSource::_updateIfDoneWithInitialSync(OperationContext* opCtx) {
     const auto usedToDoHandshake = _doHandshake;
     if (!usedToDoHandshake && addDbNextPass.empty() && incompleteCloneDbs.empty()) {
         _doHandshake = true;
         oplogReader.resetConnection();
-        const auto myRID = getGlobalReplicationCoordinator()->getMyRID();
+        const auto myRID = ReplicationCoordinator::get(opCtx)->getMyRID();
         if (!_connect(&oplogReader, HostAndPort{hostName}, myRID)) {
             return {ErrorCodes::MasterSlaveConnectionFailure,
                     str::stream() << "could not connect to " << hostName << " with rid: "
@@ -674,7 +674,8 @@ void ReplSource::applyOperation(OperationContext* opCtx, Database* db, const BSO
             // sync source.
             SyncTail sync(nullptr, SyncTail::MultiSyncApplyFunc());
             sync.setHostname(hostName);
-            sync.fetchAndInsertMissingDocument(opCtx, op);
+            OplogEntry oplogEntry(op);
+            sync.fetchAndInsertMissingDocument(opCtx, oplogEntry);
         }
     } catch (AssertionException& e) {
         log() << "sync: caught user assertion " << redact(e) << " while applying op: " << redact(op)
@@ -702,9 +703,8 @@ void ReplSource::_sync_pullOpLog_applyOperation(OperationContext* opCtx,
     if (op.getStringField("op")[0] == 'n')
         return;
 
-    char dbName[MaxDatabaseNameLen];
     const char* ns = op.getStringField("ns");
-    nsToDatabase(ns, dbName);
+    const auto dbName = nsToDatabaseSubstring(ns).toString();
 
     if (*ns == '.') {
         log() << "skipping bad op in oplog: " << redact(op) << endl;
@@ -726,7 +726,7 @@ void ReplSource::_sync_pullOpLog_applyOperation(OperationContext* opCtx,
     // reported.
     CurOp individualOp(opCtx);
     UnreplicatedWritesBlock uwb(opCtx);
-    const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
+    const ReplSettings& replSettings = ReplicationCoordinator::get(opCtx)->getSettings();
     if (replSettings.getPretouch() &&
         !alreadyLocked /*doesn't make sense if in write lock already*/) {
         if (replSettings.getPretouch() > 1) {
@@ -774,7 +774,7 @@ void ReplSource::_sync_pullOpLog_applyOperation(OperationContext* opCtx,
         throw SyncException();
     }
 
-    if (!handleDuplicateDbName(opCtx, op, ns, dbName)) {
+    if (!handleDuplicateDbName(opCtx, op, ns, dbName.c_str())) {
         return;
     }
 
@@ -948,7 +948,7 @@ int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
         }
     }
 
-    auto status = _updateIfDoneWithInitialSync();
+    auto status = _updateIfDoneWithInitialSync(opCtx);
     if (!status.isOK()) {
         switch (status.code()) {
             case ErrorCodes::Interrupted: {
@@ -1088,7 +1088,8 @@ int ReplSource::_sync_pullOpLog(OperationContext* opCtx, int& nApplied) {
                         "replication error last applied optime at slave >= nextOpTime from master",
                         false);
                 }
-                const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
+                const ReplSettings& replSettings =
+                    ReplicationCoordinator::get(opCtx)->getSettings();
                 if (replSettings.getSlaveDelaySecs() != Seconds(0) &&
                     (Seconds(time(0)) <
                      Seconds(nextOpTime.getSecs()) + replSettings.getSlaveDelaySecs())) {
@@ -1153,7 +1154,7 @@ int ReplSource::sync(OperationContext* opCtx, int& nApplied) {
     }
 
     if (!_connect(
-            &oplogReader, HostAndPort(hostName), getGlobalReplicationCoordinator()->getMyRID())) {
+            &oplogReader, HostAndPort(hostName), ReplicationCoordinator::get(opCtx)->getMyRID())) {
         LOG(4) << "can't connect to sync source" << endl;
         return -1;
     }
@@ -1235,7 +1236,7 @@ static void replMain(OperationContext* opCtx) {
             Lock::GlobalWrite lk(opCtx);
             if (replAllDead) {
                 // throttledForceResyncDead can throw
-                if (!getGlobalReplicationCoordinator()->getSettings().isAutoResyncEnabled() ||
+                if (!ReplicationCoordinator::get(opCtx)->getSettings().isAutoResyncEnabled() ||
                     !ReplSource::throttledForceResyncDead(opCtx, "auto")) {
                     log() << "all sources dead: " << replAllDead << ", sleeping for 5 seconds"
                           << endl;
@@ -1300,7 +1301,7 @@ static void replMasterThread() {
         OperationContext& opCtx = *opCtxPtr;
         AuthorizationSession::get(opCtx.getClient())->grantInternalAuthorization();
 
-        Lock::GlobalWrite globalWrite(&opCtx, 1);
+        Lock::GlobalWrite globalWrite(&opCtx, Date_t::now() + Milliseconds(1));
         if (globalWrite.isLocked()) {
             toSleep = 10;
 
@@ -1347,7 +1348,7 @@ static void replSlaveThread() {
 }
 
 void startMasterSlave(OperationContext* opCtx) {
-    const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
+    const ReplSettings& replSettings = ReplicationCoordinator::get(opCtx)->getSettings();
     if (!replSettings.isSlave() && !replSettings.isMaster())
         return;
 

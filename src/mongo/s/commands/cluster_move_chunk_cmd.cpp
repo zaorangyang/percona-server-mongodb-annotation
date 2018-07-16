@@ -44,7 +44,7 @@
 #include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/migration_secondary_throttle_options.h"
+#include "mongo/s/request_types/migration_secondary_throttle_options.h"
 #include "mongo/util/log.h"
 #include "mongo/util/timer.h"
 
@@ -55,10 +55,9 @@ class MoveChunkCmd : public ErrmsgCommandDeprecated {
 public:
     MoveChunkCmd() : ErrmsgCommandDeprecated("moveChunk", "movechunk") {}
 
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
-
     bool adminOnly() const override {
         return true;
     }
@@ -67,17 +66,17 @@ public:
         return true;
     }
 
-    void help(std::stringstream& help) const override {
-        help << "Example: move chunk that contains the doc {num : 7} to shard001\n"
-             << "  { movechunk : 'test.foo' , find : { num : 7 } , to : 'shard0001' }\n"
-             << "Example: move chunk with lower bound 0 and upper bound 10 to shard001\n"
-             << "  { movechunk : 'test.foo' , bounds : [ { num : 0 } , { num : 10 } ] "
-             << " , to : 'shard001' }\n";
+    std::string help() const override {
+        return "Example: move chunk that contains the doc {num : 7} to shard001\n"
+               "  { movechunk : 'test.foo' , find : { num : 7 } , to : 'shard0001' }\n"
+               "Example: move chunk with lower bound 0 and upper bound 10 to shard001\n"
+               "  { movechunk : 'test.foo' , bounds : [ { num : 0 } , { num : 10 } ] "
+               " , to : 'shard001' }\n";
     }
 
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                 ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
                 ActionType::moveChunk)) {
@@ -88,7 +87,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
     }
 
     bool errmsgRun(OperationContext* opCtx,
@@ -122,7 +121,8 @@ public:
                                           << toString
                                           << "' because that shard does not exist");
             log() << msg;
-            return appendCommandStatus(result, Status(ErrorCodes::ShardNotFound, msg));
+            return CommandHelpers::appendCommandStatus(result,
+                                                       Status(ErrorCodes::ShardNotFound, msg));
         }
 
         const auto to = toStatus.getValue();
@@ -182,7 +182,7 @@ public:
             uassertStatusOK(MigrationSecondaryThrottleOptions::createFromCommand(cmdObj));
 
         ChunkType chunkType;
-        chunkType.setNS(nss.ns());
+        chunkType.setNS(nss);
         chunkType.setMin(chunk->getMin());
         chunkType.setMax(chunk->getMax());
         chunkType.setShard(chunk->getShardId());

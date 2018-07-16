@@ -109,13 +109,13 @@ using std::unique_ptr;
 
 class CmdShutdownMongoD : public CmdShutdown {
 public:
-    virtual void help(stringstream& help) const {
-        help << "shutdown the database.  must be ran against admin db and "
-             << "either (1) ran from localhost or (2) authenticated. If "
-             << "this is a primary in a replica set and there is no member "
-             << "within 10 seconds of its optime, it will not shutdown "
-             << "without force : true.  You can also specify timeoutSecs : "
-             << "N to wait N seconds for other members to catch up.";
+    std::string help() const override {
+        return "shutdown the database.  must be ran against admin db and "
+               "either (1) ran from localhost or (2) authenticated. If "
+               "this is a primary in a replica set and there is no member "
+               "within 10 seconds of its optime, it will not shutdown "
+               "without force : true.  You can also specify timeoutSecs : "
+               "N to wait N seconds for other members to catch up.";
     }
 
     virtual bool run(OperationContext* opCtx,
@@ -129,10 +129,10 @@ public:
             timeoutSecs = cmdObj["timeoutSecs"].numberLong();
         }
 
-        Status status = repl::getGlobalReplicationCoordinator()->stepDown(
+        Status status = repl::ReplicationCoordinator::get(opCtx)->stepDown(
             opCtx, force, Seconds(timeoutSecs), Seconds(120));
         if (!status.isOK() && status.code() != ErrorCodes::NotMaster) {  // ignore not master
-            return appendCommandStatus(result, status);
+            return CommandHelpers::appendCommandStatus(result, status);
         }
 
         // Never returns
@@ -144,16 +144,16 @@ public:
 
 class CmdDropDatabase : public BasicCommand {
 public:
-    virtual void help(stringstream& help) const {
-        help << "drop (delete) this database";
+    std::string help() const override {
+        return "drop (delete) this database";
     }
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::dropDatabase);
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
@@ -173,16 +173,17 @@ public:
         // disallow dropping the config database
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
             (dbname == NamespaceString::kConfigDb)) {
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::IllegalOperation,
-                                              "Cannot drop 'config' database if mongod started "
-                                              "with --configsvr"));
+            return CommandHelpers::appendCommandStatus(
+                result,
+                Status(ErrorCodes::IllegalOperation,
+                       "Cannot drop 'config' database if mongod started "
+                       "with --configsvr"));
         }
 
-        if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+        if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
              repl::ReplicationCoordinator::modeNone) &&
-            ((dbname == NamespaceString::kLocalDb) || (dbname == NamespaceString::kAdminDb))) {
-            return appendCommandStatus(
+            (dbname == NamespaceString::kLocalDb)) {
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::IllegalOperation,
                        str::stream() << "Cannot drop '" << dbname
@@ -191,32 +192,32 @@ public:
         BSONElement e = cmdObj.firstElement();
         int p = (int)e.number();
         if (p != 1) {
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result, Status(ErrorCodes::IllegalOperation, "have to pass 1 as db parameter"));
         }
 
         Status status = dropDatabase(opCtx, dbname);
         if (status == ErrorCodes::NamespaceNotFound) {
-            return appendCommandStatus(result, Status::OK());
+            return CommandHelpers::appendCommandStatus(result, Status::OK());
         }
         if (status.isOK()) {
             result.append("dropped", dbname);
         }
-        return appendCommandStatus(result, status);
+        return CommandHelpers::appendCommandStatus(result, status);
     }
 
 } cmdDropDatabase;
 
 class CmdRepairDatabase : public ErrmsgCommandDeprecated {
 public:
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool maintenanceMode() const {
         return true;
     }
-    virtual void help(stringstream& help) const {
-        help << "repair database.  also compacts. note: slow.";
+    std::string help() const override {
+        return "repair database.  also compacts. note: slow.";
     }
 
 
@@ -226,7 +227,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::repairDatabase);
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
@@ -284,7 +285,7 @@ public:
 
         // Open database before returning
         dbHolder().openDb(opCtx, dbname);
-        return appendCommandStatus(result, status);
+        return CommandHelpers::appendCommandStatus(result, status);
     }
 } cmdRepairDatabase;
 
@@ -294,16 +295,16 @@ public:
 */
 class CmdProfile : public ErrmsgCommandDeprecated {
 public:
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "enable or disable performance profiling\n";
-        help << "{ profile : <n> }\n";
-        help << "0=off 1=log slow ops 2=log all\n";
-        help << "-1 to get current values\n";
-        help << "http://docs.mongodb.org/manual/reference/command/profile/#dbcmd.profile";
+    std::string help() const override {
+        return "enable or disable performance profiling\n"
+               "{ profile : <n> }\n"
+               "0=off 1=log slow ops 2=log all\n"
+               "-1 to get current values\n"
+               "http://docs.mongodb.org/manual/reference/command/profile/#dbcmd.profile";
     }
 
 
@@ -313,7 +314,7 @@ public:
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         AuthorizationSession* authzSession = AuthorizationSession::get(client);
 
         if (cmdObj.firstElement().numberInt() == -1 && !cmdObj.hasField("slowms") &&
@@ -409,21 +410,21 @@ public:
 class CmdDrop : public ErrmsgCommandDeprecated {
 public:
     CmdDrop() : ErrmsgCommandDeprecated("drop") {}
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
     virtual bool adminOnly() const {
         return false;
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::dropCollection);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
     }
-    virtual void help(stringstream& help) const {
-        help << "drop a collection\n{drop : <collectionName>}";
+    std::string help() const override {
+        return "drop a collection\n{drop : <collectionName>}";
     }
 
 
@@ -436,21 +437,21 @@ public:
                            const BSONObj& cmdObj,
                            string& errmsg,
                            BSONObjBuilder& result) {
-        const NamespaceString nsToDrop = parseNsCollectionRequired(dbname, cmdObj);
+        const NamespaceString nsToDrop(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
-        if (NamespaceString::virtualized(nsToDrop.ns())) {
+        if (nsToDrop.isVirtualized()) {
             errmsg = "can't drop a virtual collection";
             return false;
         }
 
-        if ((repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+        if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
              repl::ReplicationCoordinator::modeNone) &&
             nsToDrop.isOplog()) {
             errmsg = "can't drop live oplog while replicating";
             return false;
         }
 
-        return appendCommandStatus(
+        return CommandHelpers::appendCommandStatus(
             result,
             dropCollection(opCtx,
                            nsToDrop,
@@ -465,8 +466,8 @@ public:
 class CmdCreate : public BasicCommand {
 public:
     CmdCreate() : BasicCommand("create") {}
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
     virtual bool adminOnly() const {
         return false;
@@ -477,13 +478,13 @@ public:
         return true;
     }
 
-    virtual void help(stringstream& help) const {
-        help << "create a collection explicitly\n"
-                "{ create: <ns>[, capped: <bool>, size: <collSizeInBytes>, max: <nDocs>] }";
+    std::string help() const override {
+        return "create a collection explicitly\n"
+               "{ create: <ns>[, capped: <bool>, size: <collSizeInBytes>, max: <nDocs>] }";
     }
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         const NamespaceString nss(parseNs(dbname, cmdObj));
         return AuthorizationSession::get(client)->checkAuthForCreate(nss, cmdObj, false);
     }
@@ -492,7 +493,7 @@ public:
                      const string& dbname,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        const NamespaceString ns(parseNsCollectionRequired(dbname, cmdObj));
+        const NamespaceString ns(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
 
         if (cmdObj.hasField("autoIndexId")) {
             const char* deprecationWarning =
@@ -504,21 +505,21 @@ public:
         // Validate _id index spec and fill in missing fields.
         if (auto idIndexElem = cmdObj["idIndex"]) {
             if (cmdObj["viewOn"]) {
-                return appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result,
                     {ErrorCodes::InvalidOptions,
                      str::stream() << "'idIndex' is not allowed with 'viewOn': " << idIndexElem});
             }
             if (cmdObj["autoIndexId"]) {
-                return appendCommandStatus(result,
-                                           {ErrorCodes::InvalidOptions,
-                                            str::stream()
-                                                << "'idIndex' is not allowed with 'autoIndexId': "
-                                                << idIndexElem});
+                return CommandHelpers::appendCommandStatus(
+                    result,
+                    {ErrorCodes::InvalidOptions,
+                     str::stream() << "'idIndex' is not allowed with 'autoIndexId': "
+                                   << idIndexElem});
             }
 
             if (idIndexElem.type() != BSONType::Object) {
-                return appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result,
                     {ErrorCodes::TypeMismatch,
                      str::stream() << "'idIndex' has to be a document: " << idIndexElem});
@@ -535,7 +536,7 @@ public:
             std::unique_ptr<CollatorInterface> defaultCollator;
             if (auto collationElem = cmdObj["collation"]) {
                 if (collationElem.type() != BSONType::Object) {
-                    return appendCommandStatus(
+                    return CommandHelpers::appendCommandStatus(
                         result,
                         {ErrorCodes::TypeMismatch,
                          str::stream() << "'collation' has to be a document: " << collationElem});
@@ -543,7 +544,7 @@ public:
                 auto collatorStatus = CollatorFactoryInterface::get(opCtx->getServiceContext())
                                           ->makeFromBSON(collationElem.Obj());
                 if (!collatorStatus.isOK()) {
-                    return appendCommandStatus(result, collatorStatus.getStatus());
+                    return CommandHelpers::appendCommandStatus(result, collatorStatus.getStatus());
                 }
                 defaultCollator = std::move(collatorStatus.getValue());
             }
@@ -559,7 +560,7 @@ public:
                 idIndexCollator = std::move(collatorStatus.getValue());
             }
             if (!CollatorInterface::collatorsMatch(defaultCollator.get(), idIndexCollator.get())) {
-                return appendCommandStatus(
+                return CommandHelpers::appendCommandStatus(
                     result,
                     {ErrorCodes::BadValue,
                      "'idIndex' must have the same collation as the collection."});
@@ -568,12 +569,13 @@ public:
             // Remove "idIndex" field from command.
             auto resolvedCmdObj = cmdObj.removeField("idIndex");
 
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result, createCollection(opCtx, dbname, resolvedCmdObj, idIndexSpec));
         }
 
         BSONObj idIndexSpec;
-        return appendCommandStatus(result, createCollection(opCtx, dbname, cmdObj, idIndexSpec));
+        return CommandHelpers::appendCommandStatus(
+            result, createCollection(opCtx, dbname, cmdObj, idIndexSpec));
     }
 } cmdCreate;
 
@@ -582,12 +584,12 @@ class CmdFileMD5 : public BasicCommand {
 public:
     CmdFileMD5() : BasicCommand("filemd5") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
 
-    virtual void help(stringstream& help) const {
-        help << " example: { filemd5 : ObjectId(aaaaaaa) , root : \"fs\" }";
+    std::string help() const override {
+        return " example: { filemd5 : ObjectId(aaaaaaa) , root : \"fs\" }";
     }
 
 
@@ -611,7 +613,7 @@ public:
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), ActionType::find));
     }
 
@@ -715,11 +717,11 @@ public:
             }
 
             if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
-                return appendCommandStatus(result,
-                                           Status(ErrorCodes::OperationFailed,
-                                                  str::stream()
-                                                      << "Executor error during filemd5 command: "
-                                                      << WorkingSetCommon::toStatusString(obj)));
+                return CommandHelpers::appendCommandStatus(
+                    result,
+                    Status(ErrorCodes::OperationFailed,
+                           str::stream() << "Executor error during filemd5 command: "
+                                         << WorkingSetCommon::toStatusString(obj)));
             }
 
             if (partialOk)
@@ -753,34 +755,34 @@ public:
 
 class CmdDatasize : public ErrmsgCommandDeprecated {
     virtual string parseNs(const string& dbname, const BSONObj& cmdObj) const {
-        return parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
     }
 
 public:
     CmdDatasize() : ErrmsgCommandDeprecated("dataSize", "datasize") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual void help(stringstream& help) const {
-        help << "determine data size for a set of data in a certain range"
-                "\nexample: { dataSize:\"blog.posts\", keyPattern:{x:1}, min:{x:10}, max:{x:55} }"
-                "\nmin and max parameters are optional. They must either both be included or both "
-                "omitted"
-                "\nkeyPattern is an optional parameter indicating an index pattern that would be "
-                "useful"
-                "for iterating over the min/max bounds. If keyPattern is omitted, it is inferred "
-                "from "
-                "the structure of min. "
-                "\nnote: This command may take a while to run";
+    std::string help() const override {
+        return "determine data size for a set of data in a certain range"
+               "\nexample: { dataSize:\"blog.posts\", keyPattern:{x:1}, min:{x:10}, max:{x:55} }"
+               "\nmin and max parameters are optional. They must either both be included or both "
+               "omitted"
+               "\nkeyPattern is an optional parameter indicating an index pattern that would be "
+               "useful"
+               "for iterating over the min/max bounds. If keyPattern is omitted, it is inferred "
+               "from "
+               "the structure of min. "
+               "\nnote: This command may take a while to run";
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::find);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -884,7 +886,7 @@ public:
 
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
             warning() << "Internal error while reading " << ns;
-            return appendCommandStatus(
+            return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::OperationFailed,
                        str::stream() << "Executor error while reading during dataSize command: "
@@ -909,21 +911,20 @@ class CollectionStats : public ErrmsgCommandDeprecated {
 public:
     CollectionStats() : ErrmsgCommandDeprecated("collStats", "collstats") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual void help(stringstream& help) const {
-        help
-            << "{ collStats:\"blog.posts\" , scale : 1 } scale divides sizes e.g. for KB use 1024\n"
+    std::string help() const override {
+        return "{ collStats:\"blog.posts\" , scale : 1 } scale divides sizes e.g. for KB use 1024\n"
                "    avgObjSize - in bytes";
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::collStats);
         out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
@@ -934,7 +935,7 @@ public:
                    const BSONObj& jsobj,
                    string& errmsg,
                    BSONObjBuilder& result) {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, jsobj));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, jsobj));
 
         if (nss.coll().empty()) {
             errmsg = "No collection name specified";
@@ -957,22 +958,22 @@ class CollectionModCommand : public BasicCommand {
 public:
     CollectionModCommand() : BasicCommand("collMod") {}
 
-    virtual bool slaveOk() const {
-        return false;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
-    virtual void help(stringstream& help) const {
-        help << "Sets collection options.\n"
-                "Example: { collMod: 'foo', usePowerOf2Sizes:true }\n"
-                "Example: { collMod: 'foo', index: {keyPattern: {a: 1}, expireAfterSeconds: 600} "
-                "Example: { collMod: 'foo', index: {name: 'bar', expireAfterSeconds: 600} }\n";
+    std::string help() const override {
+        return "Sets collection options.\n"
+               "Example: { collMod: 'foo', usePowerOf2Sizes:true }\n"
+               "Example: { collMod: 'foo', index: {keyPattern: {a: 1}, expireAfterSeconds: 600} "
+               "Example: { collMod: 'foo', index: {name: 'bar', expireAfterSeconds: 600} }\n";
     }
 
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         const NamespaceString nss(parseNs(dbname, cmdObj));
         return AuthorizationSession::get(client)->checkAuthForCollMod(nss, cmdObj, false);
     }
@@ -981,8 +982,8 @@ public:
              const string& dbname,
              const BSONObj& jsobj,
              BSONObjBuilder& result) {
-        const NamespaceString nss(parseNsCollectionRequired(dbname, jsobj));
-        return appendCommandStatus(result, collMod(opCtx, nss, jsobj, &result));
+        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, jsobj));
+        return CommandHelpers::appendCommandStatus(result, collMod(opCtx, nss, jsobj, &result));
     }
 
 } collectionModCommand;
@@ -991,21 +992,21 @@ class DBStats : public ErrmsgCommandDeprecated {
 public:
     DBStats() : ErrmsgCommandDeprecated("dbStats", "dbstats") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual void help(stringstream& help) const {
-        help << "Get stats on a database. Not instantaneous. Slower for databases with large "
-                ".ns files.\n"
-                "Example: { dbStats:1, scale:1 }";
+    std::string help() const override {
+        return "Get stats on a database. Not instantaneous. Slower for databases with large "
+               ".ns files.\n"
+               "Example: { dbStats:1, scale:1 }";
     }
 
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
+                                       std::vector<Privilege>* out) const {
         ActionSet actions;
         actions.addAction(ActionType::dbStats);
         out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
@@ -1087,18 +1088,18 @@ public:
 class CmdWhatsMyUri : public BasicCommand {
 public:
     CmdWhatsMyUri() : BasicCommand("whatsmyuri") {}
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    virtual void help(stringstream& help) const {
-        help << "{whatsmyuri:1}";
+    std::string help() const override {
+        return "{whatsmyuri:1}";
     }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {}  // No auth required
+                                       std::vector<Privilege>* out) const {}  // No auth required
     virtual bool run(OperationContext* opCtx,
                      const string& dbname,
                      const BSONObj& cmdObj,
@@ -1112,15 +1113,15 @@ class AvailableQueryOptions : public BasicCommand {
 public:
     AvailableQueryOptions() : BasicCommand("availableQueryOptions", "availablequeryoptions") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         return Status::OK();
     }
 

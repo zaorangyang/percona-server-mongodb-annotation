@@ -832,6 +832,8 @@ static const char * const __stats_connection_desc[] = {
 	"cache: pages queued for urgent eviction during walk",
 	"cache: pages read into cache",
 	"cache: pages read into cache requiring lookaside entries",
+	"cache: pages read into cache skipping older lookaside entries",
+	"cache: pages read into cache with skipped lookaside entries needed later",
 	"cache: pages requested from the cache",
 	"cache: pages seen by eviction walk",
 	"cache: pages selected for eviction unable to be evicted",
@@ -1021,7 +1023,7 @@ static const char * const __stats_connection_desc[] = {
 	"thread-yield: page reconciliation yielded due to child modification",
 	"thread-yield: tree descend one level yielded for split page index update",
 	"transaction: commit timestamp queue insert to empty",
-	"transaction: commit timestamp queue inserts to head",
+	"transaction: commit timestamp queue inserts to tail",
 	"transaction: commit timestamp queue inserts total",
 	"transaction: commit timestamp queue length",
 	"transaction: number of named snapshots created",
@@ -1210,6 +1212,8 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
 	stats->cache_eviction_pages_queued_oldest = 0;
 	stats->cache_read = 0;
 	stats->cache_read_lookaside = 0;
+	stats->cache_read_lookaside_skipped = 0;
+	stats->cache_read_lookaside_delay = 0;
 	stats->cache_pages_requested = 0;
 	stats->cache_eviction_pages_seen = 0;
 	stats->cache_eviction_fail = 0;
@@ -1399,7 +1403,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
 	stats->child_modify_blocked_page = 0;
 	stats->tree_descend_blocked = 0;
 	stats->txn_commit_queue_empty = 0;
-	stats->txn_commit_queue_head = 0;
+	stats->txn_commit_queue_tail = 0;
 	stats->txn_commit_queue_inserts = 0;
 	stats->txn_commit_queue_len = 0;
 	stats->txn_snapshots_created = 0;
@@ -1624,6 +1628,10 @@ __wt_stat_connection_aggregate(
 	    WT_STAT_READ(from, cache_eviction_pages_queued_oldest);
 	to->cache_read += WT_STAT_READ(from, cache_read);
 	to->cache_read_lookaside += WT_STAT_READ(from, cache_read_lookaside);
+	to->cache_read_lookaside_skipped +=
+	    WT_STAT_READ(from, cache_read_lookaside_skipped);
+	to->cache_read_lookaside_delay +=
+	    WT_STAT_READ(from, cache_read_lookaside_delay);
 	to->cache_pages_requested +=
 	    WT_STAT_READ(from, cache_pages_requested);
 	to->cache_eviction_pages_seen +=
@@ -1901,8 +1909,8 @@ __wt_stat_connection_aggregate(
 	to->tree_descend_blocked += WT_STAT_READ(from, tree_descend_blocked);
 	to->txn_commit_queue_empty +=
 	    WT_STAT_READ(from, txn_commit_queue_empty);
-	to->txn_commit_queue_head +=
-	    WT_STAT_READ(from, txn_commit_queue_head);
+	to->txn_commit_queue_tail +=
+	    WT_STAT_READ(from, txn_commit_queue_tail);
 	to->txn_commit_queue_inserts +=
 	    WT_STAT_READ(from, txn_commit_queue_inserts);
 	to->txn_commit_queue_len += WT_STAT_READ(from, txn_commit_queue_len);

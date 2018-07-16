@@ -212,26 +212,12 @@ public:
         LOG(1) << "stopping " << name() << " thread";
     }
 
-    bool supportsRecoverToStableTimestamp() {
-        // Replication is calling this method, however it is not setting the
-        // `_initialDataTimestamp` in all necessary cases. This may be removed when replication
-        // believes all sets of `_initialDataTimestamp` are correct. See SERVER-30184,
-        // SERVER-30185, SERVER-30335.
-        const bool keepOldBehavior = true;
-        if (keepOldBehavior) {
-            return false;
-        }
-
+    bool canRecoverToStableTimestamp() {
         static const std::uint64_t allowUnstableCheckpointsSentinel =
             static_cast<std::uint64_t>(Timestamp::kAllowUnstableCheckpointsSentinel.asULL());
         const std::uint64_t initialDataTimestamp = _initialDataTimestamp.load();
         // Illegal to be called when the dataset is incomplete.
         invariant(initialDataTimestamp > allowUnstableCheckpointsSentinel);
-
-        // Must return false until `recoverToStableTimestamp` is implemented. See SERVER-29213.
-        if (keepOldBehavior) {
-            return false;
-        }
         return _stableTimestamp.load() > initialDataTimestamp;
     }
 
@@ -241,6 +227,14 @@ public:
 
     void setInitialDataTimestamp(Timestamp initialDataTimestamp) {
         _initialDataTimestamp.store(initialDataTimestamp.asULL());
+    }
+
+    std::uint64_t getInitialDataTimestamp() const {
+        return _initialDataTimestamp.load();
+    }
+
+    std::uint64_t getStableTimestamp() const {
+        return _stableTimestamp.load();
     }
 
     void shutdown() {
@@ -852,8 +846,16 @@ SortedDataInterface* WiredTigerKVEngine::getGroupedSortedDataInterface(Operation
                                                                        StringData ident,
                                                                        const IndexDescriptor* desc,
                                                                        KVPrefix prefix) {
-    if (desc->unique())
-        return new WiredTigerIndexUnique(opCtx, _uri(ident), desc, prefix, _readOnly);
+    if (desc->unique()) {
+        // MongoDB 4.0 onwards new index version `kV2Unique` would be supported. By default unique
+        // index would be created with index version `kV2`. New format unique index would be created
+        // only if `IndexVersion` is `kV2Unique`.
+        if (desc->version() == IndexDescriptor::IndexVersion::kV2Unique)
+            return new WiredTigerIndexUniqueV2(opCtx, _uri(ident), desc, prefix, _readOnly);
+        else
+            return new WiredTigerIndexUnique(opCtx, _uri(ident), desc, prefix, _readOnly);
+    }
+
     return new WiredTigerIndexStandard(opCtx, _uri(ident), desc, prefix, _readOnly);
 }
 
@@ -996,12 +998,13 @@ bool WiredTigerKVEngine::_hasUri(WT_SESSION* session, const std::string& uri) co
 
 std::vector<std::string> WiredTigerKVEngine::getAllIdents(OperationContext* opCtx) const {
     std::vector<std::string> all;
+    int ret;
     WiredTigerCursor cursor("metadata:", WiredTigerSession::kMetadataTableId, false, opCtx);
     WT_CURSOR* c = cursor.get();
     if (!c)
         return all;
 
-    while (c->next(c) == 0) {
+    while ((ret = c->next(c)) == 0) {
         const char* raw;
         c->get_key(c, &raw);
         StringData key(raw);
@@ -1018,6 +1021,8 @@ std::vector<std::string> WiredTigerKVEngine::getAllIdents(OperationContext* opCt
 
         all.push_back(ident.toString());
     }
+
+    fassert(50663, ret == WT_NOTFOUND);
 
     return all;
 }
@@ -1081,11 +1086,25 @@ void WiredTigerKVEngine::setOldestTimestamp(Timestamp oldestTimestamp) {
     invariantWTOK(_conn->set_timestamp(_conn, commitTSConfigString));
 
     _oplogManager->setOplogReadTimestamp(oldestTimestamp);
+    stdx::unique_lock<stdx::mutex> lock(_oplogManagerMutex);
     _previousSetOldestTimestamp = oldestTimestamp;
     LOG(1) << "Forced a new oldest_timestamp. Value: " << oldestTimestamp;
 }
 
 void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp) {
+    if (stableTimestamp.isNull()) {
+        return;
+    }
+
+    const auto oplogReadTimestamp = Timestamp(_oplogManager->getOplogReadTimestamp());
+    if (!oplogReadTimestamp.isNull() && stableTimestamp > oplogReadTimestamp) {
+        // When a replica set has one voting node, replication can advance the commit point ahead
+        // of the current oplog read visibility. Allowing that to happen in storage can result in
+        // logically previous transactions trying to commit behind this updated stable
+        // timestamp. Instead, pin the stable timestamp to the oplog read timestamp.
+        stableTimestamp = oplogReadTimestamp;
+    }
+
     const bool keepOldBehavior = true;
     // Communicate to WiredTiger what the "stable timestamp" is. Timestamp-aware checkpoints will
     // only persist to disk transactions committed with a timestamp earlier than the "stable
@@ -1116,10 +1135,7 @@ void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp) {
 }
 
 void WiredTigerKVEngine::_advanceOldestTimestamp(Timestamp oldestTimestamp) {
-    if (oldestTimestamp == Timestamp()) {
-        // No oldestTimestamp to set, yet.
-        return;
-    }
+    Timestamp timestampToSet;
     {
         stdx::unique_lock<stdx::mutex> lock(_oplogManagerMutex);
         if (!_oplogManager) {
@@ -1136,12 +1152,13 @@ void WiredTigerKVEngine::_advanceOldestTimestamp(Timestamp oldestTimestamp) {
                 return;
             }
         }
+
+        // Lag the oldest_timestamp by one timestamp set, to give a bit more history.
+        invariant(_previousSetOldestTimestamp <= oldestTimestamp);
+        timestampToSet = _previousSetOldestTimestamp;
+        _previousSetOldestTimestamp = oldestTimestamp;
     }
 
-    // Lag the oldest_timestamp by one timestamp set, to give a bit more history.
-    invariant(_previousSetOldestTimestamp <= oldestTimestamp);
-    auto timestampToSet = _previousSetOldestTimestamp;
-    _previousSetOldestTimestamp = oldestTimestamp;
     if (timestampToSet == Timestamp()) {
         // Nothing to set yet.
         return;
@@ -1174,7 +1191,36 @@ bool WiredTigerKVEngine::supportsRecoverToStableTimestamp() const {
         return false;
     }
 
-    return _checkpointThread->supportsRecoverToStableTimestamp();
+    // Must return false until `recoverToStableTimestamp` is implemented. See SERVER-29213.
+    const bool keepOldBehavior = true;
+    if (keepOldBehavior) {
+        return false;
+    }
+    return true;
+}
+
+Status WiredTigerKVEngine::recoverToStableTimestamp() {
+    if (!supportsRecoverToStableTimestamp()) {
+        severe() << "WiredTiger is configured to not support recover to a stable timestamp";
+        fassertFailed(50665);
+    }
+
+    if (!_checkpointThread->canRecoverToStableTimestamp()) {
+        Timestamp stableTS = Timestamp(_checkpointThread->getStableTimestamp());
+        Timestamp initialDataTS = Timestamp(_checkpointThread->getInitialDataTimestamp());
+        return Status(ErrorCodes::UnrecoverableRollbackError,
+                      str::stream()
+                          << "No stable timestamp available to recover to. Initial data timestamp: "
+                          << initialDataTS.toString()
+                          << ", Stable timestamp: "
+                          << stableTS.toString());
+    }
+    return Status(ErrorCodes::UnrecoverableRollbackError,
+                  "WT does not support recover to stable timestamp yet.");
+}
+
+bool WiredTigerKVEngine::supportsReadConcernSnapshot() const {
+    return true;
 }
 
 void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,

@@ -44,8 +44,8 @@ class CmdMakeSnapshot final : public BasicCommand {
 public:
     CmdMakeSnapshot() : BasicCommand("makeSnapshot") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -57,12 +57,12 @@ public:
     // No auth needed because it only works when enabled via command line.
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         return Status::OK();
     }
 
-    virtual void help(std::stringstream& h) const {
-        h << "Creates a new named snapshot";
+    std::string help() const override {
+        return "Creates a new named snapshot";
     }
 
     bool run(OperationContext* opCtx,
@@ -72,17 +72,19 @@ public:
         auto snapshotManager =
             getGlobalServiceContext()->getGlobalStorageEngine()->getSnapshotManager();
         if (!snapshotManager) {
-            return appendCommandStatus(result, {ErrorCodes::CommandNotSupported, ""});
+            return CommandHelpers::appendCommandStatus(result,
+                                                       {ErrorCodes::CommandNotSupported, ""});
         }
 
-        Lock::GlobalLock lk(opCtx, MODE_IX, UINT_MAX);
+        Lock::GlobalLock lk(opCtx, MODE_IX, Date_t::max());
 
         auto status = snapshotManager->prepareForCreateSnapshot(opCtx);
         if (status.isOK()) {
-            const auto name = repl::ReplicationCoordinator::get(opCtx)->reserveSnapshotName(opCtx);
+            const auto name =
+                repl::ReplicationCoordinator::get(opCtx)->getMinimumVisibleSnapshot(opCtx);
             result.append("name", static_cast<long long>(name.asULL()));
         }
-        return appendCommandStatus(result, status);
+        return CommandHelpers::appendCommandStatus(result, status);
     }
 };
 
@@ -90,8 +92,8 @@ class CmdSetCommittedSnapshot final : public BasicCommand {
 public:
     CmdSetCommittedSnapshot() : BasicCommand("setCommittedSnapshot") {}
 
-    virtual bool slaveOk() const {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -103,12 +105,12 @@ public:
     // No auth needed because it only works when enabled via command line.
     virtual Status checkAuthForCommand(Client* client,
                                        const std::string& dbname,
-                                       const BSONObj& cmdObj) {
+                                       const BSONObj& cmdObj) const {
         return Status::OK();
     }
 
-    virtual void help(std::stringstream& h) const {
-        h << "Sets the snapshot for {readConcern: {level: 'majority'}}";
+    std::string help() const override {
+        return "Sets the snapshot for {readConcern: {level: 'majority'}}";
     }
 
     bool run(OperationContext* opCtx,
@@ -118,10 +120,11 @@ public:
         auto snapshotManager =
             getGlobalServiceContext()->getGlobalStorageEngine()->getSnapshotManager();
         if (!snapshotManager) {
-            return appendCommandStatus(result, {ErrorCodes::CommandNotSupported, ""});
+            return CommandHelpers::appendCommandStatus(result,
+                                                       {ErrorCodes::CommandNotSupported, ""});
         }
 
-        Lock::GlobalLock lk(opCtx, MODE_IX, UINT_MAX);
+        Lock::GlobalLock lk(opCtx, MODE_IX, Date_t::max());
         auto timestamp = Timestamp(cmdObj.firstElement().Long());
         snapshotManager->setCommittedSnapshot(timestamp);
         return true;

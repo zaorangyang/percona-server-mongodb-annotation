@@ -105,12 +105,16 @@ struct __wt_cache {
 	WT_CONDVAR *evict_cond;		/* Eviction server condition */
 	WT_SPINLOCK evict_walk_lock;	/* Eviction walk location */
 
-	u_int eviction_dirty_target;    /* Percent to allow dirty */
-	u_int eviction_dirty_trigger;	/* Percent to trigger dirty eviction */
-	u_int eviction_trigger;		/* Percent to trigger eviction */
-	u_int eviction_target;		/* Percent to end eviction */
+	/*
+	 * Eviction threshold percentages use double type to allow for
+	 * specifying percentages less than one.
+	 */
+	double eviction_dirty_target;	/* Percent to allow dirty */
+	double eviction_dirty_trigger;	/* Percent to trigger dirty eviction */
+	double eviction_trigger;	/* Percent to trigger eviction */
+	double eviction_target;		/* Percent to end eviction */
 
-	u_int eviction_checkpoint_target;/* Percent to reduce dirty
+	double eviction_checkpoint_target;/* Percent to reduce dirty
 					   to during checkpoint scrubs */
 	double eviction_scrub_limit;	/* Percent of cache to trigger
 					   dirty eviction during checkpoint
@@ -196,7 +200,9 @@ struct __wt_cache {
 	uint64_t las_entry_count;       /* Count of entries in lookaside */
 	uint64_t las_pageid;		/* Lookaside table page ID counter */
 
-	WT_SPINLOCK	 las_sweep_lock;
+	uint64_t las_sweep_cnt;		/* Entries to walk per sweep. */
+	WT_RWLOCK las_sweepwalk_lock;
+	WT_SPINLOCK las_sweep_lock;
 	WT_ITEM las_sweep_key;		/* Track sweep position. */
 	uint32_t las_sweep_dropmin;	/* Minimum btree ID in current set. */
 	uint8_t *las_sweep_dropmap;	/* Bitmap of dropped btree IDs. */
