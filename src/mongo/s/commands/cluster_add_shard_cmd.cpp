@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/audit.h"
 #include "mongo/db/commands.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
