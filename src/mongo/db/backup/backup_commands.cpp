@@ -38,15 +38,14 @@ namespace percona {
 class CreateBackupCommand : public ErrmsgCommandDeprecated {
 public:
     CreateBackupCommand() : ErrmsgCommandDeprecated("createBackup") {}
-    void help(std::stringstream& help) const override {
-        help << "Creates a hot backup, into the given directory, of the files currently in the "
-                "storage engine's data directory."
-             << std::endl
-             << "{ createBackup: 1, backupDir: <destination directory> }";
+    virtual std::string help() const override {
+        return "Creates a hot backup, into the given directory, of the files currently in the "
+               "storage engine's data directory.\n"
+               "{ createBackup: 1, backupDir: <destination directory> }";
     }
     Status checkAuthForCommand(Client* client,
                                const std::string& dbname,
-                               const BSONObj& cmdObj) override {
+                               const BSONObj& cmdObj) const override {
         return AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
                    ResourcePattern::forAnyNormalResource(), ActionType::startBackup)
             ? Status::OK()
@@ -55,8 +54,8 @@ public:
     bool adminOnly() const override {
         return true;
     }
-    bool slaveOk() const override {
-        return true;
+    AllowedOnSecondary secondaryAllowed() const override {
+        return AllowedOnSecondary::kAlways;
     }
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;

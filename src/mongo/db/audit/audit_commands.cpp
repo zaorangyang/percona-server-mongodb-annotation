@@ -47,7 +47,9 @@ namespace mongo {
         // TODO: Investigate if any other Command class virtual
         // methods need to be overridden.
         virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool slaveOk() const { return true; }
+        virtual AllowedOnSecondary secondaryAllowed() const override {
+            return AllowedOnSecondary::kAlways;
+        }
         virtual bool supportsWriteConcern(const BSONObj& cmd) const { return false; }
     };
 
@@ -55,15 +57,14 @@ namespace mongo {
     public:
         LogApplicationMessageCommand() : AuditCommand("logApplicationMessage") { }
         virtual ~LogApplicationMessageCommand() { }
-        virtual void help( std::stringstream &help ) const {
-            help << 
-                "Log a custom application message string to the audit log. Must be a string." << 
-                "Example: { logApplicationMessage: \"it's a trap!\" }";
+        virtual std::string help() const override {
+            return "Log a custom application message string to the audit log. Must be a string."
+                   "Example: { logApplicationMessage: \"it's a trap!\" }";
         }
 
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
+                                           std::vector<Privilege>* out) const override {
             ActionSet actions;
             actions.addAction(ActionType::logApplicationMessage);
 
@@ -93,15 +94,14 @@ namespace mongo {
     public:
         AuditGetOptionsCommand() : AuditCommand("auditGetOptions") { }
         virtual ~AuditGetOptionsCommand() { }
-        virtual void help( std::stringstream &help ) const {
-            help << 
-                "Get the options the audit system is currently using"
-                "Example: { auditGetOptions: 1 }";
+        virtual std::string help() const override {
+            return "Get the options the audit system is currently using"
+                   "Example: { auditGetOptions: 1 }";
         }
 
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) { }
+                                           std::vector<Privilege>* out) const override { }
 
         bool errmsgRun(OperationContext* txn, const std::string& dbname, const BSONObj& jsobj, std::string& errmsg, BSONObjBuilder& result) override {
             result.appendElements(auditOptions.toBSON());
