@@ -60,7 +60,8 @@
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
@@ -392,6 +393,9 @@ IndexCatalogImpl::IndexBuildBlock::IndexBuildBlock(OperationContext* opCtx,
 }
 
 Status IndexCatalogImpl::IndexBuildBlock::init() {
+    // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
+    invariant(_opCtx->lockState()->inAWriteUnitOfWork());
+
     // need this first for names, etc...
     BSONObj keyPattern = _spec.getObjectField("key");
     auto descriptor = stdx::make_unique<IndexDescriptor>(
@@ -402,7 +406,15 @@ Status IndexCatalogImpl::IndexBuildBlock::init() {
 
     /// ----------   setup on disk structures ----------------
 
-    Status status = _collection->getCatalogEntry()->prepareForIndexBuild(_opCtx, descriptor.get());
+    bool isBackgroundSecondaryBuild = false;
+    if (auto replCoord = repl::ReplicationCoordinator::get(_opCtx)) {
+        isBackgroundSecondaryBuild =
+            replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet &&
+            replCoord->getMemberState().secondary() && _spec["background"].trueValue();
+    }
+
+    Status status = _collection->getCatalogEntry()->prepareForIndexBuild(
+        _opCtx, descriptor.get(), isBackgroundSecondaryBuild);
     if (!status.isOK())
         return status;
 
@@ -425,6 +437,8 @@ IndexCatalogImpl::IndexBuildBlock::~IndexBuildBlock() {
 }
 
 void IndexCatalogImpl::IndexBuildBlock::fail() {
+    // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
+    invariant(_opCtx->lockState()->inAWriteUnitOfWork());
     fassert(17204, _catalog->_getCollection()->ok());  // defensive
 
     IndexCatalogEntry* entry = IndexCatalog::_getEntries(_catalog).find(_indexName);
@@ -438,6 +452,9 @@ void IndexCatalogImpl::IndexBuildBlock::fail() {
 }
 
 void IndexCatalogImpl::IndexBuildBlock::success() {
+    // Being in a WUOW means all timestamping responsibility can be pushed up to the caller.
+    invariant(_opCtx->lockState()->inAWriteUnitOfWork());
+
     Collection* collection = _catalog->_getCollection();
     fassert(17207, collection->ok());
     NamespaceString ns(_indexNamespace);

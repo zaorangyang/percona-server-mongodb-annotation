@@ -223,6 +223,7 @@ MigrationDestinationManager::State MigrationDestinationManager::getState() const
 void MigrationDestinationManager::setState(State newState) {
     stdx::lock_guard<stdx::mutex> sl(_mutex);
     _state = newState;
+    _stateChangedCV.notify_all();
 }
 
 void MigrationDestinationManager::setStateFail(std::string msg) {
@@ -231,6 +232,7 @@ void MigrationDestinationManager::setStateFail(std::string msg) {
         stdx::lock_guard<stdx::mutex> sl(_mutex);
         _errmsg = std::move(msg);
         _state = FAIL;
+        _stateChangedCV.notify_all();
     }
 
     _sessionMigration->forceFail(msg);
@@ -242,6 +244,7 @@ void MigrationDestinationManager::setStateFailWarn(std::string msg) {
         stdx::lock_guard<stdx::mutex> sl(_mutex);
         _errmsg = std::move(msg);
         _state = FAIL;
+        _stateChangedCV.notify_all();
     }
 
     _sessionMigration->forceFail(msg);
@@ -256,7 +259,21 @@ bool MigrationDestinationManager::_isActive(WithLock) const {
     return _sessionId.is_initialized();
 }
 
-void MigrationDestinationManager::report(BSONObjBuilder& b) {
+void MigrationDestinationManager::report(BSONObjBuilder& b,
+                                         OperationContext* opCtx,
+                                         bool waitForSteadyOrDone) {
+    if (waitForSteadyOrDone) {
+        stdx::unique_lock<stdx::mutex> lock(_mutex);
+        try {
+            opCtx->waitForConditionOrInterruptFor(_stateChangedCV, lock, Seconds(1), [&]() -> bool {
+                return _state != READY && _state != CLONE && _state != CATCHUP;
+            });
+        } catch (...) {
+            // Ignoring this error because this is an optional parameter and we catch timeout
+            // exceptions later.
+        }
+        b.append("waited", true);
+    }
     stdx::lock_guard<stdx::mutex> sl(_mutex);
 
     b.appendBool("active", _sessionId.is_initialized());
@@ -297,7 +314,7 @@ BSONObj MigrationDestinationManager::getMigrationStatusReport() {
 }
 
 Status MigrationDestinationManager::start(const NamespaceString& nss,
-                                          ScopedRegisterReceiveChunk scopedRegisterReceiveChunk,
+                                          ScopedReceiveChunk scopedReceiveChunk,
                                           const MigrationSessionId& sessionId,
                                           const ConnectionString& fromShardConnString,
                                           const ShardId& fromShard,
@@ -309,9 +326,10 @@ Status MigrationDestinationManager::start(const NamespaceString& nss,
                                           const WriteConcernOptions& writeConcern) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     invariant(!_sessionId);
-    invariant(!_scopedRegisterReceiveChunk);
+    invariant(!_scopedReceiveChunk);
 
     _state = READY;
+    _stateChangedCV.notify_all();
     _errmsg = "";
 
     _nss = nss;
@@ -330,7 +348,7 @@ Status MigrationDestinationManager::start(const NamespaceString& nss,
     _numSteady = 0;
 
     _sessionId = sessionId;
-    _scopedRegisterReceiveChunk = std::move(scopedRegisterReceiveChunk);
+    _scopedReceiveChunk = std::move(scopedReceiveChunk);
 
     // TODO: If we are here, the migrate thread must have completed, otherwise _active above
     // would be false, so this would never block. There is no better place with the current
@@ -366,6 +384,7 @@ Status MigrationDestinationManager::abort(const MigrationSessionId& sessionId) {
     }
 
     _state = ABORT;
+    _stateChangedCV.notify_all();
     _errmsg = "aborted";
 
     return Status::OK();
@@ -374,6 +393,7 @@ Status MigrationDestinationManager::abort(const MigrationSessionId& sessionId) {
 void MigrationDestinationManager::abortWithoutSessionIdCheck() {
     stdx::lock_guard<stdx::mutex> sl(_mutex);
     _state = ABORT;
+    _stateChangedCV.notify_all();
     _errmsg = "aborted without session id check";
 }
 
@@ -406,6 +426,7 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
 
     _sessionMigration->finish();
     _state = COMMIT_START;
+    _stateChangedCV.notify_all();
 
     auto const deadline = Date_t::now() + Seconds(30);
     while (_sessionId) {
@@ -413,6 +434,7 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
             _isActiveCV.wait_until(lock, deadline.toSystemTimePoint())) {
             _errmsg = str::stream() << "startCommit timed out waiting, " << _sessionId->toString();
             _state = FAIL;
+            _stateChangedCV.notify_all();
             return {ErrorCodes::CommandFailed, _errmsg};
         }
     }
@@ -452,7 +474,7 @@ void MigrationDestinationManager::_migrateThread(BSONObj min,
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     _sessionId.reset();
-    _scopedRegisterReceiveChunk.reset();
+    _scopedReceiveChunk.reset();
     _isActiveCV.notify_all();
 }
 
@@ -465,7 +487,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
                                                  const WriteConcernOptions& writeConcern) {
     invariant(isActive());
     invariant(_sessionId);
-    invariant(_scopedRegisterReceiveChunk);
+    invariant(_scopedReceiveChunk);
     invariant(!min.isEmpty());
     invariant(!max.isEmpty());
 
@@ -539,25 +561,21 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
             donorOptionsBob.appendElements(entry["options"].Obj());
         }
 
-        if (serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
-            BSONObj info;
-            if (entry["info"].isABSONObj()) {
-                info = entry["info"].Obj();
-            }
-            if (info["uuid"].eoo()) {
-                setStateFailWarn(str::stream()
-                                 << "The donor shard did not return a UUID for collection "
-                                 << _nss.ns()
-                                 << " as part of its listCollections response: "
-                                 << entry
-                                 << ", but this node expects to see a UUID since its "
-                                    "feature compatibility version is 3.6. Please follow "
-                                    "the online documentation to set the same feature "
-                                    "compatibility version across the cluster.");
-                return;
-            }
-            donorOptionsBob.append(info["uuid"]);
+        BSONObj info;
+        if (entry["info"].isABSONObj()) {
+            info = entry["info"].Obj();
         }
+        if (info["uuid"].eoo()) {
+            setStateFailWarn(str::stream()
+                             << "The donor shard did not return a UUID for collection "
+                             << _nss.ns()
+                             << " as part of its listCollections response: "
+                             << entry
+                             << ", but this node expects to see a UUID.");
+            return;
+        }
+        donorOptionsBob.append(info["uuid"]);
+
         donorOptions = donorOptionsBob.obj();
     }
 
@@ -591,7 +609,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx,
                 donorUUID.emplace(UUID::parse(donorOptions));
             }
 
-            if (!collection->getCatalogEntry()->isEqualToMetadataUUID(opCtx, donorUUID)) {
+            if (collection->uuid() != donorUUID) {
                 setStateFailWarn(
                     str::stream()
                     << "Cannot receive chunk "
@@ -1085,6 +1103,7 @@ void MigrationDestinationManager::_forgetPending(OperationContext* opCtx,
         return;  // no documents can have been moved in, so there is nothing to clean up.
     }
 
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     AutoGetCollection autoColl(opCtx, nss, MODE_IX, MODE_X);
     auto css = CollectionShardingState::get(opCtx, nss);
     auto metadata = css->getMetadata();

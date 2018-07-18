@@ -78,7 +78,7 @@ class FindAndModifyCmd : public BasicCommand {
 public:
     FindAndModifyCmd() : BasicCommand("findAndModify", "findandmodify") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
@@ -97,10 +97,11 @@ public:
     }
 
     Status explain(OperationContext* opCtx,
-                   const std::string& dbName,
-                   const BSONObj& cmdObj,
+                   const OpMsgRequest& request,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
+        std::string dbName = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
         auto routingInfo =
@@ -216,7 +217,7 @@ private:
         uassertStatusOK(response.status);
 
         const auto responseStatus = getStatusFromCommandResult(response.data);
-        if (ErrorCodes::isStaleShardingError(responseStatus.code())) {
+        if (ErrorCodes::isNeedRetargettingError(responseStatus.code())) {
             // Command code traps this exception and re-runs
             uassertStatusOK(responseStatus.withContext("findAndModify"));
         }

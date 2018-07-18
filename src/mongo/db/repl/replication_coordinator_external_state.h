@@ -38,13 +38,13 @@
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/stdx/functional.h"
+#include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
 class BSONObj;
 class OID;
-class OldThreadPool;
 class OperationContext;
 class ServiceContext;
 class Status;
@@ -97,11 +97,6 @@ public:
     virtual void stopDataReplication(OperationContext* opCtx) = 0;
 
     /**
-     * Starts the Master/Slave threads and sets up logOp
-     */
-    virtual void startMasterSlave(OperationContext* opCtx) = 0;
-
-    /**
      * Performs any necessary external state specific shutdown tasks, such as cleaning up
      * the threads it started.
      */
@@ -115,7 +110,7 @@ public:
     /**
      * Returns shared db worker thread pool for collection cloning.
      */
-    virtual OldThreadPool* getDbWorkThreadPool() const = 0;
+    virtual ThreadPool* getDbWorkThreadPool() const = 0;
 
     /**
      * Runs the repair database command on the "local" db, if the storage engine is MMapV1.
@@ -297,29 +292,22 @@ public:
                                           MultiApplier::ApplyOperationFn applyOperation) = 0;
 
     /**
-     * Used by multiApply() to writes operations to database during steady state replication.
-     */
-    virtual Status multiSyncApply(MultiApplier::OperationPtrs* ops) = 0;
-
-    /**
      * Used by multiApply() to writes operations to database during initial sync. `fetchCount` is a
      * pointer to a counter that is incremented every time we fetch a missing document.
+     * `workerMultikeyPathInfo` is a pointer to a list of objects tracking which indexes to set as
+     * multikey at the end of the batch.
      *
      */
-    virtual Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+    virtual Status multiInitialSyncApply(OperationContext* opCtx,
+                                         MultiApplier::OperationPtrs* ops,
                                          const HostAndPort& source,
-                                         AtomicUInt32* fetchCount) = 0;
+                                         AtomicUInt32* fetchCount,
+                                         WorkerMultikeyPathInfo* workerMultikeyPathInfo) = 0;
 
     /**
      * This function creates an oplog buffer of the type specified at server startup.
      */
     virtual std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(
-        OperationContext* opCtx) const = 0;
-
-    /**
-     * Creates an oplog buffer suitable for steady state replication.
-     */
-    virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(
         OperationContext* opCtx) const = 0;
 
     /**

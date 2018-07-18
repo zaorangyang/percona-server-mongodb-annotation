@@ -37,6 +37,7 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/net/message.h"
 
@@ -57,11 +58,11 @@ struct ClientCursorParams {
     ClientCursorParams(std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> planExecutor,
                        NamespaceString nss,
                        UserNameIterator authenticatedUsersIter,
-                       bool isReadCommitted,
+                       repl::ReadConcernLevel readConcernLevel,
                        BSONObj originatingCommandObj)
         : exec(std::move(planExecutor)),
           nss(std::move(nss)),
-          isReadCommitted(isReadCommitted),
+          readConcernLevel(readConcernLevel),
           queryOptions(exec->getCanonicalQuery()
                            ? exec->getCanonicalQuery()->getQueryRequest().getOptions()
                            : 0),
@@ -88,7 +89,7 @@ struct ClientCursorParams {
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
     const NamespaceString nss;
     std::vector<UserName> authenticatedUsers;
-    bool isReadCommitted = false;
+    const repl::ReadConcernLevel readConcernLevel;
     int queryOptions = 0;
     BSONObj originatingCommandObj;
 };
@@ -129,8 +130,12 @@ public:
         return _lsid;
     }
 
-    bool isReadCommitted() const {
-        return _isReadCommitted;
+    boost::optional<TxnNumber> getTxnNumber() const {
+        return _txnNumber;
+    }
+
+    repl::ReadConcernLevel getReadConcernLevel() const {
+        return _readConcernLevel;
     }
 
     /**
@@ -268,10 +273,10 @@ private:
     ~ClientCursor();
 
     /**
-     * Marks this cursor as killed, so any future uses will return an error status including
-     * 'reason'.
+     * Marks this cursor as killed, so any future uses will return 'killStatus'. It is an error to
+     * call this method with Status::OK.
      */
-    void markAsKilled(const std::string& reason);
+    void markAsKilled(Status killStatus);
 
     /**
      * Disposes this ClientCursor's PlanExecutor. Must be called before deleting a ClientCursor to
@@ -300,7 +305,10 @@ private:
     // A logical session id for this cursor, if it is running inside of a session.
     const boost::optional<LogicalSessionId> _lsid;
 
-    const bool _isReadCommitted = false;
+    // A transaction number for this cursor, if it was provided in the originating command.
+    const boost::optional<TxnNumber> _txnNumber;
+
+    const repl::ReadConcernLevel _readConcernLevel;
 
     CursorManager* _cursorManager;
 

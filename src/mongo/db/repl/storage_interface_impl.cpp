@@ -71,7 +71,6 @@
 #include "mongo/db/repl/collection_bulk_loader_impl.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/repl/rollback_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/assert_util.h"
@@ -398,6 +397,7 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
                                               const NamespaceString& nss,
                                               const CollectionOptions& options) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::createCollection", nss.ns(), [&] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetOrCreateDb databaseWriteGuard(opCtx, nss.db(), MODE_X);
         auto db = databaseWriteGuard.getDb();
         invariant(db);
@@ -420,6 +420,7 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
 
 Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
     return writeConflictRetry(opCtx, "StorageInterfaceImpl::dropCollection", nss.ns(), [&] {
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDB(opCtx, nss.db(), MODE_X);
         if (!autoDB.getDb()) {
             // Database does not exist - nothing to do.
@@ -429,10 +430,6 @@ Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const Names
         const auto status = autoDB.getDb()->dropCollectionEvenIfSystem(opCtx, nss);
         if (!status.isOK()) {
             return status;
-        }
-        if (nss.isDropPendingNamespace() && !opCtx->writesAreReplicated()) {
-            Timestamp ts = LogicalClock::get(opCtx)->getClusterTime().asTimestamp();
-            fassertStatusOK(50661, opCtx->recoveryUnit()->setTimestamp(ts));
         }
         wunit.commit();
         return Status::OK();
@@ -1008,10 +1005,6 @@ StatusWith<OptionalCollectionUUID> StorageInterfaceImpl::getCollectionUUID(
     return collection->uuid();
 }
 
-Status StorageInterfaceImpl::upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) {
-    return updateUUIDSchemaVersionNonReplicated(opCtx, true);
-}
-
 void StorageInterfaceImpl::setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) {
     serviceCtx->getGlobalStorageEngine()->setStableTimestamp(snapshotName);
 }
@@ -1021,8 +1014,17 @@ void StorageInterfaceImpl::setInitialDataTimestamp(ServiceContext* serviceCtx,
     serviceCtx->getGlobalStorageEngine()->setInitialDataTimestamp(snapshotName);
 }
 
-Status StorageInterfaceImpl::recoverToStableTimestamp(ServiceContext* serviceCtx) {
+StatusWith<Timestamp> StorageInterfaceImpl::recoverToStableTimestamp(ServiceContext* serviceCtx) {
     return serviceCtx->getGlobalStorageEngine()->recoverToStableTimestamp();
+}
+
+bool StorageInterfaceImpl::supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const {
+    return serviceCtx->getGlobalStorageEngine()->supportsRecoverToStableTimestamp();
+}
+
+boost::optional<Timestamp> StorageInterfaceImpl::getRecoveryTimestamp(
+    ServiceContext* serviceCtx) const {
+    return serviceCtx->getGlobalStorageEngine()->getRecoveryTimestamp();
 }
 
 Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {

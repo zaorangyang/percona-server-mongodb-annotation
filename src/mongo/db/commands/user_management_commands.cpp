@@ -64,14 +64,16 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/service_context.h"
-#include "mongo/platform/unordered_set.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
+#include "mongo/stdx/unordered_set.h"
+#include "mongo/util/icu.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/password_digest.h"
 #include "mongo/util/sequence_util.h"
 #include "mongo/util/time_support.h"
 
@@ -93,9 +95,10 @@ Status useDefaultCode(const Status& status, ErrorCodes::Error defaultCode) {
     return Status(defaultCode, status.reason());
 }
 
-BSONArray roleSetToBSONArray(const unordered_set<RoleName>& roles) {
+BSONArray roleSetToBSONArray(const stdx::unordered_set<RoleName>& roles) {
     BSONArrayBuilder rolesArrayBuilder;
-    for (unordered_set<RoleName>::const_iterator it = roles.begin(); it != roles.end(); ++it) {
+    for (stdx::unordered_set<RoleName>::const_iterator it = roles.begin(); it != roles.end();
+         ++it) {
         const RoleName& role = *it;
         rolesArrayBuilder.append(BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME
                                       << role.getRole()
@@ -142,7 +145,7 @@ Status privilegeVectorToBSONArray(const PrivilegeVector& privileges, BSONArray* 
 Status getCurrentUserRoles(OperationContext* opCtx,
                            AuthorizationManager* authzManager,
                            const UserName& userName,
-                           unordered_set<RoleName>* roles) {
+                           stdx::unordered_set<RoleName>* roles) {
     User* user;
     authzManager->invalidateUserByName(userName);  // Need to make sure cache entry is up to date
     Status status = authzManager->acquireUser(opCtx, userName, &user);
@@ -489,25 +492,36 @@ Status insertPrivilegeDocument(OperationContext* opCtx, const BSONObj& userObj) 
  * Updates the given user object with the given update modifier.
  */
 Status updatePrivilegeDocument(OperationContext* opCtx,
+                               const BSONObj& queryObj,
+                               const BSONObj& updateObj) {
+    // Minimum fields required for an update.
+    dassert(queryObj.hasField(AuthorizationManager::USER_NAME_FIELD_NAME));
+    dassert(queryObj.hasField(AuthorizationManager::USER_DB_FIELD_NAME));
+
+    const auto status = updateOneAuthzDocument(
+        opCtx, AuthorizationManager::usersCollectionNamespace, queryObj, updateObj, false);
+    if (status.code() == ErrorCodes::UnknownError) {
+        return {ErrorCodes::UserModificationFailed, status.reason()};
+    }
+    return status;
+}
+
+/**
+ * Convenience wrapper for above using only the UserName to match the original document.
+ * Clarifies NoMatchingDocument result to reflect the user not existing.
+ */
+Status updatePrivilegeDocument(OperationContext* opCtx,
                                const UserName& user,
                                const BSONObj& updateObj) {
-    Status status = updateOneAuthzDocument(opCtx,
-                                           AuthorizationManager::usersCollectionNamespace,
-                                           BSON(AuthorizationManager::USER_NAME_FIELD_NAME
-                                                << user.getUser()
-                                                << AuthorizationManager::USER_DB_FIELD_NAME
-                                                << user.getDB()),
-                                           updateObj,
-                                           false);
-    if (status.isOK()) {
-        return status;
-    }
+    const auto status = updatePrivilegeDocument(opCtx,
+                                                BSON(AuthorizationManager::USER_NAME_FIELD_NAME
+                                                     << user.getUser()
+                                                     << AuthorizationManager::USER_DB_FIELD_NAME
+                                                     << user.getDB()),
+                                                updateObj);
     if (status.code() == ErrorCodes::NoMatchingDocument) {
-        return Status(ErrorCodes::UserNotFound,
-                      str::stream() << "User " << user.getFullName() << " not found");
-    }
-    if (status.code() == ErrorCodes::UnknownError) {
-        return Status(ErrorCodes::UserModificationFailed, status.reason());
+        return {ErrorCodes::UserNotFound,
+                str::stream() << "User " << user.getFullName() << " not found"};
     }
     return status;
 }
@@ -604,6 +618,128 @@ Status requireReadableAuthSchema26Upgrade(OperationContext* opCtx,
     return Status::OK();
 }
 
+Status buildCredentials(BSONObjBuilder* builder, const auth::CreateOrUpdateUserArgs& args) {
+    if (!args.hasPassword) {
+        // Must be external user.
+        builder->append("external", true);
+        return Status::OK();
+    }
+
+    bool buildSCRAMSHA1 = false, buildSCRAMSHA256 = false;
+    if (args.mechanisms.empty()) {
+        buildSCRAMSHA1 = sequenceContains(saslGlobalParams.authenticationMechanisms, "SCRAM-SHA-1");
+        buildSCRAMSHA256 =
+            sequenceContains(saslGlobalParams.authenticationMechanisms, "SCRAM-SHA-256");
+    } else {
+        for (const auto& mech : args.mechanisms) {
+            if (mech == "SCRAM-SHA-1") {
+                buildSCRAMSHA1 = true;
+            } else if (mech == "SCRAM-SHA-256") {
+                buildSCRAMSHA256 = true;
+            } else {
+                return {ErrorCodes::BadValue,
+                        str::stream() << "Unknown auth mechanism '" << mech << "'"};
+            }
+
+            if (!sequenceContains(saslGlobalParams.authenticationMechanisms, mech)) {
+                return {ErrorCodes::BadValue,
+                        str::stream() << mech << " not supported in authMechanisms"};
+            }
+        }
+    }
+
+    if (buildSCRAMSHA1) {
+        // Add SCRAM-SHA-1 credentials.
+        std::string hashedPwd;
+        if (args.digestPassword) {
+            hashedPwd = createPasswordDigest(args.userName.getUser(), args.password);
+        } else {
+            hashedPwd = args.password;
+        }
+        auto sha1Cred = scram::Secrets<SHA1Block>::generateCredentials(
+            hashedPwd, saslGlobalParams.scramSHA1IterationCount.load());
+        builder->append("SCRAM-SHA-1", sha1Cred);
+    }
+
+    if (buildSCRAMSHA256) {
+        const auto swPreppedName = saslPrep(args.userName.getUser());
+        if (!swPreppedName.isOK() || (swPreppedName.getValue() != args.userName.getUser())) {
+            return {
+                ErrorCodes::BadValue,
+                "Username must be normalized according to SASLPREP rules when using SCRAM-SHA-256"};
+        }
+
+        // FCV check is deferred till this point so that the suitability checks can be performed
+        // regardless.
+        const auto fcv = serverGlobalParams.featureCompatibility.getVersion();
+        if (fcv < ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
+            buildSCRAMSHA256 = false;
+        }
+    }
+
+    if (buildSCRAMSHA256) {
+        if (!args.digestPassword) {
+            return {ErrorCodes::BadValue, "Use of SCRAM-SHA-256 requires undigested passwords"};
+        }
+        const auto swPwd = saslPrep(args.password);
+        if (!swPwd.isOK()) {
+            return swPwd.getStatus();
+        }
+        auto sha256Cred = scram::Secrets<SHA256Block>::generateCredentials(
+            swPwd.getValue(), saslGlobalParams.scramSHA256IterationCount.load());
+        builder->append("SCRAM-SHA-256", sha256Cred);
+    }
+
+    return Status::OK();
+}
+
+Status trimCredentials(OperationContext* opCtx,
+                       BSONObjBuilder* queryBuilder,
+                       BSONObjBuilder* unsetBuilder,
+                       const auth::CreateOrUpdateUserArgs& args) {
+    auto* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
+    BSONObj userObj;
+    const auto status = authzManager->getUserDescription(opCtx, args.userName, &userObj);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    const auto& credsElem = userObj["credentials"];
+    if (credsElem.eoo() || (credsElem.type() != Object)) {
+        return {ErrorCodes::UnsupportedFormat,
+                "Unable to trim credentials from a user document with no credentials"};
+    }
+
+    const auto& creds = credsElem.Obj();
+    queryBuilder->append("credentials", creds);
+
+    bool keepSCRAMSHA1 = false, keepSCRAMSHA256 = false;
+    for (const auto& mech : args.mechanisms) {
+        if (!creds.hasField(mech)) {
+            return {ErrorCodes::BadValue,
+                    "mechanisms field must be a subset of previously set mechanisms"};
+        }
+        if (mech == "SCRAM-SHA-1") {
+            keepSCRAMSHA1 = true;
+        } else if (mech == "SCRAM-SHA-256") {
+            keepSCRAMSHA256 = true;
+        }
+    }
+    if (!(keepSCRAMSHA1 || keepSCRAMSHA256)) {
+        return {ErrorCodes::BadValue,
+                "mechanisms field must contain at least one previously set known mechanism"};
+    }
+
+    if (!keepSCRAMSHA1) {
+        unsetBuilder->append("credentials.SCRAM-SHA-1", "");
+    }
+    if (!keepSCRAMSHA256) {
+        unsetBuilder->append("credentials.SCRAM-SHA-256", "");
+    }
+
+    return Status::OK();
+}
+
 }  // namespace
 
 
@@ -611,7 +747,7 @@ class CmdCreateUser : public BasicCommand {
 public:
     CmdCreateUser() : BasicCommand("createUser") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -644,7 +780,7 @@ public:
                 result, Status(ErrorCodes::BadValue, "Cannot create users in the local database"));
         }
 
-        if (!args.hasHashedPassword && args.userName.getDB() != "$external") {
+        if (!args.hasPassword && args.userName.getDB() != "$external") {
             return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::BadValue,
@@ -652,7 +788,7 @@ public:
                        " with '$external' as the user's source db"));
         }
 
-        if ((args.hasHashedPassword) && args.userName.getDB() == "$external") {
+        if ((args.hasPassword) && args.userName.getDB() == "$external") {
             return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::BadValue,
@@ -693,14 +829,9 @@ public:
         }
 
         BSONObjBuilder credentialsBuilder(userObjBuilder.subobjStart("credentials"));
-        if (!args.hasHashedPassword) {
-            // Must be an external user
-            credentialsBuilder.append("external", true);
-        } else {
-            // Add SCRAM credentials.
-            BSONObj scramCred = scram::SHA1Secrets::generateCredentials(
-                args.hashedPassword, saslGlobalParams.scramSHA1IterationCount.load());
-            credentialsBuilder.append("SCRAM-SHA-1", scramCred);
+        status = buildCredentials(&credentialsBuilder, args);
+        if (!status.isOK()) {
+            return CommandHelpers::appendCommandStatus(result, status);
         }
         credentialsBuilder.done();
 
@@ -740,7 +871,7 @@ public:
 
         audit::logCreateUser(Client::getCurrent(),
                              args.userName,
-                             args.hasHashedPassword,
+                             args.hasPassword,
                              args.hasCustomData ? &args.customData : NULL,
                              args.roles,
                              args.authenticationRestrictions);
@@ -758,7 +889,7 @@ class CmdUpdateUser : public BasicCommand {
 public:
     CmdUpdateUser() : BasicCommand("updateUser") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -786,15 +917,15 @@ public:
             return CommandHelpers::appendCommandStatus(result, status);
         }
 
-        if (!args.hasHashedPassword && !args.hasCustomData && !args.hasRoles &&
-            !args.authenticationRestrictions) {
+        if (!args.hasPassword && !args.hasCustomData && !args.hasRoles &&
+            !args.authenticationRestrictions && args.mechanisms.empty()) {
             return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::BadValue,
                        "Must specify at least one field to update in updateUser"));
         }
 
-        if (args.hasHashedPassword && args.userName.getDB() == "$external") {
+        if (args.hasPassword && args.userName.getDB() == "$external") {
             return CommandHelpers::appendCommandStatus(
                 result,
                 Status(ErrorCodes::BadValue,
@@ -802,17 +933,24 @@ public:
                        "database"));
         }
 
+        BSONObjBuilder queryBuilder;
+        queryBuilder.append(AuthorizationManager::USER_NAME_FIELD_NAME, args.userName.getUser());
+        queryBuilder.append(AuthorizationManager::USER_DB_FIELD_NAME, args.userName.getDB());
+
         BSONObjBuilder updateSetBuilder;
         BSONObjBuilder updateUnsetBuilder;
-        if (args.hasHashedPassword) {
+        if (args.hasPassword) {
             BSONObjBuilder credentialsBuilder(updateSetBuilder.subobjStart("credentials"));
-
-            // Add SCRAM credentials.
-            BSONObj scramCred = scram::SHA1Secrets::generateCredentials(
-                args.hashedPassword, saslGlobalParams.scramSHA1IterationCount.load());
-            credentialsBuilder.append("SCRAM-SHA-1", scramCred);
-
+            status = buildCredentials(&credentialsBuilder, args);
+            if (!status.isOK()) {
+                return CommandHelpers::appendCommandStatus(result, status);
+            }
             credentialsBuilder.done();
+        } else if (!args.mechanisms.empty()) {
+            status = trimCredentials(opCtx, &queryBuilder, &updateUnsetBuilder, args);
+            if (!status.isOK()) {
+                return CommandHelpers::appendCommandStatus(result, status);
+            }
         }
 
         if (args.hasCustomData) {
@@ -871,12 +1009,12 @@ public:
 
         audit::logUpdateUser(Client::getCurrent(),
                              args.userName,
-                             args.hasHashedPassword,
+                             args.hasPassword,
                              args.hasCustomData ? &args.customData : NULL,
                              args.hasRoles ? &args.roles : NULL,
                              args.authenticationRestrictions);
 
-        status = updatePrivilegeDocument(opCtx, args.userName, updateDocumentBuilder.done());
+        status = updatePrivilegeDocument(opCtx, queryBuilder.done(), updateDocumentBuilder.done());
         // Must invalidate even on bad status - what if the write succeeded but the GLE failed?
         authzManager->invalidateUserByName(args.userName);
         return CommandHelpers::appendCommandStatus(result, status);
@@ -892,7 +1030,7 @@ class CmdDropUser : public BasicCommand {
 public:
     CmdDropUser() : BasicCommand("dropUser") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -959,7 +1097,7 @@ class CmdDropAllUsersFromDatabase : public BasicCommand {
 public:
     CmdDropAllUsersFromDatabase() : BasicCommand("dropAllUsersFromDatabase") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -1015,7 +1153,7 @@ class CmdGrantRolesToUser : public BasicCommand {
 public:
     CmdGrantRolesToUser() : BasicCommand("grantRolesToUser") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -1055,7 +1193,7 @@ public:
         }
 
         UserName userName(userNameString, dbname);
-        unordered_set<RoleName> userRoles;
+        stdx::unordered_set<RoleName> userRoles;
         status = getCurrentUserRoles(opCtx, authzManager, userName, &userRoles);
         if (!status.isOK()) {
             return CommandHelpers::appendCommandStatus(result, status);
@@ -1087,7 +1225,7 @@ class CmdRevokeRolesFromUser : public BasicCommand {
 public:
     CmdRevokeRolesFromUser() : BasicCommand("revokeRolesFromUser") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -1127,7 +1265,7 @@ public:
         }
 
         UserName userName(userNameString, dbname);
-        unordered_set<RoleName> userRoles;
+        stdx::unordered_set<RoleName> userRoles;
         status = getCurrentUserRoles(opCtx, authzManager, userName, &userRoles);
         if (!status.isOK()) {
             return CommandHelpers::appendCommandStatus(result, status);
@@ -1157,7 +1295,7 @@ public:
 
 class CmdUsersInfo : public BasicCommand {
 public:
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kOptIn;
     }
 
@@ -1281,7 +1419,7 @@ class CmdCreateRole : public BasicCommand {
 public:
     CmdCreateRole() : BasicCommand("createRole") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -1402,7 +1540,7 @@ class CmdUpdateRole : public BasicCommand {
 public:
     CmdUpdateRole() : BasicCommand("updateRole") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -1519,7 +1657,7 @@ class CmdGrantPrivilegesToRole : public BasicCommand {
 public:
     CmdGrantPrivilegesToRole() : BasicCommand("grantPrivilegesToRole") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -1629,7 +1767,7 @@ class CmdRevokePrivilegesFromRole : public BasicCommand {
 public:
     CmdRevokePrivilegesFromRole() : BasicCommand("revokePrivilegesFromRole") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -1741,7 +1879,7 @@ class CmdGrantRolesToRole : public BasicCommand {
 public:
     CmdGrantRolesToRole() : BasicCommand("grantRolesToRole") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -1830,7 +1968,7 @@ class CmdRevokeRolesFromRole : public BasicCommand {
 public:
     CmdRevokeRolesFromRole() : BasicCommand("revokeRolesFromRole") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -1914,7 +2052,7 @@ class CmdDropRole : public BasicCommand {
 public:
     CmdDropRole() : BasicCommand("dropRole") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -2056,7 +2194,7 @@ class CmdDropAllRolesFromDatabase : public BasicCommand {
 public:
     CmdDropAllRolesFromDatabase() : BasicCommand("dropAllRolesFromDatabase") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -2187,7 +2325,7 @@ public:
 
 class CmdRolesInfo : public BasicCommand {
 public:
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kOptIn;
     }
 
@@ -2272,7 +2410,7 @@ public:
 
 class CmdInvalidateUserCache : public BasicCommand {
 public:
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
@@ -2309,7 +2447,7 @@ public:
 
 class CmdGetCacheGeneration : public BasicCommand {
 public:
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
@@ -2358,7 +2496,7 @@ class CmdMergeAuthzCollections : public BasicCommand {
 public:
     CmdMergeAuthzCollections() : BasicCommand("_mergeAuthzCollections") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -2423,17 +2561,19 @@ public:
             authenticationRestrictions = r.getValue();
         }
 
+        const bool hasPwd = userObj["credentials"].Obj().hasField("SCRAM-SHA-1") ||
+            userObj["credentials"].Obj().hasField("SCRAM-SHA-256");
         if (create) {
             audit::logCreateUser(Client::getCurrent(),
                                  userName,
-                                 userObj["credentials"].Obj().hasField("SCRAM-SHA-1"),
+                                 hasPwd,
                                  userObj.hasField("customData") ? &customData : NULL,
                                  roles,
                                  authenticationRestrictions);
         } else {
             audit::logUpdateUser(Client::getCurrent(),
                                  userName,
-                                 userObj["credentials"].Obj().hasField("SCRAM-SHA-1"),
+                                 hasPwd,
                                  userObj.hasField("customData") ? &customData : NULL,
                                  &roles,
                                  authenticationRestrictions);
@@ -2480,7 +2620,7 @@ public:
                         AuthorizationManager* authzManager,
                         StringData db,
                         bool update,
-                        unordered_set<UserName>* usersToDrop,
+                        stdx::unordered_set<UserName>* usersToDrop,
                         const BSONObj& userObj) {
         UserName userName = extractUserNameFromBSON(userObj);
         if (!db.empty() && userName.getDB() != db) {
@@ -2518,7 +2658,7 @@ public:
                         AuthorizationManager* authzManager,
                         StringData db,
                         bool update,
-                        unordered_set<RoleName>* rolesToDrop,
+                        stdx::unordered_set<RoleName>* rolesToDrop,
                         const BSONObj roleObj) {
         RoleName roleName = extractRoleNameFromBSON(roleObj);
         if (!db.empty() && roleName.getDB() != db) {
@@ -2563,7 +2703,7 @@ public:
         // collection with the users from the temp collection, without removing all
         // users at the beginning and thus potentially locking ourselves out by having
         // no users in the whole system for a time.
-        unordered_set<UserName> usersToDrop;
+        stdx::unordered_set<UserName> usersToDrop;
 
         if (drop) {
             // Create map of the users currently in the DB
@@ -2636,7 +2776,7 @@ public:
         // This is so that we can completely replace the system.roles
         // collection with the roles from the temp collection, without removing all
         // roles at the beginning and thus potentially locking ourselves out.
-        unordered_set<RoleName> rolesToDrop;
+        stdx::unordered_set<RoleName> rolesToDrop;
 
         if (drop) {
             // Create map of the roles currently in the DB
@@ -2674,7 +2814,7 @@ public:
 
         if (drop) {
             long long numRemoved;
-            for (unordered_set<RoleName>::iterator it = rolesToDrop.begin();
+            for (stdx::unordered_set<RoleName>::iterator it = rolesToDrop.begin();
                  it != rolesToDrop.end();
                  ++it) {
                 const RoleName& roleName = *it;

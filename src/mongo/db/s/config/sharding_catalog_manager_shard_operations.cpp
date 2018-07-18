@@ -43,9 +43,10 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/audit.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/feature_compatibility_version_command_parser.h"
+#include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -339,21 +340,15 @@ StatusWith<ShardType> ShardingCatalogManager::_validateHostAsShard(
                                                 << " as a shard");
     }
     if (serverGlobalParams.featureCompatibility.getVersion() >
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-        // If FCV 4.0, or upgrading to / downgrading from, wire version must be LATEST.
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo36) {
+        // If the cluster's FCV is 4.0, or upgrading to / downgrading from, the node being added
+        // must be a v4.0 binary.
         invariant(maxWireVersion == WireVersion::LATEST_WIRE_VERSION);
-    } else if (serverGlobalParams.featureCompatibility.getVersion() >
-                   ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34 &&
-               serverGlobalParams.featureCompatibility.getVersion() <=
-                   ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-        // If FCV 3.6, or upgrading to / downgrading from, wire version must be v3.6
-        // LATEST_WIRE_VERSION or greater.
-        invariant(maxWireVersion >= WireVersion::LATEST_WIRE_VERSION - 1);
     } else {
-        // If FCV 3.4, wire version cannot be less than v3.4 LATEST_WIRE_VERSION.
+        // If the cluster's FCV is 3.6, the node being added must be a v3.6 or v4.0 binary.
         invariant(serverGlobalParams.featureCompatibility.getVersion() ==
-                  ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34);
-        invariant(maxWireVersion >= WireVersion::LATEST_WIRE_VERSION - 2);
+                  ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo36);
+        invariant(maxWireVersion >= WireVersion::LATEST_WIRE_VERSION - 1);
     }
 
     // Check whether there is a master. If there isn't, the replica set may not have been
@@ -659,18 +654,29 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
         return batchResponseStatus;
     }
 
-    // The featureCompatibilityVersion should be the same throughout the cluster. We don't
-    // explicitly send writeConcern majority to the added shard, because a 3.4 mongod will reject
-    // it (setFCV did not support writeConcern until 3.6), and a 3.6 mongod will still default to
-    // majority writeConcern.
+
+    // Since addShard runs under the fcvLock, it is guaranteed the fcv state won't change, but it's
+    // possible an earlier setFCV failed partway, so we handle all possible fcv states. Note, if
+    // the state is upgrading (downgrading), a user cannot switch to downgrading (upgrading) without
+    // first finishing the upgrade (downgrade).
     //
-    // TODO SERVER-32045: propagate the user's writeConcern
-    auto versionResponse = _runCommandForAddShard(
-        opCtx,
-        targeter.get(),
-        "admin",
-        BSON(FeatureCompatibilityVersion::kCommandName << FeatureCompatibilityVersion::toString(
-                 serverGlobalParams.featureCompatibility.getVersion())));
+    // Note, we don't explicitly send writeConcern majority to the added shard, because a 3.4 mongod
+    // will reject it (setFCV did not support writeConcern until 3.6), and a 3.6 mongod will still
+    // default to majority writeConcern.
+    // TODO SERVER-32045: propagate the user's writeConcern.
+    BSONObj setFCVCmd;
+    switch (serverGlobalParams.featureCompatibility.getVersion()) {
+        case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40:
+        case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40:
+            setFCVCmd = BSON(FeatureCompatibilityVersionCommandParser::kCommandName
+                             << FeatureCompatibilityVersionParser::kVersion40);
+            break;
+        default:
+            setFCVCmd = BSON(FeatureCompatibilityVersionCommandParser::kCommandName
+                             << FeatureCompatibilityVersionParser::kVersion36);
+            break;
+    }
+    auto versionResponse = _runCommandForAddShard(opCtx, targeter.get(), "admin", setFCVCmd);
     if (!versionResponse.isOK()) {
         return versionResponse.getStatus();
     }

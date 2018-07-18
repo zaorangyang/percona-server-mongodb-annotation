@@ -123,7 +123,7 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
     std::string help() const override {
@@ -211,10 +211,8 @@ public:
 
             return CommandHelpers::appendCommandStatus(
                 result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream() << "Executor error during "
-                                     << "StageDebug command: "
-                                     << WorkingSetCommon::toStatusString(obj)));
+                WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                    "Executor error during StageDebug command"));
         }
 
         return true;

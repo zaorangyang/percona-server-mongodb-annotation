@@ -67,7 +67,7 @@ class ValidateCmd : public BasicCommand {
 public:
     ValidateCmd() : BasicCommand("validate") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
@@ -207,26 +207,11 @@ public:
         bool skipUUIDCheck = nss.coll() == "system.indexes" || nss.coll() == "system.namespaces";
 
         if (!skipUUIDCheck) {
-            ServerGlobalParams::FeatureCompatibility::Version version =
-                serverGlobalParams.featureCompatibility.getVersion();
-
-            if (version >= ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36) {
-                // All collections must have a UUID.
-                if (!opts.uuid) {
-                    results.errors.push_back(str::stream() << "UUID missing on collection "
-                                                           << nss.ns()
-                                                           << " but SchemaVersion=3.6");
-                    results.valid = false;
-                }
-            } else if (version ==
-                       ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34) {
-                // All collections must not have a UUID.
-                if (opts.uuid) {
-                    results.errors.push_back(str::stream() << "UUID present in collection "
-                                                           << nss.ns()
-                                                           << " but SchemaVersion=3.4");
-                    results.valid = false;
-                }
+            // All collections must have a UUID.
+            if (!opts.uuid) {
+                results.errors.push_back(str::stream() << "UUID missing on collection " << nss.ns()
+                                                       << " but SchemaVersion=3.6");
+                results.valid = false;
             }
         }
 

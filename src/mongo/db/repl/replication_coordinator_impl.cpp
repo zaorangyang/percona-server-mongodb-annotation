@@ -303,9 +303,6 @@ ReplicationCoordinator::Mode getReplicationModeFromSettings(const ReplSettings& 
     if (settings.usingReplSets()) {
         return ReplicationCoordinator::modeReplSet;
     }
-    if (settings.isMaster() || settings.isSlave()) {
-        return ReplicationCoordinator::modeMasterSlave;
-    }
     return ReplicationCoordinator::modeNone;
 }
 
@@ -347,7 +344,7 @@ ReplicationCoordinatorImpl::ReplicationCoordinatorImpl(
       _rsConfigState(kConfigPreStart),
       _selfIndex(-1),
       _sleptLastElection(false),
-      _canAcceptNonLocalWrites(!(settings.usingReplSets() || settings.isSlave())),
+      _canAcceptNonLocalWrites(!settings.usingReplSets()),
       _canServeNonLocalReads(0U),
       _replicationProcess(replicationProcess),
       _storage(storage),
@@ -449,6 +446,10 @@ void ReplicationCoordinatorImpl::appendConnectionStats(executor::ConnectionPoolS
 }
 
 bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) {
+    // Create necessary replication collections to guarantee that if a checkpoint sees data after
+    // initial sync has completed, it also sees these collections.
+    fassert(50708, _replicationProcess->getConsistencyMarkers()->createInternalCollections(opCtx));
+
     _replicationProcess->getConsistencyMarkers()->initializeMinValidDocument(opCtx);
 
     StatusWith<LastVote> lastVote = _externalState->loadLocalLastVoteDocument(opCtx);
@@ -466,14 +467,14 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
     }
 
     // Check that we have a local Rollback ID. If we do not have one, create one.
-    auto rbid = _replicationProcess->getRollbackID(opCtx);
-    if (!rbid.isOK()) {
-        if (rbid.getStatus() == ErrorCodes::NamespaceNotFound) {
+    auto status = _replicationProcess->refreshRollbackID(opCtx);
+    if (!status.isOK()) {
+        if (status == ErrorCodes::NamespaceNotFound) {
             log() << "Did not find local Rollback ID document at startup. Creating one.";
             auto initializingStatus = _replicationProcess->initializeRollbackID(opCtx);
-            fassertStatusOK(40424, initializingStatus);
+            fassert(40424, initializingStatus);
         } else {
-            severe() << "Error loading local Rollback ID document at startup; " << rbid.getStatus();
+            severe() << "Error loading local Rollback ID document at startup; " << status;
             fassertFailedNoTrace(40428);
         }
     }
@@ -485,7 +486,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
         return true;
     }
     ReplSetConfig localConfig;
-    Status status = localConfig.initialize(cfg.getValue());
+    status = localConfig.initialize(cfg.getValue());
     if (!status.isOK()) {
         error() << "Locally stored replica set configuration does not parse; See "
                    "http://www.mongodb.org/dochub/core/recover-replica-set-from-invalid-config "
@@ -495,7 +496,8 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
     }
 
     // Read the last op from the oplog after cleaning up any partially applied batches.
-    _replicationProcess->getReplicationRecovery()->recoverFromOplog(opCtx);
+    const auto stableTimestamp = boost::none;
+    _replicationProcess->getReplicationRecovery()->recoverFromOplog(opCtx, stableTimestamp);
     auto lastOpTimeStatus = _externalState->loadLastOpTime(opCtx);
 
     // Use a callback here, because _finishLoadLocalConfig calls isself() which requires
@@ -508,7 +510,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
     if (handle == ErrorCodes::ShutdownInProgress) {
         handle = CallbackHandle{};
     }
-    fassertStatusOK(40446, handle);
+    fassert(40446, handle);
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     _finishLoadLocalConfigCbh = std::move(handle.getValue());
 
@@ -731,6 +733,7 @@ void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
         _setConfigState_inlock(kConfigReplicationDisabled);
         return;
     }
+    invariant(_settings.usingReplSets());
 
     {
         OID rid = _externalState->ensureMe(opCtx);
@@ -740,13 +743,6 @@ void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
         _setConfigState_inlock(kConfigStartingUp);
         _myRID = rid;
         _topCoord->setMyRid(rid);
-    }
-
-    if (!_settings.usingReplSets()) {
-        // Must be Master/Slave
-        invariant(_settings.isMaster() || _settings.isSlave());
-        _externalState->startMasterSlave(opCtx);
-        return;
     }
 
     _replExecutor->startup();
@@ -1160,13 +1156,6 @@ OpTime ReplicationCoordinatorImpl::getMyLastDurableOpTime() const {
 
 Status ReplicationCoordinatorImpl::_validateReadConcern(OperationContext* opCtx,
                                                         const ReadConcernArgs& readConcern) {
-    // We should never wait for replication if we are holding any locks, because this can
-    // potentially block for long time while doing network activity.
-    if (opCtx->lockState()->isLocked()) {
-        return {ErrorCodes::IllegalOperation,
-                "Waiting for replication not allowed while holding a lock"};
-    }
-
     if (readConcern.getArgsAfterClusterTime() &&
         readConcern.getLevel() != ReadConcernLevel::kMajorityReadConcern &&
         readConcern.getLevel() != ReadConcernLevel::kLocalReadConcern &&
@@ -1211,6 +1200,13 @@ Status ReplicationCoordinatorImpl::waitUntilOpTimeForRead(OperationContext* opCt
     if (!readConcern.getArgsAfterClusterTime() && !readConcern.getArgsOpTime() &&
         !readConcern.getArgsAtClusterTime()) {
         return Status::OK();
+    }
+
+    // We should never wait for replication if we are holding any locks, because this can
+    // potentially block for long time while doing network activity.
+    if (opCtx->lockState()->isLocked()) {
+        return {ErrorCodes::IllegalOperation,
+                "Waiting for replication not allowed while holding a lock"};
     }
 
     return waitUntilOpTimeForReadUntil(opCtx, readConcern, boost::none);
@@ -1580,6 +1576,7 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     const Date_t stepDownUntil = startTime + stepdownTime;
     const Date_t waitUntil = startTime + waitTime;
 
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     if (!getMemberState().primary()) {
         // Note this check is inherently racy - it's always possible for the node to
         // stepdown from some other path before we acquire the global exclusive lock.  This check
@@ -1614,6 +1611,8 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     status = _topCoord->prepareForStepDownAttempt();
     if (!status.isOK()) {
         // This will cause us to fail if we're already in the process of stepping down.
+        // It is also possible to get here even if we're done stepping down via another path,
+        // and this will also elicit a failure from this call.
         return status;
     }
 
@@ -1744,29 +1743,13 @@ void ReplicationCoordinatorImpl::_handleTimePassing(
 }
 
 bool ReplicationCoordinatorImpl::isMasterForReportingPurposes() {
-    if (_settings.usingReplSets()) {
-        stdx::lock_guard<stdx::mutex> lock(_mutex);
-        if (getReplicationMode() == modeReplSet && _getMemberState_inlock().primary()) {
-            return true;
-        }
-        return false;
-    }
-
-    if (!_settings.isSlave())
-        return true;
-
-
-    // TODO(dannenberg) replAllDead is bad and should be removed when master slave is removed
-    if (replAllDead) {
-        return false;
-    }
-
-    if (_settings.isMaster()) {
-        // if running with --master --slave, allow.
+    if (!_settings.usingReplSets()) {
         return true;
     }
 
-    return false;
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    invariant(getReplicationMode() == modeReplSet);
+    return _getMemberState_inlock().primary();
 }
 
 bool ReplicationCoordinatorImpl::canAcceptWritesForDatabase(OperationContext* opCtx,
@@ -1778,20 +1761,18 @@ bool ReplicationCoordinatorImpl::canAcceptWritesForDatabase(OperationContext* op
 
 bool ReplicationCoordinatorImpl::canAcceptWritesForDatabase_UNSAFE(OperationContext* opCtx,
                                                                    StringData dbName) {
-    // _canAcceptNonLocalWrites is always true for standalone nodes, always false for nodes
-    // started with --slave, and adjusted based on primary+drain state in replica sets.
+    // _canAcceptNonLocalWrites is always true for standalone nodes, and adjusted based on
+    // primary+drain state in replica sets.
     //
-    // That is, stand-alone nodes, non-slave nodes and drained replica set primaries can always
-    // accept writes.  Similarly, writes are always permitted to the "local" database.  Finally,
-    // in the event that a node is started with --slave and --master, we allow writes unless the
-    // master/slave system has set the replAllDead flag.
+    // Stand-alone nodes and drained replica set primaries can always accept writes.  Writes are
+    // always permitted to the "local" database.
     if (_canAcceptNonLocalWrites || alwaysAllowNonLocalWrites(*opCtx)) {
         return true;
     }
     if (dbName == kLocalDB) {
         return true;
     }
-    return !replAllDead && _settings.isMaster();
+    return false;
 }
 
 bool ReplicationCoordinatorImpl::canAcceptWritesFor(OperationContext* opCtx,
@@ -2528,10 +2509,11 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator_inlock(
     }
 
     log() << "transition to " << newState << " from " << _memberState << rsLog;
-    // Initializes the featureCompatibilityVersion to the default value, because arbiters do not
-    // receive the replicated version.
+    // Initializes the featureCompatibilityVersion to the latest value, because arbiters do not
+    // receive the replicated version. This is to avoid bugs like SERVER-32639.
     if (newState.arbiter()) {
-        serverGlobalParams.featureCompatibility.reset();
+        serverGlobalParams.featureCompatibility.setVersion(
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
     }
 
     _memberState = newState;
@@ -3118,9 +3100,10 @@ void ReplicationCoordinatorImpl::_setStableTimestampForStorage_inlock() {
         if (!testingSnapshotBehaviorInIsolation) {
             // Update committed snapshot and wake up any threads waiting on read concern or
             // write concern.
-            _updateCommittedSnapshot_inlock(stableOpTime.get());
-            // Update the stable timestamp for the storage engine.
-            _storage->setStableTimestamp(getServiceContext(), stableOpTime->getTimestamp());
+            if (_updateCommittedSnapshot_inlock(stableOpTime.get())) {
+                // Update the stable timestamp for the storage engine.
+                _storage->setStableTimestamp(getServiceContext(), stableOpTime->getTimestamp());
+            }
         }
         _cleanupStableOpTimeCandidates(&_stableOpTimeCandidates, stableOpTime.get());
     }
@@ -3179,8 +3162,7 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
     return Status::OK();
 }
 
-void ReplicationCoordinatorImpl::prepareReplMetadata(OperationContext* opCtx,
-                                                     const BSONObj& metadataRequestObj,
+void ReplicationCoordinatorImpl::prepareReplMetadata(const BSONObj& metadataRequestObj,
                                                      const OpTime& lastOpTimeFromClient,
                                                      BSONObjBuilder* builder) const {
 
@@ -3194,7 +3176,7 @@ void ReplicationCoordinatorImpl::prepareReplMetadata(OperationContext* opCtx,
     // Avoid retrieving Rollback ID if we do not need it for _prepareOplogQueryMetadata_inlock().
     int rbid = -1;
     if (hasOplogQueryMetadata) {
-        rbid = fassertStatusOK(40427, _replicationProcess->getRollbackID(opCtx));
+        rbid = _replicationProcess->getRollbackID();
         invariant(-1 != rbid);
     }
 
@@ -3367,8 +3349,10 @@ Timestamp ReplicationCoordinatorImpl::getMinimumVisibleSnapshot(OperationContext
     Timestamp reservedName;
     if (getReplicationMode() == Mode::modeReplSet) {
         invariant(opCtx->lockState()->isLocked());
-        if (getMemberState().primary()) {
-            // Use the current optime on the node, for primary nodes.
+        if (getMemberState().primary() || opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
+            // Use the current optime on the node, for primary nodes. Additionally, completion of
+            // background index builds on secondaries will not have a `commit time` and must also
+            // use the current optime.
             reservedName = LogicalClock::get(getServiceContext())->getClusterTime().asTimestamp();
         } else {
             // This function is only called when applying command operations on secondaries.
@@ -3398,17 +3382,17 @@ size_t ReplicationCoordinatorImpl::getNumUncommittedSnapshots() {
 
 MONGO_FP_DECLARE(disableSnapshotting);
 
-void ReplicationCoordinatorImpl::_updateCommittedSnapshot_inlock(
+bool ReplicationCoordinatorImpl::_updateCommittedSnapshot_inlock(
     const OpTime& newCommittedSnapshot) {
     if (testingSnapshotBehaviorInIsolation) {
-        return;
+        return false;
     }
 
     // If we are in ROLLBACK state, do not set any new _currentCommittedSnapshot, as it will be
     // cleared at the end of rollback anyway.
     if (_memberState.rollback()) {
         log() << "Not updating committed snapshot because we are in rollback";
-        return;
+        return false;
     }
     invariant(!newCommittedSnapshot.isNull());
 
@@ -3423,7 +3407,7 @@ void ReplicationCoordinatorImpl::_updateCommittedSnapshot_inlock(
         invariant(newCommittedSnapshot >= _currentCommittedSnapshot);
     }
     if (MONGO_FAIL_POINT(disableSnapshotting))
-        return;
+        return false;
     _currentCommittedSnapshot = newCommittedSnapshot;
     _currentCommittedSnapshotCond.notify_all();
 
@@ -3431,6 +3415,7 @@ void ReplicationCoordinatorImpl::_updateCommittedSnapshot_inlock(
 
     // Wake up any threads waiting for read concern or write concern.
     _wakeReadyWaiters_inlock();
+    return true;
 }
 
 void ReplicationCoordinatorImpl::dropAllSnapshots() {
@@ -3480,7 +3465,7 @@ CallbackHandle ReplicationCoordinatorImpl::_scheduleWorkAt(Date_t when, const Ca
     if (cbh == ErrorCodes::ShutdownInProgress) {
         return {};
     }
-    return fassertStatusOK(28800, cbh);
+    return fassert(28800, cbh);
 }
 
 EventHandle ReplicationCoordinatorImpl::_makeEvent() {

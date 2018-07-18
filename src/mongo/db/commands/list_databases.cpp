@@ -31,8 +31,8 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/matcher/expression.h"
@@ -57,7 +57,7 @@ intmax_t dbSize(const string& database);
 
 class CmdListDatabases : public BasicCommand {
 public:
-    AllowedOnSecondary secondaryAllowed() const final {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kOptIn;
     }
     bool adminOnly() const final {

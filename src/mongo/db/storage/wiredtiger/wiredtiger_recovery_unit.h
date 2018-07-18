@@ -39,6 +39,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/util/timer.h"
@@ -70,11 +71,14 @@ public:
     void registerChange(Change* change) override;
 
     void abandonSnapshot() override;
-    void prepareSnapshot() override;
+    void preallocateSnapshot() override;
 
-    Status setReadFromMajorityCommittedSnapshot() override;
+    Status obtainMajorityCommittedSnapshot() override;
+
     bool isReadingFromMajorityCommittedSnapshot() const override {
-        return _readFromMajorityCommittedSnapshot;
+        return _replicationMode == repl::ReplicationCoordinator::modeReplSet &&
+            (_readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern ||
+             _readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern);
     }
 
     boost::optional<Timestamp> getMajorityCommittedSnapshot() const override;
@@ -127,14 +131,6 @@ public:
 
     static void appendGlobalStats(BSONObjBuilder& b);
 
-    /**
-     * Prepares this RU to be the basis for a named snapshot.
-     *
-     * Begins a WT transaction, and invariants if we are already in one.
-     * Bans being in a WriteUnitOfWork until the next call to abandonSnapshot().
-     */
-    void prepareForCreateSnapshot(OperationContext* opCtx);
-
 private:
     void _abort();
     void _commit();
@@ -154,7 +150,6 @@ private:
     bool _isTimestamped = false;
     Timestamp _commitTimestamp;
     uint64_t _mySnapshotId;
-    bool _readFromMajorityCommittedSnapshot = false;
     Timestamp _majorityCommittedSnapshot;
     Timestamp _readAtTimestamp;
     std::unique_ptr<Timer> _timer;

@@ -36,7 +36,6 @@
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/executor/connection_pool_stats.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -54,7 +53,7 @@ public:
         return "stats about connections between servers in a replica set or sharded cluster.";
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
@@ -127,7 +126,7 @@ public:
         return false;
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 

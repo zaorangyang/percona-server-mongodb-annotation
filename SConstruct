@@ -96,6 +96,14 @@ add_option('prefix',
     help='installation prefix',
 )
 
+add_option('install-mode',
+    choices=['legacy', 'hygienic'],
+    default='legacy',
+    help='select type of installation',
+    nargs=1,
+    type='choice',
+)
+
 add_option('nostrip',
     help='do not strip installed binaries',
     nargs=0,
@@ -149,6 +157,7 @@ add_option('ssl-provider',
 
 add_option('mmapv1',
     choices=['auto', 'on', 'off'],
+    const='on',
     default='auto',
     help='Enable MMapV1',
     nargs='?',
@@ -173,6 +182,15 @@ add_option('inmemory',
     type='choice',
 )
 
+add_option('mobile-se',
+    choices=['on', 'off'],
+    const='on',
+    default='off',
+    help='Enable Mobile Storage Engine',
+    nargs='?',
+    type='choice',
+)
+
 add_option('audit',
     help='Enable auditing',
     nargs=0,
@@ -193,7 +211,6 @@ add_option('js-engine',
 
 add_option('server-js',
     choices=['on', 'off'],
-    const='on',
     default='on',
     help='Build mongod without JavaScript support',
     type='choice',
@@ -277,15 +294,6 @@ add_option('gcov',
     nargs=0,
 )
 
-add_option('smokedbprefix',
-    help='prefix to dbpath et al. for smoke tests',
-)
-
-add_option('smokeauth',
-    help='run smoke tests with --auth',
-    nargs=0,
-)
-
 add_option('use-sasl-client',
     help='Support SASL authentication in the client library',
     nargs=0,
@@ -337,6 +345,11 @@ add_option('use-system-google-benchmark',
 
 add_option('use-system-zlib',
     help='use system version of zlib library',
+    nargs=0,
+)
+
+add_option('use-system-sqlite',
+    help='use system version of sqlite library',
     nargs=0,
 )
 
@@ -503,6 +516,13 @@ add_option('git-decider',
 add_option('android-toolchain-path',
     default=None,
     help="Android NDK standalone toolchain path. Required when using --variables-files=etc/scons/android_ndk.vars",
+)
+
+add_option('msvc-debugging-format',
+    choices=["codeview", "pdb"],
+    default="codeview",
+    help='Debugging format in debug builds using msvc. Codeview (/Z7) or Program database (/Zi). Default is codeview.',
+    type='choice',
 )
 
 try:
@@ -1085,6 +1105,7 @@ os_macros = {
     # the above declarations since we will never target them with anything other than XCode 8.
     "macOS": "defined(__APPLE__) && (TARGET_OS_OSX || (TARGET_OS_MAC && !TARGET_OS_IPHONE))",
     "linux": "defined(__linux__)",
+    "android": "defined(__ANDROID__)",
 }
 
 def CheckForOS(context, which_os):
@@ -1204,8 +1225,10 @@ env['TARGET_OS_FAMILY'] = 'posix' if env.TargetOSIs('posix') else env.GetTargetO
 # options for some strange reason in SCons. Instead, we store this
 # option as a new variable in the environment.
 if get_option('allocator') == "auto":
+    # using an allocator besides system on android would require either fixing or disabling
+    # gperftools on android
     if env.TargetOSIs('windows') or \
-       env.TargetOSIs('linux'):
+       env.TargetOSIs('linux') and not env.TargetOSIs('android'):
         env['MONGO_ALLOCATOR'] = "tcmalloc"
     else:
         env['MONGO_ALLOCATOR'] = "system"
@@ -1477,7 +1500,9 @@ else:
     env.AppendUnique( CPPDEFINES=[ 'NDEBUG' ] )
 
 if env.TargetOSIs('linux'):
-    env.Append( LIBS=['m',"resolv"] )
+    env.Append( LIBS=["m"] )
+    if not env.TargetOSIs('android'):
+        env.Append( LIBS=["resolv"] )
 
 elif env.TargetOSIs('solaris'):
      env.Append( LIBS=["socket","resolv","lgrp"] )
@@ -1578,10 +1603,14 @@ elif env.TargetOSIs('windows'):
     # this would be for pre-compiled headers, could play with it later
     #env.Append( CCFLAGS=['/Yu"pch.h"'] )
 
-    # docs say don't use /FD from command line (minimal rebuild)
-    # /Gy function level linking (implicit when using /Z7)
-    # /Z7 debug info goes into each individual .obj file -- no .pdb created
-    env.Append( CCFLAGS= ["/Z7", "/errorReport:none"] )
+    # Don't send error reports in case of internal compiler error
+    env.Append( CCFLAGS= ["/errorReport:none"] ) 
+
+    # Select debugging format. /Zi gives faster links but seem to use more memory
+    if get_option('msvc-debugging-format') == "codeview":
+        env['CCPDBFLAGS'] = "/Z7"
+    elif get_option('msvc-debugging-format') == "pdb":
+        env['CCPDBFLAGS'] = '/Zi /Fd${TARGET}.pdb'
 
     # /DEBUG will tell the linker to create a .pdb file
     # which WinDbg and Visual Studio will use to resolve
@@ -1656,6 +1685,7 @@ elif env.TargetOSIs('windows'):
             'version.lib',
             'winmm.lib',
             'ws2_32.lib',
+            'secur32.lib',
         ],
     )
 
@@ -1759,6 +1789,10 @@ if get_option('inmemory') == 'on':
     inmemory = True
     if not wiredtiger:
         env.FatalError("InMemory engine requires WiredTiger to build")
+
+mobile_se = False
+if get_option('mobile-se') == 'on':
+    mobile_se = True
 
 if env['TARGET_ARCH'] == 'i386':
     # If we are using GCC or clang to target 32 bit, set the ISA minimum to 'nocona',
@@ -2895,8 +2929,10 @@ def doConfigure(myenv):
 
     if ssl_provider == 'native':
         if conf.env.TargetOSIs('windows'):
-            # TODO: Implement native crypto for windows
-            ssl_provider = 'openssl'
+            ssl_provider = 'windows'
+            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "SSL_PROVIDER_WINDOWS")
+            conf.env.Append( MONGO_CRYPTO=["windows"] )
+
         elif conf.env.TargetOSIs('darwin', 'macOS'):
             conf.env.Append( MONGO_CRYPTO=["apple"] )
             if has_option("ssl"):
@@ -2908,6 +2944,8 @@ def doConfigure(myenv):
         if has_option("ssl"):
             checkOpenSSL(conf)
             # Working OpenSSL available, use it.
+            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "SSL_PROVIDER_OPENSSL")
+
             conf.env.Append( MONGO_CRYPTO=["openssl"] )
         else:
             # If we don't need an SSL build, we can get by with TomCrypt.
@@ -2956,6 +2994,11 @@ def doConfigure(myenv):
         if not conf.CheckCXXHeader( "wiredtiger.h" ):
             myenv.ConfError("Cannot find wiredtiger headers")
         conf.FindSysLibDep("wiredtiger", ["wiredtiger"])
+
+    if use_system_version_of_library("sqlite"):
+        if not conf.CheckCXXHeader( "sqlite3.h" ):
+            myenv.ConfError("Cannot find sqlite headers")
+        conf.FindSysLibDep("sqlite", ["sqlite3"])
 
     conf.env.Append(
         CPPDEFINES=[
@@ -3140,6 +3183,33 @@ def doConfigure(myenv):
 
 env = doConfigure( env )
 
+# TODO: Later, this should live somewhere more graceful.
+if get_option('install-mode') == 'hygienic':
+    env.Tool('auto_install_binaries')
+    if env['PLATFORM'] == 'posix':
+        env.AppendUnique(
+            RPATH=[
+                env.Literal('\\$$ORIGIN/../lib')
+            ],
+            LINKFLAGS=[
+                '-Wl,-z,origin',
+                '-Wl,--enable-new-dtags',
+            ],
+            SHLINKFLAGS=[
+                # -h works for both the sun linker and the gnu linker.
+                "-Wl,-h,${TARGET.file}",
+            ]
+        )
+    elif env['PLATFORM'] == 'darwin':
+        env.AppendUnique(
+            LINKFLAGS=[
+                '-Wl,-rpath,@loader_path/../lib'
+            ],
+            SHLINKFLAGS=[
+                "-Wl,-install_name,@loader_path/../lib/${TARGET.file}",
+            ],
+        )
+
 # Now that we are done with configure checks, enable icecream, if available.
 env.Tool('icecream')
 
@@ -3270,6 +3340,7 @@ Export('module_sconscripts')
 Export("debugBuild optBuild")
 Export("wiredtiger")
 Export("mmapv1")
+Export("mobile_se")
 Export("endian")
 Export("inmemory")
 Export("ssl_provider")
@@ -3314,7 +3385,7 @@ env.SConscript(
     variant_dir='$BUILD_DIR',
 )
 
-all = env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests'])
+all = env.Alias('all', ['core', 'tools', 'dbtest', 'unittests', 'integration_tests', 'benchmarks'])
 
 # run the Dagger tool if it's installed
 if should_dagger:

@@ -35,13 +35,8 @@
 #include <string>
 #include <vector>
 
-#include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -76,7 +71,7 @@ public:
         return "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kOptIn;
     }
 
@@ -98,30 +93,43 @@ public:
         return FindCommon::kInitReplyBufferSize;
     }
 
-    void addRequiredPrivileges(const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               std::vector<Privilege>* out) const override {
-        ActionSet actions;
-        actions.addAction(ActionType::find);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj) const override {
+        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+
+        if (!authSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+
+        const auto hasTerm = false;
+        return authSession->checkAuthForFind(
+            AutoGetCollection::resolveNamespaceStringOrUUID(
+                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+            hasTerm);
     }
 
     Status explain(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
+                   const OpMsgRequest& request,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        std::string dbname = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
+        // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
+        // of a view, the locks need to be released.
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        ctx.emplace(opCtx,
+                    CommandHelpers::parseNsOrUUID(dbname, cmdObj),
+                    AutoGetCollection::ViewMode::kViewsPermitted);
+        const auto nss = ctx->getNss();
 
         const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
         auto parsedDistinct =
             uassertStatusOK(ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, true));
 
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
-        Collection* collection = ctx.getCollection();
-
-        if (ctx.getView()) {
-            ctx.releaseLocksForView();
+        if (ctx->getView()) {
+            // Relinquish locks. The aggregation command will re-acquire them.
+            ctx.reset();
 
             auto viewAggregation = parsedDistinct.asAggregationCommand();
             if (!viewAggregation.isOK()) {
@@ -138,6 +146,8 @@ public:
                 opCtx, nss, viewAggRequest.getValue(), viewAggregation.getValue(), *out);
         }
 
+        Collection* const collection = ctx->getCollection();
+
         auto executor = uassertStatusOK(getExecutorDistinct(
             opCtx, collection, nss.ns(), &parsedDistinct, PlanExecutor::YIELD_AUTO));
 
@@ -149,17 +159,21 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
+        // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
+        // of a view, the locks need to be released.
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        ctx.emplace(opCtx,
+                    CommandHelpers::parseNsOrUUID(dbname, cmdObj),
+                    AutoGetCollection::ViewMode::kViewsPermitted);
+        const auto& nss = ctx->getNss();
 
         const ExtensionsCallbackReal extensionsCallback(opCtx, &nss);
         auto parsedDistinct =
             uassertStatusOK(ParsedDistinct::parse(opCtx, nss, cmdObj, extensionsCallback, false));
 
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
-        Collection* collection = ctx.getCollection();
-
-        if (ctx.getView()) {
-            ctx.releaseLocksForView();
+        if (ctx->getView()) {
+            // Relinquish locks. The aggregation command will re-acquire them.
+            ctx.reset();
 
             auto viewAggregation = parsedDistinct.asAggregationCommand();
             if (!viewAggregation.isOK()) {
@@ -171,6 +185,8 @@ public:
             uassertStatusOK(ViewResponseFormatter(aggResult).appendAsDistinctResponse(&result));
             return true;
         }
+
+        Collection* const collection = ctx->getCollection();
 
         auto executor = getExecutorDistinct(
             opCtx, collection, nss.ns(), &parsedDistinct, PlanExecutor::YIELD_AUTO);
@@ -229,9 +245,8 @@ public:
 
             return CommandHelpers::appendCommandStatus(
                 result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream() << "Executor error during distinct command: "
-                                     << WorkingSetCommon::toStatusString(obj)));
+                WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                    "Executor error during distinct command"));
         }
 
 

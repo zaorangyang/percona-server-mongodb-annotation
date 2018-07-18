@@ -68,16 +68,6 @@ WiredTigerRecoveryUnit::~WiredTigerRecoveryUnit() {
     _abort();
 }
 
-void WiredTigerRecoveryUnit::prepareForCreateSnapshot(OperationContext* opCtx) {
-    invariant(!_active);  // Can't already be in a WT transaction.
-    invariant(!_inUnitOfWork);
-    invariant(!_readFromMajorityCommittedSnapshot);
-
-    // Starts the WT transaction that will be the basis for creating a named snapshot.
-    getSession();
-    _areWriteUnitOfWorksBanned = true;
-}
-
 void WiredTigerRecoveryUnit::_commit() {
     try {
         if (_session && _active) {
@@ -179,7 +169,7 @@ void WiredTigerRecoveryUnit::abandonSnapshot() {
     _areWriteUnitOfWorksBanned = false;
 }
 
-void WiredTigerRecoveryUnit::prepareSnapshot() {
+void WiredTigerRecoveryUnit::preallocateSnapshot() {
     // Begin a new transaction, if one is not already started.
     getSession();
 }
@@ -232,20 +222,19 @@ SnapshotId WiredTigerRecoveryUnit::getSnapshotId() const {
     return SnapshotId(_mySnapshotId);
 }
 
-Status WiredTigerRecoveryUnit::setReadFromMajorityCommittedSnapshot() {
+Status WiredTigerRecoveryUnit::obtainMajorityCommittedSnapshot() {
+    invariant(isReadingFromMajorityCommittedSnapshot());
     auto snapshotName = _sessionCache->snapshotManager().getMinSnapshotForNextCommittedRead();
     if (!snapshotName) {
         return {ErrorCodes::ReadConcernMajorityNotAvailableYet,
                 "Read concern majority reads are currently not possible."};
     }
-
     _majorityCommittedSnapshot = *snapshotName;
-    _readFromMajorityCommittedSnapshot = true;
     return Status::OK();
 }
 
 boost::optional<Timestamp> WiredTigerRecoveryUnit::getMajorityCommittedSnapshot() const {
-    if (!_readFromMajorityCommittedSnapshot)
+    if (!isReadingFromMajorityCommittedSnapshot())
         return {};
     return _majorityCommittedSnapshot;
 }
@@ -264,23 +253,25 @@ void WiredTigerRecoveryUnit::_txnOpen() {
         auto status =
             _sessionCache->snapshotManager().beginTransactionAtTimestamp(_readAtTimestamp, session);
         if (!status.isOK() && status.code() == ErrorCodes::BadValue) {
-            uasserted(
-                ErrorCodes::SnapshotTooOld,
-                str::stream()
-                    << "Read timestamp "
-                    << _readAtTimestamp.toString()
-                    << " is older than the oldest available timestamp: "
-                    << _sessionCache->getKVEngine()->getPreviousSetOldestTimestamp().toString());
+            uasserted(ErrorCodes::SnapshotTooOld,
+                      str::stream() << "Read timestamp " << _readAtTimestamp.toString()
+                                    << " is older than the oldest available timestamp.");
         }
         uassertStatusOK(status);
-    } else if (_readFromMajorityCommittedSnapshot) {
+    } else if (isReadingFromMajorityCommittedSnapshot()) {
+        // We reset _majorityCommittedSnapshot to the actual read timestamp used when the
+        // transaction was started.
         _majorityCommittedSnapshot =
             _sessionCache->snapshotManager().beginTransactionOnCommittedSnapshot(session);
     } else if (_isOplogReader) {
         _sessionCache->snapshotManager().beginTransactionOnOplog(
             _sessionCache->getKVEngine()->getOplogManager(), session);
     } else {
-        invariantWTOK(session->begin_transaction(session, NULL));
+        invariantWTOK(session->begin_transaction(
+            session,
+            _readConcernLevel == repl::ReadConcernLevel::kAvailableReadConcern
+                ? "ignore_prepare=true"
+                : nullptr));
     }
 
     LOG(3) << "WT begin_transaction for snapshot id " << _mySnapshotId;

@@ -64,7 +64,7 @@ class ConfigSvrMovePrimaryCommand : public BasicCommand {
 public:
     ConfigSvrMovePrimaryCommand() : BasicCommand("_configsvrMovePrimary") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -134,24 +134,6 @@ public:
                               << cmdObj,
                 opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
-        auto const catalogClient = Grid::get(opCtx)->catalogClient();
-        auto const catalogCache = Grid::get(opCtx)->catalogCache();
-        auto const catalogManager = ShardingCatalogManager::get(opCtx);
-        auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
-
-        // Remove the backwards compatible lock after 3.6 ships.
-        auto backwardsCompatibleDbDistLock = uassertStatusOK(
-            catalogClient->getDistLockManager()->lock(opCtx,
-                                                      dbname + "-movePrimary",
-                                                      "movePrimary",
-                                                      DistLockManager::kDefaultLockTimeout));
-        auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
-            opCtx, dbname, "movePrimary", DistLockManager::kDefaultLockTimeout));
-
-        auto dbType = uassertStatusOK(catalogClient->getDatabase(
-                                          opCtx, dbname, repl::ReadConcernLevel::kLocalReadConcern))
-                          .value;
-
         const std::string to = movePrimaryRequest.getTo().toString();
 
         if (to.empty()) {
@@ -161,7 +143,41 @@ public:
                  str::stream() << "you have to specify where you want to move it"});
         }
 
+        auto const catalogClient = Grid::get(opCtx)->catalogClient();
+        auto const catalogCache = Grid::get(opCtx)->catalogCache();
+        auto const catalogManager = ShardingCatalogManager::get(opCtx);
+        auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+
+        auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+            opCtx, dbname, "movePrimary", DistLockManager::kDefaultLockTimeout));
+
+        auto dbType = uassertStatusOK(catalogClient->getDatabase(
+                                          opCtx, dbname, repl::ReadConcernLevel::kLocalReadConcern))
+                          .value;
+
         const auto fromShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbType.getPrimary()));
+
+        // fcv 4.0 logic for movePrimary (being tested under the 'forTest' flag while in
+        // development).
+        if (movePrimaryRequest.getForTest()) {
+            const NamespaceString nss(dbname);
+
+            ShardMovePrimary shardMovePrimaryRequest;
+            shardMovePrimaryRequest.set_movePrimary(nss);
+            shardMovePrimaryRequest.setTo(movePrimaryRequest.getTo());
+
+            auto cmdResponse = uassertStatusOK(fromShard->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                "admin",
+                CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
+                    cmdObj, shardMovePrimaryRequest.toBSON())),
+                Shard::RetryPolicy::kIdempotent));
+
+            CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+
+            return true;
+        }
 
         const auto toShard = [&]() {
             auto toShardStatus = shardRegistry->getShard(opCtx, to);

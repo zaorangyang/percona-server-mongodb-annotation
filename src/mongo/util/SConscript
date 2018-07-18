@@ -59,22 +59,12 @@ debuggerEnv.Library(
     ]
 )
 
-env.Library(
-    target='decorable',
-    source=[
-        'decoration_container.cpp',
-        'decoration_registry.cpp',
-    ],
-    LIBDEPS=[]
-    )
-
 env.CppUnitTest(
     target='decorable_test',
     source=[
         'decorable_test.cpp'
         ],
     LIBDEPS=[
-        'decorable',
         ]
     )
 
@@ -355,7 +345,7 @@ if env['MONGO_ALLOCATOR'] == 'tcmalloc':
         LIBDEPS=[
             '$BUILD_DIR/mongo/db/commands/server_status',
             '$BUILD_DIR/mongo/db/server_parameters',
-            '$BUILD_DIR/mongo/util/net/network',
+            '$BUILD_DIR/mongo/transport/service_executor',
         ],
         LIBDEPS_DEPENDENTS=[
             '$BUILD_DIR/mongo/mongodmain',
@@ -403,6 +393,17 @@ env.CppUnitTest(
     LIBDEPS=[
         'clock_source_mock',
         'clock_sources',
+    ],
+)
+
+env.Benchmark(
+    target='clock_source_bm',
+    source=[
+        'clock_source_bm.cpp',
+    ],
+    LIBDEPS=[
+        'clock_sources',
+        'processinfo',
     ],
 )
 
@@ -597,6 +598,17 @@ env.CppUnitTest(
 )
 
 env.CppUnitTest(
+    target='producer_consumer_queue_test',
+    source=[
+        'producer_consumer_queue_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
+    ]
+)
+
+env.CppUnitTest(
     target='duration_test',
     source=[
         'duration_test.cpp',
@@ -622,6 +634,25 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target='future_test',
+    source=[
+        'future_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Benchmark(
+    target='future_bm',
+    source=[
+        'future_bm.cpp',
+    ],
+    LIBDEPS=[
     ],
 )
 

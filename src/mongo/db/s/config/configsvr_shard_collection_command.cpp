@@ -54,6 +54,7 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
+#include "mongo/s/commands/cluster_commands_helpers.h"
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
@@ -121,7 +122,7 @@ BSONObj makeCreateIndexesCmd(const NamespaceString& nss,
     createIndexes.append("createIndexes", nss.coll());
     createIndexes.append("indexes", BSON_ARRAY(index.obj()));
     createIndexes.append("writeConcern", WriteConcernOptions::Majority);
-    return createIndexes.obj();
+    return appendAllowImplicitCreate(createIndexes.obj(), true);
 }
 
 /**
@@ -643,11 +644,6 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
 
 boost::optional<UUID> getUUIDFromPrimaryShard(const NamespaceString& nss,
                                               ScopedDbConnection& conn) {
-    // UUIDs were introduced in featureCompatibilityVersion 3.6.
-    if (!serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
-        return boost::none;
-    }
-
     // Obtain the collection's UUID from the primary shard's listCollections response.
     BSONObj res;
     {
@@ -706,7 +702,7 @@ public:
         return Status::OK();
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -742,10 +738,6 @@ public:
                               << cmdObj,
                 opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
-        // Do not allow sharding collections while a featureCompatibilityVersion upgrade or
-        // downgrade is in progress (see SERVER-31231 for details).
-        Lock::ExclusiveLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
-
         const NamespaceString nss(parseNs(dbname, cmdObj));
         auto request = ConfigsvrShardCollectionRequest::parse(
             IDLParserErrorContext("ConfigsvrShardCollectionRequest"), cmdObj);
@@ -755,13 +747,6 @@ public:
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
 
         // Make the distlocks boost::optional so that they can be released by being reset below.
-        // Remove the backwards compatible lock after 3.6 ships.
-        boost::optional<DistLockManager::ScopedDistLock> backwardsCompatibleDbDistLock(
-            uassertStatusOK(
-                catalogClient->getDistLockManager()->lock(opCtx,
-                                                          nss.db() + "-movePrimary",
-                                                          "shardCollection",
-                                                          DistLockManager::kDefaultLockTimeout)));
         boost::optional<DistLockManager::ScopedDistLock> dbDistLock(
             uassertStatusOK(catalogClient->getDistLockManager()->lock(
                 opCtx, nss.db(), "shardCollection", DistLockManager::kDefaultLockTimeout)));
@@ -900,7 +885,6 @@ public:
         // Free the distlocks to allow the splits and migrations below to proceed.
         collDistLock.reset();
         dbDistLock.reset();
-        backwardsCompatibleDbDistLock.reset();
 
         // Step 7. Migrate initial chunks to distribute them across shards.
         migrateAndFurtherSplitInitialChunks(

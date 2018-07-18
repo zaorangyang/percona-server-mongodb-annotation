@@ -40,7 +40,7 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 
 namespace mongo {
@@ -52,7 +52,7 @@ using std::stringstream;
 class CmdCloneCollectionAsCapped : public ErrmsgCommandDeprecated {
 public:
     CmdCloneCollectionAsCapped() : ErrmsgCommandDeprecated("cloneCollectionAsCapped") {}
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -151,7 +151,7 @@ public:
 class CmdConvertToCapped : public ErrmsgCommandDeprecated {
 public:
     CmdConvertToCapped() : ErrmsgCommandDeprecated("convertToCapped") {}
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {

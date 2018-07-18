@@ -197,7 +197,7 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
 
 class CmdListCollections : public BasicCommand {
 public:
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kOptIn;
     }
     virtual bool adminOnly() const {
@@ -345,7 +345,7 @@ public:
                 {std::move(exec),
                  cursorNss,
                  AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                 opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                 opCtx->recoveryUnit()->getReadConcernLevel(),
                  jsobj});
             cursorId = pinnedCursor.getCursor()->cursorid();
         }

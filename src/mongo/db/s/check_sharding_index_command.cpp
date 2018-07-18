@@ -35,8 +35,8 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/bson/dotted_path_support.h"
-#include "mongo/db/catalog/catalog_raii.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -67,7 +67,7 @@ public:
         return false;
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -202,9 +202,8 @@ public:
         if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
             return CommandHelpers::appendCommandStatus(
                 result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream() << "Executor error while checking sharding index: "
-                                     << WorkingSetCommon::toStatusString(currKey)));
+                WorkingSetCommon::getMemberObjectStatus(currKey).withContext(
+                    "Executor error while checking sharding index"));
         }
 
         return true;

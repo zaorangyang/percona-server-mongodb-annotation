@@ -41,7 +41,7 @@ class ReplicaSetFixture(interface.ReplFixture):
                  all_nodes_electable=False,
                  use_replica_set_connection_string=None):
 
-        interface.ReplFixture.__init__(self, logger, job_num)
+        interface.ReplFixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
 
         self.mongod_executable = mongod_executable
         self.mongod_options = utils.default_if_none(mongod_options, {})
@@ -65,18 +65,16 @@ class ReplicaSetFixture(interface.ReplFixture):
         if self.use_replica_set_connection_string is None:
             self.use_replica_set_connection_string = self.all_nodes_electable
 
+        # Set the default oplogSize to 511MB.
+        self.mongod_options.setdefault("oplogSize", 511)
+
         # The dbpath in mongod_options is used as the dbpath prefix for replica set members and
         # takes precedence over other settings. The ShardedClusterFixture uses this parameter to
         # create replica sets and assign their dbpath structure explicitly.
         if "dbpath" in self.mongod_options:
             self._dbpath_prefix = self.mongod_options.pop("dbpath")
         else:
-            # Command line options override the YAML configuration.
-            dbpath_prefix = utils.default_if_none(config.DBPATH_PREFIX, dbpath_prefix)
-            dbpath_prefix = utils.default_if_none(dbpath_prefix, config.DEFAULT_DBPATH_PREFIX)
-            self._dbpath_prefix = os.path.join(dbpath_prefix,
-                                               "job{}".format(self.job_num),
-                                               config.FIXTURE_SUBDIR)
+            self._dbpath_prefix = os.path.join(self._dbpath_prefix, config.FIXTURE_SUBDIR)
 
         self.nodes = []
         self.replset_name = None
@@ -141,10 +139,11 @@ class ReplicaSetFixture(interface.ReplFixture):
         if self.write_concern_majority_journal_default is not None:
             config["writeConcernMajorityJournalDefault"] = self.write_concern_majority_journal_default
         else:
-            serverStatus = client.admin.command({"serverStatus": 1})
-            cmdLineOpts = client.admin.command({"getCmdLineOpts": 1})
-            if not (serverStatus["storageEngine"]["persistent"] and
-                    cmdLineOpts["parsed"].get("storage", {}).get("journal", {}).get("enabled", True)):
+            server_status = client.admin.command({"serverStatus": 1})
+            cmd_line_opts = client.admin.command({"getCmdLineOpts": 1})
+            if not (server_status["storageEngine"]["persistent"] and
+                    cmd_line_opts["parsed"].get("storage", {}).get(
+                        "journal", {}).get("enabled", True)):
                 config["writeConcernMajorityJournalDefault"] = False
 
         if self.replset_config_options.get("configsvr", False):
@@ -190,13 +189,18 @@ class ReplicaSetFixture(interface.ReplFixture):
             except pymongo.errors.OperationFailure as err:
                 # Retry on NodeNotFound errors from the "replSetInitiate" command.
                 if err.code != ReplicaSetFixture._NODE_NOT_FOUND:
-                    raise
+                    msg = ("Operation failure while configuring the "
+                           "replica set fixture: {}").format(err)
+                    self.logger.error(msg)
+                    raise errors.ServerFailure(msg)
 
                 msg = "replSetInitiate failed attempt {0} of {1} with error: {2}".format(
                     attempt, num_initiate_attempts, err)
                 self.logger.error(msg)
                 if attempt == num_initiate_attempts:
-                    raise
+                    msg = "Exceeded number of retries while configuring the replica set fixture"
+                    self.logger.error(msg + ".")
+                    raise errors.ServerFailure(msg)
                 time.sleep(5)  # Wait a little bit before trying again.
 
     def await_ready(self):
@@ -237,26 +241,27 @@ class ReplicaSetFixture(interface.ReplFixture):
             self.logger.info("Secondary on port %d is now available.", secondary.port)
 
     def _do_teardown(self):
-        running_at_start = self.is_running()
-        success = True  # Still a success even if nothing is running.
+        self.logger.info("Stopping all members of the replica set...")
 
+        running_at_start = self.is_running()
         if not running_at_start:
-            self.logger.info(
-                "Replica set was expected to be running in _do_teardown(), but wasn't.")
-        else:
-            self.logger.info("Stopping all members of the replica set...")
+            self.logger.info("All members of the replica set were expected to be running, "
+                             "but weren't.")
+
+        teardown_handler = interface.FixtureTeardownHandler(self.logger)
 
         if self.initial_sync_node:
-            success = self.initial_sync_node.teardown() and success
+            teardown_handler.teardown(self.initial_sync_node, "initial sync node")
 
         # Terminate the secondaries first to reduce noise in the logs.
         for node in reversed(self.nodes):
-            success = node.teardown() and success
+            teardown_handler.teardown(node, "replica set member on port %d" % node.port)
 
-        if running_at_start:
+        if teardown_handler.was_successful():
             self.logger.info("Successfully stopped all members of the replica set.")
-
-        return success
+        else:
+            self.logger.error("Stopping the replica set fixture failed.")
+            raise errors.ServerFailure(teardown_handler.get_error_message())
 
     def is_running(self):
         running = all(node.is_running() for node in self.nodes)
@@ -309,9 +314,6 @@ class ReplicaSetFixture(interface.ReplFixture):
 
     def get_initial_sync_node(self):
         return self.initial_sync_node
-
-    def get_dbpath(self):
-        return self._dbpath_prefix
 
     def _new_mongod(self, index, replset_name):
         """

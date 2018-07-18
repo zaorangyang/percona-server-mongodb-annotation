@@ -71,7 +71,7 @@ private:
         return false;
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kOptIn;
     }
 
@@ -117,11 +117,12 @@ private:
         return nss.ns();
     }
 
-    virtual Status explain(OperationContext* opCtx,
-                           const std::string& dbname,
-                           const BSONObj& cmdObj,
-                           ExplainOptions::Verbosity verbosity,
-                           BSONObjBuilder* out) const {
+    Status explain(OperationContext* opCtx,
+                   const OpMsgRequest& request,
+                   ExplainOptions::Verbosity verbosity,
+                   BSONObjBuilder* out) const override {
+        std::string dbname = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
         GroupRequest groupRequest;
         Status parseRequestStatus = _parseRequest(dbname, cmdObj, &groupRequest);
         if (!parseRequestStatus.isOK()) {
@@ -183,16 +184,10 @@ private:
         if (PlanExecutor::ADVANCED != state) {
             invariant(PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state);
 
-            if (WorkingSetCommon::isValidStatusMemberObject(retval)) {
-                return CommandHelpers::appendCommandStatus(
-                    result, WorkingSetCommon::getMemberObjectStatus(retval));
-            }
             return CommandHelpers::appendCommandStatus(
                 result,
-                Status(ErrorCodes::BadValue,
-                       str::stream() << "error encountered during group "
-                                     << "operation, executor returned "
-                                     << PlanExecutor::statestr(state)));
+                WorkingSetCommon::getMemberObjectStatus(retval).withContext(
+                    "Plan executor error during group command"));
         }
 
         invariant(planExecutor->isEOF());

@@ -47,21 +47,9 @@ void closeCatalog(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isW());
 
     // Close all databases.
-    log() << "closeCatalog: closing all databases in dbholder";
-    BSONObjBuilder closeDbsBuilder;
-    constexpr auto force = true;
+    log() << "closeCatalog: closing all databases";
     constexpr auto reason = "closing databases for closeCatalog";
-    uassert(40687,
-            str::stream() << "failed to close all databases; result of operation: "
-                          << closeDbsBuilder.obj().jsonString(),
-            dbHolder().closeAll(opCtx, closeDbsBuilder, force, reason));
-
-    // Because we've force-closed the database, there should be no databases left open.
-    auto closeDbsResult = closeDbsBuilder.obj();
-    invariant(
-        !closeDbsResult.hasField("nNotClosed"),
-        str::stream() << "expected no databases open after a force close; result of operation: "
-                      << closeDbsResult.jsonString());
+    dbHolder().closeAll(opCtx, reason);
 
     // Close the storage engine's catalog.
     log() << "closeCatalog: closing storage engine catalog";
@@ -78,9 +66,11 @@ void openCatalog(OperationContext* opCtx) {
 
     log() << "openCatalog: reconciling catalog and idents";
     auto indexesToRebuild = storageEngine->reconcileCatalogAndIdents(opCtx);
-    fassertStatusOK(40688, indexesToRebuild.getStatus());
+    fassert(40688, indexesToRebuild.getStatus());
 
-    // Rebuild indexes if necessary.
+    // Determine which indexes need to be rebuilt. rebuildIndexesOnCollection() requires that all
+    // indexes on that collection are done at once, so we use a map to group them together.
+    StringMap<IndexNameObjs> nsToIndexNameObjMap;
     for (auto indexNamespace : indexesToRebuild.getValue()) {
         NamespaceString collNss(indexNamespace.first);
         auto indexName = indexNamespace.second;
@@ -99,11 +89,11 @@ void openCatalog(OperationContext* opCtx) {
                 return name == indexName;
             });
         if (!indexSpecs.isOK() || indexSpecs.getValue().first.empty()) {
-            fassertStatusOK(40689,
-                            {ErrorCodes::InternalError,
-                             str::stream() << "failed to get index spec for index " << indexName
-                                           << " in collection "
-                                           << collNss.toString()});
+            fassert(40689,
+                    {ErrorCodes::InternalError,
+                     str::stream() << "failed to get index spec for index " << indexName
+                                   << " in collection "
+                                   << collNss.toString()});
         }
         auto indexesToRebuild = indexSpecs.getValue();
         invariant(
@@ -115,11 +105,30 @@ void openCatalog(OperationContext* opCtx) {
             str::stream() << "expected to find a list containing exactly 1 index spec, but found "
                           << indexesToRebuild.second.size());
 
-        log() << "openCatalog: rebuilding index " << indexName << " in collection "
-              << collNss.toString();
-        fassertStatusOK(40690,
-                        rebuildIndexesOnCollection(
-                            opCtx, dbCatalogEntry, collCatalogEntry, std::move(indexesToRebuild)));
+        auto& ino = nsToIndexNameObjMap[collNss.ns()];
+        ino.first.emplace_back(std::move(indexesToRebuild.first.back()));
+        ino.second.emplace_back(std::move(indexesToRebuild.second.back()));
+    }
+
+    for (const auto& entry : nsToIndexNameObjMap) {
+        NamespaceString collNss(entry.first);
+
+        auto dbCatalogEntry = storageEngine->getDatabaseCatalogEntry(opCtx, collNss.db());
+        invariant(dbCatalogEntry,
+                  str::stream() << "couldn't get database catalog entry for database "
+                                << collNss.db());
+        auto collCatalogEntry = dbCatalogEntry->getCollectionCatalogEntry(collNss.toString());
+        invariant(collCatalogEntry,
+                  str::stream() << "couldn't get collection catalog entry for collection "
+                                << collNss.toString());
+
+        for (const auto& indexName : entry.second.first) {
+            log() << "openCatalog: rebuilding index: collection: " << collNss.toString()
+                  << ", index: " << indexName;
+        }
+        fassert(40690,
+                rebuildIndexesOnCollection(
+                    opCtx, dbCatalogEntry, collCatalogEntry, std::move(entry.second)));
     }
 
     // Open all databases and repopulate the UUID catalog.
@@ -143,13 +152,11 @@ void openCatalog(OperationContext* opCtx) {
                                     << collName);
 
             auto uuid = collection->uuid();
-            // TODO (SERVER-32597): When the minimum featureCompatibilityVersion becomes 3.6, we
-            // can change this condition to be an invariant.
-            if (uuid) {
-                LOG(1) << "openCatalog: registering uuid " << uuid->toString() << " for collection "
-                       << collName;
-                uuidCatalog.registerUUIDCatalogEntry(*uuid, collection);
-            }
+            invariant(uuid);
+
+            LOG(1) << "openCatalog: registering uuid " << uuid->toString() << " for collection "
+                   << collName;
+            uuidCatalog.registerUUIDCatalogEntry(*uuid, collection);
 
             // If this is the oplog collection, re-establish the replication system's cached pointer
             // to the oplog.

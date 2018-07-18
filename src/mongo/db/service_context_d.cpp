@@ -42,6 +42,7 @@
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/unclean_shutdown.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
@@ -106,6 +107,7 @@ void ServiceContextMongoD::createLockFile() {
             fassertFailedNoTrace(34416);
         }
         warning() << "Detected unclean shutdown - " << _lockFile->getFilespec() << " is not empty.";
+        startingAfterUncleanShutdown(this) = true;
     }
 }
 
@@ -125,7 +127,7 @@ void ServiceContextMongoD::initializeGlobalStorageEngine() {
             log() << startupWarningsLog;
             log() << "** WARNING: Support for MMAPV1 storage engine has been deprecated and will be"
                   << startupWarningsLog;
-            log() << "**          removed in version 4.0. Please plan to migrate to the wiredTiger"
+            log() << "**          removed in version 4.2. Please plan to migrate to the wiredTiger"
                   << startupWarningsLog;
             log() << "**          storage engine." << startupWarningsLog;
             log() << "**          See http://dochub.mongodb.org/core/deprecated-mmapv1";
@@ -176,7 +178,7 @@ void ServiceContextMongoD::initializeGlobalStorageEngine() {
               << startupWarningsLog;
         log() << "**          storage engine has been deprecated and will be removed in"
               << startupWarningsLog;
-        log() << "**          version 4.0. See http://dochub.mongodb.org/core/deprecated-mmapv1";
+        log() << "**          version 4.2. See http://dochub.mongodb.org/core/deprecated-mmapv1";
         log() << startupWarningsLog;
     }
 

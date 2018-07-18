@@ -44,7 +44,6 @@
 #include "mongo/db/index_builder.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 
@@ -62,7 +61,7 @@ public:
     virtual bool adminOnly() const {
         return false;
     }
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -118,7 +117,7 @@ public:
         return true;
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
@@ -201,7 +200,7 @@ public:
 class CapTrunc : public BasicCommand {
 public:
     CapTrunc() : BasicCommand("captrunc") {}
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -276,7 +275,7 @@ public:
 class EmptyCapped : public BasicCommand {
 public:
     EmptyCapped() : BasicCommand("emptycapped") {}
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {

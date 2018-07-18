@@ -37,8 +37,10 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/chunk_move_write_concern_options.h"
 #include "mongo/db/s/migration_destination_manager.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/request_types/migration_secondary_throttle_options.h"
@@ -56,7 +58,7 @@ public:
         return "internal";
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -92,17 +94,7 @@ public:
 
         const auto chunkRange = uassertStatusOK(ChunkRange::fromBSON(cmdObj));
 
-        // Refresh our collection manager from the config server, we need a collection manager to
-        // start registering pending chunks. We force the remote refresh here to make the behavior
-        // consistent and predictable, generally we'd refresh anyway, and to be paranoid.
-        ChunkVersion shardVersion;
-        Status status = shardingState->refreshMetadataNow(opCtx, nss, &shardVersion);
-        if (!status.isOK()) {
-            errmsg = str::stream() << "cannot start receiving chunk "
-                                   << redact(chunkRange.toString()) << causedBy(redact(status));
-            warning() << errmsg;
-            return false;
-        }
+        const auto shardVersion = forceShardFilteringMetadataRefresh(opCtx, nss);
 
         // Process secondary throttle settings and assign defaults if necessary.
         const auto secondaryThrottle =
@@ -126,12 +118,12 @@ public:
             uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj)));
 
         // Ensure this shard is not currently receiving or donating any chunks.
-        auto scopedRegisterReceiveChunk(
-            uassertStatusOK(shardingState->registerReceiveChunk(nss, chunkRange, fromShard)));
+        auto scopedReceiveChunk(uassertStatusOK(
+            ActiveMigrationsRegistry::get(opCtx).registerReceiveChunk(nss, chunkRange, fromShard)));
 
         uassertStatusOK(MigrationDestinationManager::get(opCtx)->start(
             nss,
-            std::move(scopedRegisterReceiveChunk),
+            std::move(scopedReceiveChunk),
             migrationSessionId,
             statusWithFromShardConnectionString.getValue(),
             fromShard,
@@ -156,7 +148,7 @@ public:
         return "internal";
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -180,7 +172,8 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        MigrationDestinationManager::get(opCtx)->report(result);
+        bool waitForSteadyOrDone = cmdObj["waitForSteadyOrDone"].boolean();
+        MigrationDestinationManager::get(opCtx)->report(result, opCtx, waitForSteadyOrDone);
         return true;
     }
 
@@ -194,7 +187,7 @@ public:
         return "internal";
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -222,7 +215,7 @@ public:
         auto const sessionId = uassertStatusOK(MigrationSessionId::extractFromBSON(cmdObj));
         auto const mdm = MigrationDestinationManager::get(opCtx);
         Status const status = mdm->startCommit(sessionId);
-        mdm->report(result);
+        mdm->report(result, opCtx, false);
         if (!status.isOK()) {
             log() << status.reason();
             return CommandHelpers::appendCommandStatus(result, status);
@@ -240,7 +233,7 @@ public:
         return "internal";
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -270,14 +263,14 @@ public:
 
         if (migrationSessionIdStatus.isOK()) {
             Status const status = mdm->abort(migrationSessionIdStatus.getValue());
-            mdm->report(result);
+            mdm->report(result, opCtx, false);
             if (!status.isOK()) {
                 log() << status.reason();
                 return CommandHelpers::appendCommandStatus(result, status);
             }
         } else if (migrationSessionIdStatus == ErrorCodes::NoSuchKey) {
             mdm->abortWithoutSessionIdCheck();
-            mdm->report(result);
+            mdm->report(result, opCtx, false);
         }
 
         uassertStatusOK(migrationSessionIdStatus.getStatus());

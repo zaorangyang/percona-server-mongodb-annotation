@@ -33,6 +33,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/transport/service_executor',
     ],
 )
@@ -52,6 +53,16 @@ env.Library(
 coredbOptionalLibdeps = []
 if has_option('hotbackup'):
     coredbOptionalLibdeps.append('$BUILD_DIR/mongo/db/backup/backup')
+
+env.Library(
+    target="feature_compatibility_version_parser",
+    source=[
+        "feature_compatibility_version_parser.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
 
 env.Library(
     target="core",
@@ -102,7 +113,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/logical_session_id_helpers',
         '$BUILD_DIR/mongo/db/matcher/expressions',
         '$BUILD_DIR/mongo/db/repl/isself',
-        '$BUILD_DIR/mongo/db/repl/repl_coordinator_global',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/server_options',
         '$BUILD_DIR/mongo/db/server_parameters',
         '$BUILD_DIR/mongo/db/startup_warnings_common',
@@ -110,7 +121,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/stats/timer_stats',
         '$BUILD_DIR/mongo/db/views/views',
         '$BUILD_DIR/mongo/logger/parse_log_component_settings',
-        '$BUILD_DIR/mongo/s/client/sharding_client',
+        '$BUILD_DIR/mongo/s/sharding_legacy_api',
         '$BUILD_DIR/mongo/s/coreshard',
         '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
         '$BUILD_DIR/mongo/scripting/scripting_common',
@@ -119,6 +130,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
         '$BUILD_DIR/mongo/util/ntservice',
         '$BUILD_DIR/mongo/util/processinfo',
+        'feature_compatibility_version_parser',
         'server_status_core',
     ] + coredbOptionalLibdeps,
 )
@@ -214,6 +226,7 @@ env.Library(
         "test_commands.cpp",
         "top_command.cpp",
         "touch.cpp",
+        "txn_cmds.cpp",
         "user_management_commands.cpp",
         "validate.cpp",
         "write_commands/write_commands.cpp",
@@ -246,7 +259,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/stats/serveronly_stats',
         '$BUILD_DIR/mongo/db/views/views_mongod',
-        '$BUILD_DIR/mongo/s/client/parallel',
+        '$BUILD_DIR/mongo/s/sharding_legacy_api',
         'core',
         'current_op_common',
         'dcommands_fcv',
@@ -256,6 +269,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
+        '$BUILD_DIR/mongo/util/icu',
     ],
 )
 
@@ -326,8 +340,11 @@ env.CppUnitTest(
         "mr_test.cpp",
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/db/repl/replmocks",
+        "$BUILD_DIR/mongo/db/repl/storage_interface_impl",
         "$BUILD_DIR/mongo/db/serveronly",
         "$BUILD_DIR/mongo/db/service_context_d",
+        "$BUILD_DIR/mongo/db/service_context_d_test_fixture",
         "dcommands",
     ],
 )

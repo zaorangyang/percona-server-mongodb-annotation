@@ -19,8 +19,7 @@ class Job(object):
 
     def __init__(self, logger, fixture, hooks, report, archival, suite_options):
         """
-        Initializes the job with the specified fixture and custom
-        behaviors.
+        Initializes the job with the specified fixture and hooks.
         """
 
         self.logger = logger
@@ -61,9 +60,10 @@ class Job(object):
 
         if teardown_flag is not None:
             try:
-                if not self.fixture.teardown(finished=True):
-                    self.logger.warn("Teardown of %s was not successful.", self.fixture)
-                    teardown_flag.set()
+                self.fixture.teardown(finished=True)
+            except errors.ServerFailure as err:
+                self.logger.warn("Teardown of %s was not successful: %s", self.fixture, err)
+                teardown_flag.set()
             except:
                 self.logger.exception("Encountered an error while tearing down %s.", self.fixture)
                 teardown_flag.set()

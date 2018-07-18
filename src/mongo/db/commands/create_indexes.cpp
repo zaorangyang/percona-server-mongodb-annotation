@@ -48,7 +48,7 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
@@ -216,7 +216,7 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -254,6 +254,9 @@ public:
             return CommandHelpers::appendCommandStatus(result, specsWithStatus.getStatus());
         }
         auto specs = std::move(specsWithStatus.getValue());
+
+        // Index builds cannot currently handle lock interruption.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
 
         // now we know we have to create index(es)
         // Note: createIndexes command does not currently respect shard versioning.

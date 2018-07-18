@@ -41,8 +41,6 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer_noop.h"
 #include "mongo/db/op_observer_registry.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/stdx/memory.h"
@@ -53,6 +51,7 @@
 namespace mongo {
 
 void ServiceContextMongoDTest::setUp() {
+    Test::setUp();
     Client::initThread(getThreadName());
 
     auto const serviceContext = getServiceContext();
@@ -88,6 +87,7 @@ void ServiceContextMongoDTest::tearDown() {
     ON_BLOCK_EXIT([&] { Client::destroy(); });
     auto opCtx = cc().makeOperationContext();
     _dropAllDBs(opCtx.get());
+    Test::tearDown();
 }
 
 ServiceContext* ServiceContextMongoDTest::getServiceContext() {
@@ -114,8 +114,7 @@ void ServiceContextMongoDTest::_dropAllDBs(OperationContext* opCtx) {
     // dropAllDatabasesExceptLocal() does not close empty databases. However the holder still
     // allocates resources to track these empty databases. These resources not released by
     // dropAllDatabasesExceptLocal() will be leaked at exit unless we call DatabaseHolder::closeAll.
-    BSONObjBuilder unused;
-    invariant(dbHolder().closeAll(opCtx, unused, false, "all databases dropped"));
+    dbHolder().closeAll(opCtx, "all databases dropped");
 }
 
 }  // namespace mongo

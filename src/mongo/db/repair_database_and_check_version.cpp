@@ -36,6 +36,8 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
@@ -43,7 +45,8 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repair_database.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/util/log.h"
 #include "mongo/util/quick_exit.h"
@@ -60,96 +63,110 @@ using std::endl;
 
 namespace {
 
-constexpr StringData upgradeLink = "http://dochub.mongodb.org/core/3.6-upgrade-fcv"_sd;
-constexpr StringData mustDowngradeErrorMsg =
-    "UPGRADE PROBLEM: The data files need to be fully upgraded to version 3.4 before attempting an upgrade to 3.6; see http://dochub.mongodb.org/core/3.6-upgrade-fcv for more details."_sd;
+const std::string mustDowngradeErrorMsg = str::stream()
+    << "UPGRADE PROBLEM: The data files need to be fully upgraded to version 3.6 before attempting "
+       "an upgrade to 4.0; see "
+    << feature_compatibility_version_documentation::kUpgradeLink << " for more details.";
 
 Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx,
                                                          const std::vector<std::string>& dbNames) {
+    NamespaceString fcvNss(FeatureCompatibilityVersion::kCollection);
+
+    // If the admin database does not exist, create it.
+    Database* db = dbHolder().get(opCtx, fcvNss.db());
+    if (!db) {
+        log() << "Re-creating admin database that was dropped.";
+    }
+    db = dbHolder().openDb(opCtx, fcvNss.db());
+    invariant(db);
+
+    // If admin.system.version does not exist, create it.
+    if (!db->getCollection(opCtx, FeatureCompatibilityVersion::kCollection)) {
+        log() << "Re-creating admin.system.version collection that was dropped.";
+        uassertStatusOK(
+            createCollection(opCtx, fcvNss.db().toString(), BSON("create" << fcvNss.coll())));
+    }
+
+    Collection* fcvColl = db->getCollection(opCtx, FeatureCompatibilityVersion::kCollection);
+    invariant(fcvColl);
+
+    // Restore the featureCompatibilityVersion document if it is missing.
+    BSONObj featureCompatibilityVersion;
+    if (!Helpers::findOne(opCtx,
+                          fcvColl,
+                          BSON("_id" << FeatureCompatibilityVersionParser::kParameterName),
+                          featureCompatibilityVersion)) {
+        log() << "Re-creating featureCompatibilityVersion document that was deleted with version "
+              << FeatureCompatibilityVersionParser::kVersion36 << ".";
+
+        BSONObj fcvObj = BSON("_id" << FeatureCompatibilityVersionParser::kParameterName
+                                    << FeatureCompatibilityVersionParser::kVersionField
+                                    << FeatureCompatibilityVersionParser::kVersion36);
+
+        writeConflictRetry(opCtx, "insertFCVDocument", fcvNss.ns(), [&] {
+            WriteUnitOfWork wunit(opCtx);
+            OpDebug* const nullOpDebug = nullptr;
+            uassertStatusOK(
+                fcvColl->insertDocument(opCtx, InsertStatement(fcvObj), nullOpDebug, false));
+            wunit.commit();
+        });
+    }
+
+    invariant(Helpers::findOne(opCtx,
+                               fcvColl,
+                               BSON("_id" << FeatureCompatibilityVersionParser::kParameterName),
+                               featureCompatibilityVersion));
+
+    return Status::OK();
+}
+
+/**
+ * Checks that all replicated collections in the given list of 'dbNames' have UUIDs. Returns a
+ * MustDowngrade error status if any do not.
+ *
+ * Additionally assigns UUIDs to any non-replicated collections that are missing UUIDs.
+ */
+Status ensureAllCollectionsHaveUUIDs(OperationContext* opCtx,
+                                     const std::vector<std::string>& dbNames) {
     bool isMmapV1 = opCtx->getServiceContext()->getGlobalStorageEngine()->isMmapV1();
-    // Check whether there are any collections with UUIDs.
-    bool collsHaveUuids = false;
-    bool allCollsHaveUuids = true;
+    std::vector<NamespaceString> nonReplicatedCollNSSsWithoutUUIDs;
     for (const auto& dbName : dbNames) {
         Database* db = dbHolder().openDb(opCtx, dbName);
         invariant(db);
         for (auto collectionIt = db->begin(); collectionIt != db->end(); ++collectionIt) {
             Collection* coll = *collectionIt;
-            if (coll->uuid()) {
-                collsHaveUuids = true;
-            } else if (!coll->uuid() && (!isMmapV1 ||
-                                         !(coll->ns().coll() == "system.indexes" ||
-                                           coll->ns().coll() == "system.namespaces"))) {
-                // Exclude system.indexes and system.namespaces from the UUID check until
-                // SERVER-29926 and SERVER-30095 are addressed, respectively.
-                allCollsHaveUuids = false;
+            if (!coll->uuid()) {
+                // system.indexes and system.namespaces don't currently have UUIDs in MMAP.
+                // SERVER-29926 and SERVER-30095 will address this problem.
+                if (isMmapV1 && (coll->ns().coll() == "system.indexes" ||
+                                 coll->ns().coll() == "system.namespaces")) {
+                    continue;
+                }
+
+                if (!coll->ns().isReplicated()) {
+                    nonReplicatedCollNSSsWithoutUUIDs.push_back(coll->ns());
+                    continue;
+                }
+
+                // We expect all collections to have UUIDs starting in FCV 3.6, so if we are missing
+                // a UUID then the user never upgraded to FCV 3.6 and this startup attempt is
+                // illegal.
+                return {ErrorCodes::MustDowngrade, mustDowngradeErrorMsg};
             }
         }
     }
 
-    if (!collsHaveUuids) {
-        return {ErrorCodes::MustDowngrade, mustDowngradeErrorMsg};
+    // Non-replicated collections are very easy to fix since they don't require a replication or
+    // sharding solution. So, regardless of what the cause might have been, we go ahead and add
+    // UUIDs to them to ensure UUID dependent code works.
+    //
+    // Note: v3.6 arbiters do not have UUIDs, so this code is necessary to add them on upgrade to
+    // v4.0.
+    for (const auto& collNSS : nonReplicatedCollNSSsWithoutUUIDs) {
+        uassertStatusOK(
+            collModForUUIDUpgrade(opCtx, collNSS, BSON("collMod" << collNSS.coll()), UUID::gen()));
     }
 
-    // Restore the featureCompatibilityVersion document if it is missing.
-    NamespaceString nss(FeatureCompatibilityVersion::kCollection);
-
-    Database* db = dbHolder().get(opCtx, nss.db());
-
-    // If the admin database does not exist, create it.
-    if (!db) {
-        log() << "Re-creating admin database that was dropped.";
-    }
-
-    db = dbHolder().openDb(opCtx, nss.db());
-    invariant(db);
-
-    // If admin.system.version does not exist, create it without a UUID.
-    if (!db->getCollection(opCtx, FeatureCompatibilityVersion::kCollection)) {
-        log() << "Re-creating admin.system.version collection that was dropped.";
-        allCollsHaveUuids = false;
-        BSONObjBuilder bob;
-        bob.append("create", nss.coll());
-        BSONObj createObj = bob.done();
-        uassertStatusOK(createCollection(opCtx, nss.db().toString(), createObj));
-    }
-
-    Collection* versionColl = db->getCollection(opCtx, FeatureCompatibilityVersion::kCollection);
-    invariant(versionColl);
-    BSONObj featureCompatibilityVersion;
-    if (!Helpers::findOne(opCtx,
-                          versionColl,
-                          BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-                          featureCompatibilityVersion)) {
-        log() << "Re-creating featureCompatibilityVersion document that was deleted.";
-        BSONObjBuilder bob;
-        bob.append("_id", FeatureCompatibilityVersion::kParameterName);
-        if (allCollsHaveUuids) {
-            // If all collections have UUIDs, create a featureCompatibilityVersion document with
-            // version equal to 3.6.
-            bob.append(FeatureCompatibilityVersion::kVersionField,
-                       FeatureCompatibilityVersionCommandParser::kVersion36);
-        } else {
-            // If some collections do not have UUIDs, create a featureCompatibilityVersion document
-            // with version equal to 3.4 and targetVersion 3.6.
-            bob.append(FeatureCompatibilityVersion::kVersionField,
-                       FeatureCompatibilityVersionCommandParser::kVersion34);
-            bob.append(FeatureCompatibilityVersion::kTargetVersionField,
-                       FeatureCompatibilityVersionCommandParser::kVersion36);
-        }
-        auto fcvObj = bob.done();
-        writeConflictRetry(opCtx, "insertFCVDocument", nss.ns(), [&] {
-            WriteUnitOfWork wunit(opCtx);
-            OpDebug* const nullOpDebug = nullptr;
-            uassertStatusOK(
-                versionColl->insertDocument(opCtx, InsertStatement(fcvObj), nullOpDebug, false));
-            wunit.commit();
-        });
-    }
-    invariant(Helpers::findOne(opCtx,
-                               versionColl,
-                               BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-                               featureCompatibilityVersion));
     return Status::OK();
 }
 
@@ -176,7 +193,7 @@ void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx, Databas
         const NamespaceString ns(collectionName);
 
         if (ns.isDropPendingNamespace()) {
-            auto dropOpTime = fassertStatusOK(40459, ns.getDropPendingNamespaceOpTime());
+            auto dropOpTime = fassert(40459, ns.getDropPendingNamespaceOpTime());
             log() << "Found drop-pending namespace " << ns << " with drop optime " << dropOpTime;
             repl::DropPendingCollectionReaper::get(opCtx)->addDropPendingNamespace(dropOpTime, ns);
         }
@@ -209,7 +226,9 @@ void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx, Databas
 unsigned long long checkIfReplMissingFromCommandLine(OperationContext* opCtx) {
     // This is helpful for the query below to work as you can't open files when readlocked
     Lock::GlobalWrite lk(opCtx);
-    if (!repl::getGlobalReplicationCoordinator()->getSettings().usingReplSets()) {
+    if (!repl::ReplicationCoordinator::get(getGlobalServiceContext())
+             ->getSettings()
+             .usingReplSets()) {
         DBDirectClient c(opCtx);
         return c.count(kSystemReplSetCollection.ns());
     }
@@ -246,6 +265,8 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
     std::vector<std::string> dbNames;
     storageEngine->listDatabases(&dbNames);
 
+    bool repairVerifiedAllCollectionsHaveUUIDs = false;
+
     // Repair all databases first, so that we do not try to open them if they are in bad shape
     if (storageGlobalParams.repair) {
         invariant(!storageGlobalParams.readOnly);
@@ -253,6 +274,14 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
             LOG(1) << "    Repairing database: " << dbName;
             fassert(18506, repairDatabase(opCtx, storageEngine, dbName));
         }
+
+        // All collections must have UUIDs before restoring the FCV document to a version that
+        // requires UUIDs.
+        Status uuidsStatus = ensureAllCollectionsHaveUUIDs(opCtx, dbNames);
+        if (!uuidsStatus.isOK()) {
+            return uuidsStatus;
+        }
+        repairVerifiedAllCollectionsHaveUUIDs = true;
 
         // Attempt to restore the featureCompatibilityVersion document if it is missing.
         NamespaceString nss(FeatureCompatibilityVersion::kCollection);
@@ -263,12 +292,20 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
         if (!db || !(versionColl = db->getCollection(opCtx, nss)) ||
             !Helpers::findOne(opCtx,
                               versionColl,
-                              BSON("_id" << FeatureCompatibilityVersion::kParameterName),
+                              BSON("_id" << FeatureCompatibilityVersionParser::kParameterName),
                               featureCompatibilityVersion)) {
             auto status = restoreMissingFeatureCompatibilityVersionDocument(opCtx, dbNames);
             if (!status.isOK()) {
                 return status;
             }
+        }
+    }
+
+    // All collections must have UUIDs.
+    if (!repairVerifiedAllCollectionsHaveUUIDs) {
+        Status uuidsStatus = ensureAllCollectionsHaveUUIDs(opCtx, dbNames);
+        if (!uuidsStatus.isOK()) {
+            return uuidsStatus;
         }
     }
 
@@ -278,7 +315,18 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
     if (!storageGlobalParams.readOnly) {
         StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> swIndexesToRebuild =
             storageEngine->reconcileCatalogAndIdents(opCtx);
-        fassertStatusOK(40593, swIndexesToRebuild);
+        fassert(40593, swIndexesToRebuild);
+
+        if (!swIndexesToRebuild.getValue().empty() && serverGlobalParams.indexBuildRetry) {
+            log() << "note: restart the server with --noIndexBuildRetry "
+                  << "to skip index rebuilds";
+        }
+
+        if (!serverGlobalParams.indexBuildRetry) {
+            log() << "  not rebuilding interrupted indexes";
+            swIndexesToRebuild.getValue().clear();
+        }
+
         for (auto&& collIndexPair : swIndexesToRebuild.getValue()) {
             const std::string& coll = collIndexPair.first;
             const std::string& indexName = collIndexPair.second;
@@ -299,8 +347,8 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
 
             invariant(swIndexToRebuild.getValue().first.size() == 1 &&
                       swIndexToRebuild.getValue().second.size() == 1);
-            fassertStatusOK(
-                40592, rebuildIndexesOnCollection(opCtx, dbce, cce, swIndexToRebuild.getValue()));
+            fassert(40592,
+                    rebuildIndexesOnCollection(opCtx, dbce, cce, swIndexToRebuild.getValue()));
         }
 
         // We open the "local" database before calling checkIfReplMissingFromCommandLine() to
@@ -318,11 +366,7 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
     // to. The local DB is special because it is not replicated.  See SERVER-10927 for more
     // details.
     const bool shouldClearNonLocalTmpCollections =
-        !(checkIfReplMissingFromCommandLine(opCtx) || replSettings.usingReplSets() ||
-          replSettings.isSlave());
-
-    // To check whether we are upgrading to 3.6 or have already upgraded to 3.6.
-    bool collsHaveUuids = false;
+        !(checkIfReplMissingFromCommandLine(opCtx) || replSettings.usingReplSets());
 
     // To check whether a featureCompatibilityVersion document exists.
     bool fcvDocumentExists = false;
@@ -369,12 +413,13 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
             if (Collection* versionColl =
                     db->getCollection(opCtx, FeatureCompatibilityVersion::kCollection)) {
                 BSONObj featureCompatibilityVersion;
-                if (Helpers::findOne(opCtx,
-                                     versionColl,
-                                     BSON("_id" << FeatureCompatibilityVersion::kParameterName),
-                                     featureCompatibilityVersion)) {
+                if (Helpers::findOne(
+                        opCtx,
+                        versionColl,
+                        BSON("_id" << FeatureCompatibilityVersionParser::kParameterName),
+                        featureCompatibilityVersion)) {
                     auto swVersion =
-                        FeatureCompatibilityVersion::parse(featureCompatibilityVersion);
+                        FeatureCompatibilityVersionParser::parse(featureCompatibilityVersion);
                     if (!swVersion.isOK()) {
                         severe() << swVersion.getStatus();
                         // Note this error path captures all cases of an FCV document existing,
@@ -386,7 +431,7 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
                                        "featureCompatibilityVersion document. The data files need "
                                        "to be fully upgraded to version 3.4 before attempting an "
                                        "upgrade to 3.6. If you are upgrading to 3.6, see "
-                                    << upgradeLink
+                                    << feature_compatibility_version_documentation::kUpgradeLink
                                     << "."};
                     }
                     fcvDocumentExists = true;
@@ -397,29 +442,11 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
                     // On startup, if the version is in an upgrading or downrading state, print a
                     // warning.
                     if (version ==
-                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo36) {
-                        log() << "** WARNING: A featureCompatibilityVersion upgrade did not "
-                              << "complete." << startupWarningsLog;
-                        log() << "**          The current featureCompatibilityVersion is "
-                              << FeatureCompatibilityVersion::toString(version) << "."
-                              << startupWarningsLog;
-                        log() << "**          To fix this, use the setFeatureCompatibilityVersion "
-                              << "command to resume upgrade to 3.6." << startupWarningsLog;
-                    } else if (version == ServerGlobalParams::FeatureCompatibility::Version::
-                                              kDowngradingTo34) {
-                        log() << "** WARNING: A featureCompatibilityVersion downgrade did not "
-                              << "complete. " << startupWarningsLog;
-                        log() << "**          The current featureCompatibilityVersion is "
-                              << FeatureCompatibilityVersion::toString(version) << "."
-                              << startupWarningsLog;
-                        log() << "**          To fix this, use the setFeatureCompatibilityVersion "
-                              << "command to resume downgrade to 3.4." << startupWarningsLog;
-                    } else if (version ==
-                               ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40) {
+                        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40) {
                         log() << "** WARNING: A featureCompatibilityVersion upgrade did not "
                               << "complete. " << startupWarningsLog;
                         log() << "**          The current featureCompatibilityVersion is "
-                              << FeatureCompatibilityVersion::toString(version) << "."
+                              << FeatureCompatibilityVersionParser::toString(version) << "."
                               << startupWarningsLog;
                         log() << "**          To fix this, use the setFeatureCompatibilityVersion "
                               << "command to resume upgrade to 4.0." << startupWarningsLog;
@@ -428,21 +455,12 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
                         log() << "** WARNING: A featureCompatibilityVersion downgrade did not "
                               << "complete. " << startupWarningsLog;
                         log() << "**          The current featureCompatibilityVersion is "
-                              << FeatureCompatibilityVersion::toString(version) << "."
+                              << FeatureCompatibilityVersionParser::toString(version) << "."
                               << startupWarningsLog;
                         log() << "**          To fix this, use the setFeatureCompatibilityVersion "
                               << "command to resume downgrade to 3.6." << startupWarningsLog;
                     }
                 }
-            }
-        }
-
-        // Iterate through collections and check for UUIDs.
-        for (auto collectionIt = db->begin(); !collsHaveUuids && collectionIt != db->end();
-             ++collectionIt) {
-            Collection* coll = *collectionIt;
-            if (coll->uuid()) {
-                collsHaveUuids = true;
             }
         }
 
@@ -502,21 +520,16 @@ StatusWith<bool> repairDatabasesAndCheckVersion(OperationContext* opCtx) {
     // Fail to start up if there is no featureCompatibilityVersion document and there are non-local
     // databases present.
     if (!fcvDocumentExists && nonLocalDatabases) {
-        if (collsHaveUuids) {
-            severe()
-                << "Unable to start up mongod due to missing featureCompatibilityVersion document.";
-            if (opCtx->getServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
-                severe()
-                    << "Please run with --journalOptions "
-                    << static_cast<int>(MMAPV1Options::JournalRecoverOnly)
-                    << " to recover the journal. Then run with --repair to restore the document.";
-            } else {
-                severe() << "Please run with --repair to restore the document.";
-            }
-            fassertFailedNoTrace(40652);
+        severe()
+            << "Unable to start up mongod due to missing featureCompatibilityVersion document.";
+        if (opCtx->getServiceContext()->getGlobalStorageEngine()->isMmapV1()) {
+            severe() << "Please run with --journalOptions "
+                     << static_cast<int>(MMAPV1Options::JournalRecoverOnly)
+                     << " to recover the journal. Then run with --repair to restore the document.";
         } else {
-            return {ErrorCodes::MustDowngrade, mustDowngradeErrorMsg};
+            severe() << "Please run with --repair to restore the document.";
         }
+        fassertFailedNoTrace(40652);
     }
 
     LOG(1) << "done repairDatabases";

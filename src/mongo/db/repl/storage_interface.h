@@ -333,12 +333,6 @@ public:
                                                                  const NamespaceString& nss) = 0;
 
     /**
-     * Adds UUIDs for non-replicated collections. To be called only at the end of initial
-     * sync and only if the admin.system.version collection has a UUID.
-     */
-    virtual Status upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) = 0;
-
-    /**
      * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
      * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
      */
@@ -354,12 +348,22 @@ public:
      * Reverts the state of all database data to the last stable timestamp.
      *
      * The "local" database is exempt and none of its state should be reverted except for
-     * "local.replset.minvalid" and "local.replset.checkpointTimestamp" which should be reverted to
-     * the last stable timestamp.
+     * "local.replset.minvalid" which should be reverted to the last stable timestamp.
      *
      * The 'stable' timestamp is set by calling StorageInterface::setStableTimestamp.
      */
-    virtual Status recoverToStableTimestamp(ServiceContext* serviceCtx) = 0;
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(ServiceContext* serviceCtx) = 0;
+
+    /**
+     * Returns whether the storage engine supports "recover to stable timestamp".
+     */
+    virtual bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const = 0;
+
+    /**
+     * Returns the stable timestamp that the storage engine recovered to on startup. If the
+     * recovery point was not stable, returns "none".
+     */
+    virtual boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const = 0;
 
     /**
      * Waits for oplog writes to be visible in the oplog.

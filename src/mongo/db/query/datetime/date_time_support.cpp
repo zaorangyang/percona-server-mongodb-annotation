@@ -200,7 +200,7 @@ static timelib_tzinfo* timezonedatabase_gettzinfowrapper(char* tz_id,
 }
 
 Date_t TimeZoneDatabase::fromString(StringData dateString,
-                                    boost::optional<TimeZone> tz,
+                                    const TimeZone& tz,
                                     boost::optional<StringData> format) const {
     std::unique_ptr<timelib_error_container, TimeZoneDatabase::TimelibErrorContainerDeleter>
         errors{};
@@ -259,7 +259,7 @@ Date_t TimeZoneDatabase::fromString(StringData dateString,
                << errors->warning_messages[i].character << "'";
         }
 
-        uasserted(40553, sb.str());
+        uasserted(ErrorCodes::ConversionFailure, sb.str());
     }
 
     // If the time portion is fully missing, initialize to 0. This allows for the '%Y-%m-%d' format
@@ -272,33 +272,33 @@ Date_t TimeZoneDatabase::fromString(StringData dateString,
     if (parsedTime->y == TIMELIB_UNSET || parsedTime->m == TIMELIB_UNSET ||
         parsedTime->d == TIMELIB_UNSET || parsedTime->h == TIMELIB_UNSET ||
         parsedTime->i == TIMELIB_UNSET || parsedTime->s == TIMELIB_UNSET) {
-        uasserted(40545,
+        uasserted(ErrorCodes::ConversionFailure,
                   str::stream()
                       << "an incomplete date/time string has been found, with elements missing: \""
                       << dateString
                       << "\"");
     }
 
-    if (tz && !tz->isUtcZone()) {
+    if (!tz.isUtcZone()) {
         switch (parsedTime->zone_type) {
             case 0:
                 // Do nothing, as this indicates there is no associated time zone information.
                 break;
             case 1:
-                uasserted(40554,
+                uasserted(ErrorCodes::ConversionFailure,
                           "you cannot pass in a date/time string with GMT "
                           "offset together with a timezone argument");
                 break;
             case 2:
                 uasserted(
-                    40551,
+                    ErrorCodes::ConversionFailure,
                     str::stream()
                         << "you cannot pass in a date/time string with time zone information ('"
                         << parsedTime.get()->tz_abbr
                         << "') together with a timezone argument");
                 break;
             default:  // should technically not be possible to reach
-                uasserted(40552,
+                uasserted(ErrorCodes::ConversionFailure,
                           "you cannot pass in a date/time string with "
                           "time zone information and a timezone argument "
                           "at the same time");
@@ -306,7 +306,7 @@ Date_t TimeZoneDatabase::fromString(StringData dateString,
         }
     }
 
-    tz->adjustTimeZone(parsedTime.get());
+    tz.adjustTimeZone(parsedTime.get());
 
     return Date_t::fromMillisSinceEpoch(
         durationCount<Milliseconds>(Seconds(parsedTime->sse) + Microseconds(parsedTime->us)));

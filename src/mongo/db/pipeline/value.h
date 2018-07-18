@@ -31,7 +31,6 @@
 #include "mongo/base/static_assert.h"
 #include "mongo/base/string_data.h"
 #include "mongo/db/pipeline/value_internal.h"
-#include "mongo/platform/unordered_set.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
@@ -127,6 +126,8 @@ public:
     // TODO: add an unsafe version that can share storage with the BSONElement
     /// Deep-convert from BSONElement to Value
     explicit Value(const BSONElement& elem);
+
+    static constexpr StringData kISOFormatString = "%Y-%m-%dT%H:%M:%S.%LZ"_sd;
 
     /** Construct a long or integer-valued Value.
      *
@@ -349,6 +350,16 @@ public:
     void serializeForIDL(BSONArrayBuilder* builder) const;
     static Value deserializeForIDL(const BSONElement& element);
 
+    /**
+     * Constant double representation of 2^63, the smallest value that will overflow a long long.
+     *
+     * It is not safe to obtain this value by casting std::numeric_limits<long long>::max() to
+     * double, because the conversion loses precision, and the C++ standard leaves it up to the
+     * implentation to decide whether to round up to 2^63 or round down to the next representable
+     * value (2^63 - 2^10).
+     */
+    static const double kLongLongMaxPlusOneAsDouble;
+
 private:
     /** This is a "honeypot" to prevent unexpected implicit conversions to the accepted argument
      *  types. bool is especially bad since without this it will accept any pointer.
@@ -482,4 +493,4 @@ inline BSONBinData Value::getBinData() const {
     auto stringData = _storage.getString();
     return BSONBinData(stringData.rawData(), stringData.size(), _storage.binDataType());
 }
-};
+}  // namespace mongo

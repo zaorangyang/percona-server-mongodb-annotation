@@ -31,7 +31,6 @@
 #include "mongo/db/command_can_run_here.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -63,7 +62,7 @@ public:
     /**
      * Running an explain on a secondary requires explicitly setting slaveOk.
      */
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kOptIn;
     }
 
@@ -155,13 +154,9 @@ public:
         }
 
         // Actually call the nested command's explain(...) method.
-        Status explainStatus =
-            commToExplain->explain(opCtx, dbname, explainObj, verbosity.getValue(), &result);
-        if (!explainStatus.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, explainStatus);
-        }
-
-        return true;
+        commToExplain->parse(opCtx, OpMsgRequest::fromDBAndBody(dbname, explainObj))
+            ->explain(opCtx, verbosity.getValue(), &result);
+        return CommandHelpers::extractOrAppendOk(result);
     }
 
 } cmdExplain;

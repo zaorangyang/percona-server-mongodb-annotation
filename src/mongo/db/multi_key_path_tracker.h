@@ -30,6 +30,8 @@
 
 #include <string>
 
+#include <boost/optional.hpp>
+
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/operation_context.h"
 
@@ -41,6 +43,8 @@ struct MultikeyPathInfo {
     MultikeyPaths multikeyPaths;
 };
 
+using WorkerMultikeyPathInfo = std::vector<MultikeyPathInfo>;
+
 /**
  * An OperationContext decoration that tracks which indexes should be made multikey. This is used
  * by IndexCatalogEntryImpl::setMultikey() to track what indexes should be set as multikey during
@@ -50,6 +54,8 @@ struct MultikeyPathInfo {
 class MultikeyPathTracker {
 public:
     static const OperationContext::Decoration<MultikeyPathTracker> get;
+
+    static void mergeMultikeyPaths(MultikeyPaths* toMergeInto, const MultikeyPaths& newPaths);
 
     // Decoration requires a default constructor.
     MultikeyPathTracker() = default;
@@ -64,7 +70,13 @@ public:
     /**
      * Returns the multikey path information that has been saved.
      */
-    const std::vector<MultikeyPathInfo>& getMultikeyPathInfo() const;
+    const WorkerMultikeyPathInfo& getMultikeyPathInfo() const;
+
+    /**
+     * Returns the multikey path information for the given inputs, or boost::none if none exist.
+     */
+    const boost::optional<MultikeyPaths> getMultikeyPathInfo(const NamespaceString& nss,
+                                                             const std::string& indexName);
 
     /**
      * Specifies that we should track multikey path information on this MultikeyPathTracker. This is
@@ -87,7 +99,7 @@ public:
 
 
 private:
-    std::vector<MultikeyPathInfo> _multikeyPathInfo;
+    WorkerMultikeyPathInfo _multikeyPathInfo;
     bool _trackMultikeyPathInfo = false;
 };
 

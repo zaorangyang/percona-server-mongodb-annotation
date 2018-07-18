@@ -60,7 +60,7 @@ class ConfigSvrCreateCollectionCommand : public BasicCommand {
 public:
     ConfigSvrCreateCollectionCommand() : BasicCommand("_configsvrCreateCollection") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -88,8 +88,12 @@ public:
         return Status::OK();
     }
 
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
+    }
+
     bool run(OperationContext* opCtx,
-             const std::string& dbname,
+             const std::string& dbname_unused,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
 
@@ -109,7 +113,17 @@ public:
             IDLParserErrorContext("ConfigsvrCreateCollection"), cmdObj);
 
         CollectionOptions options;
-        uassertStatusOK(options.parse(createCmd.getOptions()));
+        if (auto requestOptions = createCmd.getOptions()) {
+            uassertStatusOK(options.parse(*requestOptions));
+        }
+
+        auto const catalogClient = Grid::get(opCtx)->catalogClient();
+        const NamespaceString nss(parseNs(dbname_unused, cmdObj));
+
+        auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+            opCtx, nss.db(), "createCollection", DistLockManager::kDefaultLockTimeout));
+        auto collDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
+            opCtx, nss.ns(), "createCollection", DistLockManager::kDefaultLockTimeout));
 
         ShardingCatalogManager::get(opCtx)->createCollection(opCtx, createCmd.getNs(), options);
 

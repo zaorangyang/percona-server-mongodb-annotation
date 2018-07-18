@@ -58,7 +58,7 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -71,6 +71,7 @@
 #include "mongo/db/system_index.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/platform/random.h"
+#include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point_service.h"
@@ -161,15 +162,10 @@ DatabaseImpl::~DatabaseImpl() {
 }
 
 void DatabaseImpl::close(OperationContext* opCtx, const std::string& reason) {
-    // XXX? - Do we need to close database under global lock or just DB-lock is sufficient ?
     invariant(opCtx->lockState()->isW());
 
     // Clear cache of oplog Collection pointer.
     repl::oplogCheckCloseDatabase(opCtx, this->_this);
-
-    if (BackgroundOperation::inProgForDb(_name)) {
-        log() << "warning: bg op in prog during close db? " << _name;
-    }
 
     for (auto&& pair : _collections) {
         auto* coll = pair.second;
@@ -556,7 +552,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
             log() << "dropCollection: " << fullns << " (" << uuidString << ") - index namespace '"
                   << index->indexNamespace()
                   << "' would be too long after drop-pending rename. Dropping index immediately.";
-            fassertStatusOK(40463, collection->getIndexCatalog()->dropIndex(opCtx, index));
+            fassert(40463, collection->getIndexCatalog()->dropIndex(opCtx, index));
             opObserver->onDropIndex(
                 opCtx, fullns, collection->uuid(), index->indexName(), index->infoObj());
         }
@@ -572,7 +568,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
             log() << "dropCollection: " << fullns << " (" << uuidString
                   << ") - no drop optime available for pending-drop. "
                   << "Dropping collection immediately.";
-            fassertStatusOK(40462, _finishDropCollection(opCtx, fullns, collection));
+            fassert(40462, _finishDropCollection(opCtx, fullns, collection));
             return Status::OK();
         }
     } else {
@@ -595,7 +591,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     log() << "dropCollection: " << fullns << " (" << uuidString
           << ") - renaming to drop-pending collection: " << dpns << " with drop optime "
           << dropOpTime;
-    fassertStatusOK(40464, renameCollection(opCtx, fullns.ns(), dpns.ns(), stayTemp));
+    fassert(40464, renameCollection(opCtx, fullns.ns(), dpns.ns(), stayTemp));
 
     // Register this drop-pending namespace with DropPendingCollectionReaper to remove when the
     // committed optime reaches the drop optime.
@@ -654,11 +650,9 @@ Collection* DatabaseImpl::getCollection(OperationContext* opCtx, const Namespace
 
     if (it != _collections.end() && it->second) {
         Collection* found = it->second;
-        if (enableCollectionUUIDs) {
-            NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
-            if (auto uuid = found->uuid())
-                cache.ensureNamespaceInCache(nss, uuid.get());
-        }
+        NamespaceUUIDCache& cache = NamespaceUUIDCache::get(opCtx);
+        if (auto uuid = found->uuid())
+            cache.ensureNamespaceInCache(nss, uuid.get());
         return found;
     }
 
@@ -771,22 +765,19 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     invariant(!options.isView());
     NamespaceString nss(ns);
 
-    uassert(ErrorCodes::CannotImplicitlyCreateCollection,
+    uassert(CannotImplicitlyCreateCollectionInfo(nss),
             "request doesn't allow collection to be created implicitly",
             OperationShardingState::get(opCtx).allowImplicitCollectionCreation());
 
     CollectionOptions optionsWithUUID = options;
     bool generatedUUID = false;
-    if (enableCollectionUUIDs && !optionsWithUUID.uuid &&
-        serverGlobalParams.featureCompatibility.isSchemaVersion36()) {
+    if (!optionsWithUUID.uuid) {
         auto coordinator = repl::ReplicationCoordinator::get(opCtx);
-        bool fullyUpgraded = serverGlobalParams.featureCompatibility.getVersion() >=
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36;
         bool canGenerateUUID =
             (coordinator->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) ||
             coordinator->canAcceptWritesForDatabase(opCtx, nss.db()) || nss.isSystemDotProfile();
 
-        if (fullyUpgraded && !canGenerateUUID) {
+        if (!canGenerateUUID) {
             std::string msg = str::stream() << "Attempted to create a new collection " << nss.ns()
                                             << " without a UUID";
             severe() << msg;
@@ -823,8 +814,10 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
         if (collection->requiresIdIndex()) {
             if (optionsWithUUID.autoIndexId == CollectionOptions::YES ||
                 optionsWithUUID.autoIndexId == CollectionOptions::DEFAULT) {
+                // createCollection() may be called before the in-memory fCV parameter is
+                // initialized, so use the unsafe fCV getter here.
                 const auto featureCompatibilityVersion =
-                    serverGlobalParams.featureCompatibility.getVersion();
+                    serverGlobalParams.featureCompatibility.getVersionUnsafe();
                 IndexCatalog* ic = collection->getIndexCatalog();
                 fullIdIndexSpec = uassertStatusOK(ic->createIndexOnEmptyCollection(
                     opCtx,
@@ -1044,6 +1037,17 @@ auto mongo::userCreateNSImpl(OperationContext* opCtx,
     if (!collectionOptions.validator.isEmpty()) {
         boost::intrusive_ptr<ExpressionContext> expCtx(
             new ExpressionContext(opCtx, collator.get()));
+
+        // Save this to a variable to avoid reading the atomic variable multiple times.
+        const auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
+
+        // If the feature compatibility version is not 4.0, and we are validating features as
+        // master, ban the use of new agg features introduced in 4.0 to prevent them from being
+        // persisted in the catalog.
+        if (serverGlobalParams.validateFeaturesAsMaster.load() &&
+            currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
+            expCtx->maxFeatureCompatibilityVersion = currentFCV;
+        }
         auto statusWithMatcher =
             MatchExpressionParser::parse(collectionOptions.validator, std::move(expCtx));
 

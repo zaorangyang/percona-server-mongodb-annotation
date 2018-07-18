@@ -63,8 +63,7 @@ class StatusWith;
  * the manager by calling PinnedCursor::returnCursor().
  *
  * The manager supports killing of registered cursors, either through the PinnedCursor object or
- * with the kill*() suite of methods.  These simply mark the affected cursors as 'kill pending',
- * which can be cleaned up by later calls to the reapZombieCursors() method.
+ * with the kill*() suite of methods.
  *
  * No public methods throw exceptions, and all public methods are thread-safe.
  *
@@ -127,10 +126,11 @@ public:
      * A PinnedCursor can either be in a state where it owns a cursor, or can be in a null state
      * where it owns no cursor.  If a cursor is owned, the underlying cursor can be iterated with
      * next(), and the underlying cursor can be returned to the manager with the returnCursor()
-     * method (and after it is returned, no cursor will be owned).
+     * method (and after it is returned, no cursor will be owned). When a PinnedCursor is created,
+     * the underlying cursor is attached to the current OperationContext.
      *
-     * Invoking the PinnedCursor's destructor while it owns a cursor will kill and return the
-     * cursor.
+     * Invoking the PinnedCursor's destructor while it owns a cursor will kill, detach from the
+     * current OperationContext, and return the cursor.
      */
     class PinnedCursor {
         MONGO_DISALLOW_COPYING(PinnedCursor);
@@ -167,17 +167,6 @@ public:
         StatusWith<ClusterQueryResult> next(RouterExecStage::ExecContext);
 
         /**
-         * Sets the operation context for the cursor. Must be called before the first call to
-         * next().
-         */
-        void reattachToOperationContext(OperationContext* opCtx);
-
-        /**
-         * Detaches the cursor from its current OperationContext.
-         */
-        void detachFromOperationContext();
-
-        /**
          * Returns whether or not the underlying cursor is tailing a capped collection.  Cannot be
          * called after returnCursor() is called.  A cursor must be owned.
          */
@@ -191,8 +180,9 @@ public:
         bool isTailableAndAwaitData() const;
 
         /**
-         * Transfers ownership of the underlying cursor back to the manager.  A cursor must be
-         * owned, and a cursor will no longer be owned after this method completes.
+         * Transfers ownership of the underlying cursor back to the manager, and detaches it from
+         * the current OperationContext. A cursor must be owned, and a cursor will no longer be
+         * owned after this method completes.
          *
          * If 'Exhausted' is passed, the manager will de-register and destroy the cursor after it
          * is returned.
@@ -310,6 +300,8 @@ public:
      * returns an error Status with code CursorInUse.  If the given cursor is not registered or has
      * a pending kill, returns an error Status with code CursorNotFound.
      *
+     * Checking out a cursor will attach it to the given operation context.
+     *
      * 'authChecker' is function that will be called with the list of users authorized to use this
      * cursor. This function should check whether the current client is also authorized to use this
      * cursor, and if not, return an error status, which will cause checkOutCursor to fail.
@@ -342,38 +334,32 @@ public:
      * If the given cursor is not registered, returns an error Status with code CursorNotFound.
      * Otherwise, marks the cursor as 'kill pending' and returns Status::OK().
      *
-     * Does not block.
+     * A thread which is currently using a cursor may not call killCursor() on it, but rather
+     * should kill the cursor by checking it back into the manager in the exhausted state.
+     *
+     * May block waiting for other threads to finish, but does not block on the network.
      */
-    Status killCursor(const NamespaceString& nss, CursorId cursorId);
+    Status killCursor(OperationContext* opCtx, const NamespaceString& nss, CursorId cursorId);
 
     /**
      * Informs the manager that all mortal cursors with a 'last active' time equal to or earlier
      * than 'cutoff' should be killed.  The cursors need not necessarily be in the 'idle' state.
      *
-     * Does not block.
+     * May block waiting for other threads to finish, but does not block on the network.
+     *
+     * Returns the number of cursors that were killed due to inactivity.
      */
-    void killMortalCursorsInactiveSince(Date_t cutoff);
+    std::size_t killMortalCursorsInactiveSince(OperationContext* opCtx, Date_t cutoff);
 
     /**
-     * Informs the manager that all currently-registered cursors should be killed (regardless of
-     * pinned status or lifetime type).
+     * Kills all cursors which are registered at the time of the call. If a cursor is registered
+     * while this function is running, it may not be killed. If the caller wants to guarantee that
+     * all cursors are killed, shutdown() should be used instead.
      *
-     * Does not block.
+     * May block waiting for other threads to finish, but does not block on the network.
      */
-    void killAllCursors();
+    void killAllCursors(OperationContext* opCtx);
 
-    /**
-     * Attempts to performs a blocking kill and deletion of all non-pinned cursors that are marked
-     * as 'kill pending'. Returns the number of cursors that were marked as inactive.
-     *
-     * If no other non-const methods are called simultaneously, it is guaranteed that this method
-     * will delete all non-pinned cursors marked as 'kill pending'. Otherwise, no such guarantee is
-     * made (this is due to the fact that the blocking kill for each cursor is performed outside of
-     * the cursor manager lock).
-     *
-     * Can block.
-     */
-    std::size_t reapZombieCursors(OperationContext* opCtx);
 
     /**
      * Returns the number of open cursors on a ClusterCursorManager, broken down by type.
@@ -423,16 +409,16 @@ public:
 
 private:
     class CursorEntry;
+    struct CursorEntryContainer;
     using CursorEntryMap = stdx::unordered_map<CursorId, CursorEntry>;
+    using NssToCursorContainerMap =
+        stdx::unordered_map<NamespaceString, CursorEntryContainer, NamespaceString::Hasher>;
 
     /**
      * Transfers ownership of the given pinned cursor back to the manager, and moves the cursor to
      * the 'idle' state.
      *
-     * If 'cursorState' is 'Exhausted', the cursor will be destroyed.  However, destruction will be
-     * delayed until reapZombieCursors() is called under the following circumstances:
-     *   - The cursor is already marked as 'kill pending'.
-     *   - The cursor is managing open remote cursors which still need to be cleaned up.
+     * If 'cursorState' is 'Exhausted', the cursor will be destroyed.
      *
      * Thread-safe.
      *
@@ -443,6 +429,14 @@ private:
                        const NamespaceString& nss,
                        CursorId cursorId,
                        CursorState cursorState);
+
+    /**
+     * Will detach a cursor, release the lock and then call kill() on it.
+     */
+    void detachAndKillCursor(stdx::unique_lock<stdx::mutex> lk,
+                             OperationContext* opCtx,
+                             const NamespaceString& nss,
+                             CursorId cursorId);
 
     /**
      * Returns a pointer to the CursorEntry for the given cursor.  If the given cursor is not
@@ -464,6 +458,20 @@ private:
     StatusWith<std::unique_ptr<ClusterClientCursor>> _detachCursor(WithLock,
                                                                    NamespaceString const& nss,
                                                                    CursorId cursorId);
+
+    /**
+     * Flags the OperationContext that's using the given cursor as interrupted.
+     */
+    void killOperationUsingCursor(WithLock, CursorEntry* entry);
+
+    /**
+     * Kill the cursors satisfying the given predicate. Assumes that 'lk' is held upon entry.
+     *
+     * Returns the number of cursors killed.
+     */
+    std::size_t killCursorsSatisfying(stdx::unique_lock<stdx::mutex> lk,
+                                      OperationContext* opCtx,
+                                      std::function<bool(CursorId, const CursorEntry&)> pred);
 
     /**
      * CursorEntry is a moveable, non-copyable container for a single cursor.
@@ -492,12 +500,11 @@ private:
         CursorEntry(CursorEntry&& other) = default;
         CursorEntry& operator=(CursorEntry&& other) = default;
 
-        bool getKillPending() const {
-            return _killPending;
-        }
-
-        bool isInactive() const {
-            return _isInactive;
+        bool isKillPending() const {
+            // A cursor is kill pending if it's checked out by an OperationContext that was
+            // interrupted.
+            return _operationUsingCursor &&
+                !_operationUsingCursor->checkForInterruptNoAssert().isOK();
         }
 
         CursorType getCursorType() const {
@@ -546,14 +553,6 @@ private:
             _operationUsingCursor = nullptr;
         }
 
-        void setKillPending() {
-            _killPending = true;
-        }
-
-        void setInactive() {
-            _isInactive = true;
-        }
-
         void setLastActive(Date_t lastActive) {
             _lastActive = lastActive;
         }
@@ -564,8 +563,6 @@ private:
 
     private:
         std::unique_ptr<ClusterClientCursor> _cursor;
-        bool _killPending = false;
-        bool _isInactive = false;
         CursorType _cursorType = CursorType::SingleTarget;
         CursorLifetime _cursorLifetime = CursorLifetime::Mortal;
         Date_t _lastActive;
@@ -597,6 +594,12 @@ private:
         CursorEntryMap entryMap;
     };
 
+    /**
+     * Erase the container that 'it' points to and return an iterator to the next one. Assumes 'it'
+     * is an iterator in '_namespaceToContainerMap'.
+     */
+    NssToCursorContainerMap::iterator eraseContainer(NssToCursorContainerMap::iterator it);
+
     // Clock source.  Used when the 'last active' time for a cursor needs to be set/updated.  May be
     // concurrently accessed by multiple threads.
     ClockSource* _clockSource;
@@ -625,8 +628,7 @@ private:
     //
     // Entries are added when the first cursor on the given namespace is registered, and removed
     // when the last cursor on the given namespace is destroyed.
-    stdx::unordered_map<NamespaceString, CursorEntryContainer, NamespaceString::Hasher>
-        _namespaceToContainerMap;
+    NssToCursorContainerMap _namespaceToContainerMap;
 
     size_t _cursorsTimedOut = 0;
 };

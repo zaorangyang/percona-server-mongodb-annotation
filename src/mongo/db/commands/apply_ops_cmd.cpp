@@ -50,7 +50,6 @@
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -163,13 +162,6 @@ OplogApplicationValidity validateApplyOpsCommand(const BSONObj& cmdObj) {
 
             bool opHasUUIDs = operationContainsUUID(opObj);
 
-            if (serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34) {
-                uassert(ErrorCodes::OplogOperationUnsupported,
-                        "applyOps with UUID requires upgrading to FeatureCompatibilityVersion 3.6",
-                        !opHasUUIDs);
-            }
-
             // If the op uses any UUIDs at all then the user must possess extra privileges.
             if (opHasUUIDs && ret == OplogApplicationValidity::kOk)
                 ret = OplogApplicationValidity::kNeedsUseUUID;
@@ -202,7 +194,7 @@ class ApplyOpsCmd : public BasicCommand {
 public:
     ApplyOpsCmd() : BasicCommand("applyOps") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 

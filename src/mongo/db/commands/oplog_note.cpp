@@ -46,7 +46,6 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 
@@ -87,7 +86,7 @@ class AppendOplogNoteCmd : public BasicCommand {
 public:
     AppendOplogNoteCmd() : BasicCommand("appendOplogNote") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 

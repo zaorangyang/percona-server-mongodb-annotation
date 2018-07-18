@@ -80,16 +80,6 @@ class ReplSetRequestVotesResponse;
 class UpdatePositionArgs;
 
 /**
- * Global variable that contains a std::string telling why master/slave halted
- *
- * "dead" means something really bad happened like replication falling completely out of sync.
- * when non-null, we are dead and the string is informational
- *
- * TODO(dannenberg) remove when master slave goes
- */
-extern const char* replAllDead;
-
-/**
  * The ReplicationCoordinator is responsible for coordinating the interaction of replication
  * with the rest of the system.  The public methods on ReplicationCoordinator are the public
  * API that the replication subsystem presents to the rest of the codebase.
@@ -760,8 +750,7 @@ public:
      * Prepares a metadata object with the ReplSetMetadata and the OplogQueryMetadata depending
      * on what has been requested.
      */
-    virtual void prepareReplMetadata(OperationContext* opCtx,
-                                     const BSONObj& metadataRequestObj,
+    virtual void prepareReplMetadata(const BSONObj& metadataRequestObj,
                                      const OpTime& lastOpTimeFromClient,
                                      BSONObjBuilder* builder) const = 0;
 

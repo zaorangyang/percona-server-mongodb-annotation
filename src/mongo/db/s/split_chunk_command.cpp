@@ -68,7 +68,7 @@ public:
         return false;
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -147,18 +147,7 @@ public:
         }
 
         OID expectedCollectionEpoch;
-        if (cmdObj.hasField("epoch")) {
-            auto epochStatus = bsonExtractOIDField(cmdObj, "epoch", &expectedCollectionEpoch);
-            uassert(
-                ErrorCodes::InvalidOptions, "unable to parse collection epoch", epochStatus.isOK());
-        } else {
-            // Backwards compatibility with v3.4 mongos, which will send 'shardVersion' and not
-            // 'epoch'.
-            const auto& oss = OperationShardingState::get(opCtx);
-            uassert(
-                ErrorCodes::InvalidOptions, "collection version is missing", oss.hasShardVersion());
-            expectedCollectionEpoch = oss.getShardVersion(nss).epoch();
-        }
+        uassertStatusOK(bsonExtractOIDField(cmdObj, "epoch", &expectedCollectionEpoch));
 
         auto statusWithOptionalChunkRange = splitChunk(
             opCtx, nss, keyPatternObj, chunkRange, splitKeys, shardName, expectedCollectionEpoch);

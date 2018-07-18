@@ -54,7 +54,6 @@
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
-#include "mongo/platform/unordered_map.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -74,7 +73,7 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
     bool supportsReadConcern(const std::string& dbName,
@@ -304,9 +303,8 @@ public:
 
             return CommandHelpers::appendCommandStatus(
                 result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream() << "Executor error during geoNear command: "
-                                     << WorkingSetCommon::toStatusString(currObj)));
+                WorkingSetCommon::getMemberObjectStatus(currObj).withContext(
+                    "Executor error during geoNear command"));
         }
 
         PlanSummaryStats summary;

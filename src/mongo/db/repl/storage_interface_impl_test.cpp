@@ -87,7 +87,6 @@ NamespaceString makeNamespace(const T& t, const std::string& suffix = "") {
  * Generates a default CollectionOptions object with a UUID. These options should be used
  * when creating a collection in this test because otherwise, collections will not be created
  * with UUIDs. All collections are expected to have UUIDs.
- * TODO(SERVER-31540) Remove once UUID is no longer a boost::optional in CollectionOptions.
  */
 CollectionOptions generateOptionsWithUuid() {
     CollectionOptions options;
@@ -395,7 +394,7 @@ TEST_F(StorageInterfaceImplTest, GetRollbackIDReturnsBadStatusIfRollbackIDIsNotI
 
 TEST_F(StorageInterfaceImplTest, SnapshotSupported) {
     auto opCtx = getOperationContext();
-    Status status = opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot();
+    Status status = opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot();
     ASSERT(status.isOK());
 }
 

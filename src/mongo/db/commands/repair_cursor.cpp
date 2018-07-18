@@ -52,7 +52,7 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
@@ -105,7 +105,7 @@ public:
             {std::move(exec),
              ns,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-             opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+             opCtx->recoveryUnit()->getReadConcernLevel(),
              cmdObj});
 
         appendCursorResponseObject(

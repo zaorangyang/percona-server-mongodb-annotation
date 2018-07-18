@@ -237,43 +237,6 @@ TEST_F(DatabaseTest,
     ASSERT_EQUALS(dropOpTime, *reaperEarliestDropOpTime);
 }
 
-/**
- * Sets up ReplicationCoordinator for master/slave.
- */
-void _setUpMasterSlave(ServiceContext* service) {
-    repl::ReplSettings settings;
-    settings.setOplogSizeBytes(10 * 1024 * 1024);
-    settings.setMaster(true);
-    repl::ReplicationCoordinator::set(
-        service, stdx::make_unique<repl::ReplicationCoordinatorMock>(service, settings));
-    auto replCoord = repl::ReplicationCoordinator::get(service);
-    ASSERT_TRUE(repl::ReplicationCoordinator::modeMasterSlave == replCoord->getReplicationMode());
-}
-
-TEST_F(DatabaseTest,
-       DropCollectionDropsCollectionAndLogsOperationIfWritesAreReplicatedAndReplModeIsMasterSlave) {
-    _setUpMasterSlave(getServiceContext());
-
-    ASSERT_TRUE(_opCtx->writesAreReplicated());
-    ASSERT_FALSE(
-        repl::ReplicationCoordinator::get(_opCtx.get())->isOplogDisabledFor(_opCtx.get(), _nss));
-
-    _testDropCollection(_opCtx.get(), _nss, true);
-
-    // Drop optime is non-null because an op was written to the oplog.
-    auto dropOpTime = repl::ReplClientInfo::forClient(&cc()).getLastOp();
-    ASSERT_GREATER_THAN(dropOpTime, repl::OpTime());
-
-    // Replicated collection should not be renamed under master/slave.
-    auto dpns = _nss.makeDropPendingNamespace(dropOpTime);
-    ASSERT_FALSE(mongo::AutoGetCollectionForRead(_opCtx.get(), dpns).getCollection());
-
-    // Reaper should not have the drop optime of the collection.
-    auto reaperEarliestDropOpTime =
-        repl::DropPendingCollectionReaper::get(_opCtx.get())->getEarliestDropOpTime();
-    ASSERT_FALSE(reaperEarliestDropOpTime);
-}
-
 TEST_F(DatabaseTest, DropCollectionRejectsProvidedDropOpTimeIfWritesAreReplicated) {
     ASSERT_TRUE(_opCtx->writesAreReplicated());
     ASSERT_FALSE(
@@ -318,40 +281,6 @@ TEST_F(
         repl::DropPendingCollectionReaper::get(_opCtx.get())->getEarliestDropOpTime();
     ASSERT_TRUE(reaperEarliestDropOpTime);
     ASSERT_EQUALS(dropOpTime, *reaperEarliestDropOpTime);
-}
-
-TEST_F(
-    DatabaseTest,
-    DropCollectionIgnoresProvidedDropOpTimeAndDropsCollectionButDoesNotLogOperationIfReplModeIsMasterSlave) {
-    _setUpMasterSlave(getServiceContext());
-
-    repl::UnreplicatedWritesBlock uwb(_opCtx.get());
-    ASSERT_FALSE(_opCtx->writesAreReplicated());
-    ASSERT_TRUE(
-        repl::ReplicationCoordinator::get(_opCtx.get())->isOplogDisabledFor(_opCtx.get(), _nss));
-
-    repl::OpTime dropOpTime(Timestamp(Seconds(100), 0), 1LL);
-    _testDropCollection(_opCtx.get(), _nss, true, dropOpTime);
-
-    // Last optime in repl client is null because we did not write to the oplog.
-    ASSERT_EQUALS(repl::OpTime(), repl::ReplClientInfo::forClient(&cc()).getLastOp());
-
-    // Collection is not renamed under master/slave.
-    auto dpns = _nss.makeDropPendingNamespace(dropOpTime);
-    ASSERT_FALSE(mongo::AutoGetCollectionForRead(_opCtx.get(), dpns).getCollection());
-
-    // Reaper should not have the drop optime of the collection.
-    auto reaperEarliestDropOpTime =
-        repl::DropPendingCollectionReaper::get(_opCtx.get())->getEarliestDropOpTime();
-    ASSERT_FALSE(reaperEarliestDropOpTime);
-}
-
-TEST_F(DatabaseTest, DropPendingCollectionIsAllowedToHaveDocumentValidators) {
-    CollectionOptions opts;
-    opts.validator = BSON("x" << BSON("$type"
-                                      << "string"));
-    opts.validationAction = "error";
-    _testDropCollection(_opCtx.get(), _nss, true, {}, opts);
 }
 
 void _testDropCollectionThrowsExceptionIfThereAreIndexesInProgress(OperationContext* opCtx,
@@ -542,28 +471,6 @@ TEST_F(
     });
 }
 
-TEST_F(DatabaseTest, DBLockCanBePassedToAutoGetDb) {
-    NamespaceString nss("test", "coll");
-    Lock::DBLock lock(_opCtx.get(), nss.db(), MODE_X);
-    {
-        AutoGetDb db(_opCtx.get(), nss.db(), std::move(lock));
-        ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
-    }
-    // The moved lock should go out of scope here, so the database should no longer be locked.
-    ASSERT_FALSE(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
-}
-
-TEST_F(DatabaseTest, DBLockCanBePassedToAutoGetCollectionOrViewForReadCommand) {
-    NamespaceString nss("test", "coll");
-    Lock::DBLock lock(_opCtx.get(), nss.db(), MODE_X);
-    {
-        AutoGetCollectionOrViewForReadCommand coll(_opCtx.get(), nss, std::move(lock));
-        ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
-    }
-    // The moved lock should go out of scope here, so the database should no longer be locked.
-    ASSERT_FALSE(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
-}
-
 TEST_F(DatabaseTest, AutoGetDBSucceedsWithDeadlineNow) {
     NamespaceString nss("test", "coll");
     Lock::DBLock lock(_opCtx.get(), nss.db(), MODE_X);
@@ -588,29 +495,32 @@ TEST_F(DatabaseTest, AutoGetDBSucceedsWithDeadlineMin) {
     }
 }
 
-TEST_F(DatabaseTest, AutoGetCollectionOrViewForReadCommandSucceedsWithDeadlineNow) {
+TEST_F(DatabaseTest, AutoGetCollectionForReadCommandSucceedsWithDeadlineNow) {
     NamespaceString nss("test", "coll");
     Lock::DBLock dbLock(_opCtx.get(), nss.db(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
     Lock::CollectionLock collLock(_opCtx.get()->lockState(), nss.toString(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isCollectionLockedForMode(nss.toString(), MODE_X));
     try {
-        AutoGetCollectionOrViewForReadCommand db(_opCtx.get(), nss, Date_t::now());
+        AutoGetCollectionForReadCommand db(
+            _opCtx.get(), nss, AutoGetCollection::kViewsForbidden, Date_t::now());
     } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
         FAIL("Should get the db within the timeout");
     }
 }
 
-TEST_F(DatabaseTest, AutoGetCollectionOrViewForReadCommandSucceedsWithDeadlineMin) {
+TEST_F(DatabaseTest, AutoGetCollectionForReadCommandSucceedsWithDeadlineMin) {
     NamespaceString nss("test", "coll");
     Lock::DBLock dbLock(_opCtx.get(), nss.db(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isDbLockedForMode(nss.db(), MODE_X));
     Lock::CollectionLock collLock(_opCtx.get()->lockState(), nss.toString(), MODE_X);
     ASSERT(_opCtx.get()->lockState()->isCollectionLockedForMode(nss.toString(), MODE_X));
     try {
-        AutoGetCollectionOrViewForReadCommand db(_opCtx.get(), nss, Date_t::min());
+        AutoGetCollectionForReadCommand db(
+            _opCtx.get(), nss, AutoGetCollection::kViewsForbidden, Date_t::min());
     } catch (const ExceptionFor<ErrorCodes::LockTimeout>&) {
         FAIL("Should get the db within the timeout");
     }
 }
+
 }  // namespace

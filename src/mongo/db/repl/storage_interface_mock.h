@@ -125,7 +125,6 @@ public:
     using IsAdminDbValidFn = stdx::function<Status(OperationContext* opCtx)>;
     using GetCollectionUUIDFn = stdx::function<StatusWith<OptionalCollectionUUID>(
         OperationContext* opCtx, const NamespaceString& nss)>;
-    using UpgradeUUIDSchemaVersionNonReplicatedFn = stdx::function<Status(OperationContext* opCtx)>;
 
     StorageInterfaceMock() = default;
 
@@ -278,10 +277,6 @@ public:
         return getCollectionUUIDFn(opCtx, nss);
     }
 
-    Status upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) override {
-        return upgradeUUIDSchemaVersionNonReplicatedFn(opCtx);
-    }
-
     void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
@@ -290,8 +285,16 @@ public:
 
     Timestamp getInitialDataTimestamp() const;
 
-    Status recoverToStableTimestamp(ServiceContext* serviceCtx) override {
+    StatusWith<Timestamp> recoverToStableTimestamp(ServiceContext* serviceCtx) override {
         return Status{ErrorCodes::IllegalOperation, "recoverToStableTimestamp not implemented."};
+    }
+
+    bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override {
+        return false;
+    }
+
+    boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override {
+        return boost::none;
     }
 
     Status isAdminDbValid(OperationContext* opCtx) override {
@@ -362,11 +365,6 @@ public:
     GetCollectionUUIDFn getCollectionUUIDFn = [](
         OperationContext* opCtx, const NamespaceString& nss) -> StatusWith<OptionalCollectionUUID> {
         return Status{ErrorCodes::IllegalOperation, "GetCollectionUUIDFn not implemented."};
-    };
-    UpgradeUUIDSchemaVersionNonReplicatedFn upgradeUUIDSchemaVersionNonReplicatedFn =
-        [](OperationContext* opCtx) -> Status {
-        return Status{ErrorCodes::IllegalOperation,
-                      "UpgradeUUIDSchemaVersionNonReplicatedFn not implemented."};
     };
 
 private:

@@ -53,7 +53,6 @@ namespace {
 const auto getReplicationProcess =
     ServiceContext::declareDecoration<std::unique_ptr<ReplicationProcess>>();
 
-const auto kRollbackNamespacePrefix = "local.system.rollback."_sd;
 }  // namespace
 
 ReplicationProcess* ReplicationProcess::get(ServiceContext* service) {
@@ -83,23 +82,31 @@ ReplicationProcess::ReplicationProcess(
       _recovery(std::move(recovery)),
       _rbid(kUninitializedRollbackId) {}
 
-StatusWith<int> ReplicationProcess::getRollbackID(OperationContext* opCtx) {
+Status ReplicationProcess::refreshRollbackID(OperationContext* opCtx) {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
 
-    if (kUninitializedRollbackId != _rbid) {
-        return _rbid;
-    }
-
-    // The _rbid, which caches the rollback ID persisted in the local.system.rollback.id collection,
-    // may be uninitialized because this is the first time we are retrieving the rollback ID.
     auto rbidResult = _storageInterface->getRollbackID(opCtx);
     if (!rbidResult.isOK()) {
-        return rbidResult;
+        return rbidResult.getStatus();
     }
-    log() << "Rollback ID is " << rbidResult.getValue();
+
+    if (kUninitializedRollbackId == _rbid) {
+        log() << "Rollback ID is " << rbidResult.getValue();
+    } else {
+        log() << "Rollback ID is " << rbidResult.getValue() << " (previously " << _rbid << ")";
+    }
     _rbid = rbidResult.getValue();
 
-    invariant(kUninitializedRollbackId != _rbid);
+    return Status::OK();
+}
+
+int ReplicationProcess::getRollbackID() const {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    if (kUninitializedRollbackId == _rbid) {
+        // This may happen when serverStatus is called by an internal client before we have a chance
+        // to read the rollback ID from storage.
+        warning() << "Rollback ID is not initialized yet.";
+    }
     return _rbid;
 }
 

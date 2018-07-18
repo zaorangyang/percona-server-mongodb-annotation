@@ -36,7 +36,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/client/remote_command_targeter_factory_mock.h"
 #include "mongo/client/remote_command_targeter_mock.h"
-#include "mongo/db/catalog/catalog_raii.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
@@ -162,10 +162,6 @@ std::unique_ptr<ShardingCatalogClient> ConfigServerTestFixture::makeShardingCata
     return stdx::make_unique<ShardingCatalogClientImpl>(std::move(distLockManager));
 }
 
-std::unique_ptr<CatalogCache> ConfigServerTestFixture::makeCatalogCache() {
-    return stdx::make_unique<CatalogCache>(CatalogCacheLoader::get(getServiceContext()));
-}
-
 std::unique_ptr<BalancerConfiguration> ConfigServerTestFixture::makeBalancerConfiguration() {
     return stdx::make_unique<BalancerConfiguration>();
 }
@@ -243,25 +239,25 @@ Status ConfigServerTestFixture::deleteToConfigCollection(OperationContext* opCtx
                                                          const NamespaceString& ns,
                                                          const BSONObj& doc,
                                                          const bool multi) {
-    auto deleteReponse = getConfigShard()->runCommand(opCtx,
-                                                      kReadPref,
-                                                      ns.db().toString(),
-                                                      [&]() {
-                                                          write_ops::Delete deleteOp(ns);
-                                                          deleteOp.setDeletes({[&] {
-                                                              write_ops::DeleteOpEntry entry;
-                                                              entry.setQ(doc);
-                                                              entry.setMulti(multi);
-                                                              return entry;
-                                                          }()});
-                                                          return deleteOp.toBSON({});
-                                                      }(),
-                                                      Shard::kDefaultConfigCommandTimeout,
-                                                      Shard::RetryPolicy::kNoRetry);
+    auto deleteResponse = getConfigShard()->runCommand(opCtx,
+                                                       kReadPref,
+                                                       ns.db().toString(),
+                                                       [&]() {
+                                                           write_ops::Delete deleteOp(ns);
+                                                           deleteOp.setDeletes({[&] {
+                                                               write_ops::DeleteOpEntry entry;
+                                                               entry.setQ(doc);
+                                                               entry.setMulti(multi);
+                                                               return entry;
+                                                           }()});
+                                                           return deleteOp.toBSON({});
+                                                       }(),
+                                                       Shard::kDefaultConfigCommandTimeout,
+                                                       Shard::RetryPolicy::kNoRetry);
 
 
     BatchedCommandResponse batchResponse;
-    auto status = Shard::CommandResponse::processBatchWriteResponse(deleteReponse, &batchResponse);
+    auto status = Shard::CommandResponse::processBatchWriteResponse(deleteResponse, &batchResponse);
     return status;
 }
 

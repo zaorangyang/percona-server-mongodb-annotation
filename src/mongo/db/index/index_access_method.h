@@ -210,6 +210,12 @@ public:
                       const InsertDeleteOptions& options,
                       int64_t* numInserted);
 
+        const MultikeyPaths& getMultikeyPaths() const {
+            return _indexMultikeyPaths;
+        }
+
+        bool isMultikey() const;
+
     private:
         friend class IndexAccessMethod;
 
@@ -248,13 +254,13 @@ public:
      * Call this when you are ready to finish your bulk work.
      * Pass in the BulkBuilder returned from initiateBulk.
      * @param bulk - something created from initiateBulk
-     * @param mayInterrupt - is this commit interruptable (will cancel)
+     * @param mayInterrupt - is this commit interruptible (will cancel)
      * @param dupsAllowed - if false, error or fill 'dups' if any duplicate values are found
      * @param dups - if NULL, error out on dups if not allowed
      *               if not NULL, put the bad RecordIds there
      */
     Status commitBulk(OperationContext* opCtx,
-                      std::unique_ptr<BulkBuilder> bulk,
+                      BulkBuilder* bulk,
                       bool mayInterrupt,
                       bool dupsAllowed,
                       std::set<RecordId>* dups);

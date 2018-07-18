@@ -28,7 +28,7 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/auth/sasl_mechanism_advertiser.h"
+#include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/logical_session_id.h"
@@ -54,7 +54,7 @@ public:
         return false;
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
@@ -133,7 +133,8 @@ public:
         MessageCompressorManager::forSession(opCtx->getClient()->session())
             .serverNegotiate(cmdObj, &result);
 
-        SASLMechanismAdvertiser::advertise(opCtx, cmdObj, &result);
+        auto& saslMechanismRegistry = SASLServerMechanismRegistry::get(opCtx->getServiceContext());
+        saslMechanismRegistry.advertiseMechanismNamesForUser(opCtx, cmdObj, &result);
 
         return true;
     }

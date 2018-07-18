@@ -55,7 +55,7 @@ if wiredtiger:
             '$BUILD_DIR/mongo/db/concurrency/lock_manager',
             '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
             '$BUILD_DIR/mongo/db/index/index_descriptor',
-            '$BUILD_DIR/mongo/db/mongod_options',
+            '$BUILD_DIR/mongo/db/global_settings',
             '$BUILD_DIR/mongo/db/namespace_string',
             '$BUILD_DIR/mongo/db/repl/repl_settings',
             '$BUILD_DIR/mongo/db/server_options_core',
@@ -77,6 +77,7 @@ if wiredtiger:
         LIBDEPS_PRIVATE= [
             # SERVER-31802 : remove this.
             '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+            '$BUILD_DIR/mongo/util/options_parser/options_parser',
             ],
         )
 
@@ -203,7 +204,6 @@ if wiredtiger:
             LIBDEPS=[
                 'storage_wiredtiger_mock',
                 '$BUILD_DIR/mongo/db/storage/kv/kv_engine_test_harness',
-                '$BUILD_DIR/mongo/s/client/sharding_client',
                 ],
             )
 

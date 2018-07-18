@@ -1,5 +1,3 @@
-// @file oplog.cpp
-
 /**
 *    Copyright (C) 2008-2014 MongoDB Inc.
 *
@@ -50,6 +48,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/catalog/drop_indexes.h"
@@ -58,6 +57,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -79,7 +79,7 @@
 #include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/repl/timestamp_block.h"
 #include "mongo/db/server_parameters.h"
@@ -154,7 +154,7 @@ void _getNextOpTimes(OperationContext* opCtx,
     }
 
     // Allow the storage engine to start the transaction outside the critical section.
-    opCtx->recoveryUnit()->prepareSnapshot();
+    opCtx->recoveryUnit()->preallocateSnapshot();
     stdx::lock_guard<stdx::mutex> lk(newOpMutex);
 
     auto ts = LogicalClock::get(opCtx)->reserveTicks(count).asTimestamp();
@@ -789,10 +789,10 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-          OptionalCollectionUUID uuid;
           NamespaceString nss;
-          std::tie(uuid, nss) = parseCollModUUIDAndNss(opCtx, ui, ns, cmd);
-          return collModForUUIDUpgrade(opCtx, nss, cmd, uuid);
+          BSONObjBuilder resultWeDontCareAbout;
+          std::tie(std::ignore, nss) = parseCollModUUIDAndNss(opCtx, ui, ns, cmd);
+          return collMod(opCtx, nss, cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
     {"dbCheck", {dbCheckOplogCommand, {}}},
@@ -917,7 +917,6 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
 }  // namespace
 
 constexpr StringData OplogApplication::kInitialSyncOplogApplicationMode;
-constexpr StringData OplogApplication::kMasterSlaveOplogApplicationMode;
 constexpr StringData OplogApplication::kRecoveringOplogApplicationMode;
 constexpr StringData OplogApplication::kSecondaryOplogApplicationMode;
 constexpr StringData OplogApplication::kApplyOpsCmdOplogApplicationMode;
@@ -926,8 +925,6 @@ StringData OplogApplication::modeToString(OplogApplication::Mode mode) {
     switch (mode) {
         case OplogApplication::Mode::kInitialSync:
             return OplogApplication::kInitialSyncOplogApplicationMode;
-        case OplogApplication::Mode::kMasterSlave:
-            return OplogApplication::kMasterSlaveOplogApplicationMode;
         case OplogApplication::Mode::kRecovering:
             return OplogApplication::kRecoveringOplogApplicationMode;
         case OplogApplication::Mode::kSecondary:
@@ -941,8 +938,6 @@ StringData OplogApplication::modeToString(OplogApplication::Mode mode) {
 StatusWith<OplogApplication::Mode> OplogApplication::parseMode(const std::string& mode) {
     if (mode == OplogApplication::kInitialSyncOplogApplicationMode) {
         return OplogApplication::Mode::kInitialSync;
-    } else if (mode == OplogApplication::kMasterSlaveOplogApplicationMode) {
-        return OplogApplication::Mode::kMasterSlave;
     } else if (mode == OplogApplication::kRecoveringOplogApplicationMode) {
         return OplogApplication::Mode::kRecovering;
     } else if (mode == OplogApplication::kSecondaryOplogApplicationMode) {
@@ -1078,7 +1073,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
         requestNss.ns() == FeatureCompatibilityVersion::kCollection) {
         std::string oID;
         auto status = bsonExtractStringField(o, "_id", &oID);
-        if (status.isOK() && oID == FeatureCompatibilityVersion::kParameterName) {
+        if (status.isOK() && oID == FeatureCompatibilityVersionParser::kParameterName) {
             return Status(ErrorCodes::OplogOperationUnsupported,
                           str::stream() << "Applying operation on feature compatibility version "
                                            "document not supported in initial sync: "
@@ -1444,7 +1439,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
             }
 
             if (opType[1] == 0) {
-                deleteObjects(opCtx, collection, requestNss, deleteCriteria, /*justOne*/ valueB);
+                const auto justOne = true;
+                deleteObjects(opCtx, collection, requestNss, deleteCriteria, justOne);
             } else
                 verify(opType[1] == 'b');  // "db" advertisement
             wuow.commit();
@@ -1503,8 +1499,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
         }
     }
 
-    // During upgrade from 3.4 to 3.6, the feature compatibility version cannot change during
-    // initial sync because we cannot do some operations with UUIDs and others without.
+    // The feature compatibility version cannot change during initial sync.
     // We do not attempt to parse the whitelisted ops because they do not have a collection
     // namespace. If we drop the 'admin' database we will also log a 'drop' oplog entry for each
     // collection dropped. 'applyOps' will try to apply each individual operation, and those
@@ -1648,7 +1643,7 @@ void initTimestampFromOplog(OperationContext* opCtx, const std::string& oplogNS)
 
     if (!lastOp.isEmpty()) {
         LOG(1) << "replSet setting last Timestamp";
-        const OpTime opTime = fassertStatusOK(28696, OpTime::parseFromOplogEntry(lastOp));
+        const OpTime opTime = fassert(28696, OpTime::parseFromOplogEntry(lastOp));
         setNewTimestamp(opCtx->getServiceContext(), opTime.getTimestamp());
     }
 }

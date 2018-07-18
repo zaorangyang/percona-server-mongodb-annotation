@@ -62,10 +62,9 @@ public:
     virtual void stopDataReplication(OperationContext* opCtx) override;
     virtual bool isInitialSyncFlagSet(OperationContext* opCtx) override;
 
-    virtual void startMasterSlave(OperationContext*);
     virtual void shutdown(OperationContext* opCtx);
     virtual executor::TaskExecutor* getTaskExecutor() const override;
-    virtual OldThreadPool* getDbWorkThreadPool() const override;
+    virtual ThreadPool* getDbWorkThreadPool() const override;
     virtual Status runRepairOnLocalDB(OperationContext* opCtx) override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
     virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx);
@@ -97,13 +96,12 @@ public:
     virtual StatusWith<OpTime> multiApply(OperationContext* opCtx,
                                           MultiApplier::Operations ops,
                                           MultiApplier::ApplyOperationFn applyOperation) override;
-    virtual Status multiSyncApply(MultiApplier::OperationPtrs* ops) override;
-    virtual Status multiInitialSyncApply(MultiApplier::OperationPtrs* ops,
+    virtual Status multiInitialSyncApply(OperationContext* opCtx,
+                                         MultiApplier::OperationPtrs* ops,
                                          const HostAndPort& source,
-                                         AtomicUInt32* fetchCount) override;
+                                         AtomicUInt32* fetchCount,
+                                         WorkerMultikeyPathInfo* workerMultikeyPathInfo) override;
     virtual std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(
-        OperationContext* opCtx) const override;
-    virtual std::unique_ptr<OplogBuffer> makeSteadyStateOplogBuffer(
         OperationContext* opCtx) const override;
     virtual std::size_t getOplogFetcherMaxFetcherRestarts() const override;
 

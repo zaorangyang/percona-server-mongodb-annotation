@@ -94,7 +94,7 @@ public:
     /**
      * Reports the state of the migration manager as a BSON document.
      */
-    void report(BSONObjBuilder& b);
+    void report(BSONObjBuilder& b, OperationContext* opCtx, bool waitForSteadyOrDone);
 
     /**
      * Returns a report on the active migration, if the migration is active. Otherwise return an
@@ -106,7 +106,7 @@ public:
      * Returns OK if migration started successfully.
      */
     Status start(const NamespaceString& nss,
-                 ScopedRegisterReceiveChunk scopedRegisterReceiveChunk,
+                 ScopedReceiveChunk scopedReceiveChunk,
                  const MigrationSessionId& sessionId,
                  const ConnectionString& fromShardConnString,
                  const ShardId& fromShard,
@@ -194,7 +194,7 @@ private:
     // Migration session ID uniquely identifies the migration and indicates whether the prepare
     // method has been called.
     boost::optional<MigrationSessionId> _sessionId;
-    boost::optional<ScopedRegisterReceiveChunk> _scopedRegisterReceiveChunk;
+    boost::optional<ScopedReceiveChunk> _scopedReceiveChunk;
 
     // A condition variable on which to wait for the prepare method to be called.
     stdx::condition_variable _isActiveCV;
@@ -223,6 +223,9 @@ private:
     std::string _errmsg;
 
     std::unique_ptr<SessionCatalogMigrationDestination> _sessionMigration;
+
+    // Condition variable, which is signalled every time the state of the migration changes.
+    stdx::condition_variable _stateChangedCV;
 };
 
 }  // namespace mongo

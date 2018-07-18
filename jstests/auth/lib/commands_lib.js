@@ -57,25 +57,28 @@ to be authorized to run the command.
 
 4) skipSharded
 
-Add "skipSharded: true" if you want to run the test only on a standalone.
+Add "skipSharded: true" if you want to run the test only ony in a non-sharded configuration.
 
-5) skipStandalone
+5) skipUnlessSharded
 
-Add "skipStandalone: true" if you want to run the test only in sharded
+Add "skipUnlessSharded: true" if you want to run the test only in sharded
 configuration.
 
-6) setup
+6) skipUnlessReplicaSet
+Add "skipUnlessReplicaSet: true" if you want to run the test only when replica sets are in use.
+
+7) setup
 
 The setup function, if present, is called before testing whether a
 particular role authorizes a command for a particular database.
 
-7) teardown
+8) teardown
 
 The teardown function, if present, is called immediately after
 testint whether a particular role authorizes a command for a
 particular database.
 
-8) privileges
+9) privileges
 
 An array of privileges used when testing user-defined roles. The test case tests that a user with
 the specified privileges is authorized to run the command, and that having only a subset of the
@@ -178,6 +181,8 @@ var roles_all = {
 };
 
 load("jstests/libs/uuid_util.js");
+// For isReplSet
+load("jstests/libs/fixture_helpers.js");
 
 var authCommandsLib = {
 
@@ -185,9 +190,20 @@ var authCommandsLib = {
 
     tests: [
         {
+          testname: "abortTxn",
+          command: {abortTransaction: 1},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_all,
+              },
+          ]
+        },
+        {
           testname: "addShard",
           command: {addShard: "x"},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -210,7 +226,7 @@ var authCommandsLib = {
                   u: {_id: {ns: "test.x", min: 1}, ns: "test.x"}
               }]
           },
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [{
               runOnDb: "config",
               roles: roles_clusterManager,
@@ -235,14 +251,7 @@ var authCommandsLib = {
         {
           testname: "applyOps_precondition",
           command: {
-              applyOps: [{
-                  "ts": Timestamp(1473353037, 1),
-                  "h": NumberLong(0),
-                  "v": 2,
-                  "op": "n",
-                  "ns": "",
-                  "o": {}
-              }],
+              applyOps: [{"op": "n", "ns": "", "o": {}}],
               preCondition: [{ns: firstDbName + ".x", q: {x: 5}, res: []}]
           },
           skipSharded: true,
@@ -270,9 +279,6 @@ var authCommandsLib = {
           testname: "applyOps_c_create",
           command: {
               applyOps: [{
-                  "ts": Timestamp(1474051004, 1),
-                  "h": NumberLong(0),
-                  "v": 2,
                   "op": "c",
                   "ns": firstDbName + ".$cmd",
                   "o": {
@@ -309,10 +315,7 @@ var authCommandsLib = {
           testname: "applyOps_c_create_UUID",
           command: {
               applyOps: [{
-                  "ts": Timestamp(1474051004, 1),
-                  "h": NumberLong(0),
                   "ui": UUID("71f1d1d7-68ca-493e-a7e9-f03c94e2e960"),
-                  "v": 2,
                   "op": "c",
                   "ns": firstDbName + ".$cmd",
                   "o": {
@@ -340,10 +343,7 @@ var authCommandsLib = {
           testname: "applyOps_c_create_UUID_failure",
           command: {
               applyOps: [{
-                  "ts": Timestamp(1474051004, 1),
-                  "h": NumberLong(0),
                   "ui": UUID("71f1d1d7-68ca-493e-a7e9-f03c94e2e960"),
-                  "v": 2,
                   "op": "c",
                   "ns": firstDbName + ".$cmd",
                   "o": {
@@ -370,9 +370,6 @@ var authCommandsLib = {
           testname: "applyOps_c_drop",
           command: {
               applyOps: [{
-                  "ts": Timestamp(1474051004, 1),
-                  "h": NumberLong(0),
-                  "v": 2,
                   "op": "c",
                   "ns": firstDbName + ".$cmd",
                   "o": {
@@ -411,9 +408,6 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   applyOps: [{
-                      "ts": Timestamp(1474051004, 1),
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "c",
                       "ui": state.uuid,
                       "ns": firstDbName + ".$cmd",
@@ -452,9 +446,6 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   applyOps: [{
-                      "ts": Timestamp(1474051004, 1),
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "c",
                       "ui": state.uuid,
                       "ns": firstDbName + ".$cmd",
@@ -490,16 +481,7 @@ var authCommandsLib = {
         },
         {
           testname: "applyOps_noop",
-          command: {
-              applyOps: [{
-                  "ts": Timestamp(1473353037, 1),
-                  "h": NumberLong(0),
-                  "v": 2,
-                  "op": "n",
-                  "ns": "",
-                  "o": {}
-              }]
-          },
+          command: {applyOps: [{"op": "n", "ns": "", "o": {}}]},
           skipSharded: true,
           testcases: [
               {
@@ -521,9 +503,6 @@ var authCommandsLib = {
           testname: "applyOps_c_renameCollection_twoDbs",
           command: {
               applyOps: [{
-                  "ts": Timestamp(1474051004, 1),
-                  "h": NumberLong(0),
-                  "v": 2,
                   "op": "c",
                   "ns": firstDbName + ".$cmd",
                   "o": {
@@ -565,9 +544,6 @@ var authCommandsLib = {
           testname: "applyOps_insert",
           command: {
               applyOps: [{
-                  "ts": Timestamp(1474051453, 1),
-                  "h": NumberLong(0),
-                  "v": 2,
                   "op": "i",
                   "ns": firstDbName + ".x",
                   "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
@@ -595,9 +571,6 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   applyOps: [{
-                      "ts": Timestamp(1474051453, 1),
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "i",
                       "ns": state.collName,
                       "ui": state.uuid,
@@ -634,9 +607,6 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   applyOps: [{
-                      "ts": Timestamp(1474051453, 1),
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "i",
                       "ns": state.collName,
                       // Given a nonexistent UUID. The command should fail.
@@ -677,9 +647,6 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   applyOps: [{
-                      "ts": Timestamp(1474051453, 1),
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "i",
                       "ns": state.collName,
                       "ui": state.uuid,
@@ -717,10 +684,7 @@ var authCommandsLib = {
               return {
                   applyOps: [
                       {
-                        "ts": Timestamp(1474051004, 1),
-                        "h": NumberLong(0),
                         "ui": UUID("71f1d1d7-68ca-493e-a7e9-f03c94e2e960"),
-                        "v": 2,
                         "op": "c",
                         "ns": firstDbName + ".$cmd",
                         "o": {
@@ -728,9 +692,6 @@ var authCommandsLib = {
                         }
                       },
                       {
-                        "ts": Timestamp(1474051453, 1),
-                        "h": NumberLong(0),
-                        "v": 2,
                         "op": "i",
                         "ns": firstDbName + ".x",
                         "ui": UUID("71f1d1d7-68ca-493e-a7e9-f03c94e2e960"),
@@ -764,9 +725,6 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   applyOps: [{
-                      "ts": Timestamp(1474051453, 1),
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "i",
                       "ns":
                           firstDbName + ".y",  // Specify wrong name but correct uuid. Should work.
@@ -806,9 +764,6 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   applyOps: [{
-                      "ts": Timestamp(1474051453, 1),
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "i",
                       "ns":
                           firstDbName + ".y",  // Specify wrong name but correct uuid. Should work.
@@ -848,9 +803,6 @@ var authCommandsLib = {
           testname: "applyOps_upsert",
           command: {
               applyOps: [{
-                  "ts": Timestamp(1474053682, 1),
-                  "h": NumberLong(0),
-                  "v": 2,
                   "op": "u",
                   "ns": firstDbName + ".x",
                   "o2": {"_id": 1},
@@ -878,9 +830,6 @@ var authCommandsLib = {
           testname: "applyOps_update",
           command: {
               applyOps: [{
-                  "ts": Timestamp(1474053682, 1),
-                  "h": NumberLong(0),
-                  "v": 2,
                   "op": "u",
                   "ns": firstDbName + ".x",
                   "o2": {"_id": 1},
@@ -910,9 +859,6 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   applyOps: [{
-                      "ts": Timestamp(1474053682, 1),
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "u",
                       "ns": state.collName,
                       "ui": state.uuid,
@@ -951,9 +897,6 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   applyOps: [{
-                      "ts": Timestamp(1474053682, 1),
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "u",
                       "ns": state.collName,
                       "ui": state.uuid,
@@ -988,16 +931,7 @@ var authCommandsLib = {
         },
         {
           testname: "applyOps_delete",
-          command: {
-              applyOps: [{
-                  "ts": Timestamp(1474056194, 1),
-                  "h": NumberLong(0),
-                  "v": 2,
-                  "op": "d",
-                  "ns": firstDbName + ".x",
-                  "o": {"_id": 1}
-              }]
-          },
+          command: {applyOps: [{"op": "d", "ns": firstDbName + ".x", "o": {"_id": 1}}]},
           skipSharded: true,
           setup: function(db) {
               db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
@@ -2148,6 +2082,18 @@ var authCommandsLib = {
           ]
         },
         {
+          testname: "commitTxn",
+          command: {commitTransaction: 1},
+          skipSharded: true,
+          skipUnlessReplicaSet: true,
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_all,
+              },
+          ]
+        },
+        {
           testname: "compact",
           command: {compact: "foo"},
           skipSharded: true,
@@ -2324,7 +2270,7 @@ var authCommandsLib = {
         {
           testname: "balancerStart",
           command: {balancerStart: 1},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -2345,7 +2291,7 @@ var authCommandsLib = {
         {
           testname: "balancerStop",
           command: {balancerStop: 1},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -2366,7 +2312,7 @@ var authCommandsLib = {
         {
           testname: "balancerStatus",
           command: {balancerStatus: 1},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -2973,15 +2919,16 @@ var authCommandsLib = {
           testname: "doTxn_precondition",
           command: {
               doTxn: [{
-                  "h": NumberLong(0),
-                  "v": 2,
                   "op": "i",
                   "ns": firstDbName + ".x",
                   "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
               }],
-              preCondition: [{ns: firstDbName + ".x", q: {x: 5}, res: []}]
+              preCondition: [{ns: firstDbName + ".x", q: {x: 5}, res: []}],
+              txnNumber: NumberLong(0),
+              lsid: {id: UUID()}
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               db.getSisterDB(firstDbName).x.save({});
           },
@@ -3002,14 +2949,15 @@ var authCommandsLib = {
           testname: "doTxn_insert",
           command: {
               doTxn: [{
-                  "h": NumberLong(0),
-                  "v": 2,
                   "op": "i",
                   "ns": firstDbName + ".x",
                   "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-              }]
+              }],
+              txnNumber: NumberLong(0),
+              lsid: {id: UUID()}
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               db.getSisterDB(firstDbName).x.save({});
           },
@@ -3031,16 +2979,17 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   doTxn: [{
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "i",
                       "ns": state.collName,
                       "ui": state.uuid,
                       "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }]
+                  }],
+                  txnNumber: NumberLong(0),
+                  lsid: {id: UUID()}
               };
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               var sibling = db.getSisterDB(firstDbName);
               sibling.runCommand({create: "x"});
@@ -3069,17 +3018,18 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   doTxn: [{
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "i",
                       "ns": state.collName,
                       // Given a nonexistent UUID. The command should fail.
                       "ui": UUID("71f1d1d7-68ca-493e-a7e9-f03c94e2e960"),
                       "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }]
+                  }],
+                  txnNumber: NumberLong(0),
+                  lsid: {id: UUID()}
               };
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               var sibling = db.getSisterDB(firstDbName);
               sibling.runCommand({create: "x"});
@@ -3111,16 +3061,17 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   doTxn: [{
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "i",
                       "ns": state.collName,
                       "ui": state.uuid,
                       "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }]
+                  }],
+                  txnNumber: NumberLong(0),
+                  lsid: {id: UUID()}
               };
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               var sibling = db.getSisterDB(firstDbName);
               sibling.runCommand({create: "x"});
@@ -3149,17 +3100,18 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   doTxn: [{
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "i",
                       "ns":
                           firstDbName + ".y",  // Specify wrong name but correct uuid. Should work.
                       "ui": state.x_uuid,      // The insert should on x
                       "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }]
+                  }],
+                  txnNumber: NumberLong(0),
+                  lsid: {id: UUID()}
               };
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               db.getSisterDB(firstDbName).x.drop();
               db.getSisterDB(firstDbName).y.drop();
@@ -3190,17 +3142,18 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   doTxn: [{
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "i",
                       "ns":
                           firstDbName + ".y",  // Specify wrong name but correct uuid. Should work.
                       "ui": state.x_uuid,      // The insert should on x
                       "o": {"_id": ObjectId("57dc3d7da4fce4358afa85b8"), "data": 5}
-                  }]
+                  }],
+                  txnNumber: NumberLong(0),
+                  lsid: {id: UUID()}
               };
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               db.getSisterDB(firstDbName).x.drop();
               db.getSisterDB(firstDbName).y.drop();
@@ -3231,15 +3184,16 @@ var authCommandsLib = {
           testname: "doTxn_upsert",
           command: {
               doTxn: [{
-                  "h": NumberLong(0),
-                  "v": 2,
                   "op": "u",
                   "ns": firstDbName + ".x",
                   "o2": {"_id": 1},
                   "o": {"_id": 1, "data": 8}
-              }]
+              }],
+              txnNumber: NumberLong(0),
+              lsid: {id: UUID()}
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
           },
@@ -3260,16 +3214,16 @@ var authCommandsLib = {
           testname: "doTxn_update",
           command: {
               doTxn: [{
-                  "h": NumberLong(0),
-                  "v": 2,
                   "op": "u",
                   "ns": firstDbName + ".x",
                   "o2": {"_id": 1},
                   "o": {"_id": 1, "data": 8}
               }],
-              alwaysUpsert: false
+              txnNumber: NumberLong(0),
+              lsid: {id: UUID()}
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
           },
@@ -3291,18 +3245,18 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   doTxn: [{
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "u",
                       "ns": state.collName,
                       "ui": state.uuid,
                       "o2": {"_id": 1},
                       "o": {"_id": 1, "data": 8}
                   }],
-                  alwaysUpsert: false
+                  txnNumber: NumberLong(0),
+                  lsid: {id: UUID()}
               };
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               var sibling = db.getSisterDB(firstDbName);
               sibling.x.save({_id: 1, data: 1});
@@ -3331,18 +3285,18 @@ var authCommandsLib = {
           command: function(state) {
               return {
                   doTxn: [{
-                      "h": NumberLong(0),
-                      "v": 2,
                       "op": "u",
                       "ns": state.collName,
                       "ui": state.uuid,
                       "o2": {"_id": 1},
                       "o": {"_id": 1, "data": 8}
                   }],
-                  alwaysUpsert: false
+                  txnNumber: NumberLong(0),
+                  lsid: {id: UUID()}
               };
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               var sibling = db.getSisterDB(firstDbName);
               sibling.x.save({_id: 1, data: 1});
@@ -3368,15 +3322,12 @@ var authCommandsLib = {
         {
           testname: "doTxn_delete",
           command: {
-              doTxn: [{
-                  "h": NumberLong(0),
-                  "v": 2,
-                  "op": "d",
-                  "ns": firstDbName + ".x",
-                  "o": {"_id": 1}
-              }]
+              doTxn: [{"op": "d", "ns": firstDbName + ".x", "o": {"_id": 1}}],
+              txnNumber: NumberLong(0),
+              lsid: {id: UUID()}
           },
           skipSharded: true,
+          skipUnlessReplicaSet: true,
           setup: function(db) {
               db.getSisterDB(firstDbName).x.save({_id: 1, data: 1});
           },
@@ -3493,7 +3444,7 @@ var authCommandsLib = {
         {
           testname: "enableSharding",
           command: {enableSharding: "x"},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -3832,7 +3783,7 @@ var authCommandsLib = {
         {
           testname: "flushRouterConfig",
           command: {flushRouterConfig: 1},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -4359,7 +4310,7 @@ var authCommandsLib = {
         {
           testname: "killOp",  // sharded version
           command: {killOp: 1, op: "shard1:123"},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -4527,7 +4478,7 @@ var authCommandsLib = {
         {
           testname: "listShards",
           command: {listShards: 1},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -4630,7 +4581,7 @@ var authCommandsLib = {
         {
           testname: "s_mergeChunks",
           command: {mergeChunks: "test.x", bounds: [{i: 0}, {i: 5}]},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -4660,7 +4611,7 @@ var authCommandsLib = {
         {
           testname: "s_moveChunk",
           command: {moveChunk: "test.x"},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -4690,7 +4641,7 @@ var authCommandsLib = {
         {
           testname: "movePrimary",
           command: {movePrimary: "x"},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -4705,7 +4656,7 @@ var authCommandsLib = {
         {
           testname: "netstat",
           command: {netstat: "x"},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -4993,7 +4944,7 @@ var authCommandsLib = {
         {
           testname: "removeShard",
           command: {removeShard: "x"},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -5248,21 +5199,6 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "resync",
-          command: {resync: 1},
-          skipSharded: true,
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: {hostManager: 1, clusterManager: 1, clusterAdmin: 1, root: 1, __system: 1},
-                privileges: [{resource: {cluster: true}, actions: ["resync"]}],
-                expectFail: true
-              },
-              {runOnDb: firstDbName, roles: {}},
-              {runOnDb: secondDbName, roles: {}}
-          ]
-        },
-        {
           testname: "serverStatus",
           command: {serverStatus: 1},
           testcases: [
@@ -5329,7 +5265,7 @@ var authCommandsLib = {
         {
           testname: "shardCollection",
           command: {shardCollection: "test.x"},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -5364,7 +5300,7 @@ var authCommandsLib = {
         {
           testname: "split",
           command: {split: "test.x"},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -5621,7 +5557,7 @@ var authCommandsLib = {
         {
           testname: "addShardToZone",
           command: {addShardToZone: shard0name, zone: 'z'},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -5641,7 +5577,7 @@ var authCommandsLib = {
         {
           testname: "removeShardFromZone",
           command: {removeShardFromZone: shard0name, zone: 'z'},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -5664,7 +5600,7 @@ var authCommandsLib = {
         {
           testname: "updateZoneKeyRange",
           command: {updateZoneKeyRange: 'test.foo', min: {x: 1}, max: {x: 5}, zone: 'z'},
-          skipStandalone: true,
+          skipUnlessSharded: true,
           testcases: [
               {
                 runOnDb: adminDbName,
@@ -5755,7 +5691,11 @@ var authCommandsLib = {
             return [];
         }
         // others shouldn't run in a standalone environment
-        if (t.skipStandalone && !this.isMongos(conn)) {
+        if (t.skipUnlessSharded && !this.isMongos(conn)) {
+            return [];
+        }
+        // some tests require replica sets to be enabled.
+        if (t.skipUnlessReplicaSet && !FixtureHelpers.isReplSet(conn.getDB("admin"))) {
             return [];
         }
 

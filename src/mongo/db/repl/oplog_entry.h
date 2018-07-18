@@ -85,6 +85,7 @@ public:
                const BSONObj& oField,
                const boost::optional<BSONObj>& o2Field,
                const OperationSessionInfo& sessionInfo,
+               const boost::optional<bool>& isUpsert,
                const boost::optional<mongo::Date_t>& wallClockTime,
                const boost::optional<StmtId>& statementId,
                const boost::optional<OpTime>& prevWriteOpTimeInTransaction,
@@ -107,6 +108,7 @@ public:
     /**
      * Returns if the oplog entry is for a CRUD operation.
      */
+    static bool isCrudOpType(OpTypeEnum opType);
     bool isCrudOpType() const;
 
     /**
@@ -154,6 +156,8 @@ std::ostream& operator<<(std::ostream& s, const OplogEntry& o);
 inline bool operator==(const OplogEntry& lhs, const OplogEntry& rhs) {
     return SimpleBSONObjComparator::kInstance.evaluate(lhs.raw == rhs.raw);
 }
+
+std::ostream& operator<<(std::ostream& s, const ReplOperation& o);
 
 }  // namespace repl
 }  // namespace mongo

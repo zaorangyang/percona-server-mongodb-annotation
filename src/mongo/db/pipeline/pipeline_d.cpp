@@ -214,8 +214,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
         return {cq.getStatus()};
     }
 
-    return getExecutorFind(
-        opCtx, collection, nss, std::move(cq.getValue()), PlanExecutor::YIELD_AUTO, plannerOpts);
+    return getExecutorFind(opCtx, collection, nss, std::move(cq.getValue()), plannerOpts);
 }
 
 BSONObj removeSortKeyMetaProjection(BSONObj projectionObj) {
@@ -706,10 +705,8 @@ Status PipelineD::MongoDInterface::attachCursorSourceToPipeline(
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
     if (expCtx->uuid) {
         try {
-            autoColl.emplace(expCtx->opCtx, expCtx->ns.db(), *expCtx->uuid);
-            uassert(ErrorCodes::NamespaceNotFound,
-                    "No namespace with UUID " + expCtx->uuid->toString(),
-                    autoColl->getCollection());
+            autoColl.emplace(expCtx->opCtx,
+                             NamespaceStringOrUUID{expCtx->ns.db().toString(), *expCtx->uuid});
         } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
             // The UUID doesn't exist anymore
             return ex.toStatus();
@@ -898,7 +895,7 @@ std::unique_ptr<CollatorInterface> PipelineD::MongoDInterface::_getCollectionDef
     auto it = _collatorCache.find(collectionUUID);
     if (it == _collatorCache.end()) {
         auto collator = [&]() -> std::unique_ptr<CollatorInterface> {
-            AutoGetCollection autoColl(opCtx, {dbName, collectionUUID}, MODE_IS);
+            AutoGetCollection autoColl(opCtx, {dbName.toString(), collectionUUID}, MODE_IS);
             if (!autoColl.getCollection()) {
                 // This collection doesn't exist, so assume a nullptr default collation
                 return nullptr;

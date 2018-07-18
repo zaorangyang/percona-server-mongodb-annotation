@@ -31,12 +31,10 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
-#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -69,7 +67,7 @@ public:
         return false;
     }
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kOptIn;
     }
 
@@ -119,21 +117,27 @@ public:
         if (!authSession->isAuthorizedToParseNamespaceElement(cmdObj.firstElement())) {
             return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
-        const NamespaceString nss(CommandHelpers::parseNsOrUUID(opCtx, dbname, cmdObj));
-        auto hasTerm = cmdObj.hasField(kTermField);
-        return authSession->checkAuthForFind(nss, hasTerm);
+
+        const auto hasTerm = cmdObj.hasField(kTermField);
+        return authSession->checkAuthForFind(
+            AutoGetCollection::resolveNamespaceStringOrUUID(
+                opCtx, CommandHelpers::parseNsOrUUID(dbname, cmdObj)),
+            hasTerm);
     }
 
     Status explain(OperationContext* opCtx,
-                   const std::string& dbname,
-                   const BSONObj& cmdObj,
+                   const OpMsgRequest& request,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-        if (!nss.isValid()) {
-            return {ErrorCodes::InvalidNamespace,
-                    str::stream() << "Invalid collection name: " << nss.ns()};
-        }
+        std::string dbname = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
+        // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
+        // of a view, the locks need to be released.
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        ctx.emplace(opCtx,
+                    CommandHelpers::parseNsOrUUID(dbname, cmdObj),
+                    AutoGetCollection::ViewMode::kViewsPermitted);
+        const auto nss = ctx->getNss();
 
         // Parse the command BSON to a QueryRequest.
         const bool isExplain = true;
@@ -157,12 +161,9 @@ public:
         }
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-        // Acquire locks. If the namespace is a view, we release our locks and convert the query
-        // request into an aggregation command.
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
-        if (ctx.getView()) {
+        if (ctx->getView()) {
             // Relinquish locks. The aggregation command will re-acquire them.
-            ctx.releaseLocksForView();
+            ctx.reset();
 
             // Convert the find command into an aggregation using $match (and other stages, as
             // necessary), if possible.
@@ -193,16 +194,10 @@ public:
 
         // The collection may be NULL. If so, getExecutor() should handle it by returning an
         // execution tree with an EOFStage.
-        Collection* collection = ctx.getCollection();
+        Collection* const collection = ctx->getCollection();
 
         // We have a parsed query. Time to get the execution plan for it.
-        auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-        auto yieldPolicy =
-            readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
-            ? PlanExecutor::INTERRUPT_ONLY
-            : PlanExecutor::YIELD_AUTO;
-        auto statusWithPlanExecutor =
-            getExecutorFind(opCtx, collection, nss, std::move(cq), yieldPolicy);
+        auto statusWithPlanExecutor = getExecutorFind(opCtx, collection, nss, std::move(cq));
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
@@ -252,8 +247,12 @@ public:
 
         // Acquire locks. If the query is on a view, we release our locks and convert the query
         // request into an aggregation command.
-        Lock::DBLock dbLock(opCtx, dbname, getLockModeForQuery(opCtx));
-        const NamespaceString nss(CommandHelpers::parseNsOrUUID(opCtx, dbname, cmdObj));
+        boost::optional<AutoGetCollectionForReadCommand> ctx;
+        ctx.emplace(opCtx,
+                    CommandHelpers::parseNsOrUUID(dbname, cmdObj),
+                    AutoGetCollection::ViewMode::kViewsPermitted);
+        const auto& nss = ctx->getNss();
+
         qr->refreshNSS(opCtx);
 
         // Fill out curop information.
@@ -280,11 +279,9 @@ public:
         }
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-        AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss, std::move(dbLock));
-        Collection* collection = ctx.getCollection();
-        if (ctx.getView()) {
+        if (ctx->getView()) {
             // Relinquish locks. The aggregation command will re-acquire them.
-            ctx.releaseLocksForView();
+            ctx.reset();
 
             // Convert the find command into an aggregation using $match (and other stages, as
             // necessary), if possible.
@@ -309,14 +306,10 @@ public:
             return status.isOK();
         }
 
+        Collection* const collection = ctx->getCollection();
+
         // Get the execution plan for the query.
-        auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-        auto yieldPolicy =
-            readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
-            ? PlanExecutor::INTERRUPT_ONLY
-            : PlanExecutor::YIELD_AUTO;
-        auto statusWithPlanExecutor =
-            getExecutorFind(opCtx, collection, nss, std::move(cq), yieldPolicy);
+        auto statusWithPlanExecutor = getExecutorFind(opCtx, collection, nss, std::move(cq));
         if (!statusWithPlanExecutor.isOK()) {
             return CommandHelpers::appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }
@@ -366,9 +359,8 @@ public:
 
             return CommandHelpers::appendCommandStatus(
                 result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream() << "Executor error during find command: "
-                                     << WorkingSetCommon::toStatusString(obj)));
+                WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                    "Executor error during find command"));
         }
 
         // Before saving the cursor, ensure that whatever plan we established happened with the
@@ -386,7 +378,7 @@ public:
                 {std::move(exec),
                  nss,
                  AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                 opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+                 opCtx->recoveryUnit()->getReadConcernLevel(),
                  cmdObj});
             cursorId = pinnedCursor.getCursor()->cursorid();
 
@@ -404,6 +396,8 @@ public:
                     opCtx->getRemainingMaxTimeMicros());
             }
             pinnedCursor.getCursor()->setPos(numResults);
+
+            opCtx->setStashedCursor();
 
             // Fill out curop based on the results.
             endQueryOp(opCtx, collection, *cursorExec, numResults, cursorId);

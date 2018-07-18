@@ -50,6 +50,7 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/query/async_results_merger.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/establish_cursors.h"
@@ -135,7 +136,7 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
     if (!qr.getSort().isEmpty() && !qr.getSort()["$natural"]) {
         BSONObjBuilder projectionBuilder;
         projectionBuilder.appendElements(qr.getProj());
-        projectionBuilder.append(ClusterClientCursorParams::kSortKeyField, kSortKeyMetaProjection);
+        projectionBuilder.append(AsyncResultsMerger::kSortKeyField, kSortKeyMetaProjection);
         newProjection = projectionBuilder.obj();
     }
 
@@ -143,8 +144,7 @@ StatusWith<std::unique_ptr<QueryRequest>> transformQueryForShards(
         invariant(qr.getSort().isEmpty());
         BSONObjBuilder projectionBuilder;
         projectionBuilder.appendElements(qr.getProj());
-        projectionBuilder.append(ClusterClientCursorParams::kSortKeyField,
-                                 kGeoNearDistanceMetaProjection);
+        projectionBuilder.append(AsyncResultsMerger::kSortKeyField, kGeoNearDistanceMetaProjection);
         newProjection = projectionBuilder.obj();
     }
 
@@ -174,11 +174,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
     // Get the set of shards on which we will run the query.
 
     std::vector<std::shared_ptr<Shard>> shards;
-    if (primary) {
-        shards.emplace_back(std::move(primary));
-    } else {
-        invariant(chunkManager);
-
+    if (chunkManager) {
         std::set<ShardId> shardIds;
         chunkManager->getShardIdsForQuery(opCtx,
                                           query.getQueryRequest().getFilter(),
@@ -188,6 +184,8 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
         for (auto id : shardIds) {
             shards.emplace_back(uassertStatusOK(shardRegistry->getShard(opCtx, id)));
         }
+    } else {
+        shards.emplace_back(std::move(primary));
     }
 
     // Construct the query and parameters.
@@ -220,7 +218,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
         // by the geoNearDistance. Request the projection {$sortKey: <geoNearDistance>} from the
         // shards. Indicate to the AsyncResultsMerger that it should extract the sort key
         // {"$sortKey": <geoNearDistance>} and sort by the order {"$sortKey": 1}.
-        params.sort = ClusterClientCursorParams::kWholeSortKeySortPattern;
+        params.sort = AsyncResultsMerger::kWholeSortKeySortPattern;
         params.compareWholeSortKey = true;
         appendGeoNearDistanceProjection = true;
     }
@@ -339,10 +337,10 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
     invariant(results);
 
     // Projection on the reserved sort key field is illegal in mongos.
-    if (query.getQueryRequest().getProj().hasField(ClusterClientCursorParams::kSortKeyField)) {
+    if (query.getQueryRequest().getProj().hasField(AsyncResultsMerger::kSortKeyField)) {
         uasserted(ErrorCodes::BadValue,
                   str::stream() << "Projection contains illegal field '"
-                                << ClusterClientCursorParams::kSortKeyField
+                                << AsyncResultsMerger::kSortKeyField
                                 << "': "
                                 << query.getQueryRequest().getProj());
     }
@@ -405,7 +403,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     invariant(request.cursorid == pinnedCursor.getValue().getCursorId());
 
     // If the fail point is enabled, busy wait until it is disabled.
-    while (MONGO_FAIL_POINT(keepCursorPinnedDuringGetMore)) {
+    while (MONGO_FAIL_POINT(waitAfterPinningCursorBeforeGetMoreBatch)) {
     }
 
     if (auto readPref = pinnedCursor.getValue().getReadPreference()) {
@@ -433,15 +431,6 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     long long batchSize = request.batchSize.value_or(0);
     long long startingFrom = pinnedCursor.getValue().getNumReturnedSoFar();
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
-
-    pinnedCursor.getValue().reattachToOperationContext(opCtx);
-
-    // A pinned cursor will not be destroyed immediately if an exception is thrown. Instead it will
-    // be marked as killed, then reaped by a background thread later. If this happens, we want to be
-    // sure the cursor does not have a pointer to this OperationContext, since it will be destroyed
-    // as soon as we return, but the cursor will live on a bit longer.
-    ScopeGuard cursorDetach =
-        MakeGuard([&pinnedCursor]() { pinnedCursor.getValue().detachFromOperationContext(); });
 
     while (!FindCommon::enoughForGetMore(batchSize, batch.size())) {
         auto context = batch.empty()
@@ -489,10 +478,8 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         batch.push_back(std::move(*next.getValue().getResult()));
     }
 
-    // Upon successful completion, we need to detach from the operation and transfer ownership of
-    // the cursor back to the cursor manager.
-    cursorDetach.Dismiss();
-    pinnedCursor.getValue().detachFromOperationContext();
+    // Upon successful completion, transfer ownership of the cursor back to the cursor manager. If
+    // the cursor has been exhausted, the cursor manager will clean it up for us.
     pinnedCursor.getValue().returnCursor(cursorState);
 
     CursorId idToReturn = (cursorState == ClusterCursorManager::CursorState::Exhausted)

@@ -202,14 +202,22 @@ void generateBatch(int ntoreturn,
     }
 
     // Propagate any errors to the caller.
-    if (PlanExecutor::FAILURE == *state) {
-        error() << "getMore executor error, stats: " << redact(Explain::getWinningPlanStats(exec));
-        uasserted(17406, "getMore executor error: " + WorkingSetCommon::toStatusString(obj));
-    } else if (PlanExecutor::DEAD == *state) {
-        uasserted(ErrorCodes::QueryPlanKilled,
-                  str::stream() << "PlanExecutor killed: "
-                                << WorkingSetCommon::toStatusString(obj));
+    switch (*state) {
+        // Log an error message and then perform the same cleanup as DEAD.
+        case PlanExecutor::FAILURE:
+            error() << "getMore executor error, stats: "
+                    << redact(Explain::getWinningPlanStats(exec));
+        case PlanExecutor::DEAD: {
+            // We should always have a valid status object by this point.
+            auto status = WorkingSetCommon::getMemberObjectStatus(obj);
+            invariant(!status.isOK());
+            uassertStatusOK(status);
+        }
+        default:
+            return;
     }
+
+    MONGO_UNREACHABLE;
 }
 
 }  // namespace
@@ -254,6 +262,7 @@ Message getMore(OperationContext* opCtx,
     // Note that we acquire our locks before our ClientCursorPin, in order to ensure that the pin's
     // destructor is called before the lock's destructor (if there is one) so that the cursor
     // cleanup can occur under the lock.
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     boost::optional<AutoGetCollectionForRead> readLock;
     boost::optional<AutoStatsTracker> statsTracker;
     CursorManager* cursorManager;
@@ -324,7 +333,6 @@ Message getMore(OperationContext* opCtx,
             cursorid = 0;
             resultFlags = ResultFlag_CursorNotFound;
         } else {
-            invariant(ccPin == ErrorCodes::QueryPlanKilled || ccPin == ErrorCodes::Unauthorized);
             uassertStatusOK(ccPin.getStatus());
         }
     } else {
@@ -350,8 +358,18 @@ Message getMore(OperationContext* opCtx,
 
         *isCursorAuthorized = true;
 
-        if (cc->isReadCommitted())
-            uassertStatusOK(opCtx->recoveryUnit()->setReadFromMajorityCommittedSnapshot());
+        const auto replicationMode = repl::ReplicationCoordinator::get(opCtx)->getReplicationMode();
+        opCtx->recoveryUnit()->setReadConcernLevelAndReplicationMode(cc->getReadConcernLevel(),
+                                                                     replicationMode);
+
+        // TODO SERVER-33698: Remove kSnapshotReadConcern clause once we can guarantee that a
+        // readConcern level snapshot getMore will have an established point-in-time WiredTiger
+        // snapshot.
+        if (replicationMode == repl::ReplicationCoordinator::modeReplSet &&
+            (cc->getReadConcernLevel() == repl::ReadConcernLevel::kMajorityReadConcern ||
+             cc->getReadConcernLevel() == repl::ReadConcernLevel::kSnapshotReadConcern)) {
+            uassertStatusOK(opCtx->recoveryUnit()->obtainMajorityCommittedSnapshot());
+        }
 
         uassert(40548,
                 "OP_GET_MORE operations are not supported on tailable aggregations. Only clients "
@@ -547,17 +565,8 @@ std::string runQuery(OperationContext* opCtx,
     LOG(2) << "Running query: " << redact(cq->toStringShort());
 
     // Parse, canonicalize, plan, transcribe, and get a plan executor.
-    AutoGetCollectionOrViewForReadCommand ctx(opCtx, nss);
-    Collection* collection = ctx.getCollection();
-
-    if (ctx.getView()) {
-        uasserted(ErrorCodes::CommandNotSupportedOnView,
-                  str::stream()
-                      << "Namespace "
-                      << nss.ns()
-                      << " is a view. Legacy find operations are not supported on views. "
-                      << "Only clients which support the find command can be used to query views.");
-    }
+    AutoGetCollectionForReadCommand ctx(opCtx, nss, AutoGetCollection::ViewMode::kViewsForbidden);
+    Collection* const collection = ctx.getCollection();
 
     {
         const QueryRequest& qr = cq->getQueryRequest();
@@ -573,8 +582,7 @@ std::string runQuery(OperationContext* opCtx,
     }
 
     // We have a parsed query. Time to get the execution plan for it.
-    auto exec = uassertStatusOK(
-        getExecutorFind(opCtx, collection, nss, std::move(cq), PlanExecutor::YIELD_AUTO));
+    auto exec = uassertStatusOK(getExecutorLegacyFind(opCtx, collection, nss, std::move(cq)));
 
     const QueryRequest& qr = exec->getCanonicalQuery()->getQueryRequest();
 
@@ -669,7 +677,9 @@ std::string runQuery(OperationContext* opCtx,
     if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
         error() << "Plan executor error during find: " << PlanExecutor::statestr(state)
                 << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
-        uasserted(17144, "Executor error: " + WorkingSetCommon::toStatusString(obj));
+        uassertStatusOKWithContext(WorkingSetCommon::getMemberObjectStatus(obj),
+                                   "Executor error during OP_QUERY find");
+        MONGO_UNREACHABLE;
     }
 
     // Before saving the cursor, ensure that whatever plan we established happened with the expected
@@ -692,7 +702,7 @@ std::string runQuery(OperationContext* opCtx,
             {std::move(exec),
              nss,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-             opCtx->recoveryUnit()->isReadingFromMajorityCommittedSnapshot(),
+             opCtx->recoveryUnit()->getReadConcernLevel(),
              upconvertQueryEntry(q.query, qr.nss(), q.ntoreturn, q.ntoskip)});
         ccId = pinnedCursor.getCursor()->cursorid();
 

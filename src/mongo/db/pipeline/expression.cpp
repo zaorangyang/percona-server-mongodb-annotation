@@ -36,6 +36,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "mongo/db/commands/feature_compatibility_version_documentation.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression_context.h"
@@ -104,15 +105,23 @@ intrusive_ptr<Expression> Expression::parseObject(
 }
 
 namespace {
-StringMap<Parser> parserMap;
+struct ParserRegistration {
+    Parser parser;
+    boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion;
+};
+
+StringMap<ParserRegistration> parserMap;
 }
 
-void Expression::registerExpression(string key, Parser parser) {
+void Expression::registerExpression(
+    string key,
+    Parser parser,
+    boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion) {
     auto op = parserMap.find(key);
     massert(17064,
             str::stream() << "Duplicate expression (" << key << ") registered.",
             op == parserMap.end());
-    parserMap[key] = parser;
+    parserMap[key] = {parser, requiredMinVersion};
 }
 
 intrusive_ptr<Expression> Expression::parseExpression(
@@ -127,11 +136,26 @@ intrusive_ptr<Expression> Expression::parseExpression(
 
     // Look up the parser associated with the expression name.
     const char* opName = obj.firstElementFieldName();
-    auto op = parserMap.find(opName);
+    auto it = parserMap.find(opName);
     uassert(ErrorCodes::InvalidPipelineOperator,
             str::stream() << "Unrecognized expression '" << opName << "'",
-            op != parserMap.end());
-    return op->second(expCtx, obj.firstElement(), vps);
+            it != parserMap.end());
+
+    // Make sure we are allowed to use this expression under the current feature compatibility
+    // version.
+    auto& entry = it->second;
+    uassert(
+        ErrorCodes::QueryFeatureNotAllowed,
+        // TODO SERVER-31968 we would like to include the current version and the required minimum
+        // version in this error message, but using FeatureCompatibilityVersion::toString() would
+        // introduce a dependency cycle.
+        str::stream() << opName
+                      << " is not allowed in the current feature compatibility version. See "
+                      << feature_compatibility_version_documentation::kCompatibilityLink
+                      << " for more information.",
+        !expCtx->maxFeatureCompatibilityVersion || !entry.requiredMinVersion ||
+            (*entry.requiredMinVersion <= *expCtx->maxFeatureCompatibilityVersion));
+    return entry.parser(expCtx, obj.firstElement(), vps);
 }
 
 Expression::ExpressionVector ExpressionNary::parseArguments(
@@ -1279,9 +1303,7 @@ intrusive_ptr<Expression> ExpressionDateFromString::parse(
                           << typeName(expr.type()),
             expr.type() == BSONType::Object);
 
-    BSONElement dateStringElem;
-    BSONElement timeZoneElem;
-    BSONElement formatElem;
+    BSONElement dateStringElem, timeZoneElem, formatElem, onNullElem, onErrorElem;
 
     const BSONObj args = expr.embeddedObject();
     for (auto&& arg : args) {
@@ -1293,11 +1315,43 @@ intrusive_ptr<Expression> ExpressionDateFromString::parse(
             dateStringElem = arg;
         } else if (field == "timezone"_sd) {
             timeZoneElem = arg;
+        } else if (field == "onNull"_sd) {
+            onNullElem = arg;
+        } else if (field == "onError"_sd) {
+            onErrorElem = arg;
         } else {
             uasserted(40541,
                       str::stream() << "Unrecognized argument to $dateFromString: "
                                     << arg.fieldName());
         }
+    }
+
+    // The 'format', 'onNull' and 'onError' options were introduced in 4.0, and should not be
+    // allowed in contexts where the maximum feature version is <= 4.0.
+    if (expCtx->maxFeatureCompatibilityVersion &&
+        *expCtx->maxFeatureCompatibilityVersion <
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
+        uassert(
+            ErrorCodes::QueryFeatureNotAllowed,
+            str::stream() << "\"format\" option to $dateFromString is not allowed with the current "
+                             "feature compatibility version. See "
+                          << feature_compatibility_version_documentation::kCompatibilityLink
+                          << " for more information.",
+            !formatElem);
+        uassert(
+            ErrorCodes::QueryFeatureNotAllowed,
+            str::stream() << "\"onNull\" option to $dateFromString is not allowed with the current "
+                             "feature compatibility version. See "
+                          << feature_compatibility_version_documentation::kCompatibilityLink
+                          << " for more information.",
+            !onNullElem);
+        uassert(ErrorCodes::QueryFeatureNotAllowed,
+                str::stream()
+                    << "\"onError\" option to $dateFromString is not allowed with the current "
+                       "feature compatibility version. See "
+                    << feature_compatibility_version_documentation::kCompatibilityLink
+                    << " for more information.",
+                !onErrorElem);
     }
 
     uassert(40542, "Missing 'dateString' parameter to $dateFromString", dateStringElem);
@@ -1306,29 +1360,45 @@ intrusive_ptr<Expression> ExpressionDateFromString::parse(
         expCtx,
         parseOperand(expCtx, dateStringElem, vps),
         timeZoneElem ? parseOperand(expCtx, timeZoneElem, vps) : nullptr,
-        formatElem ? parseOperand(expCtx, formatElem, vps) : nullptr);
+        formatElem ? parseOperand(expCtx, formatElem, vps) : nullptr,
+        onNullElem ? parseOperand(expCtx, onNullElem, vps) : nullptr,
+        onErrorElem ? parseOperand(expCtx, onErrorElem, vps) : nullptr);
 }
 
 ExpressionDateFromString::ExpressionDateFromString(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     intrusive_ptr<Expression> dateString,
     intrusive_ptr<Expression> timeZone,
-    intrusive_ptr<Expression> format)
+    intrusive_ptr<Expression> format,
+    intrusive_ptr<Expression> onNull,
+    intrusive_ptr<Expression> onError)
     : Expression(expCtx),
       _dateString(std::move(dateString)),
       _timeZone(std::move(timeZone)),
-      _format(std::move(format)) {}
+      _format(std::move(format)),
+      _onNull(std::move(onNull)),
+      _onError(std::move(onError)) {}
 
 intrusive_ptr<Expression> ExpressionDateFromString::optimize() {
     _dateString = _dateString->optimize();
     if (_timeZone) {
         _timeZone = _timeZone->optimize();
     }
+
     if (_format) {
         _format = _format->optimize();
     }
 
-    if (ExpressionConstant::allNullOrConstant({_dateString, _timeZone, _format})) {
+    if (_onNull) {
+        _onNull = _onNull->optimize();
+    }
+
+    if (_onError) {
+        _onError = _onError->optimize();
+    }
+
+    if (ExpressionConstant::allNullOrConstant(
+            {_dateString, _timeZone, _format, _onNull, _onError})) {
         // Everything is a constant, so we can turn into a constant.
         return ExpressionConstant::create(getExpressionContext(), evaluate(Document{}));
     }
@@ -1340,48 +1410,71 @@ Value ExpressionDateFromString::serialize(bool explain) const {
         Document{{"$dateFromString",
                   Document{{"dateString", _dateString->serialize(explain)},
                            {"timezone", _timeZone ? _timeZone->serialize(explain) : Value()},
-                           {"format", _format ? _format->serialize(explain) : Value()}}}});
+                           {"format", _format ? _format->serialize(explain) : Value()},
+                           {"onNull", _onNull ? _onNull->serialize(explain) : Value()},
+                           {"onError", _onError ? _onError->serialize(explain) : Value()}}}});
 }
 
 Value ExpressionDateFromString::evaluate(const Document& root) const {
     const Value dateString = _dateString->evaluate(root);
+    Value formatValue;
 
-    auto timeZone = makeTimeZone(getExpressionContext()->timeZoneDatabase, root, _timeZone.get());
+    // Eagerly validate the format parameter, ignoring if nullish since the input string nullish
+    // behavior takes precedence.
+    if (_format) {
+        formatValue = _format->evaluate(root);
+        if (!formatValue.nullish()) {
+            uassert(40684,
+                    str::stream() << "$dateFromString requires that 'format' be a string, found: "
+                                  << typeName(formatValue.getType())
+                                  << " with value "
+                                  << formatValue.toString(),
+                    formatValue.getType() == BSONType::String);
 
-    if (!timeZone || dateString.nullish()) {
-        return Value(BSONNULL);
+            TimeZone::validateFromStringFormat(formatValue.getStringData());
+        }
     }
 
-    uassert(40543,
-            str::stream() << "$dateFromString requires that 'dateString' be a string, found: "
-                          << typeName(dateString.getType())
-                          << " with value "
-                          << dateString.toString(),
-            dateString.getType() == BSONType::String);
-    const auto& dateTimeString = dateString.getStringData();
+    // Evaluate the timezone parameter before checking for nullish input, as this will throw an
+    // exception for an invalid timezone string.
+    auto timeZone = makeTimeZone(getExpressionContext()->timeZoneDatabase, root, _timeZone.get());
 
-    if (_format) {
-        const Value format = _format->evaluate(root);
+    // Behavior for nullish input takes precedence over other nullish elements.
+    if (dateString.nullish()) {
+        return _onNull ? _onNull->evaluate(root) : Value(BSONNULL);
+    }
 
-        if (format.nullish()) {
+    try {
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "$dateFromString requires that 'dateString' be a string, found: "
+                              << typeName(dateString.getType())
+                              << " with value "
+                              << dateString.toString(),
+                dateString.getType() == BSONType::String);
+
+        const auto dateTimeString = dateString.getStringData();
+
+        if (!timeZone) {
             return Value(BSONNULL);
         }
 
-        uassert(40684,
-                str::stream() << "$dateFromString requires that 'format' be a string, found: "
-                              << typeName(format.getType())
-                              << " with value "
-                              << format.toString(),
-                format.getType() == BSONType::String);
-        const auto& formatString = format.getStringData();
+        if (_format) {
+            if (formatValue.nullish()) {
+                return Value(BSONNULL);
+            }
 
-        TimeZone::validateFromStringFormat(formatString);
+            return Value(getExpressionContext()->timeZoneDatabase->fromString(
+                dateTimeString, timeZone.get(), formatValue.getStringData()));
+        }
 
-        return Value(getExpressionContext()->timeZoneDatabase->fromString(
-            dateTimeString, timeZone, formatString));
+        return Value(
+            getExpressionContext()->timeZoneDatabase->fromString(dateTimeString, timeZone.get()));
+    } catch (const ExceptionFor<ErrorCodes::ConversionFailure>&) {
+        if (_onError) {
+            return _onError->evaluate(root);
+        }
+        throw;
     }
-
-    return Value(getExpressionContext()->timeZoneDatabase->fromString(dateTimeString, timeZone));
 }
 
 void ExpressionDateFromString::_doAddDependencies(DepsTracker* deps) const {
@@ -1389,8 +1482,17 @@ void ExpressionDateFromString::_doAddDependencies(DepsTracker* deps) const {
     if (_timeZone) {
         _timeZone->addDependencies(deps);
     }
+
     if (_format) {
         _format->addDependencies(deps);
+    }
+
+    if (_onNull) {
+        _onNull->addDependencies(deps);
+    }
+
+    if (_onError) {
+        _onError->addDependencies(deps);
     }
 }
 
@@ -1549,19 +1651,22 @@ intrusive_ptr<Expression> ExpressionDateToString::parse(
     const VariablesParseState& vps) {
     verify(str::equals(expr.fieldName(), "$dateToString"));
 
-    uassert(18629, "$dateToString only supports an object as its argument", expr.type() == Object);
+    uassert(18629,
+            "$dateToString only supports an object as its argument",
+            expr.type() == BSONType::Object);
 
-    BSONElement formatElem;
-    BSONElement dateElem;
-    BSONElement timeZoneElem;
-    const BSONObj args = expr.embeddedObject();
-    BSONForEach(arg, args) {
-        if (str::equals(arg.fieldName(), "format")) {
+    BSONElement formatElem, dateElem, timeZoneElem, onNullElem;
+    for (auto&& arg : expr.embeddedObject()) {
+        auto field = arg.fieldNameStringData();
+
+        if (field == "format"_sd) {
             formatElem = arg;
-        } else if (str::equals(arg.fieldName(), "date")) {
+        } else if (field == "date"_sd) {
             dateElem = arg;
-        } else if (str::equals(arg.fieldName(), "timezone")) {
+        } else if (field == "timezone"_sd) {
             timeZoneElem = arg;
+        } else if (field == "onNull"_sd) {
+            onNullElem = arg;
         } else {
             uasserted(18534,
                       str::stream() << "Unrecognized argument to $dateToString: "
@@ -1569,30 +1674,49 @@ intrusive_ptr<Expression> ExpressionDateToString::parse(
         }
     }
 
-    uassert(18627, "Missing 'format' parameter to $dateToString", !formatElem.eoo());
+    // The 'onNull' option was introduced in 4.0, and should not be allowed in contexts where the
+    // maximum feature version is <= 4.0. Similarly, the 'format' option was made optional in 4.0,
+    // so should be required in such scenarios.
+    if (expCtx->maxFeatureCompatibilityVersion &&
+        *expCtx->maxFeatureCompatibilityVersion <
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
+        uassert(
+            ErrorCodes::QueryFeatureNotAllowed,
+            str::stream() << "\"onNull\" option to $dateToString is not allowed with the current "
+                             "feature compatibility version. See "
+                          << feature_compatibility_version_documentation::kCompatibilityLink
+                          << " for more information.",
+            !onNullElem);
+
+        uassert(ErrorCodes::QueryFeatureNotAllowed,
+                str::stream() << "\"format\" option to $dateToString is required with the current "
+                                 "feature compatibility version. See "
+                              << feature_compatibility_version_documentation::kCompatibilityLink
+                              << " for more information.",
+                formatElem);
+    }
+
     uassert(18628, "Missing 'date' parameter to $dateToString", !dateElem.eoo());
 
-    uassert(18533,
-            "The 'format' parameter to $dateToString must be a string literal",
-            formatElem.type() == String);
-
-    const string format = formatElem.str();
-
-    TimeZone::validateToStringFormat(format);
-
     return new ExpressionDateToString(expCtx,
-                                      format,
                                       parseOperand(expCtx, dateElem, vps),
+                                      formatElem ? parseOperand(expCtx, formatElem, vps) : nullptr,
                                       timeZoneElem ? parseOperand(expCtx, timeZoneElem, vps)
-                                                   : nullptr);
+                                                   : nullptr,
+                                      onNullElem ? parseOperand(expCtx, onNullElem, vps) : nullptr);
 }
 
 ExpressionDateToString::ExpressionDateToString(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const string& format,
     intrusive_ptr<Expression> date,
-    intrusive_ptr<Expression> timeZone)
-    : Expression(expCtx), _format(format), _date(std::move(date)), _timeZone(std::move(timeZone)) {}
+    intrusive_ptr<Expression> format,
+    intrusive_ptr<Expression> timeZone,
+    intrusive_ptr<Expression> onNull)
+    : Expression(expCtx),
+      _format(std::move(format)),
+      _date(std::move(date)),
+      _timeZone(std::move(timeZone)),
+      _onNull(std::move(onNull)) {}
 
 intrusive_ptr<Expression> ExpressionDateToString::optimize() {
     _date = _date->optimize();
@@ -1600,7 +1724,15 @@ intrusive_ptr<Expression> ExpressionDateToString::optimize() {
         _timeZone = _timeZone->optimize();
     }
 
-    if (ExpressionConstant::allNullOrConstant({_date, _timeZone})) {
+    if (_onNull) {
+        _onNull = _onNull->optimize();
+    }
+
+    if (_format) {
+        _format = _format->optimize();
+    }
+
+    if (ExpressionConstant::allNullOrConstant({_date, _format, _timeZone, _onNull})) {
         // Everything is a constant, so we can turn into a constant.
         return ExpressionConstant::create(getExpressionContext(), evaluate(Document{}));
     }
@@ -1611,30 +1743,67 @@ intrusive_ptr<Expression> ExpressionDateToString::optimize() {
 Value ExpressionDateToString::serialize(bool explain) const {
     return Value(
         Document{{"$dateToString",
-                  Document{{"format", _format},
-                           {"date", _date->serialize(explain)},
-                           {"timezone", _timeZone ? _timeZone->serialize(explain) : Value()}}}});
+                  Document{{"date", _date->serialize(explain)},
+                           {"format", _format ? _format->serialize(explain) : Value()},
+                           {"timezone", _timeZone ? _timeZone->serialize(explain) : Value()},
+                           {"onNull", _onNull ? _onNull->serialize(explain) : Value()}}}});
 }
 
 Value ExpressionDateToString::evaluate(const Document& root) const {
     const Value date = _date->evaluate(root);
+    Value formatValue;
 
+    // Eagerly validate the format parameter, ignoring if nullish since the input date nullish
+    // behavior takes precedence.
+    if (_format) {
+        formatValue = _format->evaluate(root);
+        if (!formatValue.nullish()) {
+            uassert(18533,
+                    str::stream() << "$dateToString requires that 'format' be a string, found: "
+                                  << typeName(formatValue.getType())
+                                  << " with value "
+                                  << formatValue.toString(),
+                    formatValue.getType() == BSONType::String);
+
+            TimeZone::validateToStringFormat(formatValue.getStringData());
+        }
+    }
+
+    // Evaluate the timezone parameter before checking for nullish input, as this will throw an
+    // exception for an invalid timezone string.
     auto timeZone = makeTimeZone(getExpressionContext()->timeZoneDatabase, root, _timeZone.get());
+
+    if (date.nullish()) {
+        return _onNull ? _onNull->evaluate(root) : Value(BSONNULL);
+    }
+
     if (!timeZone) {
         return Value(BSONNULL);
     }
 
-    if (date.nullish()) {
-        return Value(BSONNULL);
+    if (_format) {
+        if (formatValue.nullish()) {
+            return Value(BSONNULL);
+        }
+
+        return Value(timeZone->formatDate(formatValue.getStringData(), date.coerceToDate()));
     }
 
-    return Value(timeZone->formatDate(_format, date.coerceToDate()));
+    return Value(timeZone->formatDate(Value::kISOFormatString, date.coerceToDate()));
 }
 
 void ExpressionDateToString::_doAddDependencies(DepsTracker* deps) const {
     _date->addDependencies(deps);
     if (_timeZone) {
         _timeZone->addDependencies(deps);
+    }
+
+    if (_onNull) {
+        _onNull->addDependencies(deps);
+    }
+
+    if (_format) {
+        _format->addDependencies(deps);
     }
 }
 
@@ -1729,8 +1898,16 @@ intrusive_ptr<ExpressionObject> ExpressionObject::parse(
 }
 
 intrusive_ptr<Expression> ExpressionObject::optimize() {
+    bool allValuesConstant = true;
     for (auto&& pair : _expressions) {
         pair.second = pair.second->optimize();
+        if (!dynamic_cast<ExpressionConstant*>(pair.second.get())) {
+            allValuesConstant = false;
+        }
+    }
+    // If all values in ExpressionObject are constant evaluate to ExpressionConstant.
+    if (allValuesConstant) {
+        return ExpressionConstant::create(getExpressionContext(), evaluate(Document()));
     }
     return this;
 }
@@ -4230,9 +4407,21 @@ const char* ExpressionToUpper::getOpName() const {
 
 /* -------------------------- ExpressionTrim ------------------------------ */
 
-REGISTER_EXPRESSION(trim, ExpressionTrim::parse);
-REGISTER_EXPRESSION(ltrim, ExpressionTrim::parse);
-REGISTER_EXPRESSION(rtrim, ExpressionTrim::parse);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    trim,
+    ExpressionTrim::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    ltrim,
+    ExpressionTrim::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    rtrim,
+    ExpressionTrim::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+
 intrusive_ptr<Expression> ExpressionTrim::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     BSONElement expr,
@@ -4656,6 +4845,661 @@ void ExpressionZip::_doAddDependencies(DepsTracker* deps) const {
                   [&deps](intrusive_ptr<Expression> defaultExpression) -> void {
                       defaultExpression->addDependencies(deps);
                   });
+}
+
+/* -------------------------- ExpressionConvert ------------------------------ */
+
+namespace {
+
+/**
+ * $convert supports a big grab bag of conversions, so ConversionTable maintains a collection of
+ * conversion functions, as well as a table to organize them by inputType and targetType.
+ */
+class ConversionTable {
+public:
+    using ConversionFunc =
+        std::function<Value(const boost::intrusive_ptr<ExpressionContext>&, Value)>;
+
+    ConversionTable() {
+        //
+        // Conversions from NumberDouble
+        //
+        table[BSONType::NumberDouble][BSONType::NumberDouble] = &performIdentityConversion;
+        table[BSONType::NumberDouble][BSONType::String] = &performFormatDouble;
+        table[BSONType::NumberDouble]
+             [BSONType::Bool] = [](const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                   Value inputValue) { return Value(inputValue.coerceToBool()); };
+        table[BSONType::NumberDouble][BSONType::Date] = &performCastNumberToDate;
+        table[BSONType::NumberDouble][BSONType::NumberInt] = &performCastDoubleToInt;
+        table[BSONType::NumberDouble][BSONType::NumberLong] = &performCastDoubleToLong;
+        table[BSONType::NumberDouble][BSONType::NumberDecimal] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(inputValue.coerceToDecimal());
+            };
+
+        //
+        // Conversions from String
+        //
+        table[BSONType::String][BSONType::NumberDouble] = &parseStringToNumber<double, 0>;
+        table[BSONType::String][BSONType::String] = &performIdentityConversion;
+        table[BSONType::String][BSONType::jstOID] = &parseStringToOID;
+        table[BSONType::String][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::String][BSONType::Date] = [](
+            const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+            return Value(expCtx->timeZoneDatabase->fromString(inputValue.getStringData(),
+                                                              mongo::TimeZoneDatabase::utcZone()));
+        };
+        table[BSONType::String][BSONType::NumberInt] = &parseStringToNumber<int, 10>;
+        table[BSONType::String][BSONType::NumberLong] = &parseStringToNumber<long long, 10>;
+        table[BSONType::String][BSONType::NumberDecimal] = &parseStringToNumber<Decimal128, 0>;
+
+        //
+        // Conversions from jstOID
+        //
+        table[BSONType::jstOID][BSONType::String] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(inputValue.getOid().toString());
+            };
+        table[BSONType::jstOID][BSONType::jstOID] = &performIdentityConversion;
+        table[BSONType::jstOID][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::jstOID][BSONType::Date] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(inputValue.getOid().asDateT());
+            };
+
+        //
+        // Conversions from Bool
+        //
+        table[BSONType::Bool][BSONType::NumberDouble] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return inputValue.getBool() ? Value(1.0) : Value(0.0);
+            };
+        table[BSONType::Bool][BSONType::String] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return inputValue.getBool() ? Value("true"_sd) : Value("false"_sd);
+            };
+        table[BSONType::Bool][BSONType::Bool] = &performIdentityConversion;
+        table[BSONType::Bool][BSONType::NumberInt] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return inputValue.getBool() ? Value(int{1}) : Value(int{0});
+            };
+        table[BSONType::Bool][BSONType::NumberLong] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return inputValue.getBool() ? Value(1LL) : Value(0LL);
+            };
+        table[BSONType::Bool][BSONType::NumberDecimal] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return inputValue.getBool() ? Value(Decimal128(1)) : Value(Decimal128(0));
+            };
+
+        //
+        // Conversions from Date
+        //
+        table[BSONType::Date][BSONType::NumberDouble] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(static_cast<double>(inputValue.getDate().toMillisSinceEpoch()));
+            };
+        table[BSONType::Date][BSONType::String] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                auto dateString = TimeZoneDatabase::utcZone().formatDate(Value::kISOFormatString,
+                                                                         inputValue.getDate());
+                return Value(dateString);
+            };
+        table[BSONType::Date]
+             [BSONType::Bool] = [](const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                   Value inputValue) { return Value(inputValue.coerceToBool()); };
+        table[BSONType::Date][BSONType::Date] = &performIdentityConversion;
+        table[BSONType::Date][BSONType::NumberLong] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(inputValue.getDate().toMillisSinceEpoch());
+            };
+        table[BSONType::Date][BSONType::NumberDecimal] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(
+                    Decimal128(static_cast<int64_t>(inputValue.getDate().toMillisSinceEpoch())));
+            };
+
+        //
+        // Conversions from NumberInt
+        //
+        table[BSONType::NumberInt][BSONType::NumberDouble] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(inputValue.coerceToDouble());
+            };
+        table[BSONType::NumberInt][BSONType::String] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(static_cast<std::string>(str::stream() << inputValue.getInt()));
+            };
+        table[BSONType::NumberInt]
+             [BSONType::Bool] = [](const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                   Value inputValue) { return Value(inputValue.coerceToBool()); };
+        table[BSONType::NumberInt][BSONType::NumberInt] = &performIdentityConversion;
+        table[BSONType::NumberInt][BSONType::NumberLong] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(static_cast<long long>(inputValue.getInt()));
+            };
+        table[BSONType::NumberInt][BSONType::NumberDecimal] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(inputValue.coerceToDecimal());
+            };
+
+        //
+        // Conversions from NumberLong
+        //
+        table[BSONType::NumberLong][BSONType::NumberDouble] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(inputValue.coerceToDouble());
+            };
+        table[BSONType::NumberLong][BSONType::String] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(static_cast<std::string>(str::stream() << inputValue.getLong()));
+            };
+        table[BSONType::NumberLong]
+             [BSONType::Bool] = [](const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                   Value inputValue) { return Value(inputValue.coerceToBool()); };
+        table[BSONType::NumberLong][BSONType::Date] = &performCastNumberToDate;
+        table[BSONType::NumberLong][BSONType::NumberInt] = &performCastLongToInt;
+        table[BSONType::NumberLong][BSONType::NumberLong] = &performIdentityConversion;
+        table[BSONType::NumberLong][BSONType::NumberDecimal] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(inputValue.coerceToDecimal());
+            };
+
+        //
+        // Conversions from NumberDecimal
+        //
+        table[BSONType::NumberDecimal][BSONType::NumberDouble] = &performCastDecimalToDouble;
+        table[BSONType::NumberDecimal][BSONType::String] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return Value(inputValue.getDecimal().toString());
+            };
+        table[BSONType::NumberDecimal]
+             [BSONType::Bool] = [](const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                   Value inputValue) { return Value(inputValue.coerceToBool()); };
+        table[BSONType::NumberDecimal][BSONType::Date] = &performCastNumberToDate;
+        table[BSONType::NumberDecimal][BSONType::NumberInt] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return performCastDecimalToInt(BSONType::NumberInt, inputValue);
+            };
+        table[BSONType::NumberDecimal][BSONType::NumberLong] =
+            [](const boost::intrusive_ptr<ExpressionContext>& expCtx, Value inputValue) {
+                return performCastDecimalToInt(BSONType::NumberLong, inputValue);
+            };
+        table[BSONType::NumberDecimal][BSONType::NumberDecimal] = &performIdentityConversion;
+
+        //
+        // Miscellaneous conversions to Bool
+        //
+        table[BSONType::Object][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::Array][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::BinData][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::RegEx][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::DBRef][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::Code][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::Symbol][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::CodeWScope][BSONType::Bool] = &performConvertToTrue;
+        table[BSONType::bsonTimestamp][BSONType::Bool] = &performConvertToTrue;
+    }
+
+    ConversionFunc findConversionFunc(BSONType inputType, BSONType targetType) const {
+        ConversionFunc foundFunction;
+
+        // Note: We can't use BSONType::MinKey (-1) or BSONType::MaxKey (127) as table indexes,
+        // so we have to treat them as special cases.
+        if (inputType != BSONType::MinKey && inputType != BSONType::MaxKey &&
+            targetType != BSONType::MinKey && targetType != BSONType::MaxKey) {
+            invariant(inputType >= 0 && inputType <= JSTypeMax);
+            invariant(targetType >= 0 && targetType <= JSTypeMax);
+            foundFunction = table[inputType][targetType];
+        } else if (targetType == BSONType::Bool) {
+            // This is a conversion from MinKey or MaxKey to Bool, which is allowed (and always
+            // returns true).
+            foundFunction = &performConvertToTrue;
+        } else {
+            // Any other conversions involving MinKey or MaxKey (either as the target or input) are
+            // illegal.
+        }
+
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "Unsupported conversion from " << typeName(inputType) << " to "
+                              << typeName(targetType)
+                              << " in $convert with no onError value",
+                foundFunction);
+        return foundFunction;
+    }
+
+private:
+    ConversionFunc table[JSTypeMax + 1][JSTypeMax + 1];
+
+    static void validateDoubleValueIsFinite(double inputDouble) {
+        uassert(ErrorCodes::ConversionFailure,
+                "Attempt to convert NaN value to integer type in $convert with no onError value",
+                !std::isnan(inputDouble));
+        uassert(
+            ErrorCodes::ConversionFailure,
+            "Attempt to convert infinity value to integer type in $convert with no onError value",
+            std::isfinite(inputDouble));
+    }
+
+    static Value performCastDoubleToInt(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                        Value inputValue) {
+        double inputDouble = inputValue.getDouble();
+        validateDoubleValueIsFinite(inputDouble);
+
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream()
+                    << "Conversion would overflow target type in $convert with no onError value: "
+                    << inputDouble,
+                inputDouble >= std::numeric_limits<int>::lowest() &&
+                    inputDouble <= std::numeric_limits<int>::max());
+
+        return Value(static_cast<int>(inputDouble));
+    }
+
+    static Value performCastDoubleToLong(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         Value inputValue) {
+        double inputDouble = inputValue.getDouble();
+        validateDoubleValueIsFinite(inputDouble);
+
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream()
+                    << "Conversion would overflow target type in $convert with no onError value: "
+                    << inputDouble,
+                inputDouble >= std::numeric_limits<long long>::lowest() &&
+                    inputDouble < ExpressionConvert::kLongLongMaxPlusOneAsDouble);
+
+        return Value(static_cast<long long>(inputDouble));
+    }
+
+    static Value performCastDecimalToInt(BSONType targetType, Value inputValue) {
+        invariant(targetType == BSONType::NumberInt || targetType == BSONType::NumberLong);
+        Decimal128 inputDecimal = inputValue.getDecimal();
+
+        // Performing these checks up front allows us to provide more specific error messages than
+        // if we just gave the same error for any 'kInvalid' conversion.
+        uassert(ErrorCodes::ConversionFailure,
+                "Attempt to convert NaN value to integer type in $convert with no onError value",
+                !inputDecimal.isNaN());
+        uassert(
+            ErrorCodes::ConversionFailure,
+            "Attempt to convert infinity value to integer type in $convert with no onError value",
+            !inputDecimal.isInfinite());
+
+        std::uint32_t signalingFlags = Decimal128::SignalingFlag::kNoFlag;
+        Value result;
+        if (targetType == BSONType::NumberInt) {
+            int intVal =
+                inputDecimal.toInt(&signalingFlags, Decimal128::RoundingMode::kRoundTowardZero);
+            result = Value(intVal);
+        } else if (targetType == BSONType::NumberLong) {
+            long long longVal =
+                inputDecimal.toLong(&signalingFlags, Decimal128::RoundingMode::kRoundTowardZero);
+            result = Value(longVal);
+        } else {
+            MONGO_UNREACHABLE;
+        }
+
+        // NB: Decimal128::SignalingFlag has a values specifically for overflow, but it is used for
+        // arithmetic with Decimal128 operands, _not_ for conversions of this style. Overflowing
+        // conversions only trigger a 'kInvalid' flag.
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream()
+                    << "Conversion would overflow target type in $convert with no onError value: "
+                    << inputDecimal.toString(),
+                (signalingFlags & Decimal128::SignalingFlag::kInvalid) == 0);
+        invariant(signalingFlags == Decimal128::SignalingFlag::kNoFlag);
+
+        return result;
+    }
+
+    static Value performCastDecimalToDouble(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                            Value inputValue) {
+        Decimal128 inputDecimal = inputValue.getDecimal();
+
+        std::uint32_t signalingFlags = Decimal128::SignalingFlag::kNoFlag;
+        double result =
+            inputDecimal.toDouble(&signalingFlags, Decimal128::RoundingMode::kRoundTiesToEven);
+
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream()
+                    << "Conversion would overflow target type in $convert with no onError value: "
+                    << inputDecimal.toString(),
+                signalingFlags == Decimal128::SignalingFlag::kNoFlag ||
+                    signalingFlags == Decimal128::SignalingFlag::kInexact);
+
+        return Value(result);
+    }
+
+    static Value performCastLongToInt(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                      Value inputValue) {
+        long long longValue = inputValue.getLong();
+
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream()
+                    << "Conversion would overflow target type in $convert with no onError value: ",
+                longValue >= std::numeric_limits<int>::min() &&
+                    longValue <= std::numeric_limits<int>::max());
+
+        return Value(static_cast<int>(longValue));
+    }
+
+    static Value performCastNumberToDate(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                         Value inputValue) {
+        long long millisSinceEpoch;
+
+        switch (inputValue.getType()) {
+            case BSONType::NumberLong:
+                millisSinceEpoch = inputValue.getLong();
+                break;
+            case BSONType::NumberDouble:
+                millisSinceEpoch = performCastDoubleToLong(expCtx, inputValue).getLong();
+                break;
+            case BSONType::NumberDecimal:
+                millisSinceEpoch =
+                    performCastDecimalToInt(BSONType::NumberLong, inputValue).getLong();
+                break;
+            default:
+                MONGO_UNREACHABLE;
+        }
+
+        return Value(Date_t::fromMillisSinceEpoch(millisSinceEpoch));
+    }
+
+    static Value performFormatDouble(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                     Value inputValue) {
+        double doubleValue = inputValue.getDouble();
+
+        if (std::isinf(doubleValue)) {
+            return Value(std::signbit(doubleValue) ? "-Infinity"_sd : "Infinity"_sd);
+        } else if (std::isnan(doubleValue)) {
+            return Value("NaN"_sd);
+        } else if (doubleValue == 0.0 && std::signbit(doubleValue)) {
+            return Value("-0"_sd);
+        } else {
+            return Value(static_cast<std::string>(str::stream() << doubleValue));
+        }
+    }
+
+    template <class targetType, int base>
+    static Value parseStringToNumber(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                     Value inputValue) {
+        auto stringValue = inputValue.getStringData();
+        targetType result;
+
+        // Reject any strings in hex format. This check is needed because the
+        // parseNumberFromStringWithBase call below allows an input hex string prefixed by '0x' when
+        // parsing to a double.
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "Illegal hexadecimal input in $convert with no onError value: "
+                              << stringValue,
+                !stringValue.startsWith("0x"));
+
+        Status parseStatus = parseNumberFromStringWithBase(stringValue, base, &result);
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "Failed to parse number '" << stringValue
+                              << "' in $convert with no onError value: "
+                              << parseStatus.reason(),
+                parseStatus.isOK());
+
+        return Value(result);
+    }
+
+    static Value parseStringToOID(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                  Value inputValue) {
+        try {
+            return Value(OID::createFromString(inputValue.getStringData()));
+        } catch (const DBException& ex) {
+            // Rethrow any caught exception as a conversion failure such that 'onError' is evaluated
+            // and returned.
+            uasserted(ErrorCodes::ConversionFailure,
+                      str::stream() << "Failed to parse objectId '" << inputValue.getString()
+                                    << "' in $convert with no onError value: "
+                                    << ex.reason());
+        }
+    }
+
+    static Value performConvertToTrue(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                      Value inputValue) {
+        return Value(true);
+    }
+
+    static Value performIdentityConversion(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                           Value inputValue) {
+        return inputValue;
+    }
+};
+
+Expression::Parser makeConversionAlias(const StringData shortcutName, BSONType toType) {
+    return [=](const intrusive_ptr<ExpressionContext>& expCtx,
+               BSONElement elem,
+               const VariablesParseState& vps) -> intrusive_ptr<Expression> {
+
+        // Use parseArguments to allow for a singleton array, or the unwrapped version.
+        auto operands = ExpressionNary::parseArguments(expCtx, elem, vps);
+
+        uassert(50723,
+                str::stream() << shortcutName << " requires a single argument, got "
+                              << operands.size(),
+                operands.size() == 1);
+        return ExpressionConvert::create(expCtx, operands[0], toType);
+    };
+}
+
+}  // namespace
+
+const double ExpressionConvert::kLongLongMaxPlusOneAsDouble =
+    scalbn(1, std::numeric_limits<long long>::digits);
+
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    convert,
+    ExpressionConvert::parse,
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+
+// Also register shortcut expressions like $toInt, $toString, etc. which can be used as a shortcut
+// for $convert without an 'onNull' or 'onError'.
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    toString,
+    makeConversionAlias("$toString"_sd, BSONType::String),
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    toObjectId,
+    makeConversionAlias("$toObjectId"_sd, BSONType::jstOID),
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    toDate,
+    makeConversionAlias("$toDate"_sd, BSONType::Date),
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    toDouble,
+    makeConversionAlias("$toDouble"_sd, BSONType::NumberDouble),
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    toInt,
+    makeConversionAlias("$toInt"_sd, BSONType::NumberInt),
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    toLong,
+    makeConversionAlias("$toLong"_sd, BSONType::NumberLong),
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    toDecimal,
+    makeConversionAlias("$toDecimal"_sd, BSONType::NumberDecimal),
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+REGISTER_EXPRESSION_WITH_MIN_VERSION(
+    toBool,
+    makeConversionAlias("$toBool"_sd, BSONType::Bool),
+    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+
+boost::intrusive_ptr<Expression> ExpressionConvert::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const boost::intrusive_ptr<Expression>& input,
+    BSONType toType) {
+    return new ExpressionConvert(expCtx, input, toType);
+}
+
+ExpressionConvert::ExpressionConvert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                     const boost::intrusive_ptr<Expression>& input,
+                                     BSONType toType)
+    : Expression(expCtx),
+      _input(input),
+      _to(ExpressionConstant::create(expCtx, Value(StringData(typeName(toType))))) {}
+
+intrusive_ptr<Expression> ExpressionConvert::parse(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    BSONElement expr,
+    const VariablesParseState& vps) {
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "$convert expects an object of named arguments but found: "
+                          << typeName(expr.type()),
+            expr.type() == BSONType::Object);
+
+    intrusive_ptr<ExpressionConvert> newConvert(new ExpressionConvert(expCtx));
+
+    for (auto&& elem : expr.embeddedObject()) {
+        const auto field = elem.fieldNameStringData();
+        if (field == "input"_sd) {
+            newConvert->_input = parseOperand(expCtx, elem, vps);
+        } else if (field == "to"_sd) {
+            newConvert->_to = parseOperand(expCtx, elem, vps);
+        } else if (field == "onError"_sd) {
+            newConvert->_onError = parseOperand(expCtx, elem, vps);
+        } else if (field == "onNull"_sd) {
+            newConvert->_onNull = parseOperand(expCtx, elem, vps);
+        } else {
+            uasserted(ErrorCodes::FailedToParse,
+                      str::stream() << "$convert found an unknown argument: "
+                                    << elem.fieldNameStringData());
+        }
+    }
+
+    uassert(ErrorCodes::FailedToParse, "Missing 'input' parameter to $convert", newConvert->_input);
+    uassert(ErrorCodes::FailedToParse, "Missing 'to' parameter to $convert", newConvert->_to);
+
+    return std::move(newConvert);
+}
+
+Value ExpressionConvert::evaluate(const Document& root) const {
+    auto toValue = _to->evaluate(root);
+    Value inputValue = _input->evaluate(root);
+    boost::optional<BSONType> targetType;
+    if (!toValue.nullish()) {
+        targetType = computeTargetType(toValue);
+    }
+
+    if (inputValue.nullish()) {
+        return _onNull ? _onNull->evaluate(root) : Value(BSONNULL);
+    } else if (!targetType) {
+        // "to" evaluated to a nullish value.
+        return Value(BSONNULL);
+    }
+
+    try {
+        return performConversion(*targetType, inputValue);
+    } catch (const ExceptionFor<ErrorCodes::ConversionFailure>&) {
+        if (_onError) {
+            return _onError->evaluate(root);
+        } else {
+            throw;
+        }
+    }
+}
+
+boost::intrusive_ptr<Expression> ExpressionConvert::optimize() {
+    _input = _input->optimize();
+    _to = _to->optimize();
+    if (_onError) {
+        _onError = _onError->optimize();
+    }
+    if (_onNull) {
+        _onNull = _onNull->optimize();
+    }
+
+    // Perform constant folding if possible. This does not support folding for $convert operations
+    // that have constant _to and _input values but non-constant _onError and _onNull values.
+    // Because _onError and _onNull are evaluated lazily, conversions that do not used the _onError
+    // and _onNull values could still be legally folded if those values are not needed. Support for
+    // that case would add more complexity than it's worth, though.
+    if (ExpressionConstant::allNullOrConstant({_input, _to, _onError, _onNull})) {
+        return ExpressionConstant::create(getExpressionContext(), evaluate(Document{}));
+    }
+
+    return this;
+}
+
+Value ExpressionConvert::serialize(bool explain) const {
+    return Value(Document{{"$convert",
+                           Document{{"input", _input->serialize(explain)},
+                                    {"to", _to->serialize(explain)},
+                                    {"onError", _onError ? _onError->serialize(explain) : Value()},
+                                    {"onNull", _onNull ? _onNull->serialize(explain) : Value()}}}});
+}
+
+void ExpressionConvert::_doAddDependencies(DepsTracker* deps) const {
+    _input->addDependencies(deps);
+    _to->addDependencies(deps);
+    if (_onError) {
+        _onError->addDependencies(deps);
+    }
+    if (_onNull) {
+        _onNull->addDependencies(deps);
+    }
+}
+
+namespace {
+bool isTargetTypeSupported(BSONType targetType) {
+    switch (targetType) {
+        case BSONType::NumberDouble:
+        case BSONType::String:
+        case BSONType::jstOID:
+        case BSONType::Bool:
+        case BSONType::Date:
+        case BSONType::NumberInt:
+        case BSONType::NumberLong:
+        case BSONType::NumberDecimal:
+            return true;
+        default:
+            return false;
+    }
+}
+}
+
+BSONType ExpressionConvert::computeTargetType(Value targetTypeName) const {
+    BSONType targetType;
+    if (targetTypeName.getType() == BSONType::String) {
+        // This will throw if the type name is invalid.
+        targetType = typeFromName(targetTypeName.getString());
+    } else if (targetTypeName.numeric()) {
+        uassert(ErrorCodes::FailedToParse,
+                "In $convert, numeric 'to' argument is not an integer",
+                targetTypeName.integral());
+
+        int typeCode = targetTypeName.coerceToInt();
+        uassert(ErrorCodes::FailedToParse,
+                str::stream()
+                    << "In $convert, numeric value for 'to' does not correspond to a BSON type: "
+                    << typeCode,
+                isValidBSONType(typeCode));
+        targetType = static_cast<BSONType>(typeCode);
+    } else {
+        uasserted(ErrorCodes::FailedToParse,
+                  str::stream() << "$convert's 'to' argument must be a string or number, but is "
+                                << typeName(targetTypeName.getType()));
+    }
+
+    // Make sure the type is one of the supported "to" types for $convert.
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "$convert with unsupported 'to' type: " << typeName(targetType),
+            isTargetTypeSupported(targetType));
+
+    return targetType;
+}
+
+Value ExpressionConvert::performConversion(BSONType targetType, Value inputValue) const {
+    invariant(!inputValue.nullish());
+
+    static const ConversionTable table;
+    BSONType inputType = inputValue.getType();
+    return table.findConversionFunc(inputType, targetType)(getExpressionContext(), inputValue);
 }
 
 }  // namespace mongo

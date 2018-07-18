@@ -69,6 +69,7 @@
         _configsvrCommitChunkMerge: {skip: isAnInternalCommand},
         _configsvrCommitChunkMigration: {skip: isAnInternalCommand},
         _configsvrCommitChunkSplit: {skip: isAnInternalCommand},
+        _configsvrCommitMovePrimary: {skip: isAnInternalCommand},
         _configsvrCreateCollection: {skip: isAnInternalCommand},
         _configsvrCreateDatabase: {skip: isAnInternalCommand},
         _configsvrDropCollection: {skip: isAnInternalCommand},
@@ -87,11 +88,13 @@
         _isSelf: {skip: isAnInternalCommand},
         _mergeAuthzCollections: {skip: isAnInternalCommand},
         _migrateClone: {skip: isAnInternalCommand},
+        _movePrimary: {skip: isAnInternalCommand},
         _recvChunkAbort: {skip: isAnInternalCommand},
         _recvChunkCommit: {skip: isAnInternalCommand},
         _recvChunkStart: {skip: isAnInternalCommand},
         _recvChunkStatus: {skip: isAnInternalCommand},
         _transferMods: {skip: isAnInternalCommand},
+        abortTransaction: {skip: isUnrelated},
         addShard: {skip: isUnrelated},
         addShardToZone: {skip: isUnrelated},
         aggregate: {command: {aggregate: "view", pipeline: [{$match: {}}], cursor: {}}},
@@ -124,6 +127,7 @@
         },
         collMod: {command: {collMod: "view", viewOn: "other", pipeline: []}},
         collStats: {skip: "Tested in views/views_coll_stats.js"},
+        commitTransaction: {skip: isUnrelated},
         compact: {command: {compact: "view", force: true}, expectFailure: true, skipSharded: true},
         configureFailPoint: {skip: isUnrelated},
         connPoolStats: {skip: isUnrelated},
@@ -186,10 +190,17 @@
         delete: {command: {delete: "view", deletes: [{q: {x: 1}, limit: 1}]}, expectFailure: true},
         distinct: {command: {distinct: "view", key: "_id"}},
         doTxn: {
-            command: {doTxn: [{op: "i", o: {_id: 1}, ns: "test.view"}]},
+            command: {
+                doTxn: [{op: "i", o: {_id: 1}, ns: "test.view"}],
+                txnNumber: NumberLong("0"),
+                lsid: {id: UUID()}
+            },
             expectFailure: true,
-            expectedErrorCode:
-                [ErrorCodes.CommandNotSupportedOnView, ErrorCodes.CommandNotSupported],
+            expectedErrorCode: [
+                ErrorCodes.CommandNotSupportedOnView,
+                ErrorCodes.CommandNotSupported,
+                ErrorCodes.IllegalOperation
+            ],
             skipSharded: true,
         },
         driverOIDTest: {skip: isUnrelated},
@@ -252,7 +263,7 @@
             command: function(conn) {
                 function testGetMoreForCommand(cmd) {
                     let res = conn.runCommand(cmd);
-                    assert.commandWorked(res, cmd);
+                    assert.commandWorked(res, tojson(cmd));
                     let cursor = res.cursor;
                     assert.eq(cursor.ns,
                               "test.view",
@@ -262,7 +273,7 @@
                     let getmoreCmd = {getMore: cursor.id, collection: "view"};
                     res = conn.runCommand(getmoreCmd);
 
-                    assert.commandWorked(res, getmoreCmd);
+                    assert.commandWorked(res, tojson(getmoreCmd));
                     assert.eq("test.view",
                               res.cursor.ns,
                               "expected view namespace in cursor: " + tojson(res));
@@ -317,7 +328,7 @@
                     cursor: {batchSize: 2}
                 };
                 let res = conn.runCommand(aggCmd);
-                assert.commandWorked(res, aggCmd);
+                assert.commandWorked(res, tojson(aggCmd));
                 let cursor = res.cursor;
                 assert.eq(
                     cursor.ns, "test.view", "expected view namespace in cursor: " + tojson(cursor));
@@ -328,7 +339,7 @@
                 // Then check correct execution of the killCursors command.
                 let killCursorsCmd = {killCursors: "view", cursors: [cursor.id]};
                 res = conn.runCommand(killCursorsCmd);
-                assert.commandWorked(res, killCursorsCmd);
+                assert.commandWorked(res, tojson(killCursorsCmd));
                 let expectedRes = {
                     cursorsKilled: [cursor.id],
                     cursorsNotFound: [],
@@ -432,7 +443,6 @@
         replSetUpdatePosition: {skip: isUnrelated},
         replSetResizeOplog: {skip: isUnrelated},
         resetError: {skip: isUnrelated},
-        resync: {skip: isUnrelated},
         revokePrivilegesFromRole: {
             command: {
                 revokePrivilegesFromRole: "testrole",

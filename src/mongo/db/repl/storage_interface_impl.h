@@ -152,13 +152,15 @@ public:
     StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
                                                          const NamespaceString& nss) override;
 
-    Status upgradeUUIDSchemaVersionNonReplicated(OperationContext* opCtx) override;
-
     void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
-    Status recoverToStableTimestamp(ServiceContext* serviceCtx) override;
+    StatusWith<Timestamp> recoverToStableTimestamp(ServiceContext* serviceCtx) override;
+
+    bool supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const override;
+
+    boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override;
 
     /**
      * Checks that the "admin" database contains a supported version of the auth data schema.

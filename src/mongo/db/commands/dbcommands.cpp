@@ -30,12 +30,9 @@
 
 #include "mongo/platform/basic.h"
 
-#include <array>
 #include <time.h>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/base/simple_string_data_comparator.h"
-#include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
@@ -50,12 +47,12 @@
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/coll_mod.h"
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/create_collection.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
@@ -86,12 +83,10 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_settings.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/s/chunk_version.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/fail_point_service.h"
@@ -106,6 +101,7 @@ using std::string;
 using std::stringstream;
 using std::unique_ptr;
 
+namespace {
 
 class CmdShutdownMongoD : public CmdShutdown {
 public:
@@ -136,7 +132,7 @@ public:
         }
 
         // Never returns
-        shutdownHelper();
+        shutdownHelper(cmdObj);
         return true;
     }
 
@@ -147,7 +143,7 @@ public:
     std::string help() const override {
         return "drop (delete) this database";
     }
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
 
@@ -210,7 +206,7 @@ public:
 
 class CmdRepairDatabase : public ErrmsgCommandDeprecated {
 public:
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
     virtual bool maintenanceMode() const {
@@ -248,7 +244,16 @@ public:
 
         // Closing a database requires a global lock.
         Lock::GlobalWrite lk(opCtx);
-        if (!dbHolder().get(opCtx, dbname)) {
+        auto db = dbHolder().get(opCtx, dbname);
+        if (db) {
+            if (db->isDropPending(opCtx)) {
+                return CommandHelpers::appendCommandStatus(
+                    result,
+                    Status(ErrorCodes::DatabaseDropPending,
+                           str::stream() << "Cannot repair database " << dbname
+                                         << " since it is pending being dropped."));
+            }
+        } else {
             // If the name doesn't make an exact match, check for a case insensitive match.
             std::set<std::string> otherCasing = dbHolder().getNamesWithConflictingCasing(dbname);
             if (otherCasing.empty()) {
@@ -295,7 +300,7 @@ public:
 */
 class CmdProfile : public ErrmsgCommandDeprecated {
 public:
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
@@ -410,7 +415,7 @@ public:
 class CmdDrop : public ErrmsgCommandDeprecated {
 public:
     CmdDrop() : ErrmsgCommandDeprecated("drop") {}
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
     virtual bool adminOnly() const {
@@ -466,7 +471,7 @@ public:
 class CmdCreate : public BasicCommand {
 public:
     CmdCreate() : BasicCommand("create") {}
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
     virtual bool adminOnly() const {
@@ -579,12 +584,11 @@ public:
     }
 } cmdCreate;
 
-
 class CmdFileMD5 : public BasicCommand {
 public:
     CmdFileMD5() : BasicCommand("filemd5") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
 
@@ -719,9 +723,8 @@ public:
             if (PlanExecutor::DEAD == state || PlanExecutor::FAILURE == state) {
                 return CommandHelpers::appendCommandStatus(
                     result,
-                    Status(ErrorCodes::OperationFailed,
-                           str::stream() << "Executor error during filemd5 command: "
-                                         << WorkingSetCommon::toStatusString(obj)));
+                    WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                        "Executor error during filemd5 command"));
             }
 
             if (partialOk)
@@ -752,7 +755,6 @@ public:
 
 } cmdFileMD5;
 
-
 class CmdDatasize : public ErrmsgCommandDeprecated {
     virtual string parseNs(const string& dbname, const BSONObj& cmdObj) const {
         return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
@@ -761,7 +763,7 @@ class CmdDatasize : public ErrmsgCommandDeprecated {
 public:
     CmdDatasize() : ErrmsgCommandDeprecated("dataSize", "datasize") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -888,9 +890,8 @@ public:
             warning() << "Internal error while reading " << ns;
             return CommandHelpers::appendCommandStatus(
                 result,
-                Status(ErrorCodes::OperationFailed,
-                       str::stream() << "Executor error while reading during dataSize command: "
-                                     << WorkingSetCommon::toStatusString(obj)));
+                WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                    "Executor error while reading during dataSize command"));
         }
 
         ostringstream os;
@@ -911,7 +912,7 @@ class CollectionStats : public ErrmsgCommandDeprecated {
 public:
     CollectionStats() : ErrmsgCommandDeprecated("collStats", "collstats") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -958,7 +959,7 @@ class CollectionModCommand : public BasicCommand {
 public:
     CollectionModCommand() : BasicCommand("collMod") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kNever;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -992,7 +993,7 @@ class DBStats : public ErrmsgCommandDeprecated {
 public:
     DBStats() : ErrmsgCommandDeprecated("dbStats", "dbstats") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -1088,7 +1089,7 @@ public:
 class CmdWhatsMyUri : public BasicCommand {
 public:
     CmdWhatsMyUri() : BasicCommand("whatsmyuri") {}
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -1113,7 +1114,7 @@ class AvailableQueryOptions : public BasicCommand {
 public:
     AvailableQueryOptions() : BasicCommand("availableQueryOptions", "availablequeryoptions") {}
 
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
@@ -1134,4 +1135,5 @@ public:
     }
 } availableQueryOptionsCmd;
 
+}  // namespace
 }  // namespace mongo

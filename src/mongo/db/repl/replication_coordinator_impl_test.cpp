@@ -594,24 +594,6 @@ TEST_F(ReplCoordTest, NodeReturnsImmediatelyWhenAwaitReplicationIsRanAgainstASta
     ASSERT_OK(statusAndDur.status);
 }
 
-TEST_F(ReplCoordTest, NodeReturnsImmediatelyWhenAwaitReplicationIsRanAgainstAMasterSlaveNode) {
-    ReplSettings settings;
-    settings.setMaster(true);
-    init(settings);
-    auto opCtx = makeOperationContext();
-
-    OpTimeWithTermOne time(100, 1);
-
-    WriteConcernOptions writeConcern;
-    writeConcern.wTimeout = WriteConcernOptions::kNoWaiting;
-    writeConcern.wNumNodes = 0;
-    writeConcern.wMode = WriteConcernOptions::kMajority;
-    // w:majority always works on master/slave
-    ReplicationCoordinator::StatusAndDuration statusAndDur =
-        getReplCoord()->awaitReplication(opCtx.get(), time, writeConcern);
-    ASSERT_OK(statusAndDur.status);
-}
-
 TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenRunningAwaitReplicationAgainstASecondaryNode) {
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -1427,6 +1409,71 @@ TEST_F(ReplCoordTest, NodeReturnsBadValueWhenUpdateTermIsRunAgainstANonReplNode)
     ASSERT_EQUALS(ErrorCodes::BadValue, getReplCoord()->updateTerm(opCtx.get(), 0).code());
 }
 
+TEST_F(ReplCoordTest, ElectionIdTracksTermInPV1) {
+    init("mySet/test1:1234,test2:1234,test3:1234");
+
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version"
+                            << 1
+                            << "members"
+                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                     << "test1:1234")
+                                          << BSON("_id" << 1 << "host"
+                                                        << "test2:1234")
+                                          << BSON("_id" << 2 << "host"
+                                                        << "test3:1234"))
+                            << "protocolVersion"
+                            << 1),
+                       HostAndPort("test1", 1234));
+    getReplCoord()->setMyLastAppliedOpTime(OpTime(Timestamp(100, 1), 0));
+    getReplCoord()->setMyLastDurableOpTime(OpTime(Timestamp(100, 1), 0));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+
+    // No election has taken place yet.
+    {
+        auto term = getTopoCoord().getTerm();
+        auto electionId = getTopoCoord().getElectionId();
+
+        ASSERT_EQUALS(0, term);
+        ASSERT_FALSE(electionId.isSet());
+    }
+
+    simulateSuccessfulV1Election();
+
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+
+    // Check that the electionId is set properly after the election.
+    {
+        auto term = getTopoCoord().getTerm();
+        auto electionId = getTopoCoord().getElectionId();
+
+        ASSERT_EQUALS(1, term);
+        ASSERT_EQUALS(OID::fromTerm(term), electionId);
+    }
+
+    const auto opCtx = makeOperationContext();
+    auto status = getReplCoord()->stepDown(opCtx.get(), true, Milliseconds(0), Milliseconds(1000));
+
+    ASSERT_OK(status);
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+
+    simulateSuccessfulV1ElectionWithoutExitingDrainMode(
+        getReplCoord()->getElectionTimeout_forTest());
+
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+
+    // Check that the electionId is again properly set after the new election.
+    {
+        auto term = getTopoCoord().getTerm();
+        auto electionId = getTopoCoord().getElectionId();
+
+        ASSERT_EQUALS(2, term);
+        ASSERT_EQUALS(OID::fromTerm(term), electionId);
+    }
+}
+
 TEST_F(ReplCoordTest, NodeChangesTermAndStepsDownWhenAndOnlyWhenUpdateTermSuppliesAHigherTerm) {
     init("mySet/test1:1234,test2:1234,test3:1234");
 
@@ -2184,24 +2231,6 @@ TEST_F(ReplCoordTest, GetReplicationModeNone) {
 }
 
 TEST_F(ReplCoordTest,
-       NodeReturnsModeMasterSlaveInResponseToGetReplicationModeWhenRunningWithTheMasterFlag) {
-    // modeMasterSlave if master set
-    ReplSettings settings;
-    settings.setMaster(true);
-    init(settings);
-    ASSERT_EQUALS(ReplicationCoordinator::modeMasterSlave, getReplCoord()->getReplicationMode());
-}
-
-TEST_F(ReplCoordTest,
-       NodeReturnsModeMasterSlaveInResponseToGetReplicationModeWhenRunningWithTheSlaveFlag) {
-    // modeMasterSlave if the slave flag was set
-    ReplSettings settings;
-    settings.setSlave(true);
-    init(settings);
-    ASSERT_EQUALS(ReplicationCoordinator::modeMasterSlave, getReplCoord()->getReplicationMode());
-}
-
-TEST_F(ReplCoordTest,
        NodeReturnsModeReplSetInResponseToGetReplicationModeWhenRunningWithTheReplSetFlag) {
     // modeReplSet if the set name was supplied.
     ReplSettings settings;
@@ -2622,36 +2651,6 @@ TEST_F(ReplCoordTest,
     }
 }
 
-TEST_F(ReplCoordTest, NodeDoesNotIncludeItselfWhenRunningGetHostsWrittenToInMasterSlave) {
-    ReplSettings settings;
-    settings.setMaster(true);
-    init(settings);
-    HostAndPort clientHost("node2:12345");
-    auto opCtx = makeOperationContext();
-
-
-    OID client = OID::gen();
-    OpTimeWithTermOne time1(100, 1);
-    OpTimeWithTermOne time2(100, 2);
-
-    getExternalState()->setClientHostAndPort(clientHost);
-    HandshakeArgs handshake;
-    ASSERT_OK(handshake.initialize(BSON("handshake" << client)));
-    ASSERT_OK(getReplCoord()->processHandshake(opCtx.get(), handshake));
-
-    getReplCoord()->setMyLastAppliedOpTime(time2);
-    getReplCoord()->setMyLastDurableOpTime(time2);
-    ASSERT_OK(getReplCoord()->setLastOptimeForSlave(client, time1.timestamp));
-
-    std::vector<HostAndPort> caughtUpHosts = getReplCoord()->getHostsWrittenTo(time2, false);
-    ASSERT_EQUALS(0U, caughtUpHosts.size());  // self doesn't get included in master-slave
-
-    ASSERT_OK(getReplCoord()->setLastOptimeForSlave(client, time2.timestamp));
-    caughtUpHosts = getReplCoord()->getHostsWrittenTo(time2, false);
-    ASSERT_EQUALS(1U, caughtUpHosts.size());
-    ASSERT_EQUALS(clientHost, caughtUpHosts[0]);
-}
-
 TEST_F(ReplCoordTest, NodeReturnsNoNodesWhenGetOtherNodesInReplSetIsRunBeforeHavingAConfig) {
     start();
     ASSERT_EQUALS(0U, getReplCoord()->getOtherNodesInReplSet().size());
@@ -2759,7 +2758,7 @@ TEST_F(ReplCoordTest, IsMaster) {
     ASSERT_EQUALS(1U, arbiters.size());
     ASSERT_EQUALS(h3, arbiters[0]);
 
-    unordered_map<std::string, std::string> tags = response.getTags();
+    stdx::unordered_map<std::string, std::string> tags = response.getTags();
     ASSERT_EQUALS(2U, tags.size());
     ASSERT_EQUALS("value1", tags["key1"]);
     ASSERT_EQUALS("value2", tags["key2"]);
@@ -3479,12 +3478,6 @@ protected:
         settings.setReplSetString("replset");
         init(settings);
     }
-
-    void initMasterSlaveMode() {
-        auto settings = ReplSettings();
-        settings.setSlave(true);
-        init(settings);
-    }
 };
 
 // An equality assertion for two std::set<OpTime> values. Prints the elements of each set when
@@ -3681,25 +3674,6 @@ TEST_F(StableOpTimeTest, AdvanceCommitPointSetsStableOpTimeForStorage) {
     auto opTimeCandidates = getReplCoord()->getStableOpTimeCandidates_forTest();
     std::set<OpTime> expectedOpTimeCandidates = {OpTime({1, 2}, term)};
     ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
-}
-
-TEST_F(StableOpTimeTest, SetMyLastAppliedDoesntAddTimestampCandidateInMasterSlaveMode) {
-
-    /**
-     * Test that 'setMyLastAppliedOpTime' doesn't add timestamp candidates to the stable optime
-     * list when running in master-slave mode.
-     */
-
-    initMasterSlaveMode();
-    auto repl = getReplCoord();
-
-    ASSERT(repl->getStableOpTimeCandidates_forTest().empty());
-
-    repl->setMyLastAppliedOpTime(OpTime({0, 1}, 0));
-    repl->setMyLastAppliedOpTime(OpTime({0, 2}, 0));
-
-    // Make sure no timestamps candidates were added.
-    ASSERT(repl->getStableOpTimeCandidates_forTest().empty());
 }
 
 TEST_F(StableOpTimeTest, ClearOpTimeCandidatesPastCommonPointAfterRollback) {
@@ -4356,7 +4330,6 @@ TEST_F(ReplCoordTest, PrepareOplogQueryMetadata) {
 
     BSONObjBuilder metadataBob;
     getReplCoord()->prepareReplMetadata(
-        opCtx.get(),
         BSON(rpc::kOplogQueryMetadataFieldName << 1 << rpc::kReplSetMetadataFieldName << 1),
         OpTime(),
         &metadataBob);
@@ -4500,32 +4473,6 @@ TEST_F(ReplCoordTest,
 
     ASSERT_LESS_THAN_OR_EQUALS(until + replCoord->getConfig().getElectionTimeoutPeriod(),
                                replCoord->getElectionTimeout_forTest());
-}
-
-TEST_F(ReplCoordTest, DoNotScheduleElectionWhenCancelAndRescheduleElectionTimeoutIsRunInPV0) {
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "protocolVersion"
-                            << 0
-                            << "version"
-                            << 2
-                            << "members"
-                            << BSON_ARRAY(BSON("host"
-                                               << "node1:12345"
-                                               << "_id"
-                                               << 0)
-                                          << BSON("host"
-                                                  << "node2:12345"
-                                                  << "_id"
-                                                  << 1))),
-                       HostAndPort("node1", 12345));
-    ReplicationCoordinatorImpl* replCoord = getReplCoord();
-    ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_SECONDARY));
-
-    getReplCoord()->cancelAndRescheduleElectionTimeout();
-
-    auto electionTimeoutWhen = replCoord->getElectionTimeout_forTest();
-    ASSERT_EQUALS(Date_t(), electionTimeoutWhen);
 }
 
 TEST_F(ReplCoordTest, DoNotScheduleElectionWhenCancelAndRescheduleElectionTimeoutIsRunInRollback) {

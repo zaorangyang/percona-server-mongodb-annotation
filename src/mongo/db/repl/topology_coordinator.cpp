@@ -940,10 +940,7 @@ std::pair<ReplSetHeartbeatArgs, Milliseconds> TopologyCoordinator::prepareHeartb
         hbArgs.setSetName(ourSetName);
         hbArgs.setConfigVersion(-2);
     }
-    if (serverGlobalParams.featureCompatibility.getVersion() !=
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34) {
-        hbArgs.setHeartbeatVersion(1);
-    }
+    hbArgs.setHeartbeatVersion(1);
 
     const Milliseconds timeoutPeriod(
         _rsConfig.isInitialized() ? _rsConfig.getHeartbeatTimeoutPeriodMillis()
@@ -979,10 +976,7 @@ std::pair<ReplSetHeartbeatArgsV1, Milliseconds> TopologyCoordinator::prepareHear
         hbArgs.setConfigVersion(-2);
         hbArgs.setTerm(OpTime::kInitialTerm);
     }
-    if (serverGlobalParams.featureCompatibility.getVersion() !=
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo34) {
-        hbArgs.setHeartbeatVersion(1);
-    }
+    hbArgs.setHeartbeatVersion(1);
 
     const Milliseconds timeoutPeriod(
         _rsConfig.isInitialized() ? _rsConfig.getHeartbeatTimeoutPeriodMillis()
@@ -1691,7 +1685,7 @@ HeartbeatResponseAction TopologyCoordinator::_updatePrimaryFromHBData(
         LOG(2) << "TopologyCoordinator::_updatePrimaryFromHBData - " << status.reason();
         return HeartbeatResponseAction::makeNoAction();
     }
-    fassertStatusOK(28816, becomeCandidateIfElectable(now, StartElectionReason::kElectionTimeout));
+    fassert(28816, becomeCandidateIfElectable(now, StartElectionReason::kElectionTimeout));
     return HeartbeatResponseAction::makeElectAction();
 }
 
@@ -1916,6 +1910,11 @@ Status TopologyCoordinator::prepareForStepDownAttempt() {
         return Status{ErrorCodes::ConflictingOperationInProgress,
                       "This node is already in the process of stepping down"};
     }
+
+    if (_leaderMode == LeaderMode::kNotLeader) {
+        return Status{ErrorCodes::NotMaster, "This node is not a primary."};
+    }
+
     _setLeaderMode(LeaderMode::kAttemptingStepDown);
     return Status::OK();
 }

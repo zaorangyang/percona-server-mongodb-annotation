@@ -165,46 +165,42 @@ struct ServerGlobalParams {
          * Features can be gated for specific versions, or ranges of versions above or below some
          * minimum or maximum version, respectively.
          *
-         * The legal enum (and featureCompatiblityVersion document) states are:
+         * The legal enum (and featureCompatibilityVersion document) states are:
          *
-         * kFullyDowngradedTo34
-         * (3.4, Unset): Only 3.4 features are available, and new and existing storage
-         *               engine entries use the 3.4 format
-         *
-         * kUpgradingTo36
-         * (3.4, 3.6): Only 3.4 features are available, but new storage engine entries
-         *             use the 3.6 format, and existing entries may have either the
-         *             3.4 or 3.6 format
-         *
-         * kFullyUpgradedTo36
-         * (3.6, Unset): 3.6 features are available, and new and existing storage
+         * kFullyDowngradedTo36
+         * (3.6, Unset): Only 3.6 features are available, and new and existing storage
          *               engine entries use the 3.6 format
          *
-         * kDowngradingTo34
-         * (3.4, 3.4): Only 3.4 features are available and new storage engine
-         *             entries use the 3.4 format, but existing entries may have
-         *             either the 3.4 or 3.6 format
+         * kUpgradingTo40
+         * (3.6, 4.0): Only 3.6 features are available, but new storage engine entries
+         *             use the 4.0 format, and existing entries may have either the
+         *             3.6 or 4.0 format
+         *
+         * kFullyUpgradedTo40
+         * (4.0, Unset): 4.0 features are available, and new and existing storage
+         *               engine entries use the 4.0 format
+         *
+         * kDowngradingTo36
+         * (3.6, 3.6): Only 3.6 features are available and new storage engine
+         *             entries use the 3.6 format, but existing entries may have
+         *             either the 3.6 or 4.0 format
          *
          * kUnsetDefault36Behavior
          * (Unset, Unset): This is the case on startup before the fCV document is
          *                 loaded into memory. isVersionInitialized() will return
          *                 false, and getVersion() will return the default
-         *                 (kFullyUpgradedTo36).
+         *                 (kFullyDowngradedTo36).
          *
-         * TODO: update this comment to 3.6/4.0 when FCV 3.4 is removed (SERVER-32597).
          */
         enum class Version {
             // The order of these enums matter, higher upgrades having higher values, so that
             // features can be active or inactive if the version is higher than some minimum or
             // lower than some maximum, respectively.
             kUnsetDefault36Behavior = 0,
-            kFullyDowngradedTo34 = 1,
-            kDowngradingTo34 = 2,
-            kUpgradingTo36 = 3,
-            kFullyUpgradedTo36 = 4,
-            kDowngradingTo36 = 5,
-            kUpgradingTo40 = 6,
-            kFullyUpgradedTo40 = 7,
+            kFullyDowngradedTo36 = 1,
+            kDowngradingTo36 = 2,
+            kUpgradingTo40 = 3,
+            kFullyUpgradedTo40 = 4,
         };
 
         /**
@@ -216,12 +212,23 @@ struct ServerGlobalParams {
         }
 
         /**
-         * This safe getter for the featureCompatibilityVersion returns a default value when the
-         * version has not yet been set.
+         * This safe getter for the featureCompatibilityVersion parameter ensures the parameter has
+         * been initialized with a meaningful value.
          */
         const Version getVersion() const {
+            invariant(isVersionInitialized());
+            return _version.load();
+        }
+
+        /**
+         * This unsafe getter for the featureCompatibilityVersion parameter returns the last-stable
+         * featureCompatibilityVersion value if the parameter has not yet been initialized with a
+         * meaningful value. This getter should only be used if the parameter is intentionally read
+         * prior to the creation/parsing of the featureCompatibilityVersion document.
+         */
+        const Version getVersionUnsafe() const {
             Version v = _version.load();
-            return (v == Version::kUnsetDefault36Behavior) ? Version::kFullyUpgradedTo36 : v;
+            return (v == Version::kUnsetDefault36Behavior) ? Version::kFullyDowngradedTo36 : v;
         }
 
         void reset() {
@@ -232,10 +239,9 @@ struct ServerGlobalParams {
             return _version.store(version);
         }
 
-        // This determines whether to give Collections UUIDs upon creation.
-        const bool isSchemaVersion36() {
-            return (getVersion() >= Version::kFullyUpgradedTo36 ||
-                    getVersion() == Version::kUpgradingTo36);
+        bool isVersionUpgradingOrUpgraded() {
+            return (getVersion() == Version::kUpgradingTo40 ||
+                    getVersion() == Version::kFullyUpgradedTo40);
         }
 
     private:

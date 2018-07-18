@@ -21,6 +21,14 @@ load("jstests/libs/analyze_plan.js");
 (function() {
     "use strict";
 
+    // Skip this test if running with --nojournal and WiredTiger.
+    if (jsTest.options().noJournal &&
+        (!jsTest.options().storageEngine || jsTest.options().storageEngine === "wiredTiger")) {
+        print("Skipping test because running WiredTiger without journaling isn't a valid" +
+              " replica set configuration");
+        return;
+    }
+
     // Tests the functionality for committed reads for the given read concern level.
     function testReadConcernLevel(level) {
         var replTest = new ReplSetTest({
@@ -54,9 +62,9 @@ load("jstests/libs/analyze_plan.js");
         function getCursorForReadConcernLevel() {
             var res = t.runCommand(
                 'find',
-                {batchSize: 2, readConcern: {level: level}, txnNumber: NumberLong(txnNumber++)});
+                {batchSize: 2, readConcern: {level: level}, txnNumber: NumberLong(txnNumber)});
             assert.commandWorked(res);
-            return new DBCommandCursor(db, res, 2);
+            return new DBCommandCursor(db, res, 2, undefined, txnNumber++);
         }
 
         function getAggCursorForReadConcernLevel() {
@@ -64,10 +72,10 @@ load("jstests/libs/analyze_plan.js");
                 pipeline: [],
                 cursor: {batchSize: 2},
                 readConcern: {level: level},
-                txnNumber: NumberLong(txnNumber++)
+                txnNumber: NumberLong(txnNumber)
             });
             assert.commandWorked(res);
-            return new DBCommandCursor(db, res, 2);
+            return new DBCommandCursor(db, res, 2, undefined, txnNumber++);
         }
 
         function getExplainPlan(query) {
@@ -246,7 +254,11 @@ load("jstests/libs/analyze_plan.js");
         testReadConcernLevel("majority");
     }
 
+    // TODO SERVER-33218: Test for readConcern level snapshot once itcount() preserves
+    // txnNumber. Without this, itcount() calls will execute a getMore without txnNumber.
+    /*
     if (supportsSnapshotReadConcern) {
         testReadConcernLevel("snapshot");
     }
+    */
 }());

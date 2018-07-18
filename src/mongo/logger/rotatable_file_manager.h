@@ -36,7 +36,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/logger/auditlog.h"
 #include "mongo/logger/rotatable_file_writer.h"
-#include "mongo/platform/unordered_map.h"
+#include "mongo/stdx/unordered_map.h"
 
 namespace mongo {
 namespace logger {
@@ -89,7 +89,7 @@ public:
     void setAuditLog(AuditLog * const auditLog);
 
 private:
-    typedef unordered_map<std::string, RotatableFileWriter*> WriterByNameMap;
+    typedef stdx::unordered_map<std::string, RotatableFileWriter*> WriterByNameMap;
 
     WriterByNameMap _writers;
     AuditLog * _auditLog;

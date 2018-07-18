@@ -56,6 +56,7 @@ class WiredTigerSizeStorer;
 
 class WiredTigerKVEngine final : public KVEngine {
 public:
+    static const int kDefaultJournalDelayMillis;
     WiredTigerKVEngine(const std::string& canonicalName,
                        const std::string& path,
                        ClockSource* cs,
@@ -171,18 +172,15 @@ public:
 
     /**
      * This method will force the oldest timestamp to the input value. Callers must be serialized
-     * along with `_advanceOldestTimestamp`
+     * along with `setStableTimestamp`
      */
     void setOldestTimestamp(Timestamp oldestTimestamp);
 
-    Timestamp getPreviousSetOldestTimestamp() const {
-        stdx::unique_lock<stdx::mutex> lock(_oplogManagerMutex);
-        return _previousSetOldestTimestamp;
-    }
-
     virtual bool supportsRecoverToStableTimestamp() const override;
 
-    virtual Status recoverToStableTimestamp() override;
+    virtual StatusWith<Timestamp> recoverToStableTimestamp() override;
+
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
 
     bool supportsReadConcernSnapshot() const final;
 
@@ -267,24 +265,17 @@ private:
 
     std::string _uri(StringData ident) const;
 
-    // Not threadsafe; callers must be serialized along with `setOldestTimestamp`.
-    void _advanceOldestTimestamp(Timestamp oldestTimestamp);
-
-    // Protected by _oplogManagerMutex.
-    Timestamp _previousSetOldestTimestamp;
+    void _setOldestTimestamp(Timestamp oldestTimestamp, bool force = false);
 
     WT_CONNECTION* _conn;
     WT_EVENT_HANDLER _eventHandler;
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
     ClockSource* const _clockSource;
 
-    // Mutex to protect use of _oplogManager and _oplogManagerCount by this instance of KV
-    // engine.
-    // Uses of _oplogManager by the oplog record stores themselves are safe without locking, since
-    // those record stores manage the oplogManager lifetime.
+    // Mutex to protect use of _oplogManagerCount by this instance of KV engine.
     mutable stdx::mutex _oplogManagerMutex;
-    std::unique_ptr<WiredTigerOplogManager> _oplogManager;
     std::size_t _oplogManagerCount = 0;
+    std::unique_ptr<WiredTigerOplogManager> _oplogManager;
 
     std::string _canonicalName;
     std::string _path;
