@@ -34,8 +34,8 @@ Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
 #include "encryption_keydb_c_api.h"
 
-#define IV_LEN 16
 #define KEY_LEN 32
+#define GCM_TAG_LEN 16
 
 typedef struct {
     // WT_ENCRYPTOR must be the first field
@@ -43,6 +43,7 @@ typedef struct {
     WT_EXTENSION_API *wt_api;
     const EVP_CIPHER *cipher;
     EVP_CIPHER_CTX *ctx;
+    int iv_len;
     unsigned char key[KEY_LEN];
 } PERCONA_ENCRYPTOR;
 
@@ -120,13 +121,13 @@ static int parse_customization_config(PERCONA_ENCRYPTOR *encryptor, WT_SESSION *
 }
 
 static void store_IV(PERCONA_ENCRYPTOR *pe, uint8_t *dst) {
-    uint8_t buf[IV_LEN];
-    store_pseudo_bytes(buf, IV_LEN);
+    uint8_t buf[pe->iv_len];
+    store_pseudo_bytes(buf, pe->iv_len);
     //TODO: encrypt pseudo bytes same way as PS does
-    memcpy(dst, buf, IV_LEN);
+    memcpy(dst, buf, pe->iv_len);
 }
 
-static int percona_encrypt(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
+static int percona_encrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     uint8_t *src, size_t src_len,
     uint8_t *dst, size_t dst_len,
     size_t *result_lenp)
@@ -135,7 +136,7 @@ static int percona_encrypt(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     int ret = 0;
     int encrypted_len = 0;
     PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
-    if (dst_len < IV_LEN + src_len + EVP_CIPHER_block_size(pe->cipher))
+    if (dst_len < pe->iv_len + src_len + EVP_CIPHER_block_size(pe->cipher))
         return (report_error(pe, session,
                 ENOMEM, "encrypt buffer not big enough"));
 
@@ -143,7 +144,7 @@ static int percona_encrypt(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     EVP_CIPHER_CTX_init(pe->ctx);
 
     store_IV(pe, dst);
-    *result_lenp += IV_LEN;
+    *result_lenp += pe->iv_len;
 
     if(1 != EVP_EncryptInit_ex(pe->ctx, pe->cipher, NULL, pe->key, dst))
         goto err;
@@ -166,7 +167,54 @@ err:
     return ret;
 }
 
-static int percona_decrypt(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
+static int percona_encrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
+    uint8_t *src, size_t src_len,
+    uint8_t *dst, size_t dst_len,
+    size_t *result_lenp)
+{
+    printf("entering encrypt %lu %lu\n", src_len, dst_len);
+    int ret = 0;
+    int encrypted_len = 0;
+    PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
+    if (dst_len < pe->iv_len + src_len + GCM_TAG_LEN)
+        return (report_error(pe, session,
+                ENOMEM, "encrypt buffer not big enough"));
+
+    *result_lenp = 0;
+    EVP_CIPHER_CTX_init(pe->ctx);
+
+    store_IV(pe, dst);
+    *result_lenp += pe->iv_len;
+
+    if(1 != EVP_EncryptInit_ex(pe->ctx, pe->cipher, NULL, pe->key, dst))
+        goto err;
+
+    // we don't provide any AAD data yet
+
+    if(1 != EVP_EncryptUpdate(pe->ctx, dst + *result_lenp, &encrypted_len, src, src_len))
+        goto err;
+    *result_lenp += encrypted_len;
+
+    if(1 != EVP_EncryptFinal_ex(pe->ctx, dst + *result_lenp, &encrypted_len))
+        goto err;
+    *result_lenp += encrypted_len;
+
+    // get the tag
+    if(1 != EVP_CIPHER_CTX_ctrl(pe->ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, dst + *result_lenp))
+        goto err;
+    *result_lenp += GCM_TAG_LEN;
+
+    EVP_CIPHER_CTX_cleanup(pe->ctx);
+    printf("exiting encrypt %lu\n", *result_lenp);
+    return 0;
+
+err:
+    ret = handleErrors();
+    EVP_CIPHER_CTX_cleanup(pe->ctx);
+    return ret;
+}
+
+static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     uint8_t *src, size_t src_len,
     uint8_t *dst, size_t dst_len,
     size_t *result_lenp)
@@ -181,8 +229,8 @@ static int percona_decrypt(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
 
     if(1 != EVP_DecryptInit_ex(pe->ctx, pe->cipher, NULL, pe->key, src))
         goto err;
-    src += IV_LEN;
-    src_len -= IV_LEN;
+    src += pe->iv_len;
+    src_len -= pe->iv_len;
 
     if(1 != EVP_DecryptUpdate(pe->ctx, dst, &decrypted_len, src, src_len))
         goto err;
@@ -203,14 +251,71 @@ err:
     return ret;
 }
 
-static int percona_sizing(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
+static int percona_decrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
+    uint8_t *src, size_t src_len,
+    uint8_t *dst, size_t dst_len,
+    size_t *result_lenp)
+{
+    printf("entering decrypt %lu %lu\n", src_len, dst_len);
+    int ret = 0;
+    int decrypted_len = 0;
+    PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
+
+    *result_lenp = 0;
+    EVP_CIPHER_CTX_init(pe->ctx);
+
+    if(1 != EVP_DecryptInit_ex(pe->ctx, pe->cipher, NULL, pe->key, src))
+        goto err;
+    src += pe->iv_len;
+    src_len -= pe->iv_len;
+
+    // we have no AAD yet
+
+    if(1 != EVP_DecryptUpdate(pe->ctx, dst, &decrypted_len, src, src_len - GCM_TAG_LEN))
+        goto err;
+    *result_lenp += decrypted_len;
+    dst += decrypted_len;
+    src += src_len - GCM_TAG_LEN;
+    src_len = GCM_TAG_LEN;
+
+    // Set expected tag value. Works in OpenSSL 1.0.1d and later
+    if(!EVP_CIPHER_CTX_ctrl(pe->ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, src))
+        goto err;
+
+    if(1 != EVP_DecryptFinal_ex(pe->ctx, dst, &decrypted_len))
+        goto err;
+    *result_lenp += decrypted_len;
+
+    EVP_CIPHER_CTX_cleanup(pe->ctx);
+    printf("exiting decrypt %lu\n", *result_lenp);
+    return 0;
+
+err:
+    ret = handleErrors();
+    EVP_CIPHER_CTX_cleanup(pe->ctx);
+    return ret;
+}
+
+static int percona_sizing_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     size_t *expansion_constantp)
 {
+    PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
     printf("entering sizing\n");
     (void)session;              /* Unused parameters */
 
-    //*expansion_constantp = CHKSUM_LEN + IV_LEN;
-    *expansion_constantp = IV_LEN + EVP_CIPHER_block_size(((PERCONA_ENCRYPTOR*)encryptor)->cipher);
+    //*expansion_constantp = CHKSUM_LEN + pe->iv_len;
+    *expansion_constantp = pe->iv_len + EVP_CIPHER_block_size(((PERCONA_ENCRYPTOR*)encryptor)->cipher);
+    return 0;
+}
+
+static int percona_sizing_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
+    size_t *expansion_constantp)
+{
+    PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
+    printf("entering sizing\n");
+    (void)session;              /* Unused parameters */
+
+    *expansion_constantp = pe->iv_len + GCM_TAG_LEN;
     return 0;
 }
 
@@ -264,10 +369,16 @@ static int init_from_config(PERCONA_ENCRYPTOR *pe, WT_CONFIG_ARG *config)
             if (!strncmp("AES256-CBC", v.str, (int)v.len)) {
                 cipherMode = true;
                 pe->cipher = EVP_aes_256_cbc();
+                pe->encryptor.encrypt = percona_encrypt_cbc;
+                pe->encryptor.decrypt = percona_decrypt_cbc;
+                pe->encryptor.sizing = percona_sizing_cbc;
             }
             else if (!strncmp("AES256-GCM", v.str, (int)v.len)) {
                 cipherMode = true;
                 pe->cipher = EVP_aes_256_gcm();
+                pe->encryptor.encrypt = percona_encrypt_gcm;
+                pe->encryptor.decrypt = percona_decrypt_gcm;
+                pe->encryptor.sizing = percona_sizing_gcm;
             }
             else
                 return (report_error(pe, NULL, EINVAL, "specified cipher mode is not supported"));
@@ -292,6 +403,9 @@ int percona_encryption_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *
 
     dump_config_arg(pe, NULL, config);
 
+    pe->encryptor.customize = percona_customize;
+    pe->encryptor.terminate = percona_terminate;
+
     ret = init_from_config(pe, config);
     if (ret != 0)
         goto failure;
@@ -302,24 +416,13 @@ int percona_encryption_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *
         goto failure;
     }
 
-#if 0
-    // get default key (masterkey)
-    ret = get_key_by_id(NULL, 0, pe->key);
-    if (ret != 0) {
-        ret = report_error(pe, NULL, EINVAL, "cannot get default key");
-        goto failure;
-    }
-#else
+    pe->iv_len = EVP_CIPHER_iv_length(pe->cipher);
+    printf("IV len is %d\n", pe->iv_len);
+    printf("key len is %d\n", EVP_CIPHER_key_length(pe->cipher));
+
     // calloc initializes all allocated memory to zero
     // thus pe->key is filled with zeros
     // actual encryption keys are loaded by 'customize' callback
-#endif
-
-    pe->encryptor.encrypt = percona_encrypt;
-    pe->encryptor.decrypt = percona_decrypt;
-    pe->encryptor.sizing = percona_sizing;
-    pe->encryptor.customize = percona_customize;
-    pe->encryptor.terminate = percona_terminate;
 
     return connection->add_encryptor(connection, "percona", (WT_ENCRYPTOR*)pe, NULL);
 
