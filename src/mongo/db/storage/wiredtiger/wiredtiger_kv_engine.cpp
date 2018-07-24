@@ -61,6 +61,7 @@
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -451,6 +452,21 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
 
     _previousCheckedDropsQueued = _clockSource->now();
 
+    if (encryptionGlobalParams.enableEncryption) {
+        boost::filesystem::path keyDBPath = path;
+        keyDBPath /= "keydb";
+        if (!boost::filesystem::exists(keyDBPath)) {
+            try {
+                boost::filesystem::create_directory(keyDBPath);
+            } catch (std::exception& e) {
+                log() << "error creating KeyDB dir " << keyDBPath.string() << ' ' << e.what();
+                throw;
+            }
+        }
+        _encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(keyDBPath.string());
+        _encryptionKeyDB->init();
+    }
+
     std::stringstream ss;
     ss << "create,";
     ss << "cache_size=" << cacheSizeMB << "M,";
@@ -567,6 +583,7 @@ WiredTigerKVEngine::~WiredTigerKVEngine() {
     }
 
     _sessionCache.reset(NULL);
+    _encryptionKeyDB.reset(nullptr);
 }
 
 void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
@@ -734,6 +751,7 @@ void WiredTigerKVEngine::cleanShutdown() {
     LOG(1) << "Downgrade compatibility configuration: " << _fileVersion.getDowngradeString();
     invariantWTOK(conn->reconfigure(conn, _fileVersion.getDowngradeString().c_str()));
     invariantWTOK(conn->close(conn, closeConfig.c_str()));
+    _encryptionKeyDB.reset(nullptr);
 }
 
 Status WiredTigerKVEngine::okToRename(OperationContext* opCtx,
