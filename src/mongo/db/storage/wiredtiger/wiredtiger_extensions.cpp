@@ -33,6 +33,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
 
@@ -41,6 +42,12 @@ namespace mongo {
 MONGO_INITIALIZER_WITH_PREREQUISITES(SetWiredTigerExtensions, ("SetGlobalEnvironment"))
 (InitializerContext* context) {
     auto configHooks = stdx::make_unique<WiredTigerExtensions>();
+    // add Percona encryption extension
+    if (encryptionGlobalParams.enableEncryption) {
+        std::stringstream ss;
+        ss << "local=(entry=percona_encryption_extension_init,early_load=true,config=(cipher=" << encryptionGlobalParams.encryptionCipherMode << "))";
+        configHooks->addExtension(ss.str());
+    }
     WiredTigerExtensions::set(getGlobalServiceContext(), std::move(configHooks));
 
     return Status::OK();
