@@ -40,6 +40,7 @@
 #include "mongo/bson/ordering.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/wiredtiger/encryption_keydb.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/stdx/functional.h"
@@ -280,6 +281,7 @@ private:
 
     const bool _keepDataHistory;
 
+    std::unique_ptr<EncryptionKeyDB> _encryptionKeyDB;
     WT_CONNECTION* _conn;
     WT_EVENT_HANDLER _eventHandler;
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
