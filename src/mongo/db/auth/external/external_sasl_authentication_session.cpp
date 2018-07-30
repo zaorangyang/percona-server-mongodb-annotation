@@ -3,7 +3,7 @@
 /*======
 This file is part of Percona Server for MongoDB.
 
-Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
+Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
     Percona Server for MongoDB is free software: you can redistribute
     it and/or modify it under the terms of the GNU Affero General
@@ -22,207 +22,118 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kAccessControl
 
+#include "mongo/db/auth/external/external_sasl_authentication_session.h"
+
 #include <sasl/sasl.h>
-
-#include "mongo/db/auth/native_sasl_authentication_session.h"
-
-#include <boost/scoped_ptr.hpp>
-#include <boost/range/size.hpp>
 
 #include "mongo/base/init.h"
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/sasl_client_authenticate.h"
-#include "mongo/db/commands.h"
-#include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
-#include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/sasl_options.h"
-#include "mongo/db/auth/external/external_sasl_authentication_session.h"
-#include "mongo/util/assert_util.h"
+#include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
 
 namespace mongo {
 
-    using boost::scoped_ptr;
+static Status getInitializationError(int result) {
+    return Status(ErrorCodes::OperationFailed,
+                  mongoutils::str::stream() <<
+                  "Could not initialize sasl server session (" <<
+                  sasl_errstring(result, NULL, NULL) <<
+                  ")");
+}
 
-namespace {
-
-    static SaslAuthenticationSession::SaslAuthenticationSessionFactoryFn createSaslBase;
-
-    SaslAuthenticationSession* createExternalSaslAuthenticationSession(
-        AuthorizationSession* authzSession,
-        StringData db,
-        StringData mechanism) {
-        if (mechanism == "PLAIN" && db == saslDefaultDBName)
-            return new ExternalSaslAuthenticationSession(authzSession);
-        else
-            return createSaslBase(authzSession, db, mechanism);
+StatusWith<std::tuple<bool, std::string>> SaslExternalLDAPServerMechanism::getStepResult() const {
+    if (_results.resultsShowNoError()) {
+        return std::make_tuple(_results.resultsAreOK(), std::string(_results.output, _results.length));
     }
 
-    // External SASL session factory needs to be set AFTER the native one has been set.
-    MONGO_INITIALIZER_GENERAL(ExternalSaslServerCore, ("NativeSaslServerCore"), ("PostSaslCommands"))
-        (InitializerContext* context) {
-        if (saslGlobalParams.hostName.empty())
-            saslGlobalParams.hostName = getHostNameCached();
-        if (saslGlobalParams.serviceName.empty())
-            saslGlobalParams.serviceName = "mongodb";
+    return Status(ErrorCodes::OperationFailed,
+                  mongoutils::str::stream() <<
+                  "SASL step did not complete: (" <<
+                  sasl_errstring(_results.result, NULL, NULL) <<
+                  ")");
+}
 
-        int result = sasl_server_init(NULL, saslDefaultServiceName);
-        if (result != SASL_OK) {
-            log() << "Failed Initializing External Auth Session" << std::endl;
-            return ExternalSaslAuthenticationSession::getInitializationError(result);
+Status SaslExternalLDAPServerMechanism::initializeConnection() {
+    int result = sasl_server_new(saslDefaultServiceName,
+                                 prettyHostName().c_str(), // Fully Qualified Domain Name (FQDN), NULL => gethostname()
+                                 NULL, // User Realm string, NULL forces default value: FQDN.
+                                 NULL, // Local IP address
+                                 NULL, // Remote IP address
+                                 NULL, // Callbacks specific to this connection.
+                                 0,    // Security flags.
+                                 &_saslConnection); // Connection object output parameter.
+    if (result != SASL_OK) {
+        return getInitializationError(result);
+    }
+
+    return Status::OK();
+}
+
+StatusWith<std::tuple<bool, std::string>> SaslExternalLDAPServerMechanism::processInitialClientPayload(const StringData& payload) {
+    _results.initialize_results();
+    _results.result = sasl_server_start(_saslConnection,
+                                       mechanismName().rawData(),
+                                       payload.rawData(),
+                                       static_cast<unsigned>(payload.size()),
+                                       &_results.output,
+                                       &_results.length);
+    return getStepResult();
+}
+
+StatusWith<std::tuple<bool, std::string>> SaslExternalLDAPServerMechanism::processNextClientPayload(const StringData& payload) {
+    _results.initialize_results();
+    _results.result = sasl_server_step(_saslConnection,
+                                      payload.rawData(),
+                                      static_cast<unsigned>(payload.size()),
+                                      &_results.output,
+                                      &_results.length);
+    return getStepResult();
+}
+
+SaslExternalLDAPServerMechanism::~SaslExternalLDAPServerMechanism() {
+    if (_saslConnection) {
+        sasl_dispose(&_saslConnection);
+    }
+}
+
+StatusWith<std::tuple<bool, std::string>> SaslExternalLDAPServerMechanism::stepImpl(
+    OperationContext* opCtx, StringData inputData) {
+    if (_step++ == 0) {
+        Status status = initializeConnection();
+        if (!status.isOK()) {
+            return status;
         }
+        return processInitialClientPayload(inputData);
+    }
+    return processNextClientPayload(inputData);
+}
 
-        log() << "Initialized External Auth Session" << std::endl;
-        createSaslBase = SaslAuthenticationSession::create;
-        SaslAuthenticationSession::create = createExternalSaslAuthenticationSession;
-        return Status::OK();
+StringData SaslExternalLDAPServerMechanism::getPrincipalName() const {
+    const char* username;
+    int result = sasl_getprop(_saslConnection, SASL_USERNAME, (const void**)&username);
+    if (result == SASL_OK) {
+        return username;
     }
 
-} //namespace
+    return "";
+}
 
-    ExternalSaslAuthenticationSession::ExternalSaslAuthenticationSession(
-        AuthorizationSession* authzSession) :
-        SaslAuthenticationSession(authzSession),
-        _saslConnection(NULL),
-        _mechanism("") {
-        _results.result = SASL_FAIL;
-        _results.output = NULL;
-        _results.length = 0;
+MONGO_INITIALIZER_WITH_PREREQUISITES(SaslExternalLDAPServerMechanism,
+                                     ("CreateSASLServerMechanismRegistry"))
+(::mongo::InitializerContext* context) {
+    int result = sasl_server_init(NULL, saslDefaultServiceName);
+    if (result != SASL_OK) {
+        log() << "Failed Initializing SASL " << std::endl;
+        return getInitializationError(result);
     }
 
-    ExternalSaslAuthenticationSession::~ExternalSaslAuthenticationSession() {
-        if (_saslConnection) {
-            sasl_dispose(&_saslConnection);
-        }
-    }
-
-    Status ExternalSaslAuthenticationSession::start(StringData authenticationDatabase,
-                                                    StringData mechanism,
-                                                    StringData serviceName,
-                                                    StringData serviceHostname,
-                                                    int64_t conversationId,
-                                                    bool autoAuthorize) {
-        if (_conversationId != 0) {
-            return Status(ErrorCodes::AlreadyInitialized,
-                          "Cannot call start() twice on same ExternalSaslAuthenticationSession.");
-        }
-
-        _authenticationDatabase = authenticationDatabase.toString();
-        _mechanism = mechanism.toString();
-        _serviceName = serviceName.toString();
-        _serviceHostname = serviceHostname.toString();
-        _conversationId = conversationId;
-        _autoAuthorize = autoAuthorize;
-
-        // NOTE: At this point we could ask libsasl2 if the given
-        // mechanism is supported, though later it will report an
-        // error for an unsupported mechanism during the first SASL
-        // step.
-        return this->initializeConnection();
-    }
-
-    Status ExternalSaslAuthenticationSession::step(StringData inputData, std::string* outputData) {
-        if (_saslStep++ == 0) {
-            this->processInitialClientPayload(inputData);
-        } else {
-            this->processNextClientPayload(inputData);
-        }
-
-        this->copyStepOutput(outputData);
-        return this->getStepResult();
-    }
-    
-    Status ExternalSaslAuthenticationSession::getStepResult() const {
-        if (_results.resultsShowNoError()) {
-            return Status::OK();
-        }
-
-        return Status(ErrorCodes::OperationFailed,
-                      mongoutils::str::stream() <<
-                      "SASL step did not complete: (" <<
-                      sasl_errstring(_results.result, NULL, NULL) <<
-                      ")");
-    }
-
-    std::string ExternalSaslAuthenticationSession::getPrincipalId() const {
-        const char * username;
-        int result = this->getUserName(&username);
-        if (result == SASL_OK) {
-            std::string principal(username);
-            return principal;
-        }
-        
-        return std::string("");
-    }
-
-    const char* ExternalSaslAuthenticationSession::getMechanism() const {
-        return _mechanism.c_str();
-    }
-
-    Status ExternalSaslAuthenticationSession::initializeConnection() {
-        int result = sasl_server_new(saslDefaultServiceName,
-                                     prettyHostName().c_str(), // Fully Qualified Domain Name (FQDN), NULL => gethostname()
-                                     NULL, // User Realm string, NULL forces default value: FQDN.
-                                     NULL, // Local IP address
-                                     NULL, // Remote IP address
-                                     NULL, // Callbacks specific to this connection.
-                                     0,    // Security flags.
-                                     &_saslConnection); // Connection object output parameter.
-        if (result != SASL_OK) {
-            return ExternalSaslAuthenticationSession::getInitializationError(result);
-        }
-
-        return Status::OK();
-    }
-
-    Status ExternalSaslAuthenticationSession::getInitializationError(int result) {
-        return Status(ErrorCodes::OperationFailed,
-                      mongoutils::str::stream() <<
-                      "Could not initialize sasl server session (" <<
-                      sasl_errstring(result, NULL, NULL) <<
-                      ")");
-    }
-
-    void ExternalSaslAuthenticationSession::processInitialClientPayload(const StringData& payload) {
-        _results.initialize_results();
-        _results.result = sasl_server_start(_saslConnection,
-                                           _mechanism.c_str(),
-                                           payload.rawData(),
-                                           static_cast<unsigned>(payload.size()),
-                                           &_results.output,
-                                           &_results.length);
-        this->updateDoneStatus();
-    }
-
-    void ExternalSaslAuthenticationSession::processNextClientPayload(const StringData& payload) {
-        _results.initialize_results();
-        _results.result = sasl_server_step(_saslConnection,
-                                          payload.rawData(),
-                                          static_cast<unsigned>(payload.size()),
-                                          &_results.output,
-                                          &_results.length);
-        this->updateDoneStatus();
-    }
-
-    void ExternalSaslAuthenticationSession::copyStepOutput(std::string *output) const {
-        if (_results.resultsShowNoError()) {
-            output->assign(_results.output, _results.length);
-        }
-    }
-
-    void ExternalSaslAuthenticationSession::updateDoneStatus() {
-        if (_results.resultsAreOK()) {
-            _done = true;
-        }
-    }
-
-    int ExternalSaslAuthenticationSession::getUserName(const char ** username) const {
-        return sasl_getprop(_saslConnection, SASL_USERNAME, (const void**)username);
-    }
+    auto& registry = SASLServerMechanismRegistry::get(getGlobalServiceContext());
+    registry.registerFactory<ExternalLDAPServerFactory>();
+    return Status::OK();
+}
 
 }  // namespace mongo

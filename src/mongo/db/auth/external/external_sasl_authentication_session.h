@@ -3,7 +3,7 @@
 /*======
 This file is part of Percona Server for MongoDB.
 
-Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
+Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
     Percona Server for MongoDB is free software: you can redistribute
     it and/or modify it under the terms of the GNU Affero General
@@ -22,65 +22,64 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-#include <cstdint>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
+#include <sasl/sasl.h>
+
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/auth/authentication_session.h"
-#include "mongo/db/auth/sasl_authentication_session.h"
+#include "mongo/db/auth/sasl_mechanism_policies.h"
 
 namespace mongo {
 
-    /**
-     * Authentication session data for the server side of external SASL authentication.
-     */
-    class ExternalSaslAuthenticationSession : public SaslAuthenticationSession {
-        MONGO_DISALLOW_COPYING(ExternalSaslAuthenticationSession);
-    public:
-        explicit ExternalSaslAuthenticationSession(AuthorizationSession* authSession);
-        virtual ~ExternalSaslAuthenticationSession();
-        virtual Status start(StringData authenticationDatabase,
-                             StringData mechanism,
-                             StringData serviceName,
-                             StringData serviceHostname,
-                             int64_t conversationId,
-                             bool autoAuthorize);
-        virtual Status step(StringData inputData, std::string* outputData);
-        virtual std::string getPrincipalId() const;
-        virtual const char* getMechanism() const;
-        static Status getInitializationError(int);
+class SaslExternalLDAPServerMechanism : public MakeServerMechanism<PLAINPolicy> {
+public:
+    static const bool isInternal = false;
 
-    private:
-        Status initializeConnection();
-        void processInitialClientPayload(const StringData& payload);
-        void processNextClientPayload(const StringData& payload);
-        void updateDoneStatus();
-        void copyStepOutput(std::string *output) const;
-        Status getStepResult() const;
-        int getUserName(const char **username) const;
+    explicit SaslExternalLDAPServerMechanism(std::string authenticationDatabase)
+        : MakeServerMechanism<PLAINPolicy>(std::move(authenticationDatabase)) {}
 
-    private:
-        sasl_conn_t * _saslConnection;
-        std::string _mechanism;
-        struct SaslServerResults {
-            int result;
-            const char *output;
-            unsigned length;
-            inline void initialize_results() {
-                result = SASL_OK;
-                output = NULL;
-                length = 0;
-            };
-            inline bool resultsAreOK() const {
-                return result == SASL_OK;
-            };
-            inline bool resultsShowNoError() const {
-                return result == SASL_OK || result == SASL_CONTINUE;
-            }
-        } _results;
-    };
+    virtual ~SaslExternalLDAPServerMechanism();
+
+private:
+    int _step{0};
+    sasl_conn_t * _saslConnection{nullptr};
+
+    struct SaslServerResults {
+        int result;
+        const char *output;
+        unsigned length;
+        inline void initialize_results() {
+            result = SASL_OK;
+            output = NULL;
+            length = 0;
+        };
+        inline bool resultsAreOK() const {
+            return result == SASL_OK;
+        };
+        inline bool resultsShowNoError() const {
+            return result == SASL_OK || result == SASL_CONTINUE;
+        }
+    } _results;
+
+    StatusWith<std::tuple<bool, std::string>> stepImpl(OperationContext* opCtx,
+                                                       StringData input) final;
+    virtual StringData getPrincipalName() const override final;
+
+    Status initializeConnection();
+    StatusWith<std::tuple<bool, std::string>> processInitialClientPayload(const StringData& payload);
+    StatusWith<std::tuple<bool, std::string>> processNextClientPayload(const StringData& payload);
+    StatusWith<std::tuple<bool, std::string>> getStepResult() const;
+};
+
+class ExternalLDAPServerFactory : public MakeServerFactory<SaslExternalLDAPServerMechanism> {
+public:
+    bool canMakeMechanismForUser(const User* user) const final {
+        auto credentials = user->getCredentials();
+        return credentials.isExternal && (credentials.scram<SHA1Block>().isValid() ||
+                                          credentials.scram<SHA256Block>().isValid());
+    }
+};
+
 
 }  // namespace mongo
