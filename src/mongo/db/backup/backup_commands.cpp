@@ -54,7 +54,7 @@ public:
     bool adminOnly() const override {
         return true;
     }
-    AllowedOnSecondary secondaryAllowed() const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext* context) const override {
         return AllowedOnSecondary::kAlways;
     }
     bool supportsWriteConcern(const BSONObj& cmd) const override {

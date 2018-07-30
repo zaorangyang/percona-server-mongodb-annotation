@@ -47,7 +47,7 @@ namespace mongo {
         // TODO: Investigate if any other Command class virtual
         // methods need to be overridden.
         virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual AllowedOnSecondary secondaryAllowed() const override {
+        virtual AllowedOnSecondary secondaryAllowed(ServiceContext* context) const override {
             return AllowedOnSecondary::kAlways;
         }
         virtual bool supportsWriteConcern(const BSONObj& cmd) const { return false; }
