@@ -42,7 +42,6 @@ typedef struct {
     WT_ENCRYPTOR encryptor;
     WT_EXTENSION_API *wt_api;
     const EVP_CIPHER *cipher;
-    EVP_CIPHER_CTX *ctx;
     int iv_len;
     unsigned char key[KEY_LEN];
 } PERCONA_ENCRYPTOR;
@@ -146,29 +145,43 @@ static int percona_encrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
                 ENOMEM, "encrypt buffer not big enough"));
 
     *result_lenp = 0;
-    EVP_CIPHER_CTX_init(pe->ctx);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_CIPHER_CTX ctx_value;
+    EVP_CIPHER_CTX *ctx= &ctx_value;
+    EVP_CIPHER_CTX_init(ctx);
+#else
+    EVP_CIPHER_CTX *ctx= EVP_CIPHER_CTX_new();
+    if (unlikely(!ctx))
+        goto err;
+#endif
 
     store_IV(pe, dst);
     *result_lenp += pe->iv_len;
 
-    if(1 != EVP_EncryptInit_ex(pe->ctx, pe->cipher, NULL, pe->key, dst))
+    if(1 != EVP_EncryptInit_ex(ctx, pe->cipher, NULL, pe->key, dst))
         goto err;
 
-    if(1 != EVP_EncryptUpdate(pe->ctx, dst + *result_lenp, &encrypted_len, src, src_len))
-        goto err;
-    *result_lenp += encrypted_len;
-
-    if(1 != EVP_EncryptFinal_ex(pe->ctx, dst + *result_lenp, &encrypted_len))
+    if(1 != EVP_EncryptUpdate(ctx, dst + *result_lenp, &encrypted_len, src, src_len))
         goto err;
     *result_lenp += encrypted_len;
 
-    EVP_CIPHER_CTX_cleanup(pe->ctx);
-    DBG_MSG("exiting encrypt %lu", *result_lenp);
-    return 0;
+    if(1 != EVP_EncryptFinal_ex(ctx, dst + *result_lenp, &encrypted_len))
+        goto err;
+    *result_lenp += encrypted_len;
+
+    ret = 0;
+    goto cleanup;
 
 err:
     ret = handleErrors(pe, session);
-    EVP_CIPHER_CTX_cleanup(pe->ctx);
+
+cleanup:
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_CIPHER_CTX_cleanup(ctx);
+#else
+    EVP_CIPHER_CTX_free(ctx);
+#endif
+    DBG_MSG("exiting encrypt %lu", *result_lenp);
     return ret;
 }
 
@@ -186,36 +199,50 @@ static int percona_encrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
                 ENOMEM, "encrypt buffer not big enough"));
 
     *result_lenp = 0;
-    EVP_CIPHER_CTX_init(pe->ctx);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_CIPHER_CTX ctx_value;
+    EVP_CIPHER_CTX *ctx= &ctx_value;
+    EVP_CIPHER_CTX_init(ctx);
+#else
+    EVP_CIPHER_CTX *ctx= EVP_CIPHER_CTX_new();
+    if (unlikely(!ctx))
+        goto err;
+#endif
 
     store_IV(pe, dst);
     *result_lenp += pe->iv_len;
 
-    if(1 != EVP_EncryptInit_ex(pe->ctx, pe->cipher, NULL, pe->key, dst))
+    if(1 != EVP_EncryptInit_ex(ctx, pe->cipher, NULL, pe->key, dst))
         goto err;
 
     // we don't provide any AAD data yet
 
-    if(1 != EVP_EncryptUpdate(pe->ctx, dst + *result_lenp, &encrypted_len, src, src_len))
+    if(1 != EVP_EncryptUpdate(ctx, dst + *result_lenp, &encrypted_len, src, src_len))
         goto err;
     *result_lenp += encrypted_len;
 
-    if(1 != EVP_EncryptFinal_ex(pe->ctx, dst + *result_lenp, &encrypted_len))
+    if(1 != EVP_EncryptFinal_ex(ctx, dst + *result_lenp, &encrypted_len))
         goto err;
     *result_lenp += encrypted_len;
 
     // get the tag
-    if(1 != EVP_CIPHER_CTX_ctrl(pe->ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, dst + *result_lenp))
+    if(1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, dst + *result_lenp))
         goto err;
     *result_lenp += GCM_TAG_LEN;
 
-    EVP_CIPHER_CTX_cleanup(pe->ctx);
-    DBG_MSG("exiting encrypt %lu", *result_lenp);
-    return 0;
+    ret = 0;
+    goto cleanup;
 
 err:
     ret = handleErrors(pe, session);
-    EVP_CIPHER_CTX_cleanup(pe->ctx);
+
+cleanup:
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_CIPHER_CTX_cleanup(ctx);
+#else
+    EVP_CIPHER_CTX_free(ctx);
+#endif
+    DBG_MSG("exiting encrypt %lu", *result_lenp);
     return ret;
 }
 
@@ -230,29 +257,43 @@ static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     DBG_MSG("entering decrypt %lu %lu", src_len, dst_len);
 
     *result_lenp = 0;
-    EVP_CIPHER_CTX_init(pe->ctx);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_CIPHER_CTX ctx_value;
+    EVP_CIPHER_CTX *ctx= &ctx_value;
+    EVP_CIPHER_CTX_init(ctx);
+#else
+    EVP_CIPHER_CTX *ctx= EVP_CIPHER_CTX_new();
+    if (unlikely(!ctx))
+        goto err;
+#endif
 
-    if(1 != EVP_DecryptInit_ex(pe->ctx, pe->cipher, NULL, pe->key, src))
+    if(1 != EVP_DecryptInit_ex(ctx, pe->cipher, NULL, pe->key, src))
         goto err;
     src += pe->iv_len;
     src_len -= pe->iv_len;
 
-    if(1 != EVP_DecryptUpdate(pe->ctx, dst, &decrypted_len, src, src_len))
+    if(1 != EVP_DecryptUpdate(ctx, dst, &decrypted_len, src, src_len))
         goto err;
     *result_lenp += decrypted_len;
     dst += decrypted_len;
 
-    if(1 != EVP_DecryptFinal_ex(pe->ctx, dst, &decrypted_len))
+    if(1 != EVP_DecryptFinal_ex(ctx, dst, &decrypted_len))
         goto err;
     *result_lenp += decrypted_len;
 
-    EVP_CIPHER_CTX_cleanup(pe->ctx);
-    DBG_MSG("exiting decrypt %lu", *result_lenp);
-    return 0;
+    ret = 0;
+    goto cleanup;
 
 err:
     ret = handleErrors(pe, session);
-    EVP_CIPHER_CTX_cleanup(pe->ctx);
+
+cleanup:
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_CIPHER_CTX_cleanup(ctx);
+#else
+    EVP_CIPHER_CTX_free(ctx);
+#endif
+    DBG_MSG("exiting decrypt %lu", *result_lenp);
     return ret;
 }
 
@@ -267,16 +308,24 @@ static int percona_decrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     DBG_MSG("entering decrypt %lu %lu", src_len, dst_len);
 
     *result_lenp = 0;
-    EVP_CIPHER_CTX_init(pe->ctx);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_CIPHER_CTX ctx_value;
+    EVP_CIPHER_CTX *ctx= &ctx_value;
+    EVP_CIPHER_CTX_init(ctx);
+#else
+    EVP_CIPHER_CTX *ctx= EVP_CIPHER_CTX_new();
+    if (unlikely(!ctx))
+        goto err;
+#endif
 
-    if(1 != EVP_DecryptInit_ex(pe->ctx, pe->cipher, NULL, pe->key, src))
+    if(1 != EVP_DecryptInit_ex(ctx, pe->cipher, NULL, pe->key, src))
         goto err;
     src += pe->iv_len;
     src_len -= pe->iv_len;
 
     // we have no AAD yet
 
-    if(1 != EVP_DecryptUpdate(pe->ctx, dst, &decrypted_len, src, src_len - GCM_TAG_LEN))
+    if(1 != EVP_DecryptUpdate(ctx, dst, &decrypted_len, src, src_len - GCM_TAG_LEN))
         goto err;
     *result_lenp += decrypted_len;
     dst += decrypted_len;
@@ -284,20 +333,26 @@ static int percona_decrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     src_len = GCM_TAG_LEN;
 
     // Set expected tag value. Works in OpenSSL 1.0.1d and later
-    if(!EVP_CIPHER_CTX_ctrl(pe->ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, src))
+    if(!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, src))
         goto err;
 
-    if(1 != EVP_DecryptFinal_ex(pe->ctx, dst, &decrypted_len))
+    if(1 != EVP_DecryptFinal_ex(ctx, dst, &decrypted_len))
         goto err;
     *result_lenp += decrypted_len;
 
-    EVP_CIPHER_CTX_cleanup(pe->ctx);
-    DBG_MSG("exiting decrypt %lu", *result_lenp);
-    return 0;
+    ret = 0;
+    goto cleanup;
 
 err:
     ret = handleErrors(pe, session);
-    EVP_CIPHER_CTX_cleanup(pe->ctx);
+
+cleanup:
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    EVP_CIPHER_CTX_cleanup(ctx);
+#else
+    EVP_CIPHER_CTX_free(ctx);
+#endif
+    DBG_MSG("exiting decrypt %lu", *result_lenp);
     return ret;
 }
 
@@ -334,12 +389,6 @@ static int percona_customize(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     if ((cpe = calloc(1, sizeof(PERCONA_ENCRYPTOR))) == NULL)
             return errno;
     *cpe = *pe;
-    cpe->ctx = EVP_CIPHER_CTX_new();
-    if (!cpe->ctx) {
-        int ret = report_error(cpe, session, EINVAL, "cannot create cipher context");
-        free(cpe);
-        return ret;
-    }
     // new instance passed to parse_customization_config because it should fill encryption key field
     int ret = parse_customization_config(cpe, session, encrypt_config);
     if (ret != 0) {
@@ -354,7 +403,6 @@ static int percona_terminate(WT_ENCRYPTOR *encryptor, WT_SESSION *session)
 {
     PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
     DBG_MSG("entering terminate");
-    EVP_CIPHER_CTX_free(pe->ctx);
     free(encryptor);
     return 0;
 }
@@ -415,12 +463,6 @@ int percona_encryption_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *
     ret = init_from_config(pe, config);
     if (ret != 0)
         goto failure;
-
-    pe->ctx = EVP_CIPHER_CTX_new();
-    if (!pe->ctx) {
-        ret = report_error(pe, NULL, EINVAL, "cannot create cipher context");
-        goto failure;
-    }
 
     pe->iv_len = EVP_CIPHER_iv_length(pe->cipher);
     DBG_MSG("IV len is %d", pe->iv_len);
