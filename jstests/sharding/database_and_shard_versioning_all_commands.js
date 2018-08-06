@@ -410,6 +410,10 @@
         validate:
             {skip: "Not captured by the profiler; will be tested separately (TODO SERVER-33429)"},
         whatsmyuri: {skip: "executes locally on mongos (not sent to any remote node)"},
+
+        // Percona commands
+        auditGetOptions: {skip: "executes locally on mongos (not sent to any remote node)"},
+        createBackup: {skip: "not allowed through mongos"},
     };
 
     var st = new ShardingTest({shards: 1});
