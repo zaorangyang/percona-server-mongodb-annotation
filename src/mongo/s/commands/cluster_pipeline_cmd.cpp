@@ -47,6 +47,10 @@ public:
                "http://dochub.mongodb.org/core/aggregation for more details.";
     }
 
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const final {
+        return AggregationRequest::parseNs(dbname, cmdObj).ns();
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
@@ -57,6 +61,12 @@ public:
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return Pipeline::aggSupportsWriteConcern(cmd);
+    }
+
+    bool supportsReadConcern(const std::string& dbName,
+                             const BSONObj& cmdObj,
+                             repl::ReadConcernLevel level) const final {
+        return true;
     }
 
     Status checkAuthForCommand(Client* client,

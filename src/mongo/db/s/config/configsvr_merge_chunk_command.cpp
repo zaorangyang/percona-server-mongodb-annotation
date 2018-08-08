@@ -95,7 +95,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool run(OperationContext* opCtx,
@@ -114,7 +114,8 @@ public:
                                                                  parsedRequest.getNamespace(),
                                                                  parsedRequest.getEpoch(),
                                                                  parsedRequest.getChunkBoundaries(),
-                                                                 parsedRequest.getShardName());
+                                                                 parsedRequest.getShardName(),
+                                                                 parsedRequest.getValidAfter());
 
         if (!mergeChunkResult.isOK()) {
             return CommandHelpers::appendCommandStatus(result, mergeChunkResult);

@@ -45,11 +45,11 @@
 #endif
 
 #include "mongo/base/init.h"
-#include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/config.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/internal_user_auth.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/security_key.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -212,6 +212,7 @@ void forkServerOrDie() {
         quickExit(EXIT_FAILURE);
 }
 
+MONGO_EXPORT_SERVER_PARAMETER(maxLogSizeKB, int, logger::LogContext::kDefaultMaxLogSizeKB);
 MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
                           ("GlobalLogManager", "EndStartupOptionHandling", "ForkServer"),
                           ("default"))
@@ -223,6 +224,9 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
     using logger::MessageLogDomain;
     using logger::RotatableFileAppender;
     using logger::StatusWithRotatableFileWriter;
+
+    // Hook up this global into our logging encoder
+    MessageEventDetailsEncoder::setMaxLogSizeKBSource(maxLogSizeKB);
 
     if (serverGlobalParams.logWithSyslog) {
 #ifdef _WIN32
@@ -236,12 +240,12 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
         openlog(strdup(sb.str().c_str()), LOG_PID | LOG_CONS, serverGlobalParams.syslogFacility);
         LogManager* manager = logger::globalLogManager();
         manager->getGlobalDomain()->clearAppenders();
-        manager->getGlobalDomain()->attachAppender(MessageLogDomain::AppenderAutoPtr(
-            new SyslogAppender<MessageEventEphemeral>(new logger::MessageEventWithContextEncoder)));
+        manager->getGlobalDomain()->attachAppender(
+            std::make_unique<SyslogAppender<MessageEventEphemeral>>(
+                std::make_unique<logger::MessageEventWithContextEncoder>()));
         manager->getNamedDomain("javascriptOutput")
-            ->attachAppender(
-                MessageLogDomain::AppenderAutoPtr(new SyslogAppender<MessageEventEphemeral>(
-                    new logger::MessageEventWithContextEncoder)));
+            ->attachAppender(std::make_unique<SyslogAppender<MessageEventEphemeral>>(
+                std::make_unique<logger::MessageEventWithContextEncoder>()));
 #endif  // defined(_WIN32)
     } else if (!serverGlobalParams.logpath.empty()) {
         fassert(16448, !serverGlobalParams.logWithSyslog);
@@ -297,12 +301,11 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
         LogManager* manager = logger::globalLogManager();
         manager->getGlobalDomain()->clearAppenders();
         manager->getGlobalDomain()->attachAppender(
-            MessageLogDomain::AppenderAutoPtr(new RotatableFileAppender<MessageEventEphemeral>(
-                new MessageEventDetailsEncoder, writer.getValue())));
+            std::make_unique<RotatableFileAppender<MessageEventEphemeral>>(
+                std::make_unique<MessageEventDetailsEncoder>(), writer.getValue()));
         manager->getNamedDomain("javascriptOutput")
-            ->attachAppender(
-                MessageLogDomain::AppenderAutoPtr(new RotatableFileAppender<MessageEventEphemeral>(
-                    new MessageEventDetailsEncoder, writer.getValue())));
+            ->attachAppender(std::make_unique<RotatableFileAppender<MessageEventEphemeral>>(
+                std::make_unique<MessageEventDetailsEncoder>(), writer.getValue()));
 
         if (serverGlobalParams.logAppend && exists) {
             log() << "***** SERVER RESTARTED *****";
@@ -313,13 +316,12 @@ MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
     } else {
         logger::globalLogManager()
             ->getNamedDomain("javascriptOutput")
-            ->attachAppender(MessageLogDomain::AppenderAutoPtr(
-                new logger::ConsoleAppender<MessageEventEphemeral>(
-                    new MessageEventDetailsEncoder)));
+            ->attachAppender(std::make_unique<logger::ConsoleAppender<MessageEventEphemeral>>(
+                std::make_unique<MessageEventDetailsEncoder>()));
     }
 
     logger::globalLogDomain()->attachAppender(
-        logger::MessageLogDomain::AppenderAutoPtr(new RamLogAppender(RamLog::get("global"))));
+        std::make_unique<RamLogAppender>(RamLog::get("global")));
 
     return Status::OK();
 }

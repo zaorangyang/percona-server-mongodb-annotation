@@ -65,6 +65,10 @@ public:
     static constexpr StringData kShardConfigCollectionsCollectionName =
         "config.cache.collections"_sd;
 
+    // Name for a shard's databases metadata collection, each document of which indicates the
+    // state of a specific database.
+    static constexpr StringData kShardConfigDatabasesCollectionName = "config.cache.databases"_sd;
+
     // Name for causal consistency's key collection.
     static constexpr StringData kSystemKeysCollectionName = "admin.system.keys"_sd;
 
@@ -72,7 +76,7 @@ public:
     // running as a replica set. Documents in this collection should represent some configuration
     // state of the server, which needs to be recovered/consulted at startup. Each document in this
     // namespace should have its _id set to some string, which meaningfully describes what it
-    // represents.
+    // represents. For example, 'shardIdentity' and 'featureCompatibilityVersion'.
     static const NamespaceString kServerConfigurationNamespace;
 
     // Namespace for storing the transaction information for each session
@@ -212,6 +216,9 @@ public:
     bool isSystem() const {
         return coll().startsWith("system.");
     }
+    bool isAdminDB() const {
+        return db() == kAdminDb;
+    }
     bool isLocal() const {
         return db() == kLocalDb;
     }
@@ -224,7 +231,7 @@ public:
     bool isSystemDotViews() const {
         return coll() == kSystemDotViewsCollectionName;
     }
-    bool isAdminDotSystemDotVersion() const {
+    bool isServerConfigurationCollection() const {
         return (db() == kAdminDb) && (coll() == "system.version");
     }
     bool isConfigDB() const {

@@ -38,6 +38,7 @@
 #include "mongo/client/embedded/service_context_embedded.h"
 #include "mongo/client/embedded/service_entry_point_embedded.h"
 #include "mongo/config.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/health_log.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
@@ -48,14 +49,13 @@
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index_rebuilder.h"
 #include "mongo/db/kill_sessions_local.h"
-#include "mongo/db/log_process_details.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/service_context_registrar.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/session_killer.h"
-#include "mongo/db/startup_warnings_mongod.h"
 #include "mongo/db/storage/encryption_hooks.h"
 #include "mongo/db/ttl.h"
 #include "mongo/logger/log_component.h"
@@ -97,17 +97,26 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 
 // Create a minimalistic replication coordinator to provide a limited interface for users. Not
 // functional to provide any replication logic.
-MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
-                                     ("SetGlobalEnvironment", "SSLManager", "default"))
-(InitializerContext* context) {
-    auto serviceContext = getGlobalServiceContext();
-    repl::StorageInterface::set(serviceContext, stdx::make_unique<repl::StorageInterfaceImpl>());
+GlobalInitializerRegisterer replicationManagerInitializer(
+    "CreateReplicationManager",
+    {"SSLManager", "default"},
+    [](InitializerContext* context) {
+        auto serviceContext = context->serviceContext();
+        repl::StorageInterface::set(serviceContext, std::make_unique<repl::StorageInterfaceImpl>());
 
-    auto replCoord = stdx::make_unique<ReplicationCoordinatorEmbedded>(serviceContext);
-    repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
-    repl::setOplogCollectionName(serviceContext);
-    return Status::OK();
-}
+        auto replCoord = std::make_unique<ReplicationCoordinatorEmbedded>(serviceContext);
+        repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
+        repl::setOplogCollectionName(serviceContext);
+        return Status::OK();
+    },
+    [](DeinitializerContext* context) {
+        auto serviceContext = context->serviceContext();
+
+        repl::ReplicationCoordinator::set(serviceContext, nullptr);
+        repl::StorageInterface::set(serviceContext, nullptr);
+
+        return Status::OK();
+    });
 
 MONGO_INITIALIZER(fsyncLockedForWriting)(InitializerContext* context) {
     setLockedForWritingImpl([]() { return false; });
@@ -118,56 +127,58 @@ MONGO_INITIALIZER(fsyncLockedForWriting)(InitializerContext* context) {
 using logger::LogComponent;
 using std::endl;
 
-void shutdown() {
-    Client::initThreadIfNotAlready();
+void shutdown(ServiceContext* srvContext) {
 
+    Client::initThreadIfNotAlready();
     auto const client = Client::getCurrent();
     auto const serviceContext = client->getServiceContext();
+    invariant(srvContext == serviceContext);
 
     serviceContext->setKillAllOperations();
 
-    // Shut down the background periodic task runner
-    if (auto runner = serviceContext->getPeriodicRunner()) {
-        runner->shutdown();
-    }
-
     // We should always be able to acquire the global lock at shutdown.
-    //
-    // TODO: This call chain uses the locker directly, because we do not want to start an
-    // operation context, which also instantiates a recovery unit. Also, using the
-    // lockGlobalBegin/lockGlobalComplete sequence, we avoid taking the flush lock.
-    //
-    // For a Windows service, dbexit does not call exit(), so we must leak the lock outside
-    // of this function to prevent any operations from running that need a lock.
-    //
-    DefaultLockerImpl* globalLocker = new DefaultLockerImpl();
-    LockResult result = globalLocker->lockGlobalBegin(MODE_X, Date_t::max());
-    if (result == LOCK_WAITING) {
-        result = globalLocker->lockGlobalComplete(Date_t::max());
-    }
+    // Close all open databases, shutdown storage engine and run all deinitializers.
+    auto shutdownOpCtx = serviceContext->makeOperationContext(client);
+    {
+        Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X, Date_t::max());
+        dbHolder().closeAll(shutdownOpCtx.get(), "shutdown");
 
-    invariant(LOCK_OK == result);
+        // Shut down the background periodic task runner
+        if (auto runner = serviceContext->getPeriodicRunner()) {
+            runner->shutdown();
+        }
 
-    // Global storage engine may not be started in all cases before we exit
-    if (serviceContext->getGlobalStorageEngine()) {
-        serviceContext->shutdownGlobalStorageEngineCleanly();
+        // Global storage engine may not be started in all cases before we exit
+        if (serviceContext->getGlobalStorageEngine()) {
+            serviceContext->shutdownGlobalStorageEngineCleanly();
+        }
+
+        Status status = mongo::runGlobalDeinitializers(serviceContext);
+        uassertStatusOKWithContext(status, "Global deinitilization failed");
     }
+    shutdownOpCtx.reset();
+
+    if (Client::getCurrent())
+        Client::destroy();
+
+    setGlobalServiceContext(nullptr);
 
     log(LogComponent::kControl) << "now exiting";
 }
 
 
-int initialize(int argc, char* argv[], char** envp) {
-    registerShutdownTask(shutdown);
-
+ServiceContext* initialize(const char* yaml_config) {
     srand(static_cast<unsigned>(curTimeMicros64()));
-    //
 
-    Status status = mongo::runGlobalInitializers(argc, argv, envp);
-    if (!status.isOK()) {
-        severe(LogComponent::kControl) << "Failed global initializations: " << status;
-        return EXIT_FAILURE;
-    }
+    setGlobalServiceContext(createServiceContext());
+
+    // yaml_config is passed to the options parser through the argc/argv interface that already
+    // existed. If it is nullptr then use 0 count which will be interpreted as empty string.
+    const char* argv[2] = {yaml_config, nullptr};
+
+    Status status =
+        mongo::runGlobalInitializers(yaml_config ? 1 : 0, argv, nullptr, getGlobalServiceContext());
+    uassertStatusOKWithContext(status, "Global initilization failed");
 
     Client::initThread("initandlisten");
 
@@ -175,9 +186,9 @@ int initialize(int argc, char* argv[], char** envp) {
 
     auto serviceContext = checked_cast<ServiceContextMongoEmbedded*>(getGlobalServiceContext());
 
-    auto opObserverRegistry = stdx::make_unique<OpObserverRegistry>();
-    opObserverRegistry->addObserver(stdx::make_unique<OpObserverImpl>());
-    opObserverRegistry->addObserver(stdx::make_unique<UUIDCatalogObserver>());
+    auto opObserverRegistry = std::make_unique<OpObserverRegistry>();
+    opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+    opObserverRegistry->addObserver(std::make_unique<UUIDCatalogObserver>());
     serviceContext->setOpObserver(std::move(opObserverRegistry));
 
     DBDirectClientFactory::get(serviceContext).registerImplementation([](OperationContext* opCtx) {
@@ -196,20 +207,12 @@ int initialize(int argc, char* argv[], char** envp) {
 
     DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
 
-    logProcessDetails();
-
     serviceContext->createLockFile();
 
     serviceContext->setServiceEntryPoint(
-        stdx::make_unique<ServiceEntryPointEmbedded>(serviceContext));
+        std::make_unique<ServiceEntryPointEmbedded>(serviceContext));
 
     serviceContext->initializeGlobalStorageEngine();
-
-#ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
-    if (EncryptionHooks::get(serviceContext)->restartRequired()) {
-        quickExit(EXIT_CLEAN);
-    }
-#endif
 
     // Warn if we detect configurations for multiple registered storage engines in the same
     // configuration file/environment.
@@ -230,8 +233,6 @@ int initialize(int argc, char* argv[], char** envp) {
             }
         }
     }
-
-    logMongodStartupWarnings(storageGlobalParams, serverGlobalParams, serviceContext);
 
     {
         std::stringstream ss;
@@ -313,7 +314,7 @@ int initialize(int argc, char* argv[], char** envp) {
 
     serviceContext->notifyStartupComplete();
 
-    return 0;
+    return serviceContext;
 }
 }  // namespace embedded
 }  // namespace mongo

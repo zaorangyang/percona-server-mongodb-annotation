@@ -126,20 +126,6 @@ Status addMongodOptions(moe::OptionSection* options) {
 
     // Diagnostic Options
 
-    general_options
-        .addOptionChaining("operationProfiling.slowOpThresholdMs",
-                           "slowms",
-                           moe::Int,
-                           "value of slow for profile and console log")
-        .setDefault(moe::Value(100));
-
-    general_options
-        .addOptionChaining("operationProfiling.slowOpSampleRate",
-                           "slowOpSampleRate",
-                           moe::Double,
-                           "fraction of slow ops to include in the profile and console log")
-        .setDefault(moe::Value(1.0));
-
     general_options.addOptionChaining("profile", "profile", moe::Int, "0=off 1=slow, 2=all")
         .setSources(moe::SourceAllLegacy);
 
@@ -147,14 +133,6 @@ Status addMongodOptions(moe::OptionSection* options) {
         .addOptionChaining("operationProfiling.mode", "", moe::String, "(off/slowOp/all)")
         .setSources(moe::SourceYAMLConfig)
         .format("(:?off)|(:?slowOp)|(:?all)", "(off/slowOp/all)");
-
-    general_options
-        .addOptionChaining("operationProfiling.rateLimit",
-                           "rateLimit",
-                           moe::Int,
-                           "rate limiter value for profiling")
-        .setDefault(moe::Value(1))
-        .validRange(0, RATE_LIMIT_MAX);
 
     general_options
         .addOptionChaining(
@@ -414,6 +392,12 @@ Status addMongodOptions(moe::OptionSection* options) {
                            "enables majority readConcern")
         .setDefault(moe::Value(true));
 
+    replication_options.addOptionChaining(
+        "master", "master", moe::Switch, "Master/slave replication no longer supported");
+
+    replication_options.addOptionChaining(
+        "slave", "slave", moe::Switch, "Master/slave replication no longer supported");
+
     // Sharding Options
 
     sharding_options
@@ -568,6 +552,11 @@ bool handlePreValidationMongodOptions(const moe::Environment& params,
         return false;
     }
 
+    if (params.count("master") || params.count("slave")) {
+        severe() << "Master/slave replication is no longer supported";
+        return false;
+    }
+
     return true;
 }
 
@@ -581,14 +570,6 @@ Status validateMongodOptions(const moe::Environment& params) {
         (params.count("dur") || params.count("journal"))) {
         return Status(ErrorCodes::BadValue,
                       "Can't specify both --journal and --nojournal options.");
-    }
-
-    if (params.count("operationProfiling.slowOpSampleRate")
-        && params["operationProfiling.slowOpSampleRate"].as<double>() != 1.0
-        && params.count("operationProfiling.rateLimit")
-        && params["operationProfiling.rateLimit"].as<int>() != 1) {
-        return Status(ErrorCodes::BadValue,
-                      "Can't specify non-default values for both --rateLimit and --slowOpSampleRate options.");
     }
 
 #ifdef _WIN32
@@ -924,22 +905,6 @@ Status storeMongodOptions(const moe::Environment& params) {
                << ".  Supported modes are: (off|slowOp|all)";
             return Status(ErrorCodes::BadValue, sb.str());
         }
-    }
-
-    if (params.count("operationProfiling.slowOpThresholdMs")) {
-        serverGlobalParams.slowMS = params["operationProfiling.slowOpThresholdMs"].as<int>();
-    }
-
-    if (params.count("operationProfiling.rateLimit")) {
-        // range checking is provided by validRange() above
-        // if 0 is specified we interpret it as 1
-        int rateLimit = params["operationProfiling.rateLimit"].as<int>();
-        rateLimit = std::max(1, rateLimit);
-        serverGlobalParams.rateLimit = rateLimit;
-    }
-
-    if (params.count("operationProfiling.slowOpSampleRate")) {
-        serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
     }
 
     if (params.count("storage.syncPeriodSecs")) {

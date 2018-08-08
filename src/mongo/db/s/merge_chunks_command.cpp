@@ -36,6 +36,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
@@ -61,7 +62,7 @@ bool checkMetadataForSuccess(OperationContext* opCtx,
                              const BSONObj& maxKey) {
     const auto metadataAfterMerge = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss)->getMetadata();
+        return CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
     }();
 
     uassert(ErrorCodes::StaleEpoch,
@@ -106,7 +107,7 @@ Status mergeChunks(OperationContext* opCtx,
 
     const auto metadata = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-        return CollectionShardingState::get(opCtx, nss)->getMetadata();
+        return CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
     }();
 
     if (!metadata) {
@@ -240,8 +241,11 @@ Status mergeChunks(OperationContext* opCtx,
     //
     // Run _configsvrCommitChunkMerge.
     //
-    MergeChunkRequest request{
-        nss, shardingState->getShardName(), shardVersion.epoch(), chunkBoundaries};
+    MergeChunkRequest request{nss,
+                              shardingState->getShardName(),
+                              shardVersion.epoch(),
+                              chunkBoundaries,
+                              LogicalClock::get(opCtx)->getClusterTime().asTimestamp()};
 
     auto configCmdObj =
         request.toConfigCommandBSON(ShardingCatalogClient::kMajorityWriteConcern.toBSON());
@@ -304,7 +308,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool adminOnly() const override {

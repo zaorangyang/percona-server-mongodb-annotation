@@ -73,7 +73,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool adminOnly() const override {
@@ -177,7 +177,7 @@ public:
         bool ok = conn->runCommand("admin", remoteCmdObjB.obj(), remoteResult);
         conn.done();
 
-        Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(routingInfo));
+        Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo));
 
         CommandHelpers::filterCommandReplyForPassthrough(remoteResult, &result);
         return ok;

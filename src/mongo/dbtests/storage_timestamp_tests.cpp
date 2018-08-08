@@ -155,7 +155,7 @@ public:
      */
     void reset(NamespaceString nss) const {
         ::mongo::writeConflictRetry(_opCtx, "deleteAll", nss.ns(), [&] {
-            invariant(_opCtx->recoveryUnit()->selectSnapshot(Timestamp::min()).isOK());
+            invariant(_opCtx->recoveryUnit()->setPointInTimeReadTimestamp(Timestamp::min()).isOK());
             AutoGetCollection collRaii(_opCtx, nss, LockMode::MODE_X);
 
             if (collRaii.getCollection()) {
@@ -237,7 +237,7 @@ public:
                                            const repl::MinValidDocument& expectedDoc) {
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(ts));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(ts));
         auto doc =
             repl::MinValidDocument::parse(IDLParserErrorContext("MinValidDocument"), findOne(coll));
         ASSERT_EQ(expectedDoc.getMinValidTimestamp(), doc.getMinValidTimestamp())
@@ -263,7 +263,7 @@ public:
         const repl::CheckpointTimestampDocument& expectedDoc) {
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(ts));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(ts));
         auto doc = repl::CheckpointTimestampDocument::parse(
             IDLParserErrorContext("CheckpointTimestampDocument"), findOne(coll));
         ASSERT_EQ(expectedDoc.getCheckpointTimestamp(), doc.getCheckpointTimestamp())
@@ -277,7 +277,7 @@ public:
     void assertEmptyCollectionAtTimestamp(Collection* coll, const Timestamp& ts) {
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(ts));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(ts));
         ASSERT_EQ(0, itCount(coll)) << "collection " << coll->ns() << " isn't empty at "
                                     << ts.toString() << ". One document is " << findOne(coll);
     }
@@ -288,7 +288,7 @@ public:
 
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(ts));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(ts));
         if (expectedDoc.isEmpty()) {
             ASSERT_EQ(0, itCount(coll)) << "Should not find any documents in " << coll->ns()
                                         << " at ts: " << ts;
@@ -320,7 +320,7 @@ public:
 
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(ts));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(ts));
 
         // getCollectionIdent() returns the ident for the given namespace in the KVCatalog.
         // getAllIdents() actually looks in the RecordStore for a list of all idents, and is thus
@@ -388,7 +388,7 @@ public:
                                       Timestamp timestamp) {
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(_opCtx->recoveryUnit()->selectSnapshot(timestamp));
+        ASSERT_OK(_opCtx->recoveryUnit()->setPointInTimeReadTimestamp(timestamp));
         auto allIdents = kvCatalog->getAllIdents(_opCtx);
         if (collIdent.size() > 0) {
             // Index build test does not pass in a collection ident.
@@ -407,7 +407,7 @@ public:
                                         Timestamp timestamp) {
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(_opCtx->recoveryUnit()->selectSnapshot(timestamp));
+        ASSERT_OK(_opCtx->recoveryUnit()->setPointInTimeReadTimestamp(timestamp));
         auto allIdents = kvCatalog->getAllIdents(_opCtx);
         if (collIdent.size() > 0) {
             // Index build test does not pass in a collection ident.
@@ -444,7 +444,7 @@ public:
 
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(ts));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(ts));
 
         MultikeyPaths actualMultikeyPaths;
         if (!shouldBeMultikey) {
@@ -517,7 +517,8 @@ public:
         for (std::uint32_t idx = 0; idx < docsToInsert; ++idx) {
             auto recoveryUnit = _opCtx->recoveryUnit();
             recoveryUnit->abandonSnapshot();
-            ASSERT_OK(recoveryUnit->selectSnapshot(firstInsertTime.addTicks(idx).asTimestamp()));
+            ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(
+                firstInsertTime.addTicks(idx).asTimestamp()));
             BSONObj result;
             ASSERT(Helpers::getLast(_opCtx, nss.ns().c_str(), result)) << " idx is " << idx;
             ASSERT_EQ(0, SimpleBSONObjComparator::kInstance.compare(result, BSON("_id" << idx)))
@@ -599,7 +600,8 @@ public:
         for (std::uint32_t idx = 0; idx < docsToInsert; ++idx) {
             auto recoveryUnit = _opCtx->recoveryUnit();
             recoveryUnit->abandonSnapshot();
-            ASSERT_OK(recoveryUnit->selectSnapshot(firstInsertTime.addTicks(idx).asTimestamp()));
+            ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(
+                firstInsertTime.addTicks(idx).asTimestamp()));
             BSONObj result;
             ASSERT(Helpers::getLast(_opCtx, nss.ns().c_str(), result)) << " idx is " << idx;
             ASSERT_EQ(0, SimpleBSONObjComparator::kInstance.compare(result, BSON("_id" << idx)))
@@ -665,7 +667,8 @@ public:
             // at each successive tick counts one less document.
             auto recoveryUnit = _opCtx->recoveryUnit();
             recoveryUnit->abandonSnapshot();
-            ASSERT_OK(recoveryUnit->selectSnapshot(lastInsertTime.addTicks(num).asTimestamp()));
+            ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(
+                lastInsertTime.addTicks(num).asTimestamp()));
             ASSERT_EQ(docsToInsert - num, itCount(autoColl.getCollection()));
         }
     }
@@ -741,7 +744,8 @@ public:
             // the series.
             auto recoveryUnit = _opCtx->recoveryUnit();
             recoveryUnit->abandonSnapshot();
-            ASSERT_OK(recoveryUnit->selectSnapshot(insertTime.addTicks(idx + 1).asTimestamp()));
+            ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(
+                insertTime.addTicks(idx + 1).asTimestamp()));
 
             auto doc = findOne(autoColl.getCollection());
             ASSERT_EQ(0, SimpleBSONObjComparator::kInstance.compare(doc, updates[idx].second))
@@ -799,7 +803,7 @@ public:
         // Reading at `insertTime` should show the original document, `{_id: 0, field: 0}`.
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(insertTime.asTimestamp()));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(insertTime.asTimestamp()));
         auto doc = findOne(autoColl.getCollection());
         ASSERT_EQ(0,
                   SimpleBSONObjComparator::kInstance.compare(doc, BSON("_id" << 0 << "field" << 0)))
@@ -808,7 +812,7 @@ public:
         // Reading at `insertTime + 1` should show the second insert that got converted to an
         // upsert, `{_id: 0}`.
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(insertTime.addTicks(1).asTimestamp()));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(insertTime.addTicks(1).asTimestamp()));
         doc = findOne(autoColl.getCollection());
         ASSERT_EQ(0, SimpleBSONObjComparator::kInstance.compare(doc, BSON("_id" << 0)))
             << "Doc: " << doc.toString() << " Expected: {_id: 0}";
@@ -857,7 +861,7 @@ public:
         // Reading at `preInsertTimestamp` should not find anything.
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(preInsertTimestamp.asTimestamp()));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(preInsertTimestamp.asTimestamp()));
         ASSERT_EQ(0, itCount(autoColl.getCollection()))
             << "Should not observe a write at `preInsertTimestamp`. TS: "
             << preInsertTimestamp.asTimestamp();
@@ -865,7 +869,8 @@ public:
         // Reading at `preInsertTimestamp + 1` should observe both inserts.
         recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(preInsertTimestamp.addTicks(1).asTimestamp()));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(
+            preInsertTimestamp.addTicks(1).asTimestamp()));
         ASSERT_EQ(2, itCount(autoColl.getCollection()))
             << "Should observe both writes at `preInsertTimestamp + 1`. TS: "
             << preInsertTimestamp.addTicks(1).asTimestamp();
@@ -919,14 +924,15 @@ public:
         // Reading at `insertTime` should not see any documents.
         auto recoveryUnit = _opCtx->recoveryUnit();
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(preInsertTimestamp.asTimestamp()));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(preInsertTimestamp.asTimestamp()));
         ASSERT_EQ(0, itCount(autoColl.getCollection()))
             << "Should not find any documents at `preInsertTimestamp`. TS: "
             << preInsertTimestamp.asTimestamp();
 
         // Reading at `preInsertTimestamp + 1` should show the final state of the document.
         recoveryUnit->abandonSnapshot();
-        ASSERT_OK(recoveryUnit->selectSnapshot(preInsertTimestamp.addTicks(1).asTimestamp()));
+        ASSERT_OK(recoveryUnit->setPointInTimeReadTimestamp(
+            preInsertTimestamp.addTicks(1).asTimestamp()));
         auto doc = findOne(autoColl.getCollection());
         ASSERT_EQ(0, SimpleBSONObjComparator::kInstance.compare(doc, BSON("_id" << 0)))
             << "Doc: " << doc.toString() << " Expected: {_id: 0}";
@@ -1347,16 +1353,8 @@ public:
         // after bulk index builds.
         std::vector<repl::OplogEntry> ops = {op0, createIndexOp, op1, op2};
 
-        AtomicUInt32 fetchCount(0);
-        auto applyOpFn = [&fetchCount](OperationContext* opCtx,
-                                       repl::MultiApplier::OperationPtrs* ops,
-                                       repl::SyncTail* st,
-                                       WorkerMultikeyPathInfo* workerMultikeyPathInfo) {
-            return repl::multiInitialSyncApply(opCtx, ops, st, &fetchCount, workerMultikeyPathInfo);
-        };
-
         auto writerPool = repl::SyncTail::makeWriterPool();
-        repl::SyncTail syncTail(nullptr, applyOpFn, writerPool.get());
+        repl::SyncTail syncTail(nullptr, repl::multiInitialSyncApply, writerPool.get());
         auto lastTime = unittest::assertGet(syncTail.multiApply(_opCtx, ops));
         ASSERT_EQ(lastTime.getTimestamp(), insertTime2.asTimestamp());
 
@@ -1608,61 +1606,6 @@ public:
     }
 };
 
-class WriteCheckpointTimestamp : public StorageTimestampTest {
-public:
-    void run() {
-        // Only run on 'wiredTiger'. No other storage engines to-date support timestamp writes.
-        if (mongo::storageGlobalParams.engine != "wiredTiger") {
-            return;
-        }
-
-        NamespaceString nss(
-            repl::ReplicationConsistencyMarkersImpl::kDefaultCheckpointTimestampNamespace);
-        ASSERT_OK(repl::StorageInterface::get(_opCtx)->dropCollection(_opCtx, nss));
-        { ASSERT_FALSE(AutoGetCollectionForReadCommand(_opCtx, nss).getCollection()); }
-
-        repl::ReplicationConsistencyMarkersImpl consistencyMarkers(
-            repl::StorageInterface::get(_opCtx));
-
-        unittest::log() << "Writing checkpoint timestamp at " << presentTs;
-        ASSERT_EQ(nullTs, consistencyMarkers.getCheckpointTimestamp(_opCtx));
-        consistencyMarkers.writeCheckpointTimestamp(_opCtx, presentTs);
-        ASSERT_EQ(presentTs, consistencyMarkers.getCheckpointTimestamp(_opCtx));
-
-        repl::CheckpointTimestampDocument expectedCheckpointTsPresent;
-        expectedCheckpointTsPresent.setCheckpointTimestamp(presentTs);
-        expectedCheckpointTsPresent.set_id("checkpointTimestamp");
-
-        AutoGetCollectionForReadCommand autoColl(_opCtx, nss);
-        auto checkpointTsColl = autoColl.getCollection();
-        ASSERT(checkpointTsColl);
-
-        assertEmptyCollectionAtTimestamp(checkpointTsColl, pastTs);
-        assertCheckpointTimestampDocumentAtTimestamp(
-            checkpointTsColl, presentTs, expectedCheckpointTsPresent);
-        assertCheckpointTimestampDocumentAtTimestamp(
-            checkpointTsColl, futureTs, expectedCheckpointTsPresent);
-        assertCheckpointTimestampDocumentAtTimestamp(
-            checkpointTsColl, nullTs, expectedCheckpointTsPresent);
-
-        unittest::log() << "Writing checkpoint timestamp at " << futureTs;
-        consistencyMarkers.writeCheckpointTimestamp(_opCtx, futureTs);
-        ASSERT_EQ(futureTs, consistencyMarkers.getCheckpointTimestamp(_opCtx));
-
-        repl::CheckpointTimestampDocument expectedCheckpointTsFuture;
-        expectedCheckpointTsFuture.setCheckpointTimestamp(futureTs);
-        expectedCheckpointTsFuture.set_id("checkpointTimestamp");
-
-        assertEmptyCollectionAtTimestamp(checkpointTsColl, pastTs);
-        assertCheckpointTimestampDocumentAtTimestamp(
-            checkpointTsColl, presentTs, expectedCheckpointTsPresent);
-        assertCheckpointTimestampDocumentAtTimestamp(
-            checkpointTsColl, futureTs, expectedCheckpointTsFuture);
-        assertCheckpointTimestampDocumentAtTimestamp(
-            checkpointTsColl, nullTs, expectedCheckpointTsFuture);
-    }
-};
-
 /**
  * This KVDropDatabase test only exists in this file for historical reasons, the final phase of
  * timestamping `dropDatabase` side-effects no longer applies. The purpose of this test is to
@@ -1756,14 +1699,30 @@ public:
  * This test asserts that the catalog updates that represent the beginning and end of an index
  * build are timestamped. Additionally, the index will be `multikey` and that catalog update that
  * finishes the index build will also observe the index is multikey.
+ *
+ * Primaries log no-ops when starting an index build to acquire a timestamp. A primary committing
+ * an index build gets timestamped when the `createIndexes` command creates an oplog entry. That
+ * step is mimiced here.
+ *
+ * Secondaries timestamp starting their index build by being in a `TimestampBlock` when the oplog
+ * entry is processed. Secondaries will look at the logical clock when completing the index
+ * build. This is safe so long as completion is not racing with secondary oplog application (i.e:
+ * enforced via the parallel batch writer lock).
  */
-template <bool SimulateBackground>
+template <bool SimulatePrimary>
 class TimestampIndexBuilds : public StorageTimestampTest {
 public:
     void run() {
         // Only run on 'wiredTiger'. No other storage engines to-date timestamp writes.
         if (mongo::storageGlobalParams.engine != "wiredTiger") {
             return;
+        }
+
+        const bool SimulateSecondary = !SimulatePrimary;
+        if (SimulateSecondary) {
+            // The MemberState is inspected during index builds to use a "ghost" write to timestamp
+            // index completion.
+            ASSERT_OK(_coordinatorMock->setFollowerMode({repl::MemberState::MS::RS_SECONDARY}));
         }
 
         auto kvStorageEngine =
@@ -1793,20 +1752,30 @@ public:
         // Build an index on `{a: 1}`. This index will be multikey.
         MultiIndexBlock indexer(_opCtx, autoColl.getCollection());
         const LogicalTime beforeIndexBuild = _clock->reserveTicks(2);
+        BSONObj indexInfoObj;
         {
+            // Primaries do not have a wrapping `TimestampBlock`; secondaries do.
             const Timestamp commitTimestamp =
-                SimulateBackground ? Timestamp::min() : beforeIndexBuild.addTicks(1).asTimestamp();
+                SimulatePrimary ? Timestamp::min() : beforeIndexBuild.addTicks(1).asTimestamp();
             TimestampBlock tsBlock(_opCtx, commitTimestamp);
 
-            ASSERT_OK(indexer
-                          .init({BSON("v" << 2 << "unique" << true << "name"
-                                          << "a_1"
-                                          << "ns"
-                                          << nss.ns()
-                                          << "key"
-                                          << BSON("a" << 1))})
-                          .getStatus());
+            // Secondaries will also be in an `UnreplicatedWritesBlock` that prevents the `logOp`
+            // from making creating an entry.
+            boost::optional<repl::UnreplicatedWritesBlock> unreplicated;
+            if (SimulateSecondary) {
+                unreplicated.emplace(_opCtx);
+            }
+
+            auto swIndexInfoObj = indexer.init({BSON("v" << 2 << "unique" << true << "name"
+                                                         << "a_1"
+                                                         << "ns"
+                                                         << nss.ns()
+                                                         << "key"
+                                                         << BSON("a" << 1))});
+            ASSERT_OK(swIndexInfoObj.getStatus());
+            indexInfoObj = std::move(swIndexInfoObj.getValue()[0]);
         }
+
         const LogicalTime afterIndexInit = _clock->reserveTicks(2);
 
         // Inserting all the documents has the side-effect of setting internal state on the index
@@ -1814,12 +1783,16 @@ public:
         ASSERT_OK(indexer.insertAllDocumentsInCollection());
 
         {
-            const Timestamp commitTimestamp =
-                SimulateBackground ? Timestamp::min() : afterIndexInit.addTicks(1).asTimestamp();
-            TimestampBlock tsBlock(_opCtx, commitTimestamp);
-
             WriteUnitOfWork wuow(_opCtx);
+            // Primaries will perform no timestamping in the indexer's commit. Secondaries will
+            // look at the logical clock.
             indexer.commit();
+            if (SimulatePrimary) {
+                // The op observer is not called from the index builder, but rather the
+                // `createIndexes` command.
+                _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                    _opCtx, nss, autoColl.getCollection()->uuid(), indexInfoObj, false);
+            }
             wuow.commit();
         }
 
@@ -1832,7 +1805,8 @@ public:
         assertIdentsExistAtTimestamp(kvCatalog, "", indexIdent, afterIndexInit.asTimestamp());
         {
             _opCtx->recoveryUnit()->abandonSnapshot();
-            ASSERT_OK(_opCtx->recoveryUnit()->selectSnapshot(afterIndexInit.asTimestamp()));
+            ASSERT_OK(
+                _opCtx->recoveryUnit()->setPointInTimeReadTimestamp(afterIndexInit.asTimestamp()));
             auto collMetaData = kvCatalog->getMetaData(_opCtx, nss.ns());
             auto indexMetaData = collMetaData.indexes[collMetaData.findIndexOffset("a_1")];
             ASSERT_FALSE(indexMetaData.ready);
@@ -1842,7 +1816,7 @@ public:
         assertIdentsExistAtTimestamp(kvCatalog, "", indexIdent, afterIndexBuild);
         {
             _opCtx->recoveryUnit()->abandonSnapshot();
-            ASSERT_OK(_opCtx->recoveryUnit()->selectSnapshot(afterIndexBuild));
+            ASSERT_OK(_opCtx->recoveryUnit()->setPointInTimeReadTimestamp(afterIndexBuild));
             auto collMetaData = kvCatalog->getMetaData(_opCtx, nss.ns());
             auto indexMetaData = collMetaData.indexes[collMetaData.findIndexOffset("a_1")];
             ASSERT(indexMetaData.ready);
@@ -1880,9 +1854,8 @@ public:
         add<SetMinValidInitialSyncFlag>();
         add<SetMinValidToAtLeast>();
         add<SetMinValidAppliedThrough>();
-        add<WriteCheckpointTimestamp>();
         add<KVDropDatabase>();
-        // Timestamp<SimulateBackground>
+        // TimestampIndexBuilds<SimulatePrimary>
         add<TimestampIndexBuilds<false>>();
         add<TimestampIndexBuilds<true>>();
     }

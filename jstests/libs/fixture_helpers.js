@@ -51,13 +51,21 @@ var FixtureHelpers = (function() {
     }
 
     /**
+     * Looks for an entry in the config database for the given collection, to check whether it's
+     * sharded.
+     */
+    function isSharded(coll) {
+        const db = coll.getDB();
+        return db.getSiblingDB("config").collections.find({_id: coll.getFullName()}).count() > 0;
+    }
+
+    /**
      * Returns the number of shards that 'coll' has any chunks on. Returns 1 if the collection is
      * not sharded. Note that if the balancer is enabled then the number of shards with chunks for
      * this collection can change at any moment.
      */
     function numberOfShardsForCollection(coll) {
-        if (!isMongos(coll.getDB()) ||
-            db.getSiblingDB("config").collections.find({_id: coll.getFullName()}).count() === 0) {
+        if (!isMongos(coll.getDB()) || !isSharded(coll)) {
             // If we're not talking to a mongos, or the collection is not sharded, there is one
             // shard.
             return 1;
@@ -66,14 +74,15 @@ var FixtureHelpers = (function() {
     }
 
     /**
-     * Runs the command given by 'cmdObj' on the database given by 'dbName' on each replica set in
+     * Runs the command given by 'cmdObj' on the database given by 'db' on each replica set in
      * the fixture (besides the config servers). Asserts that each command works, and returns an
      * array with the responses from each shard, or with a single element if the fixture was a
      * replica set. Asserts if the fixture is a standalone or if the shards are standalones.
      */
-    function runCommandOnEachPrimary({dbName, cmdObj}) {
-        return _getAllReplicas().map((replSet) => assert.commandWorked(
-                                         replSet.getPrimary().getDB(dbName).runCommand(cmdObj)));
+    function runCommandOnEachPrimary({db, cmdObj}) {
+        return _getAllReplicas(db).map(
+            (replSet) =>
+                assert.commandWorked(replSet.getPrimary().getDB(db.getName()).runCommand(cmdObj)));
     }
 
     /**
@@ -106,6 +115,7 @@ var FixtureHelpers = (function() {
 
     return {
         isMongos: isMongos,
+        isSharded: isSharded,
         numberOfShardsForCollection: numberOfShardsForCollection,
         awaitReplication: awaitReplication,
         awaitLastOpCommitted: awaitLastOpCommitted,

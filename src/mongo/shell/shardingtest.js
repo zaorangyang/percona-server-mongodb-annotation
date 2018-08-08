@@ -876,9 +876,31 @@ var ShardingTest = function(params) {
     };
 
     /**
+     * Restarts each node in a particular shard replica set using the shard's original startup
+     * options by default.
+     *
+     * Option { startClean : true } forces clearing the data directory.
+     * Option { auth : Object } object that contains the auth details for admin credentials.
+     *   Should contain the fields 'user' and 'pwd'
+     *
+     *
+     * @param {int} shard server number (0, 1, 2, ...) to be restarted
+     */
+    this.restartShardRS = function(n, options, signal, wait) {
+        for (let i = 0; i < this["rs" + n].nodeList().length; i++) {
+            this["rs" + n].restart(i);
+        }
+
+        this["rs" + n].awaitSecondaryNodes();
+        this._connections[n] = new Mongo(this["rs" + n].getURL());
+        this["shard" + n] = this._connections[n];
+    };
+
+    /**
      * Stops and restarts a config server mongod process.
      *
-     * If opts is specified, the new mongod is started using those options. Otherwise, it is started
+     * If opts is specified, the new mongod is started using those options. Otherwise, it is
+     * started
      * with its previous parameters.
      *
      * Warning: Overwrites the old cn/confign member variables.
@@ -1053,6 +1075,7 @@ var ShardingTest = function(params) {
         var tempCount = 0;
         for (var i in numShards) {
             otherParams[i] = numShards[i];
+
             tempCount++;
         }
 
@@ -1143,6 +1166,31 @@ var ShardingTest = function(params) {
                 rsDefaults.nodes = rsDefaults.nodes || otherParams.numReplicas;
             }
 
+            if (startShardsAsRS && !(otherParams.rs || otherParams["rs" + i])) {
+                if (jsTestOptions().shardMixedBinVersions) {
+                    if (!otherParams.shardOptions) {
+                        otherParams.shardOptions = {};
+                    }
+                    // If the test doesn't depend on specific shard binVersions, create a mixed
+                    // version
+                    // shard cluster that randomly assigns shard binVersions, half "latest" and half
+                    // "last-stable".
+                    if (!otherParams.shardOptions.binVersion) {
+                        Random.setRandomSeed();
+                        otherParams.shardOptions.binVersion =
+                            MongoRunner.versionIterator(["latest", "last-stable"], true);
+                    }
+                }
+
+                if (otherParams.shardOptions && otherParams.shardOptions.binVersion) {
+                    otherParams.shardOptions.binVersion =
+                        MongoRunner.versionIterator(otherParams.shardOptions.binVersion);
+                }
+
+                rsDefaults = Object.merge(rsDefaults, otherParams["d" + i]);
+                rsDefaults = Object.merge(rsDefaults, otherParams.shardOptions);
+            }
+
             var rsSettings = rsDefaults.settings;
             delete rsDefaults.settings;
 
@@ -1151,7 +1199,7 @@ var ShardingTest = function(params) {
             if (otherParams.rs || otherParams["rs" + i]) {
                 var numReplicas = rsDefaults.nodes || 3;
             } else if (startShardsAsRS) {
-                var numReplicas = 2;
+                var numReplicas = 1;
             }
             delete rsDefaults.nodes;
 

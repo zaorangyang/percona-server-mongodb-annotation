@@ -35,6 +35,7 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/write_commands/write_commands_common.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -59,13 +60,12 @@ void batchErrorToLastError(const BatchedCommandRequest& request,
     error->reset();
 
     std::unique_ptr<WriteErrorDetail> commandError;
-    WriteErrorDetail* lastBatchError = NULL;
+    WriteErrorDetail* lastBatchError = nullptr;
 
     if (!response.getOk()) {
         // Command-level error, all writes failed
-        commandError.reset(new WriteErrorDetail);
+        commandError = stdx::make_unique<WriteErrorDetail>();
         commandError->setStatus(response.getTopLevelStatus());
-
         lastBatchError = commandError.get();
     } else if (response.isErrDetailsSet()) {
         // The last error in the batch is always reported - this matches expected COE semantics for
@@ -139,32 +139,31 @@ class ClusterWriteCmd : public Command {
 public:
     virtual ~ClusterWriteCmd() {}
 
+    std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
+                                             const OpMsgRequest& request) final;
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kNever;
     }
 
-    bool supportsWriteConcern(const BSONObj& cmd) const final {
-        return true;
-    }
-
-    Status checkAuthForRequest(OperationContext* opCtx, const OpMsgRequest& request) const final {
-        Status status = auth::checkAuthForWriteCommand(
-            AuthorizationSession::get(opCtx->getClient()), _writeType, request);
-
-        // TODO: Remove this when we standardize GLE reporting from commands
-        if (!status.isOK()) {
-            LastError::get(opCtx->getClient()).setLastError(status.code(), status.reason());
+    LogicalOp getLogicalOp() const {
+        switch (_writeType) {
+            case BatchedCommandRequest::BatchType::BatchType_Insert:
+                return LogicalOp::opInsert;
+            case BatchedCommandRequest::BatchType::BatchType_Delete:
+                return LogicalOp::opDelete;
+            case BatchedCommandRequest::BatchType::BatchType_Update:
+                return LogicalOp::opUpdate;
         }
 
-        return status;
+        MONGO_UNREACHABLE;
     }
 
-    Status explain(OperationContext* opCtx,
-                   const OpMsgRequest& request,
-                   ExplainOptions::Verbosity verbosity,
-                   BSONObjBuilder* out) const final {
-        const auto batchedRequest(parseRequest(_writeType, request));
-
+    Status explainImpl(OperationContext* opCtx,
+                       const OpMsgRequest& request,
+                       ExplainOptions::Verbosity verbosity,
+                       BatchedCommandRequest& batchedRequest,
+                       BSONObjBuilder* out) const {
         // We can only explain write batches of size 1.
         if (batchedRequest.sizeWriteOps() != 1U) {
             return Status(ErrorCodes::InvalidLength, "explained write batches must be of size 1");
@@ -188,11 +187,10 @@ public:
             opCtx, shardResults, ClusterExplain::kWriteOnShards, timer.millis(), out);
     }
 
-    bool enhancedRun(OperationContext* opCtx,
-                     const OpMsgRequest& request,
-                     BSONObjBuilder& result) final {
-        auto batchedRequest(parseRequest(_writeType, request));
-
+    bool runImpl(OperationContext* opCtx,
+                 const OpMsgRequest& request,
+                 BatchedCommandRequest& batchedRequest,
+                 BSONObjBuilder& result) const {
         auto db = batchedRequest.getNS().db();
         if (db != NamespaceString::kAdminDb && db != NamespaceString::kConfigDb) {
             batchedRequest.setAllowImplicitCreate(false);
@@ -218,22 +216,31 @@ public:
         }
 
         // TODO: increase opcounters by more than one
+        auto& debug = CurOp::get(opCtx)->debug();
         if (_writeType == BatchedCommandRequest::BatchType_Insert) {
             for (size_t i = 0; i < numAttempts; ++i) {
                 globalOpCounters.gotInsert();
             }
+            debug.ninserted = response.getN();
         } else if (_writeType == BatchedCommandRequest::BatchType_Update) {
             for (size_t i = 0; i < numAttempts; ++i) {
                 globalOpCounters.gotUpdate();
             }
+            debug.upsert = response.isUpsertDetailsSet();
+            debug.nMatched = response.getN() - (debug.upsert ? response.sizeUpsertDetails() : 0);
+            debug.nModified = response.getNModified();
         } else if (_writeType == BatchedCommandRequest::BatchType_Delete) {
             for (size_t i = 0; i < numAttempts; ++i) {
                 globalOpCounters.gotDelete();
             }
+            debug.ndeleted = response.getN();
         }
 
         // Save the last opTimes written on each shard for this client, to allow GLE to work
         ClusterLastErrorInfo::get(opCtx->getClient())->addHostOpTimes(stats.getWriteOpTimes());
+
+        // Record the number of shards targeted by this write.
+        CurOp::get(opCtx)->debug().nShards = stats.getTargetedShards().size();
 
         result.appendElements(response.toBSON());
         return response.getOk();
@@ -248,8 +255,7 @@ protected:
         : Command(name), _writeType(writeType) {}
 
 private:
-    // Type of batch (e.g. insert, update).
-    const BatchedCommandRequest::BatchType _writeType;
+    class Invocation;
 
     /**
      * Executes a write command against a particular database, and targets the command based on
@@ -330,9 +336,82 @@ private:
 
         return dispatchStatus;
     }
+
+    // Type of batch: insert, update, or delete.
+    const BatchedCommandRequest::BatchType _writeType;
 };
 
-class ClusterCmdInsert : public ClusterWriteCmd {
+class ClusterWriteCmd::Invocation final : public CommandInvocation {
+public:
+    Invocation(const ClusterWriteCmd* clusterWriteCmd,
+               const OpMsgRequest& request,
+               NamespaceString ns,
+               BatchedCommandRequest batchedRequest)
+        : CommandInvocation(clusterWriteCmd),
+          _request{&request},
+          _ns{std::move(ns)},
+          _batchedRequest{std::move(batchedRequest)} {}
+
+private:
+    void run(OperationContext* opCtx, CommandReplyBuilder* result) override {
+        try {
+            BSONObjBuilder bob = result->getBodyBuilder();
+            bool ok = command()->runImpl(opCtx, *_request, _batchedRequest, bob);
+            CommandHelpers::appendCommandStatus(bob, ok);
+        } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
+            CommandHelpers::logAuthViolation(opCtx, command(), *_request, ErrorCodes::Unauthorized);
+            throw;
+        }
+    }
+
+    void explain(OperationContext* opCtx,
+                 ExplainOptions::Verbosity verbosity,
+                 BSONObjBuilder* result) override {
+        uassertStatusOK(
+            command()->explainImpl(opCtx, *_request, verbosity, _batchedRequest, result));
+    }
+
+    NamespaceString ns() const override {
+        return _ns;
+    }
+
+    bool supportsWriteConcern() const override {
+        return true;
+    }
+
+    Command::AllowedOnSecondary secondaryAllowed(ServiceContext* context) const override {
+        return command()->secondaryAllowed(context);
+    }
+
+    void doCheckAuthorization(OperationContext* opCtx) const override {
+        try {
+            auth::checkAuthForWriteCommand(
+                AuthorizationSession::get(opCtx->getClient()), command()->_writeType, *_request);
+        } catch (const DBException& e) {
+            LastError::get(opCtx->getClient()).setLastError(e.code(), e.reason());
+            throw;
+        }
+    }
+
+    const ClusterWriteCmd* command() const {
+        return static_cast<const ClusterWriteCmd*>(definition());
+    }
+
+    const OpMsgRequest* _request;
+    NamespaceString _ns;
+    BatchedCommandRequest _batchedRequest;
+};
+
+std::unique_ptr<CommandInvocation> ClusterWriteCmd::parse(OperationContext* opCtx,
+                                                          const OpMsgRequest& request) {
+    return stdx::make_unique<Invocation>(
+        this,
+        request,
+        NamespaceString(parseNs(request.getDatabase().toString(), request.body)),
+        parseRequest(_writeType, request));
+}
+
+class ClusterCmdInsert final : public ClusterWriteCmd {
 public:
     ClusterCmdInsert() : ClusterWriteCmd("insert", BatchedCommandRequest::BatchType_Insert) {}
 
@@ -342,7 +421,7 @@ public:
 
 } clusterInsertCmd;
 
-class ClusterCmdUpdate : public ClusterWriteCmd {
+class ClusterCmdUpdate final : public ClusterWriteCmd {
 public:
     ClusterCmdUpdate() : ClusterWriteCmd("update", BatchedCommandRequest::BatchType_Update) {}
 
@@ -352,7 +431,7 @@ public:
 
 } clusterUpdateCmd;
 
-class ClusterCmdDelete : public ClusterWriteCmd {
+class ClusterCmdDelete final : public ClusterWriteCmd {
 public:
     ClusterCmdDelete() : ClusterWriteCmd("delete", BatchedCommandRequest::BatchType_Delete) {}
 

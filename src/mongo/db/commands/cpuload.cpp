@@ -32,6 +32,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 
 namespace mongo {
 
@@ -82,7 +83,7 @@ public:
 };
 
 MONGO_INITIALIZER(RegisterCpuLoadCmd)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         new CPULoadCommand();
     }
     return Status::OK();

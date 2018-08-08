@@ -40,6 +40,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/op_observer.h"
@@ -299,7 +300,7 @@ public:
 // ----------------------------
 
 MONGO_INITIALIZER(RegisterEmptyCappedCmd)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         // Leaked intentionally: a Command registers itself when constructed.
         new CapTrunc();
         new CmdSleep();

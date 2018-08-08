@@ -32,6 +32,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/executor/async_multicaster.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -47,7 +48,7 @@ std::vector<HostAndPort> getAllClusterHosts(OperationContext* opCtx) {
     auto registry = Grid::get(opCtx)->shardRegistry();
 
     std::vector<ShardId> shardIds;
-    registry->getAllShardIds(&shardIds);
+    registry->getAllShardIds(opCtx, &shardIds);
 
     std::vector<HostAndPort> servers;
     for (const auto& shardId : shardIds) {
@@ -147,7 +148,7 @@ public:
 };
 
 MONGO_INITIALIZER(RegisterMulticast)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         new MulticastCmd();
     }
     return Status::OK();

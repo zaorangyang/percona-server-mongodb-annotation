@@ -228,6 +228,10 @@ if (typeof _threadInject != "undefined") {
             return fileList;
         };
 
+        // Transactions are not supported on standalone nodes so we do not run them here.
+        let txnsTestFiles = getFilesRecursive("jstests/core/txns").map(f => ("txns/" + f.baseName));
+        Object.assign(skipTests, makeKeys(txnsTestFiles));
+
         var parallelFilesDir = "jstests/core";
 
         // some tests can't be run in parallel with each other
@@ -268,6 +272,13 @@ if (typeof _threadInject != "undefined") {
             parallelFilesDir + "/profile_repair_cursor.js",
             parallelFilesDir + "/profile_sampling.js",
             parallelFilesDir + "/profile_update.js",
+
+            // These tests can't be run in parallel because they expect an awaitData cursor to
+            // return after maxTimeMS, however this doesn't work if a long running blocking
+            // operation is running in parallel.
+            // TODO: Remove this restriction as part of SERVER-33942.
+            parallelFilesDir + "/compact_keeps_indexes.js",
+            parallelFilesDir + "/awaitdata_getmore_cmd.js",
         ];
         var serialTests = makeKeys(serialTestsArr);
 

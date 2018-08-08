@@ -93,7 +93,6 @@ public:
                                     const NamespaceString& fromCollection,
                                     const NamespaceString& toCollection,
                                     OptionalCollectionUUID uuid,
-                                    bool dropTarget,
                                     OptionalCollectionUUID dropTargetUUID,
                                     bool stayTemp) override;
     void onApplyOps(OperationContext* opCtx,
@@ -103,6 +102,7 @@ public:
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid) override {}
     void onTransactionCommit(OperationContext* opCtx) override {}
+    void onTransactionPrepare(OperationContext* opCtx) override {}
     void onTransactionAbort(OperationContext* opCtx) override {}
     void onReplicationRollback(OperationContext* opCtx,
                                const RollbackObserverInfo& rbInfo) override {}

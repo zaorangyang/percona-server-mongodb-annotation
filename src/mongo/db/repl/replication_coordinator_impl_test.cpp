@@ -39,7 +39,6 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/bson_extract_optime.h"
-#include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -1375,7 +1374,6 @@ protected:
         exitNetwork();
     }
 
-    OID myRid;
     OID rid2;
     OID rid3;
 
@@ -1396,7 +1394,6 @@ private:
                                                             << "test3:1234"))),
                            HostAndPort("test1", 1234));
         ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        myRid = getReplCoord()->getMyRID();
     }
 };
 
@@ -1729,7 +1726,6 @@ private:
                                                             << "test5:1234"))),
                            HostAndPort("test1", 1234));
         ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
-        myRid = getReplCoord()->getMyRID();
     }
 };
 
@@ -3063,6 +3059,8 @@ void doReplSetReconfig(ReplicationCoordinatorImpl* replCoord, Status* status) {
                              << "mySet"
                              << "version"
                              << 3
+                             << "protocolVersion"
+                             << 1
                              << "members"
                              << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                       << "node1:12345"
@@ -3161,6 +3159,8 @@ void doReplSetReconfigToFewer(ReplicationCoordinatorImpl* replCoord, Status* sta
                              << "mySet"
                              << "version"
                              << 3
+                             << "protocolVersion"
+                             << 1
                              << "members"
                              << BSON_ARRAY(BSON("_id" << 0 << "host"
                                                       << "node1:12345")

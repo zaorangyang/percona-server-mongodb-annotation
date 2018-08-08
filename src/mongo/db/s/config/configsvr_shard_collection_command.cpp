@@ -38,7 +38,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
@@ -721,7 +721,7 @@ public:
     }
 
     std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
-        return CommandHelpers::parseNsFullyQualified(dbname, cmdObj);
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
     }
 
     bool run(OperationContext* opCtx,
@@ -745,6 +745,7 @@ public:
         auto const catalogManager = ShardingCatalogManager::get(opCtx);
         auto const catalogCache = Grid::get(opCtx)->catalogCache();
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
+        auto shardRegistry = Grid::get(opCtx)->shardRegistry();
 
         // Make the distlocks boost::optional so that they can be released by being reset below.
         boost::optional<DistLockManager::ScopedDistLock> dbDistLock(
@@ -773,7 +774,7 @@ public:
         ShardKeyPattern shardKeyPattern(proposedKey);
 
         std::vector<ShardId> shardIds;
-        Grid::get(opCtx)->shardRegistry()->getAllShardIds(&shardIds);
+        shardRegistry->getAllShardIds(opCtx, &shardIds);
         const int numShards = shardIds.size();
 
         uassert(ErrorCodes::IllegalOperation,
@@ -786,11 +787,9 @@ public:
             // (unless we are in test mode)
             uassert(ErrorCodes::IllegalOperation,
                     "only special collections in the config db may be sharded",
-                    nss.ns() == SessionsCollection::kSessionsFullNS ||
-                        Command::testCommandsEnabled);
+                    nss.ns() == SessionsCollection::kSessionsFullNS || getTestCommandsEnabled());
 
-            auto configShard = uassertStatusOK(
-                Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dbType.getPrimary()));
+            auto configShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbType.getPrimary()));
             ScopedDbConnection configConn(configShard->getConnString());
             ON_BLOCK_EXIT([&configConn] { configConn.done(); });
 
@@ -811,8 +810,7 @@ public:
             }
         }();
 
-        auto primaryShard =
-            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, primaryShardId));
+        auto primaryShard = uassertStatusOK(shardRegistry->getShard(opCtx, primaryShardId));
         ScopedDbConnection conn(primaryShard->getConnString());
         ON_BLOCK_EXIT([&conn] { conn.done(); });
 

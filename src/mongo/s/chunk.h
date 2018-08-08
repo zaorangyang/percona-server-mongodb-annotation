@@ -55,11 +55,18 @@ public:
     }
 
     const ShardId& getShardId() const {
-        return _shardId;
+        // TODO: SERVER-34100 - consolidate a usage of getShardAt and getShardIdAt
+        return getShardIdAt(boost::none);
     }
+
+    const ShardId& getShardIdAt(const boost::optional<Timestamp>& ts) const;
 
     ChunkVersion getLastmod() const {
         return _lastmod;
+    }
+
+    const auto& getHistory() const {
+        return _history;
     }
 
     bool isJumbo() const {
@@ -97,6 +104,8 @@ private:
     const ShardId _shardId;
 
     const ChunkVersion _lastmod;
+
+    const std::vector<ChunkHistory> _history;
 
     // Indicates whether this chunk should be treated as jumbo and not attempted to be moved or
     // split

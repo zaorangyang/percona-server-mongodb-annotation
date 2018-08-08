@@ -1230,7 +1230,8 @@ TEST_F(DConcurrencyTestFixture, CollectionLockTimeout) {
         opctx2->lockState(), "testdb.test"_sd, MODE_X, Date_t::now() + timeoutMillis);
     ASSERT(!CL2.isLocked());
     Date_t t2 = Date_t::now();
-    ASSERT_GTE(t2 - t1, Milliseconds(timeoutMillis));
+    // 2 terms both can have .9ms rounded away, so we adjust by + 1.
+    ASSERT_GTE(t2 - t1 + Milliseconds(1), Milliseconds(timeoutMillis));
 }
 
 TEST_F(DConcurrencyTestFixture, CompatibleFirstWithSXIS) {
@@ -1456,7 +1457,7 @@ TEST_F(DConcurrencyTestFixture, TestGlobalLockAbandonsSnapshotWhenNotInWriteUnit
     auto recovUnitOwned = stdx::make_unique<RecoveryUnitMock>();
     auto recovUnitBorrowed = recovUnitOwned.get();
     opCtx->setRecoveryUnit(recovUnitOwned.release(),
-                           OperationContext::RecoveryUnitState::kNotInUnitOfWork);
+                           WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
     {
         Lock::GlobalLock gw1(opCtx, MODE_IS, Date_t::now());
@@ -1481,7 +1482,7 @@ TEST_F(DConcurrencyTestFixture, TestGlobalLockDoesNotAbandonSnapshotWhenInWriteU
     auto recovUnitOwned = stdx::make_unique<RecoveryUnitMock>();
     auto recovUnitBorrowed = recovUnitOwned.get();
     opCtx->setRecoveryUnit(recovUnitOwned.release(),
-                           OperationContext::RecoveryUnitState::kActiveUnitOfWork);
+                           WriteUnitOfWork::RecoveryUnitState::kActiveUnitOfWork);
     opCtx->lockState()->beginWriteUnitOfWork();
 
     {

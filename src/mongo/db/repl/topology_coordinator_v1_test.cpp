@@ -135,12 +135,21 @@ protected:
         return _currentConfig.getMemberAt(getTopoCoord().getCurrentPrimaryIndex()).getHostAndPort();
     }
 
+    BSONObj addProtocolVersion(const BSONObj& configDoc) {
+        if (configDoc.hasField("protocolVersion")) {
+            return configDoc;
+        }
+        BSONObjBuilder builder;
+        builder << "protocolVersion" << 1;
+        builder.appendElementsUnique(configDoc);
+        return builder.obj();
+    }
+
     // Update config and set selfIndex
     // If "now" is passed in, set _now to now+1
     void updateConfig(BSONObj cfg, int selfIndex, Date_t now = Date_t::fromMillisSinceEpoch(-1)) {
         ReplSetConfig config;
-        // Use Protocol version 1 by default.
-        ASSERT_OK(config.initialize(cfg, true));
+        ASSERT_OK(config.initialize(addProtocolVersion(cfg)));
         ASSERT_OK(config.validate());
 
         _selfIndex = selfIndex;
@@ -2094,6 +2103,8 @@ TEST_F(TopoCoordTest, BecomeCandidateWhenReconfigToBeElectableInSingleNodeSet) {
                         << "rs0"
                         << "version"
                         << 1
+                        << "protocolVersion"
+                        << 1
                         << "members"
                         << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                  << "hself"
@@ -2129,6 +2140,8 @@ TEST_F(TopoCoordTest,
     ASSERT_OK(cfg.initialize(BSON("_id"
                                   << "rs0"
                                   << "version"
+                                  << 1
+                                  << "protocolVersion"
                                   << 1
                                   << "members"
                                   << BSON_ARRAY(BSON("_id" << 1 << "host"
@@ -2295,6 +2308,8 @@ TEST_F(TopoCoordTest, NodeTransitionsToSecondaryWhenReconfiggingToBeUnelectable)
     updateConfig(BSON("_id"
                       << "rs0"
                       << "version"
+                      << 1
+                      << "protocolVersion"
                       << 1
                       << "members"
                       << BSON_ARRAY(BSON("_id" << 0 << "host"
@@ -4401,6 +4416,166 @@ TEST_F(TopoCoordTest, StepDownAttemptFailsIfSecondaryCaughtUpButNotElectable) {
         HostAndPort("host3"), "rs0", MemberState::RS_SECONDARY, OpTime(Timestamp(4, 0), term));
 
     ASSERT_FALSE(getTopoCoord().attemptStepDown(term, curTime, futureTime, futureTime, false));
+}
+
+TEST_F(TopoCoordTest,
+       StatusResponseAlwaysIncludesStringStatusFieldsForReplicaSetMembersNoHeartbeats) {
+
+    Date_t heartbeatTime = Date_t::fromMillisSinceEpoch(5000);
+    Seconds uptimeSecs(10);
+    Date_t curTime = heartbeatTime + uptimeSecs;
+    OpTime oplogProgress(Timestamp(3, 4), 0);
+
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
+    ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version"
+                      << 5
+                      << "members"
+                      << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                               << "host0:27017")
+                                    << BSON("_id" << 1 << "host"
+                                                  << "host1:27017"))
+                      << "protocolVersion"
+                      << 1),
+                 0);
+    {
+        BSONObjBuilder statusBuilder;
+        Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
+        getTopoCoord().prepareStatusResponse(
+            TopologyCoordinator::ReplSetStatusArgs{
+                curTime,
+                static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
+                OpTime(),
+                BSONObj()},
+            &statusBuilder,
+            &resultStatus);
+
+        ASSERT_OK(resultStatus);
+        BSONObj rsStatus = statusBuilder.obj();
+        BSONObj member0Status = rsStatus["members"].Array()[0].Obj();
+        BSONObj member1Status = rsStatus["members"].Array()[1].Obj();
+
+        // These fields should all be empty, since this node has not received heartbeats and has
+        // no sync source yet.
+        ASSERT_EQUALS("", rsStatus["syncingTo"].String());
+        ASSERT_EQUALS("", member0Status["syncingTo"].String());
+        ASSERT_EQUALS("", member0Status["lastHeartbeatMessage"].String());
+        ASSERT_EQUALS("", member0Status["infoMessage"].String());
+        ASSERT_EQUALS("", member1Status["syncingTo"].String());
+        ASSERT_EQUALS("", member1Status["lastHeartbeatMessage"].String());
+        ASSERT_EQUALS("", member1Status["infoMessage"].String());
+    }
+}
+
+TEST_F(TopoCoordTest,
+       StatusResponseAlwaysIncludesStringStatusFieldsForReplicaSetMembersWithHeartbeats) {
+
+    Date_t heartbeatTime = Date_t::fromMillisSinceEpoch(5000);
+    Seconds uptimeSecs(10);
+    Date_t curTime = heartbeatTime + uptimeSecs;
+    OpTime oplogProgress(Timestamp(3, 4), 0);
+
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
+    ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version"
+                      << 5
+                      << "members"
+                      << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                               << "host0:27017")
+                                    << BSON("_id" << 1 << "host"
+                                                  << "host1:27017"))
+                      << "protocolVersion"
+                      << 1),
+                 0);
+
+    ASSERT(getTopoCoord().getSyncSourceAddress().empty());
+
+    // Receive heartbeats and choose a sync source.
+    setSelfMemberState(MemberState::RS_SECONDARY);
+
+    OpTime election = OpTime();
+
+    // Record two rounds of pings so the node can pick a sync source.
+    receiveUpHeartbeat(
+        HostAndPort("host1"), "rs0", MemberState::RS_PRIMARY, election, oplogProgress);
+    receiveUpHeartbeat(
+        HostAndPort("host1"), "rs0", MemberState::RS_PRIMARY, election, oplogProgress);
+
+    getTopoCoord().chooseNewSyncSource(
+        now()++, OpTime(), TopologyCoordinator::ChainingPreference::kUseConfiguration);
+    ASSERT_EQUALS(HostAndPort("host1"), getTopoCoord().getSyncSourceAddress());
+
+    {
+        BSONObjBuilder statusBuilder;
+        Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
+        getTopoCoord().prepareStatusResponse(
+            TopologyCoordinator::ReplSetStatusArgs{
+                curTime,
+                static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
+                OpTime(),
+                BSONObj()},
+            &statusBuilder,
+            &resultStatus);
+
+        ASSERT_OK(resultStatus);
+        BSONObj rsStatus = statusBuilder.obj();
+        BSONObj member0Status = rsStatus["members"].Array()[0].Obj();
+        BSONObj member1Status = rsStatus["members"].Array()[1].Obj();
+
+        // Node 0 (self) has received heartbeats and has a sync source.
+        ASSERT_EQUALS("host1:27017", rsStatus["syncingTo"].String());
+        ASSERT_EQUALS("host1:27017", member0Status["syncingTo"].String());
+        ASSERT_EQUALS("syncing from: host1:27017", member0Status["infoMessage"].String());
+        ASSERT_EQUALS("", member0Status["lastHeartbeatMessage"].String());
+        ASSERT_EQUALS("", member1Status["syncingTo"].String());
+        ASSERT_EQUALS("", member1Status["infoMessage"].String());
+        ASSERT_EQUALS("", member1Status["lastHeartbeatMessage"].String());
+    }
+}
+
+TEST_F(TopoCoordTest, StatusResponseAlwaysIncludesStringStatusFieldsForNonMembers) {
+    Date_t heartbeatTime = Date_t::fromMillisSinceEpoch(5000);
+    Seconds uptimeSecs(10);
+    Date_t curTime = heartbeatTime + uptimeSecs;
+    OpTime oplogProgress(Timestamp(3, 4), 0);
+
+    ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
+    ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version"
+                      << 5
+                      << "members"
+                      << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                               << "host0:27017"))
+                      << "protocolVersion"
+                      << 1),
+                 -1);  // This node is no longer part of this replica set.
+
+    BSONObjBuilder statusBuilder;
+    Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
+    getTopoCoord().prepareStatusResponse(
+        TopologyCoordinator::ReplSetStatusArgs{
+            curTime,
+            static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
+            OpTime(),
+            BSONObj()},
+        &statusBuilder,
+        &resultStatus);
+
+    ASSERT_NOT_OK(resultStatus);
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig, resultStatus);
+
+    BSONObj rsStatus = statusBuilder.obj();
+
+    // These fields should all be empty, since this node is not a member of a replica set.
+    ASSERT_EQUALS("", rsStatus["lastHeartbeatMessage"].String());
+    ASSERT_EQUALS("", rsStatus["syncingTo"].String());
+    ASSERT_EQUALS("", rsStatus["infoMessage"].String());
 }
 
 TEST_F(HeartbeatResponseTestV1,

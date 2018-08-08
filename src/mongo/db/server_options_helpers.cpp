@@ -419,6 +419,28 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
         .hidden()
         .setSources(moe::SourceAllLegacy);
 
+    options
+        ->addOptionChaining("operationProfiling.rateLimit",
+                           "rateLimit",
+                           moe::Int,
+                           "rate limiter value for profiling")
+        .setDefault(moe::Value(1))
+        .validRange(0, RATE_LIMIT_MAX);
+
+    options
+        ->addOptionChaining("operationProfiling.slowOpThresholdMs",
+                            "slowms",
+                            moe::Int,
+                            "value of slow for profile and console log")
+        .setDefault(moe::Value(100));
+
+    options
+        ->addOptionChaining("operationProfiling.slowOpSampleRate",
+                            "slowOpSampleRate",
+                            moe::Double,
+                            "fraction of slow ops to include in the profile and console log")
+        .setDefault(moe::Value(1.0));
+
     auto ret = addMessageCompressionOptions(options, false);
     if (!ret.isOK()) {
         return ret;
@@ -541,6 +563,14 @@ Status validateServerOptions(const moe::Environment& params) {
         }
     }
 
+    if (params.count("operationProfiling.slowOpSampleRate")
+        && params["operationProfiling.slowOpSampleRate"].as<double>() != 1.0
+        && params.count("operationProfiling.rateLimit")
+        && params["operationProfiling.rateLimit"].as<int>() != 1) {
+        return Status(ErrorCodes::BadValue,
+                      "Can't specify non-default values for both --rateLimit and --slowOpSampleRate options.");
+    }
+
 #ifdef _WIN32
     if (params.count("install") || params.count("reinstall")) {
         if (params.count("logpath") &&
@@ -601,13 +631,11 @@ Status validateServerOptions(const moe::Environment& params) {
         if (parameters.find("internalValidateFeaturesAsMaster") != parameters.end()) {
             // Command line options that are disallowed when internalValidateFeaturesAsMaster is
             // specified.
-            for (const auto& disallowedOption : {"replication.replSet", "master", "slave"}) {
-                if (params.count(disallowedOption)) {
-                    return Status(ErrorCodes::BadValue,
-                                  str::stream()
-                                      << "Cannot specify both internalValidateFeaturesAsMaster and "
-                                      << disallowedOption);
-                }
+            if (params.count("replication.replSet")) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() <<  //
+                                  "Cannot specify both internalValidateFeaturesAsMaster and "
+                                  "replication.replSet");
             }
         }
     }
@@ -1089,6 +1117,23 @@ Status storeServerOptions(const moe::Environment& params) {
         return Status(ErrorCodes::BadValue,
                       "--transitionToAuth must be used with keyFile or x509 authentication");
     }
+
+    if (params.count("operationProfiling.slowOpThresholdMs")) {
+        serverGlobalParams.slowMS = params["operationProfiling.slowOpThresholdMs"].as<int>();
+    }
+
+    if (params.count("operationProfiling.rateLimit")) {
+        // range checking is provided by validRange() above
+        // if 0 is specified we interpret it as 1
+        int rateLimit = params["operationProfiling.rateLimit"].as<int>();
+        rateLimit = std::max(1, rateLimit);
+        serverGlobalParams.rateLimit = rateLimit;
+    }
+
+    if (params.count("operationProfiling.slowOpSampleRate")) {
+        serverGlobalParams.sampleRate = params["operationProfiling.slowOpSampleRate"].as<double>();
+    }
+
 #ifdef MONGO_CONFIG_SSL
     ret = storeSSLServerOptions(params);
     if (!ret.isOK()) {

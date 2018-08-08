@@ -6,6 +6,7 @@
 //   # latter must be routed to the primary.
 //   assumes_read_preference_unchanged,
 //   requires_getmore,
+//   requires_fastcount
 // ]
 
 var t = db.max_time_ms;
@@ -29,9 +30,7 @@ cursor.maxTimeMS(100);
 error = assert.throws(function() {
     cursor.itcount();
 }, [], "expected query to abort due to time limit");
-if (error.code !== ErrorCodes.CursorNotFound) {
-    assert.eq(ErrorCodes.ExceededTimeLimit, error.code);
-}
+assert.eq(ErrorCodes.ExceededTimeLimit, error.code);
 
 //
 // Simple negative test for query: a ~300ms query with a 10s time limit should not hit the time
@@ -81,9 +80,7 @@ error = assert.throws(function() {
     cursor.next();
     cursor.next();
 }, [], "expected batch 2 (getmore) to abort due to time limit");
-if (error.code !== ErrorCodes.CursorNotFound) {
-    assert.eq(ErrorCodes.ExceededTimeLimit, error.code);
-}
+assert.eq(ErrorCodes.ExceededTimeLimit, error.code);
 
 //
 // Simple negative test for getmore:
@@ -139,9 +136,7 @@ cursor.maxTimeMS(6 * 1000);
 error = assert.throws(function() {
     cursor.itcount();
 }, [], "expected find() to abort due to time limit");
-if (error.code !== ErrorCodes.CursorNotFound) {
-    assert.eq(ErrorCodes.ExceededTimeLimit, error.code);
-}
+assert.eq(ErrorCodes.ExceededTimeLimit, error.code);
 
 //
 // Many-batch negative test for getmore:
@@ -414,9 +409,7 @@ assert.commandWorked(
 error = assert.throws(function() {
     cursor.itcount();
 }, [], "expected query to abort due to time limit");
-if (error.code !== ErrorCodes.CursorNotFound) {
-    assert.eq(ErrorCodes.ExceededTimeLimit, error.code);
-}
+assert.eq(ErrorCodes.ExceededTimeLimit, error.code);
 assert.commandWorked(
     t.getDB().adminCommand({configureFailPoint: "maxTimeAlwaysTimeOut", mode: "off"}));
 

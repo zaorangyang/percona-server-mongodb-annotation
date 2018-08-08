@@ -122,6 +122,8 @@ typedef struct {
 
 	WT_RAND_STATE rnd;			/* Global RNG state */
 
+	pthread_rwlock_t prepare_lock;		/* Prepare running */
+
 	uint64_t timestamp;			/* Counter for timestamps */
 
 	uint64_t truncate_cnt;			/* Counter for truncation */
@@ -209,6 +211,14 @@ typedef struct {
 	uint32_t c_statistics_server;
 	uint32_t c_threads;
 	uint32_t c_timer;
+	uint32_t c_timing_stress_checkpoint;
+	uint32_t c_timing_stress_split_1;
+	uint32_t c_timing_stress_split_2;
+	uint32_t c_timing_stress_split_3;
+	uint32_t c_timing_stress_split_4;
+	uint32_t c_timing_stress_split_5;
+	uint32_t c_timing_stress_split_6;
+	uint32_t c_timing_stress_split_7;
 	uint32_t c_txn_freq;
 	uint32_t c_txn_timestamps;
 	uint32_t c_truncate;
@@ -289,6 +299,8 @@ typedef struct {
 
 	uint64_t last;				/* truncate range */
 	WT_ITEM	 *lastkey, _lastkey;
+
+	WT_ITEM  *tbuf, _tbuf;			/* temporary buffer */
 
 #define	TINFO_RUNNING	1			/* Running */
 #define	TINFO_COMPLETE	2			/* Finished */

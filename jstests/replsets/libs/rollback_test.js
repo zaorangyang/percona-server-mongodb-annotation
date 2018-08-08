@@ -101,7 +101,14 @@ function RollbackTest(name = "RollbackTest", replSet) {
      * three-node replica set running with the latest version.
      */
     function performStandardSetup() {
-        let replSet = new ReplSetTest({name, nodes: 3, useBridge: true});
+        let nodeOptions = {};
+        if (TestData.logComponentVerbosity) {
+            nodeOptions["setParameter"] = {
+                "logComponentVerbosity": tojsononeline(TestData.logComponentVerbosity)
+            };
+        }
+
+        let replSet = new ReplSetTest({name, nodes: 3, useBridge: true, nodeOptions: nodeOptions});
         replSet.startSet();
 
         const nodes = replSet.nodeList();
@@ -121,6 +128,8 @@ function RollbackTest(name = "RollbackTest", replSet) {
                   State.kSteadyStateOps,
                   "Not in kSteadyStateOps state, cannot check data consistency");
         const name = rst.name;
+        // We must check counts before we validate since validate fixes counts.
+        rst.checkCollectionCounts(name);
         rst.checkOplogs(name);
         rst.checkReplicatedDataHashes(name);
         collectionValidator.validateNodes(rst.nodeList());

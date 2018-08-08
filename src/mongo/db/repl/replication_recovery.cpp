@@ -31,12 +31,15 @@
 
 #include "mongo/db/repl/replication_recovery.h"
 
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_tail.h"
+#include "mongo/db/server_recovery.h"
+#include "mongo/db/session.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -53,6 +56,16 @@ void ReplicationRecoveryImpl::recoverFromOplog(OperationContext* opCtx,
         return;  // Initial Sync will take over so no cleanup is needed.
     }
 
+    const auto serviceCtx = getGlobalServiceContext();
+    inReplicationRecovery(serviceCtx) = true;
+    ON_BLOCK_EXIT([serviceCtx] {
+        invariant(
+            inReplicationRecovery(serviceCtx),
+            "replication recovery flag is unexpectedly unset when exiting recoverFromOplog()");
+        inReplicationRecovery(serviceCtx) = false;
+        sizeRecoveryState(serviceCtx).clearStateAfterRecovery();
+    });
+
     const auto truncateAfterPoint = _consistencyMarkers->getOplogTruncateAfterPoint(opCtx);
     if (!truncateAfterPoint.isNull()) {
         log() << "Removing unapplied entries starting at: " << truncateAfterPoint.toBSON();
@@ -61,6 +74,7 @@ void ReplicationRecoveryImpl::recoverFromOplog(OperationContext* opCtx,
         // Clear the truncateAfterPoint so that we don't truncate the next batch of oplog entries
         // erroneously.
         _consistencyMarkers->setOplogTruncateAfterPoint(opCtx, {});
+        opCtx->recoveryUnit()->waitUntilDurable();
     }
 
     auto topOfOplogSW = _getTopOfOplog(opCtx);
@@ -110,8 +124,10 @@ void ReplicationRecoveryImpl::_recoverFromStableTimestamp(OperationContext* opCt
                                                           OpTime topOfOplog) {
     invariant(!stableTimestamp.isNull());
     invariant(!topOfOplog.isNull());
+    const auto truncateAfterPoint = _consistencyMarkers->getOplogTruncateAfterPoint(opCtx);
     log() << "Recovering from stable timestamp: " << stableTimestamp
-          << " (top of oplog: " << topOfOplog << ", appliedThrough: " << appliedThrough << ")";
+          << " (top of oplog: " << topOfOplog << ", appliedThrough: " << appliedThrough
+          << ", TruncateAfter: " << truncateAfterPoint << ")";
 
     log() << "Starting recovery oplog application at the stable timestamp: " << stableTimestamp;
     _applyToEndOfOplog(opCtx, stableTimestamp, topOfOplog.getTimestamp());
@@ -135,6 +151,28 @@ void ReplicationRecoveryImpl::_recoverFromUnstableCheckpoint(OperationContext* o
               << ", through the top of the oplog: " << topOfOplog;
         _applyToEndOfOplog(opCtx, appliedThrough.getTimestamp(), topOfOplog.getTimestamp());
     }
+
+    // `_recoverFromUnstableCheckpoint` is only expected to be called on startup.
+    _storageInterface->setInitialDataTimestamp(opCtx->getServiceContext(),
+                                               topOfOplog.getTimestamp());
+
+    // Ensure the `appliedThrough` is set to the top of oplog, specifically if the node was
+    // previously running as a primary. If a crash happens before the first stable checkpoint on
+    // upgrade, replication recovery will know it must apply from this point and not assume the
+    // datafiles contain any writes that were taken before the crash.
+    _consistencyMarkers->setAppliedThrough(opCtx, topOfOplog);
+
+    // Force the set `appliedThrough` to become durable on disk in a checkpoint. This method would
+    // typically take a stable checkpoint, but because we're starting up from a checkpoint that
+    // has no checkpoint timestamp, the stable checkpoint "degrades" into an unstable checkpoint.
+    //
+    // Not waiting for checkpoint durability here can result in a scenario where the node takes
+    // writes and persists them to the oplog, but crashes before a stable checkpoint persists a
+    // "recovery timestamp". The typical startup path for data-bearing nodes with 4.0 is to use
+    // the recovery timestamp to determine where to play oplog forward from. As this method shows,
+    // when a recovery timestamp does not exist, the applied through is used to determine where to
+    // start playing oplog entries from.
+    opCtx->recoveryUnit()->waitUntilUnjournaledWritesDurable();
 }
 
 void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
@@ -191,6 +229,13 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
     while (cursor->more()) {
         entry = cursor->nextSafe();
         fassert(40294, SyncTail::syncApply(opCtx, entry, OplogApplication::Mode::kRecovering));
+
+        auto oplogEntry = fassert(50763, OplogEntry::parse(entry));
+        if (auto txnTableOplog = Session::createMatchingTransactionTableUpdate(oplogEntry)) {
+            fassert(50764,
+                    SyncTail::syncApply(
+                        opCtx, txnTableOplog->toBSON(), OplogApplication::Mode::kRecovering));
+        }
     }
 
     // We may crash before setting appliedThrough. If we have a stable checkpoint, we will recover

@@ -63,10 +63,13 @@ public:
     ~WiredTigerRecoveryUnit();
 
     void beginUnitOfWork(OperationContext* opCtx) override;
+    void prepareUnitOfWork() override;
     void commitUnitOfWork() override;
     void abortUnitOfWork() override;
 
     bool waitUntilDurable() override;
+
+    bool waitUntilUnjournaledWritesDurable() override;
 
     void registerChange(Change* change) override;
 
@@ -75,13 +78,7 @@ public:
 
     Status obtainMajorityCommittedSnapshot() override;
 
-    bool isReadingFromMajorityCommittedSnapshot() const override {
-        return _replicationMode == repl::ReplicationCoordinator::modeReplSet &&
-            (_readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern ||
-             _readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern);
-    }
-
-    boost::optional<Timestamp> getMajorityCommittedSnapshot() const override;
+    boost::optional<Timestamp> getPointInTimeReadTimestamp() const override;
 
     SnapshotId getSnapshotId() const override;
 
@@ -93,11 +90,17 @@ public:
 
     Timestamp getCommitTimestamp() override;
 
-    Status selectSnapshot(Timestamp timestamp) override;
+    void setPrepareTimestamp(Timestamp timestamp) override;
+
+    Status setPointInTimeReadTimestamp(Timestamp timestamp) override;
 
     void* writingPtr(void* data, size_t len) override;
 
     void setRollbackWritesDisabled() override {}
+
+    virtual void setOrderedCommit(bool orderedCommit) override {
+        _orderedCommit = orderedCommit;
+    }
 
     // ---- WT STUFF
 
@@ -132,6 +135,12 @@ public:
     static void appendGlobalStats(BSONObjBuilder& b);
 
 private:
+    bool _isReadingFromPointInTime() const {
+        return _replicationMode == repl::ReplicationCoordinator::modeReplSet &&
+            (_readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern ||
+             _readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern);
+    }
+
     void _abort();
     void _commit();
 
@@ -148,7 +157,11 @@ private:
     bool _inUnitOfWork;
     bool _active;
     bool _isTimestamped = false;
+    // Commits are assumed ordered.  Unordered commits are assumed to always need to reserve a
+    // new optime, and thus always call oplogDiskLocRegister() on the record store.
+    bool _orderedCommit = true;
     Timestamp _commitTimestamp;
+    Timestamp _prepareTimestamp;
     uint64_t _mySnapshotId;
     Timestamp _majorityCommittedSnapshot;
     Timestamp _readAtTimestamp;

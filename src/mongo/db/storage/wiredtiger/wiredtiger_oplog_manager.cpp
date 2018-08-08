@@ -54,19 +54,23 @@ void WiredTigerOplogManager::start(OperationContext* opCtx,
                                    WiredTigerRecordStore* oplogRecordStore) {
     invariant(!_isRunning);
     // Prime the oplog read timestamp.
-    auto sessionCache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
-    setOplogReadTimestamp(Timestamp(_fetchAllCommittedValue(sessionCache->conn())));
-
     std::unique_ptr<SeekableRecordCursor> reverseOplogCursor =
         oplogRecordStore->getCursor(opCtx, false /* false = reverse cursor */);
     auto lastRecord = reverseOplogCursor->next();
-    _oplogMaxAtStartup = lastRecord ? lastRecord->id : RecordId();
+    if (lastRecord) {
+        _oplogMaxAtStartup = lastRecord->id;
 
-    auto replCoord = repl::ReplicationCoordinator::get(getGlobalServiceContext());
-    bool isMasterSlave = false;
-    if (replCoord) {
-        isMasterSlave =
-            replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeMasterSlave;
+        // Although the oplog may have holes, using the top of the oplog should be safe. In the
+        // event of a secondary crashing, replication recovery will truncate the oplog, resetting
+        // visibility to the truncate point. In the event of a primary crashing, it will perform
+        // rollback before servicing oplog reads.
+        auto oplogVisibility = Timestamp(_oplogMaxAtStartup.repr());
+        setOplogReadTimestamp(oplogVisibility);
+        LOG(1) << "Setting oplog visibility at startup. Val: " << oplogVisibility;
+    } else {
+        _oplogMaxAtStartup = RecordId();
+        // Avoid setting oplog visibility to 0. That means "everything is visible".
+        setOplogReadTimestamp(Timestamp(kMinimumTimestamp));
     }
 
     // Need to obtain the mutex before starting the thread, as otherwise it may race ahead
@@ -74,9 +78,8 @@ void WiredTigerOplogManager::start(OperationContext* opCtx,
     stdx::lock_guard<stdx::mutex> lk(_oplogVisibilityStateMutex);
     _oplogJournalThread = stdx::thread(&WiredTigerOplogManager::_oplogJournalThreadLoop,
                                        this,
-                                       sessionCache,
-                                       oplogRecordStore,
-                                       isMasterSlave);
+                                       WiredTigerRecoveryUnit::get(opCtx)->getSessionCache(),
+                                       oplogRecordStore);
 
     _isRunning = true;
     _shuttingDown = false;
@@ -151,9 +154,8 @@ void WiredTigerOplogManager::triggerJournalFlush() {
     }
 }
 
-void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* sessionCache,
-                                                     WiredTigerRecordStore* oplogRecordStore,
-                                                     bool isMasterSlave) noexcept {
+void WiredTigerOplogManager::_oplogJournalThreadLoop(
+    WiredTigerSessionCache* sessionCache, WiredTigerRecordStore* oplogRecordStore) noexcept {
     Client::initThread("WTOplogJournalThread");
 
     // This thread updates the oplog read timestamp, the timestamp used to read from the oplog with
@@ -220,18 +222,15 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* ses
         sessionCache->waitUntilDurable(/*forceCheckpoint=*/false, false);
 
         lk.lock();
-        // Publish the new timestamp value.
-        _setOplogReadTimestamp(lk, newTimestamp);
+        // Publish the new timestamp value.  Avoid going backward.
+        auto oldTimestamp = getOplogReadTimestamp();
+        if (newTimestamp > oldTimestamp) {
+            _setOplogReadTimestamp(lk, newTimestamp);
+        }
         lk.unlock();
 
         // Wake up any await_data cursors and tell them more data might be visible now.
         oplogRecordStore->notifyCappedWaitersIfNeeded();
-
-        // For master/slave masters, set oldest timestamp here so that we clean up old timestamp
-        // data.  SERVER-31802
-        if (isMasterSlave) {
-            sessionCache->getKVEngine()->setStableTimestamp(Timestamp(newTimestamp));
-        }
     }
 }
 
@@ -248,6 +247,10 @@ void WiredTigerOplogManager::_setOplogReadTimestamp(WithLock, uint64_t newTimest
     _oplogReadTimestamp.store(newTimestamp);
     _opsBecameVisibleCV.notify_all();
     LOG(2) << "setting new oplogReadTimestamp: " << newTimestamp;
+}
+
+uint64_t WiredTigerOplogManager::fetchAllCommittedValue(OperationContext* opCtx) {
+    return _fetchAllCommittedValue(WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn());
 }
 
 uint64_t WiredTigerOplogManager::_fetchAllCommittedValue(WT_CONNECTION* conn) {

@@ -124,9 +124,13 @@ public:
 
     virtual bool supportsRecoverToStableTimestamp() const override;
 
-    virtual StatusWith<Timestamp> recoverToStableTimestamp() override;
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
 
     virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
+
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const override;
+
+    virtual Timestamp getAllCommittedTimestamp(OperationContext* opCtx) const override;
 
     bool supportsReadConcernSnapshot() const final;
 
@@ -179,6 +183,8 @@ private:
                                          std::list<std::string>& toDrop,
                                          CollIter begin,
                                          CollIter end);
+
+    void _dumpCatalog(OperationContext* opCtx);
 
     class RemoveDBChange;
 

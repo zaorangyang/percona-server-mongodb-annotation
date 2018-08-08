@@ -41,7 +41,6 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/fetcher.h"
 #include "mongo/client/remote_command_retry_scheduler.h"
-#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/commands/server_status_metric.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -53,6 +52,7 @@
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_fetcher.h"
 #include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_source_selector.h"
@@ -163,11 +163,31 @@ StatusWith<OpTimeWithHash> parseOpTimeWithHash(const QueryResponseStatus& fetchR
         : StatusWith<OpTimeWithHash>{ErrorCodes::NoMatchingDocument, "no oplog entry found"};
 }
 
+/**
+ * OplogApplier observer that updates 'fetchCount' when applying operations for each writer thread.
+ */
+class InitialSyncApplyObserver : public OplogApplier::Observer {
+public:
+    explicit InitialSyncApplyObserver(AtomicUInt32* fetchCount) : _fetchCount(fetchCount) {}
+
+    // OplogApplier::Observer functions
+    void onBatchBegin(const OplogApplier::Operations&) final {}
+    void onBatchEnd(const StatusWith<OpTime>&, const OplogApplier::Operations&) final {}
+    void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>& docs) final {
+        _fetchCount->fetchAndAdd(docs.size());
+    }
+    void onOperationConsumed(const BSONObj& op) final {}
+
+private:
+    AtomicUInt32* const _fetchCount;
+};
+
 }  // namespace
 
 InitialSyncer::InitialSyncer(
     InitialSyncerOptions opts,
     std::unique_ptr<DataReplicatorExternalState> dataReplicatorExternalState,
+    ThreadPool* writerPool,
     StorageInterface* storage,
     ReplicationProcess* replicationProcess,
     const OnCompletionFn& onCompletion)
@@ -175,6 +195,7 @@ InitialSyncer::InitialSyncer(
       _opts(opts),
       _dataReplicatorExternalState(std::move(dataReplicatorExternalState)),
       _exec(_dataReplicatorExternalState->getTaskExecutor()),
+      _writerPool(writerPool),
       _storage(storage),
       _replicationProcess(replicationProcess),
       _onCompletion(onCompletion) {
@@ -383,6 +404,10 @@ void InitialSyncer::_tearDown_inlock(OperationContext* opCtx,
     // this node's oplog, it won't appear empty.
     _storage->waitForAllEarlierOplogWritesToBeVisible(opCtx);
 
+    _replicationProcess->getConsistencyMarkers()->clearInitialSyncFlag(opCtx);
+
+    // All updates that represent initial sync must be completed before setting the initial data
+    // timestamp.
     _storage->setInitialDataTimestamp(opCtx->getServiceContext(),
                                       lastApplied.getValue().opTime.getTimestamp());
 
@@ -394,7 +419,6 @@ void InitialSyncer::_tearDown_inlock(OperationContext* opCtx,
         invariant(currentLastAppliedOpTime == lastApplied.getValue().opTime);
     }
 
-    _replicationProcess->getConsistencyMarkers()->clearInitialSyncFlag(opCtx);
     log() << "initial sync done; took "
           << duration_cast<Seconds>(_stats.initialSyncEnd - _stats.initialSyncStart) << ".";
     initialSyncCompletes.increment();
@@ -439,7 +463,7 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
 
     LOG(2) << "Resetting feature compatibility version to last-stable. If the sync source is in "
               "latest feature compatibility version, we will find out when we clone the "
-              "admin.system.version collection.";
+              "server configuration collection (admin.system.version).";
     serverGlobalParams.featureCompatibility.reset();
 
     // Clear the oplog buffer.
@@ -611,7 +635,7 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForBeginTimestamp(
     const auto& lastOpTimeWithHash = opTimeWithHashResult.getValue();
 
     BSONObjBuilder queryBob;
-    queryBob.append("find", nsToCollectionSubstring(FeatureCompatibilityVersion::kCollection));
+    queryBob.append("find", NamespaceString::kServerConfigurationNamespace.coll());
     auto filterBob = BSONObjBuilder(queryBob.subobjStart("filter"));
     filterBob.append("_id", FeatureCompatibilityVersionParser::kParameterName);
     filterBob.done();
@@ -619,7 +643,7 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForBeginTimestamp(
     _fCVFetcher = stdx::make_unique<Fetcher>(
         _exec,
         _syncSource,
-        nsToDatabaseSubstring(FeatureCompatibilityVersion::kCollection).toString(),
+        NamespaceString::kServerConfigurationNamespace.db().toString(),
         queryBob.obj(),
         [=](const StatusWith<mongo::Fetcher::QueryResponse>& response,
             mongo::Fetcher::NextAction*,
@@ -707,12 +731,9 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
         return (name != "local");
     };
     _initialSyncState = stdx::make_unique<InitialSyncState>(stdx::make_unique<DatabasesCloner>(
-        _storage,
-        _exec,
-        _dataReplicatorExternalState->getDbWorkThreadPool(),
-        _syncSource,
-        listDatabasesFilter,
-        [=](const Status& status) { _databasesClonerCallback(status, onCompletionGuard); }));
+        _storage, _exec, _writerPool, _syncSource, listDatabasesFilter, [=](const Status& status) {
+            _databasesClonerCallback(status, onCompletionGuard);
+        }));
 
     _initialSyncState->beginTimestamp = lastOpTimeWithHash.opTime.getTimestamp();
 
@@ -901,6 +922,9 @@ void InitialSyncer::_lastOplogEntryFetcherCallbackForStopTimestamp(
             onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
             return;
         }
+        const bool orderedCommit = true;
+        _storage->oplogDiskLocRegister(
+            opCtx.get(), optimeWithHash.opTime.getTimestamp(), orderedCommit);
     }
 
     stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -935,18 +959,17 @@ void InitialSyncer::_getNextApplierBatchCallback(
     if (!ops.empty()) {
         _fetchCount.store(0);
         MultiApplier::ApplyOperationFn applyOperationsForEachReplicationWorkerThreadFn =
-            [ =, source = _syncSource ](OperationContext * opCtx,
-                                        MultiApplier::OperationPtrs * x,
-                                        WorkerMultikeyPathInfo * workerMultikeyPathInfo) {
-            return _dataReplicatorExternalState->_multiInitialSyncApply(
-                opCtx, x, source, &_fetchCount, workerMultikeyPathInfo);
-        };
-        MultiApplier::MultiApplyFn applyBatchOfOperationsFn =
-            [=](OperationContext* opCtx,
-                MultiApplier::Operations ops,
-                MultiApplier::ApplyOperationFn apply) {
-                return _dataReplicatorExternalState->_multiApply(opCtx, ops, apply);
+            [](OperationContext*, MultiApplier::OperationPtrs*, WorkerMultikeyPathInfo*) {
+                return Status::OK();
             };
+        MultiApplier::MultiApplyFn applyBatchOfOperationsFn =
+            [ =, source = _syncSource ](OperationContext * opCtx,
+                                        MultiApplier::Operations ops,
+                                        MultiApplier::ApplyOperationFn apply) {
+            InitialSyncApplyObserver observer(&_fetchCount);
+            return _dataReplicatorExternalState->_multiApply(
+                opCtx, ops, &observer, source, _writerPool);
+        };
         const auto& lastEntry = ops.back();
         OpTimeWithHash lastApplied(lastEntry.getHash(), lastEntry.getOpTime());
         auto numApplied = ops.size();

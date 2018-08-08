@@ -105,7 +105,6 @@ public:
                                     const NamespaceString& fromCollection,
                                     const NamespaceString& toCollection,
                                     OptionalCollectionUUID uuid,
-                                    bool dropTarget,
                                     OptionalCollectionUUID dropTargetUUID,
                                     bool stayTemp) override {
         return repl::OpTime();
@@ -120,6 +119,8 @@ public:
                        OptionalCollectionUUID uuid) override {}
 
     void onTransactionCommit(OperationContext* opCtx) override {}
+
+    void onTransactionPrepare(OperationContext* opCtx) override {}
 
     void onTransactionAbort(OperationContext* opCtx) override {}
 

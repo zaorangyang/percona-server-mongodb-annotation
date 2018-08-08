@@ -65,6 +65,7 @@
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_identity_loader.h"
+#include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/s/write_ops/batched_command_request.h"
@@ -700,6 +701,15 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     // Add all databases which were discovered on the new shard
     for (const auto& dbName : dbNamesStatus.getValue()) {
         DatabaseType dbt(dbName, shardType.getName(), false);
+
+        // If we're in FCV 4.0, we should add a version to each database.
+        if (serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40 ||
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40) {
+            dbt.setVersion(databaseVersion::makeNew());
+        }
+
         Status status = Grid::get(opCtx)->catalogClient()->updateDatabase(opCtx, dbName, dbt);
         if (!status.isOK()) {
             log() << "adding shard " << shardConnectionString.toString()
@@ -887,14 +897,9 @@ StatusWith<ShardId> ShardingCatalogManager::_selectShardForNewDatabase(
     OperationContext* opCtx, ShardRegistry* shardRegistry) {
     std::vector<ShardId> allShardIds;
 
-    shardRegistry->getAllShardIds(&allShardIds);
+    shardRegistry->getAllShardIds(opCtx, &allShardIds);
     if (allShardIds.empty()) {
-        shardRegistry->reload(opCtx);
-        shardRegistry->getAllShardIds(&allShardIds);
-
-        if (allShardIds.empty()) {
-            return Status(ErrorCodes::ShardNotFound, "No shards found");
-        }
+        return Status(ErrorCodes::ShardNotFound, "No shards found");
     }
 
     ShardId candidateShardId = allShardIds[0];

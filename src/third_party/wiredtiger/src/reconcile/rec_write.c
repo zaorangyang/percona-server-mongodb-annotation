@@ -1341,12 +1341,15 @@ __rec_txn_read(WT_SESSION_IMPL *session, WT_RECONCILE *r,
 		 * started.  The global commit point can move forward during
 		 * reconciliation so we use a cached copy to avoid races when a
 		 * concurrent transaction commits or rolls back while we are
-		 * examining its updates.
+		 * examining its updates. As prepared transaction id's are
+		 * globally visible, need to check the update state as well.
 		 */
 		if (F_ISSET(r, WT_REC_EVICT) &&
+		    (upd->prepare_state == WT_PREPARE_LOCKED ||
+		    upd->prepare_state == WT_PREPARE_INPROGRESS ||
 		    (F_ISSET(r, WT_REC_VISIBLE_ALL) ?
 		    WT_TXNID_LE(r->last_running, txnid) :
-		    !__txn_visible_id(session, txnid))) {
+		    !__txn_visible_id(session, txnid)))) {
 			uncommitted = r->update_uncommitted = true;
 			continue;
 		}
@@ -1629,10 +1632,12 @@ __rec_child_deleted(WT_SESSION_IMPL *session,
 	 * it holds the transaction ID we care about.
 	 *
 	 * In some cases, there had better not be any updates we can't see.
+	 *
+	 * A visible update to be in READY state (i.e. not in LOCKED or
+	 * PREPARED state), for truly visible to others.
 	 */
 	if (F_ISSET(r, WT_REC_VISIBILITY_ERR) && page_del != NULL &&
-	    !__wt_txn_visible(session,
-	    page_del->txnid, WT_TIMESTAMP_NULL(&page_del->timestamp)))
+	    __wt_page_del_active(session, ref, false))
 		WT_PANIC_RET(session, EINVAL,
 		    "reconciliation illegally skipped an update");
 
@@ -1660,9 +1665,7 @@ __rec_child_deleted(WT_SESSION_IMPL *session,
 	 * read into this part of the name space again, the cache read function
 	 * instantiates an entirely new page.)
 	 */
-	if (ref->addr != NULL &&
-	    (page_del == NULL || __wt_txn_visible_all(
-	    session, page_del->txnid, WT_TIMESTAMP_NULL(&page_del->timestamp))))
+	if (ref->addr != NULL && !__wt_page_del_active(session, ref, true))
 		WT_RET(__wt_ref_block_free(session, ref));
 
 	/*
@@ -1707,10 +1710,11 @@ __rec_child_deleted(WT_SESSION_IMPL *session,
 	 * page to reference it from the parent page.
 	 *
 	 * If the delete is not visible in this checkpoint, write the original
-	 * address normally.  Otherwise, we have to write a proxy record.
+	 * address normally. Otherwise, we have to write a proxy record.
+	 * If the delete state is not ready, then delete is not visible as it
+	 * is in prepared state.
 	 */
-	if (__wt_txn_visible(
-	    session, page_del->txnid, WT_TIMESTAMP_NULL(&page_del->timestamp)))
+	if (!__wt_page_del_active(session, ref, false))
 		*statep = WT_CHILD_PROXY;
 
 	return (0);
@@ -1783,12 +1787,12 @@ __rec_child_modify(WT_SESSION_IMPL *session,
 			/*
 			 * If called during checkpoint, the child is being
 			 * considered by the eviction server or the child is a
-			 * fast-delete page being read.  The eviction may have
+			 * truncated page being read.  The eviction may have
 			 * started before the checkpoint and so we must wait
 			 * for the eviction to be resolved.  I suspect we could
-			 * handle fast-delete reads, but we can't distinguish
-			 * between the two and fast-delete reads aren't expected
-			 * to be common.
+			 * handle reads of truncated pages, but we can't
+			 * distinguish between the two and reads of truncated
+			 * pages aren't expected to be common.
 			 */
 			break;
 
@@ -1836,6 +1840,11 @@ __rec_child_modify(WT_SESSION_IMPL *session,
 			 *
 			 * This call cannot return split/restart, we have a lock
 			 * on the parent which prevents a child page split.
+			 *
+			 * Set WT_READ_NO_WAIT because we're only interested in
+			 * the WT_REF's final state. Pages in transition might
+			 * change WT_REF state during our read, and then return
+			 * WT_NOTFOUND to us. In that case, loop and look again.
 			 */
 			ret = __wt_page_in(session, ref,
 			    WT_READ_CACHE | WT_READ_NO_EVICT |
@@ -5630,8 +5639,7 @@ build:
 				if (key_onpage_ovfl) {
 					WT_ERR(__wt_dsk_cell_data_ref(session,
 					    WT_PAGE_ROW_LEAF, kpack, r->cur));
-					key_onpage_ovfl = false;
-					WT_NOT_READ(key_onpage_ovfl);
+					WT_NOT_READ(key_onpage_ovfl, false);
 				}
 
 				/*

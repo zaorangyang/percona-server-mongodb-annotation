@@ -34,6 +34,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 
@@ -161,7 +162,7 @@ public:
 
     /** Returns which database contains the user which authentication is being performed against. */
     StringData getAuthenticationDatabase() const {
-        if (Command::testCommandsEnabled && _authenticationDatabase == "admin" &&
+        if (getTestCommandsEnabled() && _authenticationDatabase == "admin" &&
             getPrincipalName() == internalSecurity.user->getName().getUser()) {
             // Allows authenticating as the internal user against the admin database.  This is to
             // support the auth passthrough test framework on mongos (since you can't use the local

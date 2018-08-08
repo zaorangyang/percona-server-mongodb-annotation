@@ -163,9 +163,9 @@ variables:
        value: ${remote_dir}/mongod.log
 
 - &powercycle_test
-  ec2_artifacts: ${log_path} ${backup_path_after} ${backup_path_before}
+  ec2_artifacts: ${log_path} ${db_path} ${backup_path_after} ${backup_path_before}
   program_options: --logLevel=info --backupPathBefore=${backup_path_before} --backupPathAfter=${backup_path_after}
-  connection_options: --sshUserHost=${ip_address} --sshConnection=\"${ssh_identity} ${ssh_connection_options}\"
+  connection_options: --sshUserHost=${private_ip_address} --sshConnection=\"${ssh_identity} ${ssh_connection_options}\"
   test_options: --testLoops=15 --seedDocNum=10000 --rsync --rsyncExcludeFiles=diagnostic.data/metrics.interim* --validate=local --canary=local
   crash_options: --crashMethod=internal --crashOption=${windows_crash_cmd} --crashWaitTime=45 --jitterForCrashWaitTime=5 --instanceId=${instance_id}
   client_options: --numCrudClients=20 --numFsmClients=20
@@ -472,6 +472,17 @@ functions:
         make USE_RTTI=1 CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ static_lib
         fi
 
+  "fetch and build OpenSSL" :
+    command: shell.exec
+    params:
+        working_dir:  src
+        script: |
+            set -o errexit
+            set -o verbose
+            if [ "${build_openssl|}" = "true" ]; then
+                bash buildscripts/fetch_and_build_openssl.sh "${python|python}" "${openssl_make_flags|}" "${openssl_config_flags|}"
+            fi
+
   "use WiredTiger develop" :
     command: shell.exec
     params:
@@ -495,7 +506,7 @@ functions:
         set -o verbose
         if [ "${setup_android_toolchain|}" = "true" ]; then
             ${activate_virtualenv}
-            PYTHON=$python ${compile_env|} src/buildscripts/setup-android-toolchain.sh
+            PYTHON=$python ${compile_env|} src/buildscripts/setup-android-toolchain.sh ${android_toolchain_system_image_arch} ${android_toolchain_target_arch}
         fi
 
   "scons cache pruning" :
@@ -563,9 +574,10 @@ functions:
         # remove this patch once SERVER-33101 is released
         patch -p1 < ../src/buildscripts/mongoc-stat.c.diff
         export ${compile_env|}
-        ./configure --prefix=$(pwd)/install --with-libbson=bundled --disable-tests --disable-automatic-init-and-cleanup --disable-ssl --disable-sasl --disable-examples --disable-man-pages --disable-html-docs --disable-shm-counters --disable-shared --enable-static ${cdriver_configure_flags|}
+        ./configure --prefix=$(pwd)/../src/build/mongo-embedded-sdk-${version}-tmp --with-libbson=bundled --disable-tests --disable-automatic-init-and-cleanup --disable-ssl --disable-sasl --disable-examples --disable-man-pages --disable-html-docs --disable-shm-counters --enable-shared --disable-static ${cdriver_configure_flags|}
         make
         make install
+        mv $(pwd)/../src/build/mongo-embedded-sdk-${version}-tmp $(pwd)/../src/build/mongo-embedded-sdk-${version}
         fi
 
   "build new tools" :
@@ -645,6 +657,12 @@ functions:
             --jsonArtifact artifacts.json
         fi
 
+  "send benchmark results" :
+    command: json.send
+    params:
+      name: perf
+      file: src/perf.json
+
   "do setup" :
   - *fetch_artifacts
   - *update_bypass_expansions
@@ -674,11 +692,15 @@ functions:
           set -o verbose
 
           python_loc=$(which ${python|/opt/mongodbtoolchain/v2/bin/python2})
+          python3_loc=$(which ${python|/opt/mongodbtoolchain/v2/bin/python3})
           if [ "Windows_NT" = "$OS" ]; then
             python_loc=$(cygpath -w $python_loc)
+            python3_loc=$(cygpath -w c:/python/Python36/python.exe)
           fi
           # Set up virtualenv in ${workdir}
           virtualenv --python "$python_loc" --system-site-packages "${workdir}/venv"
+          # Add virtualenv for python3 in ${workdir}
+          virtualenv --python "$python3_loc" --system-site-packages "${workdir}/venv_3"
 
   "run tests" :
     - command: expansions.update
@@ -704,6 +726,7 @@ functions:
           # activate the virtualenv if it has been set up
           ${activate_virtualenv}
           pip install boto3==1.5.27
+          pip install mock==2.0.0
 
           # Set the TMPDIR environment variable to be a directory in the task's working
           # directory so that temporary files created by processes spawned by resmoke.py get
@@ -805,15 +828,19 @@ functions:
                   ${test_flags}                           \
                   --log=buildlogger                       \
                   --staggerJobs=on                        \
-                  --taskId=${task_id}                     \
-                  --taskName=${task_name}                 \
+                  --buildId=${build_id}                   \
+                  --distroId=${distro_id}                 \
                   --executionNumber=${execution}          \
                   --projectName=${project}                \
-                  --variantName=${build_variant}          \
-                  --distroId=${distro_id}                 \
                   --gitRevision=${revision}               \
+                  --revisionOrderId=${revision_order_id}  \
+                  --taskId=${task_id}                     \
+                  --taskName=${task_name}                 \
+                  --variantName=${build_variant}          \
+                  --versionId=${version_id}               \
                   --archiveFile=archive.json              \
-                  --reportFile=report.json
+                  --reportFile=report.json                \
+                  --perfReportFile=perf.json
           resmoke_exit_code=$?
           set -o errexit
 
@@ -849,13 +876,13 @@ functions:
         rm -rf ${install_directory|/data/mongo-install-directory}
 
         extra_args=""
-        if [ ${targets} = "all" ] && [ -n "${num_scons_compile_all_jobs_available|}" ]; then
+        if [ "${targets}" = "all" ] && [ -n "${num_scons_compile_all_jobs_available|}" ]; then
           echo "Changing SCons to run with --jobs=${num_scons_compile_all_jobs_available|}"
           extra_args="$extra_args --jobs=${num_scons_compile_all_jobs_available|}"
         fi
 
         ${activate_virtualenv}
-        ${compile_env|} $python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} --use-new-tools --build-mongoreplay="${build_mongoreplay}" --detect-odr-violations $extra_args ${targets} ${additional_targets|} MONGO_VERSION=${version}
+        ${compile_env|} $python ./buildscripts/scons.py ${compile_flags|} ${task_compile_flags|} ${scons_cache_args|} $extra_args ${targets} ${additional_targets|} MONGO_VERSION=${version}
 
   "generate compile expansions" :
     command: shell.exec
@@ -1014,6 +1041,7 @@ functions:
                         --ssh-private-key ~/.ssh/id_rsa_lxc               \
                         --clock-skew faketime                             \
                         --libfaketime-path /opt/mongodb/libfaketime.so.1  \
+                        --mongod-conf mongod_verbose.conf                 \
                         ${jepsen_key_time_limit}                          \
                         ${jepsen_protocol_version}                        \
                         ${jepsen_read_concern}                            \
@@ -1144,7 +1172,7 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/idl/run_tests.py
 
-  "run ios sim embedded tests" :
+  "run embedded tests" :
     command: shell.exec
     type: test
     params:
@@ -1154,27 +1182,18 @@ functions:
         set -o errexit
 
         ${activate_virtualenv}
-        if [ ${enable_iostvos_sim_tests|false} = "true" ]; then
-            ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/debug/mongo/client/embedded/mongo_embedded_capi_test"
-            ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/debug/mongo/client/embedded/mongo_embedded_transport_test"
-        fi
-
-  "run android emulator tests" :
-    command: shell.exec
-    type: test
-    params:
-      working_dir: src
-      script: |
-        set -o verbose
-        set -o errexit
-
-        ${activate_virtualenv}
-        if [ ${enable_android_emu_tests|false} = "true" ]; then
+        if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" ]; then
+            ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_capi_test" --tempPath /data
+            ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_transport_test" --tempPath /data
+        elif [ ${enable_embedded_tests|false} = "android_emulator" ]; then
             # strip because the binaries with debug symbols are too big for the default storage on the emulator
-            $(dirname $(pwd))/android_toolchain/bin/aarch64-linux-android-strip "build/debug/mongo/client/embedded/mongo_embedded_capi_test"
-            $(dirname $(pwd))/android_toolchain/bin/aarch64-linux-android-strip "build/debug/mongo/client/embedded/mongo_embedded_transport_test"
-            ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk "build/debug/mongo/client/embedded/mongo_embedded_capi_test"
-            ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk "build/debug/mongo/client/embedded/mongo_embedded_transport_test"
+            find build/mongo-embedded-sdk-${version}/bin -type f | xargs $(dirname $(pwd))/android_toolchain/bin/*-linux-android-strip
+            find build/mongo-embedded-sdk-${version}/lib -type f -name "*.so" | xargs $(dirname $(pwd))/android_toolchain/bin/*-linux-android-strip
+            ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_capi_test" --tempPath /data
+            ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_transport_test" --tempPath /data
+        elif [ ${enable_embedded_tests|false} = "native" ]; then
+          "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_capi_test"
+          "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_transport_test"
         fi
 
   "run powercycle test" :
@@ -1187,7 +1206,7 @@ functions:
 
           if [ ! -z "${virtualenv_requirements}" ]; then
             ${activate_virtualenv}
-            pip install ${virtualenv_requirements}
+            pip install -r pytests/requirements.txt
           fi
 
     - command: shell.exec
@@ -1254,10 +1273,30 @@ functions:
             ${mongod_extra_options}"
           set +o errexit
           $python -u pytests/powertest.py --configFile=$config_file
+          # SERVER-34033: Figure out why shell.exec exits at this point.
           test_status=$?
-          aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode status)
-          echo "Test completed, AMI EC2 instance ${instance_id} status: $aws_ec2"
+          echo "Completed pytests/powertest.py, status: $test_status"
           exit $test_status
+
+    - command: shell.exec
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          if [ ! -f report.json ]; then
+            exit 0
+          fi
+          grep -q "pass" report.json
+          pass=$?
+          # On test success, we only archive mongod.log.
+          if [ $pass -eq 0 ]; then
+            echo "ec2_artifacts: ${log_path}" > ec2_artifacts.yml
+          fi
+
+    - command: expansions.update
+      params:
+        ignore_missing_file: true
+        file: src/ec2_artifacts.yml
 
   "do multiversion setup" :
     command: shell.exec
@@ -1278,7 +1317,7 @@ functions:
           --edition ${multiversion_edition|base}             \
           --platform ${multiversion_platform|linux}          \
           --architecture ${multiversion_architecture|x86_64} \
-          --useLatest 3.0 3.2 3.4 3.6
+          --useLatest 3.2 3.4 3.6
 
   "do snmp setup" :
     command: shell.exec
@@ -1381,9 +1420,11 @@ functions:
 
         for i in {1..3}
         do
-          if ! kitchen verify "${packager_distro}"; then
+          # kitchen commands use regex so 'kitchen verify amazon' matches both amazon and amazon2
+          # that's why we pass $ at the end of "${packager_distro}"
+          if ! kitchen verify "${packager_distro}"\$; then
             verified="false"
-            kitchen destroy "${packager_distro}" || true
+            kitchen destroy "${packager_distro}"\$ || true
             sleep 30
           else
             verified="true"
@@ -1391,7 +1432,7 @@ functions:
           fi
         done
 
-        kitchen destroy "${packager_distro}" || true
+        kitchen destroy "${packager_distro}"\$ || true
         test "$verified" = "true"
 
   "fetch test_lifecycle.yml":
@@ -1431,25 +1472,30 @@ functions:
           if [ -z "${ec2_monitor_files}" ] || [ -z "${instance_id}" ]; then
             exit 0
           fi
-          # Ensure we use the latest ip_address, as it could change if the EC2 instance
+          # Ensure we use the latest private_ip_address, as it could change if the EC2 instance
           # has been stopped and started.
           ${activate_virtualenv}
           # Specify '--mode start' to ensure the remote instance is running.
-          aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode start)
+          monitor_ec2_yml=monitor_ec2.yml
+          aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode start --yamlFile $monitor_ec2_yml)
           echo "AMI EC2 instance ${instance_id} status: $aws_ec2"
-          ip_address=$(echo $aws_ec2 | sed -e "s/[^[:print:]\t]//g; s/.*private_ip_address: //; s/ .*//")
+          private_ip_address=$($python buildscripts/yaml_key_value.py --yamlFile $monitor_ec2_yml --yamlKey private_ip_address)
+          if [ -z "$private_ip_address" ]; then
+            echo "Cannot determine the IP address for the remote monitor."
+            continue
+          fi
           cmd="${tar|tar} czf ec2_monitor_files.tgz ${ec2_monitor_files}"
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           ssh_connection_options="$ssh_connection_options -o ConnectionAttempts=3"
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@$ip_address                     \
+            --userHost $USER@$private_ip_address             \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
             --commands "$cmd"
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@$ip_address                     \
+            --userHost $USER@$private_ip_address             \
             --operation "copy_from"                          \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
@@ -1457,7 +1503,7 @@ functions:
           sleep 30
         done
 
-  "set up EC2 instance":
+  "set up EC2 instance": &set_ec2_instance
     - command: shell.exec
       params:
         working_dir: src
@@ -1465,7 +1511,8 @@ functions:
 
           set -o errexit
           ${activate_virtualenv}
-          pip install boto3==1.5.27
+          pip install -r buildscripts/requirements.txt
+          pip install -r pytests/requirements.txt
 
           if [ ! -z "${subnet_id}" ]; then
             subnet_id="-n ${subnet_id}"
@@ -1512,7 +1559,7 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@${ip_address}                   \
+            --userHost $USER@${private_ip_address}           \
             --operation "copy_to"                            \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
@@ -1550,7 +1597,7 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@${ip_address}                   \
+            --userHost $USER@${private_ip_address}           \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
             --commands "$cmds"
@@ -1577,7 +1624,7 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@${ip_address}                   \
+            --userHost $USER@${private_ip_address}           \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
             --commands "$cmds"
@@ -1599,7 +1646,7 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@${ip_address}                   \
+            --userHost $USER@${private_ip_address}           \
             --operation "copy_to"                            \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
@@ -1626,7 +1673,7 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@${ip_address}                   \
+            --userHost $USER@${private_ip_address}           \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
             --commands "$cmds"
@@ -1668,7 +1715,7 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@${ip_address}                   \
+            --userHost $USER@${private_ip_address}           \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
             --commands "$cmds"
@@ -1739,7 +1786,7 @@ functions:
             ${activate_virtualenv}
             $python buildscripts/remote_operations.py          \
               --verbose                                        \
-              --userHost $USER@${ip_address}                   \
+              --userHost $USER@${private_ip_address}           \
               --sshConnectionOptions "$ssh_connection_options" \
               --retries ${ssh_retries|0}                       \
               --commands "$cmds"
@@ -1762,77 +1809,79 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@${ip_address}                   \
+            --userHost $USER@${private_ip_address}           \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
             --commands "$cmds"
 
     - *copy_ec2_monitor_files
 
+  ### Determine & set remote EC2 IP address ###
+  "get EC2 address": &get_ec2_address
+    command: shell.exec
+    params:
+      shell: bash
+      working_dir: src
+      script: |
+        if [ -z "${instance_id}" ]; then
+          exit 0
+        fi
+        # Ensure we use the latest private_ip_address, as it could change if the EC2 instance
+        # has been stopped and started.
+        ${activate_virtualenv}
+        # Specify '--mode start' to ensure the remote instance is running.
+        aws_ec2_status_yml=aws_ec2_status.yml
+        aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode start --yamlFile $aws_ec2_status_yml)
+        private_ip_address=$($python buildscripts/yaml_key_value.py --yamlFile $aws_ec2_status_yml --yamlKey private_ip_address)
+        echo "private_ip_address: $private_ip_address" > private_ip_address.yml
 
-  "set EC2 address":
-    - command: shell.exec
-      params:
-        shell: bash
-        working_dir: src
-        script: |
-          if [ -z "${instance_id}" ]; then
-            exit 0
-          fi
-          # Ensure we use the latest ip_address, as it could change if the EC2 instance
-          # has been stopped and started.
-          ${activate_virtualenv}
-          # Specify '--mode start' to ensure the remote instance is running.
-          aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode start)
-          echo "AMI EC2 instance ${instance_id} status: $aws_ec2"
-          ip_address=$(echo $aws_ec2 | sed -e "s/[^[:print:]\t]//g; s/.*private_ip_address: //; s/ .*//")
-          sed -i -e "s/${ip_address}/$ip_address/" ${aws_ec2_yml}
-          echo "Instance status: $aws_ec2"
+  "update EC2 address": &update_ec2_address
+    command: expansions.update
+    params:
+      file: src/private_ip_address.yml
 
-    - command: expansions.update
-      params:
-        file: src/${aws_ec2_yml}
+  ### Process & archive remote EC2 artifacts ###
+  "tar EC2 artifacts": &tar_ec2_artifacts
+    command: shell.exec
+    params:
+      shell: bash
+      working_dir: src
+      script: |
+        # Tar/zip artifacts on remote host.
+        if [ -z "${ec2_artifacts}" ]; then
+          exit 0
+        fi
+        cmd="${tar|tar} czf ec2_artifacts.tgz ${ec2_artifacts}"
+        ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+        ${activate_virtualenv}
+        $python buildscripts/remote_operations.py          \
+          --verbose                                        \
+          --userHost $USER@${private_ip_address}           \
+          --sshConnectionOptions "$ssh_connection_options" \
+          --retries ${ssh_retries|0}                       \
+          --commands "$cmd"
 
-  "copy EC2 artifacts":
-    - command: shell.exec
-      params:
-        shell: bash
-        working_dir: src
-        script: |
-          # Tar/zip artifacts on remote host.
-          if [ -z "${ec2_artifacts}" ]; then
-            exit 0
-          fi
-          cmd="${tar|tar} czf ec2_artifacts.tgz ${ec2_artifacts}"
-          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
-          ${activate_virtualenv}
-          $python buildscripts/remote_operations.py          \
-            --verbose                                        \
-            --userHost $USER@${ip_address}                   \
-            --sshConnectionOptions "$ssh_connection_options" \
-            --retries ${ssh_retries|0}                       \
-            --commands "$cmd"
+  "copy EC2 artifacts": &copy_ec2_artifacts
+    command: shell.exec
+    params:
+      shell: bash
+      working_dir: src
+      script: |
+        # Copy remote artifacts.
+        if [ -z "${ec2_artifacts}" ]; then
+          exit 0
+        fi
+        ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+        ${activate_virtualenv}
+        $python buildscripts/remote_operations.py          \
+          --verbose                                        \
+          --userHost $USER@${private_ip_address}           \
+          --operation "copy_from"                          \
+          --sshConnectionOptions "$ssh_connection_options" \
+          --retries ${ssh_retries|0}                       \
+          --file ec2_artifacts.tgz
 
-    - command: shell.exec
-      params:
-        shell: bash
-        working_dir: src
-        script: |
-          # Copy remote artifacts.
-          if [ -z "${ec2_artifacts}" ]; then
-            exit 0
-          fi
-          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
-          ${activate_virtualenv}
-          $python buildscripts/remote_operations.py          \
-            --verbose                                        \
-            --userHost $USER@${ip_address}                   \
-            --operation "copy_from"                          \
-            --sshConnectionOptions "$ssh_connection_options" \
-            --retries ${ssh_retries|0}                       \
-            --file ec2_artifacts.tgz
-
-  "cleanup EC2 instance":
+  "cleanup EC2 instance": &cleanup_ec2_instance
     command: shell.exec
     params:
       working_dir: src
@@ -1845,12 +1894,125 @@ functions:
         aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode terminate)
         echo "Terminated AMI EC2 instance: $aws_ec2"
 
-pre:
-  - func: "kill processes"
-  - func: "cleanup environment"
-  # The python virtual environment is installed in ${workdir}, which is created in "set up virtualenv".
-  - func: "set up virtualenv"
-  - command: expansions.update
+  "gather remote mongo coredumps": &gather_remote_mongo_coredumps
+    command: shell.exec
+    params:
+      working_dir: "src"
+      script: |
+        if [ ! -f ${aws_ec2_yml|""} ]; then
+          exit 0
+        fi
+        ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+        remote_dir=${remote_dir|.}
+        # Find all core files and move to $remote_dir
+        cmds="core_files=\$(/usr/bin/find -H . \( -name '*.core' -o -name '*.mdmp' \) 2> /dev/null)"
+        cmds="$cmds; if [ -z \"\$core_files\" ]; then exit 0; fi"
+        cmds="$cmds; echo Found remote core files \$core_files, moving to \$(pwd)"
+        cmds="$cmds; for core_file in \$core_files"
+        cmds="$cmds; do base_name=\$(echo \$core_file | sed 's/.*\///')"
+        cmds="$cmds;   if [ ! -f \$base_name ]; then mv \$core_file .; fi"
+        cmds="$cmds; done"
+        ${activate_virtualenv}
+        $python buildscripts/remote_operations.py          \
+          --verbose                                        \
+          --userHost $USER@${private_ip_address}           \
+          --sshConnectionOptions "$ssh_connection_options" \
+          --retries ${ssh_retries}                         \
+          --commands "$cmds"                               \
+          --commandDir $remote_dir
+
+  "copy remote mongo coredumps": &copy_remote_mongo_coredumps
+    command: shell.exec
+    params:
+      working_dir: "src"
+      script: |
+        if [ ! -f ${aws_ec2_yml|""} ]; then
+          exit 0
+        fi
+        ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+        remote_dir=${remote_dir|.}
+        ${activate_virtualenv}
+        $python buildscripts/remote_operations.py          \
+          --verbose                                        \
+          --userHost $USER@${private_ip_address}           \
+          --operation "copy_from"                          \
+          --sshConnectionOptions "$ssh_connection_options" \
+          --retries ${ssh_retries}                         \
+          --file "$remote_dir/*.core"                      \
+          --file "$remote_dir/*.mdmp"
+        # Since both type of core files do not exist on the same host, this command
+        # will always return non-zero. As the core file retrieval is optional, we
+        # always exit successfully.
+        exit 0
+
+  "archive remote EC2 artifacts": &archive_remote_ec2_artifacts
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/ec2_artifacts.tgz
+      remote_file: ${project}/${build_variant}/${revision}/remote_ec2/remote_ec2_artifacts-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Remote EC2 Artifacts - Execution ${execution}
+      optional: true
+
+  "archive remote EC2 monitor files": &archive_remote_ec2_monitor_files
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/ec2_monitor_files.tgz
+      remote_file: ${project}/${build_variant}/${revision}/remote_ec2/remote_ec2_monitor-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Remote EC2 Monitor - Execution ${execution}
+      optional: true
+
+  "save ec2 task artifacts":
+    - *get_ec2_address
+    - *update_ec2_address
+    - *tar_ec2_artifacts
+    - *copy_ec2_artifacts
+    - *gather_remote_mongo_coredumps
+    - *copy_remote_mongo_coredumps
+    - *cleanup_ec2_instance
+    - *archive_remote_ec2_artifacts
+    - *archive_remote_ec2_monitor_files
+
+  ### Process & archive local client logs ###
+  "tar local client logs": &tar_local_client_logs
+    command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        client_logs=$(ls crud*.log fsm*.log 2> /dev/null)
+        if [ ! -z "$client_logs" ]; then
+          ${tar|tar} czf client-logs.tgz $client_logs
+        fi
+
+  "archive local client logs": &archive_local_client_logs
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/client-logs.tgz
+      remote_file: ${project}/${build_variant}/${revision}/client_logs/mongo-client-logs-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Client logs - Execution ${execution}
+      optional: true
+
+  "save local client logs":
+    - *tar_local_client_logs
+    - *archive_local_client_logs
+
+  ### Set expansion macros used in each task ###
+  "set task expansion macros":
+    command: expansions.update
     params:
       updates:
       - key: activate_virtualenv
@@ -1870,7 +2032,29 @@ pre:
           else
             python=${python|/opt/mongodbtoolchain/v2/bin/python2}
           fi
-          echo "python set to $(which python)"
+          echo "python set to $(which $python)"
+      - key: activate_virtualenv_3
+        value: |
+          # check if virtualenv for python3 is set up
+          if [ -d "${workdir}/venv_3" ]; then
+            if [ "Windows_NT" = "$OS" ]; then
+              # Need to quote the path on Windows to preserve the separator.
+              . "${workdir}/venv_3/Scripts/activate" 2> /tmp/activate_error.log
+            else
+              . ${workdir}/venv_3/bin/activate 2> /tmp/activate_error.log
+            fi
+            if [ $? -ne 0 ]; then
+              echo "Failed to activate virtualenv: $(cat /tmp/activate_error.log)"
+            fi
+            python=python
+          else
+            if [ "Windows_NT" = "$OS" ]; then
+              python=/cygdrive/c/python/Python36/python
+            else
+              python=${python3|/opt/mongodbtoolchain/v2/bin/python3}
+            fi
+          fi
+          echo "python set to $(which $python)"
       - key: posix_workdir
         value: eval 'if [ "Windows_NT" = "$OS" ]; then echo $(cygpath -u "${workdir}"); else echo ${workdir}; fi'
       # For ssh disable the options GSSAPIAuthentication, CheckHostIP, StrictHostKeyChecking
@@ -1904,88 +2088,26 @@ pre:
       - key: mongo_shell
         value: ${project}/${build_variant}/${revision}/binaries/mongo-shell-${build_id}.${ext|tgz}
 
-  - command: shell.exec
-    params:
-      system_log: true
-      script: |
+  ### Clear and print OOM messages ###
+  "clear OOM messages":
+      command: shell.exec
+      params:
+        system_log: true
+        script: |
 
-        ulimit -a
-        # Clear the dmesg ring buffer. The "post" phase will check dmesg for OOM messages.
-        ${set_sudo}
-        $sudo dmesg -c > /dev/null 2>&1
-        if [ $? -eq 0 ]; then
-          echo "Cleared the dmesg ring buffer"
-        else
-          echo "Could not clear the dmesg ring buffer"
-        fi
+          ulimit -a
+          # Clear the dmesg ring buffer. The "post" phase will check dmesg for OOM messages.
+          ${set_sudo}
+          $sudo dmesg -c > /dev/null 2>&1
+          if [ $? -eq 0 ]; then
+            echo "Cleared the dmesg ring buffer"
+          else
+            echo "Could not clear the dmesg ring buffer"
+          fi
 
-
-post:
-  - command: attach.results
-    params:
-      file_location: src/report.json
-  - command: attach.artifacts
-    params:
-      optional: true
-      ignore_artifacts_for_spawn: false
-      files:
-        - src/archive.json
-
-  - func: "set EC2 address"
-  - func: "copy EC2 artifacts"
-  # Gather remote mongo coredumps.
-  - command: shell.exec
-    params:
-      working_dir: "src"
-      script: |
-        if [ ! -f ${aws_ec2_yml|""} ]; then
-          exit 0
-        fi
-        ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
-        remote_dir=${remote_dir|.}
-        # Find all core files and move to $remote_dir
-        cmds="core_files=\$(/usr/bin/find -H . \( -name '*.core' -o -name '*.mdmp' \) 2> /dev/null)"
-        cmds="$cmds; if [ -z \"\$core_files\" ]; then exit 0; fi"
-        cmds="$cmds; echo Found remote core files \$core_files, moving to \$(pwd)"
-        cmds="$cmds; for core_file in \$core_files"
-        cmds="$cmds; do base_name=\$(echo \$core_file | sed 's/.*\///')"
-        cmds="$cmds;   if [ ! -f \$base_name ]; then mv \$core_file .; fi"
-        cmds="$cmds; done"
-        ${activate_virtualenv}
-        $python buildscripts/remote_operations.py          \
-          --verbose                                        \
-          --userHost $USER@${ip_address}                   \
-          --sshConnectionOptions "$ssh_connection_options" \
-          --retries ${ssh_retries}                         \
-          --commands "$cmds"                               \
-          --commandDir $remote_dir
-  - command: shell.exec
-    params:
-      working_dir: "src"
-      script: |
-        if [ ! -f ${aws_ec2_yml|""} ]; then
-          exit 0
-        fi
-        ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
-        remote_dir=${remote_dir|.}
-        ${activate_virtualenv}
-        $python buildscripts/remote_operations.py          \
-          --verbose                                        \
-          --userHost $USER@${ip_address}                   \
-          --operation "copy_from"                          \
-          --sshConnectionOptions "$ssh_connection_options" \
-          --retries ${ssh_retries}                         \
-          --file "$remote_dir/*.core"                      \
-          --file "$remote_dir/*.mdmp"
-        # Since both type of core files do not exist on the same host, this command
-        # will always return non-zero. As the core file retrieval is optional, we
-        # always exit successfully.
-        exit 0
-  - func: "cleanup EC2 instance"
-
-  - func: "kill processes"
-  # Print out any Out of Memory killed process messages.
-  - command: shell.exec
+  "print OOM messages":
+    # Print out any Out of Memory killed process messages.
+    command: shell.exec
     params:
       system_log: true
       working_dir: src # Temporary files created in src will be cleaned up in "pre".
@@ -2010,8 +2132,9 @@ post:
           echo "No OOM (Out of memory) killed processes detected"
         fi
 
-  # Cleanup after the watchdog FUSE testing
-  - command: shell.exec
+  ### Cleanup after the watchdog FUSE testing ###
+  "cleanup FUSE watchdog":
+    command: shell.exec
     params:
       working_dir: src
       script: |
@@ -2023,73 +2146,50 @@ post:
           rm -rf /data/charybdefs
         fi
 
-  # Archive remote EC2 monitor files.
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: src/ec2_monitor_files.tgz
-      remote_file: ${project}/${build_variant}/${revision}/remote_ec2/remote_ec2_monitor-${task_id}-${execution}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: ${content_type|application/x-gzip}
-      display_name: Remote EC2 Monitor - Execution ${execution}
-      optional: true
-
-  # Archive remote EC2 artifacts.
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: src/ec2_artifacts.tgz
-      remote_file: ${project}/${build_variant}/${revision}/remote_ec2/remote_ec2_artifacts-${task_id}-${execution}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: ${content_type|application/x-gzip}
-      display_name: Remote EC2 Artifacts - Execution ${execution}
-      optional: true
-
-  # Gather and archive the local client logs.
-  - command: shell.exec
+  ### Process & archive Code Coverage artifacts ###
+  "process code coverage data": &process_code_coverage_data
+    command: shell.exec
     params:
       working_dir: src
       script: |
-        client_logs=$(ls crud*.log fsm*.log 2> /dev/null)
-        if [ ! -z "$client_logs" ]; then
-          ${tar|tar} czf client-logs.tgz $client_logs
-        fi
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: src/client-logs.tgz
-      remote_file: ${project}/${build_variant}/${revision}/client_logs/mongo-client-logs-${task_id}-${execution}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: ${content_type|application/x-gzip}
-      display_name: Client logs - Execution ${execution}
-      optional: true
-
-  # Process and save coverage data.
-  - command: shell.exec
-    params:
-      working_dir: src
-      script: |
+        set +o errexit
         if [ -d "./build" ]; then
-            file_list=$(find ./build -type f -name "*.gcda")
-            if [ -n "$file_list" ]; then
-                for gcda_file in $file_list; do
-                    /opt/mongodbtoolchain/v2/bin/gcov -i $gcda_file
-                done
-            fi
+          file_list=$(find ./build -type f -name "*.gcda")
+          if [ -n "$file_list" ]; then
+            for gcda_file in $file_list; do
+              echo "Processing file $gcda_file"
+              /opt/mongodbtoolchain/v2/bin/gcov -i $gcda_file
+              base_name=$(echo $gcda_file | rev | cut -f1 -d '/' | cut -f2 -d '.' | rev)
+              gcov_file=$base_name.gcda.gcov
+              if [ -f "$gcov_file" ]; then
+                # Add a prefix to the intermediate file, since it does not have a unique name.
+                # Convert the '/' to '#' in the file path.
+                file_prefix=$(echo $gcda_file | sed -e 's,^\./,,' | rev | cut -f2- -d '/' | rev | tr -s '/' '#')
+                new_gcov_file=$file_prefix#$base_name.gcda.gcov
+                if [ ! -f $new_gcov_file ]; then
+                  echo "Renaming gcov intermediate file $gcov_file to $new_gcov_file"
+                  mv $gcov_file $new_gcov_file
+                else
+                  # We treat this as a fatal condition and remove all of the coverage files.
+                  echo "Not renaming $gcov_file as $new_gcov_file already exists!"
+                  rm -f *.gcda.gcov
+                  exit 1
+                fi
+              fi
+            done
+          fi
         fi
-  - command: archive.targz_pack
+
+  "tar code coverage data": &tar_code_coverage_data
+    command: archive.targz_pack
     params:
       target: "src/gcov-intermediate-files.tgz"
       source_dir: "src"
       include:
         - "*.gcda.gcov"
-  - command: s3.put
+
+  "archive code coverage data": &archive_code_coverage_data
+    command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
@@ -2101,8 +2201,14 @@ post:
       display_name: gcov intermediate files - Execution ${execution}
       optional: true
 
-  # Gather and archive the Jepsen mongod logs.
-  - command: shell.exec
+  "save code coverage data":
+    - *process_code_coverage_data
+    - *tar_code_coverage_data
+    - *archive_code_coverage_data
+
+  ### Process & archive Jepsen artifacts ###
+  "gather jepsen logs": &gather_jepsen_logs
+    command: shell.exec
     params:
       working_dir: src
       script: |
@@ -2132,14 +2238,18 @@ post:
             done
           done
         fi
-  - command: archive.targz_pack
+
+  "tar jepsen logs": &tar_jepsen_logs
+    command: archive.targz_pack
     params:
       target: "src/jepsen-mongod-logs.tgz"
       source_dir: "src"
       include:
         - "mongod*.log"
         - "stdout*.log"
-  - command: s3.put
+
+  "archive jepsen logs": &archive_jepsen_logs
+    command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
@@ -2151,14 +2261,16 @@ post:
       display_name: Jepsen mongod Logs - ${execution}
       optional: true
 
-  # Gather and archive the Jepsen results.
-  - command: archive.targz_pack
+  "tar jepsen results": &tar_jepsen_results
+    command: archive.targz_pack
     params:
       target: "src/jepsen-results.tgz"
       source_dir: "src/jepsen-mongodb/store"
       include:
         - "./**"
-  - command: s3.put
+
+  "archive jepsen results": &archive_jepsen_results
+    command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
@@ -2170,8 +2282,16 @@ post:
       display_name: Jepsen Test Results - ${execution}
       optional: true
 
-  # Gather and archive mongo coredumps.
-  - command: shell.exec
+  "save jepsen artifacts":
+    - *gather_jepsen_logs
+    - *tar_jepsen_logs
+    - *archive_jepsen_logs
+    - *tar_jepsen_results
+    - *archive_jepsen_results
+
+  ### Process & archive mongo coredumps ###
+  "gather mongo coredumps": &gather_mongo_coredumps
+    command: shell.exec
     params:
       working_dir: "src"
       script: |
@@ -2185,14 +2305,18 @@ post:
             mv $core_file .
           fi
         done
-  - command: archive.targz_pack
+
+  "tar mongo coredumps": &tar_mongo_coredumps
+    command: archive.targz_pack
     params:
       target: "mongo-coredumps.tgz"
       source_dir: "src"
       include:
         - "./**.core"
         - "./**.mdmp" # Windows: minidumps
-  - command: s3.put
+
+  "archive mongo coredumps": &archive_mongo_coredumps
+    command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
@@ -2204,8 +2328,14 @@ post:
       display_name: Core Dumps - Execution ${execution}
       optional: true
 
-  # Gather and archive failed unit test binaries.
-  - command: shell.exec
+  "save mongo coredumps":
+  - *gather_mongo_coredumps
+  - *tar_mongo_coredumps
+  - *archive_mongo_coredumps
+
+  ### Process & archive failed unittest artifacts ###
+  "gather failed unittests": &gather_failed_unittests
+    command: shell.exec
     params:
       working_dir: "src"
       script: |
@@ -2246,13 +2376,17 @@ post:
             fi
           done
         done
-  - command: archive.targz_pack
+
+  "tar failed unittests": &tar_failed_unittests
+    command: archive.targz_pack
     params:
       target: "mongo-unittests.tgz"
       source_dir: "src/unittest_binaries"
       include:
         - "./*_test${exe}"
-  - command: s3.put
+
+  "archive failed unittests": &archive_failed_unittests
+    command: s3.put
     params:
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
@@ -2264,72 +2398,14 @@ post:
       display_name: Unit tests - Execution ${execution}
       optional: true
 
-  # Gather and archive hang_analyzer debugger files.
-  - command: archive.targz_pack
-    params:
-      target: "src/mongo-hanganalyzer.tgz"
-      source_dir: "src"
-      include:
-        - "./debugger*.*"
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: src/mongo-hanganalyzer.tgz
-      remote_file: ${project}/${build_variant}/${revision}/hanganalyzer/mongo-hanganalyzer-${build_id}-${task_name}-${execution}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: ${content_type|application/x-gzip}
-      display_name: Hang Analyzer Output - Execution ${execution}
-      optional: true
+  "save failed unittests":
+  - *gather_failed_unittests
+  - *tar_failed_unittests
+  - *archive_failed_unittests
 
-  # Gather and archive disk statistics.
-  - command: archive.targz_pack
-    params:
-      target: "diskstats.tgz"
-      source_dir: "./"
-      include:
-        - "./mongo-diskstats*"
-        - "./mongo-diskstats*.csv"
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: diskstats.tgz
-      remote_file: ${project}/${build_variant}/${revision}/diskstats/mongo-diskstats-${task_id}-${execution}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: ${content_type|application/x-gzip}
-      display_name: Disk Stats - Execution ${execution}
-      optional: true
-
-  # Gather and archive system resource information.
-  - command: archive.targz_pack
-    params:
-      target: "system-resource-info.tgz"
-      source_dir: src
-      include:
-        - "./system_resource_info*"
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: system-resource-info.tgz
-      remote_file: ${project}/${build_variant}/${revision}/systemresourceinfo/mongo-system-resource-info-${task_id}-${execution}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: ${content_type|application/x-gzip}
-      display_name: System Resource Info - Execution ${execution}
-      optional: true
-
-  # Cleanup steps.
-  - func: "cleanup environment"
-
-timeout:
-  - func: "fetch debugsymbols archive"
-  - func: "extract debugsymbols"
-  - func: "set EC2 address"
-  - command: shell.exec
+  ### Process & archive artifacts from hung processes ###
+  "run hang_analyzer":
+    command: shell.exec
     params:
       working_dir: src
       script: |
@@ -2353,10 +2429,7 @@ timeout:
         PATH="/opt/mongodbtoolchain/gdb/bin:$PATH" $sudo $python buildscripts/hang_analyzer.py $hang_analyzer_option
 
         # Call hang_analyzer.py script for tasks that are running remote mongo processes
-        # The file ${aws_ec2_yml} will define the remote's ${ip_address}.
-        # Any task which uses remote processes will have previously loaded this file to set these
-        # expansion macros.
-        if [ -f ${aws_ec2_yml|""} ]; then
+        if [ -n "${private_ip_address}" ]; then
           core_ext=core
           if [ "Windows_NT" = "$OS" ]; then
             core_ext=mdmp
@@ -2374,7 +2447,7 @@ timeout:
           if [ ! -z "$file_param" ]; then
             $python buildscripts/remote_operations.py          \
               --verbose                                        \
-              --userHost $USER@${ip_address}                   \
+              --userHost $USER@${private_ip_address}           \
               --operation "copy_to"                            \
               --sshConnectionOptions "$ssh_connection_options" \
               --retries ${ssh_retries}                         \
@@ -2393,20 +2466,163 @@ timeout:
           cmds="$cmds; PATH=\"/opt/mongodbtoolchain/gdb/bin:\$PATH\" $sudo python buildscripts/hang_analyzer.py $hang_analyzer_option"
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@${ip_address}                   \
+            --userHost $USER@${private_ip_address}           \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries}                         \
             --commands "$cmds"
 
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
-            --userHost $USER@${ip_address}                   \
+            --userHost $USER@${private_ip_address}           \
             --operation "copy_from"                          \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries}                         \
             --file "$remote_dir/debugger*.*"                 \
             --file "$remote_dir/*.$core_ext"
         fi
+
+  "tar hang_analyzer debugger files": &tar_hang_analyzer_debugger_files
+    command: archive.targz_pack
+    params:
+      target: "src/mongo-hanganalyzer.tgz"
+      source_dir: "src"
+      include:
+        - "./debugger*.*"
+
+  "archive hang_analyzer debugger files": &archive_hang_analyzer_debugger_files
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/mongo-hanganalyzer.tgz
+      remote_file: ${project}/${build_variant}/${revision}/hanganalyzer/mongo-hanganalyzer-${build_id}-${task_name}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Hang Analyzer Output - Execution ${execution}
+      optional: true
+
+  "save hang_analyzer debugger files":
+  - *tar_hang_analyzer_debugger_files
+  - *archive_hang_analyzer_debugger_files
+
+  ### Process & archive disk statistic artifacts ###
+  "tar disk statistics": &tar_disk_statistics
+    command: archive.targz_pack
+    params:
+      target: "diskstats.tgz"
+      source_dir: "./"
+      include:
+        - "./mongo-diskstats*"
+        - "./mongo-diskstats*.csv"
+
+  "archive disk statistics": &archive_disk_statistics
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: diskstats.tgz
+      remote_file: ${project}/${build_variant}/${revision}/diskstats/mongo-diskstats-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: Disk Stats - Execution ${execution}
+      optional: true
+
+  "save disk statistics":
+  - *tar_disk_statistics
+  - *archive_disk_statistics
+
+  ### Process & archive system resource artifacts ###
+  "tar system resource information": &tar_system_resource_information
+    command: archive.targz_pack
+    params:
+      target: "system-resource-info.tgz"
+      source_dir: src
+      include:
+        - "./system_resource_info*"
+
+  "archive system resource information": &archive_system_resource_information
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: system-resource-info.tgz
+      remote_file: ${project}/${build_variant}/${revision}/systemresourceinfo/mongo-system-resource-info-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: System Resource Info - Execution ${execution}
+      optional: true
+
+  "save system resource information":
+  - *tar_system_resource_information
+  - *archive_system_resource_information
+
+  ### Attach report & artifacts ###
+  "attach scons config log":
+    command: s3.put
+    params:
+      optional: true
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/build/scons/config.log
+      remote_file: ${project}/${build_variant}/${revision}/artifacts/config-${build_id}.log
+      bucket: mciuploads
+      permissions: public-read
+      content_type: text/plain
+      display_name: config.log
+
+  "attach report":
+    command: attach.results
+    params:
+      file_location: ${report_file|src/report.json}
+
+  "attach artifacts":
+    command: attach.artifacts
+    params:
+      optional: true
+      ignore_artifacts_for_spawn: false
+      files:
+        - ${archive_file|src/archive.json}
+
+
+# Pre task steps
+pre: &pre
+  - func: "kill processes"
+  - func: "cleanup environment"
+  # The python virtual environment is installed in ${workdir}, which is created in "set up virtualenv".
+  - func: "set up virtualenv"
+  - func: "set task expansion macros"
+  - func: "clear OOM messages"
+
+# Post task steps
+post: &post
+  - func: "attach scons config log"
+  - func: "attach report"
+  - func: "attach artifacts"
+  - func: "save ec2 task artifacts"
+  - func: "kill processes"
+  - func: "save local client logs"
+  - func: "save code coverage data"
+  - func: "save jepsen artifacts"
+  - func: "save mongo coredumps"
+  - func: "save failed unittests"
+  - func: "save hang_analyzer debugger files"
+  - func: "save disk statistics"
+  - func: "save system resource information"
+  - func: "print OOM messages"
+  - func: "cleanup FUSE watchdog"
+  - func: "cleanup environment"
+
+# Timeout steps
+timeout:
+  - func: "fetch debugsymbols archive"
+  - func: "extract debugsymbols"
+  - func: "get EC2 address"
+  - func: "update EC2 address"
+  - func: "run hang_analyzer"
+
 
 #######################################
 #               Tasks                 #
@@ -2447,7 +2663,8 @@ tasks:
     - func: "update bypass expansions"
     - func: "get buildnumber"
     - func: "set up credentials"
-    - func: "build new tools" # noop if ${newtools} is not "true"
+    - func: "fetch and build OpenSSL"
+    - func: "build new tools"
     - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
     - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
     - func: "generate compile expansions"
@@ -2456,6 +2673,10 @@ tasks:
     - func: "scons compile"
       vars:
         targets: core tools dbtest integration_tests dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|}
+        task_compile_flags: >-
+          --use-new-tools
+          --build-mongoreplay="${build_mongoreplay}"
+          --detect-odr-violations
     - command: shell.exec
       type: test
       params:
@@ -2610,17 +2831,20 @@ tasks:
     - func: "git get project"
     - func: "get buildnumber"
     - func: "set up credentials"
-    - func: "build new tools" # noop if ${newtools} is not "true"
+    - func: "fetch and build OpenSSL"
+    - func: "build new tools"
     - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
     - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
-    - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
-    - func: "build cdriver" # noop if ${build_cdriver} is not "true"
     - func: "generate compile expansions"
     # Then we load the generated version data into the agent so we can use it in task definitions.
     - func: "apply compile expansions"
     - func: "scons compile"
       vars:
         targets: all
+        task_compile_flags: >-
+          --use-new-tools
+          --build-mongoreplay="${build_mongoreplay}"
+          --detect-odr-violations
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -2641,13 +2865,112 @@ tasks:
         resmoke_args: --suites=unittests
         run_multiple_jobs: true
 
-    # Run the iOS embedded CAPI tests in the iOS simulator
-    # noop if ${enable_iostvos_sim_tests} is not "true"
-    - func: "run ios sim embedded tests"
+    - func: "scons cache pruning"
+    - func: "umount shared scons directory"
 
-    # Run the android embedded CAPI tests in the android emulator
-    # noop if ${enable_android_emu_tests} is not "true"
-    - func: "run android emulator tests"
+## compile_mogile - build the mobile-dev and mobile-test targets only ##
+- name: compile_mobile
+  commands:
+    - command: manifest.load
+    - func: "git get project"
+    - func: "get buildnumber"
+    - func: "set up credentials"
+    - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
+    - func: "generate compile expansions"
+    # Then we load the generated version data into the agent so we can use it in task definitions.
+    - func: "apply compile expansions"
+
+    - func: "build cdriver" # noop if ${build_cdriver} is not "true"
+
+    # Need to fixup C driver install names on iOS-ish
+    # TODO: Remove this once building the cdriver with cmake, which will allow
+    # us better control over installation names.
+    - command: shell.exec
+      params:
+        working_dir: "src/build/mongo-embedded-sdk-${version}"
+        script: |
+          set -o errexit
+          set -o verbose
+          if command -v xcrun; then
+            # fixup the install names.
+            _LibBsonInstallName=$(xcrun otool -l lib/libbson-1.0.0.dylib | grep mongo-embedded-sdk-${version} | awk '{ print $2 }')
+            xcrun install_name_tool -id '@loader_path/../lib/libbson-1.0.0.dylib' lib/libbson-1.0.0.dylib
+            xcrun install_name_tool -id '@loader_path/../lib/libmongoc-1.0.0.dylib' lib/libmongoc-1.0.0.dylib
+            xcrun install_name_tool -change $_LibBsonInstallName @loader_path/../lib/libbson-1.0.0.dylib lib/libmongoc-1.0.0.dylib
+          fi
+
+    - func: "scons compile"
+      vars:
+        targets: install-mobile-dev install-mobile-test
+        task_compile_flags: >-
+          --disable-warnings-as-errors
+          --install-mode=hygienic
+          --js-engine=none
+          --link-model=dynamic
+          --prefix='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION'
+          CPPPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libbson-1.0 $BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libmongoc-1.0'
+          LIBPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/lib'
+
+    # Need to sign artifacts on iOS-ish.
+    - command: shell.exec
+      params:
+        working_dir: "src/build/mongo-embedded-sdk-${version}"
+        script: |
+          set -o errexit
+          set -o verbose
+          if command -v xcrun; then
+            # Do ad-hoc signing for now, until we have a better answer
+            find ./lib -type f -name "*.dylib" -print0 | xargs -0 -L 1 xcrun codesign -s -
+          fi
+
+    # Not using archive.targz_pack here because I can't get it to work.
+    - command: shell.exec
+      params:
+        working_dir: "src/build"
+        script: |
+          set -o errexit
+          set -o verbose
+          tar cfvz ./embedded-sdk.tgz ./mongo-embedded-sdk-${version}
+
+    # Upload it so we can download from EVG.
+    - command: s3.put
+      params:
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "src/build/embedded-sdk.tgz"
+        remote_file: ${project}/embedded-sdk/${build_variant}/${revision}/${build_id}.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+        display_name: "Embedded SDK Tar Archive"
+
+    - func: "run embedded tests"
+
+    # If this is a patch build, blow away the file so our subsequent and optional s3.put
+    # doesn't run. That way, we won't overwrite the latest part in our patches.
+    - command: shell.exec
+      params:
+        working_dir: "src/build"
+        script: |
+          if [ "${is_patch}" = "true" ]; then
+            rm -f src/build/embedded-sdk.tgz
+          fi
+
+    # A second put, this time to -latest, to give devs a reasonable
+    # way to get the most recent build.
+    - command: s3.put
+      params:
+        visibility: none
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "src/build/embedded-sdk.tgz"
+        remote_file: ${project}/embedded-sdk/${build_variant}-latest.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+
     - func: "scons cache pruning"
     - func: "umount shared scons directory"
 
@@ -2658,7 +2981,7 @@ tasks:
     - func: "git get project"
     - func: "get buildnumber"
     - func: "set up credentials"
-    - func: "build new tools" # noop if ${newtools} is not "true"
+    - func: "build new tools"
     - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
     - func: "generate compile expansions"
     # Then we load the generated version data into the agent so we can use it in task definitions
@@ -2701,8 +3024,19 @@ tasks:
           set -o errexit
           set -o verbose
 
+          ### TODO: Remove python3 when mypy 0.580 is installed in the toolchain.
+          # Since mypy requires python3, we need to activate the venv_3
+          ${activate_virtualenv_3}
+          pip install -r buildscripts/requirements.txt
+          updated_mypy=$(which mypy)
+          deactivate
+          ###
           ${activate_virtualenv}
-          ${compile_env|} $python ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
+          # TODO: Remove once the linters have been updated on the variants.
+          pip install -r buildscripts/requirements.txt
+          # The linters require the modules be installed.
+          pip install -r pytests/requirements.txt
+          MYPY=$updated_mypy ${compile_env|} $python ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
 
 - <<: *task_template
   name: burn_in_tests
@@ -2734,7 +3068,11 @@ tasks:
         ${activate_virtualenv}
         popd
         # Capture a list of new and modified tests.
-        $python buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=${build_variant} --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
+        build_variant=${build_variant}
+        if [ -n "${burn_in_tests_build_variant|}" ]; then
+          build_variant=${burn_in_tests_build_variant|}
+        fi
+        $python buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=$build_variant --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
         # Copy the results to the src dir.
         cp jstests/new_tests.json ../src/jstests/new_tests.json
   - func: "do multiversion setup"
@@ -2753,6 +3091,17 @@ tasks:
     vars:
       resmoke_args: --suites=benchmarks
       run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *benchmark_template
+  name: benchmarks_sharding
+  commands:
+  - func: "do benchmark setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchmarks_sharding
+      run_multiple_jobs: false
+  - func: "send benchmark results"
 
 - <<: *run_jepsen_template
   name: jepsen_register_findAndModify_WT
@@ -3006,6 +3355,28 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       resmoke_args: --suites=jstestfuzz_sharded_session --storageEngine=wiredTiger --numClientsPerFixture=10
+
+# jstestfuzz interrupt #
+- <<: *jstestfuzz_template
+  name: jstestfuzz_interrupt
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz_interrupt --storageEngine=wiredTiger
+
+# jstestfuzz interrupt #
+- <<: *jstestfuzz_template
+  name: jstestfuzz_interrupt_replication
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      resmoke_args: --suites=jstestfuzz_interrupt_replication --storageEngine=wiredTiger
 
 ## jstestfuzz replica set ##
 - <<: *jstestfuzz_template
@@ -3497,6 +3868,15 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: jsCore_txns
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core_txns --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: replica_sets_jscore_passthrough
   depends_on:
   - name: jsCore
@@ -3527,6 +3907,17 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=replica_sets_initsync_static_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_kill_primary_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_kill_primary_jscore_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4080,7 +4471,6 @@ tasks:
 
 - name: powercycle
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
-  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4094,13 +4484,13 @@ tasks:
   - command: expansions.update
     <<: *powercycle_expansions
   - func: "run powercycle test"
+    timeout_secs: 1800 # 30 minute timeout for no output
     vars:
       <<: *powercycle_test
       mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
 
 - name: powercycle_fcv3.6
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
-  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4114,6 +4504,7 @@ tasks:
   - command: expansions.update
     <<: *powercycle_expansions
   - func: "run powercycle test"
+    timeout_secs: 1800 # 30 minute timeout for no output
     vars:
       <<: *powercycle_test
       client_options: --numCrudClients=20 --numFsmClients=20
@@ -4122,7 +4513,6 @@ tasks:
 
 - name: powercycle_replication
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
-  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4136,13 +4526,13 @@ tasks:
   - command: expansions.update
     <<: *powercycle_expansions
   - func: "run powercycle test"
+    timeout_secs: 1800 # 30 minute timeout for no output
     vars:
       <<: *powercycle_test
-      mongod_extra_options: --replSet=powercyle --mongodOptions=\"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
+      mongod_extra_options: --replSet=powercycle --mongodOptions=\"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
 
 - name: powercycle_replication_smalloplog
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
-  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4156,13 +4546,13 @@ tasks:
   - command: expansions.update
     <<: *powercycle_expansions
   - func: "run powercycle test"
+    timeout_secs: 1800 # 30 minute timeout for no output
     vars:
       <<: *powercycle_test
-      mongod_extra_options: --replSet=powercyle --mongodOptions=\"--setParameter enableTestCommands=1 --oplogSize 20 --storageEngine wiredTiger\"
+      mongod_extra_options: --replSet=powercycle --mongodOptions=\"--setParameter enableTestCommands=1 --oplogSize 20 --storageEngine wiredTiger\"
 
 - name: powercycle_syncdelay
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
-  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4176,13 +4566,13 @@ tasks:
   - command: expansions.update
     <<: *powercycle_expansions
   - func: "run powercycle test"
+    timeout_secs: 1800 # 30 minute timeout for no output
     vars:
       <<: *powercycle_test
       mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1 --syncdelay 10 --storageEngine wiredTiger\"
 
 - name: powercycle_write_concern_majority
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
-  timeout_secs: 1800 # 30 minute timeout for no output
   depends_on:
   - name: compile
   commands:
@@ -4196,6 +4586,7 @@ tasks:
   - command: expansions.update
     <<: *powercycle_expansions
   - func: "run powercycle test"
+    timeout_secs: 1800 # 30 minute timeout for no output
     vars:
       <<: *powercycle_test
       client_options: "--numCrudClients=20 --numFsmClients=20 --writeConcern='{\"w\": \"majority\"}'"
@@ -4207,6 +4598,16 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run idl tests"
+
+- name: buildscripts_test
+  depends_on: []
+  commands:
+  - func: "git get project"
+  - func: "get buildnumber"
+  - func: "set up credentials"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=buildscripts_test
 
 - name: package
   depends_on:
@@ -4784,6 +5185,8 @@ buildvariants:
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --release
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: ""
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -4821,6 +5224,7 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -4873,6 +5277,8 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --repeat=10 --shuffle
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: ""
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -4886,6 +5292,7 @@ buildvariants:
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: jsCore
+  - name: jsCore_txns
   - name: parallel
   - name: concurrency
   - name: concurrency_replication
@@ -4907,6 +5314,8 @@ buildvariants:
     compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     scons_cache_scope: shared
     shared_scons_pruning: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: ""
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -4944,6 +5353,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: jsonSchema
   - name: mongosTest
   - name: noPassthrough
@@ -4959,6 +5369,7 @@ buildvariants:
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
   - name: replica_sets_jscore_passthrough
+  - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
   - name: retryable_writes_jscore_passthrough
   - name: retryable_writes_jscore_stepdown_passthrough
@@ -5000,10 +5411,13 @@ buildvariants:
     push_arch: x86_64
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    # Running WiredTiger with --nojournal in a replica set is no longer supported,
-    # so this variant does not include replica set tests.
-    test_flags: --nojournal --excludeWithAnyTags=requires_journaling,requires_replication,requires_mmapv1
+    # Running WiredTiger with --nojournal in a replica set is no longer supported, so this variant
+    # does not include replica set tests. Since transactions are only supported on replica sets, we
+    # exclude those tests as well.
+    test_flags: --nojournal --excludeWithAnyTags=requires_journaling,requires_replication,requires_mmapv1,requires_sharding,uses_transactions
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: ""
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -5025,6 +5439,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -5049,8 +5464,10 @@ buildvariants:
   expansions:
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --wiredTigerCollectionConfig=type=lsm --wiredTigerIndexConfig=type=lsm --excludeWithAnyTags=requires_mmapv1
+    test_flags: --wiredTigerEngineConfig=mmap=false --wiredTigerCollectionConfig=type=lsm --wiredTigerIndexConfig=type=lsm --excludeWithAnyTags=requires_mmapv1,uses_transactions
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: ""
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -5059,126 +5476,8 @@ buildvariants:
   - name: compile_all
     distros:
     - rhel62-large
-  - name: aggregation
-  - name: auth
   - name: dbtest
-  - name: gle_auth
-  - name: gle_auth_write_cmd
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
   - name: jsCore
-  - name: jsCore_compatibility
-  - name: aggregation_fuzzer
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
-  - name: bulk_gle_passthrough
-  - name: parallel
-  - name: parallel_compatibility
-  - name: concurrency
-  - name: concurrency_replication
-  - name: concurrency_sharded
-  - name: concurrency_simultaneous
-  - name: replica_sets
-  - name: replica_sets_jscore_passthrough
-  - name: sharding
-  - name: slow1
-  - name: serial_run
-  - name: sharded_collections_jscore_passthrough
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_op_query_passthrough
-  - name: sharding_jscore_passthrough_wire_ops
-  - name: tool
-
-- name: ubuntu1204
-  display_name: SSL Ubuntu 12.04
-  run_on:
-  - ubuntu1204-test
-  batchtime: 1440 # 1 day
-  expansions:
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    tooltags: "-tags ssl"
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: x86_64-ubuntu1204
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1204 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform: ubuntu1204
-    multiversion_edition: targeted
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: x86_64
-    packager_distro: ubuntu1204
-    repo_edition: org
-    scons_cache_scope: shared
-    shared_scons_pruning: true
-    build_mongoreplay: true
-  tasks:
-  - name: compile
-    distros:
-    - ubuntu1204-build
-  - name: compile_all
-    distros:
-    - ubuntu1204-build
-  - name: aggregation
-  - name: aggregation_auth
-  - name: auth
-  - name: dbtest
-  - name: disk_wiredtiger
-  - name: failpoints
-  - name: failpoints_auth
-  - name: gle_auth
-  - name: gle_auth_write_cmd
-  - name: gle_auth_basics_passthrough
-  - name: gle_auth_basics_passthrough_write_cmd
-  - name: sharding_gle_auth_basics_passthrough
-  - name: sharding_gle_auth_basics_passthrough_write_cmd
-  - name: jsCore
-  - name: jsCore_auth
-  - name: jsCore_compatibility
-  - name: jsCore_decimal
-  - name: aggregation_fuzzer
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
-  - name: mongosTest
-  - name: multiversion
-  - name: noPassthrough
-  - name: noPassthroughWithMongod
-  - name: bulk_gle_passthrough
-  - name: parallel
-  - name: parallel_compatibility
-  - name: concurrency
-  - name: concurrency_replication
-  - name: concurrency_sharded
-  - name: concurrency_simultaneous
-  - name: replica_sets
-  - name: replica_sets_auth
-  - name: replica_sets_jscore_passthrough
-  - name: sharding
-  - name: sharding_auth
-  - name: sharding_last_stable_mongos_and_mixed_shards
-  - name: slow1
-  - name: serial_run
-  - name: sharding_jscore_passthrough
-  - name: ssl
-  - name: sslSpecial
-  - name: tool
-  - name: package
-    distros:
-    - ubuntu1604-packer
-  - name: push
 
 - name: ubuntu1404
   display_name: SSL Ubuntu 14.04
@@ -5187,7 +5486,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    tooltags: "-tags ssl"
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -5203,6 +5501,8 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags ssl"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -5249,6 +5549,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -5272,8 +5573,9 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
   - name: powercycle
   - name: powercycle_fcv3.6
-  - name: powercycle_replication
-  - name: powercycle_replication_smalloplog
+# SERVER-34075: Re-enable once powercycle_replication* can test against recoverable rollback changes.
+#  - name: powercycle_replication
+#  - name: powercycle_replication_smalloplog
   - name: powercycle_syncdelay
   - name: powercycle_write_concern_majority
   - name: sharding
@@ -5297,7 +5599,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    tooltags: "-tags ssl"
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -5313,6 +5614,8 @@ buildvariants:
     packager_distro: ubuntu1604
     repo_edition: org
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags ssl"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -5338,6 +5641,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -5378,12 +5682,9 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-arm64-small
   - ubuntu1604-arm64-large
   batchtime: 1440 # 1 day
   expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto libsasl2)" -tags 'sasl ssl'
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -5393,21 +5694,19 @@ buildvariants:
     max_jobs: 8 # Avoid starting too many mongod's on ARM test servers
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: arm64
     packager_distro: ubuntu1604
     repo_edition: enterprise
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
+    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto libsasl2)" -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: arm64
-    multiversion_edition: targeted
+    multiversion_edition: enterprise
   tasks:
   - name: compile
-    distros:
-    - ubuntu1604-arm64-large
   - name: compile_all
-    distros:
-    - ubuntu1604-arm64-large
   - name: aggregation
   - name: aggregation_auth
   - name: auth
@@ -5423,6 +5722,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -5469,12 +5769,9 @@ buildvariants:
 - name: ubuntu1604-arm64
   display_name: SSL Ubuntu 16.04 arm64
   run_on:
-  - ubuntu1604-arm64-small
   - ubuntu1604-arm64-large
   batchtime: 1440 # 1 day
   expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto)" -tags 'ssl'
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -5488,17 +5785,15 @@ buildvariants:
     packager_arch: arm64
     packager_distro: ubuntu1604
     repo_edition: org
+    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
+    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto)" -tags 'ssl'
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: arm64
     multiversion_edition: targeted
   tasks:
   - name: compile
-    distros:
-    - ubuntu1604-arm64-large
   - name: compile_all
-    distros:
-    - ubuntu1604-arm64-large
   - name: dbtest
   - name: jsCore
   - name: push
@@ -5510,12 +5805,9 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-power8-build
   - ubuntu1604-power8-test
   batchtime: 1440 # 1 day
   expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2 libcrypto)" -tags 'sasl ssl'
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -5524,10 +5816,12 @@ buildvariants:
     num_jobs_available: 2
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: ppc64le
     packager_distro: ubuntu1604
     repo_edition: enterprise
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
+    tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: ppc64le
@@ -5554,6 +5848,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -5591,13 +5886,10 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - ubuntu1604-zseries-large
   - ubuntu1604-zseries-small
   batchtime: 1440 # 1 day
   stepback: false
   expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto libsasl2)" -tags 'sasl ssl'
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -5606,10 +5898,12 @@ buildvariants:
     num_jobs_available: 2
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: s390x
     packager_distro: ubuntu1604
     repo_edition: enterprise
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: s390x
@@ -5650,6 +5944,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -5701,7 +5996,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    tooltags: "-tags 'ssl sasl'"
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -5709,11 +6003,13 @@ buildvariants:
     compile_flags: --ssl MONGO_DISTMOD=amzn64 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: x86_64
     packager_distro: amazon
     repo_edition: enterprise
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -5734,6 +6030,7 @@ buildvariants:
   - name: jsCore_ese
   - name: jsCore_auth
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -5772,14 +6069,13 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    tooltags: "-tags 'ssl'"
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64-amazon
     compile_flags: --ssl MONGO_DISTMOD=amazon -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    multiversion_platform: amzn64
-    multiversion_edition: enterprise
+    multiversion_platform: amazon
+    multiversion_edition: targeted
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
     packager_script: packager.py
@@ -5788,6 +6084,8 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -5813,6 +6111,174 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
+  - name: aggregation_fuzzer
+  - name: jstestfuzz
+  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_concurrent_replication
+  - name: jstestfuzz_concurrent_sharded
+  - name: jstestfuzz_replication
+  - name: jstestfuzz_sharded
+  - name: mongosTest
+  - name: multiversion
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: bulk_gle_passthrough
+  - name: parallel
+  - name: parallel_compatibility
+  - name: concurrency
+  - name: concurrency_replication
+  - name: concurrency_sharded
+  - name: concurrency_simultaneous
+  - name: replica_sets
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: sharding
+  - name: sharding_auth
+  - name: sharding_last_stable_mongos_and_mixed_shards
+  - name: slow1
+  - name: serial_run
+  - name: sharded_collections_jscore_passthrough
+  - name: sharding_jscore_passthrough
+  - name: sharding_jscore_op_query_passthrough
+  - name: sharding_jscore_passthrough_wire_ops
+  - name: ssl
+  - name: sslSpecial
+  - name: tool
+  - name: package
+    distros:
+    - ubuntu1604-packer
+  - name: push
+
+- name: enterprise-amazon2
+  display_name: "Enterprise Amazon Linux 2"
+  modules:
+  - enterprise
+  run_on:
+  - amazon2-test
+  batchtime: 1440 # 1 day
+  expansions:
+    test_flags: >-
+      --excludeWithAnyTags=requires_mmapv1
+      --excludeWithAnyTags=SERVER-34286
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-amazon2
+    compile_flags: --ssl MONGO_DISTMOD=amazon2 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    has_packages: true
+    packager_script: packager_enterprise.py
+    packager_arch: x86_64
+    packager_distro: amazon2
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: true
+  tasks:
+  - name: compile
+    distros:
+    - amazon2-build
+  - name: compile_all
+    distros:
+    - amazon2-build
+  - name: aggregation_auth
+  - name: aggregation
+  - name: audit
+  - name: auth
+  - name: auth_audit
+  - name: dbtest
+  - name: ese
+  - name: failpoints_auth
+  - name: jsCore
+  - name: jsCore_ese
+  - name: jsCore_auth
+  - name: jsCore_decimal
+  - name: jsCore_txns
+  - name: aggregation_fuzzer
+  - name: jstestfuzz
+  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_concurrent_replication
+  - name: jstestfuzz_concurrent_sharded
+  - name: jstestfuzz_replication
+  - name: jstestfuzz_sharded
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: bulk_gle_passthrough
+  - name: replica_sets_auth
+  - name: replica_sets_ese
+  - name: powercycle
+  - name: sasl
+  - name: sharding_auth
+  - name: sharding_auth_audit
+  - name: sharding_ese
+  - name: slow1
+  - name: serial_run
+  - name: sharded_collections_jscore_passthrough
+  - name: sharding_jscore_passthrough
+  - name: sharding_jscore_op_query_passthrough
+  - name: sharding_jscore_passthrough_wire_ops
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: package
+    distros:
+    - ubuntu1604-packer
+  - name: push
+
+- name: amazon2
+  display_name: SSL Amazon Linux 2
+  run_on:
+  - amazon2-test
+  batchtime: 1440 # 1 day
+  expansions:
+    test_flags: >-
+      --excludeWithAnyTags=requires_mmapv1
+      --excludeWithAnyTags=SERVER-34286
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: x86_64-amazon2
+    compile_flags: --ssl MONGO_DISTMOD=amazon2 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    multiversion_platform: amazon
+    multiversion_edition: targeted
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    has_packages: true
+    packager_script: packager.py
+    packager_arch: x86_64
+    packager_distro: amazon2
+    repo_edition: org
+    scons_cache_scope: shared
+    shared_scons_pruning: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl'"
+    build_mongoreplay: true
+  tasks:
+  - name: compile
+    distros:
+    - amazon2-build
+  - name: compile_all
+    distros:
+    - amazon2-build
+  - name: aggregation
+  - name: aggregation_auth
+  - name: auth
+  - name: dbtest
+  - name: disk_wiredtiger
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth
+  - name: gle_auth_write_cmd
+  - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_write_cmd
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_decimal
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -5876,6 +6342,9 @@ buildvariants:
     python: python
     ext: zip
     use_scons_cache: true
+    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go"'
+    tooltags: ""
+    build_mongoreplay: false
   tasks:
   - name: compile
     distros:
@@ -5905,6 +6374,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: jsonSchema
   - name: mongosTest
   - name: noPassthrough
@@ -5959,6 +6429,9 @@ buildvariants:
   - name: replica_sets_initsync_static_jscore_passthrough
     distros:
     - windows-64-vs2015-large
+  - name: replica_sets_kill_primary_jscore_passthrough
+    distros:
+    - windows-64-vs2015-large
   - name: replica_sets_kill_secondaries_jscore_passthrough
     distros:
     - windows-64-vs2015-large
@@ -5987,9 +6460,7 @@ buildvariants:
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
     platform_decompress: unzip
-    tooltags: "-tags 'ssl sasl'"
     exe: ".exe"
-    gorootvars: 'PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     push_path: win32
     push_bucket: downloads.10gen.com
     push_name: win32
@@ -6006,6 +6477,9 @@ buildvariants:
     use_scons_cache: true
     multiversion_platform: windows
     multiversion_edition: enterprise
+    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: false
   tasks:
   - name: compile
     requires:
@@ -6022,6 +6496,8 @@ buildvariants:
   - name: audit
   - name: auth_audit
   - name: benchmarks_orphaned
+  - name: benchmarks_sharding
+  - name: buildscripts_test
   - name: dbtest
   - name: ese
   - name: external_auth
@@ -6032,6 +6508,7 @@ buildvariants:
     distros:
     - windows-64-vs2015-large
   - name: jsCore_auth
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -6066,9 +6543,7 @@ buildvariants:
     test_flags: --excludeWithAnyTags=requires_mmapv1
     use_wt_develop: true
     platform_decompress: unzip
-    tooltags: "-tags 'ssl sasl'"
     exe: ".exe"
-    gorootvars: 'PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
@@ -6079,6 +6554,33 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
+    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: false
+
+- <<: *enterprise-windows-64-2k8-template
+  name: enterprise-windows-64-2k8-openssl
+  display_name: "~ Enterprise Windows 2008R2 OpenSSL"
+  batchtime: 1440 # 1 day
+  modules:
+  - enterprise
+  expansions:
+    test_flags: --excludeWithAnyTags=requires_mmapv1
+    platform_decompress: unzip
+    exe: ".exe"
+    msi_target: msi
+    content_type: application/zip
+    compile_flags: --release --ssl --ssl-provider=openssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
+    # spawning a large number of linker processes.
+    num_scons_compile_all_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
+    python: python
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    ext: zip
+    use_scons_cache: true
+    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: false
 
 - name: enterprise-windows-64-2k8-async
   display_name: "~ Enterprise Windows 2008R2 async"
@@ -6089,11 +6591,8 @@ buildvariants:
   stepback: true
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --excludeWithAnyTags=requires_mmapv1
     platform_decompress: unzip
-    tooltags: "-tags 'ssl sasl'"
     exe: ".exe"
-    gorootvars: 'PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     push_path: win32
     push_bucket: downloads.10gen.com
     push_name: win32
@@ -6108,7 +6607,10 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
-    test_flags: --serviceExecutor=adaptive
+    test_flags: --serviceExecutor=adaptive --excludeWithAnyTags=requires_mmapv1
+    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: false
   tasks:
   - name: compile
     distros:
@@ -6126,9 +6628,7 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     platform_decompress: unzip
-    tooltags: "-tags 'ssl sasl'"
     exe: ".exe"
-    gorootvars: 'PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     push_path: win32
     push_bucket: downloads.10gen.com
     push_name: win32
@@ -6146,6 +6646,9 @@ buildvariants:
     use_scons_cache: true
     multiversion_platform: windows
     multiversion_edition: enterprise
+    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: false
   tasks:
   - name: compile
     distros:
@@ -6164,6 +6667,7 @@ buildvariants:
   - name: concurrency_simultaneous
   - name: jsCore
   - name: jsCore_auth
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -6194,8 +6698,6 @@ buildvariants:
     test_flags: --excludeWithAnyTags=requires_mmapv1
     platform_decompress: unzip
     exe: ".exe"
-    gorootvars: 'PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
-    tooltags: "-tags ssl"
     push_path: win32
     push_bucket: downloads.mongodb.org
     push_name: win32
@@ -6211,6 +6713,9 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
+    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    tooltags: "-tags ssl"
+    build_mongoreplay: false
   tasks:
   - name: compile
     distros:
@@ -6239,6 +6744,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: jsonSchema
   - name: aggregation_fuzzer
   - name: jstestfuzz
@@ -6249,6 +6755,8 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_causal_consistency
   - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session
+  - name: jstestfuzz_interrupt
+  - name: jstestfuzz_interrupt_replication
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_session
   - name: jstestfuzz_sharded
@@ -6265,7 +6773,8 @@ buildvariants:
   - name: parallel_compatibility
   - name: powercycle
   - name: powercycle_fcv3.6
-  - name: powercycle_replication
+# SERVER-34075: Re-enable once powercycle_replication* can test against recoverable rollback changes.
+#  - name: powercycle_replication
   - name: powercycle_syncdelay
   - name: read_concern_linearizable_passthrough
   - name: read_concern_majority_passthrough
@@ -6305,9 +6814,7 @@ buildvariants:
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
     platform_decompress: unzip
-    tooltags: "-tags 'ssl sasl'"
     exe: ".exe"
-    gorootvars: 'PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     content_type: application/zip
     compile_flags: --dbg=on --opt=off --ssl MONGO_DISTMOD=2008plus CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
@@ -6317,6 +6824,9 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
+    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: false
   tasks:
   # This variant tests that unoptimized, DEBUG mongos and mongod binaries can run on Windows.
   # It has a minimal amount of tasks because unoptimized builds are slow, which causes
@@ -6342,12 +6852,12 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: osx-ssl
     push_arch: x86_64
-    tooltags: "-tags 'ssl openssl_pre_1.0'"
-    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
+    compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
     multiversion_platform: osx-ssl
     num_jobs_available: 1
+    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    tooltags: "-tags 'ssl openssl_pre_1.0'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -6383,6 +6893,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -6391,6 +6902,8 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_causal_consistency
   - name: jstestfuzz_concurrent_sharded_session
+  - name: jstestfuzz_interrupt
+  - name: jstestfuzz_interrupt_replication
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_session
   - name: jstestfuzz_sharded
@@ -6437,9 +6950,10 @@ buildvariants:
     push_name: osx-debug
     push_arch: x86_64
     num_jobs_available: 1
-    gorootvars: CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --dbg=on --opt=on -j$(sysctl -n hw.logicalcpu) --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
+    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    tooltags: ""
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -6452,11 +6966,13 @@ buildvariants:
   - name: jsCore
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: mongosTest
   - name: replica_sets
   - name: tool
 
-- name: enterprise-osx-1010
+- &enterprise-osx-1010-template
+  name: enterprise-osx-1010
   display_name: Enterprise OS X 10.10
   modules:
   - enterprise
@@ -6469,11 +6985,11 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: osx
     push_arch: x86_64-enterprise
-    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
-    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
+    compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
     num_jobs_available: 1
+    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
     build_mongoreplay: true
     multiversion_platform: osx
     multiversion_edition: enterprise
@@ -6486,6 +7002,7 @@ buildvariants:
   - name: ese
   - name: jsCore
   - name: jsCore_auth
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -6501,88 +7018,251 @@ buildvariants:
     distros:
     - rhel70-small
 
-- name: ios-102-debug
-  display_name: "iOS 10.2 DEBUG"
+- <<: *enterprise-osx-1010-template
+  name: enterprise-osx-1010-openssl
+  display_name: Enterprise OS X 10.10 OpenSSL
+  expansions:
+    test_flags: --excludeWithAnyTags=requires_mmapv1
+    push_path: osx
+    push_bucket: downloads.10gen.com
+    push_name: osx
+    push_arch: x86_64-enterprise
+    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
+    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
+    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
+    compile_flags: --ssl --ssl-provider=openssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" LIBPATH="$PWD/openssl_install_dir/lib" CPPPATH="$PWD/openssl_install_dir/include"
+    num_jobs_available: 1
+    build_mongoreplay: true
+    multiversion_platform: osx
+    multiversion_edition: enterprise
+    build_openssl: true
+    openssl_config_flags: "-mmacosx-version-min=10.10"
+    openssl_make_flags: "-j$(sysctl -n hw.logicalcpu)"
+
+
+###########################################
+#          Mobile SDK buildvariants       #
+###########################################
+
+- name: embedded-sdk-macosx-10.10-debug
+  display_name: "Embedded SDK - macOS 10.10 DEBUG"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
     build_cdriver: true
-    cdriver_configure_flags: --build x86_64-apple-darwin16.6.0 --host arm-apple-darwin CC="$(xcrun -f --sdk iphoneos clang)" CXX="$(xcrun -f --sdk iphoneos clang++)" CPPFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 "  CFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 " CXXFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64 " LDFLAGS="-miphoneos-version-min=10.2 -arch arm64"
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --variables-files=etc/scons/xcode_ios.vars  CPPPATH="$(dirname $PWD)/mongo-c-driver/install/include/libbson-1.0 $(dirname $PWD)/mongo-c-driver/install/include/libmongoc-1.0" LIBPATH="$(dirname $PWD)/mongo-c-driver/install/lib"
+    cdriver_configure_flags: >-
+      CC="$(xcrun -f --sdk macosx clang)"
+      CXX="$(xcrun -f --sdk macosx clang++)"
+      CPPFLAGS="-isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10"
+      CFLAGS="-isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10"
+      CXXFLAGS="-isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10"
+      LDFLAGS="-mmacosx-version-min=10.10 -Wl,-rpath,@loader_path/../lib"
+    compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
+    compile_flags: >-
+      -j$(sysctl -n hw.logicalcpu)
+      --dbg=on
+      --variables-files=etc/scons/xcode_macos.vars
+    disable_unit_tests: true
+    enable_embedded_tests: native
+  tasks:
+  - name: compile_mobile
+
+- name: embedded-sdk-iphoneos-10.2-debug
+  display_name: "Embedded SDK - iOS 10.2 DEBUG"
+  run_on:
+  - macos-1012
+  batchtime: 1440 # 1 day
+  expansions:
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
+    build_cdriver: true
+    cdriver_configure_flags: >-
+      --build x86_64-apple-darwin16.6.0
+      --host arm-apple-darwin
+      CC="$(xcrun -f --sdk iphoneos clang)"
+      CXX="$(xcrun -f --sdk iphoneos clang++)"
+      CPPFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64"
+      CFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64"
+      CXXFLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2 -arch arm64"
+      LDFLAGS="-miphoneos-version-min=10.2 -arch arm64 -Wl,-rpath,@loader_path/../lib"
+    compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
+    compile_flags: >-
+      -j$(sysctl -n hw.logicalcpu)
+      --dbg=on
+      --variables-files=etc/scons/xcode_ios.vars
     disable_unit_tests: true
   tasks:
-  - name: compile_all
+  - name: compile_mobile
 
-- name: ios-sim-102-debug
-  display_name: "iOS Simulator 10.2 DEBUG"
+- name: embedded-sdk-iphonesimulator-10.2-debug
+  display_name: "Embedded SDK - iOS Simulator 10.2 DEBUG"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
     build_cdriver: true
-    cdriver_configure_flags: --build x86_64-apple-darwin16.6.0 --host x86_64-apple-darwin CC="$(xcrun -f --sdk iphonesimulator clang)" CXX="$(xcrun -f --sdk iphonesimulator clang++)" CPPFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2 "  CFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2 " CXXFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2 " LDFLAGS="-miphoneos-version-min=10.2 "
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --variables-files=etc/scons/xcode_ios_sim.vars CPPPATH="$(dirname $PWD)/mongo-c-driver/install/include/libbson-1.0 $(dirname $PWD)/mongo-c-driver/install/include/libmongoc-1.0" LIBPATH="$(dirname $PWD)/mongo-c-driver/install/lib"
+    cdriver_configure_flags: >-
+      --build x86_64-apple-darwin16.6.0
+      --host x86_64-apple-darwin
+      CC="$(xcrun -f --sdk iphonesimulator clang)"
+      CXX="$(xcrun -f --sdk iphonesimulator clang++)"
+      CPPFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
+      CFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
+      CXXFLAGS="-isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
+      LDFLAGS="-miphoneos-version-min=10.2 -Wl,-rpath,@loader_path/../lib"
+    compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
+    compile_flags: >-
+      -j$(sysctl -n hw.logicalcpu)
+      --dbg=on
+      --variables-files=etc/scons/xcode_ios_sim.vars
     disable_unit_tests: true
-    enable_iostvos_sim_tests: true
+    enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: iPhone-7
-    ios_sim_runtime: iOS-10-3
+    ios_sim_runtime: iOS-10-2
   tasks:
-  - name: compile_all
+  - name: compile_mobile
 
-- name: tvos-101-debug
-  display_name: "tvOS 10.1 DEBUG"
+- name: embedded-sdk-appletvos-10.2-debug
+  display_name: "Embedded SDK - tvOS 10.2 DEBUG"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
   expansions:
     build_cdriver: true
-    cdriver_configure_flags: --build x86_64-apple-darwin16.6.0 --host arm-apple-darwin CC="$(xcrun -f --sdk appletvos clang)" CXX="$(xcrun -f --sdk appletvos clang++)" CPPFLAGS="-isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.1 -arch arm64"  CFLAGS="-isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.1 -arch arm64" CXXFLAGS="-isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.1 -arch arm64" LDFLAGS="-mtvos-version-min=10.1 -arch arm64"
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_tvos.vars CPPPATH="$(dirname $PWD)/mongo-c-driver/install/include/libbson-1.0 $(dirname $PWD)/mongo-c-driver/install/include/libmongoc-1.0" LIBPATH="$(dirname $PWD)/mongo-c-driver/install/lib"
+    cdriver_configure_flags: >-
+      --build x86_64-apple-darwin16.6.0
+      --host arm-apple-darwin
+      CC="$(xcrun -f --sdk appletvos clang)"
+      CXX="$(xcrun -f --sdk appletvos clang++)"
+      CPPFLAGS="-isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2 -arch arm64"
+      CFLAGS="-isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2 -arch arm64"
+      CXXFLAGS="-isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2 -arch arm64"
+      LDFLAGS="-mtvos-version-min=10.2 -arch arm64 -Wl,-rpath,@loader_path/../lib"
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
+    compile_env: DEVELOPER_DIR=/Applications/XCode9.2.app
+    compile_flags: >-
+      -j$(sysctl -n hw.logicalcpu)
+      --dbg=on
+      --variables-files=etc/scons/xcode_tvos.vars
     disable_unit_tests: true
   tasks:
-  - name: compile_all
+  - name: compile_mobile
 
-- name: tvos-sim-101-debug
-  display_name: "tvOS Simulator 10.1 DEBUG"
+- name: embedded-sdk-appletvsimulator-10.2-debug
+  display_name: "Embedded SDK - tvOS Simulator 10.2 DEBUG"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
   expansions:
     build_cdriver: true
-    cdriver_configure_flags: --build x86_64-apple-darwin16.6.0 --host x86_64-apple-darwin CC="$(xcrun -f --sdk appletvsimulator clang)" CXX="$(xcrun -f --sdk appletvsimulator clang++)" CPPFLAGS="-isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.1"  CFLAGS="-isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.1" CXXFLAGS="-isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.1" LDFLAGS="-mtvos-version-min=10.1"
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: -j$(sysctl -n hw.logicalcpu) --dbg=on --disable-warnings-as-errors --js-engine=none --variables-files=etc/scons/xcode_tvos_sim.vars CPPPATH="$(dirname $PWD)/mongo-c-driver/install/include/libbson-1.0 $(dirname $PWD)/mongo-c-driver/install/include/libmongoc-1.0" LIBPATH="$(dirname $PWD)/mongo-c-driver/install/lib"
+    cdriver_configure_flags: >-
+      --build x86_64-apple-darwin16.6.0
+      --host x86_64-apple-darwin
+      CC="$(xcrun -f --sdk appletvsimulator clang)"
+      CXX="$(xcrun -f --sdk appletvsimulator clang++)"
+      CPPFLAGS="-isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
+      CFLAGS="-isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
+      CXXFLAGS="-isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
+      LDFLAGS="-mtvos-version-min=10.2 -Wl,-rpath,@loader_path/../lib"
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
+    compile_env: DEVELOPER_DIR=/Applications/XCode9.2.app
+
+    compile_flags: >-
+      -j$(sysctl -n hw.logicalcpu)
+      --dbg=on
+      --variables-files=etc/scons/xcode_tvos_sim.vars
     disable_unit_tests: true
-    enable_iostvos_sim_tests: true
+    enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: Apple-TV-1080p
     ios_sim_runtime: tvOS-10-2
   tasks:
-  - name: compile_all
+  - name: compile_mobile
 
-- name: android-emulator
-  display_name: "Android emulator DEBUG"
+- name: embedded-sdk-ubuntu-1604-x86_64-debug
+  display_name: "Embedded SDK - Ubuntu 16.04 x86_64 DEBUG"
   run_on:
   - ubuntu1604-build
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
     build_cdriver: true
-    cdriver_configure_flags: --prefix=$(pwd)/install --host aarch64-unknown-linux-gnu CC=$(dirname $(pwd))/android_toolchain/bin/clang CXX=$(dirname $(pwd))/android_toolchain/clang++
-    compile_env: JAVA_HOME=/opt/java/jdk8/
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=on --android-toolchain-path=$(dirname $(pwd))/android_toolchain --variables-files=etc/scons/android_toolchain.vars CPPPATH="$(dirname $(pwd))/mongo-c-driver/install/include/libbson-1.0 $(dirname $(pwd))/mongo-c-driver/install/include/libmongoc-1.0" LIBPATH="$(dirname $(pwd))/mongo-c-driver/install/lib"
+    # Normally, we would include -Wl,z,origin here to make origin processing a thing
+    # but see the notes in SConstruct about z,origin and android.
+    cdriver_configure_flags: >-
+      CC="/opt/mongodbtoolchain/v2/bin/gcc"
+      CXX="/opt/mongodbtoolchain/v2/bin/g++"
+      LDFLAGS="-Wl,-rpath,\$ORIGIN/../lib"
+    # We need --allocator=system here to work around SERVER-XXXXX
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --dbg=on
+      --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+      --allocator=system
     disable_unit_tests: true
-    enable_android_emu_tests: true
-    setup_android_toolchain: true
+    enable_embedded_tests: native
   tasks:
-  - name: compile_all
+  - name: compile_mobile
+
+- name: embedded-sdk-android-arm64-debug
+  display_name: "Embedded SDK - Android arm64 DEBUG"
+  run_on:
+  - ubuntu1604-build
+  batchtime: 1440 # 1 day
+  expansions:
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
+    build_cdriver: true
+    # Normally, we would include -Wl,z,origin here to make origin processing a thing
+    # but see the notes in SConstruct about z,origin and android.
+    cdriver_configure_flags: >-
+      --host aarch64-unknown-linux-gnu
+      CC=$(dirname $(pwd))/android_toolchain/bin/clang
+      CXX=$(dirname $(pwd))/android_toolchain/clang++
+      LDFLAGS="-Wl,-rpath,\$ORIGIN/../lib"
+    compile_env: JAVA_HOME=/opt/java/jdk8/
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --dbg=on
+      --android-toolchain-path=$(dirname $(pwd))/android_toolchain
+      --variables-files=etc/scons/android_toolchain.vars
+    disable_unit_tests: true
+    enable_embedded_tests: android_emulator
+    setup_android_toolchain: true
+    android_toolchain_system_image_arch: "arm64-v8a"
+    android_toolchain_target_arch: "arm64"
+  tasks:
+  - name: compile_mobile
+
+- name: embedded-sdk-android-x86_64-debug
+  display_name: "Embedded SDK - Android x86_64 DEBUG"
+  run_on:
+  - ubuntu1604-build
+  batchtime: 1440 # 1 day
+  expansions:
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
+    build_cdriver: true
+    # Normally, we would include -Wl,z,origin here to make origin processing a thing
+    # but see the notes in SConstruct about z,origin and android.
+    cdriver_configure_flags: >-
+      --host x86_64-unknown-linux-gnu
+      CC=$(dirname $(pwd))/android_toolchain/bin/clang
+      CXX=$(dirname $(pwd))/android_toolchain/clang++
+      LDFLAGS="-Wl,-rpath,\$ORIGIN/../lib"
+    compile_env: JAVA_HOME=/opt/java/jdk8/
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --dbg=on
+      --android-toolchain-path=$(dirname $(pwd))/android_toolchain
+      --variables-files=etc/scons/android_toolchain.vars
+    disable_unit_tests: true
+    # The Android x86_64 emulator requires KVM.
+    enable_embedded_tests: false
+    setup_android_toolchain: true
+    android_toolchain_system_image_arch: "x86_64"
+    android_toolchain_target_arch: "x86_64"
+  tasks:
+  - name: compile_mobile
 
 ###########################################
 #          Redhat buildvariants           #
@@ -6596,8 +7276,6 @@ buildvariants:
   - rhel62-small
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -6605,14 +7283,16 @@ buildvariants:
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
     multiversion_platform: rhel62
-    multiversion_edition: targeted
+    multiversion_edition: enterprise
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: x86_64
     packager_distro: rhel62
     repo_edition: enterprise
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -6644,6 +7324,10 @@ buildvariants:
   - name: benchmarks_orphaned
     distros:
     - centos6-perf
+  - name: benchmarks_sharding
+    distros:
+    - centos6-perf
+  - name: buildscripts_test
   - name: bulk_gle_passthrough
   - name: causally_consistent_jscore_passthrough
   - name: causally_consistent_jscore_passthrough_auth
@@ -6680,6 +7364,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: jsonSchema
   - name: aggregation_fuzzer
   - name: jstestfuzz
@@ -6690,6 +7375,8 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_causal_consistency
   - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session
+  - name: jstestfuzz_interrupt
+  - name: jstestfuzz_interrupt_replication
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_initsync
   - name: jstestfuzz_replication_session
@@ -6729,6 +7416,9 @@ buildvariants:
     distros:
     - rhel62-large
   - name: replica_sets_initsync_static_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_kill_primary_jscore_passthrough
     distros:
     - rhel62-large
   - name: replica_sets_kill_secondaries_jscore_passthrough
@@ -6796,11 +7486,9 @@ buildvariants:
   stepback: false
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     compile_flags: --dbg=on --gcov --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     multiversion_platform: rhel62
-    multiversion_edition: targeted
+    multiversion_edition: enterprise
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 2)) # Avoid starting too many mongod's
     # The gcov instrumentation saves the path the .gcno files were created in as the default path
     # for the .gcda files. In Evergreen the path will start with /data/mci/[Hashed ID]/src/... where
@@ -6810,6 +7498,8 @@ buildvariants:
     # Mixing --cache and --gcov doesn't work correctly yet. See SERVER-11084
     timeout_secs: 10800 # 3 hour timeout
     use_scons_cache: false
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -6857,6 +7547,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion
@@ -6875,6 +7566,7 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
+  - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
   - name: retryable_writes_jscore_passthrough
   - name: sasl
@@ -6909,8 +7601,6 @@ buildvariants:
   - rhel70-small
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -6918,11 +7608,13 @@ buildvariants:
     compile_flags: --ssl MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: x86_64
     packager_distro: rhel70
     repo_edition: enterprise
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -6938,10 +7630,12 @@ buildvariants:
   - name: auth
   - name: auth_audit
   - name: benchmarks_orphaned
+  - name: benchmarks_sharding
   - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -6972,6 +7666,8 @@ buildvariants:
     compile_flags: MONGO_DISTMOD=ubuntu1604 --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     scons_cache_scope: shared
     shared_scons_pruning: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: ""
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -6992,8 +7688,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags ssl"
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -7008,6 +7702,8 @@ buildvariants:
     packager_distro: rhel62
     repo_edition: org
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags ssl"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -7033,6 +7729,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7075,8 +7772,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags ssl"
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -7092,6 +7787,8 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags ssl"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -7117,6 +7814,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_decimal
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7165,20 +7863,17 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel71-power8-build
   - rhel71-power8-test
   batchtime: 1440 # 1 day
   stepback: false
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
     # We need to compensate for SMT8 setting the cpu count very high and lower the amount of parallelism down
     compile_flags: --ssl MONGO_DISTMOD=rhel71 --release -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(echo "$(grep -c processor /proc/cpuinfo)/4" | bc)
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: ppc64le
     packager_distro: rhel71
     push_path: linux
@@ -7186,6 +7881,8 @@ buildvariants:
     push_name: linux
     push_arch: ppc64le-enterprise-rhel71
     repo_edition: enterprise
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
+    tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: rhel71
     multiversion_architecture: ppc64le
@@ -7226,6 +7923,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7273,18 +7971,15 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel72-zseries-build
   - rhel72-zseries-test
   batchtime: 2880 # 2 days
   stepback: false
   expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
     compile_flags: --ssl MONGO_DISTMOD=rhel72 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: 2
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: s390x
     packager_distro: rhel72
     push_path: linux
@@ -7292,6 +7987,8 @@ buildvariants:
     push_name: linux
     push_arch: s390x-enterprise-rhel72
     repo_edition: enterprise
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: rhel72
     multiversion_architecture: s390x
@@ -7332,6 +8029,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7379,18 +8077,15 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel67-zseries-build
   - rhel67-zseries-test
   batchtime: 1440 # 1 day
   stepback: false
   expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto) -lsasl2" -tags 'sasl ssl'
     compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_gcc.vars --use-s390x-crc32=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: s390x
     packager_distro: rhel67
     push_path: linux
@@ -7398,6 +8093,8 @@ buildvariants:
     push_name: linux
     push_arch: s390x-enterprise-rhel67
     repo_edition: enterprise
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -7436,6 +8133,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: mongosTest
   - name: noPassthroughWithMongod
   - name: noPassthrough
@@ -7469,67 +8167,11 @@ buildvariants:
   - name: write_concern_majority_passthrough
   - name: push
     distros:
-    - rhel70
     - rhel62-large
 
 ###########################################
 #          Ubuntu buildvariants           #
 ###########################################
-
-- name: enterprise-ubuntu1204-64
-  display_name: Enterprise Ubuntu 12.04
-  modules:
-  - enterprise
-  run_on:
-  - ubuntu1204-test
-  batchtime: 1440 # 1 day
-  expansions:
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
-    push_path: linux
-    push_bucket: downloads.10gen.com
-    push_name: linux
-    push_arch: x86_64-enterprise-ubuntu1204
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1204 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    has_packages: true
-    packager_script: packager-enterprise.py
-    packager_arch: x86_64
-    packager_distro: ubuntu1204
-    repo_edition: enterprise
-    scons_cache_scope: shared
-    build_mongoreplay: true
-  tasks:
-  - name: compile
-    distros:
-    - ubuntu1204-build
-  - name: compile_all
-    distros:
-    - ubuntu1204-build
-  - name: audit
-  - name: dbtest
-  - name: ese
-  - name: jsCore
-  - name: jsCore_auth
-  - name: aggregation_fuzzer
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
-  - name: replica_sets_auth
-  - name: sasl
-  - name: sharding_auth
-  - name: snmp
-  - name: ssl
-  - name: sslSpecial
-  - name: package
-    distros:
-    - ubuntu1604-packer
-  - name: push
-
 
 - name: enterprise-ubuntu1404-64
   display_name: Enterprise Ubuntu 14.04
@@ -7540,8 +8182,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -7549,11 +8189,13 @@ buildvariants:
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1404 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: x86_64
     packager_distro: ubuntu1404
     repo_edition: enterprise
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -7588,6 +8230,7 @@ buildvariants:
     - ubuntu1404-jepsen
   - name: jsCore
   - name: jsCore_auth
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7616,8 +8259,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -7626,11 +8267,13 @@ buildvariants:
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: x86_64
     packager_distro: ubuntu1604
     repo_edition: enterprise
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
     additional_targets: dagger
   tasks:
@@ -7645,6 +8288,7 @@ buildvariants:
   - name: ese
   - name: jsCore
   - name: jsCore_auth
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7674,11 +8318,11 @@ buildvariants:
    - ubuntu1604-test
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     lang_environment: LANG=C
     compile_flags: --link-model=dynamic --ssl CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -7701,8 +8345,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -7710,11 +8352,13 @@ buildvariants:
     compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: x86_64
     packager_distro: suse12
     repo_edition: enterprise
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -7728,6 +8372,7 @@ buildvariants:
   - name: ese
   - name: jsCore
   - name: jsCore_auth
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7752,13 +8397,10 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - suse12-zseries-build
   - suse12-zseries-test
   batchtime: 1440 # 1 day
   stepback: false
   expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -7767,14 +8409,16 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --excludeWithAnyTags=requires_mmapv1
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: s390x
     packager_distro: suse12
     repo_edition: enterprise
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: suse12
     multiversion_architecture: s390x
-    multiversion_edition: targeted
+    multiversion_edition: enterprise
   tasks:
   - name: compile
     distros:
@@ -7811,6 +8455,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7861,7 +8506,6 @@ buildvariants:
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
     gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags ssl"
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -7877,6 +8521,8 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -7901,6 +8547,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7949,8 +8596,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -7958,11 +8603,13 @@ buildvariants:
     compile_flags: --ssl MONGO_DISTMOD=debian71 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: x86_64
     packager_distro: debian71
     repo_edition: enterprise
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -7976,6 +8623,7 @@ buildvariants:
   - name: ese
   - name: jsCore
   - name: jsCore_auth
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -8004,8 +8652,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -8013,11 +8659,13 @@ buildvariants:
     compile_flags: --ssl MONGO_DISTMOD=debian81 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: x86_64
     packager_distro: debian81
     repo_edition: enterprise
     scons_cache: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8031,6 +8679,7 @@ buildvariants:
   - name: ese
   - name: jsCore
   - name: jsCore_auth
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -8057,8 +8706,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags ssl"
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -8074,6 +8721,8 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8098,6 +8747,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -8144,8 +8794,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags ssl"
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -8161,6 +8809,8 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8185,6 +8835,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -8232,8 +8883,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     push_path: linux
     push_bucket: downloads.10gen.com
     push_name: linux
@@ -8241,11 +8890,13 @@ buildvariants:
     compile_flags: --ssl MONGO_DISTMOD=debian92 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: x86_64
     packager_distro: debian92
     repo_edition: enterprise
-    use_scons_cache: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
+    scons_cache_scope: shared
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8259,6 +8910,7 @@ buildvariants:
   - name: ese
   - name: jsCore
   - name: jsCore_auth
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -8284,8 +8936,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags ssl"
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -8299,7 +8949,10 @@ buildvariants:
     packager_arch: x86_64
     packager_distro: debian92
     repo_edition: org
-    use_scons_cache: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl'"
+    scons_cache_scope: shared
+    shared_scons_pruning: true
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8324,6 +8977,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
+  - name: jsCore_txns
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -8374,8 +9028,6 @@ buildvariants:
   - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling,requires_mmapv1
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
@@ -8383,6 +9035,8 @@ buildvariants:
     multiversion_edition: enterprise
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8431,6 +9085,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: aggregation_fuzzer
@@ -8441,6 +9096,8 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_concurrent_sharded_causal_consistency
   - name: jstestfuzz_concurrent_sharded_session
+  - name: jstestfuzz_interrupt
+  - name: jstestfuzz_interrupt_replication
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_session
   - name: jstestfuzz_sharded
@@ -8489,14 +9146,26 @@ buildvariants:
   run_on:
   - rhel62-small
   batchtime: 1440 # 1 day
-  expansions:
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
+  expansions: &enterprise-rhel-62-64-bit-mobile-expansions
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
-    test_flags: --storageEngine=mobile --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_sharding,requires_replication,SERVER-32709,SERVER-32869,SERVER-32993,SERVER-32997
-    compile_flags: --mobile-se=on --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
+    # Transactions are only supported on replica sets, and replication is not supported by the
+    # mobile storage engine.
+    test_flags: >-
+      --storageEngine=mobile
+      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions
+      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993,SERVER-32997
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --mobile-se=on
+      --ssl
+      --use-basis-tech-rosette-linguistics-platform=on
+      --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+      CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include"
+      MONGO_DISTMOD=rhel62
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8539,6 +9208,28 @@ buildvariants:
   - name: session_jscore_passthrough
   - name: snmp
 
+- name: enterprise-rhel-62-64-bit-required-mobile
+  display_name: "! Enterprise RHEL 6.2 (mobile)"
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions:
+    <<: *enterprise-rhel-62-64-bit-mobile-expansions
+    burn_in_tests_build_variant: enterprise-rhel-62-64-bit-mobile
+  tasks:
+  # This build variant exists specifically to test that newly added or modified JavaScript tests are
+  # correctly tagged with "requires_replication" and "requires_sharding" prior to the changes being
+  # pushed. It uses the task list from the enterprise-rhel-62-64-bit-mobile build variant to
+  # determine the resmoke.py YAML suite configurations to run the tests under. Do not add more tasks
+  # to this list.
+  - name: compile
+    requires:
+    - name: burn_in_tests
+    distros:
+    - rhel62-large
+  - name: burn_in_tests
+
 - name: enterprise-osx-1010-mobile
   display_name: Enterprise OS X 10.10 (mobile)
   modules:
@@ -8551,12 +9242,25 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: osx
     push_arch: x86_64-enterprise
-    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
-    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
-    test_flags: --storageEngine=mobile --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_sharding,requires_replication,SERVER-32709,SERVER-32869,SERVER-32993,SERVER-32997
+    # Transactions are only supported on replica sets, and replication is not supported by the
+    # mobile storage engine.
+    test_flags: >-
+      --storageEngine=mobile
+      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions
+      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993,SERVER-32997
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: --mobile-se=on --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" CPPPATH=/opt/mongodbtoolchain/v2/include
+    compile_flags: >-
+      -j$(sysctl -n hw.logicalcpu)
+      --libc++
+      --mobile-se=on
+      --release
+      --ssl
+      CCFLAGS="-mmacosx-version-min=10.10"
+      CPPPATH=/opt/mongodbtoolchain/v2/include
+      LINKFLAGS="-mmacosx-version-min=10.10"
     num_jobs_available: 1
+    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8567,6 +9271,7 @@ buildvariants:
   - name: audit
   - name: auth
   - name: auth_audit
+
   - name: dbtest
   # TODO SERVER-32993: Re-enable the concurrency suite on the mobile storage engine builders.
   # - name: concurrency
@@ -8597,10 +9302,13 @@ buildvariants:
   - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_mmapv1,requires_wiredtiger
+    # Transactions are not explicitly supported on the ephemeralForTest storage engine.
+    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_mmapv1,requires_wiredtiger,uses_transactions
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: ""
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8672,17 +9380,16 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel71-power8-build
   - rhel71-power8-test
   batchtime: 10080 # 7 days
   stepback: false
   expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
     # We need to compensate for SMT8 setting the cpu count very high and lower the amount of parallelism down
     compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel71 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(echo "$(grep -c processor /proc/cpuinfo)/4" | bc)
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_mmapv1,requires_journaling
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
+    tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8717,6 +9424,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -8751,16 +9459,15 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel72-zseries-build
   - rhel72-zseries-test
   batchtime: 10080 # 7 days
   stepback: false
   expansions:
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libsasl2)" -tags 'sasl ssl'
     compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: 2
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_mmapv1,requires_journaling
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -8803,6 +9510,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -8843,8 +9551,11 @@ buildvariants:
     build_rocksdb: true
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CPPPATH=$(readlink -f ../rocksdb/include/) LIBPATH=$(readlink -f ../rocksdb/) LIBS=rocksdb --variables-files=etc/scons/mongodbtoolchain_gcc.vars --runtime-hardening=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --storageEngine=rocksdb --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger
+    # Transactions are not explicitly supported on the RocksDB storage engine.
+    test_flags: --storageEngine=rocksdb --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,uses_transactions
     use_scons_cache: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: ""
     build_mongoreplay: true
   stepback: false
   tasks:
@@ -8868,17 +9579,19 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
     lang_environment: LANG=C
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform: ubuntu1604
-    multiversion_edition: targeted
+    multiversion_edition: enterprise
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl'"
     build_mongoreplay: true
     hang_analyzer_dump_core: false
+    scons_cache_scope: shared
   tasks:
   - name: compile
   - name: compile_all
@@ -8928,6 +9641,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: jsonSchema
   - name: mongosTest
   - name: multiversion_auth
@@ -8947,6 +9661,7 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
+  - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
   - name: retryable_writes_jscore_passthrough
   - name: retryable_writes_jscore_stepdown_passthrough
@@ -8982,15 +9697,17 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
     lang_environment: LANG=C
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl'"
     build_mongoreplay: true
     hang_analyzer_dump_core: false
+    scons_cache_scope: shared
   tasks:
   - name: compile
   - name: compile_all
@@ -9003,6 +9720,8 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_causal_consistency
   - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session
+  - name: jstestfuzz_interrupt
+  - name: jstestfuzz_interrupt_replication
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_session
   - name: jstestfuzz_sharded
@@ -9022,15 +9741,16 @@ buildvariants:
     test_flags: --excludeWithAnyTags=requires_mmapv1
     # We need llvm-symbolizer in the PATH for UBSAN.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform: ubuntu1604
-    multiversion_edition: targeted
+    multiversion_edition: enterprise
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under UBSAN build.
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
+    scons_cache_scope: shared
   tasks:
   - name: compile
   - name: compile_all
@@ -9081,6 +9801,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: jsonSchema
   - name: mongosTest
   - name: multiversion_auth
@@ -9100,6 +9821,7 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
+  - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
   - name: retryable_writes_jscore_passthrough
   - name: retryable_writes_jscore_stepdown_passthrough
@@ -9136,15 +9858,17 @@ buildvariants:
   stepback: true
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
     lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl'"
     build_mongoreplay: true
     hang_analyzer_dump_core: false
+    scons_cache_scope: shared
   tasks:
   - name: compile
   - name: compile_all
@@ -9161,16 +9885,18 @@ buildvariants:
   stepback: true
   batchtime: 1440 # 1 day
   expansions:
-    tooltags: "-tags 'ssl'"
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v2/bin
     lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl'"
     build_mongoreplay: false
     hang_analyzer_dump_core: false
     test_flags: --serviceExecutor=adaptive --excludeWithAnyTags=requires_mmapv1
+    scons_cache_scope: shared
   tasks:
   - name: compile
   - name: compile_all
@@ -9210,6 +9936,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
+  - name: jsCore_txns
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion
@@ -9256,13 +9983,14 @@ buildvariants:
   - enterprise
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: "-tags 'ssl sasl'"
     lang_environment: LANG=C
     compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --link-model=dynamic
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
     scons_cache_mode: all
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: true
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -9292,9 +10020,8 @@ buildvariants:
   - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
-    tooltags: -tags 'ssl sasl'
+    # Transactions are not supported on the MMAPv1 storage engine.
+    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,uses_transactions
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
     compile_flags: >-
       --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release
@@ -9302,14 +10029,16 @@ buildvariants:
       CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include"
       --use-basis-tech-rosette-linguistics-platform=on
     multiversion_platform: rhel62
-    multiversion_edition: targeted
+    multiversion_edition: enterprise
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     has_packages: true
-    packager_script: packager-enterprise.py
+    packager_script: packager_enterprise.py
     packager_arch: x86_64
     packager_distro: rhel62
     repo_edition: enterprise
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: -tags 'ssl sasl'
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -9345,6 +10074,8 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_causal_consistency
   - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session
+  - name: jstestfuzz_interrupt
+  - name: jstestfuzz_interrupt_replication
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_initsync
   - name: jstestfuzz_replication_session
@@ -9400,10 +10131,13 @@ buildvariants:
   - windows-64-vs2015-small
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger
+    # Transactions are not supported on the MMAPv1 storage engine.
+    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,uses_transactions
     platform_decompress: unzip
-    tooltags: -tags 'ssl sasl'
     exe: .exe
+    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: false
     gorootvars: >-
       PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH"
       CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"
@@ -9467,6 +10201,8 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_causal_consistency
   - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session
+  - name: jstestfuzz_interrupt
+  - name: jstestfuzz_interrupt_replication
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_initsync
   - name: jstestfuzz_replication_session
@@ -9519,11 +10255,8 @@ buildvariants:
   - macos-1012
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger
-    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
-    gorootvars: >-
-      CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10
-      CGO_LDFLAGS=-mmacosx-version-min=10.10
+    # Transactions are not supported on the MMAPv1 storage engine.
+    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,uses_transactions
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: >-
       --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10"
@@ -9531,6 +10264,8 @@ buildvariants:
     multiversion_platform: osx
     multiversion_edition: enterprise
     num_jobs_available: 1
+    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
     build_mongoreplay: true
   tasks:
   - name: compile
@@ -9566,6 +10301,8 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_causal_consistency
   - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_concurrent_sharded_session
+  - name: jstestfuzz_interrupt
+  - name: jstestfuzz_interrupt_replication
   - name: jstestfuzz_replication
   - name: jstestfuzz_replication_initsync
   - name: jstestfuzz_replication_session
@@ -9608,8 +10345,10 @@ buildvariants:
     push_arch: x86_64
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --nojournal --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,requires_journaling
+    test_flags: --nojournal --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,requires_journaling,uses_transactions
     scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: ""
     build_mongoreplay: false
   tasks:
   - name: compile

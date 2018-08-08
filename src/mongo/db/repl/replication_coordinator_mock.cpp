@@ -94,7 +94,7 @@ MemberState ReplicationCoordinatorMock::getMemberState() const {
 
 Status ReplicationCoordinatorMock::waitForMemberState(MemberState expectedState,
                                                       Milliseconds timeout) {
-    invariant(false);
+    MONGO_UNREACHABLE;
     return Status::OK();
 }
 
@@ -175,10 +175,6 @@ bool ReplicationCoordinatorMock::shouldRelaxIndexConstraints(OperationContext* o
     return !canAcceptWritesFor(opCtx, ns);
 }
 
-Status ReplicationCoordinatorMock::setLastOptimeForSlave(const OID& rid, const Timestamp& ts) {
-    return Status::OK();
-}
-
 void ReplicationCoordinatorMock::setMyHeartbeatMessage(const std::string& msg) {
     // TODO
 }
@@ -252,7 +248,7 @@ ReplicationCoordinator::ApplierState ReplicationCoordinatorMock::getApplierState
 void ReplicationCoordinatorMock::signalDrainComplete(OperationContext*, long long) {}
 
 Status ReplicationCoordinatorMock::waitForDrainFinish(Milliseconds timeout) {
-    invariant(false);
+    MONGO_UNREACHABLE;
     return Status::OK();
 }
 
@@ -358,11 +354,6 @@ Status ReplicationCoordinatorMock::processReplSetUpdatePosition(const UpdatePosi
     return Status::OK();
 }
 
-Status ReplicationCoordinatorMock::processHandshake(OperationContext* opCtx,
-                                                    const HandshakeArgs& handshake) {
-    return Status::OK();
-}
-
 bool ReplicationCoordinatorMock::buildsIndexes() {
     // TODO
     return true;
@@ -399,14 +390,18 @@ void ReplicationCoordinatorMock::blacklistSyncSource(const HostAndPort& host, Da
 
 void ReplicationCoordinatorMock::resetLastOpTimesFromOplog(OperationContext* opCtx,
                                                            DataConsistency consistency) {
-    invariant(false);
+    _resetLastOpTimesCalled = true;
+}
+
+bool ReplicationCoordinatorMock::lastOpTimesWereReset() const {
+    return _resetLastOpTimesCalled;
 }
 
 bool ReplicationCoordinatorMock::shouldChangeSyncSource(
     const HostAndPort& currentSource,
     const rpc::ReplSetMetadata& replMetadata,
     boost::optional<rpc::OplogQueryMetadata> oqMetadata) {
-    invariant(false);
+    MONGO_UNREACHABLE;
 }
 
 OpTime ReplicationCoordinatorMock::getLastCommittedOpTime() const {

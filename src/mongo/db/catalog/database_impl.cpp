@@ -218,7 +218,10 @@ Collection* DatabaseImpl::_getOrCreateCollectionInstance(OperationContext* opCtx
     auto uuid = cce->getCollectionOptions(opCtx).uuid;
 
     unique_ptr<RecordStore> rs(_dbEntry->getRecordStore(nss.ns()));
-    invariant(rs.get());  // if cce exists, so should this
+    invariant(
+        rs.get(),
+        str::stream() << "Record store did not exist. Collection: " << nss.ns() << " UUID: "
+                      << (uuid ? uuid->toString() : "none"));  // if cce exists, so should this
 
     // Not registering AddCollectionChange since this is for collections that already exist.
     Collection* coll = new Collection(opCtx, nss.ns(), uuid, cce.release(), rs.release(), _dbEntry);
@@ -504,14 +507,10 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 
     // Drop unreplicated collections immediately.
     // If 'dropOpTime' is provided, we should proceed to rename the collection.
-    // Under master/slave, collections are always dropped immediately. This is because drop-pending
-    // collections support the rollback process which is not applicable to master/slave.
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     auto opObserver = opCtx->getServiceContext()->getOpObserver();
     auto isOplogDisabledForNamespace = replCoord->isOplogDisabledFor(opCtx, fullns);
-    auto isMasterSlave =
-        repl::ReplicationCoordinator::modeMasterSlave == replCoord->getReplicationMode();
-    if ((dropOpTime.isNull() && isOplogDisabledForNamespace) || isMasterSlave) {
+    if (dropOpTime.isNull() && isOplogDisabledForNamespace) {
         auto status = _finishDropCollection(opCtx, fullns, collection);
         if (!status.isOK()) {
             return status;

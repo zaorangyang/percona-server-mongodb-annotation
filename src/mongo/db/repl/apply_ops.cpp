@@ -77,7 +77,7 @@ bool _parseAreOpsCrudOnly(const BSONObj& applyOpCmd) {
         BSONElement& fieldOp = fields[1];
 
         const char* opType = fieldOp.valuestrsafe();
-        const StringData ns = fieldNs.valueStringData();
+        const StringData ns = fieldNs.valuestrsafe();
 
         // All atomic ops have an opType of length 1.
         if (opType[0] == '\0' || opType[1] != '\0')
@@ -443,8 +443,7 @@ Status applyOps(OperationContext* opCtx,
         writeConflictRetry(opCtx, "applyOps", dbName, [&] {
             BSONObjBuilder intermediateResult;
             std::unique_ptr<BSONArrayBuilder> opsBuilder;
-            if (opCtx->writesAreReplicated() &&
-                repl::ReplicationCoordinator::modeMasterSlave != replCoord->getReplicationMode()) {
+            if (opCtx->writesAreReplicated()) {
                 opsBuilder = stdx::make_unique<BSONArrayBuilder>();
             }
             WriteUnitOfWork wunit(opCtx);

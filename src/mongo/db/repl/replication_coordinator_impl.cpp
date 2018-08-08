@@ -39,16 +39,17 @@
 #include "mongo/client/fetcher.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 #include "mongo/db/repl/data_replicator_external_state_initial_sync.h"
 #include "mongo/db/repl/elect_cmd_runner.h"
 #include "mongo/db/repl/freshness_checker.h"
-#include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/last_vote.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -563,6 +564,13 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         } else {
             lastOpTime = lastOpTimeStatus.getValue();
         }
+    } else {
+        // The node is an arbiter hence will not need logical clock for external operations.
+        LogicalClock::get(getServiceContext())->setEnabled(false);
+        auto validator = LogicalTimeValidator::get(getServiceContext());
+        if (validator) {
+            validator->resetKeyManager();
+        }
     }
 
     long long term = OpTime::kUninitializedTerm;
@@ -709,6 +717,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
                 createInitialSyncerOptions(this, _externalState.get()),
                 stdx::make_unique<DataReplicatorExternalStateInitialSync>(this,
                                                                           _externalState.get()),
+                _externalState->getDbWorkThreadPool(),
                 _storage,
                 _replicationProcess,
                 onCompletion);
@@ -736,22 +745,14 @@ void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
     invariant(_settings.usingReplSets());
 
     {
-        OID rid = _externalState->ensureMe(opCtx);
-
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         fassert(18822, !_inShutdown);
         _setConfigState_inlock(kConfigStartingUp);
-        _myRID = rid;
-        _topCoord->setMyRid(rid);
-    }
-
-    _replExecutor->startup();
-
-    {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
         _topCoord->setStorageEngineSupportsReadCommitted(
             _externalState->isReadCommittedSupportedByStorageEngine(opCtx));
     }
+
+    _replExecutor->startup();
 
     bool doneLoadingConfig = _startLoadLocalConfig(opCtx);
     if (doneLoadingConfig) {
@@ -1015,16 +1016,6 @@ void ReplicationCoordinatorImpl::signalUpstreamUpdater() {
     _externalState->forwardSlaveProgress();
 }
 
-Status ReplicationCoordinatorImpl::setLastOptimeForSlave(const OID& rid, const Timestamp& ts) {
-    stdx::unique_lock<stdx::mutex> lock(_mutex);
-
-    // term == -1 for master-slave
-    OpTime opTime(ts, OpTime::kUninitializedTerm);
-    _topCoord->setLastOptimeForSlave(rid, opTime, _replExecutor->now());
-    _updateLastCommittedOpTime_inlock();
-    return Status::OK();
-}
-
 void ReplicationCoordinatorImpl::setMyHeartbeatMessage(const std::string& msg) {
     stdx::unique_lock<stdx::mutex> lock(_mutex);
     _topCoord->setMyHeartbeatMessage(_replExecutor->now(), msg);
@@ -1104,15 +1095,14 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTime_inlock(const OpTime& op
     _opTimeWaiterList.signalAndRemoveIf_inlock(
         [opTime](Waiter* waiter) { return waiter->opTime <= opTime; });
 
-
-    // Note that master-slave mode has no automatic fail over, and so rollbacks never occur.
-    // Additionally, the commit point for a master-slave set will never advance, since it doesn't
-    // use any consensus protocol. Since the set of stable optime candidates can only get cleaned up
-    // when the commit point advances, we should refrain from updating stable optime candidates in
-    // master-slave mode, to avoid the candidates list from growing unbounded.
-    if (opTime.isNull() || getReplicationMode() != Mode::modeReplSet) {
+    if (opTime.isNull()) {
         return;
     }
+
+    // Update the local snapshot before updating the stable timestamp on the storage engine. New
+    // transactions reading from the local snapshot should start before the oldest timestamp is
+    // advanced to avoid races.
+    _externalState->updateLocalSnapshot(opTime);
 
     // Add the new applied optime to the list of stable optime candidates and then set the last
     // stable optime. Stable optimes are used to determine the last optime that it is safe to revert
@@ -1462,11 +1452,6 @@ Status ReplicationCoordinatorImpl::_awaitReplication_inlock(
         return Status::OK();
     }
 
-    if (replMode == modeMasterSlave && writeConcern.wMode == WriteConcernOptions::kMajority) {
-        // with master/slave, majority is equivalent to w=1
-        return Status::OK();
-    }
-
     if (opTime.isNull()) {
         // If waiting for the empty optime, always say it's been replicated.
         return Status::OK();
@@ -1540,7 +1525,7 @@ Status ReplicationCoordinatorImpl::_awaitReplication_inlock(
         }
 
         if (status.getValue() == stdx::cv_status::timeout) {
-            if (Command::testCommandsEnabled) {
+            if (getTestCommandsEnabled()) {
                 // log state of replica set on timeout to help with diagnosis.
                 BSONObjBuilder progress;
                 _topCoord->fillMemberData(&progress);
@@ -1576,7 +1561,6 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     const Date_t stepDownUntil = startTime + stepdownTime;
     const Date_t waitUntil = startTime + waitTime;
 
-    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
     if (!getMemberState().primary()) {
         // Note this check is inherently racy - it's always possible for the node to
         // stepdown from some other path before we acquire the global exclusive lock.  This check
@@ -1598,6 +1582,10 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
                 "Could not acquire the global shared lock within the amount of time "
                 "specified that we should step down for"};
     }
+
+    // TODO SERVER-34395: Remove this method and kill cursors as part of killAllUserOperations call
+    // when the CursorManager no longer requires collection locks to kill cursors.
+    _externalState->killAllTransactionCursors(opCtx);
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
@@ -1678,8 +1666,7 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
             invariant(!opCtx->lockState()->isLocked());
 
             // Make sure we re-acquire the global lock before returning so that we're always holding
-            // the
-            // global lock when the onExitGuard set up earlier runs.
+            // the global lock when the onExitGuard set up earlier runs.
             ON_BLOCK_EXIT([&] {
                 // Need to release _mutex before re-acquiring the global lock to preserve lock
                 // acquisition order rules.
@@ -1687,13 +1674,12 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
 
                 // Need to re-acquire the global lock before re-attempting stepdown.
                 // We use no timeout here even though that means the lock acquisition could take
-                // longer
-                // than the stepdown window.  If that happens, the call to _tryToStepDown
-                // immediately
-                // after will error.  Since we'll need the global lock no matter what to clean up a
-                // failed stepdown attempt, we might as well spend whatever time we need to acquire
-                // it
-                // now.
+                // longer than the stepdown window.  If that happens, the call to _tryToStepDown
+                // immediately after will error.  Since we'll need the global lock no matter what to
+                // clean up a failed stepdown attempt, we might as well spend whatever time we need
+                // to acquire it now.  For the same reason, we also disable lock acquisition
+                // interruption, to guarantee that we get the lock eventually.
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
                 globalLock.reset(new Lock::GlobalLock(opCtx, MODE_X, Date_t::max()));
                 invariant(globalLock->isLocked());
                 lk.lock();
@@ -1841,9 +1827,6 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
     if (canAcceptWritesFor_UNSAFE(opCtx, ns)) {
         return Status::OK();
     }
-    if (getReplicationMode() == modeMasterSlave) {
-        return Status::OK();
-    }
     if (slaveOk) {
         if (isPrimaryOrSecondary) {
             return Status::OK();
@@ -1866,15 +1849,6 @@ bool ReplicationCoordinatorImpl::shouldRelaxIndexConstraints(OperationContext* o
 OID ReplicationCoordinatorImpl::getElectionId() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     return _electionId;
-}
-
-OID ReplicationCoordinatorImpl::getMyRID() const {
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
-    return _getMyRID_inlock();
-}
-
-OID ReplicationCoordinatorImpl::_getMyRID_inlock() const {
-    return _myRID;
 }
 
 int ReplicationCoordinatorImpl::getMyId() const {
@@ -1930,7 +1904,8 @@ Status ReplicationCoordinatorImpl::processReplSetGetStatus(
             _replExecutor->now(),
             static_cast<unsigned>(time(0) - serverGlobalParams.started),
             _getCurrentCommittedSnapshotOpTime_inlock(),
-            initialSyncProgress},
+            initialSyncProgress,
+            _storage->getLastStableCheckpointTimestamp(_service)},
         response,
         &result);
     return result;
@@ -2172,8 +2147,7 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
         newConfigObj = incrementConfigVersionByRandom(newConfigObj);
     }
 
-    Status status = newConfig.initialize(
-        newConfigObj, oldConfig.getProtocolVersion() == 1, oldConfig.getReplicaSetId());
+    Status status = newConfig.initialize(newConfigObj, oldConfig.getReplicaSetId());
     if (!status.isOK()) {
         error() << "replSetReconfig got " << status << " while parsing " << newConfigObj;
         return Status(ErrorCodes::InvalidReplicaSetConfig, status.reason());
@@ -2300,7 +2274,7 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
     lk.unlock();
 
     ReplSetConfig newConfig;
-    Status status = newConfig.initializeForInitiate(configObj, true);
+    Status status = newConfig.initializeForInitiate(configObj);
     if (!status.isOK()) {
         error() << "replSet initiate got " << status << " while parsing " << configObj;
         return Status(ErrorCodes::InvalidReplicaSetConfig, status.reason());
@@ -2837,14 +2811,6 @@ Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(const UpdatePosi
     return status;
 }
 
-Status ReplicationCoordinatorImpl::processHandshake(OperationContext* opCtx,
-                                                    const HandshakeArgs& handshake) {
-    LOG(2) << "Received handshake " << handshake.toBSON();
-    stdx::lock_guard<stdx::mutex> lock(_mutex);
-    return _topCoord->processHandshake(handshake.getRid(),
-                                       _externalState->getClientHostAndPort(opCtx));
-}
-
 bool ReplicationCoordinatorImpl::buildsIndexes() {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (_selfIndex == -1) {
@@ -2857,9 +2823,7 @@ bool ReplicationCoordinatorImpl::buildsIndexes() {
 std::vector<HostAndPort> ReplicationCoordinatorImpl::getHostsWrittenTo(const OpTime& op,
                                                                        bool durablyWritten) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    /* skip self in master-slave mode because our own HostAndPort is unknown */
-    const bool skipSelf = getReplicationMode() == modeMasterSlave;
-    return _topCoord->getHostsWrittenTo(op, durablyWritten, skipSelf);
+    return _topCoord->getHostsWrittenTo(op, durablyWritten);
 }
 
 std::vector<HostAndPort> ReplicationCoordinatorImpl::getOtherNodesInReplSet() const {
@@ -2891,15 +2855,6 @@ Status ReplicationCoordinatorImpl::_checkIfWriteConcernCanBeSatisfied_inlock(
     if (getReplicationMode() == modeNone) {
         return Status(ErrorCodes::NoReplicationEnabled,
                       "No replication enabled when checking if write concern can be satisfied");
-    }
-
-    if (getReplicationMode() == modeMasterSlave) {
-        if (!writeConcern.wMode.empty()) {
-            return Status(ErrorCodes::UnknownReplWriteConcern,
-                          "Cannot use named write concern modes in master-slave");
-        }
-        // No way to know how many slaves there are, so assume any numeric mode is possible.
-        return Status::OK();
     }
 
     invariant(getReplicationMode() == modeReplSet);

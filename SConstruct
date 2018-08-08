@@ -294,6 +294,13 @@ add_option('gcov',
     nargs=0,
 )
 
+add_option('enable-free-mon',
+    choices=["on", "off"],
+    default="off",
+    help='Disable support for Free Monitoring to avoid HTTP client library dependencies',
+    type='choice',
+)
+
 add_option('use-sasl-client',
     help='Support SASL authentication in the client library',
     nargs=0,
@@ -533,7 +540,7 @@ try:
         print("version.json does not contain a version string")
         Exit(1)
     if 'githash' not in version_data:
-        version_data['githash'] = utils.getGitVersion()
+        version_data['githash'] = utils.get_git_version()
 
 except IOError as e:
     # If the file error wasn't because the file is missing, error out
@@ -542,8 +549,8 @@ except IOError as e:
         Exit(1)
 
     version_data = {
-        'version': utils.getGitDescribe()[1:],
-        'githash': utils.getGitVersion(),
+        'version': utils.get_git_describe()[1:],
+        'githash': utils.get_git_version(),
     }
 
 except ValueError as e:
@@ -2500,14 +2507,36 @@ def doConfigure(myenv):
             "undefined" : myenv.File("#etc/ubsan.blacklist"),
         }
 
-        blackfiles = set([v for (k, v) in blackfiles_map.iteritems() if k in sanitizer_list])
-        blacklist_options=["-fsanitize-blacklist=%s" % blackfile
-                           for blackfile in blackfiles
-                           if os.stat(blackfile.path).st_size != 0]
+        # Select those unique black files that are associated with the
+        # currently enabled sanitizers, but filter out those that are
+        # zero length.
+        blackfiles = {v for (k, v) in blackfiles_map.iteritems() if k in sanitizer_list}
+        blackfiles = [f for f in blackfiles if os.stat(f.path).st_size != 0]
 
-        for blacklist_option in blacklist_options:
-            if AddToCCFLAGSIfSupported(myenv, blacklist_option):
-                myenv.Append(LINKFLAGS=[blacklist_option])
+        # Filter out any blacklist options that the toolchain doesn't support.
+        supportedBlackfiles = []
+        blackfilesTestEnv = myenv.Clone()
+        for blackfile in blackfiles:
+            if AddToCCFLAGSIfSupported(blackfilesTestEnv, "-fsanitize-blacklist=%s" % blackfile):
+                supportedBlackfiles.append(blackfile)
+        blackfilesTestEnv = None
+        blackfiles = sorted(supportedBlackfiles)
+
+        # If we ended up with any blackfiles after the above filters,
+        # then expand them into compiler flag arguments, and use a
+        # generator to return at command line expansion time so that
+        # we can change the signature if the file contents change.
+        if blackfiles:
+            blacklist_options=["-fsanitize-blacklist=%s" % blackfile for blackfile in blackfiles]
+            def SanitizerBlacklistGenerator(source, target, env, for_signature):
+                if for_signature:
+                    return [f.get_csig() for f in blackfiles]
+                return blacklist_options
+            myenv.AppendUnique(
+                SANITIZER_BLACKLIST_GENERATOR=SanitizerBlacklistGenerator,
+                CCFLAGS="${SANITIZER_BLACKLIST_GENERATOR}",
+                LINKFLAGS="${SANITIZER_BLACKLIST_GENERATOR}",
+            )
 
         llvm_symbolizer = get_option('llvm-symbolizer')
         if os.path.isabs(llvm_symbolizer):
@@ -2779,9 +2808,13 @@ def doConfigure(myenv):
     def checkOpenSSL(conf):
         sslLibName = "ssl"
         cryptoLibName = "crypto"
+        sslLinkDependencies = ["crypto", "dl"]
+        if conf.env.TargetOSIs('freebsd'):
+            sslLinkDependencies = ["crypto"]
         if conf.env.TargetOSIs('windows'):
             sslLibName = "ssleay32"
             cryptoLibName = "libeay32"
+            sslLinkDependencies = ["libeay32"]
 
             # Add the SSL binaries to the zip file distribution
             def addOpenSslLibraryToDistArchive(file_name):
@@ -2839,15 +2872,6 @@ def doConfigure(myenv):
                         pass
 
         if not conf.CheckLibWithHeader(
-                sslLibName,
-                ["openssl/ssl.h"],
-                "C",
-                "SSL_version(NULL);",
-                autoadd=True):
-            maybeIssueDarwinSSLAdvice(conf.env)
-            conf.env.ConfError("Couldn't find OpenSSL ssl.h header and library")
-
-        if not conf.CheckLibWithHeader(
                 cryptoLibName,
                 ["openssl/crypto.h"],
                 "C",
@@ -2855,6 +2879,23 @@ def doConfigure(myenv):
                 autoadd=True):
             maybeIssueDarwinSSLAdvice(conf.env)
             conf.env.ConfError("Couldn't find OpenSSL crypto.h header and library")
+
+        def CheckLibSSL(context):
+            res = SCons.Conftest.CheckLib(context,
+                     libs=[sslLibName],
+                     extra_libs=sslLinkDependencies,
+                     header='#include "openssl/ssl.h"',
+                     language="C",
+                     call="SSL_version(NULL);",
+                     autoadd=True)
+            context.did_show_result = 1
+            return not res
+
+        conf.AddTest("CheckLibSSL", CheckLibSSL)
+
+        if not conf.CheckLibSSL():
+           maybeIssueDarwinSSLAdvice(conf.env)
+           conf.env.ConfError("Couldn't find OpenSSL ssl.h header and library")
 
         def CheckLinkSSL(context):
             test_body = """
@@ -2921,11 +2962,10 @@ def doConfigure(myenv):
 
     ssl_provider = get_option("ssl-provider")
     if ssl_provider == 'auto':
-        # TODO: When native platforms are implemented, make them the default
-        # if conf.env.TargetOSIs('windows', 'darwin', 'macOS'):
-        #     ssl_provider = 'native'
-        # else:
-        ssl_provider = 'openssl'
+        if conf.env.TargetOSIs('windows', 'darwin', 'macOS'):
+            ssl_provider = 'native'
+        else:
+            ssl_provider = 'openssl'
 
     if ssl_provider == 'native':
         if conf.env.TargetOSIs('windows'):
@@ -2934,11 +2974,13 @@ def doConfigure(myenv):
             conf.env.Append( MONGO_CRYPTO=["windows"] )
 
         elif conf.env.TargetOSIs('darwin', 'macOS'):
+            ssl_provider = 'apple'
+            env.SetConfigHeaderDefine("MONGO_CONFIG_SSL_PROVIDER", "SSL_PROVIDER_APPLE")
             conf.env.Append( MONGO_CRYPTO=["apple"] )
-            if has_option("ssl"):
-                # TODO: Replace SSL implementation as well.
-                # For now, let openssl fill that role.
-                checkOpenSSL(conf)
+            conf.env.AppendUnique(FRAMEWORKS=[
+                'CoreFoundation',
+                'Security',
+            ])
 
     if ssl_provider == 'openssl':
         if has_option("ssl"):
@@ -2955,6 +2997,7 @@ def doConfigure(myenv):
         # Either crypto engine is native,
         # or it's OpenSSL and has been checked to be working.
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
+        print("Using SSL Provider: {0}".format(ssl_provider))
     else:
         ssl_provider = "none"
 
@@ -3192,7 +3235,11 @@ if get_option('install-mode') == 'hygienic':
                 env.Literal('\\$$ORIGIN/../lib')
             ],
             LINKFLAGS=[
-                '-Wl,-z,origin',
+                # Most systems *require* -z,origin to make origin work, but android
+                # blows up at runtime if it finds DF_ORIGIN_1 in DT_FLAGS_1.
+                # https://android.googlesource.com/platform/bionic/+/cbc80ba9d839675a0c4891e2ab33f39ba51b04b2/linker/linker.h#68
+                # https://android.googlesource.com/platform/bionic/+/cbc80ba9d839675a0c4891e2ab33f39ba51b04b2/libc/include/elf.h#215
+                '-Wl,-z,origin' if not env.TargetOSIs('android') else [],
                 '-Wl,--enable-new-dtags',
             ],
             SHLINKFLAGS=[
@@ -3236,8 +3283,8 @@ if incremental_link.exists(env):
 
 def checkErrorCodes():
     import buildscripts.errorcodes as x
-    if x.checkErrorCodes() == False:
-        env.FatalError("next id to use: {0}", x.getNextCode())
+    if x.check_error_codes() == False:
+        env.FatalError("next id to use: {0}", x.get_next_code())
 
 checkErrorCodes()
 

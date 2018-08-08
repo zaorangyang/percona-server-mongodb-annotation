@@ -125,7 +125,7 @@ public:
      * an error is returned.
      */
     virtual Status insertDocument(OperationContext* opCtx,
-                                  const NamespaceString& nss,
+                                  const NamespaceStringOrUUID& nsOrUUID,
                                   const TimestampedBSONObj& doc,
                                   long long term) = 0;
 
@@ -135,7 +135,7 @@ public:
      * It is an error to call this function with an empty set of documents.
      */
     virtual Status insertDocuments(OperationContext* opCtx,
-                                   const NamespaceString& nss,
+                                   const NamespaceStringOrUUID& nsOrUUID,
                                    const std::vector<InsertStatement>& docs) = 0;
 
     /**
@@ -277,7 +277,7 @@ public:
      * Not supported on collections with a default collation.
      */
     virtual StatusWith<BSONObj> findById(OperationContext* opCtx,
-                                         const NamespaceString& nss,
+                                         const NamespaceStringOrUUID& nsOrUUID,
                                          const BSONElement& idKey) = 0;
 
     /**
@@ -287,7 +287,7 @@ public:
      * Not supported on collections with a default collation.
      */
     virtual StatusWith<BSONObj> deleteById(OperationContext* opCtx,
-                                           const NamespaceString& nss,
+                                           const NamespaceStringOrUUID& nsOrUUID,
                                            const BSONElement& idKey) = 0;
 
     /**
@@ -299,7 +299,7 @@ public:
      * applied.
      */
     virtual Status upsertById(OperationContext* opCtx,
-                              const NamespaceString& nss,
+                              const NamespaceStringOrUUID& nsOrUUID,
                               const BSONElement& idKey,
                               const BSONObj& update) = 0;
 
@@ -323,8 +323,16 @@ public:
     /**
      * Returns the number of documents in the collection.
      */
-    virtual StatusWith<CollectionCount> getCollectionCount(OperationContext* opCtx,
-                                                           const NamespaceString& nss) = 0;
+    virtual StatusWith<CollectionCount> getCollectionCount(
+        OperationContext* opCtx, const NamespaceStringOrUUID& nsOrUUID) = 0;
+
+    /**
+     * Sets the number of documents in the collection. This function does NOT also update the
+     * data size of the collection.
+     */
+    virtual Status setCollectionCount(OperationContext* opCtx,
+                                      const NamespaceStringOrUUID& nsOrUUID,
+                                      long long newCount) = 0;
 
     /**
      * Returns the UUID of the collection specified by nss, if such a UUID exists.
@@ -352,7 +360,7 @@ public:
      *
      * The 'stable' timestamp is set by calling StorageInterface::setStableTimestamp.
      */
-    virtual StatusWith<Timestamp> recoverToStableTimestamp(ServiceContext* serviceCtx) = 0;
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) = 0;
 
     /**
      * Returns whether the storage engine supports "recover to stable timestamp".
@@ -371,6 +379,24 @@ public:
      * batch.
      */
     virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) = 0;
+
+    /**
+     * Registers a timestamp with the storage engine so that it can enforce oplog visiblity rules.
+     * orderedCommit - specifies whether the timestamp provided is ordered w.r.t. commits; that is,
+     * all commits with older timestamps have already occurred, and any commits with newer
+     * timestamps have not yet occurred.
+     */
+    virtual void oplogDiskLocRegister(OperationContext* opCtx,
+                                      const Timestamp& ts,
+                                      bool orderedCommit) = 0;
+
+    /**
+     * Returns a timestamp that is guaranteed to be persisted on disk in a checkpoint. Returns
+     * `Timestamp::min()` if no stable checkpoint has been taken. Returns boost::none if
+     * `supportsRecoverToStableTimestamp` returns false.
+     */
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp(
+        ServiceContext* serviceCtx) const = 0;
 };
 
 }  // namespace repl

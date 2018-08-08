@@ -141,7 +141,8 @@ public:
             .transitional_ignore();
 
         // Drop the database's collections.
-        for (const auto& nss : catalogManager->getAllShardedCollectionsForDb(opCtx, dbname)) {
+        for (const auto& nss : catalogClient->getAllShardedCollectionsForDb(
+                 opCtx, dbname, repl::ReadConcernLevel::kLocalReadConcern)) {
             auto collDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
                 opCtx, nss.ns(), "dropCollection", DistLockManager::kDefaultLockTimeout));
             uassertStatusOK(catalogManager->dropCollection(opCtx, nss));
@@ -153,7 +154,7 @@ public:
         // Drop the database from each of the remaining shards.
         {
             std::vector<ShardId> allShardIds;
-            Grid::get(opCtx)->shardRegistry()->getAllShardIds(&allShardIds);
+            Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload(&allShardIds);
 
             for (const ShardId& shardId : allShardIds) {
                 _dropDatabaseFromShard(opCtx, shardId, dbname);

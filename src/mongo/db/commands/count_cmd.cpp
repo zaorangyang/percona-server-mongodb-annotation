@@ -150,13 +150,10 @@ public:
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getMetadata();
+        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
 
-        auto statusWithPlanExecutor = getExecutorCount(opCtx,
-                                                       collection,
-                                                       request.getValue(),
-                                                       true,  // explain
-                                                       PlanExecutor::YIELD_AUTO);
+        auto statusWithPlanExecutor =
+            getExecutorCount(opCtx, collection, request.getValue(), true /*explain*/);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
@@ -205,13 +202,10 @@ public:
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
-        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getMetadata();
+        auto rangePreserver = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
 
-        auto statusWithPlanExecutor = getExecutorCount(opCtx,
-                                                       collection,
-                                                       request.getValue(),
-                                                       false,  // !explain
-                                                       PlanExecutor::YIELD_AUTO);
+        auto statusWithPlanExecutor =
+            getExecutorCount(opCtx, collection, request.getValue(), false /*explain*/);
         if (!statusWithPlanExecutor.isOK()) {
             return CommandHelpers::appendCommandStatus(result, statusWithPlanExecutor.getStatus());
         }

@@ -42,7 +42,6 @@ class OperationContext;
 namespace repl {
 
 class ReplicationProcess;
-class StorageInterfaceMock;
 
 /**
  * OpObserver for SyncTail test fixture.
@@ -104,13 +103,8 @@ protected:
     void _testSyncApplyCrudOperation(ErrorCodes::Error expectedError,
                                      const BSONObj& op,
                                      bool expectedApplyOpCalled);
-    void _testSyncApplyInsertDocument(ErrorCodes::Error expectedError);
+
     ServiceContext::UniqueOperationContext _opCtx;
-    unsigned int _opsApplied;
-    SyncTail::ApplyOperationInLockFn _applyOp;
-    SyncTail::ApplyCommandInLockFn _applyCmd;
-    SyncTail::IncrementOpsAppliedStatsFn _incOps;
-    StorageInterfaceMock* _storageInterface = nullptr;
     ReplicationProcess* _replicationProcess = nullptr;
     SyncTailOpObserver* _opObserver = nullptr;
 
@@ -131,6 +125,7 @@ protected:
     void tearDown() override;
 
     Status runOpSteadyState(const OplogEntry& op);
+    Status runOpsSteadyState(std::vector<OplogEntry> ops);
     Status runOpInitialSync(const OplogEntry& entry);
     Status runOpsInitialSync(std::vector<OplogEntry> ops);
 };

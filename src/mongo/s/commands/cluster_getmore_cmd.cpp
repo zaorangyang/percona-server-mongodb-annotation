@@ -50,6 +50,9 @@ class ClusterGetMoreCmd final : public BasicCommand {
 public:
     ClusterGetMoreCmd() : BasicCommand("getMore") {}
 
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const final {
+        return GetMoreRequest::parseNs(dbname, cmdObj).ns();
+    }
 
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -76,6 +79,10 @@ public:
 
     std::string help() const final {
         return "retrieve more documents for a cursor id";
+    }
+
+    LogicalOp getLogicalOp() const final {
+        return LogicalOp::opGetMore;
     }
 
     Status checkAuthForCommand(Client* client,

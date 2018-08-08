@@ -30,6 +30,7 @@ Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 #include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/client/sasl_client_authenticate.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -58,7 +59,7 @@ StatusWith<std::tuple<bool, std::string>> SaslExternalLDAPServerMechanism::getSt
 }
 
 Status SaslExternalLDAPServerMechanism::initializeConnection() {
-    int result = sasl_server_new(saslDefaultServiceName,
+    int result = sasl_server_new(saslDefaultServiceName.rawData(),
                                  prettyHostName().c_str(), // Fully Qualified Domain Name (FQDN), NULL => gethostname()
                                  NULL, // User Realm string, NULL forces default value: FQDN.
                                  NULL, // Local IP address
@@ -125,7 +126,7 @@ StringData SaslExternalLDAPServerMechanism::getPrincipalName() const {
 MONGO_INITIALIZER_WITH_PREREQUISITES(SaslExternalLDAPServerMechanism,
                                      ("CreateSASLServerMechanismRegistry"))
 (::mongo::InitializerContext* context) {
-    int result = sasl_server_init(NULL, saslDefaultServiceName);
+    int result = sasl_server_init(NULL, saslDefaultServiceName.rawData());
     if (result != SASL_OK) {
         log() << "Failed Initializing SASL " << std::endl;
         return getInitializationError(result);

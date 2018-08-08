@@ -132,8 +132,10 @@ std::unique_ptr<CollectionMetadata> makeAMetadata(BSONObj const& keyPattern) {
     const OID epoch = OID::gen();
     auto range = ChunkRange(BSON("key" << MINKEY), BSON("key" << MAXKEY));
     auto chunk = ChunkType(kTestNss, std::move(range), ChunkVersion(1, 0, epoch), ShardId("other"));
-    auto cm = ChunkManager::makeNew(
+    auto rt = RoutingTableHistory::makeNew(
         kTestNss, UUID::gen(), KeyPattern(keyPattern), nullptr, false, epoch, {std::move(chunk)});
+    std::shared_ptr<ChunkManager> cm = std::make_shared<ChunkManager>(rt, Timestamp(100, 0));
+
     return stdx::make_unique<CollectionMetadata>(std::move(cm), ShardId("this"));
 }
 
@@ -154,7 +156,7 @@ TEST_F(DeleteStateTest, MakeDeleteStateUnsharded) {
 
     // First, check that an order for deletion from an unsharded collection (where css has not been
     // "refreshed" with chunk metadata) extracts just the "_id" field:
-    auto deleteState = css->makeDeleteState(doc);
+    auto deleteState = css->makeDeleteState(operationContext(), doc);
     ASSERT_BSONOBJ_EQ(deleteState.documentKey,
                       BSON("_id"
                            << "hello"));
@@ -179,7 +181,7 @@ TEST_F(DeleteStateTest, MakeDeleteStateShardedWithoutIdInShardKey) {
                     << true);
 
     // Verify the shard key is extracted, in correct order, followed by the "_id" field.
-    auto deleteState = css->makeDeleteState(doc);
+    auto deleteState = css->makeDeleteState(operationContext(), doc);
     ASSERT_BSONOBJ_EQ(deleteState.documentKey,
                       BSON("key" << 100 << "key3"
                                  << "abc"
@@ -205,7 +207,7 @@ TEST_F(DeleteStateTest, MakeDeleteStateShardedWithIdInShardKey) {
                            << 100);
 
     // Verify the shard key is extracted with "_id" in the right place.
-    auto deleteState = css->makeDeleteState(doc);
+    auto deleteState = css->makeDeleteState(operationContext(), doc);
     ASSERT_BSONOBJ_EQ(deleteState.documentKey,
                       BSON("key" << 100 << "_id"
                                  << "hello"
@@ -229,7 +231,7 @@ TEST_F(DeleteStateTest, MakeDeleteStateShardedWithIdHashInShardKey) {
                            << 100);
 
     // Verify the shard key is extracted with "_id" in the right place, not hashed.
-    auto deleteState = css->makeDeleteState(doc);
+    auto deleteState = css->makeDeleteState(operationContext(), doc);
     ASSERT_BSONOBJ_EQ(deleteState.documentKey,
                       BSON("_id"
                            << "hello"));

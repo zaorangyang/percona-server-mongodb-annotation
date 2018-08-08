@@ -91,6 +91,9 @@ public:
         const std::string& dbName,
         repl::ReadConcernLevel readConcernLevel) override;
 
+    StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> getAllDBs(
+        OperationContext* opCtx, repl::ReadConcernLevel readConcern) override;
+
     StatusWith<repl::OpTimeWith<CollectionType>> getCollection(
         OperationContext* opCtx,
         const NamespaceString& nss,
@@ -101,6 +104,9 @@ public:
         const std::string* dbName,
         repl::OpTime* optime,
         repl::ReadConcernLevel readConcernLevel) override;
+
+    std::vector<NamespaceString> getAllShardedCollectionsForDb(
+        OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) override;
 
     StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
                                                               const ShardId& shardName) override;

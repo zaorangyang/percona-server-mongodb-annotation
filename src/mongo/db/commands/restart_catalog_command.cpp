@@ -37,6 +37,7 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/util/log.h"
 
@@ -115,7 +116,7 @@ public:
 };
 
 MONGO_INITIALIZER(RegisterRestartCatalogCommand)(InitializerContext* ctx) {
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         // Leaked intentionally: a Command registers itself when constructed.
         new RestartCatalogCmd();
     }

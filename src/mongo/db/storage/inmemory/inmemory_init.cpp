@@ -148,7 +148,7 @@ private:
 };
 }  // namespace
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(InMemoryEngineInit, ("SetGlobalEnvironment"))
+MONGO_INITIALIZER(InMemoryEngineInit)
 (InitializerContext* context) {
     getGlobalServiceContext()->registerStorageEngine(kInMemoryEngineName, new InMemoryFactory());
 

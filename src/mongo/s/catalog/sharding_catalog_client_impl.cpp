@@ -276,6 +276,40 @@ StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::getDatabas
     return result;
 }
 
+StatusWith<repl::OpTimeWith<std::vector<DatabaseType>>> ShardingCatalogClientImpl::getAllDBs(
+    OperationContext* opCtx, repl::ReadConcernLevel readConcern) {
+    std::vector<DatabaseType> databases;
+    auto findStatus = _exhaustiveFindOnConfig(opCtx,
+                                              kConfigReadSelector,
+                                              readConcern,
+                                              DatabaseType::ConfigNS,
+                                              BSONObj(),     // no query filter
+                                              BSONObj(),     // no sort
+                                              boost::none);  // no limit
+    if (!findStatus.isOK()) {
+        return findStatus.getStatus();
+    }
+
+    for (const BSONObj& doc : findStatus.getValue().value) {
+        auto dbRes = DatabaseType::fromBSON(doc);
+        if (!dbRes.isOK()) {
+            return dbRes.getStatus().withContext(stream() << "Failed to parse database document "
+                                                          << doc);
+        }
+
+        Status validateStatus = dbRes.getValue().validate();
+        if (!validateStatus.isOK()) {
+            return validateStatus.withContext(stream() << "Failed to validate database document "
+                                                       << doc);
+        }
+
+        databases.push_back(dbRes.getValue());
+    }
+
+    return repl::OpTimeWith<std::vector<DatabaseType>>{std::move(databases),
+                                                       findStatus.getValue().opTime};
+}
+
 StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::_fetchDatabaseMetadata(
     OperationContext* opCtx,
     const std::string& dbName,
@@ -390,6 +424,24 @@ StatusWith<std::vector<CollectionType>> ShardingCatalogClientImpl::getCollection
     }
 
     return collections;
+}
+
+std::vector<NamespaceString> ShardingCatalogClientImpl::getAllShardedCollectionsForDb(
+    OperationContext* opCtx, StringData dbName, repl::ReadConcernLevel readConcern) {
+    const auto dbNameStr = dbName.toString();
+
+    const std::vector<CollectionType> collectionsOnConfig =
+        uassertStatusOK(getCollections(opCtx, &dbNameStr, nullptr, readConcern));
+
+    std::vector<NamespaceString> collectionsToReturn;
+    for (const auto& coll : collectionsOnConfig) {
+        if (coll.getDropped())
+            continue;
+
+        collectionsToReturn.push_back(coll.getNs());
+    }
+
+    return collectionsToReturn;
 }
 
 StatusWith<BSONObj> ShardingCatalogClientImpl::getGlobalSettings(OperationContext* opCtx,

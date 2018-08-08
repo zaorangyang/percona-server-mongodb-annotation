@@ -129,6 +129,10 @@ WriteConcernOptions ReplicationCoordinatorEmbedded::populateUnsetWriteConcernOpt
     return writeConcern;
 }
 
+bool ReplicationCoordinatorEmbedded::buildsIndexes() {
+    return true;
+}
+
 OpTime ReplicationCoordinatorEmbedded::getCurrentCommittedSnapshotOpTime() const {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -175,10 +179,6 @@ Status ReplicationCoordinatorEmbedded::waitForDrainFinish(Milliseconds) {
 }
 
 void ReplicationCoordinatorEmbedded::signalUpstreamUpdater() {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-Status ReplicationCoordinatorEmbedded::setLastOptimeForSlave(const OID&, const Timestamp&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -238,10 +238,6 @@ Status ReplicationCoordinatorEmbedded::stepDown(OperationContext*,
 }
 
 OID ReplicationCoordinatorEmbedded::getElectionId() {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-OID ReplicationCoordinatorEmbedded::getMyRID() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -333,14 +329,6 @@ Status ReplicationCoordinatorEmbedded::processReplSetElect(const ReplSetElectArg
 
 Status ReplicationCoordinatorEmbedded::processReplSetUpdatePosition(const UpdatePositionArgs&,
                                                                     long long*) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-Status ReplicationCoordinatorEmbedded::processHandshake(OperationContext*, const HandshakeArgs&) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-bool ReplicationCoordinatorEmbedded::buildsIndexes() {
     UASSERT_NOT_IMPLEMENTED;
 }
 

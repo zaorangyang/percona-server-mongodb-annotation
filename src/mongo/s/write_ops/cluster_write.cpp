@@ -259,12 +259,12 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
 
     const NamespaceString& nss = manager->getns();
 
-    if (!manager->_autoSplitThrottle._splitTickets.tryAcquire()) {
+    if (!manager->autoSplitThrottle()._splitTickets.tryAcquire()) {
         LOG(1) << "won't auto split because not enough tickets: " << nss;
         return;
     }
 
-    TicketHolderReleaser releaser(&(manager->_autoSplitThrottle._splitTickets));
+    TicketHolderReleaser releaser(&(manager->autoSplitThrottle()._splitTickets));
 
     const ChunkRange chunkRange(chunk->getMin(), chunk->getMax());
 
@@ -402,7 +402,7 @@ void updateChunkWriteStatsAndSplitIfNeeded(OperationContext* opCtx,
     } catch (const DBException& ex) {
         chunk->clearBytesWritten();
 
-        if (ErrorCodes::isStaleShardingError(ex.code())) {
+        if (ErrorCodes::isStaleShardVersionError(ex.code())) {
             log() << "Unable to auto-split chunk " << redact(chunkRange.toString()) << causedBy(ex)
                   << ", going to invalidate routing table entry for " << nss;
             Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(nss);

@@ -268,7 +268,7 @@ bool checkShardVersion(OperationContext* opCtx,
     auto& routingInfo = routingInfoStatus.getValue();
 
     const auto manager = routingInfo.cm();
-    const auto primary = routingInfo.primary();
+    const auto primary = routingInfo.db().primary();
 
     unsigned long long officialSequenceNumber = 0;
 
@@ -377,7 +377,7 @@ bool checkShardVersion(OperationContext* opCtx,
         return true;
     }
 
-    Grid::get(opCtx)->catalogCache()->onStaleConfigError(std::move(routingInfo));
+    Grid::get(opCtx)->catalogCache()->onStaleShardVersion(std::move(routingInfo));
 
     const int maxNumTries = 7;
     if (tryNumber < maxNumTries) {

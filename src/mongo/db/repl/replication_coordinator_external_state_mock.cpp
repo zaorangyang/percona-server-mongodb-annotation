@@ -96,10 +96,6 @@ ThreadPool* ReplicationCoordinatorExternalStateMock::getDbWorkThreadPool() const
 
 void ReplicationCoordinatorExternalStateMock::forwardSlaveProgress() {}
 
-OID ReplicationCoordinatorExternalStateMock::ensureMe(OperationContext*) {
-    return OID::gen();
-}
-
 bool ReplicationCoordinatorExternalStateMock::isSelf(const HostAndPort& host,
                                                      ServiceContext* const service) {
     return sequenceContains(_selfHosts, host);
@@ -205,6 +201,8 @@ void ReplicationCoordinatorExternalStateMock::closeConnections() {
 
 void ReplicationCoordinatorExternalStateMock::killAllUserOperations(OperationContext* opCtx) {}
 
+void ReplicationCoordinatorExternalStateMock::killAllTransactionCursors(OperationContext* opCtx) {}
+
 void ReplicationCoordinatorExternalStateMock::shardingOnStepDownHook() {}
 
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
@@ -217,6 +215,8 @@ void ReplicationCoordinatorExternalStateMock::dropAllSnapshots() {}
 
 void ReplicationCoordinatorExternalStateMock::updateCommittedSnapshot(
     const OpTime& newCommitPoint) {}
+
+void ReplicationCoordinatorExternalStateMock::updateLocalSnapshot(const OpTime& optime) {}
 
 bool ReplicationCoordinatorExternalStateMock::snapshotsEnabled() const {
     return _areSnapshotsEnabled;
@@ -241,25 +241,6 @@ bool ReplicationCoordinatorExternalStateMock::isReadCommittedSupportedByStorageE
 bool ReplicationCoordinatorExternalStateMock::isReadConcernSnapshotSupportedByStorageEngine(
     OperationContext* opCtx) const {
     return true;
-}
-
-StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::multiApply(
-    OperationContext*, MultiApplier::Operations, MultiApplier::ApplyOperationFn) {
-    return {ErrorCodes::InternalError, "Method not implemented"};
-}
-
-Status ReplicationCoordinatorExternalStateMock::multiInitialSyncApply(
-    OperationContext* opCtx,
-    MultiApplier::OperationPtrs* ops,
-    const HostAndPort& source,
-    AtomicUInt32* fetchCount,
-    WorkerMultikeyPathInfo* workerMultikeyPathInfo) {
-    return Status::OK();
-}
-
-std::unique_ptr<OplogBuffer> ReplicationCoordinatorExternalStateMock::makeInitialSyncOplogBuffer(
-    OperationContext* opCtx) const {
-    return stdx::make_unique<OplogBufferBlockingQueue>();
 }
 
 std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherMaxFetcherRestarts() const {

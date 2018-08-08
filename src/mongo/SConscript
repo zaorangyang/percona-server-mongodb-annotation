@@ -60,14 +60,12 @@ env.Library(
         'base/data_type.cpp',
         'base/data_type_string_data.cpp',
         'base/data_type_terminated.cpp',
-        'base/deinitializer_context.cpp',
         'base/error_codes.cpp',
         'base/error_extra_info.cpp',
         'base/global_initializer.cpp',
         'base/global_initializer_registerer.cpp',
         'base/init.cpp',
         'base/initializer.cpp',
-        'base/initializer_context.cpp',
         'base/initializer_dependency_graph.cpp',
         'base/make_string_vector.cpp',
         'base/parse_number.cpp',
@@ -96,7 +94,6 @@ env.Library(
         'logger/log_severity.cpp',
         'logger/logger.cpp',
         'logger/logstream_builder.cpp',
-        'logger/max_log_size.cpp',
         'logger/message_event_utf8_encoder.cpp',
         'logger/message_log_domain.cpp',
         'logger/ramlog.cpp',
@@ -298,9 +295,11 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'db/catalog/health_log',
-        'db/commands/core',
+        'db/commands/mongod',
+        'db/commands/mongod_fcv',
         'db/dbdirectclient',
         'db/ftdc/ftdc_mongod',
+        'db/free_mon/free_mon_mongod',
         'db/index_d',
         'db/initialize_snmp',
         'db/keys_collection_client_direct',
@@ -309,6 +308,7 @@ env.Library(
         'db/mongod_options',
         'db/mongodandmongos',
         'db/op_observer_d',
+        'db/periodic_runner_job_abort_expired_transactions',
         'db/query_exec',
         'db/repair_database',
         'db/repair_database_and_check_version',
@@ -361,32 +361,22 @@ mongod = env.Program(
         'base',
         'mongodmain',
     ],
+    INSTALL_ALIAS=[
+        'core',
+        'default',
+        'servers',
+    ],
 )
 
 hygienic = get_option('install-mode') == 'hygienic'
 
-if not hygienic:
+if hygienic:
+    env.Default('$INSTALL_DIR/bin/mongod$PROGSUFFIX')
+else:
     env.Default(env.Install('#/', mongod))
 
 # tools
 rewrittenTools = [ "mongodump", "mongorestore", "mongoexport", "mongoimport", "mongostat", "mongotop", "bsondump", "mongofiles" ]
-
-# mongoperf
-if not hygienic:
-    env.Install(
-        '#/',
-        [
-            env.Program("mongoperf",
-                        [
-                            "client/examples/mongoperf.cpp",
-                        ] + env.WindowsResourceFile("client/examples/mongoperf.rc"),
-                        LIBDEPS=[
-                            "base",
-                            "db/serveronly",
-                            "db/storage/mmap_v1/logfile",
-                            "db/storage/mmap_v1/mmap",
-                        ]),
-        ])
 
 if env.TargetOSIs('windows'):
     generatedServerManifest = env.Substfile(
@@ -403,45 +393,53 @@ if env.TargetOSIs('windows'):
     env.Depends("s/server.res", generatedServerManifest)
 
 # mongos
+mongos = env.Program(
+    target='mongos',
+    source=[
+        's/cluster_cursor_stats.cpp',
+        's/mongos_options.cpp',
+        's/mongos_options_init.cpp',
+        's/s_sharding_server_status.cpp',
+        's/server.cpp',
+        's/service_entry_point_mongos.cpp',
+        's/sharding_uptime_reporter.cpp',
+        's/version_mongos.cpp',
+    ] + env.WindowsResourceFile("s/server.rc"),
+    LIBDEPS=[
+        'db/auth/authmongos',
+        'db/commands/server_status',
+        'db/commands/server_status_core',
+        'db/curop',
+        'db/ftdc/ftdc_mongos',
+        'db/logical_time_metadata_hook',
+        'db/mongodandmongos',
+        'db/server_options',
+        'db/startup_warnings_common',
+        'db/stats/counters',
+        's/client/sharding_connection_hook',
+        's/commands/cluster_commands',
+        's/commands/shared_cluster_commands',
+        's/committed_optime_metadata_hook',
+        's/coreshard',
+        's/is_mongos',
+        's/sharding_egress_metadata_hook_for_mongos',
+        's/sharding_initialization',
+        's/query/cluster_cursor_cleanup_job',
+        'transport/service_entry_point',
+        'transport/transport_layer_manager',
+        'util/clock_sources',
+        'util/fail_point',
+        'util/ntservice',
+        'util/options_parser/options_parser_init',
+        'util/version_impl',
+    ],
+    INSTALL_ALIAS=[
+        'servers',
+    ],
+)
+
 if not hygienic:
-    env.Install(
-        '#/',
-        env.Program(
-            target='mongos',
-            source=[
-                's/cluster_cursor_stats.cpp',
-                's/mongos_options.cpp',
-                's/mongos_options_init.cpp',
-                's/s_sharding_server_status.cpp',
-                's/server.cpp',
-                's/service_entry_point_mongos.cpp',
-                's/sharding_uptime_reporter.cpp',
-                's/version_mongos.cpp',
-            ] + env.WindowsResourceFile("s/server.rc"),
-            LIBDEPS=[
-                'db/commands/core',
-                'db/commands/server_status',
-                'db/ftdc/ftdc_mongos',
-                'db/logical_time_metadata_hook',
-                'db/mongodandmongos',
-                'db/server_options',
-                'db/stats/counters',
-                's/client/sharding_connection_hook',
-                's/commands/cluster_commands',
-                's/commands/shared_cluster_commands',
-                's/committed_optime_metadata_hook',
-                's/coreshard',
-                's/is_mongos',
-                's/sharding_egress_metadata_hook_for_mongos',
-                's/sharding_initialization',
-                'transport/service_entry_point',
-                'transport/transport_layer_manager',
-                'util/clock_sources',
-                'util/fail_point',
-                'util/ntservice',
-                'util/options_parser/options_parser_init',
-                'util/version_impl',
-            ]))
+    env.Install('#/', mongos)
 
 env.Library("linenoise_utf8",
     source=[
@@ -526,7 +524,11 @@ if not has_option('noshell') and usemozjs:
         ],
         LIBDEPS_PRIVATE=[
             "$BUILD_DIR/mongo/client/connection_string",
-        ]
+        ],
+        INSTALL_ALIAS=[
+            'shell',
+            'core',
+        ],
     )
 
     if not hygienic:
@@ -616,19 +618,19 @@ if has_option("use-new-tools"):
         installExternalBinary(env, "%s/%s" % (toolsRoot, "mongoreplay"))
 
 # legacy tools
-installBinary(env, "mongoperf")
-env.Alias("tools", '#/' + add_exe("mongoperf"))
-
-env.Alias("tools", "#/" + add_exe("mongobridge"))
+if not hygienic:
+    env.Alias("tools", "#/" + add_exe("mongobridge"))
 
 installBinary( env, "mongod" )
 installBinary( env, "mongos" )
 
 if shellEnv is not None:
     installBinary( shellEnv, "mongo" )
-    env.Alias( "core", [ '#/%s' % b for b in [ add_exe( "mongo" ) ] ] )
+    if not hygienic:
+        env.Alias( "core", [ '#/%s' % b for b in [ add_exe( "mongo" ) ] ] )
 
-env.Alias( "core", [ '#/%s' % b for b in [ add_exe( "mongod" ), add_exe( "mongos" ) ] ] )
+if not hygienic:
+    env.Alias( "core", [ '#/%s' % b for b in [ add_exe( "mongod" ), add_exe( "mongos" ) ] ] )
 
 # Stage the top-level mongodb banners
 distsrc = env.Dir('#distsrc')
@@ -684,7 +686,18 @@ compass_installer = env.Substfile('#/src/mongo/installer/compass/' + compass_scr
                                   ])
 distBinaries.append(compass_installer)
 
-compass_script_installer = env.Install("$INSTALL_DIR/bin", compass_installer)
+if not hygienic:
+    compass_script_installer = env.Install("$INSTALL_DIR/bin", compass_installer)
+else:
+    compass_script_installer = env.AutoInstall(
+        'bin',
+        source=[
+            compass_installer,
+        ],
+        INSTALL_ALIAS=[
+            'tools',
+        ],
+    )
 
 if env.TargetOSIs('posix'):
     env.AddPostAction( compass_script_installer, 'chmod 755 $TARGET' )

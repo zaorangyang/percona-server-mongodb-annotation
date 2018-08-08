@@ -106,15 +106,8 @@ void ShardingTestFixture::setUp() {
     service->setPreciseClockSource(stdx::make_unique<ClockSourceMock>());
     service->setTickSource(stdx::make_unique<TickSourceMock>());
 
-    {
-        auto tlMock = stdx::make_unique<transport::TransportLayerMock>();
-        _transportLayer = tlMock.get();
-        ASSERT_OK(_transportLayer->start());
-        service->setTransportLayer(std::move(tlMock));
-    }
-
     CollatorFactoryInterface::set(service, stdx::make_unique<CollatorFactoryMock>());
-    _transportSession = transport::MockSession::create(_transportLayer);
+    _transportSession = transport::MockSession::create(nullptr);
     _client = service->makeClient("ShardingTestFixture", _transportSession);
     _opCtx = _client->makeOperationContext();
 
@@ -280,6 +273,27 @@ void ShardingTestFixture::onFindWithMetadataCommand(
 
 void ShardingTestFixture::onCommandForPoolExecutor(NetworkTestEnv::OnCommandFunction func) {
     _networkTestEnvForPool->onCommand(func);
+}
+
+void ShardingTestFixture::addRemoteShards(
+    const std::vector<std::tuple<ShardId, HostAndPort>>& shardInfos) {
+    std::vector<ShardType> shards;
+
+    for (auto shard : shardInfos) {
+        ShardType shardType;
+        shardType.setName(std::get<0>(shard).toString());
+        shardType.setHost(std::get<1>(shard).toString());
+        shards.push_back(shardType);
+
+        std::unique_ptr<RemoteCommandTargeterMock> targeter(
+            stdx::make_unique<RemoteCommandTargeterMock>());
+        targeter->setConnectionStringReturnValue(ConnectionString(std::get<1>(shard)));
+        targeter->setFindHostReturnValue(std::get<1>(shard));
+
+        targeterFactory()->addTargeterToReturn(ConnectionString(std::get<1>(shard)),
+                                               std::move(targeter));
+    }
+    setupShards(shards);
 }
 
 void ShardingTestFixture::setupShards(const std::vector<ShardType>& shards) {
@@ -523,7 +537,7 @@ void ShardingTestFixture::expectFindSendBSONObjVector(const HostAndPort& configH
 }
 
 void ShardingTestFixture::setRemote(const HostAndPort& remote) {
-    _transportSession = transport::MockSession::create(remote, HostAndPort{}, _transportLayer);
+    _transportSession = transport::MockSession::create(remote, HostAndPort{}, nullptr);
 }
 
 void ShardingTestFixture::checkReadConcern(const BSONObj& cmdObj,

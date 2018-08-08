@@ -20,6 +20,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/command_generic_argument',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface',
         '$BUILD_DIR/mongo/db/server_parameters',
     ],
@@ -224,6 +225,16 @@ env.Library(
     LIBDEPS=[
 	'database_holder',
         '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Library(
+    target='index_create_impl_servers',
+    source=[
+        'index_create_impl_servers.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        'catalog_impl',
     ],
 )
 

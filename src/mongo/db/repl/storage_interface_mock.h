@@ -91,11 +91,11 @@ public:
             const BSONObj idIndexSpec,
             const std::vector<BSONObj>& secondaryIndexSpecs)>;
     using InsertDocumentFn = stdx::function<Status(OperationContext* opCtx,
-                                                   const NamespaceString& nss,
+                                                   const NamespaceStringOrUUID& nsOrUUID,
                                                    const TimestampedBSONObj& doc,
                                                    long long term)>;
     using InsertDocumentsFn = stdx::function<Status(OperationContext* opCtx,
-                                                    const NamespaceString& nss,
+                                                    const NamespaceStringOrUUID& nsOrUUID,
                                                     const std::vector<InsertStatement>& docs)>;
     using DropUserDatabasesFn = stdx::function<Status(OperationContext* opCtx)>;
     using CreateOplogFn =
@@ -141,16 +141,16 @@ public:
     };
 
     Status insertDocument(OperationContext* opCtx,
-                          const NamespaceString& nss,
+                          const NamespaceStringOrUUID& nsOrUUID,
                           const TimestampedBSONObj& doc,
                           long long term) override {
-        return insertDocumentFn(opCtx, nss, doc, term);
+        return insertDocumentFn(opCtx, nsOrUUID, doc, term);
     };
 
     Status insertDocuments(OperationContext* opCtx,
-                           const NamespaceString& nss,
+                           const NamespaceStringOrUUID& nsOrUUID,
                            const std::vector<InsertStatement>& docs) override {
-        return insertDocumentsFn(opCtx, nss, docs);
+        return insertDocumentsFn(opCtx, nsOrUUID, docs);
     }
 
     Status dropReplicatedDatabases(OperationContext* opCtx) override {
@@ -238,19 +238,19 @@ public:
     }
 
     StatusWith<BSONObj> findById(OperationContext* opCtx,
-                                 const NamespaceString& nss,
+                                 const NamespaceStringOrUUID&,
                                  const BSONElement& idKey) override {
         return Status{ErrorCodes::IllegalOperation, "findById not implemented."};
     }
 
     StatusWith<BSONObj> deleteById(OperationContext* opCtx,
-                                   const NamespaceString& nss,
+                                   const NamespaceStringOrUUID&,
                                    const BSONElement& idKey) override {
         return Status{ErrorCodes::IllegalOperation, "deleteById not implemented."};
     }
 
     Status upsertById(OperationContext* opCtx,
-                      const NamespaceString& nss,
+                      const NamespaceStringOrUUID& nsOrUUID,
                       const BSONElement& idKey,
                       const BSONObj& update) override {
         return Status{ErrorCodes::IllegalOperation, "upsertById not implemented."};
@@ -268,8 +268,14 @@ public:
     }
 
     StatusWith<StorageInterface::CollectionCount> getCollectionCount(
-        OperationContext* opCtx, const NamespaceString& nss) override {
+        OperationContext* opCtx, const NamespaceStringOrUUID& nsOrUUID) override {
         return 0;
+    }
+
+    Status setCollectionCount(OperationContext* opCtx,
+                              const NamespaceStringOrUUID& nsOrUUID,
+                              long long newCount) override {
+        return Status{ErrorCodes::IllegalOperation, "setCollectionCount not implemented."};
     }
 
     StatusWith<OptionalCollectionUUID> getCollectionUUID(OperationContext* opCtx,
@@ -285,7 +291,7 @@ public:
 
     Timestamp getInitialDataTimestamp() const;
 
-    StatusWith<Timestamp> recoverToStableTimestamp(ServiceContext* serviceCtx) override {
+    StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override {
         return Status{ErrorCodes::IllegalOperation, "recoverToStableTimestamp not implemented."};
     }
 
@@ -305,6 +311,17 @@ public:
         return;
     }
 
+    void oplogDiskLocRegister(OperationContext* opCtx,
+                              const Timestamp& ts,
+                              bool orderedCommit) override {
+        return;
+    }
+
+    boost::optional<Timestamp> getLastStableCheckpointTimestamp(
+        ServiceContext* serviceCtx) const override {
+        return boost::none;
+    }
+
     // Testing functions.
     CreateCollectionForBulkFn createCollectionForBulkFn =
         [](const NamespaceString& nss,
@@ -315,13 +332,13 @@ public:
         return Status{ErrorCodes::IllegalOperation, "CreateCollectionForBulkFn not implemented."};
     };
     InsertDocumentFn insertDocumentFn = [](OperationContext* opCtx,
-                                           const NamespaceString& nss,
+                                           const NamespaceStringOrUUID& nsOrUUID,
                                            const TimestampedBSONObj& doc,
                                            long long term) {
         return Status{ErrorCodes::IllegalOperation, "InsertDocumentFn not implemented."};
     };
     InsertDocumentsFn insertDocumentsFn = [](OperationContext* opCtx,
-                                             const NamespaceString& nss,
+                                             const NamespaceStringOrUUID& nsOrUUID,
                                              const std::vector<InsertStatement>& docs) {
         return Status{ErrorCodes::IllegalOperation, "InsertDocumentsFn not implemented."};
     };

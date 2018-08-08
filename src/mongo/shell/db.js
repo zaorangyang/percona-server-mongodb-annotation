@@ -926,9 +926,9 @@ var DB;
         });
     };
 
-    DB.prototype._getCollectionInfosCommand = function(filter) {
+    DB.prototype._getCollectionInfosCommand = function(filter, nameOnly = false) {
         filter = filter || {};
-        var res = this.runCommand({listCollections: 1, filter: filter});
+        var res = this.runCommand({listCollections: 1, filter: filter, nameOnly: nameOnly});
         if (res.code == 59) {
             // command doesn't exist, old mongod
             return null;
@@ -950,8 +950,8 @@ var DB;
      * collection name. An optional filter can be specified to match only collections with certain
      * metadata.
      */
-    DB.prototype.getCollectionInfos = function(filter) {
-        var res = this._getCollectionInfosCommand(filter);
+    DB.prototype.getCollectionInfos = function(filter, nameOnly = false) {
+        var res = this._getCollectionInfosCommand(filter, nameOnly);
         if (res) {
             return res;
         }
@@ -962,7 +962,7 @@ var DB;
      * Returns this database's list of collection names in sorted order.
      */
     DB.prototype.getCollectionNames = function() {
-        return this.getCollectionInfos().map(function(infoObj) {
+        return this.getCollectionInfos({}, true).map(function(infoObj) {
             return infoObj.name;
         });
     };
@@ -1046,11 +1046,6 @@ var DB;
            use local
            db.getReplicationInfo();
       </pre>
-      It is assumed that this database is a replication master -- the information returned is
-      about the operation log stored at local.oplog.$main on the replication master.  (It also
-      works on a machine in a replica pair: for replica pairs, both machines are "masters" from
-      an internal database perspective.
-      <p>
       * @return Object timeSpan: time span of the oplog from start to end  if slave is more out
       *                          of date than that, it can't recover without a complete resync
     */
@@ -1062,10 +1057,8 @@ var DB;
         var localCollections = localdb.getCollectionNames();
         if (localCollections.indexOf('oplog.rs') >= 0) {
             oplog = 'oplog.rs';
-        } else if (localCollections.indexOf('oplog.$main') >= 0) {
-            oplog = 'oplog.$main';
         } else {
-            result.errmsg = "neither master/slave nor replica set replication detected";
+            result.errmsg = "replication not detected";
             return result;
         }
 
@@ -1209,12 +1202,6 @@ var DB;
             for (i in status.members) {
                 r(status.members[i]);
             }
-        } else if (L.sources.count() != 0) {
-            startOptimeDate = new Date();
-            L.sources.find().forEach(g);
-        } else {
-            print("local.sources is empty; is this db a --slave?");
-            return;
         }
     };
 
@@ -1867,6 +1854,29 @@ var DB;
 
     DB.prototype.setLogLevel = function(logLevel, component) {
         return this.getMongo().setLogLevel(logLevel, component, this.getSession());
+    };
+
+    DB.prototype.watch = function(pipeline, options) {
+        pipeline = pipeline || [];
+        options = options || {};
+        assert(pipeline instanceof Array, "'pipeline' argument must be an array");
+        assert(options instanceof Object, "'options' argument must be an object");
+
+        let changeStreamStage = {fullDocument: options.fullDocument || "default"};
+        delete options.fullDocument;
+
+        if (options.hasOwnProperty("resumeAfter")) {
+            changeStreamStage.resumeAfter = options.resumeAfter;
+            delete options.resumeAfter;
+        }
+
+        if (options.hasOwnProperty("startAtClusterTime")) {
+            changeStreamStage.startAtClusterTime = options.startAtClusterTime;
+            delete options.startAtClusterTime;
+        }
+
+        pipeline.unshift({$changeStream: changeStreamStage});
+        return this._runAggregate({aggregate: 1, pipeline: pipeline}, options);
     };
 
     // Writing `this.hasOwnProperty` would cause DB.prototype.getCollection() to be called since the

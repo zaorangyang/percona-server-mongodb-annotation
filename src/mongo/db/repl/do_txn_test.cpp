@@ -58,15 +58,16 @@ public:
      */
     void onTransactionCommit(OperationContext* opCtx) override;
 
-    // If not empty, holds the command object written out by the ObObserverImpl onTransactionCommit.
-    BSONObj onApplyOpsCmdObj;
+    // If present, holds the applyOps oplog entry written out by the ObObserverImpl
+    // onTransactionCommit.
+    boost::optional<OplogEntry> applyOpsOplogEntry;
 };
 
 void OpObserverMock::onTransactionCommit(OperationContext* opCtx) {
     OplogInterfaceLocal oplogInterface(opCtx, NamespaceString::kRsOplogNamespace.ns());
     auto oplogIter = oplogInterface.makeIterator();
     auto opEntry = unittest::assertGet(oplogIter->next());
-    onApplyOpsCmdObj = opEntry.first.getObjectField("o").getOwned();
+    applyOpsOplogEntry = unittest::assertGet(OplogEntry::parse(opEntry.first));
 }
 
 /**
@@ -80,6 +81,25 @@ private:
 protected:
     OperationContext* opCtx() {
         return _opCtx.get();
+    }
+
+    void checkTxnTable() {
+        auto result = _storage->findById(
+            opCtx(),
+            NamespaceString::kSessionTransactionsTableNamespace,
+            BSON(SessionTxnRecord::kSessionIdFieldName << opCtx()->getLogicalSessionId()->toBSON())
+                .firstElement());
+        if (!_opObserver->applyOpsOplogEntry) {
+            ASSERT_NOT_OK(result);
+            return;
+        }
+        auto txnRecord = SessionTxnRecord::parse(IDLParserErrorContext("parse txn record for test"),
+                                                 unittest::assertGet(result));
+
+        ASSERT_EQ(opCtx()->getTxnNumber(), txnRecord.getTxnNum());
+        ASSERT_EQ(_opObserver->applyOpsOplogEntry->getOpTime(), txnRecord.getLastWriteOpTime());
+        ASSERT_EQ(_opObserver->applyOpsOplogEntry->getWallClockTime(),
+                  txnRecord.getLastWriteDate());
     }
 
     OpObserverMock* _opObserver = nullptr;
@@ -105,8 +125,7 @@ void DoTxnTest::setUp() {
     ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_PRIMARY));
 
     // Set up session catalog
-    SessionCatalog::reset_forTest(service);
-    SessionCatalog::create(service);
+    SessionCatalog::get(service)->reset_forTest();
     SessionCatalog::get(service)->onStepUp(_opCtx.get());
 
     // Need the OpObserverImpl in the registry in order for doTxn to work.
@@ -126,7 +145,11 @@ void DoTxnTest::setUp() {
     // Set up the transaction and session.
     _opCtx->setLogicalSessionId(makeLogicalSessionIdForTest());
     _opCtx->setTxnNumber(0);  // TxnNumber can always be 0 because we have a new session.
-    _ocs.emplace(_opCtx.get(), true /* checkOutSession */, false /* autocommit */);
+    _ocs.emplace(_opCtx.get(),
+                 true /* checkOutSession */,
+                 false /* autocommit */,
+                 true /* startTransaction */);
+    OperationContextSession::get(opCtx())->unstashTransactionResources(opCtx(), "doTxn");
 }
 
 void DoTxnTest::tearDown() {
@@ -206,6 +229,7 @@ TEST_F(DoTxnTest, AtomicDoTxnInsertIntoNonexistentCollectionReturnsNamespaceNotF
     auto result = resultBuilder.obj();
     auto status = getStatusFromDoTxnResult(result);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
+    checkTxnTable();
 }
 
 TEST_F(DoTxnTest, AtomicDoTxnInsertWithUuidIntoCollectionWithUuid) {
@@ -222,12 +246,14 @@ TEST_F(DoTxnTest, AtomicDoTxnInsertWithUuidIntoCollectionWithUuid) {
     auto expectedCmdObj = makeApplyOpsWithInsertOperation(nss, uuid, documentToInsert);
     BSONObjBuilder resultBuilder;
     ASSERT_OK(doTxn(opCtx(), "test", cmdObj, &resultBuilder));
-    ASSERT_EQ(expectedCmdObj.woCompare(_opObserver->onApplyOpsCmdObj,
+    ASSERT_EQ(expectedCmdObj.woCompare(_opObserver->applyOpsOplogEntry->getObject(),
                                        BSONObj(),
                                        BSONObj::ComparisonRules::kIgnoreFieldOrder |
                                            BSONObj::ComparisonRules::kConsiderFieldName),
               0)
-        << "expected: " << expectedCmdObj << " got: " << _opObserver->onApplyOpsCmdObj;
+        << "expected: " << expectedCmdObj
+        << " got: " << _opObserver->applyOpsOplogEntry->getObject();
+    checkTxnTable();
 }
 
 TEST_F(DoTxnTest, AtomicDoTxnInsertWithUuidIntoCollectionWithOtherUuid) {
@@ -250,6 +276,7 @@ TEST_F(DoTxnTest, AtomicDoTxnInsertWithUuidIntoCollectionWithOtherUuid) {
     auto result = resultBuilder.obj();
     auto status = getStatusFromDoTxnResult(result);
     ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, status);
+    checkTxnTable();
 }
 
 TEST_F(DoTxnTest, AtomicDoTxnInsertWithoutUuidIntoCollectionWithUuid) {
@@ -269,12 +296,14 @@ TEST_F(DoTxnTest, AtomicDoTxnInsertWithoutUuidIntoCollectionWithUuid) {
     // Insert operation provided by caller did not contain collection uuid but doTxn() should add
     // the uuid to the oplog entry.
     auto expectedCmdObj = makeApplyOpsWithInsertOperation(nss, uuid, documentToInsert);
-    ASSERT_EQ(expectedCmdObj.woCompare(_opObserver->onApplyOpsCmdObj,
+    ASSERT_EQ(expectedCmdObj.woCompare(_opObserver->applyOpsOplogEntry->getObject(),
                                        BSONObj(),
                                        BSONObj::ComparisonRules::kIgnoreFieldOrder |
                                            BSONObj::ComparisonRules::kConsiderFieldName),
               0)
-        << "expected: " << expectedCmdObj << " got: " << _opObserver->onApplyOpsCmdObj;
+        << "expected: " << expectedCmdObj
+        << " got: " << _opObserver->applyOpsOplogEntry->getObject();
+    checkTxnTable();
 }
 
 }  // namespace

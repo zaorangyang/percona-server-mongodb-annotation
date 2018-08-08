@@ -90,6 +90,11 @@ public:
     void setupShards(const std::vector<ShardType>& shards);
 
     /**
+     * Adds ShardRemote shards to the shard registry.
+     */
+    void addRemoteShards(const std::vector<std::tuple<ShardId, HostAndPort>>& shards);
+
+    /**
      * Wait for the shards listing command to be run and returns the specified set of shards.
      */
     void expectGetShards(const std::vector<ShardType>& shards);
@@ -183,7 +188,6 @@ public:
 private:
     ServiceContext::UniqueClient _client;
     ServiceContext::UniqueOperationContext _opCtx;
-    transport::TransportLayerMock* _transportLayer;
     transport::SessionHandle _transportSession;
 
     RemoteCommandTargeterFactoryMock* _targeterFactory;

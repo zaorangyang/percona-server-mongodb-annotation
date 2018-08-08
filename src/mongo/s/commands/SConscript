@@ -12,9 +12,7 @@ env.Library(
         'cluster_get_shard_map_cmd.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/commands',
-        '$BUILD_DIR/mongo/db/commands/killcursors_common',
-        '$BUILD_DIR/mongo/db/commands/current_op_common',
+        '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/s/async_requests_sender',
     ]
 )
@@ -93,9 +91,15 @@ env.Library(
         'strategy.cpp',
         env.Idlc('cluster_multicast.idl')[0],
     ],
-    LIBDEPS=[
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/auth/authmongos',
-        '$BUILD_DIR/mongo/db/commands/killcursors_common',
+        '$BUILD_DIR/mongo/db/commands/core',
+        '$BUILD_DIR/mongo/db/commands/current_op_common',
+        '$BUILD_DIR/mongo/db/commands/servers',
+        '$BUILD_DIR/mongo/db/commands/feature_compatibility_parsers',
+        '$BUILD_DIR/mongo/db/commands/kill_common',
+        '$BUILD_DIR/mongo/db/commands/profile_common',
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/commands/write_commands_common',
         '$BUILD_DIR/mongo/db/ftdc/ftdc_server',
         '$BUILD_DIR/mongo/db/logical_session_cache_impl',
@@ -112,15 +116,30 @@ env.Library(
 )
 
 env.CppUnitTest(
-    target='cluster_commands_helpers_test',
+    target='append_at_cluster_time_test',
     source=[
-        'cluster_commands_helpers_test.cpp',
+        'append_at_cluster_time_test.cpp',
     ],
     LIBDEPS=[
         'shared_cluster_commands',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/db/logical_time',
+        '$BUILD_DIR/mongo/unittest/unittest',
+    ]
+)
+
+env.CppUnitTest(
+    target='compute_at_cluster_time_test',
+    source=[
+        'compute_at_cluster_time_test.cpp',
+    ],
+    LIBDEPS=[
+        'shared_cluster_commands',
+        '$BUILD_DIR/mongo/s/catalog_cache_test_fixture',
+        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/unittest/unittest',
     ]
 )

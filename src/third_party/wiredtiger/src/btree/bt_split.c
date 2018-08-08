@@ -36,8 +36,8 @@ typedef enum {
  * debug purposes. The purpose is to uncover the race conditions in page split.
  */
 static void
-__page_split_timing_stress(WT_SESSION_IMPL *session,
-    uint32_t flag, uint64_t micro_seconds)
+__page_split_timing_stress(
+    WT_SESSION_IMPL *session, uint64_t flag, uint64_t micro_seconds)
 {
 	WT_CONNECTION_IMPL *conn;
 
@@ -402,8 +402,9 @@ __split_root(WT_SESSION_IMPL *session, WT_PAGE *root)
 	root_decr = root_incr = 0;
 	complete = WT_ERR_RETURN;
 
-	/* The root page will be marked dirty, make sure that will succeed. */
+	/* Mark the root page dirty. */
 	WT_RET(__wt_page_modify_init(session, root));
+	__wt_page_modify_set(session, root);
 
 	/*
 	 * Our caller is holding the root page locked to single-thread splits,
@@ -522,7 +523,7 @@ __split_root(WT_SESSION_IMPL *session, WT_PAGE *root)
 
 	/* Encourage a race */
 	__page_split_timing_stress(session,
-	    WT_TIMING_STRESS_INTERNAL_PAGE_SPLIT_RACE, 100 * WT_THOUSAND);
+	    WT_TIMING_STRESS_SPLIT_RACE_1, 100 * WT_THOUSAND);
 
 	/*
 	 * Confirm the root page's index hasn't moved, then update it, which
@@ -534,7 +535,7 @@ __split_root(WT_SESSION_IMPL *session, WT_PAGE *root)
 
 	/* Encourage a race */
 	__page_split_timing_stress(session,
-	    WT_TIMING_STRESS_INTERNAL_PAGE_SPLIT_RACE, 100 * WT_THOUSAND);
+	    WT_TIMING_STRESS_SPLIT_RACE_2, 100 * WT_THOUSAND);
 
 	/*
 	 * Get a generation for this split, mark the root page.  This must be
@@ -574,10 +575,9 @@ __split_root(WT_SESSION_IMPL *session, WT_PAGE *root)
 	WT_TRET(__split_safe_free(session, split_gen, false, pindex, size));
 	root_decr += size;
 
-	/* Adjust the root's memory footprint and mark it dirty. */
+	/* Adjust the root's memory footprint. */
 	__wt_cache_page_inmem_incr(session, root, root_incr);
 	__wt_cache_page_inmem_decr(session, root, root_decr);
-	__wt_page_modify_set(session, root);
 
 err:	switch (complete) {
 	case WT_ERR_RETURN:
@@ -629,8 +629,9 @@ __split_parent(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF **ref_new,
 	empty_parent = false;
 	complete = WT_ERR_RETURN;
 
-	/* The parent page will be marked dirty, make sure that will succeed. */
+	/* Mark the page dirty. */
 	WT_RET(__wt_page_modify_init(session, parent));
+	__wt_page_modify_set(session, parent);
 
 	/*
 	 * We've locked the parent, which means it cannot split (which is the
@@ -719,12 +720,11 @@ __split_parent(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF **ref_new,
 	    alloc_refp - alloc_index->index == (ptrdiff_t)result_entries);
 
 	/* Start making real changes to the tree, errors are fatal. */
-	complete = WT_ERR_PANIC;
-	WT_NOT_READ(complete);
+	WT_NOT_READ(complete, WT_ERR_PANIC);
 
 	/* Encourage a race */
 	__page_split_timing_stress(session,
-	    WT_TIMING_STRESS_INTERNAL_PAGE_SPLIT_RACE, 100 * WT_THOUSAND);
+	    WT_TIMING_STRESS_SPLIT_RACE_3, 100 * WT_THOUSAND);
 
 	/*
 	 * Confirm the parent page's index hasn't moved then update it, which
@@ -736,7 +736,7 @@ __split_parent(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF **ref_new,
 
 	/* Encourage a race */
 	__page_split_timing_stress(session,
-	    WT_TIMING_STRESS_INTERNAL_PAGE_SPLIT_RACE, 100 * WT_THOUSAND);
+	    WT_TIMING_STRESS_SPLIT_RACE_4, 100 * WT_THOUSAND);
 
 	/*
 	 * Get a generation for this split, mark the page.  This must be after
@@ -863,10 +863,9 @@ __split_parent(WT_SESSION_IMPL *session, WT_REF *ref, WT_REF **ref_new,
 	WT_TRET(__split_safe_free(session, split_gen, exclusive, pindex, size));
 	parent_decr += size;
 
-	/* Adjust the parent's memory footprint and mark it dirty. */
+	/* Adjust the parent's memory footprint. */
 	__wt_cache_page_inmem_incr(session, parent, parent_incr);
 	__wt_cache_page_inmem_decr(session, parent, parent_decr);
-	__wt_page_modify_set(session, parent);
 
 err:	__wt_scr_free(session, &scr);
 	/*
@@ -930,8 +929,9 @@ __split_internal(WT_SESSION_IMPL *session, WT_PAGE *parent, WT_PAGE *page)
 	WT_STAT_CONN_INCR(session, cache_eviction_split_internal);
 	WT_STAT_DATA_INCR(session, cache_eviction_split_internal);
 
-	/* The page will be marked dirty, make sure that will succeed. */
+	/* Mark the page dirty. */
 	WT_RET(__wt_page_modify_init(session, page));
+	__wt_page_modify_set(session, page);
 
 	btree = S2BT(session);
 	alloc_index = replace_index = NULL;
@@ -1078,7 +1078,7 @@ __split_internal(WT_SESSION_IMPL *session, WT_PAGE *parent, WT_PAGE *page)
 
 	/* Encourage a race */
 	__page_split_timing_stress(session,
-	    WT_TIMING_STRESS_INTERNAL_PAGE_SPLIT_RACE, 100 * WT_THOUSAND);
+	    WT_TIMING_STRESS_SPLIT_RACE_5, 100 * WT_THOUSAND);
 
 	/* Split into the parent. */
 	WT_ERR(__split_parent(session, page_ref, alloc_index->index,
@@ -1093,7 +1093,7 @@ __split_internal(WT_SESSION_IMPL *session, WT_PAGE *parent, WT_PAGE *page)
 
 	/* Encourage a race */
 	__page_split_timing_stress(session,
-	    WT_TIMING_STRESS_INTERNAL_PAGE_SPLIT_RACE, 100 * WT_THOUSAND);
+	    WT_TIMING_STRESS_SPLIT_RACE_6, 100 * WT_THOUSAND);
 
 	/*
 	 * Get a generation for this split, mark the parent page.  This must be
@@ -1137,10 +1137,9 @@ __split_internal(WT_SESSION_IMPL *session, WT_PAGE *parent, WT_PAGE *page)
 	WT_TRET(__split_safe_free(session, split_gen, false, pindex, size));
 	page_decr += size;
 
-	/* Adjust the page's memory footprint, and mark it dirty. */
+	/* Adjust the page's memory footprint. */
 	__wt_cache_page_inmem_incr(session, page, page_incr);
 	__wt_cache_page_inmem_decr(session, page, page_decr);
-	__wt_page_modify_set(session, page);
 
 err:	switch (complete) {
 	case WT_ERR_RETURN:
@@ -1206,9 +1205,9 @@ __split_internal_lock(
 	for (;;) {
 		parent = ref->home;
 
-		/* Encourage race */
+		/* Encourage races. */
 		__page_split_timing_stress(session,
-		    WT_TIMING_STRESS_PAGE_SPLIT_RACE, WT_THOUSAND);
+		    WT_TIMING_STRESS_SPLIT_RACE_7, WT_THOUSAND);
 
 		/* Page locks live in the modify structure. */
 		WT_RET(__wt_page_modify_init(session, parent));

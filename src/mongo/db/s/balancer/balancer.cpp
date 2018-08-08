@@ -151,9 +151,10 @@ void warnOnMultiVersion(const vector<ClusterStatistics::ShardStatistics>& cluste
 
 Balancer::Balancer(ServiceContext* serviceContext)
     : _balancedLastTime(0),
-      _clusterStats(stdx::make_unique<ClusterStatisticsImpl>()),
+      _random(std::random_device{}()),
+      _clusterStats(stdx::make_unique<ClusterStatisticsImpl>(_random)),
       _chunkSelectionPolicy(
-          stdx::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get())),
+          stdx::make_unique<BalancerChunkSelectionPolicyImpl>(_clusterStats.get(), _random)),
       _migrationManager(serviceContext) {}
 
 Balancer::~Balancer() {
@@ -466,7 +467,7 @@ bool Balancer::_checkOIDs(OperationContext* opCtx) {
     auto shardingContext = Grid::get(opCtx);
 
     vector<ShardId> all;
-    shardingContext->shardRegistry()->getAllShardIds(&all);
+    shardingContext->shardRegistry()->getAllShardIdsNoReload(&all);
 
     // map of OID machine ID => shardId
     map<int, ShardId> oids;

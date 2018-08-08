@@ -38,9 +38,11 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/server_options.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
@@ -145,7 +147,6 @@ public:
 
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
         auto const catalogCache = Grid::get(opCtx)->catalogCache();
-        auto const catalogManager = ShardingCatalogManager::get(opCtx);
         auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
 
         auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
@@ -156,28 +157,6 @@ public:
                           .value;
 
         const auto fromShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbType.getPrimary()));
-
-        // fcv 4.0 logic for movePrimary (being tested under the 'forTest' flag while in
-        // development).
-        if (movePrimaryRequest.getForTest()) {
-            const NamespaceString nss(dbname);
-
-            ShardMovePrimary shardMovePrimaryRequest;
-            shardMovePrimaryRequest.set_movePrimary(nss);
-            shardMovePrimaryRequest.setTo(movePrimaryRequest.getTo());
-
-            auto cmdResponse = uassertStatusOK(fromShard->runCommandWithFixedRetryAttempts(
-                opCtx,
-                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                "admin",
-                CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
-                    cmdObj, shardMovePrimaryRequest.toBSON())),
-                Shard::RetryPolicy::kIdempotent));
-
-            CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
-
-            return true;
-        }
 
         const auto toShard = [&]() {
             auto toShardStatus = shardRegistry->getShard(opCtx, to);
@@ -204,10 +183,37 @@ public:
             return true;
         }
 
+        // FCV 4.0 logic exists inside the if statement.
+        if (serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40 ||
+            serverGlobalParams.featureCompatibility.getVersion() ==
+                ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40) {
+            const NamespaceString nss(dbname);
+
+            ShardMovePrimary shardMovePrimaryRequest;
+            shardMovePrimaryRequest.set_movePrimary(nss);
+            shardMovePrimaryRequest.setTo(toShard->getId().toString());
+
+            auto cmdResponse = uassertStatusOK(fromShard->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                "admin",
+                CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
+                    cmdObj, shardMovePrimaryRequest.toBSON())),
+                Shard::RetryPolicy::kIdempotent));
+
+            CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+
+            return true;
+        }
+
+        // The rest of this function will only be executed under FCV 3.6 (or downgrading).
+
         log() << "Moving " << dbname << " primary from: " << fromShard->toString()
               << " to: " << toShard->toString();
 
-        const auto shardedColls = catalogManager->getAllShardedCollectionsForDb(opCtx, dbname);
+        const auto shardedColls = catalogClient->getAllShardedCollectionsForDb(
+            opCtx, dbname, repl::ReadConcernLevel::kLocalReadConcern);
 
         // Record start in changelog
         uassertStatusOK(catalogClient->logChange(
@@ -253,9 +259,26 @@ public:
             }
         }
 
-        // Update the new primary in the config server metadata.
-        dbType.setPrimary(toShard->getId());
-        uassertStatusOK(catalogClient->updateDatabase(opCtx, dbname, dbType));
+        {
+            // Check if the FCV has been changed under us.
+            invariant(!opCtx->lockState()->isLocked());
+            Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+
+            // If we are upgrading to (or are fully on) FCV 4.0, then fail. If we do not fail, we
+            // will potentially write an unversioned database in a schema that requires versions.
+            if (serverGlobalParams.featureCompatibility.getVersion() ==
+                    ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40 ||
+                serverGlobalParams.featureCompatibility.getVersion() ==
+                    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
+                uasserted(ErrorCodes::ConflictingOperationInProgress,
+                          "committing movePrimary failed due to version mismatch");
+            }
+
+            // Update the new primary in the config server metadata.
+            dbType.setPrimary(toShard->getId());
+            uassertStatusOK(catalogClient->updateDatabase(opCtx, dbname, dbType));
+        }
+
 
         // Ensure the next attempt to retrieve the database or any of its collections will do a full
         // reload
@@ -267,7 +290,6 @@ public:
         ON_BLOCK_EXIT([&fromconn] { fromconn.done(); });
 
         if (shardedColls.empty()) {
-            // TODO: Collections can be created in the meantime, and we should handle in the future.
             log() << "movePrimary dropping database on " << oldPrimary
                   << ", no sharded collections in " << dbname;
 
@@ -295,7 +317,8 @@ public:
                       << "User must manually remove unsharded collections in database " << dbname
                       << " on " << oldPrimary;
         } else {
-            // We moved some unsharded collections, but not all
+            // Sharded collections exist on the old primary, so drop only the cloned (unsharded)
+            // collections.
             BSONObjIterator it(cloneRes["clonedColls"].Obj());
 
             while (it.more()) {

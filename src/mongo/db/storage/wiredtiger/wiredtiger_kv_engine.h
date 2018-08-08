@@ -178,9 +178,18 @@ public:
 
     virtual bool supportsRecoverToStableTimestamp() const override;
 
-    virtual StatusWith<Timestamp> recoverToStableTimestamp() override;
+    virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
 
     virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
+
+    /**
+     * Returns a timestamp value that is at or before the last checkpoint. Everything before this
+     * value is guaranteed to be persisted on disk and replication recovery will not need to
+     * replay documents with an earlier time.
+     */
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const override;
+
+    virtual Timestamp getAllCommittedTimestamp(OperationContext* opCtx) const override;
 
     bool supportsReadConcernSnapshot() const final;
 
@@ -247,7 +256,7 @@ public:
     /**
      * Initializes a background job to remove excess documents in the oplog collections.
      * This applies to the capped collections in the local.oplog.* namespaces (specifically
-     * local.oplog.rs for replica sets and local.oplog.$main for master/slave replication).
+     * local.oplog.rs for replica sets).
      * Returns true if a background job is running for the namespace.
      */
     static bool initRsOplogBackgroundThread(StringData ns);
@@ -301,5 +310,6 @@ private:
     mutable Date_t _previousCheckedDropsQueued;
 
     std::unique_ptr<WiredTigerSession> _backupSession;
+    Timestamp _recoveryTimestamp;
 };
 }

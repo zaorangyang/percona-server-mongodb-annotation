@@ -76,7 +76,7 @@ bool _areOpsCrudOnly(const BSONObj& doTxnCmd) {
         BSONElement& fieldOp = fields[1];
 
         const char* opType = fieldOp.valuestrsafe();
-        const StringData ns = fieldNs.valueStringData();
+        const StringData ns = fieldNs.valuestrsafe();
 
         // All atomic ops have an opType of length 1.
         if (opType[0] == '\0' || opType[1] != '\0')
@@ -281,7 +281,8 @@ Status doTxn(OperationContext* opCtx,
     uassert(ErrorCodes::InvalidOptions, "doTxn can only be run with a transaction ID.", txnNumber);
     auto* session = OperationContextSession::get(opCtx);
     uassert(ErrorCodes::InvalidOptions, "doTxn must be run within a session", session);
-    invariant(!session->getAutocommit());
+    invariant(session->inMultiDocumentTransaction());
+    invariant(opCtx->getWriteUnitOfWork());
     uassert(
         ErrorCodes::InvalidOptions, "doTxn supports only CRUD opts.", _areOpsCrudOnly(doTxnCmd));
     auto hasPrecondition = _hasPrecondition(doTxnCmd);
@@ -301,32 +302,20 @@ Status doTxn(OperationContext* opCtx,
     int numApplied = 0;
 
     try {
-        writeConflictRetry(opCtx, "doTxn", dbName, [&] {
-            BSONObjBuilder intermediateResult;
-            // The write unit of work guarantees snapshot isolation for precondition check and the
-            // write.
-            WriteUnitOfWork wunit(opCtx);
+        BSONObjBuilder intermediateResult;
 
-            // Check precondition in the same write unit of work so that they share the same
-            // snapshot.
-            if (hasPrecondition) {
-                uassertStatusOK(_checkPrecondition(opCtx, doTxnCmd, result));
-            }
-
-            numApplied = 0;
-            uassertStatusOK(_doTxn(opCtx, dbName, doTxnCmd, &intermediateResult, &numApplied));
-            auto opObserver = getGlobalServiceContext()->getOpObserver();
-            invariant(opObserver);
-            opObserver->onTransactionCommit(opCtx);
-            wunit.commit();
-            result->appendElements(intermediateResult.obj());
-        });
-
-        // Commit the global WUOW if the command succeeds.
-        if (opCtx->getWriteUnitOfWork()) {
-            opCtx->getWriteUnitOfWork()->commit();
+        // The transaction takes place in a global unit of work, so the precondition check
+        // and the writes will share the same snapshot.
+        if (hasPrecondition) {
+            uassertStatusOK(_checkPrecondition(opCtx, doTxnCmd, result));
         }
+
+        numApplied = 0;
+        uassertStatusOK(_doTxn(opCtx, dbName, doTxnCmd, &intermediateResult, &numApplied));
+        session->commitTransaction(opCtx);
+        result->appendElements(intermediateResult.obj());
     } catch (const DBException& ex) {
+        session->abortActiveTransaction(opCtx);
         BSONArrayBuilder ab;
         ++numApplied;
         for (int j = 0; j < numApplied; j++)

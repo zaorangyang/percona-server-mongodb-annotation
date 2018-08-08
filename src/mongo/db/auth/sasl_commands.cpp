@@ -44,6 +44,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
+#include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/auth/sasl_options.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -325,7 +326,7 @@ bool CmdSaslContinue::run(OperationContext* opCtx,
     auto& mechanism = session->getMechanism();
     // Authenticating the __system@local user to the admin database on mongos is required
     // by the auth passthrough test suite.
-    if (mechanism.getAuthenticationDatabase() != db && !Command::testCommandsEnabled) {
+    if (mechanism.getAuthenticationDatabase() != db && !getTestCommandsEnabled()) {
         return CommandHelpers::appendCommandStatus(
             result,
             Status(ErrorCodes::ProtocolError,

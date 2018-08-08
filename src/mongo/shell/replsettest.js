@@ -439,10 +439,7 @@ var ReplSetTest = function(opts) {
     this.getReplSetConfig = function() {
         var cfg = {};
         cfg._id = this.name;
-
-        if (this.protocolVersion !== undefined && this.protocolVersion !== null) {
-            cfg.protocolVersion = this.protocolVersion;
-        }
+        cfg.protocolVersion = 1;
 
         cfg.members = [];
 
@@ -467,10 +464,6 @@ var ReplSetTest = function(opts) {
             }
 
             cfg.members.push(member);
-        }
-
-        if (jsTestOptions().forceReplicationProtocolVersion !== undefined) {
-            cfg.protocolVersion = jsTestOptions().forceReplicationProtocolVersion;
         }
 
         if (_configSettings) {
@@ -833,12 +826,12 @@ var ReplSetTest = function(opts) {
     };
 
     this._setDefaultConfigOptions = function(config) {
-        if (jsTestOptions().forceReplicationProtocolVersion !== undefined &&
-            !config.hasOwnProperty("protocolVersion")) {
-            config.protocolVersion = jsTestOptions().forceReplicationProtocolVersion;
-        }
         // Update config for non journaling test variants
         this._updateConfigIfNotDurable(config);
+        // Add protocolVersion if missing
+        if (!config.hasOwnProperty('protocolVersion')) {
+            config['protocolVersion'] = 1;
+        }
     };
 
     /**
@@ -945,8 +938,9 @@ var ReplSetTest = function(opts) {
                 let val = self.nodeOptions[key];
                 if (typeof(val) === "object" &&
                     (val.hasOwnProperty("shardsvr") ||
-                     // TODO: SERVER-31376
-                     val.hasOwnProperty("binVersion") && val.binVersion != "latest")) {
+                     val.hasOwnProperty("binVersion") &&
+                         // Should not wait for keys if version is less than 3.6
+                         MongoRunner.compareBinVersions(val.binVersion, "3.6") == -1)) {
                     shouldWaitForKeys = false;
                     print("Set shouldWaitForKeys from node options: " + shouldWaitForKeys);
                 }
@@ -955,7 +949,9 @@ var ReplSetTest = function(opts) {
                 let val = self.startOptions;
                 if (typeof(val) === "object" &&
                     (val.hasOwnProperty("shardsvr") ||
-                     val.hasOwnProperty("binVersion") && val.binVersion != "latest")) {
+                     val.hasOwnProperty("binVersion") &&
+                         // Should not wait for keys if version is less than 3.6
+                         MongoRunner.compareBinVersions(val.binVersion, "3.6") == -1)) {
                     shouldWaitForKeys = false;
                     print("Set shouldWaitForKeys from start options: " + shouldWaitForKeys);
                 }
@@ -1033,38 +1029,8 @@ var ReplSetTest = function(opts) {
             return;
         }
 
-        if (this.protocolVersion === 0 || jsTestOptions().forceReplicationProtocolVersion === 0) {
-            // Ensure the specified node is primary.
-            for (let i = 0; i < this.nodes.length; i++) {
-                let primary = this.getPrimary();
-                if (primary === node) {
-                    break;
-                }
-                try {
-                    // Make sure the nodes do not step back up for 10 minutes.
-                    assert.commandWorked(
-                        primary.adminCommand({replSetStepDown: 10 * 60, force: true}));
-                } catch (ex) {
-                    print("Caught exception while stepping down node '" + tojson(node.host) +
-                          "': " + tojson(ex));
-                }
-                this.awaitReplication();
-                this.awaitNodesAgreeOnAppliedOpTime();
-                this.awaitNodesAgreeOnPrimary();
-            }
-
-            // Reset the rest of the nodes so they can run for election during the test.
-            for (let i = 0; i < this.nodes.length; i++) {
-                // Cannot call replSetFreeze on the primary.
-                if (this.nodes[i] === node) {
-                    continue;
-                }
-                assert.commandWorked(this.nodes[i].adminCommand({replSetFreeze: 0}));
-            }
-        } else {
-            assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
-            this.awaitNodesAgreeOnPrimary();
-        }
+        assert.commandWorked(node.adminCommand({replSetStepUp: 1}));
+        this.awaitNodesAgreeOnPrimary();
         assert.eq(this.getPrimary(), node, node.host + " was not primary after stepUp");
     };
 
@@ -1284,14 +1250,28 @@ var ReplSetTest = function(opts) {
     };
 
     this.getHashes = function(db) {
+        assert.neq(db, 'local', 'Cannot run getHashes() on the "local" database');
+
         this.getPrimary();
         var res = {};
-        res.master = this.liveNodes.master.getDB(db).runCommand("dbhash");
+
+        // If MapReduce is interrupted by a stepdown, it could still have 'tmp.mr' collections that
+        // it will not be able to delete. Excluding them from dbhash will prevent a mismatch.
+        // TODO SERVER-27147: no need to exclude 'tmp.mr' collections
+        var collections = this.liveNodes.master.getDB(db).getCollectionNames();
+        var colls_excluding_tmp_mr = collections.filter(coll => !coll.startsWith("tmp.mr."));
+        res.master = this.liveNodes.master.getDB(db).runCommand(
+            {dbhash: 1, collections: colls_excluding_tmp_mr});
         res.slaves = [];
         this.liveNodes.slaves.forEach(function(node) {
             var isArbiter = node.getDB('admin').isMaster('admin').arbiterOnly;
             if (!isArbiter) {
-                var slaveRes = node.getDB(db).runCommand("dbhash");
+                collections = node.getDB(db).getCollectionNames();
+                colls_excluding_tmp_mr = collections.filter(coll => {
+                    return !coll.startsWith("tmp.mr.");
+                });
+                var slaveRes =
+                    node.getDB(db).runCommand({dbhash: 1, collections: colls_excluding_tmp_mr});
                 res.slaves.push(slaveRes);
             }
         });
@@ -1357,7 +1337,7 @@ var ReplSetTest = function(opts) {
         assert.commandWorked(primary.adminCommand({fsync: 1, lock: 1}),
                              'failed to lock the primary');
         try {
-            this.awaitReplication(60 * 1000 * 5);
+            this.awaitReplication();
             checkerFunction.apply(this, checkerFunctionArgs);
         } catch (e) {
             activeException = true;
@@ -1538,12 +1518,12 @@ var ReplSetTest = function(opts) {
                     continue;
                 }
 
-                var dbHashes = rst.getHashes(dbName);
-                var primaryDBHash = dbHashes.master;
-                var primaryCollections = Object.keys(primaryDBHash.collections);
-                assert.commandWorked(primaryDBHash);
-
                 try {
+                    var dbHashes = rst.getHashes(dbName);
+                    var primaryDBHash = dbHashes.master;
+                    var primaryCollections = Object.keys(primaryDBHash.collections);
+                    assert.commandWorked(primaryDBHash);
+
                     // Filter only collections that were retrieved by the dbhash. listCollections
                     // may include non-replicated collections like system.profile.
                     var primaryCollInfo =
@@ -1781,6 +1761,46 @@ var ReplSetTest = function(opts) {
             }
         }
     }
+
+    /**
+     * Checks that 'fastCount' matches an iterative count for all collections.
+     */
+    this.checkCollectionCounts = function(msgPrefix = 'checkCollectionCounts') {
+        let success = true;
+        const errPrefix = `${msgPrefix}, counts did not match for collection`;
+
+        function checkCollectionCount(coll) {
+            const itCount = coll.find().itcount();
+            const fastCount = coll.count();
+            if (itCount !== fastCount) {
+                print(`${errPrefix} ${coll.getFullName()} on ${coll.getMongo().host}.` +
+                      ` itcount: ${itCount}, fast count: ${fastCount}`);
+                print("Collection info: " +
+                      tojson(coll.getDB().getCollectionInfos({name: coll.getName()})));
+                print("Collection stats: " + tojson(coll.stats()));
+                success = false;
+            }
+        }
+
+        function checkCollectionCountsForDB(_db) {
+            const res = assert.commandWorked(
+                _db.runCommand({listCollections: 1, includePendingDrops: true}));
+            const collNames = new DBCommandCursor(_db, res).toArray();
+            collNames.forEach(c => checkCollectionCount(_db.getCollection(c.name)));
+        }
+
+        function checkCollectionCountsForNode(node) {
+            const dbNames = node.getDBNames();
+            dbNames.forEach(dbName => checkCollectionCountsForDB(node.getDB(dbName)));
+        }
+
+        function checkCollectionCountsForReplSet(rst) {
+            rst.nodes.forEach(node => checkCollectionCountsForNode(node));
+            assert(success, `Collection counts did not match. search for '${errPrefix}' in logs.`);
+        }
+
+        this.checkReplicaSet(checkCollectionCountsForReplSet, this);
+    };
 
     /**
      * Starts up a server.  Options are saved by default for subsequent starts.
@@ -2171,6 +2191,8 @@ var ReplSetTest = function(opts) {
         self.ports = existingNodes.map(node => node.split(':')[1]);
         self.nodes = existingNodes.map(node => new Mongo(node));
         self.waitForKeys = false;
+        self.host = existingNodes[0].split(':')[0];
+        self.name = conf._id;
     }
 
     if (typeof opts === 'string' || opts instanceof String) {

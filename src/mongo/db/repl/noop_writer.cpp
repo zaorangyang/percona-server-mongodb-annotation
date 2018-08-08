@@ -31,6 +31,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -164,7 +165,7 @@ void NoopWriter::_writeNoop(OperationContext* opCtx) {
                << " != last primary OpTime: " << lastAppliedOpTime;
     } else {
         if (writePeriodicNoops.load()) {
-            const auto logLevel = Command::testCommandsEnabled ? 0 : 1;
+            const auto logLevel = getTestCommandsEnabled() ? 0 : 1;
             LOG(logLevel)
                 << "Writing noop to oplog as there has been no writes to this replica set in over "
                 << _writeInterval;

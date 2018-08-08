@@ -336,7 +336,12 @@ StatusWith<BSONObj> IndexCatalogImpl::prepareSpecForCreate(OperationContext* opC
 StatusWith<BSONObj> IndexCatalogImpl::createIndexOnEmptyCollection(OperationContext* opCtx,
                                                                    BSONObj spec) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns().toString(), MODE_X));
-    invariant(_collection->numRecords(opCtx) == 0);
+    invariant(_collection->numRecords(opCtx) == 0,
+              str::stream() << "Collection must be empty. Collection: " << _collection->ns().ns()
+                            << " UUID: "
+                            << _collection->uuid()
+                            << " Count: "
+                            << _collection->numRecords(opCtx));
 
     _checkMagic();
     Status status = checkUnfinished();
@@ -456,6 +461,7 @@ void IndexCatalogImpl::IndexBuildBlock::success() {
     invariant(_opCtx->lockState()->inAWriteUnitOfWork());
 
     Collection* collection = _catalog->_getCollection();
+
     fassert(17207, collection->ok());
     NamespaceString ns(_indexNamespace);
     invariant(_opCtx->lockState()->isDbLockedForMode(ns.db(), MODE_X));
@@ -686,15 +692,12 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
             new ExpressionContext(opCtx, collator.get()));
 
         // Parsing the partial filter expression is not expected to fail here since the
-        // expression would have been successfully parsed upstream during index creation. However,
-        // filters that were allowed in partial filter expressions prior to 3.6 may be present in
-        // the index catalog and must also successfully parse (e.g., partial index filters with the
-        // $isolated/$atomic option).
+        // expression would have been successfully parsed upstream during index creation.
         StatusWithMatchExpression statusWithMatcher =
             MatchExpressionParser::parse(filterElement.Obj(),
                                          std::move(expCtx),
                                          ExtensionsCallbackNoop(),
-                                         MatchExpressionParser::kIsolated);
+                                         MatchExpressionParser::kBanAllSpecialFeatures);
         if (!statusWithMatcher.isOK()) {
             return statusWithMatcher.getStatus();
         }
@@ -1097,14 +1100,34 @@ int IndexCatalogImpl::numIndexesTotal(OperationContext* opCtx) const {
 }
 
 int IndexCatalogImpl::numIndexesReady(OperationContext* opCtx) const {
-    int count = 0;
+    std::vector<IndexDescriptor*> itIndexes;
     IndexIterator ii = _this->getIndexIterator(opCtx, /*includeUnfinished*/ false);
     while (ii.more()) {
-        ii.next();
-        count++;
+        itIndexes.push_back(ii.next());
     }
-    dassert(_collection->getCatalogEntry()->getCompletedIndexCount(opCtx) == count);
-    return count;
+    DEV {
+        std::vector<std::string> completedIndexes;
+        _collection->getCatalogEntry()->getReadyIndexes(opCtx, &completedIndexes);
+
+        // There is a potential inconistency where the index information in the collection catalog
+        // entry and the index catalog differ. Log as much information as possible here.
+        if (itIndexes.size() != completedIndexes.size()) {
+            log() << "index catalog reports: ";
+            for (IndexDescriptor* i : itIndexes) {
+                log() << "  index: " << i->toString();
+            }
+
+            log() << "collection catalog reports: ";
+            for (auto const& i : completedIndexes) {
+                log() << "  index: " << i;
+            }
+
+            invariant(itIndexes.size() == completedIndexes.size(),
+                      "The number of ready indexes reported in the collection metadata catalog did "
+                      "not match the number of ready indexes reported by the index catalog.");
+        }
+    }
+    return itIndexes.size();
 }
 
 bool IndexCatalogImpl::haveIdIndex(OperationContext* opCtx) const {
@@ -1161,7 +1184,7 @@ void IndexCatalogImpl::IndexIteratorImpl::_advance() {
 
         if (!_includeUnfinishedIndexes) {
             if (auto minSnapshot = entry->getMinimumVisibleSnapshot()) {
-                if (auto mySnapshot = _opCtx->recoveryUnit()->getMajorityCommittedSnapshot()) {
+                if (auto mySnapshot = _opCtx->recoveryUnit()->getPointInTimeReadTimestamp()) {
                     if (mySnapshot < minSnapshot) {
                         // This index isn't finished in my snapshot.
                         continue;

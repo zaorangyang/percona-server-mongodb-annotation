@@ -35,7 +35,9 @@
 
     // add an oplog entry from the distant future as the most recent entry on node C
     var future_oplog_entry = conns[2].getDB("local").oplog.rs.find().sort({$natural: -1})[0];
-    future_oplog_entry["ts"] = new Timestamp(future_oplog_entry["ts"].getTime() + 200000, 1);
+    future_oplog_entry["ts"] = new Timestamp(future_oplog_entry["ts"].getTime() + 1, 1);
+    future_oplog_entry["wall"] = new Date(Date.now() + (5000 * 1000));
+
     options = {writeConcern: {w: 1, wtimeout: ReplSetTest.kDefaultTimeoutMS}};
     assert.writeOK(conns[2].getDB("local").oplog.rs.insert(future_oplog_entry, options));
 
@@ -55,19 +57,22 @@
     // Node C should connect to new master as a sync source because chaining is disallowed.
     // C is ahead of master but it will still connect to it.
     clearRawMongoProgramOutput();
-    // Don't wait for a connection to the node after startup, since it might roll back and crash
-    // immediately.
-    replTest.start(CID, {waitForConnect: false}, true /*restart*/);
+    c_conn = replTest.start(CID, {waitForConnect: true}, true /*restart*/);
 
+    // Wait for node C to fassert
     assert.soon(function() {
         try {
-            return rawMongoProgramOutput().match(
-                "rollback error: not willing to roll back more than 30 minutes of data");
+            c_conn.getDB("local").runCommand({ping: 1});
         } catch (e) {
-            return false;
+            return true;
         }
-    }, "node C failed to fassert", 60 * 1000);
+        return false;
+    }, "Node did not fassert", 60 * 1000);
 
     replTest.stop(CID, undefined, {allowedExitCode: MongoRunner.EXIT_ABRUPT});
+
+    assert(rawMongoProgramOutput().match("not willing to roll back more than 1800 seconds of data"),
+           "node C failed to fassert");
+
     replTest.stopSet();
 }());

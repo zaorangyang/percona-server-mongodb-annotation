@@ -65,6 +65,7 @@ ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>
     setDiffieHellmanParameterPEMFile(ServerParameterSet::getGlobal(),
                                      "opensslDiffieHellmanParameters",
                                      &sslGlobalParams.sslPEMTempDHParam);
+
 }  // namespace
 
 SSLPeerInfo& SSLPeerInfo::forSession(const transport::SessionHandle& session) {
@@ -460,6 +461,35 @@ StatusWith<stdx::unordered_set<RoleName>> parsePeerRoles(ConstDataRange cdrExten
 
     return roles;
 }
+
+std::string removeFQDNRoot(std::string name) {
+    if (name.back() == '.') {
+        name.pop_back();
+    }
+    return name;
+};
+
 #endif
 
 }  // namespace mongo
+
+#ifdef MONGO_CONFIG_SSL
+// TODO SERVER-11601 Use NFC Unicode canonicalization
+bool mongo::hostNameMatchForX509Certificates(std::string nameToMatch, std::string certHostName) {
+    nameToMatch = removeFQDNRoot(std::move(nameToMatch));
+    certHostName = removeFQDNRoot(std::move(certHostName));
+
+    if (certHostName.size() < 2) {
+        return false;
+    }
+
+    // match wildcard DNS names
+    if (certHostName[0] == '*' && certHostName[1] == '.') {
+        // allow name.example.com if the cert is *.example.com, '*' does not match '.'
+        const char* subName = strchr(nameToMatch.c_str(), '.');
+        return subName && !strcasecmp(certHostName.c_str() + 1, subName);
+    } else {
+        return !strcasecmp(nameToMatch.c_str(), certHostName.c_str());
+    }
+}
+#endif

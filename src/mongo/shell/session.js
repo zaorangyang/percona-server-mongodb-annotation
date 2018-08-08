@@ -1,5 +1,8 @@
 /**
  * Implements the sessions api for the shell.
+ *
+ * Roughly follows the driver sessions spec:
+ * https://github.com/mongodb/specifications/blob/master/source/sessions/driver-sessions.rst#abstract
  */
 var {
     DriverSession, SessionOptions, _DummyDriverSession, _DelegatingDriverSession,
@@ -239,6 +242,12 @@ var {
                 }
             }
 
+            // If startTransaction was called on the session, attach txn number and readConcern.
+            // TODO: SERVER-34170 guard this code with a wire version check.
+            if (driverSession._serverSession.isInActiveTransaction()) {
+                cmdObj = driverSession._serverSession.assignTxnInfo(cmdObj);
+            }
+
             // TODO SERVER-31868: A user should get back an error if they attempt to advance the
             // DriverSession's operationTime manually when talking to a stand-alone mongod. Removing
             // the `(client.isReplicaSetMember() || client.isMongos())` condition will also involve
@@ -248,7 +257,12 @@ var {
                 (client.isReplicaSetMember() || client.isMongos()) &&
                 (driverSession.getOptions().isCausalConsistency() ||
                  client.isCausalConsistency()) &&
-                canUseReadConcern(cmdObj)) {
+                canUseReadConcern(cmdObj) &&
+                (!driverSession._serverSession.isInActiveTransaction() ||
+                 driverSession._serverSession.isFirstStatement())) {
+                // When we are in a transaction, we must only attach an afterClusterTime to the
+                // first statement because readConcern is not allowed in subsequent statements.
+
                 // `driverSession.getOperationTime()` is the smallest time needed for performing a
                 // causally consistent read using the current session. Note that
                 // `client.getClusterTime()` is no smaller than the operation time and would
@@ -259,6 +273,7 @@ var {
                 }
             }
 
+            // Retryable writes code should execute only we are not in an active transaction.
             if (jsTest.options().alwaysInjectTransactionNumber &&
                 serverSupports(kWireVersionSupportingRetryableWrites) &&
                 driverSession.getOptions().shouldRetryWrites() &&
@@ -332,8 +347,13 @@ var {
                 cmdName = Object.keys(cmdObj)[0];
             }
 
+            // TODO SERVER-33921: Revisit how the mongo shell decides whether it should retry a
+            // command or not.
+            const sessionOptions = driverSession.getOptions();
             let numRetries =
-                (cmdObj.hasOwnProperty("txnNumber") && !jsTest.options().skipRetryOnNetworkError)
+                (sessionOptions.shouldRetryWrites() && cmdObj.hasOwnProperty("txnNumber") &&
+                 !jsTest.options().skipRetryOnNetworkError &&
+                 !driverSession._serverSession.isInActiveTransaction())
                 ? 1
                 : 0;
 
@@ -428,15 +448,64 @@ var {
         };
     }
 
+    function TransactionOptions(rawOptions = {}) {
+        if (!(this instanceof TransactionOptions)) {
+            return new TransactionOptions(rawOptions);
+        }
+
+        let _readConcern = rawOptions.readConcern;
+        let _writeConcern = rawOptions.writeConcern;
+
+        this.setTxnReadConcern = function setTxnReadConcern(value) {
+            _readConcern = value;
+        };
+
+        this.getTxnReadConcern = function getTxnReadConcern() {
+            return _readConcern;
+        };
+
+        this.setTxnWriteConcern = function setTxnWriteConcern(value) {
+            _writeConcern = value;
+        };
+
+        this.getTxnWriteConcern = function getTxnWriteConcern() {
+            return _writeConcern;
+        };
+    }
+
+    // The server session maintains the state of a transaction, a monotonically increasing txn
+    // number, and a transaction's read/write concerns.
     function ServerSession(client) {
+        // The default txnState is `inactive` until we call startTransaction.
+        let _txnState = ServerSession.TransactionStates.kInactive;
+
+        let _txnOptions;
+
+        // Keep track of the next available statement id of a transaction.
+        let _nextStatementId = 0;
+
+        // _txnNumber starts at -1 because when we increment it, the first transaction
+        // and retryable write will both have a txnNumber of 0.
+        let _txnNumber = -1;
         let _lastUsed = new Date();
-        let _nextTxnNum = 0;
 
         this.client = new SessionAwareClient(client);
         this.handle = client._startSession();
 
+        this.isInActiveTransaction = function isInActiveTransaction() {
+            return _txnState === ServerSession.TransactionStates.kActive;
+        };
+
+        this.isFirstStatement = function isFirstStatement() {
+            return _nextStatementId === 0;
+        };
+
         this.getLastUsed = function getLastUsed() {
             return _lastUsed;
+        };
+
+        this.getTxnOptions = function getTxnOptions() {
+            return _txnOptions;
         };
 
         function updateLastUsed() {
@@ -484,8 +553,8 @@ var {
                 // Since there's no native support for adding NumberLong instances and getting back
                 // another NumberLong instance, converting from a 64-bit floating-point value to a
                 // 64-bit integer value will overflow at 2**53.
-                cmdObjUnwrapped.txnNumber = new NumberLong(_nextTxnNum);
-                ++_nextTxnNum;
+                _txnNumber++;
+                cmdObjUnwrapped.txnNumber = new NumberLong(_txnNumber);
             }
 
             return cmdObj;
@@ -571,7 +640,98 @@ var {
 
             return false;
         };
+
+        this.assignTxnInfo = function assignTxnInfo(cmdObj) {
+            cmdObj = Object.assign({}, cmdObj);
+
+            const cmdName = Object.keys(cmdObj)[0];
+
+            // If the command is in a wrapped form, then we look for the actual command object
+            // inside the query/$query object.
+            let cmdObjUnwrapped = cmdObj;
+            if (cmdName === "query" || cmdName === "$query") {
+                cmdObj[cmdName] = Object.assign({}, cmdObj[cmdName]);
+                cmdObjUnwrapped = cmdObj[cmdName];
+            }
+
+            if (!cmdObjUnwrapped.hasOwnProperty("txnNumber")) {
+                // Since there's no native support for adding NumberLong instances and getting back
+                // another NumberLong instance, converting from a 64-bit floating-point value to a
+                // 64-bit integer value will overflow at 2**53.
+                cmdObjUnwrapped.txnNumber = new NumberLong(_txnNumber);
+            }
+
+            // All operations of a multi-statement transaction must specify autocommit=false.
+            cmdObjUnwrapped.autocommit = false;
+
+            // Statement Id is required on all transaction operations.
+            cmdObjUnwrapped.stmtId = new NumberInt(_nextStatementId);
+
+            // 'readConcern' and 'startTransaction' can only be specified on the first statement in
+            // a transaction.
+            if (_nextStatementId == 0) {
+                cmdObjUnwrapped.startTransaction = true;
+                if (_txnOptions.getTxnReadConcern() !== undefined) {
+                    // Override the readConcern with the one specified during startTransaction.
+                    cmdObjUnwrapped.readConcern = _txnOptions.getTxnReadConcern();
+                }
+            }
+
+            // Reserve the statement ids for batch writes.
+            switch (cmdName) {
+                case "insert":
+                    _nextStatementId += cmdObjUnwrapped.documents.length;
+                    break;
+                case "update":
+                    _nextStatementId += cmdObjUnwrapped.updates.length;
+                    break;
+                case "delete":
+                    _nextStatementId += cmdObjUnwrapped.deletes.length;
+                    break;
+                default:
+                    _nextStatementId += 1;
+            }
+
+            return cmdObj;
+        };
+
+        this.startTransaction = function startTransaction(txnOptsObj) {
+            _txnOptions = new TransactionOptions(txnOptsObj);
+            _txnState = ServerSession.TransactionStates.kActive;
+            _nextStatementId = 0;
+            _txnNumber++;
+        };
+
+        this.commitTransaction = function commitTransaction(driverSession) {
+            // run commitTxn command
+            return endTransaction("commitTransaction", driverSession);
+        };
+
+        this.abortTransaction = function abortTransaction(driverSession) {
+            // run abortTxn command
+            return endTransaction("abortTransaction", driverSession);
+        };
+
+        const endTransaction = (commandName, driverSession) => {
+            let cmd = {[commandName]: 1, txnNumber: NumberLong(_txnNumber)};
+            // writeConcern should only be specified on commit or abort
+            if (_txnOptions.getTxnWriteConcern() !== undefined) {
+                cmd.writeConcern = _txnOptions.getTxnWriteConcern();
+            }
+            // run command against the admin database.
+            const res = this.client.runCommand(driverSession, "admin", cmd, 0);
+            _txnState = ServerSession.TransactionStates.kInactive;
+            return res;
+        };
     }
+
+    // TransactionStates represents the state of the current transaction. The default state
+    // is `inactive` until startTransaction is called and changes the state to `active`.
+    // Calling a successful abort or commitTransaction will change the state to `inactive`.
+    ServerSession.TransactionStates = {
+        kActive: 'active',
+        kInactive: 'inactive',
+    };
 
     function makeDriverSessionConstructor(implMethods, defaultOptions = {}) {
         return function(client, options = defaultOptions) {
@@ -671,6 +831,18 @@ var {
                 }
                 return "session " + tojson(sessionId);
             };
+
+            this.startTransaction = function startTransaction(txnOptsObj = {}) {
+                this._serverSession.startTransaction(txnOptsObj);
+            };
+
+            this.commitTransaction = function commitTransaction() {
+                assert.commandWorked(this._serverSession.commitTransaction(this));
+            };
+
+            this.abortTransaction = function abortTransaction() {
+                assert.commandWorked(this._serverSession.abortTransaction(this));
+            };
         };
     }
 
@@ -738,6 +910,37 @@ var {
 
                       canRetryWrites: function canRetryWrites(cmdObj) {
                           return false;
+                      },
+
+                      assignTxnInfo: function assignTxnInfo(cmdObj) {
+                          return cmdObj;
+                      },
+
+                      isInActiveTransaction: function isInActiveTransaction() {
+                          return false;
+                      },
+
+                      isFirstStatement: function isFirstStatement() {
+                          return false;
+                      },
+
+                      getTxnOptions: function getTxnOptions() {
+                          return {};
+                      },
+
+                      startTransaction: function startTransaction() {
+                          throw new Error("Must call startSession() on the Mongo connection " +
+                                          "object before starting a transaction.");
+                      },
+
+                      commitTransaction: function commitTransaction() {
+                          throw new Error("Must call startSession() on the Mongo connection " +
+                                          "object before committing a transaction.");
+                      },
+
+                      abortTransaction: function abortTransaction() {
+                          throw new Error("Must call startSession() on the Mongo connection " +
+                                          "object before aborting a transaction.");
                       },
                   };
               },

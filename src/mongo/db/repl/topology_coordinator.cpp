@@ -40,7 +40,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/handshake_args.h"
 #include "mongo/db/repl/heartbeat_response_action.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/isself.h"
@@ -86,7 +85,7 @@ std::string TopologyCoordinator::roleToString(TopologyCoordinator::Role role) {
         case TopologyCoordinator::Role::kCandidate:
             return "candidate";
     }
-    invariant(false);
+    MONGO_UNREACHABLE;
 }
 
 TopologyCoordinator::~TopologyCoordinator() {}
@@ -1194,14 +1193,9 @@ HeartbeatResponseAction TopologyCoordinator::checkMemberTimeouts(Date_t now) {
 }
 
 std::vector<HostAndPort> TopologyCoordinator::getHostsWrittenTo(const OpTime& op,
-                                                                bool durablyWritten,
-                                                                bool skipSelf) {
+                                                                bool durablyWritten) {
     std::vector<HostAndPort> hosts;
     for (const auto& memberData : _memberData) {
-        if (skipSelf && memberData.isSelf()) {
-            continue;
-        }
-
         if (durablyWritten) {
             if (memberData.getLastDurableOpTime() < op) {
                 continue;
@@ -1350,57 +1344,11 @@ StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::Up
     return advancedOpTime;
 }
 
-void TopologyCoordinator::setLastOptimeForSlave(const OID& rid, const OpTime& opTime, Date_t now) {
-    massert(28576,
-            "Received an old style replication progress update, which is only used for Master/"
-            "Slave replication now, but this node is not using Master/Slave replication. "
-            "This is likely caused by an old (pre-2.6) member syncing from this node.",
-            !_rsConfig.isInitialized());
-    auto* memberData = _findMemberDataByRid(rid);
-    if (memberData) {
-        memberData->advanceLastAppliedOpTime(opTime, now);
-    } else {
-        invariant(!_memberData.empty());  // Must always have our own entry first.
-        _memberData.emplace_back();
-        memberData = &_memberData.back();
-        memberData->setRid(rid);
-        memberData->setLastAppliedOpTime(opTime, now);
-    }
-}
-
-void TopologyCoordinator::setMyRid(const OID& rid) {
-    _selfMemberData().setRid(rid);
-}
-
 MemberData* TopologyCoordinator::_findMemberDataByMemberId(const int memberId) {
     const int memberIndex = _getMemberIndex(memberId);
     if (memberIndex >= 0)
         return &_memberData[memberIndex];
     return nullptr;
-}
-
-MemberData* TopologyCoordinator::_findMemberDataByRid(const OID rid) {
-    for (auto& memberData : _memberData) {
-        if (memberData.getRid() == rid)
-            return &memberData;
-    }
-    return nullptr;
-}
-
-Status TopologyCoordinator::processHandshake(const OID& rid, const HostAndPort& hostAndPort) {
-    if (_rsConfig.isInitialized()) {
-        return Status(ErrorCodes::IllegalOperation,
-                      "The handshake command is only used for master/slave replication");
-    }
-    auto* memberData = _findMemberDataByRid(rid);
-    if (!memberData) {
-        invariant(!_memberData.empty());  // Must always have our own entry first.
-        _memberData.emplace_back();
-        auto& newMember = _memberData.back();
-        newMember.setRid(rid);
-        newMember.setHostAndPort(hostAndPort);
-    }
-    return Status::OK();
 }
 
 HeartbeatResponseAction TopologyCoordinator::_updatePrimaryFromHBDataV1(
@@ -1952,12 +1900,12 @@ void TopologyCoordinator::changeMemberState_forTest(const MemberState& newMember
             break;
         default:
             severe() << "Cannot switch to state " << newMemberState;
-            invariant(false);
+            MONGO_UNREACHABLE;
     }
     if (getMemberState() != newMemberState.s) {
         severe() << "Expected to enter state " << newMemberState << " but am now in "
                  << getMemberState();
-        invariant(false);
+        MONGO_UNREACHABLE;
     }
     log() << newMemberState;
 }
@@ -2001,6 +1949,8 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     const OpTime lastOpApplied = getMyLastAppliedOpTime();
     const OpTime lastOpDurable = getMyLastDurableOpTime();
     const BSONObj& initialSyncStatus = rsStatusArgs.initialSyncStatus;
+    const boost::optional<Timestamp>& lastStableCheckpointTimestamp =
+        rsStatusArgs.lastStableCheckpointTimestamp;
 
     if (_selfIndex == -1) {
         // We're REMOVED or have an invalid config
@@ -2015,9 +1965,10 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
         if (_maintenanceModeCalls) {
             response->append("maintenanceMode", _maintenanceModeCalls);
         }
-        std::string s = _getHbmsg(now);
-        if (!s.empty())
-            response->append("infoMessage", s);
+        response->append("lastHeartbeatMessage", "");
+        response->append("syncingTo", "");
+
+        response->append("infoMessage", _getHbmsg(now));
         *result = Status(ErrorCodes::InvalidReplicaSetConfig,
                          "Our replica set config is invalid or we are not a member of it");
         return;
@@ -2043,15 +1994,15 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
 
             if (!_syncSource.empty() && !_iAmPrimary()) {
                 bb.append("syncingTo", _syncSource.toString());
+            } else {
+                bb.append("syncingTo", "");
             }
 
             if (_maintenanceModeCalls) {
                 bb.append("maintenanceMode", _maintenanceModeCalls);
             }
 
-            std::string s = _getHbmsg(now);
-            if (!s.empty())
-                bb.append("infoMessage", s);
+            bb.append("infoMessage", _getHbmsg(now));
 
             if (myState.primary()) {
                 bb.append("electionTime", _electionTime);
@@ -2060,6 +2011,7 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             }
             bb.appendIntOrLL("configVersion", _rsConfig.getConfigVersion());
             bb.append("self", true);
+            bb.append("lastHeartbeatMessage", "");
             membersOut.push_back(bb.obj());
         } else {
             // add non-self member
@@ -2101,16 +2053,18 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             bb.appendDate("lastHeartbeatRecv", it->getLastHeartbeatRecv());
             Milliseconds ping = _getPing(itConfig.getHostAndPort());
             bb.append("pingMs", durationCount<Milliseconds>(ping));
-            std::string s = it->getLastHeartbeatMsg();
-            if (!s.empty())
-                bb.append("lastHeartbeatMessage", s);
+            bb.append("lastHeartbeatMessage", it->getLastHeartbeatMsg());
             if (it->hasAuthIssue()) {
                 bb.append("authenticated", false);
             }
             const HostAndPort& syncSource = it->getSyncSource();
             if (!syncSource.empty() && !state.primary()) {
                 bb.append("syncingTo", syncSource.toString());
+            } else {
+                bb.append("syncingTo", "");
             }
+
+            bb.append("infoMessage", "");
 
             if (state == MemberState::RS_PRIMARY) {
                 bb.append("electionTime", it->getElectionTime());
@@ -2134,6 +2088,8 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     // Add sync source info
     if (!_syncSource.empty() && !myState.primary() && !myState.removed()) {
         response->append("syncingTo", _syncSource.toString());
+    } else {
+        response->append("syncingTo", "");
     }
 
     if (_rsConfig.isConfigServer()) {
@@ -2153,6 +2109,10 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     appendOpTime(&optimes, "appliedOpTime", lastOpApplied, _rsConfig.getProtocolVersion());
     appendOpTime(&optimes, "durableOpTime", lastOpDurable, _rsConfig.getProtocolVersion());
     response->append("optimes", optimes.obj());
+    if (lastStableCheckpointTimestamp) {
+        // Make sure to omit if the storage engine does not support recovering to a timestamp.
+        response->append("lastStableCheckpointTimestamp", *lastStableCheckpointTimestamp);
+    }
 
     if (!initialSyncStatus.isEmpty()) {
         response->append("initialSyncStatus", initialSyncStatus);
@@ -2206,7 +2166,6 @@ void TopologyCoordinator::fillMemberData(BSONObjBuilder* result) {
     {
         for (const auto& memberData : _memberData) {
             BSONObjBuilder entry(replicationProgress.subobjStart());
-            entry.append("rid", memberData.getRid());
             const auto lastDurableOpTime = memberData.getLastDurableOpTime();
             if (_rsConfig.getProtocolVersion() == 1) {
                 BSONObjBuilder opTime(entry.subobjStart("optime"));
@@ -2489,8 +2448,8 @@ const int TopologyCoordinator::_selfMemberDataIndex() const {
     invariant(!_memberData.empty());
     if (_selfIndex >= 0)
         return _selfIndex;
-    // In master-slave mode, the first entry is for self.  If there is no config
-    // or we're not in the config, the first-and-only entry should be for self.
+    // If there is no config or we're not in the config, the first-and-only entry should be for
+    // self.
     return 0;
 }
 
@@ -2927,7 +2886,7 @@ void TopologyCoordinator::setFollowerMode(MemberState::MS newMode) {
             _followerMode = newMode;
             break;
         default:
-            invariant(false);
+            MONGO_UNREACHABLE;
     }
 
     if (_followerMode != MemberState::RS_SECONDARY) {

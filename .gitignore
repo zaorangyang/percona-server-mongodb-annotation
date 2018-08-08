@@ -112,6 +112,9 @@ scratch
 /clientTest
 /httpClientTest
 
+# Linters
+.mypy_cache
+
 #debian
 build-stamp
 configure-stamp

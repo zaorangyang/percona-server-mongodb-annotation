@@ -1,5 +1,10 @@
-// @tags: [does_not_support_stepdowns, requires_getmore, requires_non_retryable_commands,
-// requires_non_retryable_writes]
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_getmore,
+//   requires_non_retryable_commands,
+//   requires_non_retryable_writes,
+//   requires_fastcount,
+// ]
 
 /*
  * Declaratively-defined tests for views for all database commands. This file contains a map of test
@@ -61,6 +66,7 @@
     const isUnrelated = "is unrelated";
 
     let viewsCommandTests = {
+        _cloneCatalogData: {skip: isAnInternalCommand},
         _configsvrAddShard: {skip: isAnInternalCommand},
         _configsvrAddShardToZone: {skip: isAnInternalCommand},
         _configsvrBalancerStart: {skip: isAnInternalCommand},
@@ -81,6 +87,7 @@
         _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
         _configsvrShardCollection: {skip: isAnInternalCommand},
         _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
+        _flushDatabaseCacheUpdates: {skip: isUnrelated},
         _flushRoutingTableCacheUpdates: {skip: isUnrelated},
         _getNextSessionMods: {skip: isAnInternalCommand},
         _getUserCacheGeneration: {skip: isAnInternalCommand},
@@ -238,6 +245,7 @@
         flushRouterConfig: {skip: isUnrelated},
         fsync: {skip: isUnrelated},
         fsyncUnlock: {skip: isUnrelated},
+        getDatabaseVersion: {skip: isUnrelated},
         geoNear: {
             command:
                 {geoNear: "view", near: {type: "Point", coordinates: [-50, 37]}, spherical: true},
@@ -398,6 +406,7 @@
         planCacheListQueryShapes:
             {command: {planCacheListQueryShapes: "view"}, expectFailure: true},
         planCacheSetFilter: {command: {planCacheSetFilter: "view"}, expectFailure: true},
+        prepareTransaction: {skip: isUnrelated},
         profile: {skip: isUnrelated},
         refreshLogicalSessionCacheNow: {skip: isAnInternalCommand},
         reapLogicalSessionCacheNow: {skip: isAnInternalCommand},

@@ -66,13 +66,13 @@ public:
     }
 
     void end() override {
-        if (!_tl->owns(id()))
+        if (!_tl || !_tl->owns(id()))
             return;
         _tl->_sessions[id()].ended = true;
     }
 
     StatusWith<Message> sourceMessage() override {
-        if (_tl->inShutdown()) {
+        if (!_tl || _tl->inShutdown()) {
             return TransportLayer::ShutdownStatus;
         } else if (!_tl->owns(id())) {
             return TransportLayer::SessionUnknownStatus;
@@ -88,7 +88,7 @@ public:
     }
 
     Status sinkMessage(Message message) override {
-        if (_tl->inShutdown()) {
+        if (!_tl || _tl->inShutdown()) {
             return TransportLayer::ShutdownStatus;
         } else if (!_tl->owns(id())) {
             return TransportLayer::SessionUnknownStatus;
@@ -102,6 +102,8 @@ public:
     Future<void> asyncSinkMessage(Message message) override {
         return Future<void>::makeReady(sinkMessage(message));
     }
+
+    void cancelAsyncOperations() override {}
 
     void setTimeout(boost::optional<Milliseconds>) override {}
 

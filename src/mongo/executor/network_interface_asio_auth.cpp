@@ -38,6 +38,7 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/rpc/factory.h"
@@ -63,7 +64,7 @@ void NetworkInterfaceASIO::_runIsMaster(AsyncOp* op) {
     const auto versionString = VersionInfoInterface::instance().version();
     ClientMetadata::serialize(_options.instanceName, versionString, &bob);
 
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         // Only include the host:port of this process in the isMaster command request if test
         // commands are enabled. mongobridge uses this field to identify the process opening a
         // connection to it.

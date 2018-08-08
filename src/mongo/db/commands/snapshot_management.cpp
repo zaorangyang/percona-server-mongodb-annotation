@@ -33,6 +33,7 @@
 #include "mongo/base/init.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -130,7 +131,7 @@ public:
 };
 
 MONGO_INITIALIZER(RegisterSnapshotManagementCommands)(InitializerContext* context) {
-    if (Command::testCommandsEnabled) {
+    if (getTestCommandsEnabled()) {
         // Leaked intentionally: a Command registers itself when constructed.
         new CmdMakeSnapshot();
         new CmdSetCommittedSnapshot();

@@ -4046,8 +4046,20 @@ Value ExpressionSubstrBytes::evaluate(const Document& root) const {
             (pLength.getType() == NumberInt || pLength.getType() == NumberLong ||
              pLength.getType() == NumberDouble));
 
-    string::size_type lower = static_cast<string::size_type>(pLower.coerceToLong());
-    string::size_type length = static_cast<string::size_type>(pLength.coerceToLong());
+    const long long signedLower = pLower.coerceToLong();
+
+    uassert(50752,
+            str::stream() << getOpName() << ":  starting index must be non-negative (got: "
+                          << signedLower
+                          << ")",
+            signedLower >= 0);
+
+    const string::size_type lower = static_cast<string::size_type>(signedLower);
+
+    // If the passed length is negative, we should return the rest of the string.
+    const long long signedLength = pLength.coerceToLong();
+    const string::size_type length =
+        signedLength < 0 ? str.length() : static_cast<string::size_type>(signedLength);
 
     uassert(28656,
             str::stream() << getOpName()
@@ -5445,27 +5457,15 @@ void ExpressionConvert::_doAddDependencies(DepsTracker* deps) const {
     }
 }
 
-namespace {
-bool isTargetTypeSupported(BSONType targetType) {
-    switch (targetType) {
-        case BSONType::NumberDouble:
-        case BSONType::String:
-        case BSONType::jstOID:
-        case BSONType::Bool:
-        case BSONType::Date:
-        case BSONType::NumberInt:
-        case BSONType::NumberLong:
-        case BSONType::NumberDecimal:
-            return true;
-        default:
-            return false;
-    }
-}
-}
-
 BSONType ExpressionConvert::computeTargetType(Value targetTypeName) const {
     BSONType targetType;
     if (targetTypeName.getType() == BSONType::String) {
+        // typeFromName() does not consider "missing" to be a valid type, but we want to accept it,
+        // because it is a possible result of the $type aggregation operator.
+        if (targetTypeName.getStringData() == "missing"_sd) {
+            return BSONType::EOO;
+        }
+
         // This will throw if the type name is invalid.
         targetType = typeFromName(targetTypeName.getString());
     } else if (targetTypeName.numeric()) {
@@ -5485,11 +5485,6 @@ BSONType ExpressionConvert::computeTargetType(Value targetTypeName) const {
                   str::stream() << "$convert's 'to' argument must be a string or number, but is "
                                 << typeName(targetTypeName.getType()));
     }
-
-    // Make sure the type is one of the supported "to" types for $convert.
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << "$convert with unsupported 'to' type: " << typeName(targetType),
-            isTargetTypeSupported(targetType));
 
     return targetType;
 }

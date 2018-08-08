@@ -70,6 +70,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index_names.h"
@@ -93,6 +94,7 @@
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
@@ -118,6 +120,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_context_d.h"
+#include "mongo/db/service_context_registrar.h"
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/session_killer.h"
@@ -491,8 +494,6 @@ ExitCode _initAndListen(int listenPort) {
               << startupWarningsLog;
     }
 
-    SessionCatalog::create(serviceContext);
-
     // This function may take the global lock.
     auto shardingInitialized =
         uassertStatusOK(ShardingState::get(startupOpCtx.get())
@@ -505,6 +506,8 @@ ExitCode _initAndListen(int listenPort) {
         logStartup(startupOpCtx.get());
 
         startMongoDFTDC();
+
+        startFreeMonitoring(serviceContext);
 
         restartInProgressIndexesFromLastShutdown(startupOpCtx.get());
 
@@ -542,9 +545,16 @@ ExitCode _initAndListen(int listenPort) {
         if (missingRepl) {
             log() << startupWarningsLog;
             log() << "** WARNING: mongod started without --replSet yet " << missingRepl
-                  << " documents are present in local.system.replset" << startupWarningsLog;
-            log() << "**          Restart with --replSet unless you are doing maintenance and "
-                  << " no other clients are connected." << startupWarningsLog;
+                  << " documents are present in local.system.replset." << startupWarningsLog;
+            log() << "**          Database contents may appear inconsistent with the oplog and may "
+                     "appear to not contain"
+                  << startupWarningsLog;
+            log() << "**          writes that were visible when this node was running as part of a "
+                     "replica set."
+                  << startupWarningsLog;
+            log() << "**          Restart with --replSet unless you are doing maintenance and no "
+                     "other clients are connected."
+                  << startupWarningsLog;
             log() << "**          The TTL collection monitor will not start because of this."
                   << startupWarningsLog;
             log() << "**         ";
@@ -570,6 +580,15 @@ ExitCode _initAndListen(int listenPort) {
 
     SessionKiller::set(serviceContext,
                        std::make_shared<SessionKiller>(serviceContext, killSessionsLocal));
+
+    // Start up a background task to periodically check for and kill expired transactions.
+    // Only do this on storage engines supporting snapshot reads, which hold resources we wish to
+    // release periodically in order to avoid storage cache pressure build up.
+    auto storageEngine = serviceContext->getGlobalStorageEngine();
+    invariant(storageEngine);
+    if (storageEngine->supportsReadConcernSnapshot()) {
+        startPeriodicThreadToAbortExpiredTransactions(serviceContext);
+    }
 
     // Set up the logical session cache
     LogicalSessionCacheServer kind = LogicalSessionCacheServer::kStandalone;
@@ -752,8 +771,7 @@ auto makeReplicationExecutor(ServiceContext* serviceContext) {
             "NetworkInterfaceASIO-Replication", nullptr, std::move(hookList)));
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
-                                     ("SetGlobalEnvironment", "SSLManager", "default"))
+MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager, ("SSLManager", "default"))
 (InitializerContext* context) {
     auto serviceContext = getGlobalServiceContext();
     repl::StorageInterface::set(serviceContext, stdx::make_unique<repl::StorageInterfaceImpl>());
@@ -857,6 +875,11 @@ void shutdownTask() {
         repl::ReplicationCoordinator::get(serviceContext)->shutdown(opCtx);
 
         ShardingState::get(serviceContext)->shutDown(opCtx);
+
+        // Destroy all stashed transaction resources, in order to release locks.
+        SessionKiller::Matcher matcherAllSessions(
+            KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+        killSessionsLocalKillTransactions(opCtx, matcherAllSessions);
     }
 
     serviceContext->setKillAllOperations();
@@ -900,6 +923,7 @@ void shutdownTask() {
         }
     }
 #endif
+    stopFreeMonitoring();
 
     // Shutdown Full-Time Data Capture
     stopMongoDFTDC();
@@ -948,7 +972,8 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
 
     srand(static_cast<unsigned>(curTimeMicros64()));
 
-    Status status = mongo::runGlobalInitializers(argc, argv, envp);
+    setGlobalServiceContext(createServiceContext());
+    Status status = mongo::runGlobalInitializers(argc, argv, envp, getGlobalServiceContext());
     if (!status.isOK()) {
         severe(LogComponent::kControl) << "Failed global initialization: " << status;
         quickExit(EXIT_FAILURE);

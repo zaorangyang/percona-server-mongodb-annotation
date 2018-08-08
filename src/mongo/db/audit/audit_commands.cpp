@@ -32,6 +32,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/util/mongoutils/str.h"
@@ -111,7 +112,7 @@ namespace mongo {
 
     // so tests can determine where the audit log lives
     MONGO_INITIALIZER(RegisterAuditGetOptionsCommand)(InitializerContext* context) {
-        if (Command::testCommandsEnabled) {
+        if (getTestCommandsEnabled()) {
             // Leaked intentionally: a Command registers itself when constructed.
             new AuditGetOptionsCommand();
         }

@@ -48,6 +48,7 @@
 #include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/killcursors_request.h"
@@ -777,7 +778,7 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
         BSONObjBuilder bob;
         bob.append("isMaster", 1);
 
-        if (Command::testCommandsEnabled) {
+        if (getTestCommandsEnabled()) {
             // Only include the host:port of this process in the isMaster command request if test
             // commands are enabled. mongobridge uses this field to identify the process opening a
             // connection to it.
@@ -969,7 +970,7 @@ Status DBClientConnection::connectSocketOnly(const HostAndPort& serverAddress) {
         return Status(ErrorCodes::HostUnreachable,
                       str::stream() << "couldn't connect to server " << _serverAddress.toString()
                                     << ", connection attempt failed: "
-                                    << sws.getStatus().toString());
+                                    << sws.getStatus());
     }
 
     _session = std::move(sws.getValue());
