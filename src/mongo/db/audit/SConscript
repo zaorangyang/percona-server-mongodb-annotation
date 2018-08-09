@@ -12,5 +12,10 @@ env.Library(
         'audit_options.cpp',
         'audit.cpp',
     ],
-    LIBDEPS_DEPENDENTS=['$BUILD_DIR/mongo/db/commands'],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+    ],
+    LIBDEPS_DEPENDENTS=[
+        '$BUILD_DIR/mongo/db/commands',
+    ],
 )
