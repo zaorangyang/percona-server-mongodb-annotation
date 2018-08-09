@@ -41,6 +41,7 @@ if inmemory:
         source=['inmemory_kv_engine_test.cpp',
                 ],
         LIBDEPS=[
+            '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
             '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger_mock',
             '$BUILD_DIR/mongo/db/storage/kv/kv_engine_test_harness',
             ],
