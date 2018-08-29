@@ -179,13 +179,10 @@ executor:
       set_parameters:
         enableTestCommands: 1
         numInitialSyncAttempts: 1
+        enableElectionHandoff: 0
         logComponentVerbosity:
           replication:
             heartbeats: 2
             rollback: 2
     all_nodes_electable: true
     num_nodes: 3
-    replset_config_options:
-      settings:
-        # Speeds up failover, reduces chance DBClientRS times out retargeting the primary.
-        electionTimeoutMillis: 6500

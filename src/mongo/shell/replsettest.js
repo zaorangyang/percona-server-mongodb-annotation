@@ -1326,10 +1326,19 @@ var ReplSetTest = function(opts) {
                         // doing any I/O to avoid any overhead from allocating or deleting data
                         // files when using the MMAPv1 storage engine. We call awaitReplication()
                         // later on to ensure the collMod is replicated to all nodes.
-                        assert.commandWorked(dbHandle.runCommand({
-                            collMod: collInfo.name,
-                            usePowerOf2Sizes: true,
-                        }));
+                        try {
+                            assert.commandWorked(dbHandle.runCommand({
+                                collMod: collInfo.name,
+                                usePowerOf2Sizes: true,
+                            }));
+                        } catch (e) {
+                            // Ignore NamespaceNotFound errors because a background thread could
+                            // have dropped the collection after getCollectionInfos but before
+                            // running collMod.
+                            if (e.code != ErrorCodes.NamespaceNotFound) {
+                                throw e;
+                            }
+                        }
                     }
                 });
         }
@@ -1451,6 +1460,9 @@ var ReplSetTest = function(opts) {
             // liveNodes must have been populated.
             var primary = rst.liveNodes.master;
             var combinedDBs = new Set(primary.getDBNames());
+            // replSetConfig will be undefined for master/slave passthrough.
+            const replSetConfig =
+                rst.getReplSetConfigFromNode ? rst.getReplSetConfigFromNode() : undefined;
 
             rst.liveNodes.slaves.forEach(secondary => {
                 secondary.getDBNames().forEach(dbName => combinedDBs.add(dbName));
@@ -1551,8 +1563,10 @@ var ReplSetTest = function(opts) {
                     // Check that the following collection stats are the same across replica set
                     // members:
                     //  capped
-                    //  nindexes
+                    //  nindexes, except on nodes with buildIndexes: false
                     //  ns
+                    const hasSecondaryIndexes = !replSetConfig ||
+                        replSetConfig.members[rst.getNodeId(secondary)].buildIndexes !== false;
                     primaryCollections.forEach(collName => {
                         var primaryCollStats =
                             primary.getDB(dbName).runCommand({collStats: collName});
@@ -1562,7 +1576,8 @@ var ReplSetTest = function(opts) {
                         assert.commandWorked(secondaryCollStats);
 
                         if (primaryCollStats.capped !== secondaryCollStats.capped ||
-                            primaryCollStats.nindexes !== secondaryCollStats.nindexes ||
+                            (hasSecondaryIndexes &&
+                             primaryCollStats.nindexes !== secondaryCollStats.nindexes) ||
                             primaryCollStats.ns !== secondaryCollStats.ns) {
                             print(msgPrefix +
                                   ', the primary and secondary have different stats for the ' +

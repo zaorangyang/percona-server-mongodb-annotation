@@ -35,6 +35,8 @@
 #include <algorithm>
 
 #include "mongo/base/status.h"
+#include "mongo/db/logical_clock.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/elect_cmd_runner.h"
 #include "mongo/db/repl/freshness_checker.h"
@@ -529,6 +531,13 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
         bool isArbiter = myIndex.isOK() && myIndex.getValue() != -1 &&
             newConfig.getMemberAt(myIndex.getValue()).isArbiter();
 
+        if (isArbiter) {
+            LogicalClock::get(getGlobalServiceContext())->setEnabled(false);
+            if (auto validator = LogicalTimeValidator::get(getGlobalServiceContext())) {
+                validator->stopKeyManager();
+            }
+        }
+
         if (!isArbiter && isFirstConfig) {
             shouldStartDataReplication = true;
         }
@@ -831,7 +840,7 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
     }
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     // If it is not a single node replica set, no need to start an election after stepdown timeout.
-    if (reason == TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout &&
+    if (reason == TopologyCoordinator::StartElectionReason::kSingleNodePromptElection &&
         _rsConfig.getNumMembers() != 1) {
         return;
     }
@@ -867,8 +876,8 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
                 log() << "Not starting an election for a catchup takeover, "
                       << "since we are not electable due to: " << status.reason();
                 break;
-            case TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout:
-                log() << "Not starting an election for a single node replica set stepdown timeout, "
+            case TopologyCoordinator::StartElectionReason::kSingleNodePromptElection:
+                log() << "Not starting an election for a single node replica set prompt election, "
                       << "since we are not electable due to: " << status.reason();
                 break;
         }
@@ -889,8 +898,8 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
         case TopologyCoordinator::StartElectionReason::kCatchupTakeover:
             log() << "Starting an election for a catchup takeover";
             break;
-        case TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout:
-            log() << "Starting an election due to single node replica set stepdown timeout";
+        case TopologyCoordinator::StartElectionReason::kSingleNodePromptElection:
+            log() << "Starting an election due to single node replica set prompt election";
             break;
     }
 

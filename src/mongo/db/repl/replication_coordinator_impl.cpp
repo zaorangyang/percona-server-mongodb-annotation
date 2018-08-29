@@ -43,6 +43,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time.h"
+#include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 #include "mongo/db/repl/data_replicator_external_state_initial_sync.h"
@@ -106,6 +107,8 @@ const OperationContext::Decoration<bool> alwaysAllowNonLocalWrites =
     OperationContext::declareDecoration<bool>();
 
 MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncAttempts, int, 10);
+
+MONGO_EXPORT_SERVER_PARAMETER(enableElectionHandoff, bool, true);
 
 // Number of seconds between noop writer writes.
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(periodicNoopIntervalSecs, int, 10);
@@ -322,7 +325,8 @@ InitialSyncerOptions createInitialSyncerOptions(
     options.getSlaveDelay = [replCoord]() { return replCoord->getSlaveDelaySecs(); };
     options.syncSourceSelector = replCoord;
     options.batchLimits = externalState->getInitialSyncBatchLimits();
-    options.oplogFetcherMaxFetcherRestarts = externalState->getOplogFetcherMaxFetcherRestarts();
+    options.oplogFetcherMaxFetcherRestarts =
+        externalState->getOplogFetcherInitialSyncMaxFetcherRestarts();
     return options;
 }
 }  // namespace
@@ -564,6 +568,13 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         } else {
             lastOpTime = lastOpTimeStatus.getValue();
         }
+    } else {
+        // The node is an arbiter hence will not need logical clock for external operations.
+        LogicalClock::get(getServiceContext())->setEnabled(false);
+        auto validator = LogicalTimeValidator::get(getServiceContext());
+        if (validator) {
+            validator->stopKeyManager();
+        }
     }
 
     long long term = OpTime::kUninitializedTerm;
@@ -580,6 +591,18 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     }
 
     auto opCtx = cc().makeOperationContext();
+    auto consistency = DataConsistency::Inconsistent;
+    if (!lastOpTime.isNull()) {
+
+        // If we have an oplog, it is still possible that our data is not in a consistent state. For
+        // example, if we are starting up after a crash following a post-rollback RECOVERING state.
+        // To detect this, we see if our last optime is >= the 'minValid' optime, which
+        // should be persistent across node crashes.
+        OpTime minValid = _replicationProcess->getConsistencyMarkers()->getMinValid(opCtx.get());
+        consistency =
+            (lastOpTime >= minValid) ? DataConsistency::Consistent : DataConsistency::Inconsistent;
+    }
+
     stdx::unique_lock<stdx::mutex> lock(_mutex);
     invariant(_rsConfigState == kConfigStartingUp);
     const PostMemberStateUpdateAction action =
@@ -588,15 +611,6 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     // Set our last applied and durable optimes to the top of the oplog, if we have one.
     if (!lastOpTime.isNull()) {
         bool isRollbackAllowed = false;
-
-        // If we have an oplog, it is still possible that our data is not in a consistent state. For
-        // example, if we are starting up after a crash following a post-rollback RECOVERING state.
-        // To detect this, we see if our last optime is >= the 'minValid' optime, which
-        // should be persistent across node crashes.
-        OpTime minValid = _replicationProcess->getConsistencyMarkers()->getMinValid(opCtx.get());
-        auto consistency =
-            (lastOpTime >= minValid) ? DataConsistency::Consistent : DataConsistency::Inconsistent;
-
         _setMyLastAppliedOpTime_inlock(lastOpTime, isRollbackAllowed, consistency);
         _setMyLastDurableOpTime_inlock(lastOpTime, isRollbackAllowed);
         _reportUpstream_inlock(std::move(lock));  // unlocks _mutex.
@@ -1054,6 +1068,11 @@ void ReplicationCoordinatorImpl::setMyLastAppliedOpTimeForward(const OpTime& opT
     if (opTime > _getMyLastAppliedOpTime_inlock()) {
         _setMyLastAppliedOpTime_inlock(opTime, false, consistency);
         _reportUpstream_inlock(std::move(lock));
+    } else if (consistency == DataConsistency::Consistent && _canAcceptNonLocalWrites &&
+               _rsConfig.getWriteMajority() == 1) {
+        // Single vote primaries may have a lagged stable timestamp due to paring back the stable
+        // timestamp to the all committed timestamp.
+        _setStableTimestampForStorage_inlock();
     }
 }
 
@@ -1142,6 +1161,8 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTime_inlock(const OpTime& op
     // RECOVERING after a rollback using the 'rollbackViaRefetch' algorithm, we will be inconsistent
     // until we reach the 'minValid' optime.
     if (consistency == DataConsistency::Consistent) {
+        invariant(opTime.getTimestamp().getInc() > 0,
+                  str::stream() << "Impossible optime received: " << opTime.toString());
         _stableOpTimeCandidates.insert(opTime);
         // If we are lagged behind the commit optime, set a new stable timestamp here.
         if (opTime <= _topCoord->getLastCommittedOpTime()) {
@@ -1748,21 +1769,12 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
 
     try {
 
-        bool firstTime = true;
         while (!_topCoord->attemptStepDown(
             termAtStart, _replExecutor->now(), waitUntil, stepDownUntil, force)) {
 
-            // The stepdown attempt failed.
-
-            if (firstTime) {
-                // We send out a fresh round of heartbeats because stepping down successfully
-                // without {force: true} is dependent on timely heartbeat data.
-                _restartHeartbeats_inlock();
-                firstTime = false;
-            }
-
-            // Now release the global lock to allow secondaries to read the oplog, then wait until
-            // enough secondaries are caught up for us to finish stepdown.
+            // The stepdown attempt failed. Now release the global lock to allow secondaries
+            // to read the oplog, then wait until enough secondaries are caught up for us to
+            // finish stepdown.
             globalLock.reset();
             invariant(!opCtx->lockState()->isLocked());
 
@@ -1802,16 +1814,55 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     // Stepdown success!
     onExitGuard.Dismiss();
     updateMemberState();
+
     // Schedule work to (potentially) step back up once the stepdown period has ended.
     _scheduleWorkAt(
         stepDownUntil,
         stdx::bind(&ReplicationCoordinatorImpl::_handleTimePassing, this, stdx::placeholders::_1));
+
+    // If election handoff is enabled, schedule a step-up immediately instead of waiting for the
+    // election timeout to expire.
+    if (!force && enableElectionHandoff.load()) {
+        _performElectionHandoff();
+    }
     return Status::OK();
 }
 
 void ReplicationCoordinatorImpl::_signalStepDownWaiterIfReady_inlock() {
-    if (_topCoord->isSafeToStepDown()) {
+    if (_topCoord->isSteppingDown() && _topCoord->isSafeToStepDown()) {
         _stepDownWaiters.notify_all();
+    }
+}
+
+void ReplicationCoordinatorImpl::_performElectionHandoff() {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    auto candidateIndex = _topCoord->chooseElectionHandoffCandidate();
+
+    if (candidateIndex < 0) {
+        log() << "Could not find node to hand off election to.";
+        return;
+    }
+
+    auto target = _rsConfig.getMemberAt(candidateIndex).getHostAndPort();
+    executor::RemoteCommandRequest request(target, "admin", BSON("replSetStepUp" << 1), nullptr);
+    log() << "Handing off election to " << target;
+
+    auto callbackHandleSW = _replExecutor->scheduleRemoteCommand(
+        request, [target](const executor::TaskExecutor::RemoteCommandCallbackArgs& callbackData) {
+            auto status = callbackData.response.status;
+
+            if (status.isOK()) {
+                LOG(1) << "replSetStepUp request to " << target << " succeeded with response -- "
+                       << callbackData.response.data;
+            } else {
+                log() << "replSetStepUp request to " << target << " failed due to " << status;
+            }
+        });
+
+    auto callbackHandleStatus = callbackHandleSW.getStatus();
+    if (!callbackHandleStatus.isOK()) {
+        error() << "Failed to schedule ReplSetStepUp request to " << target
+                << " for election handoff: " << callbackHandleStatus;
     }
 }
 
@@ -1825,7 +1876,7 @@ void ReplicationCoordinatorImpl::_handleTimePassing(
     // against other elections caused by events like election timeout, replSetStepUp etc.
     if (isV1ElectionProtocol()) {
         _startElectSelfIfEligibleV1(
-            TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout);
+            TopologyCoordinator::StartElectionReason::kSingleNodePromptElection);
         return;
     }
 
@@ -2192,11 +2243,19 @@ Status ReplicationCoordinatorImpl::processReplSetFreeze(int secs, BSONObjBuilder
         return result.getStatus();
     }
 
-    if (TopologyCoordinator::PrepareFreezeResponseResult::kElectSelf == result.getValue()) {
-        // If we just unfroze and ended our stepdown period and we are a one node replica set,
-        // the topology coordinator will have gone into the candidate role to signal that we
-        // need to elect ourself.
-        _performPostMemberStateUpdateAction(kActionWinElection);
+    if (TopologyCoordinator::PrepareFreezeResponseResult::kSingleNodeSelfElect ==
+        result.getValue()) {
+        if (isV1ElectionProtocol()) {
+            // For election protocol v1, call _startElectSelfIfEligibleV1 to avoid race
+            // against other elections caused by events like election timeout, replSetStepUp etc.
+            _startElectSelfIfEligibleV1(
+                TopologyCoordinator::StartElectionReason::kSingleNodePromptElection);
+        } else {
+            // If we just unfroze and ended our stepdown period and we are a one node replica set,
+            // the topology coordinator will have gone into the candidate role to signal that we
+            // need to elect ourself.
+            _performPostMemberStateUpdateAction(kActionWinElection);
+        }
     }
 
     return Status::OK();
@@ -3216,9 +3275,10 @@ void ReplicationCoordinatorImpl::_updateLastCommittedOpTime_inlock() {
     // as lastCommittedOpTime may be based on durable optimes whereas some waiters may be
     // waiting on applied (but not necessarily durable) optimes.
     _wakeReadyWaiters_inlock();
+    _signalStepDownWaiterIfReady_inlock();
 }
 
-boost::optional<OpTime> ReplicationCoordinatorImpl::_calculateStableOpTime(
+boost::optional<OpTime> ReplicationCoordinatorImpl::_calculateStableOpTime_inlock(
     const std::set<OpTime>& candidates, const OpTime& commitPoint) {
 
     // No optime candidates.
@@ -3226,12 +3286,33 @@ boost::optional<OpTime> ReplicationCoordinatorImpl::_calculateStableOpTime(
         return boost::none;
     }
 
+    auto maximumStableTimestamp = commitPoint.getTimestamp();
+    if (_canAcceptNonLocalWrites && _storage->supportsDocLocking(_service)) {
+        // If the storage engine supports document level locking, then it is possible for oplog
+        // writes to commit out of order. In that case, we don't want to set the stable timestamp
+        // ahead of the all committed timestamp. This is not a problem for oplog application
+        // because we only set lastApplied between batches when the all committed timestamp cannot
+        // be behind. During oplog application the all committed timestamp can jump around since
+        // we first write oplog entries to the oplog and then go back and apply them.
+        //
+        // If the all committed timestamp is less than the commit point, then we are guaranteed that
+        // there are no stable timestamp candidates with a greater timestamp than the all committed
+        // timestamp and a lower term than the commit point. Thus we can consider the all committed
+        // timestamp to have the same term as the commit point. When a primary enters a new term, it
+        // first storage-commits a 'new primary' oplog entry in the new term before accepting any
+        // new writes. This will ensure that the all committed timestamp is in the new term before
+        // any writes in the new term are replication committed.
+        maximumStableTimestamp =
+            std::min(_storage->getAllCommittedTimestamp(_service), commitPoint.getTimestamp());
+    }
+    const auto maximumStableOpTime = OpTime(maximumStableTimestamp, commitPoint.getTerm());
+
     // Find the greatest optime candidate that is less than or equal to the commit point.
     // To do this we first find the upper bound of 'commitPoint', which points to the smallest
     // element in 'candidates' that is greater than 'commitPoint'. We then step back one element,
     // which should give us the largest element in 'candidates' that is less than or equal to the
     // 'commitPoint'.
-    auto upperBoundIter = candidates.upper_bound(commitPoint);
+    auto upperBoundIter = candidates.upper_bound(maximumStableOpTime);
 
     // All optime candidates are greater than the commit point.
     if (upperBoundIter == candidates.begin()) {
@@ -3257,7 +3338,8 @@ void ReplicationCoordinatorImpl::_cleanupStableOpTimeCandidates(std::set<OpTime>
 
 boost::optional<OpTime> ReplicationCoordinatorImpl::calculateStableOpTime_forTest(
     const std::set<OpTime>& candidates, const OpTime& commitPoint) {
-    return _calculateStableOpTime(candidates, commitPoint);
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _calculateStableOpTime_inlock(candidates, commitPoint);
 }
 void ReplicationCoordinatorImpl::cleanupStableOpTimeCandidates_forTest(std::set<OpTime>* candidates,
                                                                        OpTime stableOpTime) {
@@ -3282,7 +3364,7 @@ boost::optional<OpTime> ReplicationCoordinatorImpl::_getStableOpTime_inlock() {
     }
 
     // Compute the current stable optime.
-    auto stableOpTime = _calculateStableOpTime(_stableOpTimeCandidates, commitPoint);
+    auto stableOpTime = _calculateStableOpTime_inlock(_stableOpTimeCandidates, commitPoint);
     if (stableOpTime) {
         // By definition, the stable optime should never be greater than the commit point.
         invariant(stableOpTime->getTimestamp() <= commitPoint.getTimestamp());

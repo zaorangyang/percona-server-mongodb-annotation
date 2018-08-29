@@ -15,7 +15,7 @@
  * unsharded collections. Mongos doesn't directly handle readConcern majority, but these tests
  * should ensure that it correctly propagates the setting to the shards when running commands.
  *
- * @tags: [rocks_requires_fcv36]
+ * @tags: [requires_majority_read_concern, rocks_requires_fcv36]
  */
 
 (function() {

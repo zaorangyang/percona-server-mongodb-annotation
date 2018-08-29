@@ -157,7 +157,7 @@ variables:
 # TODO: Remove psutil from virtualenv_requirements when BUILD-3083 is done
 - &powercycle_ec2_instance
   aws_ec2_yml: aws_ec2.yml
-  expire_hours: "3"
+  ec2_expire_hours: "24"
   ec2_monitor_files: proc.json system.json
   monitor_proc_file: proc.json
   monitor_system_file: system.json
@@ -183,14 +183,18 @@ variables:
        value: ${remote_dir}/afterrecovery
      - key: backup_path_before
        value: ${remote_dir}/beforerecovery
+     - key: backup_artifacts
+       value: ${remote_dir}/afterrecovery* ${remote_dir}/beforerecovery*
      - key: db_path
        value: /data/db
      - key: log_path
        value: ${remote_dir}/mongod.log
+     - key: exit_file
+       value: powercycle_exit.yml
 
 - &powercycle_test
-  ec2_artifacts: ${log_path} ${db_path} ${backup_path_after} ${backup_path_before}
-  program_options: --logLevel=info --backupPathBefore=${backup_path_before} --backupPathAfter=${backup_path_after}
+  ec2_artifacts: ${log_path} ${db_path} ${backup_artifacts}
+  program_options:  --exitYamlFile=${exit_file} --logLevel=info --backupPathBefore=${backup_path_before} --backupPathAfter=${backup_path_after}
   connection_options: --sshUserHost=${private_ip_address} --sshConnection=\"${ssh_identity} ${ssh_connection_options}\"
   test_options: --testLoops=15 --seedDocNum=10000 --rsync --rsyncExcludeFiles=diagnostic.data/metrics.interim* --validate=local --canary=local
   crash_options: --crashMethod=internal --crashOption=${windows_crash_cmd} --crashWaitTime=45 --jitterForCrashWaitTime=5 --instanceId=${instance_id}
@@ -430,6 +434,31 @@ functions:
         https_validate_certificates = False
         EOF
 
+  "call BF Suggestion service":
+    command: shell.exec
+    params:
+      working_dir: src
+      shell: bash
+      silent: true
+      script: |
+        report_file="report.json"
+        # Check if the report file exists and has failures.
+        if [ -f $report_file ] && grep -Eq "\"failures\": [1-9]" $report_file; then
+          # Calling the BF Suggestion server endpoint to start feature extraction.
+          payload="{\"task_id\": \"${task_id}\", \"execution\": ${execution}}"
+          echo "Sending task info to the BF suggestion service"
+          # The --user option is passed through stdin to avoid showing in process list.
+          user_option="--user ${bfsuggestion_user}:${bfsuggestion_password}"
+          curl --header "Content-Type: application/json" \
+               --data "$payload" \
+               --max-time 10 \
+               --silent \
+               --show-error \
+               --config - \
+               https://bfsuggestion.corp.mongodb.com/tasks <<< $user_option
+          echo "Request to BF Suggestion service status: $?"
+        fi
+
   "upload debugsymbols" : &upload_debugsymbols
     command: s3.put
     params:
@@ -548,11 +577,15 @@ functions:
           set -o verbose
 
           python_loc=$(which ${python|/opt/mongodbtoolchain/v2/bin/python2})
+          python3_loc=$(which ${python|/opt/mongodbtoolchain/v2/bin/python3})
           if [ "Windows_NT" = "$OS" ]; then
             python_loc=$(cygpath -w $python_loc)
+            python3_loc=$(cygpath -w c:/python/Python36/python.exe)
           fi
           # Set up virtualenv in ${workdir}
           virtualenv --python "$python_loc" --system-site-packages "${workdir}/venv"
+          # Add virtualenv for python3 in ${workdir}
+          virtualenv --python "$python3_loc" --system-site-packages "${workdir}/venv_3"
 
   "run tests" :
     - command: expansions.update
@@ -569,6 +602,7 @@ functions:
       type: test
       params:
         working_dir: src
+        shell: bash
         script: |
           set -o errexit
           set -o verbose
@@ -664,6 +698,7 @@ functions:
           # The "resmoke_wrapper" expansion is used by the 'burn_in_tests' task to wrap the resmoke.py
           # invocation. It doesn't set any environment variables and should therefore come last in
           # this list of expansions.
+          set +o errexit
           PATH="$path_value"                              \
               AWS_PROFILE=${aws_profile_remote}           \
               ${gcov_environment}                         \
@@ -689,8 +724,33 @@ functions:
                   --archiveFile=archive.json              \
                   --reportFile=report.json                \
                   --perfReportFile=perf.json
+          resmoke_exit_code=$?
+          set -o errexit
 
+          # 74 is exit code for IOError on POSIX systems, which is raised when the machine is
+          # shutting down.
+          #
+          # 75 is exit code resmoke.py uses when the log output would be incomplete due to failing
+          # to communicate with logkeeper.
+          if [[ $resmoke_exit_code = 74 || $resmoke_exit_code = 75 ]]; then
+            echo $resmoke_exit_code > run_tests_infrastructure_failure
+            exit 0
+          fi
+          exit $resmoke_exit_code
           fi # end if ${disable_unit_tests}
+
+      # The existence of the "run_tests_infrastructure_failure" file indicates this failure isn't
+      # directly actionable. We use type=setup rather than type=system or type=test for this command
+      # because we don't intend for any human to look at this failure.
+    - command: shell.exec
+      type: setup
+      params:
+        working_dir: src
+        script: |
+          set -o verbose
+          if [ -f run_tests_infrastructure_failure ]; then
+            exit $(cat run_tests_infrastructure_failure)
+          fi
 
   "scons compile" :
     command: shell.exec
@@ -992,6 +1052,8 @@ functions:
             done
           fi
 
+          # Set an exit trap so we can save the real exit status (see SERVER-34033).
+          trap 'echo $? > error_exit.txt; exit 0' EXIT
           config_file=powertest.yml
           eval $python pytests/powertest.py \
             "--saveConfigOptions=$config_file \
@@ -1010,10 +1072,22 @@ functions:
             ${mongod_extra_options}"
           set +o errexit
           $python -u pytests/powertest.py --configFile=$config_file
-          # SERVER-34033: Figure out why shell.exec exits at this point.
-          test_status=$?
-          echo "Completed pytests/powertest.py, status: $test_status"
-          exit $test_status
+
+    - command: expansions.update
+      params:
+        ignore_missing_file: true
+        file: src/${exit_file}
+
+    - command: shell.exec
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          # Trigger a system failure if powertest.py failed due to ssh access.
+          if [ -n "${ec2_ssh_failure}" ]; then
+            echo "ec2_ssh_failure detected - $(cat ${exit_file})"
+            exit ${exit_code}
+          fi
 
     - command: shell.exec
       params:
@@ -1034,6 +1108,25 @@ functions:
       params:
         ignore_missing_file: true
         file: src/ec2_artifacts.yml
+
+    - command: shell.exec
+      type: test
+      params:
+        shell: bash
+        script: |
+          # Test exits from here with specified exit_code.
+          if [ -n "${exit_code}" ]; then
+            # Python program saved exit_code
+            exit_code=${exit_code}
+          elif [ -f error_exit.txt ]; then
+            # Bash trap exit_code
+            exit_code=$(cat error_exit.txt)
+          else
+            exit_code=0
+          fi
+          echo "Exiting powercycle with code $exit_code"
+          exit $exit_code
+
 
   "do multiversion setup" :
     command: shell.exec
@@ -1250,7 +1343,7 @@ functions:
           sleep 30
         done
 
-  "set up EC2 instance":
+  "set up EC2 instance": &set_up_ec2_instance
     - command: shell.exec
       params:
         working_dir: src
@@ -1276,8 +1369,12 @@ functions:
             done
           fi
 
-          if [ ! -z "${expire_hours}" ]; then
-            expire_hours="-e ${expire_hours}"
+          if [ -n "${ec2_expire_hours}" ]; then
+            expire_hours="-e ${ec2_expire_hours}"
+            # Since Windows hosts are expensive to keep running we'll expire it after 3 hours.
+            if [ "Windows_NT" = "$OS" ]; then
+              expire_hours="-e 3"
+            fi
           fi
 
           # Clone another instance of this host in EC2.
@@ -1339,7 +1436,7 @@ functions:
           user_group="$USER:$group"
           script_opts="$script_opts -u $user_group"
           data_db=/data/db
-          cmds="$sudo bash mount_drives.sh $script_opts; ls -ld $data_db $log; df; mount"
+          cmds="$sudo bash mount_drives.sh $script_opts; mount; ls -ld $data_db $log; df"
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           $python buildscripts/remote_operations.py          \
             --verbose                                        \
@@ -1600,7 +1697,7 @@ functions:
       script: |
         ${activate_virtualenv}
         # Tar/zip artifacts on remote host.
-        if [ -z "${ec2_artifacts}" ]; then
+        if [[ -z "${ec2_artifacts}" || -n "${ec2_ssh_failure}" ]]; then
           exit 0
         fi
         cmd="${tar|tar} czf ec2_artifacts.tgz ${ec2_artifacts}"
@@ -1620,7 +1717,7 @@ functions:
       script: |
         ${activate_virtualenv}
         # Copy remote artifacts.
-        if [ -z "${ec2_artifacts}" ]; then
+        if [[ -z "${ec2_artifacts}" || -n "${ec2_ssh_failure}" ]]; then
           exit 0
         fi
         ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
@@ -1635,9 +1732,11 @@ functions:
   "cleanup EC2 instance": &cleanup_ec2_instance
     command: shell.exec
     params:
+      shell: bash
       working_dir: src
       script: |
-        if [ -z ${instance_id} ]; then
+        # We do not terminate the EC2 instance if there was an ec2_ssh_failure.
+        if [[ -z "${ec2_artifacts}" || -n "${ec2_ssh_failure}" ]]; then
           exit 0
         fi
         ${activate_virtualenv}
@@ -1648,9 +1747,10 @@ functions:
   "gather remote mongo coredumps": &gather_remote_mongo_coredumps
     command: shell.exec
     params:
+      shell: bash
       working_dir: "src"
       script: |
-        if [ ! -f ${aws_ec2_yml|""} ]; then
+        if [[ ! -f ${aws_ec2_yml|""} || -n "${ec2_ssh_failure}" ]]; then
           exit 0
         fi
         ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
@@ -1675,9 +1775,10 @@ functions:
   "copy remote mongo coredumps": &copy_remote_mongo_coredumps
     command: shell.exec
     params:
+      shell: bash
       working_dir: "src"
       script: |
-        if [ ! -f ${aws_ec2_yml|""} ]; then
+        if [[ ! -f ${aws_ec2_yml|""} || -n "${ec2_ssh_failure}" ]]; then
           exit 0
         fi
         ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
@@ -1811,12 +1912,34 @@ pre:
             python=${python|/opt/mongodbtoolchain/v2/bin/python2}
           fi
           echo "python set to $(which $python)"
+       - key: activate_virtualenv_3
+         value: |
+          # check if virtualenv for python3 is set up
+          if [ -d "${workdir}/venv_3" ]; then
+            if [ "Windows_NT" = "$OS" ]; then
+              # Need to quote the path on Windows to preserve the separator.
+              . "${workdir}/venv_3/Scripts/activate" 2> /tmp/activate_error.log
+            else
+              . ${workdir}/venv_3/bin/activate 2> /tmp/activate_error.log
+            fi
+            if [ $? -ne 0 ]; then
+              echo "Failed to activate virtualenv: $(cat /tmp/activate_error.log)"
+            fi
+            python=python
+          else
+            if [ "Windows_NT" = "$OS" ]; then
+              python=/cygdrive/c/python/Python36/python
+            else
+              python=${python3|/opt/mongodbtoolchain/v2/bin/python3}
+            fi
+          fi
+          echo "python set to $(which $python)"
        - key: posix_workdir
          value: eval 'if [ "Windows_NT" = "$OS" ]; then echo $(cygpath -u "${workdir}"); else echo ${workdir}; fi'
        # For ssh disable the options GSSAPIAuthentication, CheckHostIP, StrictHostKeyChecking
        # & UserKnownHostsFile, since these are local connections from one AWS instance to another.
        - key: ssh_connection_options
-         value: -o GSSAPIAuthentication=no -o CheckHostIP=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 -o ConnectionAttempts=20
+         value: -o GSSAPIAuthentication=no -o CheckHostIP=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ConnectionAttempts=20
        - key: ssh_retries
          value: "10"
        - key: set_sudo
@@ -1864,6 +1987,7 @@ post:
         - src/archive.json
 
   - func: "save ec2 task artifacts"
+  - func: "call BF Suggestion service"
   - func: "kill processes"
   - func: "save local client logs"
   # Print out any Out of Memory killed process messages.
@@ -2502,8 +2626,15 @@ tasks:
           set -o errexit
           set -o verbose
 
+          # Since mypy requires python3, we need to activate the venv_3
+          ${activate_virtualenv_3}
+          pip install -r buildscripts/requirements.txt
+          updated_mypy=$(PATH=$PATH:/opt/mongodbtoolchain/v2/bin which mypy)
+          deactivate
+          ###
           ${activate_virtualenv}
-          ${compile_env|} $python ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
+          pip install -r buildscripts/requirements.txt
+          MYPY=$updated_mypy ${compile_env|} $python ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
 
 - <<: *task_template
   name: burn_in_tests
@@ -5863,20 +5994,9 @@ buildvariants:
   - name: parallel_WT
   - name: parallel_compatibility_WT
   - name: concurrency_WT
-    distros:
-    # There is a known performance issue with the ubuntu1604-arm64-1.linaro.build.10gen.cc host
-    # that's part of the ubuntu1604-arm64-large pool. We run the concurrency tests only on the
-    # hosts from the ubuntu1604-arm64-small pool to work around this issue.
-    - ubuntu1604-arm64-small
   - name: concurrency_replication_WT
-    distros:
-    - ubuntu1604-arm64-small
   - name: concurrency_sharded_WT
-    distros:
-    - ubuntu1604-arm64-small
   - name: concurrency_simultaneous_WT
-    distros:
-    - ubuntu1604-arm64-small
   - name: replica_sets_WT
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough_WT
@@ -7246,6 +7366,176 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: push
+
+- name: enterprise-rhel-62-64-bit-majority-read-concern-off
+  display_name: "Enterprise RHEL 6.2 (majority read concern off)"
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions:
+    rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
+    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
+    test_flags: --majorityReadConcern=off --excludeWithAnyTags=requires_mmapv1,requires_majority_read_concern
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    use_scons_cache: true
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: true
+  tasks:
+  - name: compile
+    distros:
+    - rhel62-large
+  - name: compile_all
+    distros:
+    - rhel62-large
+  - name: rollback_fuzzer_WT
+  - name: aggregation_WT
+  - name: aggregation_WT_ese
+  - name: aggregation_auth
+  - name: aggregation_facet_unwind_passthrough_WT
+  - name: aggregation_sharded_collections_passthrough_WT
+  - name: audit_WT
+  - name: auth_WT
+  - name: auth_audit_WT
+  - name: bulk_gle_passthrough_WT
+  - name: causally_consistent_jscore_passthrough_WT
+  - name: causally_consistent_jscore_passthrough_auth_WT
+  - name: sharded_causally_consistent_jscore_passthrough_WT
+  - name: concurrency_WT
+  - name: concurrency_replication_WT
+  - name: concurrency_sharded_WT
+  - name: concurrency_sharded_causal_consistency_WT
+  - name: concurrency_sharded_causal_consistency_and_balancer_WT
+  - name: concurrency_simultaneous_WT
+  - name: dbtest_WT
+  - name: disk_WT
+  - name: ese_WT
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth_WT
+  - name: gle_auth_basics_passthrough_WT
+  - name: gle_auth_basics_passthrough_write_cmd_WT
+  - name: gle_auth_write_cmd_WT
+  - name: integration_tests_replset
+  - name: integration_tests_sharded
+  - name: integration_tests_standalone
+  - name: jsCore_WT
+  - name: jsCore_WT_ese
+  - name: jsCore_compatibility_WT
+  - name: jsCore_decimal_WT
+  - name: jsCore_minimum_batch_size_WT
+  - name: jsCore_op_query_WT
+  - name: jsonSchema
+  - name: aggregation_fuzzer_WT
+  - name: jstestfuzz_WT
+  - name: jstestfuzz_concurrent_WT
+  - name: jstestfuzz_concurrent_replication_WT
+  - name: jstestfuzz_concurrent_replication_session_WT
+  - name: jstestfuzz_concurrent_sharded_WT
+  - name: jstestfuzz_concurrent_sharded_causal_consistency_WT
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
+  - name: jstestfuzz_concurrent_sharded_session_WT
+  - name: jstestfuzz_replication_WT
+  - name: jstestfuzz_replication_initsync_WT
+  - name: jstestfuzz_replication_session_WT
+  - name: jstestfuzz_sharded_WT
+  - name: jstestfuzz_sharded_causal_consistency_WT
+  - name: jstestfuzz_sharded_continuous_stepdown
+  - name: jstestfuzz_sharded_session_WT
+  - name: master_slave_WT
+  - name: master_slave_auth
+  - name: master_slave_jscore_passthrough_WT
+  - name: multiversion_WT
+  - name: multiversion_multistorage_engine
+  - name: noPassthroughWithMongod_WT
+  - name: noPassthrough_WT
+  - name: parallel_WT
+  - name: parallel_compatibility_WT
+  - name: read_concern_linearizable_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: read_only_WT
+  - name: read_only_sharded_WT
+  - name: replica_sets_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_WT_ese
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth
+    distros:
+    - rhel62-large
+  - name: replica_sets_pv0
+    distros:
+    - rhel62-large
+  - name: replica_sets_rollback_refetch_no_uuid
+    distros:
+    - rhel62-large
+  - name: replica_sets_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_static_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_resync_static_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_kill_secondaries_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: replica_sets_jscore_fcv34_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: retryable_writes_jscore_passthrough_WT
+    distros:
+    - rhel62-large
+  - name: rlp_WT
+  - name: sasl
+  - name: session_jscore_passthrough_WT
+  - name: sharded_collections_jscore_passthrough_WT
+  - name: sharding_WT
+    distros:
+    - rhel62-large
+  - name: sharding_WT_ese
+    distros:
+    - rhel62-large
+  - name: sharding_auth
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_WT
+    distros:
+    - rhel62-large
+  - name: sharding_gle_auth_basics_passthrough_WT
+  - name: sharding_gle_auth_basics_passthrough_write_cmd_WT
+  - name: sharding_jscore_passthrough_WT
+  - name: sharding_jscore_op_query_passthrough_WT
+  - name: sharding_jscore_passthrough_wire_ops_WT
+  - name: sharding_last_stable_mongos_and_mixed_shards
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_WT
+    distros:
+    - rhel62-large
+  - name: sharding_csrs_continuous_config_stepdown_WT
+    distros:
+    - rhel62-large
+  - name: slow1_WT
+  - name: serial_run_WT
+  - name: snmp_WT
+  - name: ssl
+  - name: sslSpecial
+  - name: tool_WT
+  - name: update_fuzzer_WT
+  - name: update_fuzzer_replication_WT
+  - name: write_concern_majority_passthrough_WT
+    distros:
+    - rhel62-large
 
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"

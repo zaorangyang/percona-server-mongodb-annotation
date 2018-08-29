@@ -3,7 +3,7 @@
  * version, verifying the behavior of $clusterTime metadata and afterClusterTime commands throughout
  * the process.
  *
- * @tags: [rocks_requires_fcv36]
+ * @tags: [requires_majority_read_concern, rocks_requires_fcv36]
  */
 (function() {
     "use strict";

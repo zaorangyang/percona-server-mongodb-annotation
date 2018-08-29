@@ -15,6 +15,27 @@ from . import process as _process
 from .. import config
 from .. import utils
 
+# The below parameters define the default 'logComponentVerbosity' object passed to mongod processes
+# started either directly via resmoke or those that will get started by the mongo shell. We allow
+# this default to be different for tests run locally and tests run in Evergreen. This allows us, for
+# example, to keep log verbosity high in Evergreen test runs without polluting the logs for
+# developers running local tests.
+
+# The default verbosity setting for any tests that are not started with an Evergreen task id. This
+# will apply to any tests run locally.
+DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {"replication": {"rollback": 2}}
+
+# The default verbosity setting for any tests running in Evergreen i.e. started with an Evergreen
+# task id.
+DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY = {"replication": {"heartbeats": 2, "rollback": 2}}
+
+
+def default_mongod_log_component_verbosity():
+    """Return the default 'logComponentVerbosity' value to use for mongod processes."""
+    if config.EVERGREEN_TASK_ID:
+        return DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY
+    return DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY
+
 
 def mongod_program(logger, executable=None, process_kwargs=None, **kwargs):
     """
@@ -32,11 +53,9 @@ def mongod_program(logger, executable=None, process_kwargs=None, **kwargs):
     if config.MONGOD_SET_PARAMETERS is not None:
         suite_set_parameters.update(utils.load_yaml(config.MONGOD_SET_PARAMETERS))
 
-    # Turn on replication heartbeat logging.
-    if "replSet" in kwargs and "logComponentVerbosity" not in suite_set_parameters:
-        suite_set_parameters["logComponentVerbosity"] = {
-            "replication": {"heartbeats": 2, "rollback": 2}
-        }
+    # Set default log verbosity levels if none were specified.
+    if "logComponentVerbosity" not in suite_set_parameters:
+        suite_set_parameters["logComponentVerbosity"] = default_mongod_log_component_verbosity()
 
     # orphanCleanupDelaySecs controls an artificial delay before cleaning up an orphaned chunk
     # that has migrated off of a shard, meant to allow most dependent queries on secondaries to
@@ -61,6 +80,7 @@ def mongod_program(logger, executable=None, process_kwargs=None, **kwargs):
     _apply_set_parameters(args, suite_set_parameters)
 
     shortcut_opts = {
+        "enableMajorityReadConcern": config.MAJORITY_READ_CONCERN,
         "nojournal": config.NO_JOURNAL,
         "nopreallocj": config.NO_PREALLOC_JOURNAL,
         "serviceExecutor": config.SERVICE_EXECUTOR,
@@ -159,6 +179,7 @@ def mongo_shell_program(logger, executable=None, connection_string=None, filenam
     global_vars = kwargs.pop("global_vars", {}).copy()
 
     shortcut_opts = {
+        "enableMajorityReadConcern": (config.MAJORITY_READ_CONCERN, True),
         "noJournal": (config.NO_JOURNAL, False),
         "noJournalPrealloc": (config.NO_PREALLOC_JOURNAL, False),
         "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
@@ -182,22 +203,29 @@ def mongo_shell_program(logger, executable=None, connection_string=None, filenam
 
     global_vars["TestData"] = test_data
 
-    # Pass setParameters for mongos and mongod through TestData. The setParameter parsing in
-    # servers.js is very primitive (just splits on commas), so this may break for non-scalar
-    # setParameter values.
+    # Initialize setParameters for mongod and mongos, to be passed to the shell via TestData. Since
+    # they are dictionaries, they will be converted to JavaScript objects when passed to the shell
+    # by the _format_shell_vars() function.
+    mongod_set_parameters = {}
     if config.MONGOD_SET_PARAMETERS is not None:
         if "setParameters" in test_data:
             raise ValueError("setParameters passed via TestData can only be set from either the"
                              " command line or the suite YAML, not both")
         mongod_set_parameters = utils.load_yaml(config.MONGOD_SET_PARAMETERS)
-        test_data["setParameters"] = _format_test_data_set_parameters(mongod_set_parameters)
+
+    # If the 'logComponentVerbosity' setParameter for mongod was not already specified, we set its
+    # value to a default.
+    mongod_set_parameters.setdefault("logComponentVerbosity",
+                                     default_mongod_log_component_verbosity())
+
+    test_data["setParameters"] = mongod_set_parameters
 
     if config.MONGOS_SET_PARAMETERS is not None:
         if "setParametersMongos" in test_data:
             raise ValueError("setParametersMongos passed via TestData can only be set from either"
                              " the command line or the suite YAML, not both")
         mongos_set_parameters = utils.load_yaml(config.MONGOS_SET_PARAMETERS)
-        test_data["setParametersMongos"] = _format_test_data_set_parameters(mongos_set_parameters)
+        test_data["setParametersMongos"] = mongos_set_parameters
 
     if "eval_prepend" in kwargs:
         eval_sb.append(str(kwargs.pop("eval_prepend")))
@@ -289,6 +317,7 @@ def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **
     if suites is not None:
         args.extend(suites)
 
+    kwargs["enableMajorityReadConcern"] = config.MAJORITY_READ_CONCERN
     if config.STORAGE_ENGINE is not None:
         kwargs["storageEngine"] = config.STORAGE_ENGINE
 

@@ -1,5 +1,5 @@
 // Tests that the $changeStream stage returns an error when run against a standalone mongod.
-// @tags: [rocks_requires_fcv36]
+// @tags: [requires_majority_read_concern, rocks_requires_fcv36]
 (function() {
     "use strict";
     load("jstests/aggregation/extras/utils.js");  // For assertErrorCode.

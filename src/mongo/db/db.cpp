@@ -762,10 +762,7 @@ ExitCode _initAndListen(int listenPort) {
     if (serverGlobalParams.parsedOpts.hasField("storage")) {
         BSONElement storageElement = serverGlobalParams.parsedOpts.getField("storage");
         invariant(storageElement.isABSONObj());
-        BSONObj storageParamsObj = storageElement.Obj();
-        BSONObjIterator i = storageParamsObj.begin();
-        while (i.more()) {
-            BSONElement e = i.next();
+        for (auto&& e : storageElement.Obj()) {
             // Ignore if field name under "storage" matches current storage engine.
             if (storageGlobalParams.engine == e.fieldName()) {
                 continue;
@@ -883,6 +880,9 @@ ExitCode _initAndListen(int listenPort) {
             log() << redact(status);
             if (status == ErrorCodes::AuthSchemaIncompatible) {
                 exitCleanly(EXIT_NEED_UPGRADE);
+            } else if (status == ErrorCodes::NotMaster) {
+                // Try creating the indexes if we become master.  If we do not become master,
+                // the master will create the indexes and we will replicate them.
             } else {
                 quickExit(EXIT_FAILURE);
             }

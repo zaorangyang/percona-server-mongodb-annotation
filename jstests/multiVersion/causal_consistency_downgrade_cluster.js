@@ -2,7 +2,7 @@
  * Test the downgrade of a sharded cluster from latest to last-stable version succeeds, verifying
  * behavior related to causal consistency at each stage.
  *
- * @tags: [rocks_requires_fcv36]
+ * @tags: [requires_majority_read_concern, rocks_requires_fcv36]
  */
 (function() {
     "use strict";

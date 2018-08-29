@@ -7,7 +7,7 @@
     var result;
     const request = {startSession: 1};
 
-    conn = MongoRunner.runMongod({nojournal: ""});
+    conn = MongoRunner.runMongod({nojournal: "", setParameter: {maxSessions: 2}});
     admin = conn.getDB("admin");
 
     // ensure that the cache is empty
@@ -41,6 +41,8 @@
     assert.eq(
         result.timeoutMinutes, 30, "failed test that our session record has the correct timeout");
 
+    assert.commandFailed(admin.runCommand(request),
+                         "failed test that we can't run startSession when the cache is full");
     MongoRunner.stopMongod(conn);
 
     //

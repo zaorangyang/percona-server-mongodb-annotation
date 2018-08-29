@@ -98,8 +98,8 @@ std::ostream& operator<<(std::ostream& os,
     switch (result) {
         case TopologyCoordinator::PrepareFreezeResponseResult::kNoAction:
             return os << "no action";
-        case TopologyCoordinator::PrepareFreezeResponseResult::kElectSelf:
-            return os << "elect self";
+        case TopologyCoordinator::PrepareFreezeResponseResult::kSingleNodeSelfElect:
+            return os << "single node self elect";
     }
     MONGO_UNREACHABLE;
 }
@@ -2225,13 +2225,15 @@ TopologyCoordinator::prepareFreezeResponse(Date_t now, int secs, BSONObjBuilder*
         log() << "'unfreezing'";
         response->append("info", "unfreezing");
 
+        if (_rsConfig.getProtocolVersion() == 1)
+            return PrepareFreezeResponseResult::kSingleNodeSelfElect;
         if (_isElectableNodeInSingleNodeReplicaSet()) {
             // If we are a one-node replica set, we're the one member,
             // we're electable, we're not in maintenance mode, and we are currently in followerMode
             // SECONDARY, we must transition to candidate now that our stepdown period
             // is no longer active, in leiu of heartbeats.
             _role = Role::kCandidate;
-            return PrepareFreezeResponseResult::kElectSelf;
+            return PrepareFreezeResponseResult::kSingleNodeSelfElect;
         }
     } else {
         if (secs == 1)
@@ -2795,6 +2797,14 @@ bool TopologyCoordinator::_canCompleteStepDownAttempt(Date_t now, Date_t waitUnt
     return isSafeToStepDown();
 }
 
+bool TopologyCoordinator::_isCaughtUpAndElectable(int memberIndex, OpTime lastApplied) {
+    if (_getUnelectableReason(memberIndex)) {
+        return false;
+    }
+
+    return (_memberData.at(memberIndex).getLastAppliedOpTime() >= lastApplied);
+}
+
 bool TopologyCoordinator::isSafeToStepDown() {
     if (!_rsConfig.isInitialized() || _selfIndex < 0) {
         return false;
@@ -2811,20 +2821,51 @@ bool TopologyCoordinator::isSafeToStepDown() {
     }
 
     // Now check that we also have at least one caught up node that is electable.
-    const OpTime lastOpApplied = getMyLastAppliedOpTime();
     for (int memberIndex = 0; memberIndex < _rsConfig.getNumMembers(); memberIndex++) {
         // ignore your self
         if (memberIndex == _selfIndex) {
             continue;
         }
-        UnelectableReasonMask reason = _getUnelectableReason(memberIndex);
-        if (!reason && _memberData.at(memberIndex).getHeartbeatAppliedOpTime() >= lastOpApplied) {
-            // Found a caught up and electable node, succeed with step down.
+        if (_isCaughtUpAndElectable(memberIndex, lastApplied)) {
             return true;
         }
     }
 
     return false;
+}
+
+int TopologyCoordinator::chooseElectionHandoffCandidate() {
+
+    OpTime lastApplied = getMyLastAppliedOpTime();
+
+    int bestCandidateIndex = -1;
+    int highestPriority = -1;
+
+    for (int memberIndex = 0; memberIndex < _rsConfig.getNumMembers(); memberIndex++) {
+
+        // Skip your own member index.
+        if (memberIndex == _selfIndex) {
+            continue;
+        }
+
+        // Skip this node if it is not eligible to become primary. This includes nodes with
+        // priority 0.
+        if (!_isCaughtUpAndElectable(memberIndex, lastApplied)) {
+            continue;
+        }
+
+        // Only update best if priority is strictly greater. This guarantees that
+        // we will pick the member with the lowest index in case of a tie. Note that
+        // member priority is always a non-negative number.
+        auto memberPriority = _rsConfig.getMemberAt(memberIndex).getPriority();
+        if (memberPriority > highestPriority) {
+            bestCandidateIndex = memberIndex;
+            highestPriority = memberPriority;
+        }
+    }
+
+    // This is the most suitable node.
+    return bestCandidateIndex;
 }
 
 void TopologyCoordinator::setFollowerMode(MemberState::MS newMode) {

@@ -1,7 +1,7 @@
 /**
  * Validates the operationTime value in the command response depends on the read/writeConcern of the
  * the read/write commmand that produced it.
- * @tags: [rocks_requires_fcv36]
+ * @tags: [requires_majority_read_concern, rocks_requires_fcv36]
  */
 (function() {
     "use strict";
@@ -44,7 +44,7 @@
         testDB.runCommand({insert: collectionName, documents: [localDoc], writeConcern: {w: 1}}));
     var localWriteOperationTime = res.operationTime;
 
-    assert(localWriteOperationTime > majorityWriteOperationTime);
+    assert.gt(localWriteOperationTime, majorityWriteOperationTime);
 
     res = assert.commandWorked(testDB.runCommand({
         find: collectionName,

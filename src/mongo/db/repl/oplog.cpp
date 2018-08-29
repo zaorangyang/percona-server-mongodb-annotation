@@ -114,6 +114,9 @@ namespace repl {
 std::string masterSlaveOplogName = "local.oplog.$main";
 
 namespace {
+
+MONGO_FP_DECLARE(sleepBetweenInsertOpTimeGenerationAndLogOp);
+
 /**
  * The `_localOplogCollection` pointer is always valid (or null) because an
  * operation must take the global exclusive lock to set the pointer to null when
@@ -398,26 +401,9 @@ void _logOpsInner(OperationContext* opCtx,
 
     // Set replCoord last optime only after we're sure the WUOW didn't abort and roll back.
     opCtx->recoveryUnit()->onCommit([opCtx, replCoord, finalOpTime] {
-
-        auto lastAppliedTimestamp = finalOpTime.getTimestamp();
-        const auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
-        if (storageEngine->isFcv36Supported() && storageEngine->supportsDocLocking()) {
-            // If the storage engine supports document level locking, then it is possible for
-            // oplog writes to commit out of order. In that case, we only want to set our last
-            // applied optime to the all committed timestamp to ensure that all operations earlier
-            // than the last applied optime have been storage-committed. We are guaranteed that
-            // whatever operation occurred at the all committed timestamp occurred during the same
-            // term as 'finalOpTime'. When a primary enters a new term, it first commits a
-            // 'new primary' oplog entry in the new term before accepting any new writes. This
-            // will ensure that the all committed timestamp is in the new term before any client
-            // writes are committed.
-            lastAppliedTimestamp = storageEngine->getAllCommittedTimestamp(opCtx);
-        }
-
         // Optimes on the primary should always represent consistent database states.
         replCoord->setMyLastAppliedOpTimeForward(
-            OpTime(lastAppliedTimestamp, finalOpTime.getTerm()),
-            ReplicationCoordinator::DataConsistency::Consistent);
+            finalOpTime, ReplicationCoordinator::DataConsistency::Consistent);
 
         // We set the last op on the client to 'finalOpTime', because that contains the timestamp
         // of the operation that the client actually performed.
@@ -435,7 +421,8 @@ OpTime logOp(OperationContext* opCtx,
              Date_t wallClockTime,
              const OperationSessionInfo& sessionInfo,
              StmtId statementId,
-             const OplogLink& oplogLink) {
+             const OplogLink& oplogLink,
+             const OplogSlot& oplogSlot) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->isOplogDisabledFor(opCtx, nss)) {
         uassert(ErrorCodes::IllegalOperation,
@@ -451,7 +438,11 @@ OpTime logOp(OperationContext* opCtx,
 
     OplogSlot slot;
     WriteUnitOfWork wuow(opCtx);
-    _getNextOpTimes(opCtx, oplog, 1, &slot);
+    if (oplogSlot.opTime.isNull()) {
+        _getNextOpTimes(opCtx, oplog, 1, &slot);
+    } else {
+        slot = oplogSlot;
+    }
 
     auto writer = _logOpWriter(opCtx,
                                opstr,
@@ -535,6 +526,14 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
         oplogLink.prevOpTime = insertStatementOplogSlot.opTime;
         timestamps[i] = oplogLink.prevOpTime.getTimestamp();
         opTimes.push_back(insertStatementOplogSlot.opTime);
+    }
+
+    MONGO_FAIL_POINT_BLOCK(sleepBetweenInsertOpTimeGenerationAndLogOp, customWait) {
+        const BSONObj& data = customWait.getData();
+        auto numMillis = data["waitForMillis"].numberInt();
+        log() << "Sleeping for " << numMillis << "ms after receiving " << count << " optimes from "
+              << opTimes.front() << " to " << opTimes.back();
+        sleepmillis(numMillis);
     }
 
     std::unique_ptr<DocWriter const* []> basePtrs(new DocWriter const*[count]);
@@ -924,8 +923,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-         return convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
-     }}},
+          return convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
+      },
+      {ErrorCodes::NamespaceNotFound}}},
     {"emptycapped",
      {[](OperationContext* opCtx,
          const char* ns,
@@ -933,8 +933,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-         return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
-     }}},
+          return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
+      },
+      {ErrorCodes::NamespaceNotFound}}},
 };
 
 }  // namespace
@@ -1216,9 +1217,9 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     !fieldO.Obj().isEmpty() && !fieldTs.Obj().isEmpty() && !fieldT.Obj().isEmpty());
 
             std::vector<InsertStatement> insertObjs;
-            auto fieldOIt = fieldO.Obj().begin();
-            auto fieldTsIt = fieldTs.Obj().begin();
-            auto fieldTIt = fieldT.Obj().begin();
+            auto fieldOIt = BSONObjIterator(fieldO.Obj());
+            auto fieldTsIt = BSONObjIterator(fieldTs.Obj());
+            auto fieldTIt = BSONObjIterator(fieldT.Obj());
 
             while (true) {
                 auto oElem = fieldOIt.next();

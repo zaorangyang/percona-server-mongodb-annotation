@@ -115,6 +115,11 @@ ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>
     setDiffieHellmanParameterPEMFile(ServerParameterSet::getGlobal(),
                                      "opensslDiffieHellmanParameters",
                                      &sslGlobalParams.sslPEMTempDHParam);
+
+ExportedServerParameter<bool, ServerParameterType::kStartupOnly>
+    suppressNoTLSPeerCertificateWarning(ServerParameterSet::getGlobal(),
+                                        "suppressNoTLSPeerCertificateWarning",
+                                        &sslGlobalParams.suppressNoTLSPeerCertificateWarning);
 }  // namespace
 
 SSLPeerInfo& SSLPeerInfo::forSession(const transport::SessionHandle& session) {
@@ -238,7 +243,8 @@ IMPLEMENT_ASN1_ENCODE_FUNCTIONS_const_fname(ASN1_SEQUENCE_ANY, ASN1_SET_ANY, ASN
 #endif // MONGO_CONFIG_NEEDS_ASN1_ANY_DEFINITIONS
 // clang-format on
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || \
+    (defined(LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x2070000fL)
 // Copies of OpenSSL after 1.1.0 define new functions for interaction with
 // X509 structure. We must polyfill used definitions to interact with older
 // OpenSSL versions.
@@ -414,6 +420,7 @@ private:
     bool _weakValidation;
     bool _allowInvalidCertificates;
     bool _allowInvalidHostnames;
+    bool _suppressNoCertificateWarning;
     SSLConfiguration _sslConfiguration;
 
     /**
@@ -681,7 +688,13 @@ std::string escapeRfc2253(StringData str) {
     return ret;
 }
 
+TLSVersionCounts tlsVersionCounts;
+
 }  // namespace
+
+TLSVersionCounts& TLSVersionCounts::get() {
+    return tlsVersionCounts;
+}
 
 StatusWith<std::string> SSLX509Name::getOID(StringData oid) const {
     for (const auto& rdn : _entries) {
@@ -797,7 +810,8 @@ SSLManager::SSLManager(const SSLParams& params, bool isServer)
       _clientContext(nullptr, free_ssl_context),
       _weakValidation(params.sslWeakCertificateValidation),
       _allowInvalidCertificates(params.sslAllowInvalidCertificates),
-      _allowInvalidHostnames(params.sslAllowInvalidHostnames) {
+      _allowInvalidHostnames(params.sslAllowInvalidHostnames),
+      _suppressNoCertificateWarning(params.suppressNoTLSPeerCertificateWarning) {
     if (!_initSynchronousSSLContext(&_clientContext, params, ConnectionDirection::kOutgoing)) {
         uasserted(16768, "ssl initialization problem");
     }
@@ -1465,8 +1479,37 @@ SSLConnection* SSLManager::accept(Socket* socket, const char* initialBytes, int 
     return sslConn.release();
 }
 
+
+void recordTLSVersion(const SSL* conn) {
+    int protocol = SSL_version(conn);
+
+    auto& counts = mongo::TLSVersionCounts::get();
+    switch (protocol) {
+        case TLS1_VERSION:
+            counts.tls10.addAndFetch(1);
+            break;
+        case TLS1_1_VERSION:
+            counts.tls11.addAndFetch(1);
+            break;
+        case TLS1_2_VERSION:
+            counts.tls12.addAndFetch(1);
+            break;
+#ifdef TLS1_3_VERSION
+        case TLS1_3_VERSION:
+            counts.tls13.addAndFetch(1);
+            break;
+#endif
+        default:
+            // Do nothing
+            break;
+    }
+}
+
 StatusWith<boost::optional<SSLPeerInfo>> SSLManager::parseAndValidatePeerCertificate(
     SSL* conn, const std::string& remoteHost) {
+
+    recordTLSVersion(conn);
+
     if (!_sslConfiguration.hasCA && isSSLServer)
         return {boost::none};
 
@@ -1474,7 +1517,11 @@ StatusWith<boost::optional<SSLPeerInfo>> SSLManager::parseAndValidatePeerCertifi
 
     if (NULL == peerCert) {  // no certificate presented by peer
         if (_weakValidation) {
-            warning() << "no SSL certificate provided by peer";
+            // do not give warning if certificate warnings are suppressed
+            if (!_suppressNoCertificateWarning) {
+                warning() << "no SSL certificate provided by peer";
+            }
+            return {boost::none};
         } else {
             auto msg = "no SSL certificate provided by peer; connection rejected";
             error() << msg;

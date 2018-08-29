@@ -1,6 +1,6 @@
 // Test that $changeStreams usage is disallowed when the featureCompatibilityVersion is 3.4.
 // and that existing streams close when FCV is set to 3.4
-// @tags: [rocks_requires_fcv36]
+// @tags: [requires_majority_read_concern, rocks_requires_fcv36]
 (function() {
     "use strict";
 
