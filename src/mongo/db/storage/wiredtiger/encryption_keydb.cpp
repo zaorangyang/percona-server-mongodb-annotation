@@ -37,7 +37,9 @@ namespace mongo {
 
 static EncryptionKeyDB *encryptionKeyDB = nullptr;
 
+static constexpr const char * gcm_iv_key = "_gcm_iv_reserved";
 constexpr int EncryptionKeyDB::_key_len;
+constexpr int EncryptionKeyDB::_gcm_iv_bytes;
 
 static void dump_key(unsigned char *key, const int _key_len, const char * msg) {
     const char* m = "0123456789ABCDEF";
@@ -83,6 +85,10 @@ EncryptionKeyDB::EncryptionKeyDB(const std::string& path)
 EncryptionKeyDB::~EncryptionKeyDB() {
     DEV if (_sess)
         dump_table(_sess, _key_len, "dump_table from destructor");
+    if (_sess) {
+        _gcm_iv_reserved = _gcm_iv;
+        store_gcm_iv_reserved();
+    }
     if (_sess)
         _sess->close(_sess, nullptr);
     if (_conn)
@@ -115,7 +121,11 @@ void EncryptionKeyDB::init() {
         std::stringstream ss;
         ss << "create,";
         ss << "config_base=false,";
-        ss << "extensions=[local=(entry=percona_encryption_extension_init,early_load=true,config=(cipher=" << encryptionGlobalParams.encryptionCipherMode << "))],";
+        // encryptionGlobalParams.encryptionCipherMode is not used here with a reason:
+        // keys DB will always use CBC cipher because wiredtiger_open internally calls
+        // encryption extension's encrypt function which depends on the GCM encryption counter
+        // loaded later (see 'load parameters' section below)
+        ss << "extensions=[local=(entry=percona_encryption_extension_init,early_load=true,config=(cipher=AES256-CBC))],";
         ss << "encryption=(name=percona,keyid=\"\"),";
         int res = wiredtiger_open(_path.c_str(), nullptr, ss.str().c_str(), &_conn);
         if (res) {
@@ -129,13 +139,46 @@ void EncryptionKeyDB::init() {
         }
 
         DEV dump_table(_sess, _key_len, "before create");
-        // try to create table
+        // try to create 'key' table
         // ignore error if table already exists
         res = _sess->create(_sess, "table:key", "key_format=S,value_format=u,access_pattern_hint=random");
         if (res) {
             throw std::runtime_error(std::string("error creating/opening key table: ") + wiredtiger_strerror(res));
         }
         DEV dump_table(_sess, _key_len, "after create");
+
+        // try to create 'parameters' table
+        // ignore error if table already exists
+        res = _sess->create(_sess, "table:parameters", "key_format=S,value_format=u,access_pattern_hint=random");
+        if (res) {
+            throw std::runtime_error(std::string("error creating/opening parameters table: ") + wiredtiger_strerror(res));
+        }
+
+        // load parameters
+        {
+            WT_CURSOR *cursor;
+            int res = _sess->open_cursor(_sess, "table:parameters", nullptr, nullptr, &cursor);
+            if (res){
+                throw std::runtime_error(std::string("error opening cursor: ") + wiredtiger_strerror(res));
+            }
+            // create cursor delete guard
+            std::unique_ptr<WT_CURSOR, std::function<void(WT_CURSOR*)>> cursor_guard(cursor, [](WT_CURSOR* c)
+                {
+                    c->close(c);
+                });
+            // load _gcm_iv_reserved from DB
+            cursor->set_key(cursor, gcm_iv_key);
+            res = cursor->search(cursor);
+            if (res == 0) {
+                WT_ITEM v;
+                cursor->get_value(cursor, &v);
+                import_bits(_gcm_iv_reserved, (uint8_t*)v.data, (uint8_t*)v.data + v.size, 8, false);
+                _gcm_iv = _gcm_iv_reserved;
+            }
+            else if (res != WT_NOTFOUND) {
+                throw std::runtime_error(std::string("error reading parameters: ") + wiredtiger_strerror(res));
+            }
+        }
     } catch (std::exception& e) {
         error() << e.what();
         throw;
@@ -202,6 +245,56 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
     return 0;
 }
 
+int EncryptionKeyDB::store_gcm_iv_reserved() {
+    uint8_t tmp[_gcm_iv_bytes];
+    auto end = export_bits(_gcm_iv_reserved, tmp, 8, false);
+
+    // open cursor
+    WT_CURSOR *cursor;
+    int res = _sess->open_cursor(_sess, "table:parameters", nullptr, nullptr, &cursor);
+    if (res){
+        error() << "store_gcm_iv_reserved: error opening cursor: " << wiredtiger_strerror(res);
+        return res;
+    }
+
+    // create cursor delete guard
+    std::unique_ptr<WT_CURSOR, std::function<void(WT_CURSOR*)>> cursor_guard(cursor, [](WT_CURSOR* c)
+        {
+            c->close(c);
+        });
+
+    // put new value into the DB
+    WT_ITEM v;
+    v.size = end - tmp;
+    v.data = tmp;
+    cursor->set_key(cursor, gcm_iv_key);
+    cursor->set_value(cursor, &v);
+    res = cursor->insert(cursor);
+    if (res) {
+        error() << "cursor->insert error " << res << " : " <<wiredtiger_strerror(res);
+        return res;
+    }
+    return 0;
+}
+
+int EncryptionKeyDB::reserve_gcm_iv_range() {
+    _gcm_iv_reserved += (1<<12);
+    return store_gcm_iv_reserved();
+}
+
+int EncryptionKeyDB::get_iv_gcm(uint8_t *buf, int len) {
+    ++_gcm_iv;
+    uint8_t tmp[_gcm_iv_bytes];
+    auto end = export_bits(_gcm_iv, tmp, 8, false);
+    int ls = end - tmp;
+    memset(buf, 0, len);
+    memcpy(buf, tmp, std::min(len, ls));
+    if (_gcm_iv > _gcm_iv_reserved) {
+        return reserve_gcm_iv_range();
+    }
+    return 0;
+}
+
 void EncryptionKeyDB::store_pseudo_bytes(uint8_t *buf, int len) {
     invariant((len % 4) == 0);
     for (int i = 0; i < len / 4; ++i) {
@@ -213,6 +306,11 @@ void EncryptionKeyDB::store_pseudo_bytes(uint8_t *buf, int len) {
 extern "C" void store_pseudo_bytes(uint8_t *buf, int len) {
     invariant(encryptionKeyDB);
     encryptionKeyDB->store_pseudo_bytes(buf, len);
+}
+
+extern "C" int get_iv_gcm(uint8_t *buf, int len) {
+    invariant(encryptionKeyDB);
+    return encryptionKeyDB->get_iv_gcm(buf, len);
 }
 
 // returns encryption key from keys DB

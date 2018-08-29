@@ -209,7 +209,10 @@ static int percona_encrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
         goto err;
 #endif
 
-    store_IV(pe, dst);
+    if (0 != get_iv_gcm(dst, pe->iv_len)) {
+        ret = report_error(pe, session, EINVAL, "failed generating IV for GCM");
+        goto cleanup;
+    }
     *result_lenp += pe->iv_len;
 
     if(1 != EVP_EncryptInit_ex(ctx, pe->cipher, NULL, pe->key, dst))
