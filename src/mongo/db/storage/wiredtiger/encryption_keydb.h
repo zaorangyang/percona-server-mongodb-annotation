@@ -20,7 +20,9 @@ Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
+#include <set>
 #include <string>
+#include <boost/multiprecision/cpp_int.hpp>
 #include <wiredtiger.h>
 
 #include <mongo/platform/random.h>
@@ -43,10 +45,18 @@ public:
     // return key from keyfile if len == 0
     int get_key_by_id(const char *keyid, size_t len, unsigned char *key);
 
+    // get new counter value for IV in GCM mode
+    int get_iv_gcm(uint8_t *buf, int len);
+
     // len should be multiple of 4
     void store_pseudo_bytes(uint8_t *buf, int len);
 
 private:
+    typedef boost::multiprecision::uint128_t _gcm_iv_type;
+
+    int store_gcm_iv_reserved();
+    int reserve_gcm_iv_range();
+
     static constexpr int _key_len = 32;
     const std::string _path;
     unsigned char _masterkey[_key_len];
@@ -54,6 +64,9 @@ private:
     WT_SESSION *_sess = nullptr;
     std::unique_ptr<SecureRandom> _srng;
     std::unique_ptr<PseudoRandom> _prng;
+    _gcm_iv_type _gcm_iv{0};
+    _gcm_iv_type _gcm_iv_reserved{0};
+    static constexpr int _gcm_iv_bytes = (std::numeric_limits<decltype(_gcm_iv)>::digits + 7) / 8;
 };
 
 }  // namespace mongo
