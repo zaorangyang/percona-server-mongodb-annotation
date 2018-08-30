@@ -194,12 +194,16 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
         return 0;
     }
 
+    int res;
     // open cursor
     WT_CURSOR *cursor;
-    int res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
-    if (res){
-        error() << "get_key_by_id: error opening cursor: " << wiredtiger_strerror(res);
-        return res;
+    {
+        stdx::lock_guard<stdx::mutex> lk(_lock_sess);
+        res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
+        if (res){
+            error() << "get_key_by_id: error opening cursor: " << wiredtiger_strerror(res);
+            return res;
+        }
     }
 
     // create cursor delete guard
@@ -208,6 +212,8 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
             c->close(c);
         });
 
+    // search/write of db encryption key should be atomic
+    stdx::lock_guard<stdx::mutex> lk(_lock_key);
     // read key from DB
     std::string c_str(keyid, len);
     LOG(4) << "trying to load encryption key for keyid: " << c_str;
@@ -228,6 +234,7 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
 
     // create key if it does not exist
     for (int i = 0; i < 4; ++i) {
+        // call to nextInt64() is protected by _lock_key above
         ((int64_t*)key)[i] = _srng->nextInt64();
     }
     WT_ITEM v;
@@ -249,12 +256,16 @@ int EncryptionKeyDB::store_gcm_iv_reserved() {
     uint8_t tmp[_gcm_iv_bytes];
     auto end = export_bits(_gcm_iv_reserved, tmp, 8, false);
 
+    int res;
     // open cursor
     WT_CURSOR *cursor;
-    int res = _sess->open_cursor(_sess, "table:parameters", nullptr, nullptr, &cursor);
-    if (res){
-        error() << "store_gcm_iv_reserved: error opening cursor: " << wiredtiger_strerror(res);
-        return res;
+    {
+        stdx::lock_guard<stdx::mutex> lk(_lock_sess);
+        res = _sess->open_cursor(_sess, "table:parameters", nullptr, nullptr, &cursor);
+        if (res){
+            error() << "store_gcm_iv_reserved: error opening cursor: " << wiredtiger_strerror(res);
+            return res;
+        }
     }
 
     // create cursor delete guard
@@ -283,6 +294,7 @@ int EncryptionKeyDB::reserve_gcm_iv_range() {
 }
 
 int EncryptionKeyDB::get_iv_gcm(uint8_t *buf, int len) {
+    stdx::lock_guard<stdx::recursive_mutex> lk(_lock);
     ++_gcm_iv;
     uint8_t tmp[_gcm_iv_bytes];
     auto end = export_bits(_gcm_iv, tmp, 8, false);
@@ -297,6 +309,7 @@ int EncryptionKeyDB::get_iv_gcm(uint8_t *buf, int len) {
 
 void EncryptionKeyDB::store_pseudo_bytes(uint8_t *buf, int len) {
     invariant((len % 4) == 0);
+    stdx::lock_guard<stdx::recursive_mutex> lk(_lock);
     for (int i = 0; i < len / 4; ++i) {
         *(int32_t*)buf = _prng->nextInt32();
         buf += 4;
