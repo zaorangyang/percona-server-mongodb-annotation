@@ -16,6 +16,26 @@
     const sessionDb = session.getDatabase(dbName);
     const sessionColl = sessionDb.getCollection(collName);
 
+    //
+    // Test that calling abortTransaction as the first statement in a transaction is allowed and
+    // modifies the state accordingly.
+    //
+    jsTestLog("Call abortTransaction as the first statement in a transaction");
+    session.startTransaction({readConcern: {level: "snapshot"}, writeConcern: {w: "majority"}});
+
+    // Successfully call abortTransaction.
+    session.abortTransaction();
+
+    //
+    // Test that calling commitTransaction as the first statement in a transaction is allowed and
+    // modifies the state accordingly.
+    //
+    jsTestLog("Call commitTransaction as the first statement in a transaction");
+    session.startTransaction({readConcern: {level: "snapshot"}, writeConcern: {w: "majority"}});
+
+    // Successfully call commitTransaction.
+    session.commitTransaction();
+
     jsTestLog("Run CRUD ops, read ops, and commit transaction.");
     session.startTransaction({readConcern: {level: "snapshot"}, writeConcern: {w: "majority"}});
 
@@ -59,7 +79,7 @@
 
     assert.commandWorked(sessionColl.insert({_id: "insert-4", a: 0}));
 
-    session.abortTransaction();
+    assert.commandWorked(session.abortTransaction_forTesting());
 
     // Verify that we cannot see the document we tried to insert.
     assert.eq(null, sessionColl.findOne({_id: "insert-4"}));

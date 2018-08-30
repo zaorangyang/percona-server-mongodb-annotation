@@ -183,6 +183,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
 
     // clusterMonitor role actions that target the cluster resource
     clusterMonitorRoleClusterActions
+        << ActionType::checkFreeMonitoringStatus
         << ActionType::connPoolStats
         << ActionType::getCmdLineOpts
         << ActionType::getLog
@@ -251,7 +252,8 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::listShards  // clusterMonitor gets this also
         << ActionType::flushRouterConfig  // hostManager gets this also
         << ActionType::cleanupOrphaned
-        << ActionType::setFeatureCompatibilityVersion;
+        << ActionType::setFeatureCompatibilityVersion
+        << ActionType::setFreeMonitoring;
 
     clusterManagerRoleDatabaseActions
         << ActionType::splitChunk

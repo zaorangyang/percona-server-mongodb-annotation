@@ -15,6 +15,35 @@ if sys.version_info[0] >= 3:
     long = int  # pylint: disable=redefined-builtin,invalid-name
 
 
+class NonExecutingThread(object):
+    """NonExecutingThread class.
+
+    Idle multi-statement transactions can hold locks that are not associated with an active
+    thread. In order to generate meaningful digraphs that include these locks, we create an
+    object that implements the "Thread" class interface but populates with LockerId rather than
+    thread::id. This allows us to uniquely identify each idle transaction.
+    """
+
+    def __init__(self, locker_id):
+        """Initialize Thread."""
+        self.locker_id = locker_id
+
+    def __eq__(self, other):
+        if isinstance(other, NonExecutingThread):
+            return self.locker_id == other.locker_id
+        return NotImplemented
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __str__(self):
+        return "Idle Transaction (LockerId {})".format(self.locker_id)
+
+    def key(self):
+        """Return NonExecutingThread key."""
+        return "LockerId {}".format(self.locker_id)
+
+
 class Thread(object):
     """Thread class."""
 
@@ -156,8 +185,12 @@ class Graph(object):
             color = ""
             if nodes and node_key in nodes:
                 color = "color = red"
-            sb.append('    "{}" [label="{}" {}]'.format(node_key, self.nodes[node_key]['node'],
-                                                        color))
+
+            # The DOT language requires that literal double quotes be escaped using a backslash
+            # character.
+            escaped_label = str(self.nodes[node_key]['node']).replace('"', '\\"')
+
+            sb.append('    "{}" [label="{}" {}]'.format(node_key, escaped_label, color))
         sb.append("}")
         return "\n".join(sb)
 
@@ -291,7 +324,11 @@ def find_lock_manager_holders(graph, thread_dict, show):  # pylint: disable=too-
         locker_ptr = locker_ptr.cast(locker_ptr_type)
         locker = locker_ptr.dereference()
         lock_holder_id = int(locker["_threadId"]["_M_thread"])
-        lock_holder = find_thread(thread_dict, lock_holder_id)
+        if lock_holder_id == 0:
+            locker_id = int(locker["_id"])
+            lock_holder = NonExecutingThread(locker_id)
+        else:
+            lock_holder = find_thread(thread_dict, lock_holder_id)
         if show:
             print("MongoDB Lock at {} ({}) held by {} waited on by {}".format(
                 lock_head, lock_request["mode"], lock_holder, lock_waiter))

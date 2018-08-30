@@ -77,6 +77,18 @@ boost::optional<Status> FreeMonController::registerServerCommand(Milliseconds ti
     return Status::OK();
 }
 
+boost::optional<Status> FreeMonController::unregisterServerCommand(Milliseconds timeout) {
+    auto msg =
+        FreeMonWaitableMessageWithPayload<FreeMonMessageType::UnregisterCommand>::createNow(true);
+    _enqueue(msg);
+
+    if (timeout > Milliseconds::min()) {
+        return msg->wait_for(timeout);
+    }
+
+    return Status::OK();
+}
+
 void FreeMonController::_enqueue(std::shared_ptr<FreeMonMessage> msg) {
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -95,7 +107,7 @@ void FreeMonController::start(RegistrationType registrationType) {
 
     // Start the agent
     _processor = std::make_shared<FreeMonProcessor>(
-        _registrationCollectors, _metricCollectors, _network.get());
+        _registrationCollectors, _metricCollectors, _network.get(), _useCrankForTest);
 
     _thread = stdx::thread([this] { _processor->run(); });
 
@@ -139,5 +151,15 @@ void FreeMonController::stop() {
     _state = State::kDone;
 }
 
+void FreeMonController::turnCrankForTest(size_t countMessagesToIgnore) {
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+        invariant(_state == State::kStarted);
+    }
+
+    log() << "Turning Crank: " << countMessagesToIgnore;
+
+    _processor->turnCrankForTest(countMessagesToIgnore);
+}
 
 }  // namespace mongo

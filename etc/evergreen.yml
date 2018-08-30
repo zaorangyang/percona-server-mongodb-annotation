@@ -717,6 +717,7 @@ functions:
       type: test
       params:
         working_dir: src
+        shell: bash
         script: |
           set -o errexit
           set -o verbose
@@ -794,6 +795,12 @@ functions:
             extra_args="$extra_args --storageEngineCacheSizeGB=1"
           fi
           set -o errexit
+
+
+          # Reduce the JSHeapLimit for the serial_run task task on Code Coverage builder variant.
+          if [[ "${build_variant}" = "enterprise-rhel-62-64-bit-coverage" && "${task_name}" = "serial_run" ]]; then
+            extra_args="$extra_args --mongodSetParameter {'jsHeapLimitMB':10}"
+          fi
 
           path_value="$PATH"
           if [ ${variant_path_suffix} ]; then
@@ -965,13 +972,6 @@ functions:
           commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
           echo "Git branch: $branch, commit: $commit"
           make PREFIX=$(pwd)/build/ LIBDIRNAME='.' install
-
-          # Add libfaketime to mongo-binaries.tgz so it gets uploaded to each of the LXC containers.
-          # The build/ prefix of the shared object will get removed when Jepsen extracts the tarball
-          # into the /opt/mongodb/ directory.
-          gzip --stdout --decompress ../mongo-binaries.tgz > mongo-binaries.tar
-          tar --append --file=mongo-binaries.tar build/libfaketime.so.1
-          gzip --stdout mongo-binaries.tar > ../mongo-binaries.tgz
     - command: shell.exec
       params:
         working_dir: src
@@ -987,45 +987,14 @@ functions:
       params:
         working_dir: src
         script: |
-          # On each LXC host do the following:
-          #   Check to see if it's running, if not try to restart it.
-          #   Copy the mongodb tarball to /root.
-          numVms=5
-          exit_failure_code=0
-          ${set_sudo}
-          for i in $(seq 1 $numVms)
-          do
-            hostn=n$i
-            hostn_log=/var/log/lxc/$hostn.log
-            $sudo lxc-wait -n $hostn -s 'RUNNING' -t 0
-            lxc_code=$?
-            lxc_restarts=0
-            # If the LXC host is not running, try 5 times to start it.
-            while [ $lxc_code -ne 0 ]
-            do
-              lxc_restarts=$((lxc_restarts+1))
-              echo "Restarting host $hostn, attempt $lxc_restarts"
-              # When restarting, increase the logging level to INFO for the LXC log.
-              $sudo lxc-start -n $hostn --logpriority=INFO --logfile=$hostn_log -d
-              $sudo lxc-wait -n $hostn -s 'RUNNING' -t 60
-              lxc_code=$?
-              if [ $lxc_restarts -eq 5 ]; then
-                break
-              fi
-            done
-            scp -o ConnectTimeout=30 -o ConnectionAttempts=10 mongo-binaries.tgz root@$hostn:
-            exit_code=$?
-            # If the copy fails, then tail the LXC host log.
-            if [ $exit_code -ne 0 ]; then
-              echo "Copy to host $hostn failed!"
-              $sudo tail -n 100 $hostn_log
-              exit_failure_code=$exit_code
-            else
-              # Cleanup any existing logs from previous runs.
-              ssh root@$hostn "rm -f /root/mongod.log /root/stdout.log /opt/mongod/mongod.log /opt/mongod/stdout.log"
-            fi
-          done
-          exit $exit_failure_code
+          set -o errexit
+          ${activate_virtualenv}
+          $python -c 'import socket; num_nodes = 5; print("\n".join(["%s:%d" % (socket.gethostname(), port) for port in range(20000, 20000 + num_nodes)]))' > nodes.txt
+
+          if [ ${distro_id} = "ubuntu1404-jepsen" ]; then
+            ${set_sudo}
+            $sudo apt-get install -y --force-yes libc++-dev libsnmp-dev
+          fi
 
   "run jepsen test" :
     - command: shell.exec
@@ -1035,21 +1004,34 @@ functions:
         working_dir: src/jepsen-mongodb
         script: |
           set -o verbose
+
+          # Set the TMPDIR environment variable to be a directory in the task's working
+          # directory so that temporary files created by processes spawned by jepsen get
+          # cleaned up after the task completes. This also ensures the spawned processes
+          # aren't impacted by limited space in the mount point for the /tmp directory.
+          # We also need to set the _JAVA_OPTIONS environment variable so that lein will
+          # recognize this as the default temp directory.
+          export TMPDIR="${workdir}/tmp"
+          mkdir -p $TMPDIR
+          export _JAVA_OPTIONS=-Djava.io.tmpdir=$TMPDIR
+
           start_time=$(date +%s)
-          lein run test --test ${jepsen_test_name}                        \
-                        --tarball "file:///root/mongo-binaries.tgz"       \
-                        --ssh-private-key ~/.ssh/id_rsa_lxc               \
-                        --clock-skew faketime                             \
-                        --libfaketime-path /opt/mongodb/libfaketime.so.1  \
-                        --mongod-conf mongod_verbose.conf                 \
-                        ${jepsen_key_time_limit}                          \
-                        ${jepsen_protocol_version}                        \
-                        ${jepsen_read_concern}                            \
-                        ${jepsen_read_with_find_and_modify}               \
-                        ${jepsen_storage_engine}                          \
-                        ${jepsen_time_limit}                              \
-                        ${jepsen_write_concern}                           \
-                        2>&1                                              \
+          lein run test --test ${jepsen_test_name}                                           \
+                        --mongodb-dir ../                                                    \
+                        --working-dir ${workdir}/src/jepsen-workdir                          \
+                        --clock-skew faketime                                                \
+                        --libfaketime-path ${workdir}/src/libfaketime/build/libfaketime.so.1 \
+                        --mongod-conf mongod_verbose.conf                                    \
+                        --virtualization none                                                \
+                        --nodes-file ../nodes.txt                                            \
+                        ${jepsen_key_time_limit}                                             \
+                        ${jepsen_protocol_version}                                           \
+                        ${jepsen_read_concern}                                               \
+                        ${jepsen_read_with_find_and_modify}                                  \
+                        ${jepsen_storage_engine}                                             \
+                        ${jepsen_time_limit}                                                 \
+                        ${jepsen_write_concern}                                              \
+                        2>&1                                                                 \
           | tee jepsen_${task_name}_${execution}.log
           end_time=$(date +%s)
           elapsed_secs=$((end_time-start_time))
@@ -2206,47 +2188,13 @@ functions:
     - *tar_code_coverage_data
     - *archive_code_coverage_data
 
-  ### Process & archive Jepsen artifacts ###
-  "gather jepsen logs": &gather_jepsen_logs
-    command: shell.exec
-    params:
-      working_dir: src
-      script: |
-        # For Jepsen tasks, archive the mongod log files.
-        if [ ${distro_id} = "ubuntu1404-jepsen" ]; then
-          # Copy mongod.log & stdout.log from each LXC host for archive purposes. Note that
-          # stdout.log is also generated as a result of starting mongod.
-          # The logs can reside in 1 of 2 places:
-          #   If the task completed: /root
-          #   If the task failed to complete: /opt/mongodb
-          # There may be logs in both places, but the ones in /opt/mongodb should override
-          # the ones in /root, since the logs in /root could be from a previous successful run.
-          numVms=5
-          for i in $(seq 1 $numVms)
-          do
-            hostn=n$i
-            for log_dir in /root /opt/mongodb
-            do
-              for log in mongod.log stdout.log
-              do
-                outlog="$(echo $log | cut -f1 -d '.')-n$i.log"
-                scp -q root@$hostn:$log_dir/$log $outlog 2> /dev/null
-                if [ -f $outlog ]; then
-                  echo "Copied $log_dir/$log from $hostn to $outlog"
-                fi
-              done
-            done
-          done
-        fi
-
   "tar jepsen logs": &tar_jepsen_logs
     command: archive.targz_pack
     params:
       target: "src/jepsen-mongod-logs.tgz"
-      source_dir: "src"
+      source_dir: "${workdir}/src/jepsen-workdir"
       include:
-        - "mongod*.log"
-        - "stdout*.log"
+        - "./**.log"
 
   "archive jepsen logs": &archive_jepsen_logs
     command: s3.put
@@ -2283,7 +2231,6 @@ functions:
       optional: true
 
   "save jepsen artifacts":
-    - *gather_jepsen_logs
     - *tar_jepsen_logs
     - *archive_jepsen_logs
     - *tar_jepsen_results
@@ -2746,6 +2693,7 @@ tasks:
           - "./test*"
           - "./dbtest*"
           - "./mongobridge*"
+          - "./mongoe*"
           - "buildscripts/**"
           - "*Example"
           - "*Test"
@@ -2894,9 +2842,9 @@ tasks:
           if command -v xcrun; then
             # fixup the install names.
             _LibBsonInstallName=$(xcrun otool -l lib/libbson-1.0.0.dylib | grep mongo-embedded-sdk-${version} | awk '{ print $2 }')
-            xcrun install_name_tool -id '@loader_path/../lib/libbson-1.0.0.dylib' lib/libbson-1.0.0.dylib
-            xcrun install_name_tool -id '@loader_path/../lib/libmongoc-1.0.0.dylib' lib/libmongoc-1.0.0.dylib
-            xcrun install_name_tool -change $_LibBsonInstallName @loader_path/../lib/libbson-1.0.0.dylib lib/libmongoc-1.0.0.dylib
+            xcrun install_name_tool -id '@rpath/libbson-1.0.0.dylib' lib/libbson-1.0.0.dylib
+            xcrun install_name_tool -id '@rpath/libmongoc-1.0.0.dylib' lib/libmongoc-1.0.0.dylib
+            xcrun install_name_tool -change $_LibBsonInstallName @rpath/libbson-1.0.0.dylib lib/libmongoc-1.0.0.dylib
           fi
 
     - func: "scons compile"
@@ -3272,7 +3220,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles 75
+      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3285,7 +3233,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles 75
+      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3298,7 +3246,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles 75
+      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3311,7 +3259,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles 75
+      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3324,7 +3272,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles 75
+      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3350,7 +3298,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles 75
+      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3617,6 +3565,94 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: change_streams_whole_db_passthrough
+  depends_on:
+  - name: change_streams
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_whole_db_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: change_streams_whole_db_mongos_passthrough
+  depends_on:
+  - name: change_streams_mongos_passthrough
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_whole_db_mongos_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: change_streams_whole_db_secondary_reads_passthrough
+  depends_on:
+  - name: change_streams_secondary_reads
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_whole_db_secondary_reads_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: change_streams_whole_db_sharded_collections_passthrough
+  depends_on:
+  - name: change_streams_sharded_collections_passthrough
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_whole_db_sharded_collections_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: change_streams_whole_cluster_passthrough
+  depends_on:
+  - name: change_streams
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_whole_cluster_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: change_streams_whole_cluster_mongos_passthrough
+  depends_on:
+  - name: change_streams_mongos_passthrough
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_whole_cluster_mongos_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: change_streams_whole_cluster_secondary_reads_passthrough
+  depends_on:
+  - name: change_streams_secondary_reads
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_whole_cluster_secondary_reads_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: change_streams_whole_cluster_sharded_collections_passthrough
+  depends_on:
+  - name: change_streams_sharded_collections_passthrough
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_whole_cluster_sharded_collections_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: dbtest
   commands:
   - func: "do setup"
@@ -3810,6 +3846,15 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=core --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: jsCore_mobile
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core --mongod=./mongoe --excludeWithAnyTags=requires_scripting,requires_auth,requires_sharding,does_not_support_stepdowns,requires_eval_command,requires_background_index,incompatible_with_embedded,incompatible_with_embedded_todo_investigate,requires_replication,SERVER-32997
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4225,12 +4270,156 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: replica_sets_ese_0
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_ese_0 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_ese_1
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_ese_1 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_ese_2
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_ese_2 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_ese_3
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_ese_3 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_ese_4
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_ese_4 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_ese_5
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_ese_5 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_ese_6
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_ese_6 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_ese_misc
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_ese_misc --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: replica_sets_auth
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
       resmoke_args: --suites=replica_sets_auth --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_auth_0
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_auth_0 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_auth_1
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_auth_1 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_auth_2
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_auth_2 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_auth_3
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_auth_3 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_auth_4
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_auth_4 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_auth_5
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_auth_5 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_auth_6
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_auth_6 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_auth_misc
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_auth_misc --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4252,6 +4441,150 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: sharding_0
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_0 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_1
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_1 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_2
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_2 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_3
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_3 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_4
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_4 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_5
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_5 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_6
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_6 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_7
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_7 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_8
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_8 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_9
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_9 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_10
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_10 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_11
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_11 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_12
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_12 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_13
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_13 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_14
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_14 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_misc
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_misc --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: sharding_csrs_continuous_config_stepdown
   commands:
   - func: "do setup"
@@ -4270,6 +4603,204 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: sharding_ese_0
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_0 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_1
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_1 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_2
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_2 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_3
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_3 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_4
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_4 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_5
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_5 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_6
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_6 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_7
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_7 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_8
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_8 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_9
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_9 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_10
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_10 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_11
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_11 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_12
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_12 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_13
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_13 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_14
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_14 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_15
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_15 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_16
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_16 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_17
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_17 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_18
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_18 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_19
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_19 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_20
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_20 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_ese_misc
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_ese_misc --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: sharding_op_query
   commands:
   - func: "do setup"
@@ -4279,12 +4810,318 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: sharding_op_query_0
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_0 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_1
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_1 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_2
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_2 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_3
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_3 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_4
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_4 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_5
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_5 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_6
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_6 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_7
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_7 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_8
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_8 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_9
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_9 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_10
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_10 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_11
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_11 --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_op_query_misc
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_misc --shellReadMode=legacy --storageEngine=wiredTiger --excludeWithAnyTags=requires_find_command
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: sharding_auth
   commands:
   - func: "do setup"
   - func: "run tests"
     vars:
       resmoke_args: --suites=sharding_auth --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_0
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_0 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_1
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_1 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_2
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_2 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_3
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_3 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_4
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_4 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_5
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_5 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_6
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_6 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_7
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_7 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_8
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_8 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_9
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_9 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_10
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_10 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_11
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_11 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_12
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_12 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_13
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_13 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_14
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_14 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_15
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_15 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_16
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_16 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_17
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_17 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_18
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_18 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_19
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_19 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_misc
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_misc --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4299,6 +5136,227 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: sharding_auth_audit_0
+  depends_on: &sharding_auth_all
+  - name: sharding_auth_0
+  - name: sharding_auth_1
+  - name: sharding_auth_2
+  - name: sharding_auth_3
+  - name: sharding_auth_4
+  - name: sharding_auth_5
+  - name: sharding_auth_6
+  - name: sharding_auth_7
+  - name: sharding_auth_8
+  - name: sharding_auth_9
+  - name: sharding_auth_10
+  - name: sharding_auth_11
+  - name: sharding_auth_12
+  - name: sharding_auth_13
+  - name: sharding_auth_14
+  - name: sharding_auth_15
+  - name: sharding_auth_16
+  - name: sharding_auth_17
+  - name: sharding_auth_18
+  - name: sharding_auth_19
+  - name: sharding_auth_misc
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_0 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_1
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_1 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_2
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_2 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_3
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_3 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_4
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_4 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_5
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_5 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_6
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_6 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_7
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_7 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_8
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_8 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_9
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_9 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_10
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_10 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_11
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_11 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_12
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_12 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_13
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_13 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_14
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_14 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_15
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_15 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_16
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_16 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_17
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_17 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_18
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_18 --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_auth_audit_misc
+  depends_on: *sharding_auth_all
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharding_auth_audit_misc --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: sharding_last_stable_mongos_and_mixed_shards
   commands:
   - func: "do setup"
@@ -4307,6 +5365,149 @@ tasks:
     vars:
       task_path_suffix: /data/multiversion
       resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_0
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_0
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_1
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_2
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_2
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_3
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_3
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_4
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_4
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_5
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_5
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_6
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_6
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_7
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_7
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_8
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_8
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_9
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_9
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_10
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_10
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_11
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_11
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharding_last_stable_mongos_and_mixed_shards_misc
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run tests"
+    vars:
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=sharding_last_stable_mongos_and_mixed_shards_misc
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4659,10 +5860,10 @@ tasks:
           set -o errexit
 
           cat <<EOF > notary_env.sh
-          export NOTARY_TOKEN=${signing_auth_token_38}
+          export NOTARY_TOKEN=${signing_auth_token_40}
           EOF
 
-          echo "${signing_auth_token_38}" > signing_auth_token
+          echo "${signing_auth_token_40}" > signing_auth_token
 
     - command: shell.exec
       params:
@@ -4679,7 +5880,7 @@ tasks:
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-win32-${push_arch}-${suffix}.msi || true
 
-          /usr/local/bin/notary-client.py --key-name "server-3.8" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
+          /usr/local/bin/notary-client.py --key-name "server-4.0" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
           if [ "${has_packages|}" = "true" ]; then
              CURATOR_RELEASE="ea8d75dcc1a587111e7418e2428fb67e267af9fe"
@@ -5206,6 +6407,14 @@ buildvariants:
   - name: change_streams_mongos_passthrough
   - name: change_streams_secondary_reads
   - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_whole_db_passthrough
+  - name: change_streams_whole_db_mongos_passthrough
+  - name: change_streams_whole_db_secondary_reads_passthrough
+  - name: change_streams_whole_db_sharded_collections_passthrough
+  - name: change_streams_whole_cluster_passthrough
+  - name: change_streams_whole_cluster_mongos_passthrough
+  - name: change_streams_whole_cluster_secondary_reads_passthrough
+  - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
@@ -5317,6 +6526,58 @@ buildvariants:
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: ""
     build_mongoreplay: true
+  display_tasks:
+  - name: replica_sets_auth
+    execution_tasks:
+    - replica_sets_auth_0
+    - replica_sets_auth_1
+    - replica_sets_auth_2
+    - replica_sets_auth_3
+    - replica_sets_auth_4
+    - replica_sets_auth_5
+    - replica_sets_auth_6
+    - replica_sets_auth_misc
+  - name: sharding
+    execution_tasks:
+    - sharding_0
+    - sharding_1
+    - sharding_2
+    - sharding_3
+    - sharding_4
+    - sharding_5
+    - sharding_6
+    - sharding_7
+    - sharding_8
+    - sharding_9
+    - sharding_10
+    - sharding_11
+    - sharding_12
+    - sharding_13
+    - sharding_14
+    - sharding_misc
+  - name: sharding_auth
+    execution_tasks:
+    - sharding_auth_0
+    - sharding_auth_1
+    - sharding_auth_2
+    - sharding_auth_3
+    - sharding_auth_4
+    - sharding_auth_5
+    - sharding_auth_6
+    - sharding_auth_7
+    - sharding_auth_8
+    - sharding_auth_9
+    - sharding_auth_10
+    - sharding_auth_11
+    - sharding_auth_12
+    - sharding_auth_13
+    - sharding_auth_14
+    - sharding_auth_15
+    - sharding_auth_16
+    - sharding_auth_17
+    - sharding_auth_18
+    - sharding_auth_19
+    - sharding_auth_misc
   tasks:
   - name: compile
   - name: compile_all
@@ -5334,6 +6595,12 @@ buildvariants:
   - name: change_streams
   - name: change_streams_mongos_passthrough
   - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_whole_db_passthrough
+  - name: change_streams_whole_db_mongos_passthrough
+  - name: change_streams_whole_db_sharded_collections_passthrough
+  - name: change_streams_whole_cluster_passthrough
+  - name: change_streams_whole_cluster_mongos_passthrough
+  - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_sharded
@@ -5365,7 +6632,14 @@ buildvariants:
   - name: read_only
   - name: read_only_sharded
   - name: replica_sets
-  - name: replica_sets_auth
+  - name: replica_sets_auth_0
+  - name: replica_sets_auth_1
+  - name: replica_sets_auth_2
+  - name: replica_sets_auth_3
+  - name: replica_sets_auth_4
+  - name: replica_sets_auth_5
+  - name: replica_sets_auth_6
+  - name: replica_sets_auth_misc
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
   - name: replica_sets_jscore_passthrough
@@ -5377,8 +6651,43 @@ buildvariants:
   - name: session_jscore_passthrough
   - name: sharded_causally_consistent_jscore_passthrough
   - name: sharded_collections_jscore_passthrough
-  - name: sharding
-  - name: sharding_auth
+  - name: sharding_0
+  - name: sharding_1
+  - name: sharding_2
+  - name: sharding_3
+  - name: sharding_4
+  - name: sharding_5
+  - name: sharding_6
+  - name: sharding_7
+  - name: sharding_8
+  - name: sharding_9
+  - name: sharding_10
+  - name: sharding_11
+  - name: sharding_12
+  - name: sharding_13
+  - name: sharding_14
+  - name: sharding_misc
+  - name: sharding_auth_0
+  - name: sharding_auth_1
+  - name: sharding_auth_2
+  - name: sharding_auth_3
+  - name: sharding_auth_4
+  - name: sharding_auth_5
+  - name: sharding_auth_6
+  - name: sharding_auth_7
+  - name: sharding_auth_8
+  - name: sharding_auth_9
+  - name: sharding_auth_10
+  - name: sharding_auth_11
+  - name: sharding_auth_12
+  - name: sharding_auth_13
+  - name: sharding_auth_14
+  - name: sharding_auth_15
+  - name: sharding_auth_16
+  - name: sharding_auth_17
+  - name: sharding_auth_18
+  - name: sharding_auth_19
+  - name: sharding_auth_misc
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_op_query_passthrough
   - name: sharding_jscore_passthrough_wire_ops
@@ -6365,6 +7674,12 @@ buildvariants:
   - name: change_streams
   - name: change_streams_mongos_passthrough
   - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_whole_db_passthrough
+  - name: change_streams_whole_db_mongos_passthrough
+  - name: change_streams_whole_db_sharded_collections_passthrough
+  - name: change_streams_whole_cluster_passthrough
+  - name: change_streams_whole_cluster_mongos_passthrough
+  - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
@@ -6480,6 +7795,97 @@ buildvariants:
     gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: false
+    jstestfuzz_num_generated_files: 35
+  display_tasks:
+  - name: replica_sets_auth
+    execution_tasks:
+    - replica_sets_auth_0
+    - replica_sets_auth_1
+    - replica_sets_auth_2
+    - replica_sets_auth_3
+    - replica_sets_auth_4
+    - replica_sets_auth_5
+    - replica_sets_auth_6
+    - replica_sets_auth_misc
+  - name: replica_sets_ese
+    execution_tasks:
+    - replica_sets_ese_0
+    - replica_sets_ese_1
+    - replica_sets_ese_2
+    - replica_sets_ese_3
+    - replica_sets_ese_4
+    - replica_sets_ese_5
+    - replica_sets_ese_6
+    - replica_sets_ese_misc
+  - name: sharding_auth
+    execution_tasks:
+    - sharding_auth_0
+    - sharding_auth_1
+    - sharding_auth_2
+    - sharding_auth_3
+    - sharding_auth_4
+    - sharding_auth_5
+    - sharding_auth_6
+    - sharding_auth_7
+    - sharding_auth_8
+    - sharding_auth_9
+    - sharding_auth_10
+    - sharding_auth_11
+    - sharding_auth_12
+    - sharding_auth_13
+    - sharding_auth_14
+    - sharding_auth_15
+    - sharding_auth_16
+    - sharding_auth_17
+    - sharding_auth_18
+    - sharding_auth_19
+    - sharding_auth_misc
+  - name: sharding_auth_audit
+    execution_tasks:
+    - sharding_auth_audit_0
+    - sharding_auth_audit_1
+    - sharding_auth_audit_2
+    - sharding_auth_audit_3
+    - sharding_auth_audit_4
+    - sharding_auth_audit_5
+    - sharding_auth_audit_6
+    - sharding_auth_audit_7
+    - sharding_auth_audit_8
+    - sharding_auth_audit_9
+    - sharding_auth_audit_10
+    - sharding_auth_audit_11
+    - sharding_auth_audit_12
+    - sharding_auth_audit_13
+    - sharding_auth_audit_14
+    - sharding_auth_audit_15
+    - sharding_auth_audit_16
+    - sharding_auth_audit_17
+    - sharding_auth_audit_18
+    - sharding_auth_audit_misc
+  - name: sharding_ese
+    execution_tasks:
+    - sharding_ese_0
+    - sharding_ese_1
+    - sharding_ese_2
+    - sharding_ese_3
+    - sharding_ese_4
+    - sharding_ese_5
+    - sharding_ese_6
+    - sharding_ese_7
+    - sharding_ese_8
+    - sharding_ese_9
+    - sharding_ese_10
+    - sharding_ese_11
+    - sharding_ese_12
+    - sharding_ese_13
+    - sharding_ese_14
+    - sharding_ese_15
+    - sharding_ese_16
+    - sharding_ese_17
+    - sharding_ese_18
+    - sharding_ese_19
+    - sharding_ese_20
+    - sharding_ese_misc
   tasks:
   - name: compile
     requires:
@@ -6504,9 +7910,6 @@ buildvariants:
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_decimal
-  - name: sharding_ese
-    distros:
-    - windows-64-vs2015-large
   - name: jsCore_auth
   - name: jsCore_txns
   - name: aggregation_fuzzer
@@ -6516,13 +7919,210 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
-  - name: replica_sets_auth
-  - name: replica_sets_ese
+  - name: replica_sets_auth_0
+  - name: replica_sets_auth_1
+  - name: replica_sets_auth_2
+  - name: replica_sets_auth_3
+  - name: replica_sets_auth_4
+  - name: replica_sets_auth_5
+  - name: replica_sets_auth_6
+  - name: replica_sets_auth_misc
+  - name: replica_sets_ese_0
+  - name: replica_sets_ese_1
+  - name: replica_sets_ese_2
+  - name: replica_sets_ese_3
+  - name: replica_sets_ese_4
+  - name: replica_sets_ese_5
+  - name: replica_sets_ese_6
+  - name: replica_sets_ese_misc
   - name: sasl
-  - name: sharding_auth
+  - name: sharding_auth_0
     distros:
     - windows-64-vs2015-large
-  - name: sharding_auth_audit
+  - name: sharding_auth_1
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_2
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_3
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_4
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_5
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_6
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_7
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_8
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_9
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_10
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_11
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_12
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_13
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_14
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_15
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_16
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_17
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_18
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_19
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_misc
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_0
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_1
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_2
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_3
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_4
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_5
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_6
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_7
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_8
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_9
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_10
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_11
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_12
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_13
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_14
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_15
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_16
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_17
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_18
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_misc
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_0
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_1
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_2
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_3
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_4
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_5
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_6
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_7
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_8
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_9
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_10
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_11
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_12
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_13
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_14
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_15
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_16
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_17
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_18
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_19
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_20
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_misc
     distros:
     - windows-64-vs2015-large
   - name: snmp
@@ -6875,6 +8475,12 @@ buildvariants:
   - name: change_streams
   - name: change_streams_mongos_passthrough
   - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_whole_db_passthrough
+  - name: change_streams_whole_db_mongos_passthrough
+  - name: change_streams_whole_db_sharded_collections_passthrough
+  - name: change_streams_whole_cluster_passthrough
+  - name: change_streams_whole_cluster_mongos_passthrough
+  - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_sharded
@@ -7044,8 +8650,8 @@ buildvariants:
 #          Mobile SDK buildvariants       #
 ###########################################
 
-- name: embedded-sdk-macosx-10.10-debug
-  display_name: "Embedded SDK - macOS 10.10 DEBUG"
+- name: embedded-sdk-macosx-10.10
+  display_name: "Embedded SDK - macOS 10.10"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -7062,15 +8668,16 @@ buildvariants:
     compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
-      --dbg=on
+      --dbg=off
+      --opt=size
       --variables-files=etc/scons/xcode_macos.vars
     disable_unit_tests: true
     enable_embedded_tests: native
   tasks:
   - name: compile_mobile
 
-- name: embedded-sdk-iphoneos-10.2-debug
-  display_name: "Embedded SDK - iOS 10.2 DEBUG"
+- name: embedded-sdk-iphoneos-10.2
+  display_name: "Embedded SDK - iOS 10.2"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -7089,14 +8696,15 @@ buildvariants:
     compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
-      --dbg=on
+      --dbg=off
+      --opt=size
       --variables-files=etc/scons/xcode_ios.vars
     disable_unit_tests: true
   tasks:
   - name: compile_mobile
 
-- name: embedded-sdk-iphonesimulator-10.2-debug
-  display_name: "Embedded SDK - iOS Simulator 10.2 DEBUG"
+- name: embedded-sdk-iphonesimulator-10.2
+  display_name: "Embedded SDK - iOS Simulator 10.2"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -7115,7 +8723,8 @@ buildvariants:
     compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
-      --dbg=on
+      --dbg=off
+      --opt=size
       --variables-files=etc/scons/xcode_ios_sim.vars
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
@@ -7124,8 +8733,8 @@ buildvariants:
   tasks:
   - name: compile_mobile
 
-- name: embedded-sdk-appletvos-10.2-debug
-  display_name: "Embedded SDK - tvOS 10.2 DEBUG"
+- name: embedded-sdk-appletvos-10.2
+  display_name: "Embedded SDK - tvOS 10.2"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -7144,14 +8753,15 @@ buildvariants:
     compile_env: DEVELOPER_DIR=/Applications/XCode9.2.app
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
-      --dbg=on
+      --dbg=off
+      --opt=size
       --variables-files=etc/scons/xcode_tvos.vars
     disable_unit_tests: true
   tasks:
   - name: compile_mobile
 
-- name: embedded-sdk-appletvsimulator-10.2-debug
-  display_name: "Embedded SDK - tvOS Simulator 10.2 DEBUG"
+- name: embedded-sdk-appletvsimulator-10.2
+  display_name: "Embedded SDK - tvOS Simulator 10.2"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -7171,7 +8781,8 @@ buildvariants:
 
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
-      --dbg=on
+      --dbg=off
+      --opt=size
       --variables-files=etc/scons/xcode_tvos_sim.vars
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
@@ -7180,8 +8791,8 @@ buildvariants:
   tasks:
   - name: compile_mobile
 
-- name: embedded-sdk-ubuntu-1604-x86_64-debug
-  display_name: "Embedded SDK - Ubuntu 16.04 x86_64 DEBUG"
+- name: embedded-sdk-ubuntu-1604-x86_64
+  display_name: "Embedded SDK - Ubuntu 16.04 x86_64"
   run_on:
   - ubuntu1604-build
   batchtime: 1440 # 1 day
@@ -7197,7 +8808,8 @@ buildvariants:
     # We need --allocator=system here to work around SERVER-XXXXX
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
-      --dbg=on
+      --dbg=off
+      --opt=size
       --variables-files=etc/scons/mongodbtoolchain_gcc.vars
       --allocator=system
     disable_unit_tests: true
@@ -7205,8 +8817,8 @@ buildvariants:
   tasks:
   - name: compile_mobile
 
-- name: embedded-sdk-android-arm64-debug
-  display_name: "Embedded SDK - Android arm64 DEBUG"
+- name: embedded-sdk-android-arm64
+  display_name: "Embedded SDK - Android arm64"
   run_on:
   - ubuntu1604-build
   batchtime: 1440 # 1 day
@@ -7223,7 +8835,8 @@ buildvariants:
     compile_env: JAVA_HOME=/opt/java/jdk8/
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
-      --dbg=on
+      --dbg=off
+      --opt=size
       --android-toolchain-path=$(dirname $(pwd))/android_toolchain
       --variables-files=etc/scons/android_toolchain.vars
     disable_unit_tests: true
@@ -7234,8 +8847,8 @@ buildvariants:
   tasks:
   - name: compile_mobile
 
-- name: embedded-sdk-android-x86_64-debug
-  display_name: "Embedded SDK - Android x86_64 DEBUG"
+- name: embedded-sdk-android-x86_64
+  display_name: "Embedded SDK - Android x86_64"
   run_on:
   - ubuntu1604-build
   batchtime: 1440 # 1 day
@@ -7252,7 +8865,8 @@ buildvariants:
     compile_env: JAVA_HOME=/opt/java/jdk8/
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
-      --dbg=on
+      --dbg=off
+      --opt=size
       --android-toolchain-path=$(dirname $(pwd))/android_toolchain
       --variables-files=etc/scons/android_toolchain.vars
     disable_unit_tests: true
@@ -7294,6 +8908,145 @@ buildvariants:
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
+    jstestfuzz_num_generated_files: 40
+  display_tasks:
+  - name: replica_sets_auth
+    execution_tasks:
+    - replica_sets_auth_0
+    - replica_sets_auth_1
+    - replica_sets_auth_2
+    - replica_sets_auth_3
+    - replica_sets_auth_4
+    - replica_sets_auth_5
+    - replica_sets_auth_6
+    - replica_sets_auth_misc
+  - name: replica_sets_ese
+    execution_tasks:
+    - replica_sets_ese_0
+    - replica_sets_ese_1
+    - replica_sets_ese_2
+    - replica_sets_ese_3
+    - replica_sets_ese_4
+    - replica_sets_ese_5
+    - replica_sets_ese_6
+    - replica_sets_ese_misc
+  - name: sharding
+    execution_tasks:
+    - sharding_0
+    - sharding_1
+    - sharding_2
+    - sharding_3
+    - sharding_4
+    - sharding_5
+    - sharding_6
+    - sharding_7
+    - sharding_8
+    - sharding_9
+    - sharding_10
+    - sharding_11
+    - sharding_12
+    - sharding_13
+    - sharding_14
+    - sharding_misc
+  - name: sharding_auth
+    execution_tasks:
+    - sharding_auth_0
+    - sharding_auth_1
+    - sharding_auth_2
+    - sharding_auth_3
+    - sharding_auth_4
+    - sharding_auth_5
+    - sharding_auth_6
+    - sharding_auth_7
+    - sharding_auth_8
+    - sharding_auth_9
+    - sharding_auth_10
+    - sharding_auth_11
+    - sharding_auth_12
+    - sharding_auth_13
+    - sharding_auth_14
+    - sharding_auth_15
+    - sharding_auth_16
+    - sharding_auth_17
+    - sharding_auth_18
+    - sharding_auth_19
+    - sharding_auth_misc
+  - name: sharding_auth_audit
+    execution_tasks:
+    - sharding_auth_audit_0
+    - sharding_auth_audit_1
+    - sharding_auth_audit_2
+    - sharding_auth_audit_3
+    - sharding_auth_audit_4
+    - sharding_auth_audit_5
+    - sharding_auth_audit_6
+    - sharding_auth_audit_7
+    - sharding_auth_audit_8
+    - sharding_auth_audit_9
+    - sharding_auth_audit_10
+    - sharding_auth_audit_11
+    - sharding_auth_audit_12
+    - sharding_auth_audit_13
+    - sharding_auth_audit_14
+    - sharding_auth_audit_15
+    - sharding_auth_audit_16
+    - sharding_auth_audit_17
+    - sharding_auth_audit_18
+    - sharding_auth_audit_misc
+  - name: sharding_ese
+    execution_tasks:
+    - sharding_ese_0
+    - sharding_ese_1
+    - sharding_ese_2
+    - sharding_ese_3
+    - sharding_ese_4
+    - sharding_ese_5
+    - sharding_ese_6
+    - sharding_ese_7
+    - sharding_ese_8
+    - sharding_ese_9
+    - sharding_ese_10
+    - sharding_ese_11
+    - sharding_ese_12
+    - sharding_ese_13
+    - sharding_ese_14
+    - sharding_ese_15
+    - sharding_ese_16
+    - sharding_ese_17
+    - sharding_ese_18
+    - sharding_ese_19
+    - sharding_ese_20
+    - sharding_ese_misc
+  - name: sharding_last_stable_mongos_and_mixed_shards
+    execution_tasks:
+    - sharding_last_stable_mongos_and_mixed_shards_0
+    - sharding_last_stable_mongos_and_mixed_shards_1
+    - sharding_last_stable_mongos_and_mixed_shards_2
+    - sharding_last_stable_mongos_and_mixed_shards_3
+    - sharding_last_stable_mongos_and_mixed_shards_4
+    - sharding_last_stable_mongos_and_mixed_shards_5
+    - sharding_last_stable_mongos_and_mixed_shards_6
+    - sharding_last_stable_mongos_and_mixed_shards_7
+    - sharding_last_stable_mongos_and_mixed_shards_8
+    - sharding_last_stable_mongos_and_mixed_shards_9
+    - sharding_last_stable_mongos_and_mixed_shards_10
+    - sharding_last_stable_mongos_and_mixed_shards_11
+    - sharding_last_stable_mongos_and_mixed_shards_misc
+  - name: sharding_op_query
+    execution_tasks:
+    - sharding_op_query_0
+    - sharding_op_query_1
+    - sharding_op_query_2
+    - sharding_op_query_3
+    - sharding_op_query_4
+    - sharding_op_query_5
+    - sharding_op_query_6
+    - sharding_op_query_7
+    - sharding_op_query_8
+    - sharding_op_query_9
+    - sharding_op_query_10
+    - sharding_op_query_11
+    - sharding_op_query_misc
   tasks:
   - name: compile
     requires:
@@ -7336,6 +9089,14 @@ buildvariants:
   - name: change_streams_mongos_passthrough
   - name: change_streams_secondary_reads
   - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_whole_db_passthrough
+  - name: change_streams_whole_db_mongos_passthrough
+  - name: change_streams_whole_db_secondary_reads_passthrough
+  - name: change_streams_whole_db_sharded_collections_passthrough
+  - name: change_streams_whole_cluster_passthrough
+  - name: change_streams_whole_cluster_mongos_passthrough
+  - name: change_streams_whole_cluster_secondary_reads_passthrough
+  - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_sharded
@@ -7403,10 +9164,52 @@ buildvariants:
   - name: replica_sets
     distros:
     - rhel62-large
-  - name: replica_sets_ese
+  - name: replica_sets_auth_0
     distros:
     - rhel62-large
-  - name: replica_sets_auth
+  - name: replica_sets_auth_1
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_2
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_3
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_4
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_5
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_6
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_misc
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_0
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_1
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_2
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_3
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_4
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_5
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_6
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_misc
     distros:
     - rhel62-large
   - name: replica_sets_jscore_passthrough
@@ -7434,16 +9237,241 @@ buildvariants:
   - name: sasl
   - name: session_jscore_passthrough
   - name: sharded_collections_jscore_passthrough
-  - name: sharding
+  - name: sharding_0
     distros:
     - rhel62-large
-  - name: sharding_ese
+  - name: sharding_1
     distros:
     - rhel62-large
-  - name: sharding_auth
+  - name: sharding_2
     distros:
     - rhel62-large
-  - name: sharding_auth_audit
+  - name: sharding_3
+    distros:
+    - rhel62-large
+  - name: sharding_4
+    distros:
+    - rhel62-large
+  - name: sharding_5
+    distros:
+    - rhel62-large
+  - name: sharding_6
+    distros:
+    - rhel62-large
+  - name: sharding_7
+    distros:
+    - rhel62-large
+  - name: sharding_8
+    distros:
+    - rhel62-large
+  - name: sharding_9
+    distros:
+    - rhel62-large
+  - name: sharding_10
+    distros:
+    - rhel62-large
+  - name: sharding_11
+    distros:
+    - rhel62-large
+  - name: sharding_12
+    distros:
+    - rhel62-large
+  - name: sharding_13
+    distros:
+    - rhel62-large
+  - name: sharding_14
+    distros:
+    - rhel62-large
+  - name: sharding_misc
+    distros:
+    - rhel62-large
+  - name: sharding_auth_0
+    distros:
+    - rhel62-large
+  - name: sharding_auth_1
+    distros:
+    - rhel62-large
+  - name: sharding_auth_2
+    distros:
+    - rhel62-large
+  - name: sharding_auth_3
+    distros:
+    - rhel62-large
+  - name: sharding_auth_4
+    distros:
+    - rhel62-large
+  - name: sharding_auth_5
+    distros:
+    - rhel62-large
+  - name: sharding_auth_6
+    distros:
+    - rhel62-large
+  - name: sharding_auth_7
+    distros:
+    - rhel62-large
+  - name: sharding_auth_8
+    distros:
+    - rhel62-large
+  - name: sharding_auth_9
+    distros:
+    - rhel62-large
+  - name: sharding_auth_10
+    distros:
+    - rhel62-large
+  - name: sharding_auth_11
+    distros:
+    - rhel62-large
+  - name: sharding_auth_12
+    distros:
+    - rhel62-large
+  - name: sharding_auth_13
+    distros:
+    - rhel62-large
+  - name: sharding_auth_14
+    distros:
+    - rhel62-large
+  - name: sharding_auth_15
+    distros:
+    - rhel62-large
+  - name: sharding_auth_16
+    distros:
+    - rhel62-large
+  - name: sharding_auth_17
+    distros:
+    - rhel62-large
+  - name: sharding_auth_18
+    distros:
+    - rhel62-large
+  - name: sharding_auth_19
+    distros:
+    - rhel62-large
+  - name: sharding_auth_misc
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_0
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_1
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_2
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_3
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_4
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_5
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_6
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_7
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_8
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_9
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_10
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_11
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_12
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_13
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_14
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_15
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_16
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_17
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_18
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_misc
+    distros:
+    - rhel62-large
+  - name: sharding_ese_0
+    distros:
+    - rhel62-large
+  - name: sharding_ese_1
+    distros:
+    - rhel62-large
+  - name: sharding_ese_2
+    distros:
+    - rhel62-large
+  - name: sharding_ese_3
+    distros:
+    - rhel62-large
+  - name: sharding_ese_4
+    distros:
+    - rhel62-large
+  - name: sharding_ese_5
+    distros:
+    - rhel62-large
+  - name: sharding_ese_6
+    distros:
+    - rhel62-large
+  - name: sharding_ese_7
+    distros:
+    - rhel62-large
+  - name: sharding_ese_8
+    distros:
+    - rhel62-large
+  - name: sharding_ese_9
+    distros:
+    - rhel62-large
+  - name: sharding_ese_10
+    distros:
+    - rhel62-large
+  - name: sharding_ese_11
+    distros:
+    - rhel62-large
+  - name: sharding_ese_12
+    distros:
+    - rhel62-large
+  - name: sharding_ese_13
+    distros:
+    - rhel62-large
+  - name: sharding_ese_14
+    distros:
+    - rhel62-large
+  - name: sharding_ese_15
+    distros:
+    - rhel62-large
+  - name: sharding_ese_16
+    distros:
+    - rhel62-large
+  - name: sharding_ese_17
+    distros:
+    - rhel62-large
+  - name: sharding_ese_18
+    distros:
+    - rhel62-large
+  - name: sharding_ese_19
+    distros:
+    - rhel62-large
+  - name: sharding_ese_20
+    distros:
+    - rhel62-large
+  - name: sharding_ese_misc
     distros:
     - rhel62-large
   - name: sharding_gle_auth_basics_passthrough
@@ -7451,13 +9479,85 @@ buildvariants:
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_op_query_passthrough
   - name: sharding_jscore_passthrough_wire_ops
-  - name: sharding_last_stable_mongos_and_mixed_shards
+  - name: sharding_last_stable_mongos_and_mixed_shards_0
     distros:
     - rhel62-large
-  - name: sharding_op_query
+  - name: sharding_last_stable_mongos_and_mixed_shards_1
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_2
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_3
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_4
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_5
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_6
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_7
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_8
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_9
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_10
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_11
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_misc
     distros:
     - rhel62-large
   - name: sharding_csrs_continuous_config_stepdown
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_0
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_1
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_2
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_3
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_4
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_5
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_6
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_7
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_8
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_9
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_10
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_11
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_misc
     distros:
     - rhel62-large
   - name: slow1
@@ -7520,6 +9620,14 @@ buildvariants:
   - name: change_streams_mongos_passthrough
   - name: change_streams_secondary_reads
   - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_whole_db_passthrough
+  - name: change_streams_whole_db_mongos_passthrough
+  - name: change_streams_whole_db_secondary_reads_passthrough
+  - name: change_streams_whole_db_sharded_collections_passthrough
+  - name: change_streams_whole_cluster_passthrough
+  - name: change_streams_whole_cluster_mongos_passthrough
+  - name: change_streams_whole_cluster_secondary_reads_passthrough
+  - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_sharded
@@ -9061,6 +11169,12 @@ buildvariants:
   - name: change_streams
   - name: change_streams_mongos_passthrough
   - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_whole_db_passthrough
+  - name: change_streams_whole_db_mongos_passthrough
+  - name: change_streams_whole_db_sharded_collections_passthrough
+  - name: change_streams_whole_cluster_passthrough
+  - name: change_streams_whole_cluster_mongos_passthrough
+  - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
     distros:
     - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
@@ -9167,6 +11281,7 @@ buildvariants:
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
+    additional_targets: mongoe
   tasks:
   - name: compile
     distros:
@@ -9195,6 +11310,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_minimum_batch_size
+  - name: jsCore_mobile
   - name: jsCore_op_query
   - name: jsonSchema
   - name: jstestfuzz
@@ -9207,6 +11323,66 @@ buildvariants:
   - name: serial_run
   - name: session_jscore_passthrough
   - name: snmp
+
+- name: ubuntu1604-arm64-mobile
+  display_name: "Ubuntu 16.04 arm64 (mobile)"
+  modules:
+  - enterprise
+  run_on:
+  - ubuntu1604-arm64-large
+  batchtime: 1440 # 1 day
+  expansions:
+    test_flags: >-
+      --storageEngine=mobile
+      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions
+      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993,SERVER-32997
+    compile_flags: >-
+        -j$(grep -c ^processor /proc/cpuinfo)
+        --mobile-se=on
+        --ssl
+        --release
+        --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+        CCFLAGS="-march=armv8-a+crc -mtune=generic"
+        MONGO_DISTMOD=ubuntu1604
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    max_jobs: 8 # Avoid starting too many mongod's on ARM test servers
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto libsasl2)" -tags 'sasl ssl'
+    build_mongoreplay: true
+    additional_targets: mongoe
+  tasks:
+  - name: compile
+  - name: compile_all
+  - name: aggregation
+  - name: aggregation_auth
+  - name: aggregation_facet_unwind_passthrough
+  - name: audit
+  - name: auth
+  - name: auth_audit
+  - name: dbtest
+  # TODO SERVER-32993: Re-enable the concurrency suite on the mobile storage engine builders.
+  # - name: concurrency
+  - name: concurrency_simultaneous
+  - name: disk_mobile
+  - name: failpoints
+  - name: failpoints_auth
+  - name: integration_tests_standalone
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_decimal
+  - name: jsCore_minimum_batch_size
+  - name: jsCore_mobile
+  - name: jsCore_op_query
+  - name: jsonSchema
+  - name: jstestfuzz
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: parallel
+  - name: parallel_compatibility
+  - name: sasl
+  - name: serial_run
+  - name: session_jscore_passthrough
 
 - name: enterprise-rhel-62-64-bit-required-mobile
   display_name: "! Enterprise RHEL 6.2 (mobile)"
@@ -9229,6 +11405,7 @@ buildvariants:
     distros:
     - rhel62-large
   - name: burn_in_tests
+  - name: jsCore_mobile
 
 - name: enterprise-osx-1010-mobile
   display_name: Enterprise OS X 10.10 (mobile)
@@ -9262,6 +11439,7 @@ buildvariants:
     gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
     build_mongoreplay: true
+    additional_targets: mongoe
   tasks:
   - name: compile
   - name: compile_all
@@ -9285,6 +11463,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_minimum_batch_size
+  - name: jsCore_mobile
   - name: jsCore_op_query
   - name: jsonSchema
   - name: jstestfuzz
@@ -9615,6 +11794,14 @@ buildvariants:
   - name: change_streams_mongos_passthrough
   - name: change_streams_secondary_reads
   - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_whole_db_passthrough
+  - name: change_streams_whole_db_mongos_passthrough
+  - name: change_streams_whole_db_secondary_reads_passthrough
+  - name: change_streams_whole_db_sharded_collections_passthrough
+  - name: change_streams_whole_cluster_passthrough
+  - name: change_streams_whole_cluster_mongos_passthrough
+  - name: change_streams_whole_cluster_secondary_reads_passthrough
+  - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_sharded
@@ -9774,6 +11961,14 @@ buildvariants:
   - name: change_streams_mongos_passthrough
   - name: change_streams_secondary_reads
   - name: change_streams_sharded_collections_passthrough
+  - name: change_streams_whole_db_passthrough
+  - name: change_streams_whole_db_mongos_passthrough
+  - name: change_streams_whole_db_secondary_reads_passthrough
+  - name: change_streams_whole_db_sharded_collections_passthrough
+  - name: change_streams_whole_cluster_passthrough
+  - name: change_streams_whole_cluster_mongos_passthrough
+  - name: change_streams_whole_cluster_secondary_reads_passthrough
+  - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_sharded

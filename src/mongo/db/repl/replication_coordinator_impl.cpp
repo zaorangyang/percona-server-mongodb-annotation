@@ -125,7 +125,6 @@ MONGO_INITIALIZER(periodicNoopIntervalSecs)(InitializerContext*) {
     return Status::OK();
 }
 
-
 /**
  * Allows non-local writes despite _canAcceptNonlocalWrites being false on a single OperationContext
  * while in scope.
@@ -738,11 +737,34 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
 
 void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
     if (!isReplEnabled()) {
+        if (_settings.getShouldRecoverFromOplogAsStandalone()) {
+            if (!_storage->supportsRecoverToStableTimestamp(opCtx->getServiceContext())) {
+                severe() << "Cannot use 'recoverFromOplogAsStandalone' with a storage engine that "
+                            "does not support recover to stable timestamp.";
+                fassertFailedNoTrace(50805);
+            }
+            auto recoveryTS = _storage->getRecoveryTimestamp(opCtx->getServiceContext());
+            if (!recoveryTS || recoveryTS->isNull()) {
+                severe()
+                    << "Cannot use 'recoverFromOplogAsStandalone' without a stable checkpoint.";
+                fassertFailedNoTrace(50806);
+            }
+
+            // We pass in "none" for the stable timestamp so that recoverFromOplog asks storage
+            // for the recoveryTimestamp just like on replica set recovery.
+            const auto stableTimestamp = boost::none;
+            _replicationProcess->getReplicationRecovery()->recoverFromOplog(opCtx, stableTimestamp);
+            warning() << "Setting mongod to readOnly mode as a result of specifying "
+                         "'recoverFromOplogAsStandalone'.";
+            storageGlobalParams.readOnly = true;
+        }
+
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         _setConfigState_inlock(kConfigReplicationDisabled);
         return;
     }
     invariant(_settings.usingReplSets());
+    invariant(!_settings.getShouldRecoverFromOplogAsStandalone());
 
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
@@ -1410,6 +1432,22 @@ bool ReplicationCoordinatorImpl::_doneWaitingForReplication_inlock(
 
             // Fallthrough to wait for "majority" write concern.
         }
+
+        // Wait for all drop pending collections with drop optime before and at 'opTime' to be
+        // removed from storage.
+        if (auto dropOpTime = _externalState->getEarliestDropPendingOpTime()) {
+            if (*dropOpTime <= opTime) {
+                LOG(1) << "Unable to satisfy the requested majority write concern at "
+                          "'committed' optime "
+                       << opTime
+                       << ". There are still drop pending collections (earliest drop optime: "
+                       << *dropOpTime << ") that have to be removed from storage before we can "
+                                         "satisfy the write concern "
+                       << writeConcern.toBSON();
+                return false;
+            }
+        }
+
         // Continue and wait for replication to the majority (of voters).
         // *** Needed for J:True, writeConcernMajorityShouldJournal:False (appliedOpTime snapshot).
         patternName = ReplSetConfig::kMajorityWriteConcernModeName;
@@ -2669,6 +2707,11 @@ Status ReplicationCoordinatorImpl::abortCatchupIfNeeded() {
         return Status::OK();
     }
     return Status(ErrorCodes::IllegalOperation, "The node is not in catch-up mode.");
+}
+
+void ReplicationCoordinatorImpl::signalDropPendingCollectionsRemovedFromStorage() {
+    stdx::lock_guard<stdx::mutex> lock(_mutex);
+    _wakeReadyWaiters_inlock();
 }
 
 void ReplicationCoordinatorImpl::_enterDrainMode_inlock() {

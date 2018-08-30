@@ -158,7 +158,7 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/listen.h"
+#include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/options_parser/startup_options.h"
@@ -848,26 +848,6 @@ void shutdownTask() {
         if (!opCtx) {
             uniqueOpCtx = client->makeOperationContext();
             opCtx = uniqueOpCtx.get();
-        }
-
-        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-            serverGlobalParams.featureCompatibility.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo36) {
-            // If we are fully downgraded, drop the 'checkpointTimestamp' collection. Otherwise a
-            // 3.6 binary can apply operations without updating the 'checkpointTimestamp',
-            // corrupting data.
-            log(LogComponent::kReplication)
-                << "shutdown: removing checkpointTimestamp collection...";
-            Status status =
-                repl::StorageInterface::get(serviceContext)
-                    ->dropCollection(opCtx,
-                                     NamespaceString(repl::ReplicationConsistencyMarkersImpl::
-                                                         kDefaultCheckpointTimestampNamespace));
-            if (!status.isOK()) {
-                warning(LogComponent::kReplication)
-                    << "shutdown: dropping checkpointTimestamp collection failed: "
-                    << redact(status.toString());
-            }
         }
 
         // This can wait a long time while we drain the secondary's apply queue, especially if it

@@ -286,7 +286,6 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/server_options',
-        '$BUILD_DIR/mongo/db/storage/storage_options',
         'optime',
         'repl_coordinator_interface',
         'replication_consistency_markers_idl',
@@ -1038,10 +1037,24 @@ env.CppUnitTest('isself_test',
                 )
 
 env.Library(
+    target='repl_set_status_commands',
+    source=[
+        'repl_set_command.cpp',
+        'repl_set_get_status_cmd.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/auth/authcore',
+        '$BUILD_DIR/mongo/db/commands',
+        '$BUILD_DIR/mongo/db/lasterror',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+    ],
+)
+
+env.Library(
     target='repl_set_commands',
     source=[
         'repl_set_commands.cpp',
-        'repl_set_command.cpp',
         'repl_set_request_votes.cpp',
     ],
     LIBDEPS=[
@@ -1054,6 +1067,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         'drop_pending_collection_reaper',
+        'repl_set_status_commands',
         'repl_settings',
         'replica_set_messages',
         'replication_process',
@@ -1571,6 +1585,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/rpc/client_metadata',
+        '$BUILD_DIR/mongo/util/fail_point',
         'bgsync',
         'drop_pending_collection_reaper',
         'oplog_application',

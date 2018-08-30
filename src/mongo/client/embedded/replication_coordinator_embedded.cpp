@@ -346,7 +346,7 @@ Status ReplicationCoordinatorEmbedded::checkIfWriteConcernCanBeSatisfied(
 }
 
 Status ReplicationCoordinatorEmbedded::checkReplEnabledForCommand(BSONObjBuilder*) {
-    UASSERT_NOT_IMPLEMENTED;
+    return Status(ErrorCodes::NoReplicationEnabled, "no replication on embedded");
 }
 
 HostAndPort ReplicationCoordinatorEmbedded::chooseNewSyncSource(const OpTime&) {
@@ -434,6 +434,10 @@ ReplSettings::IndexPrefetchConfig ReplicationCoordinatorEmbedded::getIndexPrefet
 
 void ReplicationCoordinatorEmbedded::setIndexPrefetchConfig(
     const ReplSettings::IndexPrefetchConfig) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
+void ReplicationCoordinatorEmbedded::signalDropPendingCollectionsRemovedFromStorage() {
     UASSERT_NOT_IMPLEMENTED;
 }
 

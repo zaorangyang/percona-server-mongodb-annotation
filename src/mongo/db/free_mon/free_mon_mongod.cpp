@@ -33,6 +33,7 @@
 #include "mongo/db/free_mon/free_mon_mongod.h"
 
 #include <mutex>
+#include <snappy.h>
 #include <string>
 
 #include "mongo/base/data_type_validated.h"
@@ -57,6 +58,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/network_interface_factory.h"
+#include "mongo/rpc/object_check.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/future.h"

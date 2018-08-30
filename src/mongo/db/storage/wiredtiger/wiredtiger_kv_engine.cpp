@@ -452,7 +452,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         std::uint64_t tmp;
         fassert(50758, parseNumberFromStringWithBase(buf, 16, &tmp));
         _recoveryTimestamp = Timestamp(tmp);
-        LOG_FOR_RECOVERY(2) << "WiredTiger recoveryTimestamp. Ts: " << _recoveryTimestamp;
+        LOG_FOR_RECOVERY(0) << "WiredTiger recoveryTimestamp. Ts: " << _recoveryTimestamp;
     }
 
     _sessionCache.reset(new WiredTigerSessionCache(this));
@@ -897,13 +897,7 @@ SortedDataInterface* WiredTigerKVEngine::getGroupedSortedDataInterface(Operation
                                                                        const IndexDescriptor* desc,
                                                                        KVPrefix prefix) {
     if (desc->unique()) {
-        // MongoDB 4.0 onwards new index version `kV2Unique` would be supported. By default unique
-        // index would be created with index version `kV2`. New format unique index would be created
-        // only if `IndexVersion` is `kV2Unique` and for non _id indexes.
-        if (desc->version() == IndexDescriptor::IndexVersion::kV2Unique && !desc->isIdIndex())
-            return new WiredTigerIndexUniqueV2(opCtx, _uri(ident), desc, prefix, _readOnly);
-        else
-            return new WiredTigerIndexUnique(opCtx, _uri(ident), desc, prefix, _readOnly);
+        return new WiredTigerIndexUnique(opCtx, _uri(ident), desc, prefix, _readOnly);
     }
 
     return new WiredTigerIndexStandard(opCtx, _uri(ident), desc, prefix, _readOnly);
