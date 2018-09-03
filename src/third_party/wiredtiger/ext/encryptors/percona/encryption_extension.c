@@ -62,16 +62,26 @@ static int report_error(
     return err;
 }
 
+typedef struct {
+    WT_EXTENSION_API *wt_api;
+    WT_SESSION *session;
+} ERR_PARAM;
+
+// callback for ERR_print_errors_cb
+static int err_print_cb(const char *str, size_t len, void *param) {
+    ERR_PARAM *p = (ERR_PARAM*)param;
+    p->wt_api->err_printf(p->wt_api, p->session,
+                              "libcrypto: %s", str);
+    return 1;
+}
+
 static int handleErrors(PERCONA_ENCRYPTOR *pe, WT_SESSION *session) {
-    WT_EXTENSION_API *wt_api = pe->wt_api;
-    int ret = 0;
-    int e;
-    while ((e = ERR_get_error())) {
-        wt_api->err_printf(wt_api, session,
-                           "libcrypto error: %d", e);
-        ret = e;
-    }
-    return ret;
+    ERR_PARAM param;
+    param.wt_api = pe->wt_api;
+    param.session = session;
+
+    ERR_print_errors_cb(&err_print_cb, &param);
+    return 0;
 }
 
 static char value_type_char(int type)
