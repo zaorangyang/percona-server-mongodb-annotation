@@ -51,6 +51,16 @@ static const bool printDebugMessages = false;
 #define DBG if (printDebugMessages)
 #define DBG_MSG(...) DBG pe->wt_api->msg_printf(pe->wt_api, session, __VA_ARGS__)
 
+// define DBG_ENC_EXT to enable verbose debugging info (size of data before and after encryption, used key)
+#ifdef DBG_ENC_EXT
+typedef struct {
+    size_t src_len;
+    size_t dst_len;
+    size_t result_len;
+    unsigned char key[KEY_LEN];
+} DEBUG_DATA;
+#endif
+
 static int report_error(
     PERCONA_ENCRYPTOR *pe, WT_SESSION *session, int err, const char *msg)
 {
@@ -99,6 +109,20 @@ static char value_type_char(int type)
             return 'z';
     }
     return 'x';
+}
+
+static void dump_key(PERCONA_ENCRYPTOR *pe, WT_SESSION *session, unsigned char *key, const int _key_len, const char * msg) {
+    const char* m = "0123456789ABCDEF";
+    char buf[_key_len * 3 + 1];
+    char* p=buf;
+    for (int i=0; i<_key_len; ++i) {
+        *p++ = m[*key >> 4];
+        *p++ = m[*key & 0xf];
+        *p++ = ' ';
+        ++key;
+    }
+    *p = 0;
+    DBG_MSG("%s: %s", msg, buf);
 }
 
 static int dump_config_arg(PERCONA_ENCRYPTOR *pe, WT_SESSION *session, WT_CONFIG_ARG *config) {
@@ -165,10 +189,20 @@ static int percona_encrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
         goto err;
 #endif
 
-    store_IV(pe, dst);
+#ifdef DBG_ENC_EXT
+    DEBUG_DATA *dbg_data = (DEBUG_DATA*)dst;
+    *result_lenp += sizeof(DEBUG_DATA);
+    dbg_data->src_len = src_len;
+    dbg_data->dst_len = dst_len;
+    dbg_data->result_len = 0;
+    memcpy(dbg_data->key, pe->key, KEY_LEN);
+#endif
+
+    uint8_t *iv = dst + *result_lenp;
+    store_IV(pe, iv);
     *result_lenp += pe->iv_len;
 
-    if(1 != EVP_EncryptInit_ex(ctx, pe->cipher, NULL, pe->key, dst))
+    if(1 != EVP_EncryptInit_ex(ctx, pe->cipher, NULL, pe->key, iv))
         goto err;
 
     if(1 != EVP_EncryptUpdate(ctx, dst + *result_lenp, &encrypted_len, src, src_len))
@@ -192,6 +226,9 @@ cleanup:
     EVP_CIPHER_CTX_free(ctx);
 #endif
     DBG_MSG("exiting encrypt %lu", *result_lenp);
+#ifdef DBG_ENC_EXT
+    dbg_data->result_len = *result_lenp;
+#endif
     return ret;
 }
 
@@ -278,6 +315,19 @@ static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     EVP_CIPHER_CTX *ctx= EVP_CIPHER_CTX_new();
     if (unlikely(!ctx))
         goto err;
+#endif
+
+#ifdef DBG_ENC_EXT
+    DEBUG_DATA *dbg_data = (DEBUG_DATA*)src;
+    char *key_msg = "";
+    if (memcmp(dbg_data->key, pe->key, KEY_LEN)) {
+        key_msg = "(WRONG KEY)";
+        dump_key(pe, session, dbg_data->key, KEY_LEN, "encrypt key");
+        dump_key(pe, session, pe->key, KEY_LEN, "decrypt key");
+    }
+    DBG_MSG("encrypt info s: %lu, d: %lu, r: %lu %s", dbg_data->src_len, dbg_data->dst_len, dbg_data->result_len, key_msg);
+    src += sizeof(DEBUG_DATA);
+    src_len -= sizeof(DEBUG_DATA);
 #endif
 
     if(1 != EVP_DecryptInit_ex(ctx, pe->cipher, NULL, pe->key, src))
@@ -378,6 +428,9 @@ static int percona_sizing_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
 
     //*expansion_constantp = CHKSUM_LEN + pe->iv_len;
     *expansion_constantp = pe->iv_len + EVP_CIPHER_block_size(pe->cipher);
+#ifdef DBG_ENC_EXT
+    *expansion_constantp += sizeof(DEBUG_DATA);
+#endif
     return 0;
 }
 
