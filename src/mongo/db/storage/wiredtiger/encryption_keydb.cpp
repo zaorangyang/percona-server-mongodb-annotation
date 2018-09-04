@@ -127,6 +127,9 @@ void EncryptionKeyDB::init() {
         // loaded later (see 'load parameters' section below)
         ss << "extensions=[local=(entry=percona_encryption_extension_init,early_load=true,config=(cipher=AES256-CBC))],";
         ss << "encryption=(name=percona,keyid=\"\"),";
+        // logging configured; updates durable on application or system failure
+        // https://source.wiredtiger.com/3.0.0/tune_durability.html
+        ss << "log=(enabled,file_max=5MB),transaction_sync=(enabled=true,method=fsync),";
         int res = wiredtiger_open(_path.c_str(), nullptr, ss.str().c_str(), &_conn);
         if (res) {
             throw std::runtime_error(std::string("error opening keys DB at '") + _path + "': " + wiredtiger_strerror(res));
