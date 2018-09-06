@@ -1290,6 +1290,9 @@ var ReplSetTest = function(opts) {
             // liveNodes must have been populated.
             var primary = rst.liveNodes.master;
             var combinedDBs = new Set(primary.getDBNames());
+            // replSetConfig will be undefined for master/slave passthrough.
+            const replSetConfig =
+                rst.getReplSetConfigFromNode ? rst.getReplSetConfigFromNode() : undefined;
 
             rst.getSecondaries().forEach(secondary => {
                 secondary.getDBNames().forEach(dbName => combinedDBs.add(dbName));
@@ -1378,8 +1381,10 @@ var ReplSetTest = function(opts) {
                     // Check that the following collection stats are the same across replica set
                     // members:
                     //  capped
-                    //  nindexes
+                    //  nindexes, except on nodes with buildIndexes: false
                     //  ns
+                    const hasSecondaryIndexes = !replSetConfig ||
+                        replSetConfig.members[rst.getNodeId(secondary)].buildIndexes !== false;
                     primaryCollections.forEach(collName => {
                         var primaryCollStats =
                             primary.getDB(dbName).runCommand({collStats: collName});
@@ -1389,7 +1394,8 @@ var ReplSetTest = function(opts) {
                         assert.commandWorked(secondaryCollStats);
 
                         if (primaryCollStats.capped !== secondaryCollStats.capped ||
-                            primaryCollStats.nindexes !== secondaryCollStats.nindexes ||
+                            (hasSecondaryIndexes &&
+                             primaryCollStats.nindexes !== secondaryCollStats.nindexes) ||
                             primaryCollStats.ns !== secondaryCollStats.ns) {
                             print(msgPrefix +
                                   ', the primary and secondary have different stats for the ' +
@@ -1887,7 +1893,12 @@ var ReplSetTest = function(opts) {
     }
 
     if (typeof opts === 'string' || opts instanceof String) {
-        _constructFromExistingSeedNode(opts);
+        retryOnNetworkError(function() {
+            // The primary may unexpectedly step down during startup if under heavy load
+            // and too slowly processing heartbeats. When it steps down, it closes all of
+            // its connections.
+            _constructFromExistingSeedNode(opts);
+        }, 10);
     } else {
         _constructStartNewInstances(opts);
     }
