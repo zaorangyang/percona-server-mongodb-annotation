@@ -509,11 +509,12 @@ namespace audit {
     }
 
     static void _auditAuthz(Client* client,
-                                 StringData ns,
+                            const NamespaceString& nss,
                                  StringData command,
                                  const BSONObj& args,
                                  ErrorCodes::Error result) {
         if ((result != ErrorCodes::OK) || auditAuthorizationSuccess.load()) {
+            std::string ns = nssToString(nss);
             const BSONObj params = !ns.empty() ?
                 BSON("command" << command << "ns" << ns << "args" << args) :
                 BSON("command" << command << "args" << args);
@@ -548,13 +549,13 @@ namespace audit {
 
     void logCommandAuthzCheck(Client* client,
                               const OpMsgRequest& cmdObj,
-                              CommandInterface* command,
+                              const CommandInterface& command,
                               ErrorCodes::Error result) {
         if (!_auditLog) {
             return;
         }
 
-        _auditAuthz(client, command->parseNs(cmdObj.getDatabase().toString(), cmdObj.body), cmdObj.body.firstElement().fieldName(), cmdObj.body, result);
+        _auditAuthz(client, command.ns(), cmdObj.body.firstElement().fieldName(), cmdObj.body, result);
     }
 
 
@@ -567,7 +568,7 @@ namespace audit {
             return;
         }
 
-        _auditAuthz(client, nssToString(ns), "delete", BSON("pattern" << pattern), result);
+        _auditAuthz(client, ns, "delete", BSON("pattern" << pattern), result);
         _auditSystemUsers(client, ns, "dropUser",
                           BSON("db" << ns.db() << "pattern" << pattern), result);
     }
@@ -581,7 +582,7 @@ namespace audit {
             return;
         }
 
-        _auditAuthz(client, nssToString(ns), "getMore", BSON("cursorId" << cursorId), result);
+        _auditAuthz(client, ns, "getMore", BSON("cursorId" << cursorId), result);
     }
 
     void logInsertAuthzCheck(
@@ -593,7 +594,7 @@ namespace audit {
             return;
         }
 
-        _auditAuthz(client, nssToString(ns), "insert", BSON("obj" << insertedObj), result);
+        _auditAuthz(client, ns, "insert", BSON("obj" << insertedObj), result);
         _auditSystemUsers(client, ns, "createUser",
                           BSON("db" << ns.db() << "userObj" << insertedObj), result);
     }
@@ -607,7 +608,7 @@ namespace audit {
             return;
         }
 
-        _auditAuthz(client, nssToString(ns), "killCursors", BSON("cursorId" << cursorId), result);
+        _auditAuthz(client, ns, "killCursors", BSON("cursorId" << cursorId), result);
     }
 
     void logQueryAuthzCheck(
@@ -619,7 +620,7 @@ namespace audit {
             return;
         }
 
-        _auditAuthz(client, nssToString(ns), "query", BSON("query" << query), result);
+        _auditAuthz(client, ns, "query", BSON("query" << query), result);
     }
 
     void logUpdateAuthzCheck(
@@ -639,7 +640,7 @@ namespace audit {
                                       "updateObj" << updateObj <<
                                       "upsert" << isUpsert <<
                                       "multi" << isMulti); 
-            _auditAuthz(client, nssToString(ns), "update", args, result);
+            _auditAuthz(client, ns, "update", args, result);
         }
         {
             const BSONObj params = BSON("db" << ns.db() <<
