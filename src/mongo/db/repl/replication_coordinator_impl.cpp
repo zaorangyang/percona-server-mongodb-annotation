@@ -3287,7 +3287,7 @@ boost::optional<OpTime> ReplicationCoordinatorImpl::_calculateStableOpTime_inloc
     }
 
     auto maximumStableTimestamp = commitPoint.getTimestamp();
-    if (_canAcceptNonLocalWrites && _storage->supportsDocLocking(_service)) {
+    if (_canAcceptNonLocalWrites && _storage->supportsDocLocking(_service) && _service->getGlobalStorageEngine()->isFcv36Supported()) {
         // If the storage engine supports document level locking, then it is possible for oplog
         // writes to commit out of order. In that case, we don't want to set the stable timestamp
         // ahead of the all committed timestamp. This is not a problem for oplog application
