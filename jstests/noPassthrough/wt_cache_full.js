@@ -1,6 +1,6 @@
 /**
  * Fills WiredTiger cache during steady state oplog application.
- * @tags: [requires_wiredtiger]
+ * @tags: [requires_wiredtiger, rocks_requires_fcv36]
  */
 (function() {
     'use strict';

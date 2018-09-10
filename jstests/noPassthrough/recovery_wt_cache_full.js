@@ -1,6 +1,6 @@
 /**
  * Fills WiredTiger cache during recovery oplog application.
- * @tags: [requires_persistence, requires_wiredtiger]
+ * @tags: [requires_persistence, requires_wiredtiger, rocks_requires_fcv36]
  */
 (function() {
     'use strict';
