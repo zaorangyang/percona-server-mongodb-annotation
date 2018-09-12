@@ -3287,7 +3287,11 @@ boost::optional<OpTime> ReplicationCoordinatorImpl::_calculateStableOpTime_inloc
     }
 
     auto maximumStableTimestamp = commitPoint.getTimestamp();
-    if (_canAcceptNonLocalWrites && _storage->supportsDocLocking(_service) && _service->getGlobalStorageEngine()->isFcv36Supported()) {
+    if (_canAcceptNonLocalWrites && _storage->supportsDocLocking(_service)) {
+        // avoid calling getAllCommittedTimestamp on rocksdb in FCV 3.4 mode
+        // storageEngine can be nullptr in unit tests
+        auto storageEngine = _service->getGlobalStorageEngine();
+        if (!storageEngine || storageEngine->isFcv36Supported()) {
         // If the storage engine supports document level locking, then it is possible for oplog
         // writes to commit out of order. In that case, we don't want to set the stable timestamp
         // ahead of the all committed timestamp. This is not a problem for oplog application
@@ -3304,6 +3308,7 @@ boost::optional<OpTime> ReplicationCoordinatorImpl::_calculateStableOpTime_inloc
         // any writes in the new term are replication committed.
         maximumStableTimestamp =
             std::min(_storage->getAllCommittedTimestamp(_service), commitPoint.getTimestamp());
+        }
     }
     const auto maximumStableOpTime = OpTime(maximumStableTimestamp, commitPoint.getTerm());
 
