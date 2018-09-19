@@ -2374,7 +2374,6 @@ timeout:
 ##   - Non standard jstests, i.e., jstestfuzz
 ## Note that the task name supports glob patterns.
 test_lifecycle_excluded_tasks:
-- aggregation_fuzzer*
 - burn_in_tests
 - compile*
 - dbtest*
@@ -2784,38 +2783,6 @@ tasks:
       jepsen_storage_engine: --storage-engine wiredTiger
       jepsen_test_name: read-concern-majority
       jepsen_write_concern: --write-concern w1
-
-## jstestfuzz standalone aggregation generational fuzzer mmapv1 ##
-- <<: *jstestfuzz_template
-  name: aggregation_fuzzer
-  commands:
-  - func: "do setup"
-  - func: "do multiversion setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles 50
-      npm_command: aggregation-fuzzer
-  - <<: *run_jstestfuzz_tests
-    vars:
-      <<: *jstestfuzz_config_vars
-      task_path_suffix: /data/multiversion
-      resmoke_args: --suites=generational_fuzzer --storageEngine=mmapv1
-
-## jstestfuzz standalone aggregation generational fuzzer WT ##
-- <<: *jstestfuzz_template
-  name: aggregation_fuzzer_WT
-  commands:
-  - func: "do setup"
-  - func: "do multiversion setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles 50
-      npm_command: aggregation-fuzzer
-  - <<: *run_jstestfuzz_tests
-    vars:
-      <<: *jstestfuzz_config_vars
-      task_path_suffix: /data/multiversion
-      resmoke_args: --suites=generational_fuzzer --storageEngine=wiredTiger
 
 ## jstestfuzz standalone update generational fuzzer mmapv1 ##
 - <<: *jstestfuzz_template
@@ -3407,6 +3374,17 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=change_streams --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: change_streams_mongos_sessions_passthrough_WT
+  depends_on:
+  - name: change_streams_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=change_streams_mongos_sessions_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4142,6 +4120,17 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: secondary_reads_passthrough
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=secondary_reads_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: sharding_jscore_op_query_passthrough_WT
   depends_on:
   - name: jsCore_WT
@@ -4849,7 +4838,7 @@ tasks:
     timeout_secs: 1800 # 30 minute timeout for no output
     vars:
       <<: *powercycle_test
-      mongod_extra_options: --replSet=powercyle --mongodOptions=\"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
+      mongod_extra_options: --replSet=powercycle --mongodOptions=\"--setParameter enableTestCommands=1 --storageEngine wiredTiger\"
 
 - name: powercycle_replication_smalloplog_WT
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
@@ -4869,7 +4858,7 @@ tasks:
     timeout_secs: 1800 # 30 minute timeout for no output
     vars:
       <<: *powercycle_test
-      mongod_extra_options: --replSet=powercyle --mongodOptions=\"--setParameter enableTestCommands=1 --oplogSize 20 --storageEngine wiredTiger\"
+      mongod_extra_options: --replSet=powercycle --mongodOptions=\"--setParameter enableTestCommands=1 --oplogSize 20 --storageEngine wiredTiger\"
 
 - name: powercycle_syncdelay_WT
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
@@ -4992,7 +4981,7 @@ tasks:
           /usr/local/bin/notary-client.py --key-name "server-3.6" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
           if [ "${has_packages|}" = "true" ]; then
-             CURATOR_RELEASE=${curator_release|"ea8d75dcc1a587111e7418e2428fb67e267af9fe"}
+             CURATOR_RELEASE=${curator_release|"37d930ea2eeb27acb3782f1aa4d69da1e9dac223"}
              curl -L -O http://boxes.10gen.com/build/curator/curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
              tar -zxvf curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
              ./curator repo --config ./etc/repo_config.yaml --distro ${packager_distro} --edition ${repo_edition} --version ${version} --arch ${packager_arch} --packages repo
@@ -5502,6 +5491,7 @@ buildvariants:
   - name: auth_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_mongos_sessions_passthrough_WT
   - name: change_streams_secondary_reads_WT
   - name: change_streams_sharded_collections_passthrough_WT
   - name: dbtest_WT
@@ -5523,7 +5513,6 @@ buildvariants:
   - name: jsCore_op_query_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5628,6 +5617,7 @@ buildvariants:
   - name: causally_consistent_jscore_passthrough_auth_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_mongos_sessions_passthrough_WT
   - name: change_streams_sharded_collections_passthrough_WT
   - name: concurrency_WT
   - name: concurrency_replication_WT
@@ -5721,7 +5711,6 @@ buildvariants:
   - name: failpoints_auth
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5782,7 +5771,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5897,7 +5885,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -5980,7 +5967,6 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6097,7 +6083,6 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6195,7 +6180,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6284,7 +6268,6 @@ buildvariants:
   - name: jsCore_WT_ese
   - name: jsCore_auth
   - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6365,7 +6348,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6447,6 +6429,7 @@ buildvariants:
   - name: sharded_causally_consistent_jscore_passthrough_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_mongos_sessions_passthrough_WT
   - name: change_streams_sharded_collections_passthrough_WT
   - name: dbtest_WT
   - name: disk_WT
@@ -6596,7 +6579,6 @@ buildvariants:
     distros:
     - windows-64-vs2015-large
   - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6710,7 +6692,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsonSchema
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6798,8 +6779,6 @@ buildvariants:
   - name: concurrency_simultaneous
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: aggregation_fuzzer
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -6874,7 +6853,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsonSchema
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7002,6 +6980,7 @@ buildvariants:
   - name: sharded_causally_consistent_jscore_passthrough_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_mongos_sessions_passthrough_WT
   - name: change_streams_sharded_collections_passthrough_WT
   - name: concurrency_WT
   - name: concurrency_replication_WT
@@ -7021,7 +7000,6 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7131,7 +7109,6 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7212,6 +7189,7 @@ buildvariants:
   - name: sharded_causally_consistent_jscore_passthrough_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_mongos_sessions_passthrough_WT
   - name: change_streams_secondary_reads_WT
   - name: change_streams_sharded_collections_passthrough_WT
   - name: concurrency_WT
@@ -7244,7 +7222,6 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query_WT
   - name: jsonSchema
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7429,7 +7406,6 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query_WT
   - name: jsonSchema
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7536,6 +7512,9 @@ buildvariants:
   - name: write_concern_majority_passthrough_WT
     distros:
     - rhel62-large
+  - name: secondary_reads_passthrough
+    distros:
+    - rhel62-large
 
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"
@@ -7567,6 +7546,7 @@ buildvariants:
   - name: rollback_fuzzer_WT
   - name: aggregation_WT
   - name: aggregation_WT_ese
+  - name: secondary_reads_passthrough
   - name: aggregation_auth
   - name: aggregation_read_concern_majority_passthrough_WT
   - name: aggregation_sharded_collections_passthrough_WT
@@ -7576,6 +7556,7 @@ buildvariants:
   - name: bulk_gle_passthrough_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_mongos_sessions_passthrough_WT
   - name: change_streams_secondary_reads_WT
   - name: change_streams_sharded_collections_passthrough_WT
   - name: concurrency_WT
@@ -7693,7 +7674,6 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7735,6 +7715,7 @@ buildvariants:
   - name: sharded_collections_jscore_passthrough_WT
   # - name: sharding TODO SERVER-32037: Replace sharding with sharding_WT.
   - name: sharding_auth
+  - name: secondary_reads_passthrough
 
 - name: rhel62
   display_name: SSL RHEL 6.2
@@ -7784,7 +7765,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7814,6 +7794,7 @@ buildvariants:
   - name: serial_run_WT
   - name: sharding_jscore_passthrough_WT
   - name: sharding_last_stable_mongos_and_mixed_shards
+  - name: secondary_reads_passthrough
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
@@ -7870,7 +7851,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -7908,6 +7888,7 @@ buildvariants:
   - name: serial_run_WT
   - name: sharding_jscore_passthrough_WT
   - name: sharding_last_stable_mongos_and_mixed_shards
+  - name: secondary_reads_passthrough
   - name: ssl
   - name: sslSpecial
   - name: tool_WT
@@ -7980,7 +7961,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8089,7 +8069,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8311,7 +8290,6 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8388,7 +8366,6 @@ buildvariants:
     - ubuntu1604-build
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8469,7 +8446,6 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8551,7 +8527,6 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsCore_op_query_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8645,7 +8620,6 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8723,7 +8697,6 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8777,7 +8750,6 @@ buildvariants:
   - name: ese_WT
   - name: jsCore # TODO SERVER-32036: Replace with jsCore_WT when jsCore_auth depends on jsCore_WT.
   - name: jsCore_auth
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8843,7 +8815,6 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -8934,7 +8905,6 @@ buildvariants:
   - name: jsCore_WT
   - name: jsCore_auth
   - name: jsCore_compatibility_WT
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -9018,6 +8988,7 @@ buildvariants:
   - name: sharded_causally_consistent_jscore_passthrough_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_mongos_sessions_passthrough_WT
   - name: change_streams_sharded_collections_passthrough_WT
   - name: concurrency
     distros:
@@ -9044,7 +9015,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -9096,6 +9066,7 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
+  - name: secondary_reads_passthrough
   - name: update_fuzzer_WT
   - name: update_fuzzer_replication_WT
   - name: write_concern_majority_passthrough_WT
@@ -9106,7 +9077,7 @@ buildvariants:
   - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling
+    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_document_locking
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     use_scons_cache: true
@@ -9144,7 +9115,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_op_query
   - name: jsCore_compatibility
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -9264,6 +9234,7 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: write_concern_majority_passthrough_WT
+  - name: secondary_reads_passthrough
 
 - name: enterprise-rhel-72-s390x-inmem
   display_name: Enterprise RHEL 7.2 s390x (inMemory) DEBUG
@@ -9354,6 +9325,7 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: write_concern_majority_passthrough_WT
+  - name: secondary_reads_passthrough
 
 ###########################################
 #     Experimental buildvariants          #
@@ -9399,6 +9371,7 @@ buildvariants:
   - name: sharded_causally_consistent_jscore_passthrough_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_mongos_sessions_passthrough_WT
   - name: change_streams_secondary_reads_WT
   - name: change_streams_sharded_collections_passthrough_WT
   - name: concurrency_WT
@@ -9481,6 +9454,7 @@ buildvariants:
   - name: update_fuzzer_WT
   - name: update_fuzzer_replication_WT
   - name: write_concern_majority_passthrough_WT
+  - name: secondary_reads_passthrough
 
 - name: ubuntu1604-asan
   display_name: ~ ASAN SSL Ubuntu 16.04
@@ -9502,7 +9476,6 @@ buildvariants:
   tasks:
   - name: compile
   - name: compile_all
-  - name: aggregation_fuzzer_WT
   - name: jstestfuzz_WT
   - name: jstestfuzz_concurrent_WT
   - name: jstestfuzz_concurrent_replication_WT
@@ -9557,6 +9530,7 @@ buildvariants:
   - name: sharded_causally_consistent_jscore_passthrough_WT
   - name: change_streams_WT
   - name: change_streams_mongos_passthrough_WT
+  - name: change_streams_mongos_sessions_passthrough_WT
   - name: change_streams_secondary_reads_WT
   - name: change_streams_sharded_collections_passthrough_WT
   - name: concurrency_WT
@@ -9640,6 +9614,7 @@ buildvariants:
   - name: update_fuzzer_WT
   - name: update_fuzzer_replication_WT
   - name: write_concern_majority_passthrough_WT
+  - name: secondary_reads_passthrough
 
 - name: ubuntu1604-debug-aubsan-lite
   display_name: "! {A,UB}SAN Enterprise SSL Ubuntu 16.04 DEBUG"
@@ -9881,6 +9856,7 @@ buildvariants:
   - name: sslSpecial
   - name: tool_WT
   - name: write_concern_majority_passthrough_WT
+  - name: secondary_reads_passthrough
 
 - name: enterprise-ubuntu-dynamic-1604-64-bit
   display_name: "* Shared Library Enterprise Ubuntu 16.04"
@@ -9923,7 +9899,7 @@ buildvariants:
   - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger
+    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,requires_document_locking
     rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
     compile_flags: >-
       --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release
@@ -10039,7 +10015,7 @@ buildvariants:
   - windows-64-vs2015-small
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger
+    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,requires_document_locking
     platform_decompress: unzip
     exe: .exe
     multiversion_platform: windows
@@ -10165,7 +10141,7 @@ buildvariants:
   - macos-1012
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,requires_ssl_mongo_tools
+    test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,requires_ssl_mongo_tools,requires_document_locking
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: >-
       --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10"
@@ -10259,7 +10235,7 @@ buildvariants:
     push_arch: x86_64
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --nojournal --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,requires_journaling
+    test_flags: --nojournal --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,requires_journaling,requires_document_locking
     use_scons_cache: true
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: ""
@@ -10272,7 +10248,6 @@ buildvariants:
     distros:
     - rhel62-large
   - name: aggregation
-  - name: aggregation_fuzzer
   - name: auth
   - name: bulk_gle_passthrough
   - name: concurrency

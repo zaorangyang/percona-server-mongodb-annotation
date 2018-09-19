@@ -485,8 +485,9 @@ void ShardServerCatalogCacheLoader::_schedulePrimaryGetChunksSince(
                 return;
             }
 
-            log() << "Cache loader remotely refreshed for collection " << nss << " from version "
-                  << maxLoaderVersion << " and no metadata was found.";
+            LOG_CATALOG_REFRESH(1) << "Cache loader remotely refreshed for collection " << nss
+                                   << " from version " << maxLoaderVersion
+                                   << " and no metadata was found.";
         } else if (swCollectionAndChangedChunks.isOK()) {
             auto& collAndChunks = swCollectionAndChangedChunks.getValue();
 
@@ -515,10 +516,10 @@ void ShardServerCatalogCacheLoader::_schedulePrimaryGetChunksSince(
                     }
                 }
 
-                log() << "Cache loader remotely refreshed for collection " << nss
-                      << " from collection version " << maxLoaderVersion
-                      << " and found collection version "
-                      << collAndChunks.changedChunks.back().getVersion();
+                LOG_CATALOG_REFRESH(1) << "Cache loader remotely refreshed for collection " << nss
+                                       << " from collection version " << maxLoaderVersion
+                                       << " and found collection version "
+                                       << collAndChunks.changedChunks.back().getVersion();
 
                 // Metadata was found remotely -- otherwise would have received NamespaceNotFound
                 // rather than Status::OK(). Return metadata for CatalogCache that's GTE
@@ -568,18 +569,19 @@ StatusWith<CollectionAndChangedChunks> ShardServerCatalogCacheLoader::_getLoader
         persisted = std::move(swPersisted.getValue());
     }
 
-    log() << "Cache loader found "
-          << (enqueued.changedChunks.empty()
-                  ? (tasksAreEnqueued ? "a drop enqueued" : "no enqueued metadata")
-                  : ("enqueued metadata from " +
-                     enqueued.changedChunks.front().getVersion().toString() + " to " +
-                     enqueued.changedChunks.back().getVersion().toString()))
-          << " and " << (persisted.changedChunks.empty()
-                             ? "no persisted metadata"
-                             : ("persisted metadata from " +
-                                persisted.changedChunks.front().getVersion().toString() + " to " +
-                                persisted.changedChunks.back().getVersion().toString()))
-          << ", GTE cache version " << catalogCacheSinceVersion;
+    LOG_CATALOG_REFRESH(1)
+        << "Cache loader found "
+        << (enqueued.changedChunks.empty()
+                ? (tasksAreEnqueued ? "a drop enqueued" : "no enqueued metadata")
+                : ("enqueued metadata from " +
+                   enqueued.changedChunks.front().getVersion().toString() + " to " +
+                   enqueued.changedChunks.back().getVersion().toString()))
+        << " and " << (persisted.changedChunks.empty()
+                           ? "no persisted metadata"
+                           : ("persisted metadata from " +
+                              persisted.changedChunks.front().getVersion().toString() + " to " +
+                              persisted.changedChunks.back().getVersion().toString()))
+        << ", GTE cache version " << catalogCacheSinceVersion;
 
     if (!tasksAreEnqueued) {
         // There are no tasks in the queue. Return the persisted metadata.
@@ -655,13 +657,6 @@ std::pair<bool, CollectionAndChangedChunks> ShardServerCatalogCacheLoader::_getE
 
 Status ShardServerCatalogCacheLoader::_ensureMajorityPrimaryAndScheduleTask(
     OperationContext* opCtx, const NamespaceString& nss, Task task) {
-    Status linearizableReadStatus = waitForLinearizableReadConcern(opCtx);
-    if (!linearizableReadStatus.isOK()) {
-        return {linearizableReadStatus.code(),
-                str::stream() << "Unable to schedule routing table update because this is not the"
-                              << " majority primary and may not have the latest data. Error: "
-                              << linearizableReadStatus.reason()};
-    }
 
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     const bool wasEmpty = _taskLists[nss].empty();
@@ -769,8 +764,9 @@ void ShardServerCatalogCacheLoader::_updatePersistedMetadata(OperationContext* o
                           << "'. Will be retried.",
             status.isOK());
 
-    LOG(1) << "Successfully updated persisted chunk metadata for collection '" << nss << "' from '"
-           << task.minQueryVersion << "' to collection version '" << task.maxQueryVersion << "'.";
+    LOG_CATALOG_REFRESH(1) << "Successfully updated persisted chunk metadata for collection '"
+                           << nss << "' from '" << task.minQueryVersion
+                           << "' to collection version '" << task.maxQueryVersion << "'.";
 }
 
 CollectionAndChangedChunks
@@ -805,9 +801,10 @@ ShardServerCatalogCacheLoader::_getCompletePersistedMetadataForSecondarySinceVer
             return collAndChangedChunks;
         }
 
-        LOG(1) << "Cache loader read meatadata while updates were being applied: this metadata may"
-               << " be incomplete. Retrying. Refresh state before read: " << beginRefreshState
-               << ". Current refresh state: '" << endRefreshState << "'.";
+        LOG_CATALOG_REFRESH(1)
+            << "Cache loader read meatadata while updates were being applied: this metadata may"
+            << " be incomplete. Retrying. Refresh state before read: " << beginRefreshState
+            << ". Current refresh state: '" << endRefreshState << "'.";
     }
 }
 
