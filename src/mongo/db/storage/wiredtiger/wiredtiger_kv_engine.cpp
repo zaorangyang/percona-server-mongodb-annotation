@@ -690,6 +690,12 @@ Status WiredTigerKVEngine::hotBackup(const std::string& path) {
         return EngineExtension::hotBackup(path);
     }
 
+    int ret;
+    // srcPath, destPath, session, cursor
+    typedef std::tuple<boost::filesystem::path, boost::filesystem::path, std::shared_ptr<WiredTigerSession>, WT_CURSOR*> DBTuple;
+    // list of DBs to backup
+    std::vector<DBTuple> dbList;
+
     // WT-999: Create journal folder.
     const char* journalDir = "journal";
     boost::filesystem::path destPath(path);
@@ -699,46 +705,76 @@ Status WiredTigerKVEngine::hotBackup(const std::string& path) {
         return Status(ErrorCodes::InvalidPath, str::stream() << ex.what());
     }
 
+    // TODO: add synchronization of cursors creation (plus probably lock database for the moment of cursors creation)
+
     // Open backup cursor in new session, the session will kill the
     // cursor upon closing.
-    WiredTigerSession sessionBackup(_conn);
-    WT_CURSOR* c = NULL;
-    WT_SESSION* s = sessionBackup.getSession();
-    int ret = s->open_cursor(s, "backup:", NULL, NULL, &c);
-    if (ret != 0) {
-        return wtRCToStatus(ret);
+    {
+        auto session = std::make_shared<WiredTigerSession>(_conn);
+        WT_SESSION* s = session->getSession();
+        WT_CURSOR* c = nullptr;
+        ret = s->open_cursor(s, "backup:", nullptr, nullptr, &c);
+        if (ret != 0) {
+            return wtRCToStatus(ret);
+        }
+        dbList.emplace_back(_path, destPath, session, c);
     }
 
-    // Copy the list of files.
-    boost::filesystem::path srcPath(_path);
-    std::set<boost::filesystem::path> existDirs{destPath};
-    const char* filename = NULL;
-    while ((ret = c->next(c)) == 0 && (ret = c->get_key(c, &filename)) == 0) {
-        const boost::filesystem::path destFile(destPath / filename);
-        const boost::filesystem::path destDir(destFile.parent_path());
-
+    // Open backup cursor for keyDB
+    if (_encryptionKeyDB) {
+        const char* keydbDir = "keydb";
         try {
-            // Try creating destination directories if needed.
-            if (!existDirs.count(destDir)) {
-                existDirs.insert(destDir);
-                boost::filesystem::create_directories(destDir);
-            }
-            boost::filesystem::copy_file(
-                srcPath / filename, destFile, boost::filesystem::copy_option::none);
+            boost::filesystem::create_directory(destPath / keydbDir);
         } catch (const boost::filesystem::filesystem_error& ex) {
-            // WT-999: Try copying to journal folder.
-            const std::string& errmsg = str::stream() << ex.what();
+            return Status(ErrorCodes::InvalidPath, str::stream() << ex.what());
+        }
+        auto session = std::make_shared<WiredTigerSession>(_encryptionKeyDB->getConnection());
+        WT_SESSION* s = session->getSession();
+        WT_CURSOR* c = nullptr;
+        ret = s->open_cursor(s, "backup:", nullptr, nullptr, &c);
+        if (ret != 0) {
+            return wtRCToStatus(ret);
+        }
+        dbList.emplace_back(boost::filesystem::path{_path} / keydbDir, destPath / keydbDir, session, c);
+    }
+
+    // Copy files to destination directory
+    for (auto&& db : dbList) {
+        boost::filesystem::path srcPath = std::get<0>(db);
+        boost::filesystem::path destPath = std::get<1>(db);
+        WT_CURSOR* c = std::get<WT_CURSOR*>(db);
+
+        std::set<boost::filesystem::path> existDirs{destPath};
+        const char* filename = NULL;
+        while ((ret = c->next(c)) == 0 && (ret = c->get_key(c, &filename)) == 0) {
+            const boost::filesystem::path destFile(destPath / filename);
+            const boost::filesystem::path destDir(destFile.parent_path());
+
             try {
-                boost::filesystem::copy_file(srcPath / journalDir / filename,
-                                             destPath / journalDir / filename,
-                                             boost::filesystem::copy_option::none);
-            } catch (const boost::filesystem::filesystem_error&) {
-                return Status(ErrorCodes::InvalidPath, errmsg);
+                // Try creating destination directories if needed.
+                if (!existDirs.count(destDir)) {
+                    existDirs.insert(destDir);
+                    boost::filesystem::create_directories(destDir);
+                }
+                boost::filesystem::copy_file(
+                    srcPath / filename, destFile, boost::filesystem::copy_option::none);
+            } catch (const boost::filesystem::filesystem_error& ex) {
+                // WT-999: Try copying to journal folder.
+                const std::string& errmsg = str::stream() << ex.what();
+                try {
+                    boost::filesystem::copy_file(srcPath / journalDir / filename,
+                                                 destPath / journalDir / filename,
+                                                 boost::filesystem::copy_option::none);
+                } catch (const boost::filesystem::filesystem_error&) {
+                    return Status(ErrorCodes::InvalidPath, errmsg);
+                }
             }
         }
+        if (ret == WT_NOTFOUND)
+            ret = 0;
+        else
+            break;
     }
-    if (ret == WT_NOTFOUND)
-        ret = 0;
     return wtRCToStatus(ret);
 }
 

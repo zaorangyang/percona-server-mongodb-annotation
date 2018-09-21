@@ -52,6 +52,9 @@ public:
     // len should be multiple of 4
     void store_pseudo_bytes(uint8_t *buf, int len);
 
+    // get connection for hot backup procedure to create backup
+    WT_CONNECTION*  getConnection() const { return _conn; }
+
 private:
     typedef boost::multiprecision::uint128_t _gcm_iv_type;
 
