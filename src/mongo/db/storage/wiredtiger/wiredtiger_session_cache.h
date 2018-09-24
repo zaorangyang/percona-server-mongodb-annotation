@@ -323,6 +323,8 @@ private:
     WT_SESSION* _waitUntilDurableSession = nullptr;  // owned, and never explicitly closed
                                                      // (uses connection close to clean up)
 
+    WT_SESSION* _keyDBSession = nullptr;  // keyDB analog of _waitUntilDurableSession
+
     /**
      * Returns a session to the cache for later reuse. If closeAll was called between getting this
      * session and releasing it, the session is directly released. This method is thread safe.
