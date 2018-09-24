@@ -199,6 +199,10 @@ public:
         return _canonicalName;
     }
 
+    EncryptionKeyDB* getEncryptionKeyDB() {
+        return _encryptionKeyDB.get();
+    }
+
     /*
      * An oplog manager is always accessible, but this method will start the background thread to
      * control oplog entry visibility for reads.
