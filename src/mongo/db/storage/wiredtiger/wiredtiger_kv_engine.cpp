@@ -942,10 +942,10 @@ void WiredTigerKVEngine::endNonBlockingBackup(OperationContext* opCtx) {
     _backupSession.reset();
 }
 
-Status WiredTigerKVEngine::hotBackup(const std::string& path) {
+Status WiredTigerKVEngine::hotBackup(OperationContext* opCtx, const std::string& path) {
     // Nothing to backup for non-durable engine.
     if (!_durable) {
-        return EngineExtension::hotBackup(path);
+        return EngineExtension::hotBackup(opCtx, path);
     }
 
     int ret;

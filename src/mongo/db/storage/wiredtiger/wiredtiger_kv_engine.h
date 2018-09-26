@@ -169,7 +169,7 @@ public:
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override;
 
-    virtual Status hotBackup(const std::string& path) override;
+    virtual Status hotBackup(OperationContext* opCtx, const std::string& path) override;
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) override;
 

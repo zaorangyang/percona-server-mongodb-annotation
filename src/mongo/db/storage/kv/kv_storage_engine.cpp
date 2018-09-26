@@ -78,8 +78,8 @@ public:
     KVDatabaseCatalogEntryBase* const _entry;
 };
 
-Status KVStorageEngine::hotBackup(const std::string& path) {
-    return _engine->hotBackup(path);
+Status KVStorageEngine::hotBackup(OperationContext* opCtx, const std::string& path) {
+    return _engine->hotBackup(opCtx, path);
 }
 
 KVStorageEngine::KVStorageEngine(
