@@ -149,7 +149,7 @@ public:
 
     virtual void endBackup(OperationContext* opCtx);
 
-    virtual Status hotBackup(const std::string& path);
+    virtual Status hotBackup(OperationContext* opCtx, const std::string& path) override;
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident);
 
