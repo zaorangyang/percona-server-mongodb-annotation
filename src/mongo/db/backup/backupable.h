@@ -24,6 +24,10 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/base/status.h"
 
+namespace mongo {
+    class OperationContext;
+}
+
 namespace percona {
 
 /**
@@ -38,7 +42,7 @@ struct Backupable {
      * @param path destination path to perform backup into.
      * @return Status code of the operation.
      */
-    virtual mongo::Status hotBackup(const std::string& path) {
+    virtual mongo::Status hotBackup(mongo::OperationContext* opCtx, const std::string& path) {
         return mongo::Status(mongo::ErrorCodes::IllegalOperation,
                              "This engine doesn't support hot backup.");
     }
