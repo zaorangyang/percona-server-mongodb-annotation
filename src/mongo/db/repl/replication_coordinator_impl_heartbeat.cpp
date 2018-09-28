@@ -394,8 +394,11 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
     }
 
     auto opCtx = cc().makeOperationContext();
-    Lock::GlobalLock globalExclusiveLock{
-        opCtx.get(), MODE_X, Date_t::max(), Lock::GlobalLock::EnqueueOnly()};
+    Lock::GlobalLock globalExclusiveLock{opCtx.get(),
+                                         MODE_X,
+                                         Date_t::max(),
+                                         Lock::InterruptBehavior::kThrow,
+                                         Lock::GlobalLock::EnqueueOnly()};
     _externalState->killAllUserOperations(opCtx.get());
     globalExclusiveLock.waitForLockUntil(Date_t::max());
     invariant(globalExclusiveLock.isLocked());
@@ -528,9 +531,9 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
             newConfig.getMemberAt(myIndex.getValue()).isArbiter();
 
         if (isArbiter) {
-            LogicalClock::get(getGlobalServiceContext())->setEnabled(false);
+            LogicalClock::get(getGlobalServiceContext())->disable();
             if (auto validator = LogicalTimeValidator::get(getGlobalServiceContext())) {
-                validator->resetKeyManager();
+                validator->stopKeyManager();
             }
         }
 

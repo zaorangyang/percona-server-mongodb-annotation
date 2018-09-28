@@ -125,6 +125,7 @@ public:
     using IsAdminDbValidFn = stdx::function<Status(OperationContext* opCtx)>;
     using GetCollectionUUIDFn = stdx::function<StatusWith<OptionalCollectionUUID>(
         OperationContext* opCtx, const NamespaceString& nss)>;
+    using UpgradeNonReplicatedUniqueIndexesFn = stdx::function<Status(OperationContext* opCtx)>;
 
     StorageInterfaceMock() = default;
 
@@ -283,6 +284,9 @@ public:
         return getCollectionUUIDFn(opCtx, nss);
     }
 
+    Status upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) override {
+        return upgradeNonReplicatedUniqueIndexesFn(opCtx);
+    }
     void setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
 
     void setInitialDataTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) override;
@@ -302,6 +306,10 @@ public:
     boost::optional<Timestamp> getRecoveryTimestamp(ServiceContext* serviceCtx) const override {
         return boost::none;
     }
+
+    Timestamp getAllCommittedTimestamp(ServiceContext* serviceCtx) const override;
+
+    bool supportsDocLocking(ServiceContext* serviceCtx) const override;
 
     Status isAdminDbValid(OperationContext* opCtx) override {
         return isAdminDbValidFn(opCtx);
@@ -383,6 +391,14 @@ public:
         OperationContext* opCtx, const NamespaceString& nss) -> StatusWith<OptionalCollectionUUID> {
         return Status{ErrorCodes::IllegalOperation, "GetCollectionUUIDFn not implemented."};
     };
+    UpgradeNonReplicatedUniqueIndexesFn upgradeNonReplicatedUniqueIndexesFn =
+        [](OperationContext* opCtx) -> Status {
+        return Status{ErrorCodes::IllegalOperation,
+                      "upgradeNonReplicatedUniqueIndexesFn not implemented."};
+    };
+
+    bool supportsDocLockingBool = false;
+    Timestamp allCommittedTimestamp = Timestamp::min();
 
 private:
     mutable stdx::mutex _mutex;

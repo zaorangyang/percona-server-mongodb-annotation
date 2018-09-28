@@ -121,14 +121,14 @@ Status MovePrimarySourceManager::clone(OperationContext* opCtx) {
         }
     }
 
-    _state = kCloneCompleted;
+    _state = kCloneCaughtUp;
     scopedGuard.Dismiss();
     return Status::OK();
 }
 
 Status MovePrimarySourceManager::enterCriticalSection(OperationContext* opCtx) {
     invariant(!opCtx->lockState()->isLocked());
-    invariant(_state == kCloneCompleted);
+    invariant(_state == kCloneCaughtUp);
     auto scopedGuard = MakeGuard([&] { cleanupOnError(opCtx); });
 
     // Mark the shard as running a critical operation that requires recovery on crash.
@@ -266,6 +266,9 @@ Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
             }
         }
 
+        // We would not be able to guarantee our next database refresh would pick up the write for
+        // the movePrimary commit (if it happened), because we were unable to get the latest config
+        // OpTime.
         fassert(50762,
                 validateStatus.withContext(
                     str::stream() << "Failed to commit movePrimary for database " << getNss().ns()
@@ -273,9 +276,12 @@ Status MovePrimarySourceManager::commitOnConfig(OperationContext* opCtx) {
                                   << redact(commitStatus)
                                   << ". Updating the optime with a write before clearing the "
                                   << "version also failed"));
+
+        // If we can validate but the commit still failed, return the status.
+        return commitStatus;
     }
 
-    _state = kCommitted;
+    _state = kCloneCompleted;
 
     _cleanup(opCtx);
 
@@ -318,14 +324,14 @@ void MovePrimarySourceManager::cleanupOnError(OperationContext* opCtx) {
         return;
     }
 
-    uassertStatusOK(Grid::get(opCtx)->catalogClient()->logChange(
-        opCtx,
-        "movePrimary.error",
-        _dbname.toString(),
-        _buildMoveLogEntry(_dbname.toString(), _fromShard.toString(), _toShard.toString()),
-        ShardingCatalogClient::kMajorityWriteConcern));
-
     try {
+        uassertStatusOK(Grid::get(opCtx)->catalogClient()->logChange(
+            opCtx,
+            "movePrimary.error",
+            _dbname.toString(),
+            _buildMoveLogEntry(_dbname.toString(), _fromShard.toString(), _toShard.toString()),
+            ShardingCatalogClient::kMajorityWriteConcern));
+
         _cleanup(opCtx);
     } catch (const ExceptionForCat<ErrorCategory::NotMasterError>& ex) {
         BSONObjBuilder requestArgsBSON;
@@ -343,16 +349,12 @@ void MovePrimarySourceManager::_cleanup(OperationContext* opCtx) {
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetDb autoDb(opCtx, getNss().toString(), MODE_X);
 
-        if (!autoDb.getDb()) {
-            uasserted(ErrorCodes::ConflictingOperationInProgress,
-                      str::stream() << "The database " << getNss().toString()
-                                    << " was dropped during the movePrimary operation.");
+        if (autoDb.getDb()) {
+            DatabaseShardingState::get(autoDb.getDb()).clearMovePrimarySourceManager(opCtx);
+
+            // Leave the critical section if we're still registered.
+            DatabaseShardingState::get(autoDb.getDb()).exitCriticalSection(opCtx, boost::none);
         }
-
-        DatabaseShardingState::get(autoDb.getDb()).clearMovePrimarySourceManager(opCtx);
-
-        // Leave the critical section if we're still registered.
-        DatabaseShardingState::get(autoDb.getDb()).exitCriticalSection(opCtx, boost::none);
     }
 
     if (_state == kCriticalSection || _state == kCloneCompleted) {
@@ -366,9 +368,9 @@ void MovePrimarySourceManager::_cleanup(OperationContext* opCtx) {
         ShardingStateRecovery::endMetadataOp(opCtx);
     }
 
-    // If we're in the kCommitted state, then we need to do the last step of cleaning up
+    // If we're in the kCloneCompleted state, then we need to do the last step of cleaning up
     // now-stale data on the old primary. Otherwise, indicate that we're done.
-    if (_state != kCommitted) {
+    if (_state != kCloneCompleted) {
         _state = kDone;
     }
 

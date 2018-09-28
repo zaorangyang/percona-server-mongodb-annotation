@@ -43,6 +43,7 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -149,7 +150,7 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
     // Ensure the namespace is valid.
     uassert(ErrorCodes::IllegalOperation,
             "can't shard system namespaces",
-            !nss.isSystem() || nss.ns() == SessionsCollection::kSessionsFullNS);
+            !nss.isSystem() || nss == SessionsCollection::kSessionsNamespaceString);
 
     // Ensure the collation is valid. Currently we only allow the simple collation.
     bool simpleCollationSpecified = false;
@@ -727,6 +728,10 @@ public:
                 "_configsvrShardCollection can only be run on config servers",
                 serverGlobalParams.clusterRole == ClusterRole::ConfigServer);
 
+        // Set the operation context read concern level to local for reads into the config database.
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+
         uassert(ErrorCodes::InvalidOptions,
                 str::stream() << "shardCollection must be called with majority writeConcern, got "
                               << cmdObj,
@@ -756,7 +761,7 @@ public:
         auto dbType =
             uassertStatusOK(
                 Grid::get(opCtx)->catalogClient()->getDatabase(
-                    opCtx, nss.db().toString(), repl::ReadConcernLevel::kLocalReadConcern))
+                    opCtx, nss.db().toString(), repl::ReadConcernArgs::get(opCtx).getLevel()))
                 .value;
         uassert(ErrorCodes::IllegalOperation,
                 str::stream() << "sharding not enabled for db " << nss.db(),
@@ -777,11 +782,11 @@ public:
 
         // Handle collections in the config db separately.
         if (nss.db() == NamespaceString::kConfigDb) {
-            // Only whitelisted collections in config may be sharded
-            // (unless we are in test mode)
+            // Only whitelisted collections in config may be sharded (unless we are in test mode)
             uassert(ErrorCodes::IllegalOperation,
                     "only special collections in the config db may be sharded",
-                    nss.ns() == SessionsCollection::kSessionsFullNS || getTestCommandsEnabled());
+                    nss == SessionsCollection::kSessionsNamespaceString ||
+                        getTestCommandsEnabled());
 
             auto configShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbType.getPrimary()));
             ScopedDbConnection configConn(configShard->getConnString());

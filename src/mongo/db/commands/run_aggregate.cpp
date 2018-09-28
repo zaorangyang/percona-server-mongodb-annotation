@@ -333,20 +333,15 @@ Status runAggregate(OperationContext* opCtx,
 
             // If the read concern is not specified, upgrade to 'majority' and wait to make sure we
             // have a snapshot available.
-            if (!repl::ReadConcernArgs::get(opCtx).hasLevel()) {
-                const repl::ReadConcernArgs readConcern(
-                    repl::ReadConcernLevel::kMajorityReadConcern);
-                uassertStatusOK(waitForReadConcern(opCtx, readConcern, true));
+            auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+            if (!readConcernArgs.hasLevel()) {
+                readConcernArgs =
+                    repl::ReadConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern);
+                uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, true));
             }
 
-            // If the change stream is opened against a database which does not exist yet, go ahead
-            // and create it. Use MODE_IX since the AutoGetOrCreateDb helper will automatically
-            // reacquire as MODE_X if the database does not exist.
-            AutoGetOrCreateDb dbLock(opCtx, origNss.db(), MODE_IX);
-            invariant(dbLock.getDb());
             if (!origNss.isCollectionlessAggregateNS()) {
-                // AutoGetCollectionForReadCommand will raise an error if the given namespace is a
-                // view.
+                // AutoGetCollectionForReadCommand will raise an error if 'origNss' is a view.
                 AutoGetCollectionForReadCommand origNssCtx(opCtx, origNss);
 
                 // Resolve the collator to either the user-specified collation or the default
@@ -508,7 +503,7 @@ Status runAggregate(OperationContext* opCtx,
         std::move(exec),
         origNss,
         AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-        opCtx->recoveryUnit()->getReadConcernLevel(),
+        repl::ReadConcernArgs::get(opCtx).getLevel(),
         cmdObj);
     if (expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData) {
         cursorParams.setTailable(true);

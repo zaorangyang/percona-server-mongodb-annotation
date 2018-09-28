@@ -61,7 +61,7 @@ public:
     RemoveDBChange(KVStorageEngine* engine, StringData db, KVDatabaseCatalogEntryBase* entry)
         : _engine(engine), _db(db.toString()), _entry(entry) {}
 
-    virtual void commit() {
+    virtual void commit(boost::optional<Timestamp>) {
         delete _entry;
     }
 
@@ -636,8 +636,8 @@ void KVStorageEngine::replicationBatchIsComplete() const {
     return _engine->replicationBatchIsComplete();
 }
 
-Timestamp KVStorageEngine::getAllCommittedTimestamp(OperationContext* opCtx) const {
-    return _engine->getAllCommittedTimestamp(opCtx);
+Timestamp KVStorageEngine::getAllCommittedTimestamp() const {
+    return _engine->getAllCommittedTimestamp();
 }
 
 void KVStorageEngine::_dumpCatalog(OperationContext* opCtx) {

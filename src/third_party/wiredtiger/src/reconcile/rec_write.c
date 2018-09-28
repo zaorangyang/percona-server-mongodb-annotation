@@ -958,15 +958,32 @@ __rec_init(WT_SESSION_IMPL *session,
 	 * uncommitted.
 	 */
 	txn_global = &S2C(session)->txn_global;
+	WT_ORDERED_READ(r->last_running, txn_global->last_running);
+
+	/*
+	 * Decide whether to skew on-page values towards newer or older
+	 * versions.  This is a heuristic attempting to minimize the number of
+	 * pages that need to be rewritten by future checkpoints.
+	 *
+	 * We usually prefer to skew to newer versions, the logic being that by
+	 * the time the next checkpoint runs, it is likely that all the updates
+	 * we choose will be stable.  However, if checkpointing with a
+	 * timestamp (indicated by a stable_timestamp being set), and the
+	 * timestamp hasn't changed since the last time this page was
+	 * reconciled, skew oldest instead.
+	 */
 	if (__wt_btree_immediately_durable(session))
 		las_skew_oldest = false;
-	else
+	else {
 		WT_ORDERED_READ(las_skew_oldest,
 		    txn_global->has_stable_timestamp);
+		if (las_skew_oldest)
+			las_skew_oldest = ref->page_las != NULL &&
+			    !__wt_txn_visible_all(session, WT_TXN_NONE,
+			    WT_TIMESTAMP_NULL(&ref->page_las->min_timestamp));
+	}
 	r->las_skew_newest = LF_ISSET(WT_REC_LOOKASIDE) &&
 	    LF_ISSET(WT_REC_VISIBLE_ALL) && !las_skew_oldest;
-
-	WT_ORDERED_READ(r->last_running, txn_global->last_running);
 
 	/*
 	 * When operating on the lookaside table, we should never try
@@ -5304,7 +5321,7 @@ __rec_row_leaf(WT_SESSION_IMPL *session,
     WT_RECONCILE *r, WT_PAGE *page, WT_SALVAGE_COOKIE *salvage)
 {
 	WT_BTREE *btree;
-	WT_CELL *cell, *val_cell;
+	WT_CELL *cell;
 	WT_CELL_UNPACK *kpack, _kpack, *vpack, _vpack;
 	WT_CURSOR_BTREE *cbt;
 	WT_DECL_ITEM(tmpkey);
@@ -5377,19 +5394,8 @@ __rec_row_leaf(WT_SESSION_IMPL *session,
 			__wt_cell_unpack(cell, kpack);
 		}
 
-		/*
-		 * Unpack the on-page value cell, and look for an update. Under
-		 * some conditions, the underlying code returning updates will
-		 * restructure the update list to include the original on-page
-		 * value, represented by the unpacked-cell argument. Row-store
-		 * doesn't store zero-length values on the page, so we build an
-		 * unpacked cell that allows us to pretend.
-		 */
-		if ((val_cell =
-		    __wt_row_leaf_value_cell(page, rip, NULL)) == NULL)
-			__wt_cell_unpack_empty_value(vpack);
-		else
-			__wt_cell_unpack(val_cell, vpack);
+		/* Unpack the on-page value cell, and look for an update. */
+		__wt_row_leaf_value_cell(page, rip, NULL, vpack);
 		WT_ERR(__rec_txn_read(
 		    session, r, NULL, rip, vpack, NULL, &upd));
 
@@ -5467,7 +5473,7 @@ __rec_row_leaf(WT_SESSION_IMPL *session,
 				    "ovfl-unused", strlen("ovfl-unused"),
 				    (uint64_t)0));
 			} else {
-				val->buf.data = val_cell;
+				val->buf.data = vpack->cell;
 				val->buf.size = __wt_cell_total_len(vpack);
 				val->cell_len = 0;
 				val->len = val->buf.size;
@@ -5680,7 +5686,7 @@ build:
 
 leaf_insert:	/* Write any K/V pairs inserted into the page after this key. */
 		if ((ins = WT_SKIP_FIRST(WT_ROW_INSERT(page, rip))) != NULL)
-		    WT_ERR(__rec_row_leaf_insert(session, r, ins));
+			WT_ERR(__rec_row_leaf_insert(session, r, ins));
 	}
 
 	/* Write the remnant page. */

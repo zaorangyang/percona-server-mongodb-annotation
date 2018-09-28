@@ -73,7 +73,7 @@ public:
     void waitForWriteConcern(OperationContext* opCtx,
                              const CommandInvocation* invocation,
                              const repl::OpTime& lastOpBeforeRun,
-                             BSONObjBuilder commandResponseBuilder) const override {
+                             BSONObjBuilder& commandResponseBuilder) const override {
         auto lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
         // Ensures that if we tried to do a write, we wait for write concern, even if that write was
         // a noop.
@@ -94,7 +94,7 @@ public:
         if (!waitForWCStatus.isOK() && invocation->definition()->isUserManagementCommand()) {
             BSONObj temp = commandResponseBuilder.asTempObj().copy();
             commandResponseBuilder.resetToEmpty();
-            CommandHelpers::appendCommandStatus(commandResponseBuilder, waitForWCStatus);
+            CommandHelpers::appendCommandStatusNoThrow(commandResponseBuilder, waitForWCStatus);
             commandResponseBuilder.appendElementsUnique(temp);
         }
     }
@@ -110,7 +110,7 @@ public:
 
     void uassertCommandDoesNotSpecifyWriteConcern(const BSONObj& cmd) const override {
         if (commandSpecifiesWriteConcern(cmd)) {
-            uassertStatusOK({ErrorCodes::InvalidOptions, "Command does not support writeConcern"});
+            uasserted(ErrorCodes::InvalidOptions, "Command does not support writeConcern");
         }
     }
 

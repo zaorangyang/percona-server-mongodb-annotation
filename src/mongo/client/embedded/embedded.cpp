@@ -32,7 +32,6 @@
 
 #include "mongo/client/embedded/embedded.h"
 
-#include "mongo/base/checked_cast.h"
 #include "mongo/base/initializer.h"
 #include "mongo/client/embedded/replication_coordinator_embedded.h"
 #include "mongo/client/embedded/service_context_embedded.h"
@@ -58,6 +57,7 @@
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/session_killer.h"
 #include "mongo/db/storage/encryption_hooks.h"
+#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/ttl.h"
 #include "mongo/logger/log_component.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
@@ -100,9 +100,9 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 // functional to provide any replication logic.
 GlobalInitializerRegisterer replicationManagerInitializer(
     "CreateReplicationManager",
-    {"SSLManager", "default"},
+    {"SSLManager", "ServiceContext", "default"},
     [](InitializerContext* context) {
-        auto serviceContext = context->serviceContext();
+        auto serviceContext = getGlobalServiceContext();
         repl::StorageInterface::set(serviceContext, std::make_unique<repl::StorageInterfaceImpl>());
 
         auto logicalClock = stdx::make_unique<LogicalClock>(serviceContext);
@@ -114,7 +114,7 @@ GlobalInitializerRegisterer replicationManagerInitializer(
         return Status::OK();
     },
     [](DeinitializerContext* context) {
-        auto serviceContext = context->serviceContext();
+        auto serviceContext = getGlobalServiceContext();
 
         repl::ReplicationCoordinator::set(serviceContext, nullptr);
         LogicalClock::set(serviceContext, nullptr);
@@ -146,8 +146,8 @@ void shutdown(ServiceContext* srvContext) {
     auto shutdownOpCtx = serviceContext->makeOperationContext(client);
     {
         UninterruptibleLockGuard noInterrupt(shutdownOpCtx->lockState());
-        Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X, Date_t::max());
-        dbHolder().closeAll(shutdownOpCtx.get(), "shutdown");
+        Lock::GlobalLock lk(shutdownOpCtx.get(), MODE_X);
+        DatabaseHolder::getDatabaseHolder().closeAll(shutdownOpCtx.get(), "shutdown");
 
         // Shut down the background periodic task runner
         if (auto runner = serviceContext->getPeriodicRunner()) {
@@ -155,11 +155,11 @@ void shutdown(ServiceContext* srvContext) {
         }
 
         // Global storage engine may not be started in all cases before we exit
-        if (serviceContext->getGlobalStorageEngine()) {
-            serviceContext->shutdownGlobalStorageEngineCleanly();
+        if (serviceContext->getStorageEngine()) {
+            shutdownGlobalStorageEngineCleanly(serviceContext);
         }
 
-        Status status = mongo::runGlobalDeinitializers(serviceContext);
+        Status status = mongo::runGlobalDeinitializers();
         uassertStatusOKWithContext(status, "Global deinitilization failed");
     }
     shutdownOpCtx.reset();
@@ -176,21 +176,18 @@ void shutdown(ServiceContext* srvContext) {
 ServiceContext* initialize(const char* yaml_config) {
     srand(static_cast<unsigned>(curTimeMicros64()));
 
-    setGlobalServiceContext(createServiceContext());
-
     // yaml_config is passed to the options parser through the argc/argv interface that already
     // existed. If it is nullptr then use 0 count which will be interpreted as empty string.
     const char* argv[2] = {yaml_config, nullptr};
 
-    Status status =
-        mongo::runGlobalInitializers(yaml_config ? 1 : 0, argv, nullptr, getGlobalServiceContext());
+    Status status = mongo::runGlobalInitializers(yaml_config ? 1 : 0, argv, nullptr);
     uassertStatusOKWithContext(status, "Global initilization failed");
 
     Client::initThread("initandlisten");
 
     initWireSpec();
 
-    auto serviceContext = checked_cast<ServiceContextMongoEmbedded*>(getGlobalServiceContext());
+    auto serviceContext = getGlobalServiceContext();
 
     auto opObserverRegistry = std::make_unique<OpObserverRegistry>();
     opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
@@ -213,12 +210,12 @@ ServiceContext* initialize(const char* yaml_config) {
 
     DEV log(LogComponent::kControl) << "DEBUG build (which is slower)" << endl;
 
-    serviceContext->createLockFile();
+    createLockFile(serviceContext);
 
     serviceContext->setServiceEntryPoint(
         std::make_unique<ServiceEntryPointEmbedded>(serviceContext));
 
-    serviceContext->initializeGlobalStorageEngine();
+    initializeStorageEngine(serviceContext);
 
     // Warn if we detect configurations for multiple registered storage engines in the same
     // configuration file/environment.
@@ -232,7 +229,7 @@ ServiceContext* initialize(const char* yaml_config) {
             }
 
             // Warn if field name matches non-active registered storage engine.
-            if (serviceContext->isRegisteredStorageEngine(e.fieldName())) {
+            if (isRegisteredStorageEngine(serviceContext, e.fieldName())) {
                 warning() << "Detected configuration for non-active storage engine "
                           << e.fieldName() << " when current storage engine is "
                           << storageGlobalParams.engine;

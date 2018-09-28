@@ -181,7 +181,7 @@ public:
     }
 
 private:
-    using OwnedConnection = std::unique_ptr<ConnectionInterface>;
+    using OwnedConnection = std::shared_ptr<ConnectionInterface>;
     using OwnershipPool = stdx::unordered_map<ConnectionInterface*, OwnedConnection>;
     using LRUOwnershipPool = LRUCache<OwnershipPool::key_type, OwnershipPool::mapped_type>;
     using Request = std::pair<Date_t, SharedPromise<ConnectionHandle>>;
@@ -285,6 +285,10 @@ ConnectionPool::~ConnectionPool() {
         _manager->remove(this);
     }
 
+    shutdown();
+}
+
+void ConnectionPool::shutdown() {
     std::vector<SpecificPool*> pools;
 
     // Ensure we decrement active clients for all pools that we inc on (because we intend to process
@@ -297,7 +301,7 @@ ConnectionPool::~ConnectionPool() {
         }
     });
 
-    // Grab all current pools that don't match tags (under the lock)
+    // Grab all current pools (under the lock)
     {
         stdx::unique_lock<stdx::mutex> lk(_mutex);
 
@@ -649,8 +653,7 @@ void ConnectionPool::SpecificPool::processFailure(const Status& status,
     _readyPool.clear();
 
     // Log something helpful
-    log() << "Dropping all pooled connections to " << _hostAndPort
-          << " due to failed operation on a connection";
+    log() << "Dropping all pooled connections to " << _hostAndPort << " due to " << status;
 
     // Migrate processing connections to the dropped pool
     for (auto&& x : _processingPool) {
@@ -756,7 +759,7 @@ void ConnectionPool::SpecificPool::spawnConnections(stdx::unique_lock<stdx::mute
     // While all of our inflight connections are less than our target
     while ((_readyPool.size() + _processingPool.size() + _checkedOutPool.size() < target()) &&
            (_processingPool.size() < _parent->_options.maxConnecting)) {
-        std::unique_ptr<ConnectionPool::ConnectionInterface> handle;
+        OwnedConnection handle;
         try {
             // make a new connection and put it in processing
             handle = _parent->_factory->makeConnection(_hostAndPort, _generation);

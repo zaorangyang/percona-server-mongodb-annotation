@@ -71,8 +71,8 @@
 #include "mongo/util/debug_util.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_exception.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/password_digest.h"
@@ -466,7 +466,7 @@ void DBClientBase::_auth(const BSONObj& params) {
     std::string clientName = "";
 #ifdef MONGO_CONFIG_SSL
     if (sslManager() != nullptr) {
-        clientName = sslManager()->getSSLConfiguration().clientSubjectName;
+        clientName = sslManager()->getSSLConfiguration().clientSubjectName.toString();
     }
 #endif
 

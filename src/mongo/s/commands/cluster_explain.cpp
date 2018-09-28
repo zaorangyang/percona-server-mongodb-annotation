@@ -119,7 +119,7 @@ std::vector<Strategy::CommandResult> ClusterExplain::downconvert(
         }
         // Convert the error status back into the format of a command result.
         BSONObjBuilder statusObjBob;
-        CommandHelpers::appendCommandStatus(statusObjBob, status);
+        CommandHelpers::appendCommandStatusNoThrow(statusObjBob, status);
 
         // Get the Shard object in order to get the ConnectionString.
         auto shard =
@@ -236,7 +236,7 @@ void ClusterExplain::buildPlannerInfo(OperationContext* opCtx,
         singleShardBob.append("shardName", shardResults[i].shardTargetId.toString());
         {
             const auto shard = uassertStatusOK(
-                grid.shardRegistry()->getShard(opCtx, shardResults[i].shardTargetId));
+                Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardResults[i].shardTargetId));
             singleShardBob.append("connectionString", shard->getConnString().toString());
         }
         appendIfRoom(&singleShardBob, serverInfo, "serverInfo");

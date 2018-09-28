@@ -132,7 +132,7 @@ public:
                 {
                     BSONObjBuilder subbob(bob.subobjStart(host.toString()));
 
-                    if (CommandHelpers::appendCommandStatus(subbob, response.status)) {
+                    if (CommandHelpers::appendCommandStatusNoThrow(subbob, response.status)) {
                         subbob.append("data", response.data);
                         subbob.append("metadata", response.metadata);
                         if (response.elapsedMillis) {
@@ -147,12 +147,7 @@ public:
     }
 };
 
-MONGO_INITIALIZER(RegisterMulticast)(InitializerContext* context) {
-    if (getTestCommandsEnabled()) {
-        new MulticastCmd();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(MulticastCmd);
 
 }  // namespace
 }  // namespace mongo

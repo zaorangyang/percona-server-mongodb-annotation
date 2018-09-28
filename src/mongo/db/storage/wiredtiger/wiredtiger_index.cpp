@@ -84,8 +84,6 @@ static const int TempKeyMaxSize = 1024;  // this goes away with SERVER-3372
 
 static const WiredTigerItem emptyItem(NULL, 0);
 
-// This is the size constituted by CType byte and the kEnd byte in a Keystring object.
-constexpr std::size_t kCTypeAndKEndSize = 2;
 
 bool hasFieldNames(const BSONObj& obj) {
     BSONForEach(e, obj) {
@@ -172,12 +170,10 @@ std::string WiredTigerIndex::generateAppMetadataString(const IndexDescriptor& de
 
     int keyStringVersion;
 
-    // This gating variable controls the creation between timestamp safe and timestamp unsafe
-    // unique indexes. The gating condition will be enhanced to check for FCV 4.2 by SERVER-32825
+    // The gating variable controls the creation between timestamp safe and timestamp unsafe
+    // unique indexes. The gating condition will be enhanced to check for FCV 4.2 by SERVER-34489
     // and the gating variable will be removed when FCV 4.2 becomes available.
-    bool createNewStyleUniqueIdx = false;
-
-    if (createNewStyleUniqueIdx && desc.unique() && !desc.isIdIndex()) {
+    if (createTimestampSafeUniqueIndex && desc.unique() && !desc.isIdIndex()) {
         keyStringVersion = desc.version() >= IndexDescriptor::IndexVersion::kV2
             ? kDataFormatV4KeyStringV1UniqueIndexVersionV2
             : kDataFormatV3KeyStringV0UniqueIndexVersionV1;
@@ -250,7 +246,7 @@ StatusWith<std::string> WiredTigerIndex::generateCreateString(const std::string&
     ss << generateAppMetadataString(desc);
 
     bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
-        getGlobalReplSettings().getShouldRecoverFromOplogAsStandalone();
+        repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
     if (WiredTigerUtil::useTableLogging(NamespaceString(desc.parentNS()), replicatedWrites)) {
         ss << "log=(enabled=true)";
     } else {
@@ -308,7 +304,7 @@ WiredTigerIndex::WiredTigerIndex(OperationContext* ctx,
 
     if (!isReadOnly) {
         bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
-            getGlobalReplSettings().getShouldRecoverFromOplogAsStandalone();
+            repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
         uassertStatusOK(WiredTigerUtil::setTableLogging(
             ctx,
             uri,
@@ -1171,7 +1167,7 @@ public:
         auto keySize = KeyString::getKeySize(
             _key.getBuffer(), _key.getSize(), _idx.ordering(), _key.getTypeBits());
 
-        if (_key.getSize() == keySize + kCTypeAndKEndSize) {
+        if (_key.getSize() == keySize) {
             _updateIdAndTypeBitsFromValue();
         } else {
             // The RecordId is in the key at the end. This implementation is provided by the

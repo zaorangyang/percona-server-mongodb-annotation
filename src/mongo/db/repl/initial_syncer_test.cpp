@@ -236,6 +236,8 @@ protected:
         bool droppedUserDBs = false;
         std::vector<std::string> droppedCollections;
         int documentsInsertedCount = 0;
+        bool uniqueIndexUpdated = false;
+        bool upgradeNonReplicatedUniqueIndexesShouldFail = false;
     };
 
     stdx::mutex _storageInterfaceWorkDoneMutex;  // protects _storageInterfaceWorkDone.
@@ -248,6 +250,8 @@ protected:
                                                   const NamespaceString& nss) {
             LockGuard lock(_storageInterfaceWorkDoneMutex);
             _storageInterfaceWorkDone.createOplogCalled = true;
+            _storageInterfaceWorkDone.uniqueIndexUpdated = false;
+            _storageInterfaceWorkDone.upgradeNonReplicatedUniqueIndexesShouldFail = false;
             return Status::OK();
         };
         _storageInterface->truncateCollFn = [this](OperationContext* opCtx,
@@ -300,6 +304,19 @@ protected:
                 return StatusWith<std::unique_ptr<CollectionBulkLoader>>(
                     std::unique_ptr<CollectionBulkLoader>(collInfo->loader));
             };
+        _storageInterface->upgradeNonReplicatedUniqueIndexesFn = [this](OperationContext* opCtx) {
+            LockGuard lock(_storageInterfaceWorkDoneMutex);
+            if (_storageInterfaceWorkDone.upgradeNonReplicatedUniqueIndexesShouldFail) {
+                // One of the status codes a failed upgradeNonReplicatedUniqueIndexes call
+                // can return is NamespaceNotFound.
+                return Status(ErrorCodes::NamespaceNotFound,
+                              "upgradeNonReplicatedUniqueIndexes failed because the desired "
+                              "ns was not found.");
+            } else {
+                _storageInterfaceWorkDone.uniqueIndexUpdated = true;
+                return Status::OK();
+            }
+        };
 
         _dbWorkThreadPool = stdx::make_unique<ThreadPool>(ThreadPool::Options());
         _dbWorkThreadPool->startup();
@@ -326,7 +343,6 @@ protected:
             _setMyLastOptime(opTime, consistency);
         };
         options.resetOptimes = [this]() { _myLastOpTime = OpTime(); };
-        options.getSlaveDelay = [this]() { return Seconds(0); };
         options.syncSourceSelector = this;
 
         _options = options;
@@ -424,8 +440,8 @@ protected:
 
     void runInitialSyncWithBadFCVResponse(std::vector<BSONObj> docs,
                                           ErrorCodes::Error expectedError);
-    void doSuccessfulInitialSyncWithOneBatch();
-    OplogEntry doInitialSyncWithOneBatch();
+    void doSuccessfulInitialSyncWithOneBatch(bool shouldSetFCV);
+    OplogEntry doInitialSyncWithOneBatch(bool shouldSetFCV);
 
     std::unique_ptr<TaskExecutorMock> _executorProxy;
 
@@ -597,7 +613,6 @@ TEST_F(InitialSyncerTest, InvalidConstruction) {
     options.setMyLastOptime = [](const OpTime&,
                                  ReplicationCoordinator::DataConsistency consistency) {};
     options.resetOptimes = []() {};
-    options.getSlaveDelay = []() { return Seconds(0); };
     options.syncSourceSelector = this;
     auto callback = [](const StatusWith<OpTimeWithHash>&) {};
 
@@ -3384,7 +3399,7 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsGetNextApplierBatchCallbackOnOplog
     ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
 }
 
-OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch() {
+OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch(bool shouldSetFCV) {
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
 
@@ -3431,7 +3446,12 @@ OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch() {
         assertRemoteCommandNameEquals("getMore", request);
         net->blackHole(noi);
 
-        // Last rollback ID.
+        // Last rollback ID check. Before this check, set fCV to 4.2 if required by the test.
+        // TODO(SERVER-34489) Update below statement to setFCV=4.2 when upgrade/downgrade is ready.
+        if (shouldSetFCV) {
+            createTimestampSafeUniqueIndex = true;
+        }
+
         request = net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(baseRollbackId));
         assertRemoteCommandNameEquals("replSetGetRBID", request);
         net->runReadyNetworkOperations();
@@ -3447,8 +3467,10 @@ OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch() {
     return lastOp;
 }
 
-void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch() {
-    auto lastOp = doInitialSyncWithOneBatch();
+void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch(bool shouldSetFCV) {
+    auto lastOp = doInitialSyncWithOneBatch(shouldSetFCV);
+    // TODO(SERVER-34489) Replace this by fCV reset when upgrade/downgrade is ready.
+    createTimestampSafeUniqueIndex = false;
     ASSERT_EQUALS(lastOp.getOpTime(), unittest::assertGet(_lastApplied).opTime);
     ASSERT_EQUALS(lastOp.getHash(), unittest::assertGet(_lastApplied).value);
 
@@ -3457,7 +3479,14 @@ void InitialSyncerTest::doSuccessfulInitialSyncWithOneBatch() {
 
 TEST_F(InitialSyncerTest,
        InitialSyncerReturnsLastAppliedOnReachingStopTimestampAfterApplyingOneBatch) {
-    doSuccessfulInitialSyncWithOneBatch();
+    // Tell test to setFCV=4.2 before the last rollback ID check.
+    // _rollbackCheckerCheckForRollbackCallback() calls upgradeNonReplicatedUniqueIndexes
+    // only if fCV is 4.2.
+    doSuccessfulInitialSyncWithOneBatch(true);
+
+    // Ensure that upgradeNonReplicatedUniqueIndexes is called.
+    LockGuard lock(_storageInterfaceWorkDoneMutex);
+    ASSERT_TRUE(_storageInterfaceWorkDone.uniqueIndexUpdated);
 }
 
 TEST_F(InitialSyncerTest,
@@ -3988,6 +4017,95 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
     ASSERT_EQUALS(attempt1["durationMillis"].type(), NumberInt) << attempt1;
     ASSERT_EQUALS(attempt1.getStringField("syncSource"), std::string("localhost:27017"))
         << attempt1;
+}
+
+TEST_F(InitialSyncerTest, GetInitialSyncProgressOmitsClonerStatsIfClonerStatsExceedBsonLimit) {
+    auto initialSyncer = &getInitialSyncer();
+    auto opCtx = makeOpCtx();
+
+    _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 27017));
+    ASSERT_OK(initialSyncer->startup(opCtx.get(), 2U));
+
+    const std::size_t numCollections = 200000U;
+
+    auto net = getNet();
+    int baseRollbackId = 1;
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+
+        // Base rollback ID.
+        net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(baseRollbackId));
+        net->runReadyNetworkOperations();
+
+        // Last oplog entry.
+        processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
+
+        // Feature Compatibility Version.
+        processSuccessfulFCVFetcherResponse36();
+
+        // listDatabases
+        NamespaceString nss("a.a");
+        auto request =
+            net->scheduleSuccessfulResponse(makeListDatabasesResponse({nss.db().toString()}));
+        assertRemoteCommandNameEquals("listDatabases", request);
+        net->runReadyNetworkOperations();
+
+        // Ignore oplog tailing query.
+        request = net->scheduleSuccessfulResponse(
+            makeCursorResponse(1LL, _options.localOplogNS, {makeOplogEntryObj(1)}));
+        assertRemoteCommandNameEquals("find", request);
+        ASSERT_TRUE(request.cmdObj.getBoolField("oplogReplay"));
+        net->runReadyNetworkOperations();
+
+        // listCollections for "a"
+        std::vector<BSONObj> collectionInfos;
+        for (std::size_t i = 0; i < numCollections; ++i) {
+            const std::string collName = str::stream() << "coll-" << i;
+            collectionInfos.push_back(BSON("name" << collName << "options" << BSONObj()));
+        }
+        request = net->scheduleSuccessfulResponse(
+            makeCursorResponse(0LL, nss.getCommandNS(), collectionInfos));
+        assertRemoteCommandNameEquals("listCollections", request);
+        net->runReadyNetworkOperations();
+    }
+
+    // This returns a valid document because we omit the cloner stats when they do not fit in a
+    // BSON document.
+    auto progress = initialSyncer->getInitialSyncProgress();
+    ASSERT_EQUALS(progress["initialSyncStart"].type(), Date) << progress;
+    ASSERT_FALSE(progress.hasField("databases")) << progress;
+
+    // Initial sync will attempt to log stats again at shutdown in a callback, where it should not
+    // terminate because we now return a valid stats document.
+    ASSERT_OK(initialSyncer->shutdown());
+
+    // Deliver cancellation signal to callbacks.
+    executor::NetworkInterfaceMock::InNetworkGuard(net)->runReadyNetworkOperations();
+
+    initialSyncer->join();
+}
+
+TEST_F(InitialSyncerTest, InitialSyncerDoesNotCallUpgradeNonReplicatedUniqueIndexesOnFCV40) {
+    // In MongoDB 4.2, upgradeNonReplicatedUniqueIndexes will only be called if fCV is 4.2.
+    doSuccessfulInitialSyncWithOneBatch(false);
+
+    // TODO(SERVER-34489) Ensure that upgradeNonReplicatedUniqueIndexes is not called if fCV
+    // is not 4.2.
+    LockGuard lock(_storageInterfaceWorkDoneMutex);
+    ASSERT_FALSE(_storageInterfaceWorkDone.uniqueIndexUpdated);
+}
+
+TEST_F(InitialSyncerTest, InitialSyncerUpgradeNonReplicatedUniqueIndexesError) {
+    // Ensure upgradeNonReplicatedUniqueIndexes returns a bad status. This should be passed to the
+    // initial syncer.
+    {
+        LockGuard lock(_storageInterfaceWorkDoneMutex);
+        _storageInterfaceWorkDone.upgradeNonReplicatedUniqueIndexesShouldFail = true;
+    }
+    doInitialSyncWithOneBatch(true);
+
+    // Ensure the upgradeNonReplicatedUniqueIndexes status was captured.
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, _lastApplied);
 }
 
 }  // namespace

@@ -37,6 +37,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/sync_tail.h"
@@ -46,6 +47,154 @@
 
 namespace mongo {
 namespace repl {
+
+namespace {
+
+const auto kRecoveryLogLevel = logger::LogSeverity::Debug(2);
+
+/**
+ * Tracks and logs operations applied during recovery.
+ */
+class RecoveryOplogApplierStats : public OplogApplier::Observer {
+public:
+    void onBatchBegin(const OplogApplier::Operations& batch) final {
+        _numBatches++;
+        LOG_FOR_RECOVERY(kRecoveryLogLevel)
+            << "Applying operations in batch: " << _numBatches << "(" << batch.size()
+            << " operations from " << batch.front().getOpTime() << " (inclusive) to "
+            << batch.back().getOpTime()
+            << " (inclusive)). Operations applied so far: " << _numOpsApplied;
+
+        _numOpsApplied += batch.size();
+        if (shouldLog(::mongo::logger::LogComponent::kStorageRecovery, kRecoveryLogLevel)) {
+            std::size_t i = 0;
+            for (const auto& entry : batch) {
+                i++;
+                LOG_FOR_RECOVERY(kRecoveryLogLevel)
+                    << "Applying op " << i << " of " << batch.size() << " (in batch " << _numBatches
+                    << ") during replication recovery: " << redact(entry.raw);
+            }
+        }
+    }
+
+    void onBatchEnd(const StatusWith<OpTime>&, const OplogApplier::Operations&) final {}
+    void onMissingDocumentsFetchedAndInserted(const std::vector<FetchInfo>&) final {}
+    void onOperationConsumed(const BSONObj& op) final {}
+
+    void complete(const OpTime& applyThroughOpTime) const {
+        LOG_FOR_RECOVERY(kRecoveryLogLevel)
+            << "Applied " << _numOpsApplied << " operations in " << _numBatches
+            << " batches. Last operation applied with optime: " << applyThroughOpTime;
+    }
+
+private:
+    std::size_t _numBatches = 0;
+    std::size_t _numOpsApplied = 0;
+};
+
+/**
+ * OplogBuffer adaptor for a DBClient query on the oplog.
+ * Implements only functions used by OplogApplier::getNextApplierBatch().
+ */
+class OplogBufferLocalOplog final : public OplogBuffer {
+public:
+    explicit OplogBufferLocalOplog(Timestamp oplogApplicationStartPoint)
+        : _oplogApplicationStartPoint(oplogApplicationStartPoint) {}
+
+    void startup(OperationContext* opCtx) final {
+        _client = std::make_unique<DBDirectClient>(opCtx);
+        _cursor = _client->query(NamespaceString::kRsOplogNamespace.ns(),
+                                 QUERY("ts" << BSON("$gte" << _oplogApplicationStartPoint)),
+                                 /*batchSize*/ 0,
+                                 /*skip*/ 0,
+                                 /*projection*/ nullptr,
+                                 QueryOption_OplogReplay);
+
+        // Check that the first document matches our appliedThrough point then skip it since it's
+        // already been applied.
+        if (!_cursor->more()) {
+            // This should really be impossible because we check above that the top of the oplog is
+            // strictly > appliedThrough. If this fails it represents a serious bug in either the
+            // storage engine or query's implementation of OplogReplay.
+            severe() << "Couldn't find any entries in the oplog >= "
+                     << _oplogApplicationStartPoint.toBSON() << " which should be impossible.";
+            fassertFailedNoTrace(40293);
+        }
+
+        auto firstTimestampFound =
+            fassert(40291, OpTime::parseFromOplogEntry(_cursor->nextSafe())).getTimestamp();
+        if (firstTimestampFound != _oplogApplicationStartPoint) {
+            severe() << "Oplog entry at " << _oplogApplicationStartPoint.toBSON()
+                     << " is missing; actual entry found is " << firstTimestampFound.toBSON();
+            fassertFailedNoTrace(40292);
+        }
+    }
+
+    void shutdown(OperationContext*) final {
+        _cursor = {};
+        _client = {};
+    }
+
+    bool isEmpty() const final {
+        return !_cursor->more();
+    }
+
+    bool tryPop(OperationContext*, Value* value) final {
+        return _peekOrPop(value, Mode::kPop);
+    }
+
+    bool peek(OperationContext*, Value* value) final {
+        return _peekOrPop(value, Mode::kPeek);
+    }
+
+    void pushEvenIfFull(OperationContext*, const Value&) final {
+        MONGO_UNREACHABLE;
+    }
+    void push(OperationContext*, const Value&) final {
+        MONGO_UNREACHABLE;
+    }
+    void pushAllNonBlocking(OperationContext*, Batch::const_iterator, Batch::const_iterator) final {
+        MONGO_UNREACHABLE;
+    }
+    void waitForSpace(OperationContext*, std::size_t) final {
+        MONGO_UNREACHABLE;
+    }
+    std::size_t getMaxSize() const final {
+        MONGO_UNREACHABLE;
+    }
+    std::size_t getSize() const final {
+        MONGO_UNREACHABLE;
+    }
+    std::size_t getCount() const final {
+        MONGO_UNREACHABLE;
+    }
+    void clear(OperationContext*) final {
+        MONGO_UNREACHABLE;
+    }
+    bool waitForData(Seconds) final {
+        MONGO_UNREACHABLE;
+    }
+    boost::optional<Value> lastObjectPushed(OperationContext*) const final {
+        MONGO_UNREACHABLE;
+    }
+
+private:
+    enum class Mode { kPeek, kPop };
+    bool _peekOrPop(Value* value, Mode mode) {
+        if (isEmpty()) {
+            return false;
+        }
+        *value = mode == Mode::kPeek ? _cursor->peekFirst() : _cursor->nextSafe();
+        invariant(!value->isEmpty());
+        return true;
+    }
+
+    const Timestamp _oplogApplicationStartPoint;
+    std::unique_ptr<DBDirectClient> _client;
+    std::unique_ptr<DBClientCursor> _cursor;
+};
+
+}  // namespace
 
 ReplicationRecoveryImpl::ReplicationRecoveryImpl(StorageInterface* storageInterface,
                                                  ReplicationConsistencyMarkers* consistencyMarkers)
@@ -103,7 +252,7 @@ void ReplicationRecoveryImpl::recoverFromOplog(OperationContext* opCtx,
     }
 
     const auto appliedThrough = _consistencyMarkers->getAppliedThrough(opCtx);
-    invariant(!stableTimestamp || appliedThrough.isNull() ||
+    invariant(!stableTimestamp || stableTimestamp->isNull() || appliedThrough.isNull() ||
                   *stableTimestamp == appliedThrough.getTimestamp(),
               str::stream() << "Stable timestamp " << stableTimestamp->toString()
                             << " does not equal appliedThrough timestamp "
@@ -197,50 +346,40 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
     log() << "Replaying stored operations from " << oplogApplicationStartPoint.toBSON()
           << " (exclusive) to " << topOfOplog.toBSON() << " (inclusive).";
 
-    DBDirectClient db(opCtx);
-    auto cursor = db.query(NamespaceString::kRsOplogNamespace.ns(),
-                           QUERY("ts" << BSON("$gte" << oplogApplicationStartPoint)),
-                           /*batchSize*/ 0,
-                           /*skip*/ 0,
-                           /*projection*/ nullptr,
-                           QueryOption_OplogReplay);
+    OplogBufferLocalOplog oplogBuffer(oplogApplicationStartPoint);
+    oplogBuffer.startup(opCtx);
 
-    // Check that the first document matches our appliedThrough point then skip it since it's
-    // already been applied.
-    if (!cursor->more()) {
-        // This should really be impossible because we check above that the top of the oplog is
-        // strictly > appliedThrough. If this fails it represents a serious bug in either the
-        // storage engine or query's implementation of OplogReplay.
-        severe() << "Couldn't find any entries in the oplog >= "
-                 << oplogApplicationStartPoint.toBSON() << " which should be impossible.";
-        fassertFailedNoTrace(40293);
+    RecoveryOplogApplierStats stats;
+
+    auto writerPool = SyncTail::makeWriterPool();
+    OplogApplier::Options options;
+    options.allowNamespaceNotFoundErrorsOnCrudOps = true;
+    options.skipWritesToOplog = true;
+    OplogApplier oplogApplier(nullptr,
+                              &oplogBuffer,
+                              &stats,
+                              nullptr,
+                              _consistencyMarkers,
+                              _storageInterface,
+                              options,
+                              writerPool.get());
+
+    OplogApplier::BatchLimits batchLimits;
+    batchLimits.bytes = SyncTail::calculateBatchLimitBytes(opCtx, _storageInterface);
+    batchLimits.ops = std::size_t(SyncTail::replBatchLimitOperations.load());
+
+    OpTime applyThroughOpTime;
+    OplogApplier::Operations batch;
+    while (
+        !(batch = fassert(50763, oplogApplier.getNextApplierBatch(opCtx, batchLimits))).empty()) {
+        applyThroughOpTime = uassertStatusOK(oplogApplier.multiApply(opCtx, std::move(batch)));
     }
-
-    auto firstTimestampFound =
-        fassert(40291, OpTime::parseFromOplogEntry(cursor->nextSafe())).getTimestamp();
-    if (firstTimestampFound != oplogApplicationStartPoint) {
-        severe() << "Oplog entry at " << oplogApplicationStartPoint.toBSON()
-                 << " is missing; actual entry found is " << firstTimestampFound.toBSON();
-        fassertFailedNoTrace(40292);
-    }
-
-    // Apply remaining ops one at at time, but don't log them because they are already logged.
-    UnreplicatedWritesBlock uwb(opCtx);
-    DisableDocumentValidation validationDisabler(opCtx);
-
-    BSONObj entry;
-    while (cursor->more()) {
-        entry = cursor->nextSafe();
-        LOG_FOR_RECOVERY(2) << "Applying op during replication recovery: " << redact(entry);
-        fassert(40294, SyncTail::syncApply(opCtx, entry, OplogApplication::Mode::kRecovering));
-
-        auto oplogEntry = fassert(50763, OplogEntry::parse(entry));
-        if (auto txnTableOplog = Session::createMatchingTransactionTableUpdate(oplogEntry)) {
-            fassert(50764,
-                    SyncTail::syncApply(
-                        opCtx, txnTableOplog->toBSON(), OplogApplication::Mode::kRecovering));
-        }
-    }
+    stats.complete(applyThroughOpTime);
+    invariant(oplogBuffer.isEmpty(),
+              str::stream() << "Oplog buffer not empty after applying operations. Last operation "
+                               "applied with optime: "
+                            << applyThroughOpTime.toBSON());
+    oplogBuffer.shutdown(opCtx);
 
     // We may crash before setting appliedThrough. If we have a stable checkpoint, we will recover
     // to that checkpoint at a replication consistent point, and applying the oplog is safe.
@@ -248,8 +387,7 @@ void ReplicationRecoveryImpl::_applyToEndOfOplog(OperationContext* opCtx,
     // recovery, because we only roll back to a stable timestamp when we have a stable checkpoint.
     // Startup recovery from an unstable checkpoint only ever applies a single batch and it is safe
     // to replay the batch from any point.
-    _consistencyMarkers->setAppliedThrough(opCtx,
-                                           fassert(40295, OpTime::parseFromOplogEntry(entry)));
+    _consistencyMarkers->setAppliedThrough(opCtx, applyThroughOpTime);
 }
 
 StatusWith<OpTime> ReplicationRecoveryImpl::_getTopOfOplog(OperationContext* opCtx) const {

@@ -715,7 +715,10 @@ public:
 
     /*
     * Handles an incoming replSetRequestVotes command.
-    * Adds BSON to 'resultObj'; returns a Status with either OK or an error message.
+    *
+    * Populates the given 'response' object with the result of the request. If there is a failure
+    * processing the vote request, returns an error status. If an error is returned, the value of
+    * the populated 'response' object is invalid.
     */
     virtual Status processReplSetRequestVotes(OperationContext* opCtx,
                                               const ReplSetRequestVotesArgs& args,
@@ -759,21 +762,6 @@ public:
      * Returns StaleTerm if the supplied term was higher than the current term.
      */
     virtual Status updateTerm(OperationContext* opCtx, long long term) = 0;
-
-    /**
-     * Returns the minimum visible snapshot for this operation.
-     *
-     * This name is guaranteed to compare > all names reserved before and < all names reserved
-     * after.
-     *
-     * This method will not take any locks or attempt to access storage using the passed-in
-     * OperationContext. It will only be used to return reserved SnapshotNames by each operation so
-     * callers can correctly wait for the reserved snapshot to be visible.
-     *
-     * A null OperationContext can be used in cases where the snapshot to wait for should not be
-     * adjusted.
-     */
-    virtual Timestamp getMinimumVisibleSnapshot(OperationContext* opCtx) = 0;
 
     /**
      * Blocks until either the current committed snapshot is at least as high as 'untilSnapshot',

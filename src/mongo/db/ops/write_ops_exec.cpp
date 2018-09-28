@@ -212,7 +212,7 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
         if (!db.getDb()->getCollection(opCtx, ns)) {  // someone else may have beat us to it.
             uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
             WriteUnitOfWork wuow(opCtx);
-            uassertStatusOK(userCreateNS(opCtx, db.getDb(), ns.ns(), BSONObj()));
+            uassertStatusOK(Database::userCreateNS(opCtx, db.getDb(), ns.ns(), BSONObj()));
             wuow.commit();
         }
     });
@@ -384,6 +384,8 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
     auto acquireCollection = [&] {
         while (true) {
             if (MONGO_FAIL_POINT(hangDuringBatchInsert)) {
+                log() << "batch insert - hangDuringBatchInsert fail point enabled. Blocking until "
+                         "fail point is disabled.";
                 MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangDuringBatchInsert);
             }
 

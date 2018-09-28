@@ -364,15 +364,6 @@ Status addMongodOptions(moe::OptionSection* options) {
         "size to use (in MB) for replication op log. default is 5% of disk space "
         "(i.e. large is good)");
 
-    replication_options
-        .addOptionChaining("replication.recoverFromOplogAsStandalone",
-                           "recoverFromOplogAsStandalone",
-                           moe::Switch,
-                           "specifies that a standalone should execute replication recovery")
-        .hidden()
-        .incompatibleWith("replication.replSet")
-        .incompatibleWith("replication.replSetName");
-
     rs_options
         .addOptionChaining("replication.replSet",
                            "replSet",
@@ -1001,17 +992,9 @@ Status storeMongodOptions(const moe::Environment& params) {
         mmapv1GlobalOptions.smallfiles = params["storage.mmapv1.smallFiles"].as<bool>();
     }
 
-    if ((params.count("storage.journal.enabled") &&
-         params["storage.journal.enabled"].as<bool>() == true) &&
-        params.count("repair")) {
-        return Status(ErrorCodes::BadValue,
-                      "Can't have journaling enabled when using --repair option.");
-    }
-
     if (params.count("repair") && params["repair"].as<bool>() == true) {
         storageGlobalParams.upgrade = 1;  // --repair implies --upgrade
         storageGlobalParams.repair = 1;
-        storageGlobalParams.dur = false;
     }
     if (params.count("upgrade") && params["upgrade"].as<bool>() == true) {
         storageGlobalParams.upgrade = 1;
@@ -1070,10 +1053,6 @@ Status storeMongodOptions(const moe::Environment& params) {
         }
         replSettings.setOplogSizeBytes(x * 1024 * 1024);
         invariant(replSettings.getOplogSizeBytes() > 0);
-    }
-    if (params.count("replication.recoverFromOplogAsStandalone")) {
-        replSettings.setShouldRecoverFromOplogAsStandalone(
-            params["replication.recoverFromOplogAsStandalone"].as<bool>());
     }
 
     if (params.count("cacheSize")) {

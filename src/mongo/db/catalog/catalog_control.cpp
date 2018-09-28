@@ -56,11 +56,11 @@ void closeCatalog(OperationContext* opCtx) {
     // Close all databases.
     log() << "closeCatalog: closing all databases";
     constexpr auto reason = "closing databases for closeCatalog";
-    dbHolder().closeAll(opCtx, reason);
+    DatabaseHolder::getDatabaseHolder().closeAll(opCtx, reason);
 
     // Close the storage engine's catalog.
     log() << "closeCatalog: closing storage engine catalog";
-    opCtx->getServiceContext()->getGlobalStorageEngine()->closeCatalog(opCtx);
+    opCtx->getServiceContext()->getStorageEngine()->closeCatalog(opCtx);
 }
 
 void openCatalog(OperationContext* opCtx) {
@@ -68,7 +68,7 @@ void openCatalog(OperationContext* opCtx) {
 
     // Load the catalog in the storage engine.
     log() << "openCatalog: loading storage engine catalog";
-    auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     storageEngine->loadCatalog(opCtx);
 
     log() << "openCatalog: reconciling catalog and idents";
@@ -145,7 +145,7 @@ void openCatalog(OperationContext* opCtx) {
     storageEngine->listDatabases(&databasesToOpen);
     for (auto&& dbName : databasesToOpen) {
         LOG(1) << "openCatalog: dbholder reopening database " << dbName;
-        auto db = dbHolder().openDb(opCtx, dbName);
+        auto db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbName);
         invariant(db, str::stream() << "failed to reopen database " << dbName);
 
         std::list<std::string> collections;

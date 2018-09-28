@@ -41,7 +41,7 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
@@ -236,13 +236,11 @@ public:
                            BSONObjBuilder& result) {
         BSONElement val = cmdObj.firstElement();
         if (val.type() != String) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::TypeMismatch,
-                       str::stream() << "Argument to getLog must be of type String; found "
-                                     << val.toString(false)
-                                     << " of type "
-                                     << typeName(val.type())));
+            uasserted(ErrorCodes::TypeMismatch,
+                      str::stream() << "Argument to getLog must be of type String; found "
+                                    << val.toString(false)
+                                    << " of type "
+                                    << typeName(val.type()));
         }
 
         string p = val.String();
@@ -306,13 +304,10 @@ public:
                      BSONObjBuilder& result) {
         std::string logName;
         Status status = bsonExtractStringField(cmdObj, "clearLog", &logName);
-        if (!status.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, status);
-        }
+        uassertStatusOK(status);
 
         if (logName != "global") {
-            return CommandHelpers::appendCommandStatus(
-                result, Status(ErrorCodes::InvalidOptions, "Only the 'global' log can be cleared"));
+            uasserted(ErrorCodes::InvalidOptions, "Only the 'global' log can be cleared");
         }
         RamLog* ramlog = RamLog::getIfExists(logName);
         invariant(ramlog);
@@ -321,13 +316,7 @@ public:
     }
 };
 
-MONGO_INITIALIZER(RegisterClearLogCmd)(InitializerContext* context) {
-    if (getTestCommandsEnabled()) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new ClearLogCmd();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(ClearLogCmd);
 
 }  // namespace
 

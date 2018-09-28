@@ -41,6 +41,7 @@
 #include "mongo/db/record_id.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/util/timer.h"
 
@@ -92,7 +93,12 @@ public:
 
     void setPrepareTimestamp(Timestamp timestamp) override;
 
-    Status setPointInTimeReadTimestamp(Timestamp timestamp) override;
+    void setIgnorePrepared(bool ignore) override;
+
+    void setTimestampReadSource(ReadSource source,
+                                boost::optional<Timestamp> provided = boost::none) override;
+
+    ReadSource getTimestampReadSource() const override;
 
     void* writingPtr(void* data, size_t len) override;
 
@@ -105,7 +111,9 @@ public:
     // ---- WT STUFF
 
     WiredTigerSession* getSession();
-    void setIsOplogReader();
+    void setIsOplogReader() {
+        _isOplogReader = true;
+    }
 
     /**
      * Enter a period of wait or computation during which there are no WT calls.
@@ -135,20 +143,12 @@ public:
     static void appendGlobalStats(BSONObjBuilder& b);
 
 private:
-    bool _isReadingFromPointInTime() const {
-        return _replicationMode == repl::ReplicationCoordinator::modeReplSet &&
-            (_readConcernLevel == repl::ReadConcernLevel::kMajorityReadConcern ||
-             _readConcernLevel == repl::ReadConcernLevel::kSnapshotReadConcern);
-    }
-
     void _abort();
     void _commit();
 
     void _ensureSession();
     void _txnClose(bool commit);
     void _txnOpen();
-
-    char* _getOplogReaderConfigString();
 
     WiredTigerSessionCache* _sessionCache;  // not owned
     WiredTigerOplogManager* _oplogManager;  // not owned
@@ -157,11 +157,21 @@ private:
     bool _inUnitOfWork;
     bool _active;
     bool _isTimestamped = false;
+
+    // Specifies which external source to use when setting read timestamps on transactions.
+    ReadSource _timestampReadSource = ReadSource::kNone;
+
     // Commits are assumed ordered.  Unordered commits are assumed to always need to reserve a
     // new optime, and thus always call oplogDiskLocRegister() on the record store.
     bool _orderedCommit = true;
+
+    // Ignoring prepared transactions will not return prepare conflicts and allow seeing prepared,
+    // but uncommitted data.
+    WiredTigerBeginTxnBlock::IgnorePrepared _ignorePrepared{
+        WiredTigerBeginTxnBlock::IgnorePrepared::kNoIgnore};
     Timestamp _commitTimestamp;
     Timestamp _prepareTimestamp;
+    boost::optional<Timestamp> _lastTimestampSet;
     uint64_t _mySnapshotId;
     Timestamp _majorityCommittedSnapshot;
     Timestamp _readAtTimestamp;

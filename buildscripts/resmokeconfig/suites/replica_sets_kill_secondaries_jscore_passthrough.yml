@@ -17,6 +17,7 @@ selector:
 
 executor:
   archive:
+    tests: true
     hooks:
       - PeriodicKillSecondaries
   config:
@@ -24,7 +25,6 @@ executor:
       eval: "testingReplication = true;"
       readMode: commands
   hooks:
-  - class: CheckPrimary
   - class: PeriodicKillSecondaries
   fixture:
     class: ReplicaSetFixture

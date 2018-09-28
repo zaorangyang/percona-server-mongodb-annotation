@@ -26,6 +26,7 @@ env.Library(
         'cluster_add_shard_to_zone_cmd.cpp',
         'cluster_aggregate.cpp',
         'cluster_available_query_options_cmd.cpp',
+        'cluster_build_info.cpp',
         'cluster_coll_stats_cmd.cpp',
         'cluster_collection_mod_cmd.cpp',
         'cluster_compact_cmd.cpp',
@@ -94,7 +95,9 @@ env.Library(
         env.Idlc('cluster_multicast.idl')[0],
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/auth/authmongos',
+        '$BUILD_DIR/mongo/db/auth/auth',
+        '$BUILD_DIR/mongo/db/auth/role_graph',
+        '$BUILD_DIR/mongo/db/auth/saslauth',
         '$BUILD_DIR/mongo/db/commands/core',
         '$BUILD_DIR/mongo/db/commands/current_op_common',
         '$BUILD_DIR/mongo/db/commands/servers',
@@ -112,6 +115,7 @@ env.Library(
         '$BUILD_DIR/mongo/s/sharding_api',
         '$BUILD_DIR/mongo/s/sharding_legacy_api',
         '$BUILD_DIR/mongo/s/write_ops/cluster_write_op_conversion',
+        '$BUILD_DIR/mongo/transport/message_compressor',
         '$BUILD_DIR/mongo/transport/transport_layer_common',
         'shared_cluster_commands',
     ]
@@ -124,7 +128,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'shared_cluster_commands',
-        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/db/logical_time',
         '$BUILD_DIR/mongo/unittest/unittest',
@@ -139,7 +143,7 @@ env.CppUnitTest(
     LIBDEPS=[
         'shared_cluster_commands',
         '$BUILD_DIR/mongo/s/catalog_cache_test_fixture',
-        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/unittest/unittest',
@@ -153,7 +157,8 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'cluster_commands',
-        '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/auth/saslauth',
         '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/s/catalog_cache_test_fixture',
     ],

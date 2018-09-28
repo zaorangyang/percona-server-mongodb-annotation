@@ -94,20 +94,14 @@ void SyncTailTest::setUp() {
     ReplicationCoordinator::set(service, stdx::make_unique<ReplicationCoordinatorMock>(service));
     ASSERT_OK(ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_PRIMARY));
 
-    StorageInterface::set(service, stdx::make_unique<StorageInterfaceImpl>());
-    auto storageInterface = StorageInterface::get(service);
+    _storageInterface = stdx::make_unique<StorageInterfaceImpl>();
 
     DropPendingCollectionReaper::set(
-        service, stdx::make_unique<DropPendingCollectionReaper>(storageInterface));
+        service, stdx::make_unique<DropPendingCollectionReaper>(_storageInterface.get()));
     repl::setOplogCollectionName(service);
     repl::createOplog(_opCtx.get());
 
-    _replicationProcess =
-        new ReplicationProcess(storageInterface,
-                               stdx::make_unique<ReplicationConsistencyMarkersMock>(),
-                               stdx::make_unique<ReplicationRecoveryMock>());
-    ReplicationProcess::set(cc().getServiceContext(),
-                            std::unique_ptr<ReplicationProcess>(_replicationProcess));
+    _consistencyMarkers = stdx::make_unique<ReplicationConsistencyMarkersMock>();
 
     // Set up an OpObserver to track the documents SyncTail inserts.
     auto opObserver = std::make_unique<SyncTailOpObserver>();
@@ -125,10 +119,19 @@ void SyncTailTest::setUp() {
 void SyncTailTest::tearDown() {
     auto service = getServiceContext();
     _opCtx.reset();
-    ReplicationProcess::set(service, {});
+    _storageInterface = {};
+    _consistencyMarkers = {};
     DropPendingCollectionReaper::set(service, {});
     StorageInterface::set(service, {});
     ServiceContextMongoDTest::tearDown();
+}
+
+ReplicationConsistencyMarkers* SyncTailTest::getConsistencyMarkers() const {
+    return _consistencyMarkers.get();
+}
+
+StorageInterface* SyncTailTest::getStorageInterface() const {
+    return _storageInterface.get();
 }
 
 void SyncTailTest::_testSyncApplyCrudOperation(ErrorCodes::Error expectedError,
@@ -187,7 +190,11 @@ Status SyncTailTest::runOpSteadyState(const OplogEntry& op) {
 }
 
 Status SyncTailTest::runOpsSteadyState(std::vector<OplogEntry> ops) {
-    SyncTail syncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr);
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      SyncTail::MultiSyncApplyFunc(),
+                      nullptr);
     MultiApplier::OperationPtrs opsPtrs;
     for (auto& op : ops) {
         opsPtrs.push_back(&op);
@@ -201,7 +208,11 @@ Status SyncTailTest::runOpInitialSync(const OplogEntry& op) {
 }
 
 Status SyncTailTest::runOpsInitialSync(std::vector<OplogEntry> ops) {
-    SyncTail syncTail(nullptr, SyncTail::MultiSyncApplyFunc(), nullptr);
+    SyncTail syncTail(nullptr,
+                      getConsistencyMarkers(),
+                      getStorageInterface(),
+                      SyncTail::MultiSyncApplyFunc(),
+                      nullptr);
     MultiApplier::OperationPtrs opsPtrs;
     for (auto& op : ops) {
         opsPtrs.push_back(&op);

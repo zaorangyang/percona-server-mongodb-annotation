@@ -32,13 +32,14 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/free_mon/free_mon_commands_gen.h"
 #include "mongo/db/free_mon/free_mon_controller.h"
+#include "mongo/db/free_mon/free_mon_options.h"
 #include "mongo/db/free_mon/free_mon_storage.h"
 
 namespace mongo {
 
 namespace {
 
-const auto kRegisterSyncTimeout = Milliseconds{100};
+const auto kRegisterSyncTimeout = Milliseconds{5000};
 
 /**
  * Indicates the current status of Free Monitoring.
@@ -46,6 +47,10 @@ const auto kRegisterSyncTimeout = Milliseconds{100};
 class GetFreeMonitoringStatusCommand : public BasicCommand {
 public:
     GetFreeMonitoringStatusCommand() : BasicCommand("getFreeMonitoringStatus") {}
+
+    bool adminOnly() const override {
+        return true;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kAlways;
@@ -77,7 +82,17 @@ public:
         IDLParserErrorContext ctx("getFreeMonitoringStatus");
         GetFreeMonitoringStatus::parse(ctx, cmdObj);
 
-        FreeMonStorage::getStatus(opCtx, &result);
+        if (globalFreeMonParams.freeMonitoringState == EnableCloudStateEnum::kOff) {
+            result.append("state", "disabled");
+            return true;
+        }
+
+        auto* controller = FreeMonController::get(opCtx->getServiceContext());
+        if (!controller) {
+            result.append("state", "disabled");
+        } else {
+            controller->getStatus(opCtx, &result);
+        }
         return true;
     }
 } getFreeMonitoringStatusCommand;
@@ -88,6 +103,10 @@ public:
 class SetFreeMonitoringCommand : public BasicCommand {
 public:
     SetFreeMonitoringCommand() : BasicCommand("setFreeMonitoring") {}
+
+    bool adminOnly() const override {
+        return true;
+    }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kNever;
@@ -119,6 +138,12 @@ public:
         auto cmd = SetFreeMonitoring::parse(ctx, cmdObj);
 
         auto* controller = FreeMonController::get(opCtx->getServiceContext());
+        if (!controller) {
+            // Pending operation.
+            uasserted(50840,
+                      "Free Monitoring has been disabled via the command-line and/or config file");
+        }
+
         boost::optional<Status> optStatus = boost::none;
         if (cmd.getAction() == SetFreeMonActionEnum::enable) {
             optStatus = controller->registerServerCommand(kRegisterSyncTimeout);
@@ -128,11 +153,11 @@ public:
 
         if (optStatus) {
             // Completed within timeout.
-            return CommandHelpers::appendCommandStatus(result, *optStatus);
+            uassertStatusOK(*optStatus);
         } else {
             // Pending operation.
-            return CommandHelpers::appendCommandStatus(result, Status::OK());
         }
+        return true;
     }
 
 } setFreeMonitoringCmd;

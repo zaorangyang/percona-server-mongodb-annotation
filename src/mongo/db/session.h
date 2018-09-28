@@ -34,6 +34,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/read_concern_args.h"
@@ -152,12 +153,19 @@ public:
     void beginOrContinueTxn(OperationContext* opCtx,
                             TxnNumber txnNumber,
                             boost::optional<bool> autocommit,
-                            boost::optional<bool> startTransaction);
+                            boost::optional<bool> startTransaction,
+                            StringData dbName,
+                            StringData cmdName);
     /**
      * Similar to beginOrContinueTxn except it is used specifically for shard migrations and does
      * not check or modify the autocommit parameter.
      */
     void beginOrContinueTxnOnMigration(OperationContext* opCtx, TxnNumber txnNumber);
+
+    /**
+     * Called for speculative transactions to fix the optime of the snapshot to read from.
+     */
+    void setSpeculativeTransactionOpTimeToLastApplied(OperationContext* opCtx);
 
     /**
      * Called after a write under the specified transaction completes while the node is a primary
@@ -357,12 +365,13 @@ public:
      */
     BSONObj reportStashedState() const;
 
-    /**
-     * Scan through the list of operations and add new oplog entries for updating
-     * config.transactions if needed.
-     */
-    static std::vector<repl::OplogEntry> addOpsForReplicatingTxnTable(
-        const std::vector<repl::OplogEntry>& ops);
+    void addMultikeyPathInfo(MultikeyPathInfo info) {
+        _multikeyPathInfo.push_back(std::move(info));
+    }
+
+    const std::vector<MultikeyPathInfo>& getMultikeyPathInfo() const {
+        return _multikeyPathInfo;
+    }
 
     /**
      * Returns a new oplog entry if the given entry has transaction state embedded within in.
@@ -508,6 +517,14 @@ private:
     // This is unset until a transaction begins on the session, and then reset only when new
     // transactions begin.
     boost::optional<Date_t> _transactionExpireDate;
+
+    // The OpTime a speculative transaction is reading from and also the earliest opTime it
+    // should wait for write concern for on commit.
+    repl::OpTime _speculativeTransactionReadOpTime;
+
+    // This member is only applicable to operations running in a transaction. It is reset when a
+    // transaction state resets.
+    std::vector<MultikeyPathInfo> _multikeyPathInfo;
 };
 
 }  // namespace mongo

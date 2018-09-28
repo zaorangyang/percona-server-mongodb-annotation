@@ -44,15 +44,19 @@ OplogApplier::OplogApplier(executor::TaskExecutor* executor,
                            OplogBuffer* oplogBuffer,
                            Observer* observer,
                            ReplicationCoordinator* replCoord,
+                           ReplicationConsistencyMarkers* consistencyMarkers,
+                           StorageInterface* storageInterface,
                            const OplogApplier::Options& options,
                            ThreadPool* writerPool)
     : _executor(executor),
       _oplogBuffer(oplogBuffer),
       _observer(observer),
       _replCoord(replCoord),
+      _consistencyMarkers(consistencyMarkers),
+      _storageInterface(storageInterface),
       _options(options),
-      _syncTail(std::make_unique<SyncTail>(_observer, multiSyncApply, writerPool)) {
-    invariant(!options.allowNamespaceNotFoundErrorsOnCrudOps);
+      _syncTail(std::make_unique<SyncTail>(
+          _observer, _consistencyMarkers, _storageInterface, multiSyncApply, writerPool, options)) {
     invariant(!options.relaxUniqueIndexConstraints);
 }
 
@@ -78,6 +82,64 @@ void OplogApplier::shutdown() {
  * Pushes operations read from sync source into oplog buffer.
  */
 void OplogApplier::enqueue(const Operations& operations) {}
+
+StatusWith<OplogApplier::Operations> OplogApplier::getNextApplierBatch(
+    OperationContext* opCtx, const BatchLimits& batchLimits) {
+    std::uint32_t totalBytes = 0;
+    Operations ops;
+    BSONObj op;
+    while (_oplogBuffer->peek(opCtx, &op)) {
+        auto entry = OplogEntry(op);
+
+        // Check for oplog version change. If it is absent, its value is one.
+        if (entry.getVersion() != OplogEntry::kOplogVersion) {
+            std::string message = str::stream()
+                << "expected oplog version " << OplogEntry::kOplogVersion << " but found version "
+                << entry.getVersion() << " in oplog entry: " << redact(entry.toBSON());
+            severe() << message;
+            return {ErrorCodes::BadValue, message};
+        }
+
+        // Commands must be processed one at a time. The only exception to this is applyOps because
+        // applyOps oplog entries are effectively containers for CRUD operations. Therefore, it is
+        // safe to batch applyOps commands with CRUD operations when reading from the oplog buffer.
+        if (entry.isCommand() && entry.getCommandType() != OplogEntry::CommandType::kApplyOps) {
+            if (ops.empty()) {
+                // Apply commands one-at-a-time.
+                ops.push_back(std::move(entry));
+                BSONObj opToPopAndDiscard;
+                invariant(_oplogBuffer->tryPop(opCtx, &opToPopAndDiscard));
+                dassert(ops.back() == OplogEntry(opToPopAndDiscard));
+            }
+
+            // Otherwise, apply what we have so far and come back for the command.
+            return std::move(ops);
+        }
+
+        // Apply replication batch limits.
+        if (ops.size() >= batchLimits.ops) {
+            return std::move(ops);
+        }
+        if (totalBytes + entry.getRawObjSizeBytes() >= batchLimits.bytes) {
+            return std::move(ops);
+        }
+
+        // Add op to buffer.
+        ops.push_back(std::move(entry));
+        totalBytes += entry.getRawObjSizeBytes();
+        BSONObj opToPopAndDiscard;
+        invariant(_oplogBuffer->tryPop(opCtx, &opToPopAndDiscard));
+        dassert(ops.back() == OplogEntry(opToPopAndDiscard));
+    }
+    return std::move(ops);
+}
+
+StatusWith<OpTime> OplogApplier::multiApply(OperationContext* opCtx, Operations ops) {
+    _observer->onBatchBegin(ops);
+    auto lastApplied = _syncTail->multiApply(opCtx, std::move(ops));
+    _observer->onBatchEnd(lastApplied, {});
+    return lastApplied;
+}
 
 }  // namespace repl
 }  // namespace mongo

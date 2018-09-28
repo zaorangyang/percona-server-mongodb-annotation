@@ -27,7 +27,11 @@
  */
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+
 #include "mongo/base/checked_cast.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/recovery_unit_test_harness.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
@@ -53,7 +57,12 @@ public:
                   false,                  // .ephemeral
                   false,                  // .repair
                   false                   // .readOnly
-                  ) {}
+                  ) {
+        repl::ReplicationCoordinator::set(
+            getGlobalServiceContext(),
+            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
+                getGlobalServiceContext(), repl::ReplSettings())));
+    }
 
     ~WiredTigerRecoveryUnitHarnessHelper() {}
 
@@ -103,7 +112,7 @@ private:
 };
 
 std::unique_ptr<HarnessHelper> makeHarnessHelper() {
-    return stdx::make_unique<WiredTigerRecoveryUnitHarnessHelper>();
+    return std::make_unique<WiredTigerRecoveryUnitHarnessHelper>();
 }
 
 MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
@@ -149,11 +158,14 @@ private:
     const char* wt_config = "key_format=S,value_format=S";
 };
 
+TEST_F(WiredTigerRecoveryUnitTestFixture, SetReadSource) {
+    ru1->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided, Timestamp(1, 1));
+    ASSERT_EQ(RecoveryUnit::ReadSource::kProvided, ru1->getTimestampReadSource());
+    ASSERT_EQ(Timestamp(1, 1), ru1->getPointInTimeReadTimestamp());
+}
 TEST_F(WiredTigerRecoveryUnitTestFixture,
        LocalReadOnADocumentBeingPreparedTriggersPrepareConflict) {
     // Prepare but don't commit a transaction
-    ru1->setReadConcernLevelAndReplicationMode(repl::ReadConcernLevel::kLocalReadConcern,
-                                               repl::ReplicationCoordinator::modeNone);
     ru1->beginUnitOfWork(clientAndCtx1.second.get());
     WT_CURSOR* cursor;
     getCursor(ru1, &cursor);
@@ -163,10 +175,8 @@ TEST_F(WiredTigerRecoveryUnitTestFixture,
     ru1->setPrepareTimestamp({1, 1});
     ru1->prepareUnitOfWork();
 
-    // Transaction with local readConcern triggers WT_PREPARE_CONFLICT
+    // Transaction read default triggers WT_PREPARE_CONFLICT
     ru2->beginUnitOfWork(clientAndCtx2.second.get());
-    ru2->setReadConcernLevelAndReplicationMode(repl::ReadConcernLevel::kLocalReadConcern,
-                                               repl::ReplicationCoordinator::modeNone);
     getCursor(ru2, &cursor);
     cursor->set_key(cursor, "key");
     int ret = cursor->search(cursor);
@@ -179,8 +189,6 @@ TEST_F(WiredTigerRecoveryUnitTestFixture,
 TEST_F(WiredTigerRecoveryUnitTestFixture,
        AvailableReadOnADocumentBeingPreparedDoesNotTriggerPrepareConflict) {
     // Prepare but don't commit a transaction
-    ru1->setReadConcernLevelAndReplicationMode(repl::ReadConcernLevel::kLocalReadConcern,
-                                               repl::ReplicationCoordinator::modeNone);
     ru1->beginUnitOfWork(clientAndCtx1.second.get());
     WT_CURSOR* cursor;
     getCursor(ru1, &cursor);
@@ -190,11 +198,10 @@ TEST_F(WiredTigerRecoveryUnitTestFixture,
     ru1->setPrepareTimestamp({1, 1});
     ru1->prepareUnitOfWork();
 
-    // Transaction with available readConcern wouldn't trigger
+    // Transaction that should ignore prepared transactions won't trigger
     // WT_PREPARE_CONFLICT
     ru2->beginUnitOfWork(clientAndCtx2.second.get());
-    ru2->setReadConcernLevelAndReplicationMode(repl::ReadConcernLevel::kAvailableReadConcern,
-                                               repl::ReplicationCoordinator::modeNone);
+    ru2->setIgnorePrepared(true);
     getCursor(ru2, &cursor);
     cursor->set_key(cursor, "key");
     int ret = cursor->search(cursor);
@@ -206,8 +213,6 @@ TEST_F(WiredTigerRecoveryUnitTestFixture,
 
 TEST_F(WiredTigerRecoveryUnitTestFixture, WriteOnADocumentBeingPreparedTriggersWTRollback) {
     // Prepare but don't commit a transaction
-    ru1->setReadConcernLevelAndReplicationMode(repl::ReadConcernLevel::kLocalReadConcern,
-                                               repl::ReplicationCoordinator::modeNone);
     ru1->beginUnitOfWork(clientAndCtx1.second.get());
     WT_CURSOR* cursor;
     getCursor(ru1, &cursor);
@@ -217,7 +222,7 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, WriteOnADocumentBeingPreparedTriggersW
     ru1->setPrepareTimestamp({1, 1});
     ru1->prepareUnitOfWork();
 
-    // Another transaction with wirte triggers WT_ROLLBACK
+    // Another transaction with write triggers WT_ROLLBACK
     ru2->beginUnitOfWork(clientAndCtx2.second.get());
     getCursor(ru2, &cursor);
     cursor->set_key(cursor, "key");
@@ -227,6 +232,254 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, WriteOnADocumentBeingPreparedTriggersW
 
     ru1->abortUnitOfWork();
     ru2->abortUnitOfWork();
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture,
+       ChangeIsPassedEmptyLastTimestampSetOnCommitWithNoTimestamp) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        wuow.commit();
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsPassedLastTimestampSetOnCommit) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(ts1));
+        ASSERT(!commitTs);
+        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(ts2));
+        ASSERT(!commitTs);
+        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(ts1));
+        ASSERT(!commitTs);
+        wuow.commit();
+        ASSERT_EQ(*commitTs, ts1);
+    }
+    ASSERT_EQ(*commitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsNotPassedLastTimestampSetOnAbort) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(ts1));
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsPassedCommitTimestamp) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+
+    opCtx->recoveryUnit()->setCommitTimestamp(ts1);
+    ASSERT(!commitTs);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT(!commitTs);
+        wuow.commit();
+        ASSERT_EQ(*commitTs, ts1);
+    }
+    ASSERT_EQ(*commitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsNotPassedCommitTimestampIfCleared) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+
+    opCtx->recoveryUnit()->setCommitTimestamp(ts1);
+    ASSERT(!commitTs);
+    opCtx->recoveryUnit()->clearCommitTimestamp();
+    ASSERT(!commitTs);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT(!commitTs);
+        wuow.commit();
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsPassedNewestCommitTimestamp) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+
+    opCtx->recoveryUnit()->setCommitTimestamp(ts2);
+    ASSERT(!commitTs);
+    opCtx->recoveryUnit()->clearCommitTimestamp();
+    ASSERT(!commitTs);
+    opCtx->recoveryUnit()->setCommitTimestamp(ts1);
+    ASSERT(!commitTs);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT(!commitTs);
+        wuow.commit();
+        ASSERT_EQ(*commitTs, ts1);
+    }
+    ASSERT_EQ(*commitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, ChangeIsNotPassedCommitTimestampOnAbort) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+
+    opCtx->recoveryUnit()->setCommitTimestamp(ts1);
+    ASSERT(!commitTs);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitTimestampBeforeSetTimestampOnCommit) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+
+    opCtx->recoveryUnit()->setCommitTimestamp(ts2);
+    ASSERT(!commitTs);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT(!commitTs);
+        wuow.commit();
+        ASSERT_EQ(*commitTs, ts2);
+    }
+    ASSERT_EQ(*commitTs, ts2);
+    opCtx->recoveryUnit()->clearCommitTimestamp();
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(ts1));
+        ASSERT_EQ(*commitTs, ts2);
+        wuow.commit();
+        ASSERT_EQ(*commitTs, ts1);
+    }
+    ASSERT_EQ(*commitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitTimestampAfterSetTimestampOnCommit) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT(!commitTs);
+        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(ts2));
+        ASSERT(!commitTs);
+        wuow.commit();
+        ASSERT_EQ(*commitTs, ts2);
+    }
+    ASSERT_EQ(*commitTs, ts2);
+
+    opCtx->recoveryUnit()->setCommitTimestamp(ts1);
+    ASSERT_EQ(*commitTs, ts2);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT_EQ(*commitTs, ts2);
+        wuow.commit();
+        ASSERT_EQ(*commitTs, ts1);
+    }
+    ASSERT_EQ(*commitTs, ts1);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitTimestampBeforeSetTimestampOnAbort) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+
+    opCtx->recoveryUnit()->setCommitTimestamp(ts2);
+    ASSERT(!commitTs);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+    opCtx->recoveryUnit()->clearCommitTimestamp();
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(ts1));
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+}
+
+TEST_F(WiredTigerRecoveryUnitTestFixture, CommitTimestampAfterSetTimestampOnAbort) {
+    boost::optional<Timestamp> commitTs = boost::none;
+    auto opCtx = clientAndCtx1.second.get();
+    Timestamp ts1(5, 5);
+    Timestamp ts2(6, 6);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT(!commitTs);
+        ASSERT_OK(opCtx->recoveryUnit()->setTimestamp(ts2));
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
+
+    opCtx->recoveryUnit()->setCommitTimestamp(ts1);
+    ASSERT(!commitTs);
+
+    {
+        WriteUnitOfWork wuow(opCtx);
+        opCtx->recoveryUnit()->onCommit(
+            [&](boost::optional<Timestamp> commitTime) { commitTs = commitTime; });
+        ASSERT(!commitTs);
+    }
+    ASSERT(!commitTs);
 }
 
 }  // namespace

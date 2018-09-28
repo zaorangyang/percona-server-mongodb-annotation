@@ -34,6 +34,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/storage/mobile/mobile_kv_engine.h"
+#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
 
 namespace mongo {
@@ -72,8 +73,9 @@ public:
 
 GlobalInitializerRegisterer mobileKVEngineInitializer(
     "MobileKVEngineInit",
+    {"ServiceContext"},
     [](InitializerContext* context) {
-        context->serviceContext()->registerStorageEngine("mobile", new MobileFactory());
+        registerStorageEngine(getGlobalServiceContext(), std::make_unique<MobileFactory>());
         return Status::OK();
     },
     [](DeinitializerContext* const) { return Status::OK(); });

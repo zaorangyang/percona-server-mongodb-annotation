@@ -38,6 +38,23 @@
 
 namespace mongo {
 
+namespace {
+
+const auto getFreeMonController =
+    ServiceContext::declareDecoration<std::unique_ptr<FreeMonController>>();
+
+}  // namespace
+
+FreeMonController* FreeMonController::get(ServiceContext* serviceContext) {
+    return getFreeMonController(serviceContext).get();
+}
+
+void FreeMonController::set(ServiceContext* serviceContext,
+                            std::unique_ptr<FreeMonController> controller) {
+    getFreeMonController(serviceContext) = std::move(controller);
+}
+
+
 FreeMonNetworkInterface::~FreeMonNetworkInterface() = default;
 
 void FreeMonController::addRegistrationCollector(
@@ -89,6 +106,25 @@ boost::optional<Status> FreeMonController::unregisterServerCommand(Milliseconds 
     return Status::OK();
 }
 
+void FreeMonController::notifyOnUpsert(const BSONObj& doc) {
+    invariant(doc.isOwned());
+    _enqueue(FreeMonMessageWithPayload<FreeMonMessageType::NotifyOnUpsert>::createNow(doc));
+}
+
+
+void FreeMonController::notifyOnDelete() {
+    _enqueue(FreeMonMessage::createNow(FreeMonMessageType::NotifyOnDelete));
+}
+
+
+void FreeMonController::notifyOnTransitionToPrimary() {
+    _enqueue(FreeMonMessage::createNow(FreeMonMessageType::OnTransitionToPrimary));
+}
+
+void FreeMonController::notifyOnRollback() {
+    _enqueue(FreeMonMessage::createNow(FreeMonMessageType::NotifyOnRollback));
+}
+
 void FreeMonController::_enqueue(std::shared_ptr<FreeMonMessage> msg) {
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
@@ -98,7 +134,7 @@ void FreeMonController::_enqueue(std::shared_ptr<FreeMonMessage> msg) {
     _processor->enqueue(std::move(msg));
 }
 
-void FreeMonController::start(RegistrationType registrationType) {
+void FreeMonController::start(RegistrationType registrationType, std::vector<std::string>& tags) {
     {
         stdx::lock_guard<stdx::mutex> lock(_mutex);
 
@@ -119,8 +155,7 @@ void FreeMonController::start(RegistrationType registrationType) {
     }
 
     if (registrationType != RegistrationType::DoNotRegister) {
-        std::vector<std::string> vec;
-        registerServerStartup(registrationType, vec);
+        registerServerStartup(registrationType, tags);
     }
 }
 
@@ -160,6 +195,32 @@ void FreeMonController::turnCrankForTest(size_t countMessagesToIgnore) {
     log() << "Turning Crank: " << countMessagesToIgnore;
 
     _processor->turnCrankForTest(countMessagesToIgnore);
+}
+
+void FreeMonController::getStatus(OperationContext* opCtx, BSONObjBuilder* status) {
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+
+        if (_state != State::kStarted) {
+            status->append("state", "disabled");
+            return;
+        }
+    }
+
+    _processor->getStatus(opCtx, status, FreeMonProcessor::FreeMonGetStatusEnum::kCommandStatus);
+}
+
+void FreeMonController::getServerStatus(OperationContext* opCtx, BSONObjBuilder* status) {
+    {
+        stdx::lock_guard<stdx::mutex> lock(_mutex);
+
+        if (_state != State::kStarted) {
+            status->append("state", "disabled");
+            return;
+        }
+    }
+
+    _processor->getStatus(opCtx, status, FreeMonProcessor::FreeMonGetStatusEnum::kServerStatus);
 }
 
 }  // namespace mongo

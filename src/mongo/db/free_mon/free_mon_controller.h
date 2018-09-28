@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/db/client.h"
 #include "mongo/db/free_mon/free_mon_message.h"
 #include "mongo/db/free_mon/free_mon_network.h"
 #include "mongo/db/free_mon/free_mon_processor.h"
@@ -58,7 +59,7 @@ public:
      * Initializes free monitoring.
      * Start free monitoring thread in the background.
      */
-    void start(RegistrationType registrationType);
+    void start(RegistrationType registrationType, std::vector<std::string>& tags);
 
     /**
      * Stops free monitoring thread.
@@ -67,7 +68,7 @@ public:
 
     /**
      * Turn the crank of the message queue by ignoring deadlines for N messages.
-    */
+     */
     void turnCrankForTest(size_t countMessagesToIgnore);
 
     /**
@@ -84,6 +85,11 @@ public:
      * Get the FreeMonController from ServiceContext.
      */
     static FreeMonController* get(ServiceContext* serviceContext);
+
+    /**
+     * Set the FreeMonController in the ServiceContext.
+     */
+    static void set(ServiceContext* serviceContext, std::unique_ptr<FreeMonController> controller);
 
     /**
      * Start registration of mongod with remote service.
@@ -111,10 +117,38 @@ public:
      */
     boost::optional<Status> unregisterServerCommand(Milliseconds timeout);
 
-    // TODO - add these methods
-    // void getServerStatus(BSONObjBuilder* builder);
+    /**
+     * Populates an info blob for use by {getFreeMonitoringStatus: 1}
+     */
+    void getStatus(OperationContext* opCtx, BSONObjBuilder* status);
 
-    // void notifyObserver(const BSONObj& doc);
+    /**
+     * Populates an info blob for use by {serverStatus: 1}
+     */
+    void getServerStatus(OperationContext* opCtx, BSONObjBuilder* status);
+
+    /**
+     * Notify on upsert.
+     *
+     * Updates and inserts are treated as the same.
+     */
+    void notifyOnUpsert(const BSONObj& doc);
+
+    /**
+     * Notify on document delete or drop collection.
+     */
+    void notifyOnDelete();
+
+    /**
+     * Notify that we local instance has become a primary.
+     */
+    void notifyOnTransitionToPrimary();
+
+    /**
+     * Notify that storage has rolled back
+     */
+    void notifyOnRollback();
+
 private:
     void _enqueue(std::shared_ptr<FreeMonMessage> msg);
 

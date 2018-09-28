@@ -34,6 +34,7 @@
 
 #include "mongo/base/checked_cast.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/impersonation_session.h"
@@ -73,6 +74,7 @@
 #include "mongo/db/stats/top.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/message.h"
 #include "mongo/rpc/metadata.h"
 #include "mongo/rpc/metadata/config_server_metadata.h"
 #include "mongo/rpc/metadata/logical_time_metadata.h"
@@ -80,18 +82,18 @@
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/sharding_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
+#include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/s/cannot_implicitly_create_collection_info.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/message.h"
-#include "mongo/util/net/op_msg.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
+MONGO_FP_DECLARE(failCommand);
 MONGO_FP_DECLARE(rsStopGetMore);
 MONGO_FP_DECLARE(respondWithNotPrimaryInCommandDispatch);
 MONGO_FP_DECLARE(skipCheckingForNotMasterInCommandDispatch);
@@ -109,6 +111,7 @@ const StringMap<int> sessionCheckoutWhitelist = {{"abortTransaction", 1},
                                                  {"applyOps", 1},
                                                  {"commitTransaction", 1},
                                                  {"count", 1},
+                                                 {"dbHash", 1},
                                                  {"delete", 1},
                                                  {"distinct", 1},
                                                  {"doTxn", 1},
@@ -124,28 +127,16 @@ const StringMap<int> sessionCheckoutWhitelist = {{"abortTransaction", 1},
                                                  {"getMore", 1},
                                                  {"group", 1},
                                                  {"insert", 1},
+                                                 {"killCursors", 1},
                                                  {"mapReduce", 1},
                                                  {"parallelCollectionScan", 1},
                                                  {"prepareTransaction", 1},
                                                  {"refreshLogicalSessionCacheNow", 1},
                                                  {"update", 1}};
 
-// The command names that are allowed in a multi-document transaction.
-const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
-                                        {"aggregate", 1},
-                                        {"commitTransaction", 1},
-                                        {"count", 1},
-                                        {"delete", 1},
-                                        {"distinct", 1},
-                                        {"doTxn", 1},
-                                        {"find", 1},
-                                        {"findandmodify", 1},
-                                        {"findAndModify", 1},
-                                        {"geoSearch", 1},
-                                        {"getMore", 1},
-                                        {"insert", 1},
-                                        {"prepareTransaction", 1},
-                                        {"update", 1}};
+// The command names that are ignored by the 'failCommand' failpoint.
+const StringMap<int> failCommandIgnoreList = {
+    {"buildInfo", 1}, {"configureFailPoint", 1}, {"isMaster", 1}, {"ping", 1}};
 
 void generateLegacyQueryErrorResponse(const AssertionException* exception,
                                       const QueryMessage& queryMessage,
@@ -206,33 +197,38 @@ void registerError(OperationContext* opCtx, const DBException& exception) {
 void generateErrorResponse(OperationContext* opCtx,
                            rpc::ReplyBuilderInterface* replyBuilder,
                            const DBException& exception,
-                           const BSONObj& replyMetadata) {
-    registerError(opCtx, exception);
-
-    // We could have thrown an exception after setting fields in the builder,
-    // so we need to reset it to a clean state just to be sure.
-    replyBuilder->reset();
-    replyBuilder->setCommandReply(exception.toStatus());
-    replyBuilder->setMetadata(replyMetadata);
-}
-
-void generateErrorResponse(OperationContext* opCtx,
-                           rpc::ReplyBuilderInterface* replyBuilder,
-                           const DBException& exception,
                            const BSONObj& replyMetadata,
-                           LogicalTime operationTime) {
+                           BSONObj extraFields = {}) {
     registerError(opCtx, exception);
 
     // We could have thrown an exception after setting fields in the builder,
     // so we need to reset it to a clean state just to be sure.
     replyBuilder->reset();
-    replyBuilder->setCommandReply(exception.toStatus(),
-                                  BSON("operationTime" << operationTime.asTimestamp()));
+    replyBuilder->setCommandReply(exception.toStatus(), extraFields);
     replyBuilder->setMetadata(replyMetadata);
 }
 
-bool hasClusterTime(BSONObj metadata) {
-    return metadata.hasField(rpc::LogicalTimeMetadata::fieldName());
+BSONObj getErrorLabels(const boost::optional<OperationSessionInfoFromClient>& sessionOptions,
+                       const std::string& commandName,
+                       ErrorCodes::Error code) {
+    // By specifying "autocommit", the user indicates they want to run a transaction.
+    if (!sessionOptions || !sessionOptions->getAutocommit()) {
+        return {};
+    }
+
+    bool isRetryable = ErrorCodes::isNotMasterError(code) || ErrorCodes::isShutdownError(code);
+    bool isTransientTransactionError = code == ErrorCodes::WriteConflict  //
+        || code == ErrorCodes::SnapshotUnavailable                        //
+        || code == ErrorCodes::NoSuchTransaction                          //
+        || code == ErrorCodes::LockTimeout                                //
+        // Clients can retry a single commitTransaction command, but cannot retry the whole
+        // transaction if commitTransaction fails due to NotMaster.
+        || (isRetryable && (commandName != "commitTransaction"));
+
+    if (isTransientTransactionError) {
+        return BSON("errorLabels" << BSON_ARRAY("TransientTransactionError"));
+    }
+    return {};
 }
 
 /**
@@ -271,29 +267,7 @@ private:
 constexpr auto kLastCommittedOpTimeFieldName = "lastCommittedOpTime"_sd;
 
 // Called from the error contexts where request may not be available.
-// It only attaches clusterTime and operationTime.
 void appendReplyMetadataOnError(OperationContext* opCtx, BSONObjBuilder* metadataBob) {
-    auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
-    const bool isReplSet =
-        replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-
-    if (isReplSet && LogicalClock::get(opCtx)->isEnabled()) {
-        if (LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
-            // No need to sign cluster times for internal clients.
-            SignedLogicalTime currentTime(
-                LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
-            rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
-            logicalTimeMetadata.writeToMetadata(metadataBob);
-        } else if (auto validator = LogicalTimeValidator::get(opCtx)) {
-            auto currentTime =
-                validator->trySignLogicalTime(LogicalClock::get(opCtx)->getClusterTime());
-            if (currentTime.getKeyId() != 0) {
-                rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
-                logicalTimeMetadata.writeToMetadata(metadataBob);
-            }
-        }
-    }
-
     const bool isConfig = serverGlobalParams.clusterRole == ClusterRole::ConfigServer;
     if (ShardingState::get(opCtx)->enabled() || isConfig) {
         auto lastCommittedOpTime =
@@ -323,23 +297,6 @@ void appendReplyMetadata(OperationContext* opCtx,
                 .writeToMetadata(metadataBob)
                 .transitional_ignore();
         }
-        if (LogicalClock::get(opCtx)->isEnabled()) {
-            if (LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
-                // No need to sign cluster times for internal clients.
-                SignedLogicalTime currentTime(
-                    LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
-                rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
-                logicalTimeMetadata.writeToMetadata(metadataBob);
-            } else if (auto validator = LogicalTimeValidator::get(opCtx)) {
-                auto currentTime =
-                    validator->trySignLogicalTime(LogicalClock::get(opCtx)->getClusterTime());
-                // Do not add $clusterTime if the signature and keyId is dummy.
-                if (currentTime.getKeyId() != 0) {
-                    rpc::LogicalTimeMetadata logicalTimeMetadata(currentTime);
-                    logicalTimeMetadata.writeToMetadata(metadataBob);
-                }
-            }
-        }
 
         if (isShardingAware || isConfig) {
             auto lastCommittedOpTime = replCoord->getLastCommittedOpTime();
@@ -349,7 +306,7 @@ void appendReplyMetadata(OperationContext* opCtx,
 
     // If we're a shard other than the config shard, attach the last configOpTime we know about.
     if (isShardingAware && !isConfig) {
-        auto opTime = grid.configOpTime();
+        auto opTime = Grid::get(opCtx)->configOpTime();
         rpc::ConfigServerMetadata(opTime).writeToMetadata(metadataBob);
     }
 }
@@ -392,12 +349,13 @@ LogicalTime getClientOperationTime(OperationContext* opCtx) {
     auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
     const bool isReplSet =
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-    LogicalTime operationTime;
-    if (isReplSet) {
-        operationTime = LogicalTime(
-            repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp().getTimestamp());
+
+    if (!isReplSet) {
+        return LogicalTime();
     }
-    return operationTime;
+
+    return LogicalTime(
+        repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp().getTimestamp());
 }
 
 /**
@@ -405,16 +363,12 @@ LogicalTime getClientOperationTime(OperationContext* opCtx) {
  * members, it uses the last optime in the oplog for writes, last committed optime for majority
  * reads, and the last applied optime for every other read. An uninitialized cluster time is
  * returned for non replica set members.
+ *
+ * The latest in-memory clusterTime is returned if the start operationTime is uninitialized.
  */
-LogicalTime computeOperationTime(OperationContext* opCtx,
-                                 LogicalTime startOperationTime,
-                                 repl::ReadConcernLevel level) {
-    auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
-    const bool isReplSet =
-        replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-
-    if (!isReplSet) {
-        return LogicalTime();
+LogicalTime computeOperationTime(OperationContext* opCtx, LogicalTime startOperationTime) {
+    if (startOperationTime == LogicalTime::kUninitialized) {
+        return LogicalClock::get(opCtx)->getClusterTime();
     }
 
     auto operationTime = getClientOperationTime(opCtx);
@@ -423,7 +377,11 @@ LogicalTime computeOperationTime(OperationContext* opCtx,
     // If the last operationTime has not changed, consider this command a read, and, for replica set
     // members, construct the operationTime with the proper optime for its read concern level.
     if (operationTime == startOperationTime) {
-        if (level == repl::ReadConcernLevel::kMajorityReadConcern) {
+        auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
+        auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+
+        // Note: ReadConcernArgs::getLevel returns kLocal if none was set.
+        if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern) {
             operationTime = LogicalTime(replCoord->getLastCommittedOpTime().getTimestamp());
         } else {
             operationTime = LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
@@ -431,6 +389,56 @@ LogicalTime computeOperationTime(OperationContext* opCtx,
     }
 
     return operationTime;
+}
+
+/**
+ * Computes the proper $clusterTime and operationTime values to include in the command response and
+ * appends them to it. $clusterTime is added as metadata and operationTime as a command body field.
+ *
+ * The command body BSONObjBuilder is either the builder for the command body itself, or a builder
+ * for extra fields to be added to the reply when generating an error response.
+ */
+void appendClusterAndOperationTime(OperationContext* opCtx,
+                                   BSONObjBuilder* commandBodyFieldsBob,
+                                   BSONObjBuilder* metadataBob,
+                                   LogicalTime startTime) {
+    if (repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
+            repl::ReplicationCoordinator::modeReplSet ||
+        !LogicalClock::get(opCtx)->isEnabled()) {
+        return;
+    }
+
+    // Authorized clients always receive operationTime and dummy signed $clusterTime.
+    if (LogicalTimeValidator::isAuthorizedToAdvanceClock(opCtx)) {
+        auto operationTime = computeOperationTime(opCtx, startTime);
+        auto signedTime = SignedLogicalTime(
+            LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
+
+        invariant(signedTime.getTime() >= operationTime);
+        rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
+        operationTime.appendAsOperationTime(commandBodyFieldsBob);
+
+        return;
+    }
+
+    // Servers without validators (e.g. a shard server not yet added to a cluster) do not return
+    // logical times to unauthorized clients.
+    auto validator = LogicalTimeValidator::get(opCtx);
+    if (!validator) {
+        return;
+    }
+
+    auto operationTime = computeOperationTime(opCtx, startTime);
+    auto signedTime = validator->trySignLogicalTime(LogicalClock::get(opCtx)->getClusterTime());
+
+    // If there were no keys, do not return $clusterTime or operationTime to unauthorized clients.
+    if (signedTime.getKeyId() == 0) {
+        return;
+    }
+
+    invariant(signedTime.getTime() >= operationTime);
+    rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
+    operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
 
 void invokeInTransaction(OperationContext* opCtx,
@@ -465,7 +473,9 @@ bool runCommandImpl(OperationContext* opCtx,
                     const OpMsgRequest& request,
                     rpc::ReplyBuilderInterface* replyBuilder,
                     LogicalTime startOperationTime,
-                    const ServiceEntryPointCommon::Hooks& behaviors) {
+                    const ServiceEntryPointCommon::Hooks& behaviors,
+                    BSONObjBuilder* extraFieldsBuilder,
+                    const boost::optional<OperationSessionInfoFromClient>& sessionOptions) {
     const Command* command = invocation->definition();
     auto bytesToReserve = command->reserveBytesForReply();
 
@@ -498,10 +508,16 @@ bool runCommandImpl(OperationContext* opCtx,
         const auto oldWC = opCtx->getWriteConcern();
         ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
         opCtx->setWriteConcern(wcResult);
-        ON_BLOCK_EXIT([&] {
-            behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, crb.getBodyBuilder());
-        });
-        invokeInTransaction(opCtx, invocation, &crb);
+
+        try {
+            invokeInTransaction(opCtx, invocation, &crb);
+        } catch (const DBException&) {
+            behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, *extraFieldsBuilder);
+            throw;
+        }
+
+        auto bb = crb.getBodyBuilder();
+        behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, bb);
 
         // Nothing in run() should change the writeConcern.
         dassert(SimpleBSONObjComparator::kInstance.evaluate(opCtx->getWriteConcern().toBSON() ==
@@ -516,23 +532,50 @@ bool runCommandImpl(OperationContext* opCtx,
     }();
     behaviors.attachCurOpErrInfo(opCtx, crb.getBodyBuilder().asTempObj());
 
-    BSONObjBuilder metadataBob;
-    appendReplyMetadata(opCtx, request, &metadataBob);
+    if (!ok) {
+        auto response = crb.getBodyBuilder().asTempObj();
+        auto codeField = response["code"];
 
-    auto metadata = metadataBob.done();
-
-    if (hasClusterTime(metadata)) {
-        auto operationTime = computeOperationTime(
-            opCtx, startOperationTime, repl::ReadConcernArgs::get(opCtx).getLevel());
-
-        if (operationTime != LogicalTime::kUninitialized) {
-            auto body = crb.getBodyBuilder();
-            operationTime.appendAsOperationTime(&body);
+        if (codeField.isNumber()) {
+            auto code = ErrorCodes::Error(codeField.numberInt());
+            // Append the error labels for transient transaction errors.
+            auto errorLabels = getErrorLabels(sessionOptions, command->getName(), code);
+            crb.getBodyBuilder().appendElements(errorLabels);
         }
     }
 
-    replyBuilder->setMetadata(metadata);
+    BSONObjBuilder metadataBob;
+    appendReplyMetadata(opCtx, request, &metadataBob);
+
+    {
+        auto commandBodyBob = crb.getBodyBuilder();
+        appendClusterAndOperationTime(opCtx, &commandBodyBob, &metadataBob, startOperationTime);
+    }
+
+    replyBuilder->setMetadata(metadataBob.obj());
     return ok;
+}
+
+/**
+ * Maybe uassert according to the 'failCommand' fail point.
+ */
+void evaluateFailCommandFailPoint(OperationContext* opCtx, StringData commandName) {
+    MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
+        return failCommandIgnoreList.find(commandName) == failCommandIgnoreList.cend();
+    }) {
+        bool closeConnection;
+        if (bsonExtractBooleanField(data.getData(), "closeConnection", &closeConnection).isOK() &&
+            closeConnection) {
+            opCtx->getClient()->session()->end();
+            uasserted(50838, "Failing command due to 'failCommand' failpoint");
+        }
+
+        long long errorCode;
+        if (bsonExtractIntegerField(data.getData(), "errorCode", &errorCode).isOK()) {
+            uasserted(ErrorCodes::Error(errorCode),
+                      "Failing command due to 'failCommand' failpoint");
+        }
+    }
 }
 
 /**
@@ -547,8 +590,10 @@ void execCommandDatabase(OperationContext* opCtx,
                          const OpMsgRequest& request,
                          rpc::ReplyBuilderInterface* replyBuilder,
                          const ServiceEntryPointCommon::Hooks& behaviors) {
+    BSONObjBuilder extraFieldsBuilder;
     auto startOperationTime = getClientOperationTime(opCtx);
     auto invocation = command->parse(opCtx, request);
+    boost::optional<OperationSessionInfoFromClient> sessionOptions = boost::none;
     try {
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -561,12 +606,20 @@ void execCommandDatabase(OperationContext* opCtx,
         rpc::TrackingMetadata::get(opCtx).initWithOperName(command->getName());
 
         auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
-        auto sessionOptions = initializeOperationSessionInfo(
+        sessionOptions = initializeOperationSessionInfo(
             opCtx,
             request.body,
             command->requiresAuth(),
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet,
-            opCtx->getServiceContext()->getGlobalStorageEngine()->supportsDocLocking());
+            opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking());
+
+        evaluateFailCommandFailPoint(opCtx, command->getName());
+
+        const auto dbname = request.getDatabase().toString();
+        uassert(
+            ErrorCodes::InvalidNamespace,
+            str::stream() << "Invalid database name: '" << dbname << "'",
+            NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
 
         // Session ids are forwarded in requests, so commands that require roundtrips between
         // servers may result in a deadlock when a server tries to check out a session it is already
@@ -590,12 +643,6 @@ void execCommandDatabase(OperationContext* opCtx,
             }
         }
 
-        uassert(50767,
-                str::stream() << "Cannot run '" << command->getName()
-                              << "' in a multi-document transaction.",
-                !autocommitVal ||
-                    txnCmdWhitelist.find(command->getName()) != txnCmdWhitelist.cend());
-
         // Reject commands with 'txnNumber' that do not check out the Session, since no retryable
         // writes or transaction machinery will be used to execute commands that do not check out
         // the Session. Do not check this if we are in DBDirectClient because the outer command is
@@ -610,23 +657,12 @@ void execCommandDatabase(OperationContext* opCtx,
         // This constructor will check out the session and start a transaction, if necessary. It
         // handles the appropriate state management for both multi-statement transactions and
         // retryable writes.
-        OperationContextSession sessionTxnState(
-            opCtx, shouldCheckoutSession, autocommitVal, startMultiDocTxn);
-
-        // If we are in a multi-document transaction, ensure the command is allowed in this context.
-        // We do not check this in DBDirectClient, since 'aggregate' is allowed in transactions, but
-        // 'geoNear' is not, and 'aggregate' can run 'geoNear' in DBDirectClient.
-        if (!opCtx->getClient()->isInDirectClient()) {
-            auto session = OperationContextSession::get(opCtx);
-            invariant(!session || !session->inMultiDocumentTransaction() ||
-                      txnCmdWhitelist.find(command->getName()) != txnCmdWhitelist.cend());
-        }
-
-        const auto dbname = request.getDatabase().toString();
-        uassert(
-            ErrorCodes::InvalidNamespace,
-            str::stream() << "Invalid database name: '" << dbname << "'",
-            NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
+        OperationContextSession sessionTxnState(opCtx,
+                                                shouldCheckoutSession,
+                                                autocommitVal,
+                                                startMultiDocTxn,
+                                                dbname,
+                                                command->getName());
 
         std::unique_ptr<MaintenanceModeSetter> mmSetter;
 
@@ -778,8 +814,7 @@ void execCommandDatabase(OperationContext* opCtx,
             readConcernArgs.getLevel() != repl::ReadConcernLevel::kAvailableReadConcern &&
             (iAmPrimary ||
              (readConcernArgs.hasLevel() || readConcernArgs.getArgsAfterClusterTime()))) {
-            oss.initializeClientRoutingVersions(
-                NamespaceString(command->parseNs(dbname, request.body)), request.body);
+            oss.initializeClientRoutingVersions(invocation->ns(), request.body);
 
             auto const shardingState = ShardingState::get(opCtx);
             if (oss.hasShardVersion() || oss.hasDbVersion()) {
@@ -815,7 +850,9 @@ void execCommandDatabase(OperationContext* opCtx,
                                 request,
                                 replyBuilder,
                                 startOperationTime,
-                                behaviors)) {
+                                behaviors,
+                                &extraFieldsBuilder,
+                                sessionOptions)) {
                 command->incrementCommandsFailed();
             }
         } catch (DBException&) {
@@ -845,40 +882,31 @@ void execCommandDatabase(OperationContext* opCtx,
             }
         }
 
+        // Append the error labels for transient transaction errors.
+        auto errorLabels = getErrorLabels(sessionOptions, command->getName(), e.code());
+        extraFieldsBuilder.appendElements(errorLabels);
+
         BSONObjBuilder metadataBob;
         appendReplyMetadata(opCtx, request, &metadataBob);
-        auto metadata = metadataBob.obj();
-        // An uninitialized operation time means the cluster time is not propagated, so the
-        // operation time should not be attached to the error response.
-        if (hasClusterTime(metadata)) {
-            // Note: the read concern may not have been successfully or yet placed on the opCtx, so
-            // parsing it separately here.
-            const std::string db = request.getDatabase().toString();
+
+        // The read concern may not have yet been placed on the operation context, so attempt to
+        // parse it here, so if it is valid it can be used to compute the proper operationTime.
+        auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+        if (readConcernArgs.isEmpty()) {
             auto readConcernArgsStatus = _extractReadConcern(invocation.get(), request.body, false);
-            auto operationTime = readConcernArgsStatus.isOK()
-                ? computeOperationTime(
-                      opCtx, startOperationTime, readConcernArgsStatus.getValue().getLevel())
-                : LogicalClock::get(opCtx)->getClusterTime();
-
-            LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
-                   << "on database '" << request.getDatabase() << "' "
-                   << "with arguments '"
-                   << redact(
-                          ServiceEntryPointCommon::getRedactedCopyForLogging(command, request.body))
-                   << "' and operationTime '" << operationTime.toString()
-                   << "': " << redact(e.toString());
-
-            generateErrorResponse(opCtx, replyBuilder, e, metadata, operationTime);
-        } else {
-            LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
-                   << "on database '" << request.getDatabase() << "' "
-                   << "with arguments '"
-                   << redact(
-                          ServiceEntryPointCommon::getRedactedCopyForLogging(command, request.body))
-                   << "': " << redact(e.toString());
-
-            generateErrorResponse(opCtx, replyBuilder, e, metadata);
+            if (readConcernArgsStatus.isOK()) {
+                readConcernArgs = readConcernArgsStatus.getValue();
+            }
         }
+        appendClusterAndOperationTime(opCtx, &extraFieldsBuilder, &metadataBob, startOperationTime);
+
+        LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
+               << "on database '" << request.getDatabase() << "' "
+               << "with arguments '"
+               << redact(ServiceEntryPointCommon::getRedactedCopyForLogging(command, request.body))
+               << "': " << redact(e.toString());
+
+        generateErrorResponse(opCtx, replyBuilder, e, metadataBob.obj(), extraFieldsBuilder.obj());
     }
 }
 
@@ -914,18 +942,18 @@ DbResponse runCommands(OperationContext* opCtx,
 
             BSONObjBuilder metadataBob;
             appendReplyMetadataOnError(opCtx, &metadataBob);
-            auto metadata = metadataBob.obj();
+
+            BSONObjBuilder extraFieldsBuilder;
+            appendClusterAndOperationTime(
+                opCtx, &extraFieldsBuilder, &metadataBob, LogicalTime::kUninitialized);
 
             // Otherwise, reply with the parse error. This is useful for cases where parsing fails
             // due to user-supplied input, such as the document too deep error. Since we failed
             // during parsing, we can't log anything about the command.
             LOG(1) << "assertion while parsing command: " << ex.toString();
-            if (hasClusterTime(metadata)) {
-                auto operationTime = LogicalClock::get(opCtx)->getClusterTime();
-                generateErrorResponse(opCtx, replyBuilder.get(), ex, metadata, operationTime);
-            } else {
-                generateErrorResponse(opCtx, replyBuilder.get(), ex, metadata);
-            }
+
+            generateErrorResponse(
+                opCtx, replyBuilder.get(), ex, metadataBob.obj(), extraFieldsBuilder.obj());
 
             return;  // From lambda. Don't try executing if parsing failed.
         }
@@ -943,8 +971,7 @@ DbResponse runCommands(OperationContext* opCtx,
                 std::string msg = str::stream() << "no such command: '" << request.getCommandName()
                                                 << "'";
                 LOG(2) << msg;
-                uasserted(ErrorCodes::CommandNotFound,
-                          str::stream() << msg << ", bad cmd: '" << redact(request.body) << "'");
+                uasserted(ErrorCodes::CommandNotFound, str::stream() << msg);
             }
 
             LOG(2) << "run command " << request.getDatabase() << ".$cmd" << ' '
@@ -960,17 +987,16 @@ DbResponse runCommands(OperationContext* opCtx,
         } catch (const DBException& ex) {
             BSONObjBuilder metadataBob;
             appendReplyMetadataOnError(opCtx, &metadataBob);
-            auto metadata = metadataBob.obj();
 
-            if (hasClusterTime(metadata)) {
-                auto operationTime = LogicalClock::get(opCtx)->getClusterTime();
-                LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
-                       << "on database '" << request.getDatabase() << "': " << ex.toString();
+            BSONObjBuilder extraFieldsBuilder;
+            appendClusterAndOperationTime(
+                opCtx, &extraFieldsBuilder, &metadataBob, LogicalTime::kUninitialized);
 
-                generateErrorResponse(opCtx, replyBuilder.get(), ex, metadata, operationTime);
-            } else {
-                generateErrorResponse(opCtx, replyBuilder.get(), ex, metadata);
-            }
+            LOG(1) << "assertion while executing command '" << request.getCommandName() << "' "
+                   << "on database '" << request.getDatabase() << "': " << ex.toString();
+
+            generateErrorResponse(
+                opCtx, replyBuilder.get(), ex, metadataBob.obj(), extraFieldsBuilder.obj());
         }
     }();
 
@@ -1209,7 +1235,7 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
 
     if (c.isInDirectClient()) {
         if (!opCtx->getLogicalSessionId() || !opCtx->getTxnNumber() ||
-            opCtx->recoveryUnit()->getReadConcernLevel() !=
+            repl::ReadConcernArgs::get(opCtx).getLevel() !=
                 repl::ReadConcernLevel::kSnapshotReadConcern) {
             invariant(!opCtx->lockState()->inAWriteUnitOfWork());
         }

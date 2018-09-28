@@ -314,7 +314,8 @@ int _testRollbackDelete(OperationContext* opCtx,
                         ReplicationCoordinator* coordinator,
                         ReplicationProcess* replicationProcess,
                         UUID uuid,
-                        const BSONObj& documentAtSource) {
+                        const BSONObj& documentAtSource,
+                        const bool collectionAtSourceExists = true) {
     auto commonOperation = makeOpAndRecordId(1, 1);
     auto deleteOperation =
         std::make_pair(BSON("ts" << Timestamp(Seconds(2), 0) << "h" << 2LL << "op"
@@ -328,25 +329,35 @@ int _testRollbackDelete(OperationContext* opCtx,
                        RecordId(2));
     class RollbackSourceLocal : public RollbackSourceMock {
     public:
-        RollbackSourceLocal(const BSONObj& documentAtSource, std::unique_ptr<OplogInterface> oplog)
+        RollbackSourceLocal(const BSONObj& documentAtSource,
+                            std::unique_ptr<OplogInterface> oplog,
+                            const bool collectionAtSourceExists)
             : RollbackSourceMock(std::move(oplog)),
               called(false),
-              _documentAtSource(documentAtSource) {}
+              _documentAtSource(documentAtSource),
+              _collectionAtSourceExists(collectionAtSourceExists) {}
         std::pair<BSONObj, NamespaceString> findOneByUUID(const std::string& db,
                                                           UUID uuid,
                                                           const BSONObj& filter) const override {
             called = true;
+            if (!_collectionAtSourceExists) {
+                uassertStatusOKWithContext(
+                    Status(ErrorCodes::NamespaceNotFound, "MockNamespaceNotFoundMsg"),
+                    "find command using UUID failed.");
+            }
             return {_documentAtSource, NamespaceString()};
         }
         mutable bool called;
 
     private:
         BSONObj _documentAtSource;
+        bool _collectionAtSourceExists;
     };
     RollbackSourceLocal rollbackSource(documentAtSource,
                                        std::unique_ptr<OplogInterface>(new OplogInterfaceMock({
                                            commonOperation,
-                                       })));
+                                       })),
+                                       collectionAtSourceExists);
     ASSERT_OK(syncRollback(opCtx,
                            OplogInterfaceMock({deleteOperation, commonOperation}),
                            rollbackSource,
@@ -357,7 +368,7 @@ int _testRollbackDelete(OperationContext* opCtx,
 
     Lock::DBLock dbLock(opCtx, "test", MODE_S);
     Lock::CollectionLock collLock(opCtx->lockState(), "test.t", MODE_S);
-    auto db = dbHolder().get(opCtx, "test");
+    auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, "test");
     ASSERT_TRUE(db);
     auto collection = db->getCollection(opCtx, "test.t");
     if (!collection) {
@@ -372,6 +383,24 @@ TEST_F(RSRollbackTest, RollbackDeleteNoDocumentAtSourceCollectionDoesNotExist) {
         -1,
         _testRollbackDelete(
             _opCtx.get(), _coordinator, _replicationProcess.get(), UUID::gen(), BSONObj()));
+}
+
+TEST_F(RSRollbackTest, RollbackDeleteDocCmdCollectionAtSourceDropped) {
+    const bool collectionAtSourceExists = false;
+    const NamespaceString nss("test.t");
+    createOplog(_opCtx.get());
+    {
+        Lock::DBLock dbLock(_opCtx.get(), nss.db(), MODE_X);
+        auto db = DatabaseHolder::getDatabaseHolder().openDb(_opCtx.get(), nss.db());
+        ASSERT_TRUE(db);
+    }
+    ASSERT_EQUALS(-1,
+                  _testRollbackDelete(_opCtx.get(),
+                                      _coordinator,
+                                      _replicationProcess.get(),
+                                      UUID::gen(),
+                                      BSONObj(),
+                                      collectionAtSourceExists));
 }
 
 TEST_F(RSRollbackTest, RollbackDeleteNoDocumentAtSourceCollectionExistsNonCapped) {
@@ -1777,7 +1806,7 @@ TEST_F(RSRollbackTest, RollbackCreateCollectionCommand) {
                            _replicationProcess.get()));
     {
         Lock::DBLock dbLock(_opCtx.get(), "test", MODE_S);
-        auto db = dbHolder().get(_opCtx.get(), "test");
+        auto db = DatabaseHolder::getDatabaseHolder().get(_opCtx.get(), "test");
         ASSERT_TRUE(db);
         ASSERT_FALSE(db->getCollection(_opCtx.get(), "test.t"));
     }

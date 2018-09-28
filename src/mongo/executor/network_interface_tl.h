@@ -37,6 +37,7 @@
 #include "mongo/rpc/metadata/metadata_hook.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/transport/baton.h"
 #include "mongo/transport/transport_layer.h"
 
 namespace mongo {
@@ -49,9 +50,12 @@ public:
                        ServiceContext* ctx,
                        std::unique_ptr<NetworkConnectionHook> onConnectHook,
                        std::unique_ptr<rpc::EgressMetadataHook> metadataHook);
+
     std::string getDiagnosticString() override;
     void appendConnectionStats(ConnectionPoolStats* stats) const override;
     std::string getHostName() override;
+    Counters getCounters() const override;
+
     void startup() override;
     void shutdown() override;
     bool inShutdown() const override;
@@ -61,9 +65,14 @@ public:
     Date_t now() override;
     Status startCommand(const TaskExecutor::CallbackHandle& cbHandle,
                         RemoteCommandRequest& request,
-                        const RemoteCommandCompletionFn& onFinish) override;
-    void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle) override;
-    Status setAlarm(Date_t when, const stdx::function<void()>& action) override;
+                        const RemoteCommandCompletionFn& onFinish,
+                        const transport::BatonHandle& baton) override;
+
+    void cancelCommand(const TaskExecutor::CallbackHandle& cbHandle,
+                       const transport::BatonHandle& baton) override;
+    Status setAlarm(Date_t when,
+                    const stdx::function<void()>& action,
+                    const transport::BatonHandle& baton) override;
 
     bool onNetworkThread() override;
 
@@ -79,7 +88,18 @@ private:
         Date_t deadline = RemoteCommandRequest::kNoExpirationDate;
         Date_t start;
 
-        ConnectionPool::ConnectionHandle conn;
+        struct Deleter {
+            ConnectionPool::ConnectionHandleDeleter returner;
+            transport::ReactorHandle reactor;
+
+            void operator()(ConnectionPool::ConnectionInterface* ptr) const {
+                reactor->schedule(transport::Reactor::kDispatch,
+                                  [ ret = returner, ptr ] { ret(ptr); });
+            }
+        };
+        using ConnHandle = std::unique_ptr<ConnectionPool::ConnectionInterface, Deleter>;
+
+        ConnHandle conn;
         std::unique_ptr<transport::ReactorTimer> timer;
 
         AtomicBool done;
@@ -89,7 +109,8 @@ private:
 
     void _eraseInUseConn(const TaskExecutor::CallbackHandle& handle);
     Future<RemoteCommandResponse> _onAcquireConn(std::shared_ptr<CommandState> state,
-                                                 ConnectionPool::ConnectionHandle conn);
+                                                 CommandState::ConnHandle conn,
+                                                 const transport::BatonHandle& baton);
 
     std::string _instanceName;
     ServiceContext* _svcCtx;
@@ -98,9 +119,11 @@ private:
     std::unique_ptr<transport::TransportLayer> _ownedTransportLayer;
     transport::ReactorHandle _reactor;
 
+    mutable stdx::mutex _mutex;
     ConnectionPool::Options _connPoolOpts;
     std::unique_ptr<NetworkConnectionHook> _onConnectHook;
     std::unique_ptr<ConnectionPool> _pool;
+    Counters _counters;
 
     std::unique_ptr<rpc::EgressMetadataHook> _metadataHook;
     AtomicBool _inShutdown;
@@ -110,7 +133,6 @@ private:
     stdx::unordered_map<TaskExecutor::CallbackHandle, std::shared_ptr<CommandState>> _inProgress;
     stdx::unordered_set<std::shared_ptr<transport::ReactorTimer>> _inProgressAlarms;
 
-    stdx::mutex _mutex;
     stdx::condition_variable _workReadyCond;
     bool _isExecutorRunnable = false;
 };

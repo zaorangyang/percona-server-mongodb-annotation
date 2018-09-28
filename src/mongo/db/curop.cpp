@@ -47,7 +47,7 @@
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
@@ -262,12 +262,13 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
         }
 
         if (auto lsid = clientOpCtx->getLogicalSessionId()) {
-            BSONObjBuilder bob(infoBuilder->subobjStart("lsid"));
-            lsid->serialize(&bob);
+            BSONObjBuilder lsidBuilder(infoBuilder->subobjStart("lsid"));
+            lsid->serialize(&lsidBuilder);
         }
 
         if (auto txnNumber = clientOpCtx->getTxnNumber()) {
-            infoBuilder->append("txnNumber", *txnNumber);
+            infoBuilder->append("transaction",
+                                BSON("parameters" << BSON("txnNumber" << *txnNumber)));
         }
 
         CurOp::get(clientOpCtx)->reportState(infoBuilder, truncateOps);
@@ -556,8 +557,12 @@ string OpDebug::report(Client* client,
                 curCommand->redactForLogging(&cmdToLog);
                 s << curCommand->getName() << " ";
                 s << redact(cmdToLog.getObject());
-            } else {  // Should not happen but we need to handle curCommand == NULL gracefully.
-                s << redact(query);
+            } else {
+                // Should not happen but we need to handle curCommand == NULL gracefully.
+                // We don't know what the request payload is intended to be, so it might be
+                // sensitive, and we don't know how to redact it properly without a 'Command*'.
+                // So we just don't log it at all.
+                s << "unrecognized";
             }
         } else {
             s << redact(query);

@@ -926,43 +926,105 @@ var DB;
         });
     };
 
-    DB.prototype._getCollectionInfosCommand = function(filter, nameOnly = false) {
+    DB.prototype._getCollectionInfosCommand = function(
+        filter, nameOnly = false, authorizedCollections = false) {
         filter = filter || {};
-        var res = this.runCommand({listCollections: 1, filter: filter, nameOnly: nameOnly});
-        if (res.code == 59) {
-            // command doesn't exist, old mongod
-            return null;
-        }
-
+        var res = this.runCommand({
+            listCollections: 1,
+            filter: filter,
+            nameOnly: nameOnly,
+            authorizedCollections: authorizedCollections
+        });
         if (!res.ok) {
-            if (res.errmsg && res.errmsg.startsWith("no such cmd")) {
-                return null;
-            }
-
             throw _getErrorWithCode(res, "listCollections failed: " + tojson(res));
         }
 
         return new DBCommandCursor(this, res).toArray().sort(compareOn("name"));
     };
 
-    /**
-     * Returns a list that contains the names and options of this database's collections, sorted by
-     * collection name. An optional filter can be specified to match only collections with certain
-     * metadata.
-     */
-    DB.prototype.getCollectionInfos = function(filter, nameOnly = false) {
-        var res = this._getCollectionInfosCommand(filter, nameOnly);
-        if (res) {
-            return res;
+    DB.prototype._getCollectionInfosFromPrivileges = function() {
+        let ret = this.runCommand({connectionStatus: 1, showPrivileges: 1});
+        if (!ret.ok) {
+            throw _getErrorWithCode(res,
+                                    "Failed to acquire collection information from privileges");
         }
-        return this._getCollectionInfosSystemNamespaces(filter);
+
+        // Parse apart collection information.
+        let result = [];
+
+        let privileges = ret.authInfo.authenticatedUserPrivileges;
+        if (privileges === undefined) {
+            return result;
+        }
+
+        privileges.forEach(privilege => {
+            let resource = privilege.resource;
+            if (resource === undefined) {
+                return;
+            }
+            let db = resource.db;
+            if (db === undefined || db !== this.getName()) {
+                return;
+            }
+            let collection = resource.collection;
+            if (collection === undefined || typeof collection !== "string" || collection === "") {
+                return;
+            }
+
+            result.push({name: collection});
+        });
+
+        return result.sort(compareOn("name"));
+    };
+
+    /**
+     * Returns a list that contains the names and options of this database's collections, sorted
+     * by collection name. An optional filter can be specified to match only collections with
+     * certain metadata.
+     */
+    DB.prototype.getCollectionInfos = function(
+        filter, nameOnly = false, authorizedCollections = false) {
+        let oldException;
+        try {
+            return this._getCollectionInfosCommand(filter, nameOnly, authorizedCollections);
+        } catch (ex) {
+            if (ex.code !== ErrorCodes.Unauthorized && ex.code !== ErrorCodes.CommandNotFound &&
+                !ex.message.startsWith("no such cmd")) {
+                // We cannot recover from this error, propagate it.
+                throw ex;
+            }
+            oldException = ex;
+        }
+
+        // We have failed to run listCollections. This may be due to the command not
+        // existing, or authorization failing. Try to query the system.namespaces collection.
+        try {
+            return this._getCollectionInfosSystemNamespaces(filter);
+        } catch (ex2) {
+            // Querying the system.namespaces collection has failed. We may be able to compute a
+            // set of *some* collections which exist and we have access to from our privileges.
+            // For this to work, the previous operations must have failed due to authorization,
+            // we must be attempting to recover the names of our own collections,
+            // and no filter can have been provided.
+
+            if (nameOnly && authorizedCollections &&
+                Object.getOwnPropertyNames(filter).length === 0 &&
+                oldException.code === ErrorCodes.Unauthorized &&
+                ex2.code == ErrorCodes.Unauthorized) {
+                print(
+                    "Warning: unable to run listCollections, attempting to approximate collection names by parsing connectionStatus");
+                return this._getCollectionInfosFromPrivileges();
+            }
+
+            throw oldException;
+        }
     };
 
     /**
      * Returns this database's list of collection names in sorted order.
      */
     DB.prototype.getCollectionNames = function() {
-        return this.getCollectionInfos({}, true).map(function(infoObj) {
+        return this.getCollectionInfos({}, true, true).map(function(infoObj) {
             return infoObj.name;
         });
     };
@@ -1870,13 +1932,47 @@ var DB;
             delete options.resumeAfter;
         }
 
-        if (options.hasOwnProperty("startAtClusterTime")) {
-            changeStreamStage.startAtClusterTime = options.startAtClusterTime;
-            delete options.startAtClusterTime;
+        if (options.hasOwnProperty("startAtOperationTime")) {
+            changeStreamStage.startAtOperationTime = options.startAtOperationTime;
+            delete options.startAtOperationTime;
         }
 
         pipeline.unshift({$changeStream: changeStreamStage});
         return this._runAggregate({aggregate: 1, pipeline: pipeline}, options);
+    };
+
+    DB.prototype.getFreeMonitoringStatus = function() {
+        'use strict';
+        return assert.commandWorked(this.adminCommand({getFreeMonitoringStatus: 1}));
+    };
+
+    DB.prototype.enableFreeMonitoring = function() {
+        'use strict';
+        assert.commandWorked(this.adminCommand({setFreeMonitoring: 1, action: 'enable'}));
+
+        const cmd = this.adminCommand({getFreeMonitoringStatus: 1});
+        if (!cmd.ok && (cmd.code == ErrorCode.Unauthorized)) {
+            // Edge case: It's technically possible that a user can change free-mon state,
+            // but is not allowed to inspect it.
+            print("Successfully initiated free monitoring, but unable to determine status " +
+                  "as you lack the 'checkFreeMonitoringStatus' privilege.");
+            return null;
+        }
+        assert.commandWorked(cmd);
+
+        if (cmd.state !== 'enabled') {
+            print("Successfully initiated free monitoring. The registration is " +
+                  "proceeding in the background. ");
+            print("Run db.getFreeMonitoringStatus() at any time to check on the progress.");
+            return null;
+        }
+
+        return cmd;
+    };
+
+    DB.prototype.disableFreeMonitoring = function() {
+        'use strict';
+        assert.commandWorked(this.adminCommand({setFreeMonitoring: 1, action: 'disable'}));
     };
 
     // Writing `this.hasOwnProperty` would cause DB.prototype.getCollection() to be called since the

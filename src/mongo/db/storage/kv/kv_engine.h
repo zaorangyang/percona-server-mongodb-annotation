@@ -164,6 +164,10 @@ public:
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident) = 0;
 
+    virtual void alterIdentMetadata(OperationContext* opCtx,
+                                    StringData ident,
+                                    const IndexDescriptor* desc){};
+
     // optional
     virtual int flushAllFiles(OperationContext* opCtx, bool sync) {
         return 0;
@@ -293,7 +297,7 @@ public:
     /**
      * See `StorageEngine::getAllCommittedTimestamp`
      */
-    virtual Timestamp getAllCommittedTimestamp(OperationContext* opCtx) const = 0;
+    virtual Timestamp getAllCommittedTimestamp() const = 0;
 
     /**
      * See `StorageEngine::supportsReadConcernSnapshot`

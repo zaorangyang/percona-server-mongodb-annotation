@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
@@ -37,7 +38,9 @@
 #include "mongo/db/repl/multiapplier.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/replication_consistency_markers.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/future.h"
@@ -60,6 +63,22 @@ public:
     public:
         bool allowNamespaceNotFoundErrorsOnCrudOps = false;
         bool relaxUniqueIndexConstraints = false;
+        bool skipWritesToOplog = false;
+    };
+
+    /**
+     * Controls what can popped from the oplog buffer into a single batch of operations that can be
+     * applied using multiApply().
+     */
+    class BatchLimits {
+    public:
+        size_t bytes = 0;
+        size_t ops = 0;
+
+        // If provided, the batch will not include any operations with timestamps after this point.
+        // This is intended for implementing slaveDelay, so it should be some number of seconds
+        // before now.
+        boost::optional<Date_t> slaveDelayLatestTimestamp = {};
     };
 
     // Used to report oplog application progress.
@@ -76,6 +95,8 @@ public:
                  OplogBuffer* oplogBuffer,
                  Observer* observer,
                  ReplicationCoordinator* replCoord,
+                 ReplicationConsistencyMarkers* consistencyMarkers,
+                 StorageInterface* storageInterface,
                  const Options& options,
                  ThreadPool* writerPool);
 
@@ -96,6 +117,34 @@ public:
      */
     void enqueue(const Operations& operations);
 
+    /**
+     * Returns a new batch of ops to apply.
+     * A batch may consist of:
+     *     at most "BatchLimits::ops" OplogEntries
+     *     at most "BatchLimits::bytes" worth of OplogEntries
+     *     only OplogEntries from before the "BatchLimits::slaveDelayLatestTimestamp" point
+     *     a single command OplogEntry (excluding applyOps, which are grouped with CRUD ops)
+     */
+    StatusWith<Operations> getNextApplierBatch(OperationContext* opCtx,
+                                               const BatchLimits& batchLimits);
+
+    /**
+     * Applies a batch of oplog entries by writing the oplog entries to the local oplog and then
+     * using a set of threads to apply the operations.
+     *
+     * If the batch application is successful, returns the optime of the last op applied, which
+     * should be the last op in the batch.
+     * Returns ErrorCodes::CannotApplyOplogWhilePrimary if the node has become primary.
+     *
+     * To provide crash resilience, this function will advance the persistent value of 'minValid'
+     * to at least the last optime of the batch. If 'minValid' is already greater than or equal
+     * to the last optime of this batch, it will not be updated.
+     *
+     * Passthrough function for SyncTail::multiApply().
+     *
+     * TODO: remove when enqueue() is implemented.
+     */
+    StatusWith<OpTime> multiApply(OperationContext* opCtx, Operations ops);
 
 private:
     // Used to schedule task for oplog application loop.
@@ -110,6 +159,12 @@ private:
 
     // Not owned by us.
     ReplicationCoordinator* const _replCoord;
+
+    // Not owned by us.
+    ReplicationConsistencyMarkers* const _consistencyMarkers;
+
+    // Not owned by us.
+    StorageInterface* const _storageInterface;
 
     // Used to configure OplogApplier behavior.
     const Options _options;

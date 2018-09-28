@@ -38,6 +38,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_begin_transaction_block.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
@@ -203,9 +204,7 @@ void WiredTigerSizeStorer::syncCache(bool syncToDisk) {
         return;  // Nothing to do.
 
     WT_SESSION* session = _session.getSession();
-    invariantWTOK(session->begin_transaction(session, syncToDisk ? "sync=true" : ""));
-    auto rollbacker =
-        MakeGuard([&] { invariant(session->rollback_transaction(session, nullptr) == 0); });
+    WiredTigerBeginTxnBlock txnOpen(session, syncToDisk ? "sync=true" : nullptr);
 
     for (Map::iterator it = myMap.begin(); it != myMap.end(); ++it) {
         string uriKey = it->first;
@@ -230,7 +229,7 @@ void WiredTigerSizeStorer::syncCache(bool syncToDisk) {
 
     invariantWTOK(_cursor->reset(_cursor));
 
-    rollbacker.Dismiss();
+    txnOpen.done();
     invariantWTOK(session->commit_transaction(session, NULL));
 
     {

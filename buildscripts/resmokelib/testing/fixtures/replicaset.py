@@ -10,6 +10,7 @@ import pymongo.errors
 import pymongo.write_concern
 
 from . import interface
+from . import replicaset_utils
 from . import standalone
 from ... import config
 from ... import errors
@@ -22,12 +23,12 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
     # Error response codes copied from mongo/base/error_codes.err.
     _NODE_NOT_FOUND = 74
 
-    def __init__(  # pylint: disable=too-many-arguments
+    def __init__(  # pylint: disable=too-many-arguments, too-many-locals
             self, logger, job_num, mongod_executable=None, mongod_options=None, dbpath_prefix=None,
             preserve_dbpath=False, num_nodes=2, start_initial_sync_node=False,
             write_concern_majority_journal_default=None, auth_options=None,
             replset_config_options=None, voting_secondaries=None, all_nodes_electable=False,
-            use_replica_set_connection_string=None):
+            use_replica_set_connection_string=None, linear_chain=False):
         """Initialize ReplicaSetFixture."""
 
         interface.ReplFixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
@@ -43,6 +44,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         self.voting_secondaries = voting_secondaries
         self.all_nodes_electable = all_nodes_electable
         self.use_replica_set_connection_string = use_replica_set_connection_string
+        self.linear_chain = linear_chain
 
         # If voting_secondaries has not been set, set a default. By default, secondaries have zero
         # votes unless they are also nodes capable of being elected primary.
@@ -79,8 +81,14 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                 node = self._new_mongod(i, self.replset_name)
                 self.nodes.append(node)
 
-        for node in self.nodes:
-            node.setup()
+        for i in xrange(self.num_nodes):
+            if self.linear_chain and i > 0:
+                self.nodes[i].mongod_options["set_parameters"][
+                    "failpoint.forceSyncSourceCandidate"] = {
+                        "mode": "alwaysOn",
+                        "data": {"hostAndPort": self.nodes[i - 1].get_internal_connection_string()}
+                    }
+            self.nodes[i].setup()
 
         if self.start_initial_sync_node:
             if not self.initial_sync_node:
@@ -116,11 +124,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         repl_config = {"_id": self.replset_name, "protocolVersion": 1}
         client = self.nodes[0].mongo_client()
 
-        if self.auth_options is not None:
-            auth_db = client[self.auth_options["authenticationDatabase"]]
-            auth_db.authenticate(self.auth_options["username"],
-                                 password=self.auth_options["password"],
-                                 mechanism=self.auth_options["authenticationMechanism"])
+        self.auth(client, self.auth_options)
 
         if client.local.system.replset.count():
             # Skip initializing the replset if there is an existing configuration.
@@ -193,6 +197,26 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                     raise errors.ServerFailure(msg)
                 time.sleep(5)  # Wait a little bit before trying again.
 
+    def await_last_op_committed(self):
+        """Wait for the last majority committed op to be visible."""
+        primary_client = self.get_primary().mongo_client()
+        self.auth(primary_client, self.auth_options)
+
+        primary_optime = replicaset_utils.get_last_optime(primary_client)
+        up_to_date_nodes = set()
+
+        def check_rcmaj_optime(client, node):
+            """Return True if all nodes have caught up with the primary."""
+            res = client.admin.command({"replSetGetStatus": 1})
+            read_concern_majority_optime = res["optimes"]["readConcernMajorityOpTime"]
+
+            if read_concern_majority_optime >= primary_optime:
+                up_to_date_nodes.add(node.port)
+
+            return len(up_to_date_nodes) == len(self.nodes)
+
+        self._await_cmd_all_nodes(check_rcmaj_optime, "waiting for last committed optime")
+
     def await_ready(self):
         """Wait for replica set tpo be ready."""
         self._await_primary()
@@ -232,16 +256,22 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
                 time.sleep(0.1)  # Wait a little bit before trying again.
             self.logger.info("Secondary on port %d is now available.", secondary.port)
 
+    @staticmethod
+    def auth(client, auth_options=None):
+        """Auth a client connection."""
+        if auth_options is not None:
+            auth_db = client[auth_options["authenticationDatabase"]]
+            auth_db.authenticate(auth_options["username"], password=auth_options["password"],
+                                 mechanism=auth_options["authenticationMechanism"])
+
+        return client
+
     def _await_stable_checkpoint(self):
         # Since this method is called at startup we expect the first node to be primary even when
         # self.all_nodes_electable is True.
-        primary = self.nodes[0]
-        primary_client = primary.mongo_client()
-        if self.auth_options is not None:
-            auth_db = primary_client[self.auth_options["authenticationDatabase"]]
-            auth_db.authenticate(self.auth_options["username"],
-                                 password=self.auth_options["password"],
-                                 mechanism=self.auth_options["authenticationMechanism"])
+        primary_client = self.nodes[0].mongo_client()
+        self.auth(primary_client, self.auth_options)
+
         # Algorithm precondition: All nodes must be in primary/secondary state.
         #
         # 1) Perform a majority write. This will guarantee the primary updates its commit point
@@ -261,12 +291,9 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         for node in self.nodes:
             self.logger.info("Waiting for node on port %d to have a stable checkpoint.", node.port)
             client = node.mongo_client(read_preference=pymongo.ReadPreference.SECONDARY)
+            self.auth(client, self.auth_options)
+
             client_admin = client["admin"]
-            if self.auth_options is not None:
-                client_auth_db = client[self.auth_options["authenticationDatabase"]]
-                client_auth_db.authenticate(self.auth_options["username"],
-                                            password=self.auth_options["password"],
-                                            mechanism=self.auth_options["authenticationMechanism"])
 
             while True:
                 status = client_admin.command("replSetGetStatus")
@@ -328,36 +355,48 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             # of the replica set are configured with priority=0.
             return self.nodes[0]
 
+        def is_primary(client, node):
+            """Return if `node` is master."""
+            is_master = client.admin.command("isMaster")["ismaster"]
+            if is_master:
+                self.logger.info("The node on port %d is primary of replica set '%s'", node.port,
+                                 self.replset_name)
+                return True
+            return False
+
+        return self._await_cmd_all_nodes(is_primary, "waiting for a primary", timeout_secs)
+
+    def _await_cmd_all_nodes(self, fn, msg, timeout_secs=30):
+        """Run `fn` on all nodes until it returns a truthy value.
+
+        Return the node for which makes `fn` become truthy.
+
+        Two arguments are passed to fn: the client for a node and
+        the MongoDFixture corresponding to that node.
+        """
+
         start = time.time()
         clients = {}
         while True:
             for node in self.nodes:
-                self._check_get_primary_timeout(start, timeout_secs)
+                now = time.time()
+                if (now - start) >= timeout_secs:
+                    msg = "Timed out while {} for replica set '{}'.".format(msg, self.replset_name)
+                    self.logger.error(msg)
+                    raise errors.ServerFailure(msg)
 
                 try:
-                    client = clients.get(node.port)
-                    if not client:
-                        client = node.mongo_client()
-                        clients[node.port] = client
-                    is_master = client.admin.command("isMaster")["ismaster"]
+                    if node.port not in clients:
+                        clients[node.port] = self.auth(node.mongo_client(), self.auth_options)
+
+                    if fn(clients[node.port], node):
+                        return node
+
                 except pymongo.errors.AutoReconnect:
                     # AutoReconnect exceptions may occur if the primary stepped down since PyMongo
                     # last contacted it. We'll just try contacting the node again in the next round
                     # of isMaster requests.
                     continue
-
-                if is_master:
-                    self.logger.info("The node on port %d is primary of replica set '%s'",
-                                     node.port, self.replset_name)
-                    return node
-
-    def _check_get_primary_timeout(self, start, timeout_secs):
-        now = time.time()
-        if (now - start) >= timeout_secs:
-            msg = "Timed out while waiting for a primary for replica set '{}'.".format(
-                self.replset_name)
-            self.logger.error(msg)
-            raise errors.ServerFailure(msg)
 
     def get_secondaries(self):
         """Return a list of secondaries from the replica set."""
@@ -375,6 +414,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         mongod_options = self.mongod_options.copy()
         mongod_options["replSet"] = replset_name
         mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, "node{}".format(index))
+        mongod_options["set_parameters"] = mongod_options.get("set_parameters", {}).copy()
 
         return standalone.MongoDFixture(
             mongod_logger, self.job_num, mongod_executable=self.mongod_executable,

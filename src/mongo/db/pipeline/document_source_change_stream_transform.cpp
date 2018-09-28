@@ -65,22 +65,6 @@ using std::vector;
 
 namespace {
 constexpr auto checkValueType = &DocumentSourceChangeStream::checkValueType;
-
-bool isOpTypeRelevant(const Document& d) {
-    Value op = d["op"];
-    invariant(!op.missing());
-
-    if (op.getString() != "n") {
-        return true;
-    }
-
-    Value type = d.getNestedField("o2.type");
-    if (!type.missing() && type.getString() == "migrateChunkToNewShard") {
-        return true;
-    }
-
-    return false;
-}
 }  // namespace
 
 DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
@@ -356,19 +340,18 @@ Value DocumentSourceChangeStreamTransform::serialize(
         changeStreamOptions
             [DocumentSourceChangeStreamSpec::kResumeAfterClusterTimeDeprecatedFieldName]
                 .missing() &&
-        changeStreamOptions[DocumentSourceChangeStreamSpec::kStartAtClusterTimeFieldName]
+        changeStreamOptions[DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName]
             .missing()) {
         MutableDocument newChangeStreamOptions(changeStreamOptions);
 
         // Use the current cluster time plus 1 tick since the oplog query will include all
-        // operations/commands equal to or greater than the 'startAtClusterTime' timestamp. In
+        // operations/commands equal to or greater than the 'startAtOperationTime' timestamp. In
         // particular, avoid including the last operation that went through mongos in an attempt to
         // match the behavior of a replica set more closely.
         auto clusterTime = LogicalClock::get(pExpCtx->opCtx)->getClusterTime();
         clusterTime.addTicks(1);
-        newChangeStreamOptions[DocumentSourceChangeStreamSpec::kStartAtClusterTimeFieldName]
-                              [ResumeTokenClusterTime::kTimestampFieldName] =
-                                  Value(clusterTime.asTimestamp());
+        newChangeStreamOptions[DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName] =
+            Value(clusterTime.asTimestamp());
         changeStreamOptions = newChangeStreamOptions.freeze();
     }
     return Value(Document{{getSourceName(), changeStreamOptions}});
@@ -413,9 +396,13 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamTransform::getNext() {
 }
 
 bool DocumentSourceChangeStreamTransform::isDocumentRelevant(const Document& d) {
-    if (!isOpTypeRelevant(d)) {
-        return false;
-    }
+    invariant(
+        d["op"].getType() == BSONType::String,
+        str::stream()
+            << "Unexpected format for entry within a transaction oplog entry: 'op' field was type "
+            << typeName(d["op"].getType()));
+    invariant(ValueComparator::kInstance.evaluate(d["op"] != Value("n"_sd)),
+              "Unexpected noop entry within a transaction");
 
     Value nsField = d["ns"];
     invariant(!nsField.missing());

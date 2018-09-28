@@ -288,8 +288,6 @@ public:
 
     virtual Status updateTerm(OperationContext* opCtx, long long term) override;
 
-    virtual Timestamp getMinimumVisibleSnapshot(OperationContext* opCtx) override;
-
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
 
     virtual void waitUntilSnapshotCommitted(OperationContext* opCtx,
@@ -977,8 +975,8 @@ private:
      * current commit point. The stable optime is the greatest optime in 'candidates' that is
      * also less than or equal to 'commitPoint'.
      */
-    boost::optional<OpTime> _calculateStableOpTime(const std::set<OpTime>& candidates,
-                                                   const OpTime& commitPoint);
+    boost::optional<OpTime> _calculateStableOpTime_inlock(const std::set<OpTime>& candidates,
+                                                          const OpTime& commitPoint);
 
     /**
      * Removes any optimes from the optime set 'candidates' that are less than
@@ -1123,8 +1121,8 @@ private:
     // (PS) Pointer is read-only in concurrent operation, item pointed to is self-synchronizing;
     //      Access in any context.
     // (M)  Reads and writes guarded by _mutex
-    // (GM) Readable under any global intent lock.  Must hold both the global lock in exclusive
-    //      mode (MODE_X) and hold _mutex to write.
+    // (GM) Readable under any global intent lock or _mutex.  Must hold both the global lock in
+    //      exclusive mode (MODE_X) and hold _mutex to write.
     // (I)  Independently synchronized, see member variable comment.
 
     // Protects member data of this ReplicationCoordinator.

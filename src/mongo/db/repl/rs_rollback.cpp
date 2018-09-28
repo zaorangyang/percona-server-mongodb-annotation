@@ -612,8 +612,7 @@ void checkRbidAndUpdateMinValid(OperationContext* opCtx,
 
     // This method is only used with storage engines that do not support recover to stable
     // timestamp. As a result, the timestamp on the 'appliedThrough' update does not matter.
-    invariant(
-        !opCtx->getServiceContext()->getGlobalStorageEngine()->supportsRecoverToStableTimestamp());
+    invariant(!opCtx->getServiceContext()->getStorageEngine()->supportsRecoverToStableTimestamp());
     replicationProcess->getConsistencyMarkers()->clearAppliedThrough(opCtx, {});
     replicationProcess->getConsistencyMarkers()->setMinValid(opCtx, minValid);
 
@@ -844,7 +843,7 @@ void rollbackRenameCollection(OperationContext* opCtx, UUID uuid, RenameCollecti
     log() << "Attempting to rename collection with UUID: " << uuid << ", from: " << info.renameFrom
           << ", to: " << info.renameTo;
     Lock::DBLock dbLock(opCtx, dbName, MODE_X);
-    auto db = dbHolder().openDb(opCtx, dbName);
+    auto db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbName);
     invariant(db);
 
     auto status = renameCollectionForRollback(opCtx, info.renameTo, uuid);
@@ -1032,7 +1031,11 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             // If the collection turned into a view, we might get an error trying to
             // refetch documents, but these errors should be ignored, as we'll be creating
             // the view during oplog replay.
-            if (ex.code() == ErrorCodes::CommandNotSupportedOnView)
+            // Collection may be dropped on the sync source, in which case it will be dropped during
+            // oplog replay. So it is safe to ignore NamespaceNotFound errors while trying to
+            // refetch documents.
+            if (ex.code() == ErrorCodes::CommandNotSupportedOnView ||
+                ex.code() == ErrorCodes::NamespaceNotFound)
                 continue;
 
             log() << "Rollback couldn't re-fetch from uuid: " << uuid << " _id: " << redact(doc._id)
@@ -1138,7 +1141,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
             Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
 
-            auto db = dbHolder().openDb(opCtx, nss.db().toString());
+            auto db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, nss.db().toString());
             invariant(db);
 
             Collection* collection = UUIDCatalog::get(opCtx).lookupCollectionByUUID(uuid);

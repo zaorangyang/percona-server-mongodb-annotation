@@ -45,10 +45,12 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/free_mon/free_mon_controller.h"
 #include "mongo/db/free_mon/free_mon_http.h"
 #include "mongo/db/free_mon/free_mon_message.h"
 #include "mongo/db/free_mon/free_mon_network.h"
+#include "mongo/db/free_mon/free_mon_op_observer.h"
 #include "mongo/db/free_mon/free_mon_options.h"
 #include "mongo/db/free_mon/free_mon_protocol_gen.h"
 #include "mongo/db/free_mon/free_mon_storage.h"
@@ -67,19 +69,6 @@
 namespace mongo {
 
 namespace {
-
-const auto getFreeMonController =
-    ServiceContext::declareDecoration<std::unique_ptr<FreeMonController>>();
-
-FreeMonController* getGlobalFreeMonController() {
-    if (!hasGlobalServiceContext()) {
-        return nullptr;
-    }
-
-    return getFreeMonController(getGlobalServiceContext()).get();
-}
-
-
 /**
  * Expose cloudFreeMonitoringEndpointURL set parameter to URL for free monitoring.
  */
@@ -118,8 +107,7 @@ public:
             .then([](std::vector<uint8_t> blob) {
 
                 if (blob.empty()) {
-                    uassertStatusOK(
-                        Status(ErrorCodes::FreeMonHttpTemporaryFailure, "Empty response received"));
+                    uasserted(ErrorCodes::FreeMonHttpTemporaryFailure, "Empty response received");
                 }
 
                 ConstDataRange cdr(reinterpret_cast<char*>(blob.data()), blob.size());
@@ -144,8 +132,7 @@ public:
             .then([](std::vector<uint8_t> blob) {
 
                 if (blob.empty()) {
-                    uassertStatusOK(
-                        Status(ErrorCodes::FreeMonHttpTemporaryFailure, "Empty response received"));
+                    uasserted(ErrorCodes::FreeMonHttpTemporaryFailure, "Empty response received");
                 }
 
                 ConstDataRange cdr(reinterpret_cast<char*>(blob.data()), blob.size());
@@ -234,6 +221,35 @@ public:
     }
 };
 
+/**
+ * Collect the UUIDs associated with the named collections (if available).
+ */
+class FreeMonNamespaceUUIDCollector : public FreeMonCollectorInterface {
+public:
+    FreeMonNamespaceUUIDCollector(std::set<NamespaceString> namespaces)
+        : _namespaces(std::move(namespaces)) {}
+
+    std::string name() const final {
+        return "uuid";
+    }
+
+    void collect(OperationContext* opCtx, BSONObjBuilder& builder) {
+        for (auto nss : _namespaces) {
+            AutoGetCollectionForRead coll(opCtx, nss);
+            auto* collection = coll.getCollection();
+            if (collection) {
+                auto optUUID = collection->uuid();
+                if (optUUID) {
+                    builder << nss.toString() << optUUID.get();
+                }
+            }
+        }
+    }
+
+private:
+    std::set<NamespaceString> _namespaces;
+};
+
 }  // namespace
 
 
@@ -245,8 +261,7 @@ auto makeTaskExecutor(ServiceContext* /*serviceContext*/) {
         Client::initThread(threadName.c_str());
     };
     return stdx::make_unique<executor::ThreadPoolTaskExecutor>(
-        std::make_unique<ThreadPool>(tpOptions),
-        executor::makeNetworkInterface("NetworkInterfaceASIO-FreeMon"));
+        std::make_unique<ThreadPool>(tpOptions), executor::makeNetworkInterface("FreeMon"));
 }
 
 void registerCollectors(FreeMonController* controller) {
@@ -282,6 +297,13 @@ void registerCollectors(FreeMonController* controller) {
 
         controller->addMetricsCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
             "replSetGetConfig", "replSetGetConfig", "", BSON("replSetGetConfig" << 1)));
+
+        // Collect UUID for certain collections.
+        std::set<NamespaceString> namespaces({NamespaceString("local.oplog.rs")});
+        controller->addRegistrationCollector(
+            std::make_unique<FreeMonNamespaceUUIDCollector>(namespaces));
+        controller->addMetricsCollector(
+            std::make_unique<FreeMonNamespaceUUIDCollector>(namespaces));
     }
 
     controller->addRegistrationCollector(stdx::make_unique<FTDCSimpleInternalCommandCollector>(
@@ -318,12 +340,12 @@ void startFreeMonitoring(ServiceContext* serviceContext) {
 
     auto controller = stdx::make_unique<FreeMonController>(std::move(network));
 
+    auto controllerPtr = controller.get();
+
     registerCollectors(controller.get());
 
     // Install the new controller
-    auto& staticFreeMon = getFreeMonController(serviceContext);
-
-    staticFreeMon = std::move(controller);
+    FreeMonController::set(getGlobalServiceContext(), std::move(controller));
 
     RegistrationType registrationType = RegistrationType::DoNotRegister;
     if (globalFreeMonParams.freeMonitoringState == EnableCloudStateEnum::kOn) {
@@ -334,9 +356,11 @@ void startFreeMonitoring(ServiceContext* serviceContext) {
         } else {
             registrationType = RegistrationType::RegisterOnStart;
         }
+    } else if (globalFreeMonParams.freeMonitoringState == EnableCloudStateEnum::kRuntime) {
+        registrationType = RegistrationType::RegisterAfterOnTransitionToPrimary;
     }
 
-    staticFreeMon->start(registrationType);
+    controllerPtr->start(registrationType, globalFreeMonParams.freeMonitoringTags);
 }
 
 void stopFreeMonitoring() {
@@ -344,15 +368,19 @@ void stopFreeMonitoring() {
         return;
     }
 
-    auto controller = getGlobalFreeMonController();
+    auto controller = FreeMonController::get(getGlobalServiceContext());
 
     if (controller != nullptr) {
         controller->stop();
     }
 }
 
-FreeMonController* FreeMonController::get(ServiceContext* serviceContext) {
-    return getFreeMonController(serviceContext).get();
+void notifyFreeMonitoringOnTransitionToPrimary() {
+    FreeMonController::get(getGlobalServiceContext())->notifyOnTransitionToPrimary();
+}
+
+void setupFreeMonitoringOpObserver(OpObserverRegistry* registry) {
+    registry->addObserver(stdx::make_unique<FreeMonOpObserver>());
 }
 
 FreeMonHttpClientInterface::~FreeMonHttpClientInterface() = default;

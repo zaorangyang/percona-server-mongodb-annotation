@@ -13,6 +13,7 @@ selector:
   - jstests/sharding/database_versioning_upgrade_downgrade.js
   - jstests/sharding/shard_collection_cache_upgrade_downgrade.js
   #### Enable when 4.0 becomes last-stable.
+  - jstests/sharding/change_stream_no_shards.js
   - jstests/sharding/change_streams_unsharded_becomes_sharded.js
   - jstests/sharding/create_database.js
   - jstests/sharding/database_and_shard_versioning_all_commands.js
@@ -31,6 +32,7 @@ selector:
   - jstests/sharding/safe_secondary_reads_single_migration_suspend_range_deletion.js
   - jstests/sharding/safe_secondary_reads_single_migration_waitForDelete.js
   - jstests/sharding/move_primary_basic.js
+  - jstests/sharding/move_primary_fails_without_database_version.js
   - jstests/sharding/movePrimary1.js
   - jstests/sharding/mongos_validate_writes.js
   - jstests/sharding/resume_change_stream_on_subset_of_shards.js
@@ -64,10 +66,9 @@ selector:
   - jstests/sharding/change_streams_whole_db.js
   - jstests/sharding/lookup_change_stream_post_image_compound_shard_key.js
   - jstests/sharding/resume_change_stream.js
+  - jstests/sharding/transactions_prohibited_in_sharded_cluster.js
   # Requires count command to be accurate on sharded clusters, introduced in v4.0.
   - jstests/sharding/accurate_count_with_predicate.js
-  # Disabled throughout sharding. See SERVER-31937 for details.
-  - jstests/sharding/kill_sessions.js
 
 executor:
   config:

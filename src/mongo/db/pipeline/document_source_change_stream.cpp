@@ -142,7 +142,7 @@ namespace {
  * "invalidate" entries.
  * It is not intended to be created by the user.
  */
-class DocumentSourceCloseCursor final : public DocumentSource, public SplittableDocumentSource {
+class DocumentSourceCloseCursor final : public DocumentSource, public NeedsMergerDocumentSource {
 public:
     GetNextResult getNext() final;
 
@@ -423,24 +423,24 @@ void parseResumeOptions(const intrusive_ptr<ExpressionContext>& expCtx,
     }
 
     auto resumeAfterClusterTime = spec.getResumeAfterClusterTimeDeprecated();
-    auto startAtClusterTime = spec.getStartAtClusterTime();
+    auto startAtOperationTime = spec.getStartAtOperationTime();
 
     uassert(40674,
             "Only one type of resume option is allowed, but multiple were found.",
-            !(*resumeStageOut) || (!resumeAfterClusterTime && !startAtClusterTime));
+            !(*resumeStageOut) || (!resumeAfterClusterTime && !startAtOperationTime));
 
     if (resumeAfterClusterTime) {
         if (fcv >= ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
             warning() << "The '$_resumeAfterClusterTime' option is deprecated, please use "
-                         "'startAtClusterTime' instead.";
+                         "'startAtOperationTime' instead.";
         }
         *startFromOut = resumeAfterClusterTime->getTimestamp();
     }
 
-    // New field name starting in 4.0 is 'startAtClusterTime'.
-    if (startAtClusterTime) {
+    // New field name starting in 4.0 is 'startAtOperationTime'.
+    if (startAtOperationTime) {
         uassert(ErrorCodes::QueryFeatureNotAllowed,
-                str::stream() << "The startAtClusterTime option is not allowed in the current "
+                str::stream() << "The startAtOperationTime option is not allowed in the current "
                                  "feature compatibility version. See "
                               << feature_compatibility_version_documentation::kCompatibilityLink
                               << " for more information.",
@@ -448,12 +448,12 @@ void parseResumeOptions(const intrusive_ptr<ExpressionContext>& expCtx,
         uassert(50573,
                 str::stream()
                     << "Do not specify both "
-                    << DocumentSourceChangeStreamSpec::kStartAtClusterTimeFieldName
+                    << DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName
                     << " and "
                     << DocumentSourceChangeStreamSpec::kResumeAfterClusterTimeDeprecatedFieldName
                     << " in a $changeStream stage.",
                 !resumeAfterClusterTime);
-        *startFromOut = startAtClusterTime->getTimestamp();
+        *startFromOut = *startAtOperationTime;
         *resumeStageOut = DocumentSourceShardCheckResumability::create(expCtx, **startFromOut);
     }
 }
@@ -462,6 +462,10 @@ void parseResumeOptions(const intrusive_ptr<ExpressionContext>& expCtx,
 
 list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
+    uassert(50808,
+            "$changeStream stage expects a document as argument.",
+            elem.type() == BSONType::Object);
+
     // A change stream is a tailable + awaitData cursor.
     expCtx->tailableMode = TailableModeEnum::kTailableAndAwaitData;
 
@@ -528,9 +532,9 @@ BSONObj DocumentSourceChangeStream::replaceResumeTokenInCommand(const BSONObj or
         pipeline[0][DocumentSourceChangeStream::kStageName].getDocument());
     changeStreamStage[DocumentSourceChangeStreamSpec::kResumeAfterFieldName] = Value(resumeToken);
 
-    // If the command was initially specified with a startAtClusterTime, we need to remove it
+    // If the command was initially specified with a startAtOperationTime, we need to remove it
     // to use the new resume token.
-    changeStreamStage[DocumentSourceChangeStreamSpec::kStartAtClusterTimeFieldName] = Value();
+    changeStreamStage[DocumentSourceChangeStreamSpec::kStartAtOperationTimeFieldName] = Value();
     pipeline[0] =
         Value(Document{{DocumentSourceChangeStream::kStageName, changeStreamStage.freeze()}});
     MutableDocument newCmd(originalCmd);

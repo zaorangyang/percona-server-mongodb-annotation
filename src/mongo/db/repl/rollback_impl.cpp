@@ -299,10 +299,10 @@ Status RollbackImpl::_awaitBgIndexCompletion(OperationContext* opCtx) {
     }
 
     // Get a list of all databases.
-    StorageEngine* storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
     std::vector<std::string> dbs;
     {
-        Lock::GlobalLock lk(opCtx, MODE_IS, Date_t::max());
+        Lock::GlobalLock lk(opCtx, MODE_IS);
         storageEngine->listDatabases(&dbs);
     }
 
@@ -854,10 +854,10 @@ void RollbackImpl::_resetDropPendingState(OperationContext* opCtx) {
     DropPendingCollectionReaper::get(opCtx)->clearDropPendingState();
 
     std::vector<std::string> dbNames;
-    opCtx->getServiceContext()->getGlobalStorageEngine()->listDatabases(&dbNames);
+    opCtx->getServiceContext()->getStorageEngine()->listDatabases(&dbNames);
     for (const auto& dbName : dbNames) {
         Lock::DBLock dbLock(opCtx, dbName, MODE_X);
-        Database* db = dbHolder().openDb(opCtx, dbName);
+        Database* db = DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbName);
         checkForIdIndexesAndDropPendingCollections(opCtx, db);
     }
 }

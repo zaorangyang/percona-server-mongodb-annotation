@@ -92,7 +92,7 @@ repl::OpTime UUIDCatalogObserver::onRenameCollection(OperationContext* opCtx,
     if (!uuid)
         return {};
     auto getNewCollection = [opCtx, toCollection] {
-        auto db = dbHolder().get(opCtx, toCollection.db());
+        auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, toCollection.db());
         auto newColl = db->getCollection(opCtx, toCollection);
         invariant(newColl);
         return newColl;
@@ -127,7 +127,7 @@ void UUIDCatalog::onRenameCollection(OperationContext* opCtx,
                                      GetNewCollectionFunction getNewCollection,
                                      CollectionUUID uuid) {
     Collection* oldColl = removeUUIDCatalogEntry(uuid);
-    opCtx->recoveryUnit()->onCommit([this, getNewCollection, uuid] {
+    opCtx->recoveryUnit()->onCommit([this, getNewCollection, uuid](boost::optional<Timestamp>) {
         // Reset current UUID entry in case some other operation updates the UUID catalog before the
         // WUOW is committed. registerUUIDCatalogEntry() is a no-op if there's an existing UUID
         // entry.

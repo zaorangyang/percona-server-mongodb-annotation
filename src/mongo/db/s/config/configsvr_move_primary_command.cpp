@@ -40,6 +40,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/server_options.h"
@@ -108,11 +109,13 @@ public:
              BSONObjBuilder& result) override {
 
         if (serverGlobalParams.clusterRole != ClusterRole::ConfigServer) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation,
-                       "_configsvrMovePrimary can only be run on config servers"));
+            uasserted(ErrorCodes::IllegalOperation,
+                      "_configsvrMovePrimary can only be run on config servers");
         }
+
+        // Set the operation context read concern level to local for reads into the config database.
+        repl::ReadConcernArgs::get(opCtx) =
+            repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
         auto movePrimaryRequest =
             MovePrimary::parse(IDLParserErrorContext("ConfigSvrMovePrimary"), cmdObj);
@@ -125,10 +128,8 @@ public:
 
         if (dbname == NamespaceString::kAdminDb || dbname == NamespaceString::kConfigDb ||
             dbname == NamespaceString::kLocalDb) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                {ErrorCodes::InvalidOptions,
-                 str::stream() << "Can't move primary for " << dbname << " database"});
+            uasserted(ErrorCodes::InvalidOptions,
+                      str::stream() << "Can't move primary for " << dbname << " database");
         }
 
         uassert(ErrorCodes::InvalidOptions,
@@ -139,10 +140,8 @@ public:
         const std::string to = movePrimaryRequest.getTo().toString();
 
         if (to.empty()) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                {ErrorCodes::InvalidOptions,
-                 str::stream() << "you have to specify where you want to move it"});
+            uasserted(ErrorCodes::InvalidOptions,
+                      str::stream() << "you have to specify where you want to move it");
         }
 
         auto const catalogClient = Grid::get(opCtx)->catalogClient();
@@ -152,9 +151,10 @@ public:
         auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
             opCtx, dbname, "movePrimary", DistLockManager::kDefaultLockTimeout));
 
-        auto dbType = uassertStatusOK(catalogClient->getDatabase(
-                                          opCtx, dbname, repl::ReadConcernLevel::kLocalReadConcern))
-                          .value;
+        auto dbType =
+            uassertStatusOK(catalogClient->getDatabase(
+                                opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel()))
+                .value;
 
         const auto fromShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbType.getPrimary()));
 
@@ -213,7 +213,7 @@ public:
               << " to: " << toShard->toString();
 
         const auto shardedColls = catalogClient->getAllShardedCollectionsForDb(
-            opCtx, dbname, repl::ReadConcernLevel::kLocalReadConcern);
+            opCtx, dbname, repl::ReadConcernArgs::get(opCtx).getLevel());
 
         // Record start in changelog
         uassertStatusOK(catalogClient->logChange(
@@ -249,8 +249,7 @@ public:
 
             if (!worked) {
                 log() << "clone failed" << redact(cloneRes);
-                return CommandHelpers::appendCommandStatus(
-                    result, {ErrorCodes::OperationFailed, str::stream() << "clone failed"});
+                uasserted(ErrorCodes::OperationFailed, str::stream() << "clone failed");
             }
 
             if (auto wcErrorElem = cloneRes["writeConcernError"]) {

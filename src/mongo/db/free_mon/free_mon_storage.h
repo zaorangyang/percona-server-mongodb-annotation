@@ -42,6 +42,11 @@ namespace mongo {
 class FreeMonStorage {
 public:
     /**
+     * The _id value in admin.system.version.
+     */
+    static constexpr auto kFreeMonDocIdKey = "free_monitoring"_sd;
+
+    /**
      * Reads document from disk if it exists.
      */
     static boost::optional<FreeMonStorageState> read(OperationContext* opCtx);
@@ -62,13 +67,6 @@ public:
      * Returns nothing if there are more then one document or it does not exist.
      */
     static boost::optional<BSONObj> readClusterManagerState(OperationContext* opCtx);
-
-    /**
-     * Populate a BSON object with the current status of FreeMonitoring.
-     * This status object will be suitable for return to a caller
-     * invoking the {getFreeMonitoringStatus:1} command.
-     */
-    static void getStatus(OperationContext* opCtx, BSONObjBuilder* builder);
 };
 
 }  // namespace mongo

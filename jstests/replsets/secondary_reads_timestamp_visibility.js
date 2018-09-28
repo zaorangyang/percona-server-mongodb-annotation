@@ -19,6 +19,10 @@
     let primaryDB = secondaryReadsTest.getPrimaryDB();
     let secondaryDB = secondaryReadsTest.getSecondaryDB();
 
+    if (!primaryDB.serverStatus().storageEngine.supportsSnapshotReadConcern) {
+        secondaryReadsTest.stop();
+        return;
+    }
     let primaryColl = primaryDB.getCollection(collName);
 
     // Create a collection and an index. Insert some data.
@@ -56,6 +60,7 @@
 
     // We should see the previous, un-replicated state on the secondary with every readconcern.
     for (let i in levels) {
+        print("Checking that no new updates are visible yet for readConcern: " + levels[i]);
         assert.eq(secondaryDB.getCollection(collName).find({x: 0}).readConcern(levels[i]).itcount(),
                   100);
         assert.eq(secondaryDB.getCollection(collName).find({x: 1}).readConcern(levels[i]).itcount(),
@@ -70,10 +75,11 @@
     // Disable the failpoint and let the batch complete.
     secondaryReadsTest.resumeSecondaryBatchApplication();
 
-    replSet.awaitReplication();
+    replSet.awaitLastOpCommitted();
 
     for (let i in levels) {
-        // We should see the previous state on the secondary with every readconcern.
+        print("Checking that new updates are visible for readConcern: " + levels[i]);
+        // We should see the new state on the secondary with every readconcern.
         assert.eq(secondaryDB.getCollection(collName).find({x: 0}).readConcern(levels[i]).itcount(),
                   0);
         assert.eq(secondaryDB.getCollection(collName).find({x: 1}).readConcern(levels[i]).itcount(),

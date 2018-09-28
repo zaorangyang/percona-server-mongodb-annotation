@@ -104,6 +104,7 @@ class FreeMonHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(http.HTTPStatus.INTERNAL_SERVER_ERROR)
             self.send_header("content-type", "application/octet-stream")
             self.end_headers()
+            self.wfile.write("Internal Error of some sort.".encode())
             return
 
         if fault_type == FAULT_INVALID_REGISTER:
@@ -123,6 +124,7 @@ class FreeMonHandler(http.server.BaseHTTPRequestHandler):
                 'informationalURL': 'http://www.example.com/123',
                 'message': 'Welcome to the Mock Free Monitoring Endpoint',
                 'reportingInterval': bson.int64.Int64(1),
+                'userReminder': "Don't forget to check your metrics!",
             })
 
         self._send_header()

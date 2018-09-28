@@ -34,8 +34,8 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/rpc/message.h"
 #include "mongo/util/fail_point_service.h"
-#include "mongo/util/net/message.h"
 
 namespace mongo {
 
@@ -66,7 +66,7 @@ struct ServiceEntryPointCommon {
         virtual void waitForWriteConcern(OperationContext* opCtx,
                                          const CommandInvocation* invocation,
                                          const repl::OpTime& lastOpBeforeRun,
-                                         BSONObjBuilder commandResponseBuilder) const = 0;
+                                         BSONObjBuilder& commandResponseBuilder) const = 0;
 
         virtual void waitForLinearizableReadConcern(OperationContext* opCtx) const = 0;
         virtual void uassertCommandDoesNotSpecifyWriteConcern(const BSONObj& cmdObj) const = 0;

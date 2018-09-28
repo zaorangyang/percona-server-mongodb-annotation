@@ -105,7 +105,7 @@ public:
           _highestInserted(highestInserted),
           _countInserted(countInserted) {}
 
-    void commit() final {
+    void commit(boost::optional<Timestamp>) final {
         invariant(_bytesInserted >= 0);
         invariant(_highestInserted.isNormal());
 
@@ -129,7 +129,7 @@ class WiredTigerRecordStore::OplogStones::TruncateChange final : public Recovery
 public:
     TruncateChange(OplogStones* oplogStones) : _oplogStones(oplogStones) {}
 
-    void commit() final {
+    void commit(boost::optional<Timestamp>) final {
         _oplogStones->_currentRecords.store(0);
         _oplogStones->_currentBytes.store(0);
 
@@ -596,7 +596,7 @@ StatusWith<std::string> WiredTigerRecordStore::generateCreateString(
     ss << ")";
 
     bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
-        getGlobalReplSettings().getShouldRecoverFromOplogAsStandalone();
+        repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
     if (WiredTigerUtil::useTableLogging(NamespaceString(ns), replicatedWrites)) {
         ss << ",log=(enabled=true)";
     } else {
@@ -649,7 +649,7 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
 
     if (!params.isReadOnly) {
         bool replicatedWrites = getGlobalReplSettings().usingReplSets() ||
-            getGlobalReplSettings().getShouldRecoverFromOplogAsStandalone();
+            repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
         uassertStatusOK(WiredTigerUtil::setTableLogging(
             ctx, _uri, WiredTigerUtil::useTableLogging(NamespaceString(ns()), replicatedWrites)));
     }
@@ -1606,7 +1606,7 @@ WiredTigerRecoveryUnit* WiredTigerRecordStore::_getRecoveryUnit(OperationContext
 class WiredTigerRecordStore::NumRecordsChange : public RecoveryUnit::Change {
 public:
     NumRecordsChange(WiredTigerRecordStore* rs, int64_t diff) : _rs(rs), _diff(diff) {}
-    virtual void commit() {}
+    virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
         _rs->_numRecords.fetchAndAdd(-_diff);
     }
@@ -1629,7 +1629,7 @@ void WiredTigerRecordStore::_changeNumRecords(OperationContext* opCtx, int64_t d
 class WiredTigerRecordStore::DataSizeChange : public RecoveryUnit::Change {
 public:
     DataSizeChange(WiredTigerRecordStore* rs, int64_t amount) : _rs(rs), _amount(amount) {}
-    virtual void commit() {}
+    virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
         _rs->_increaseDataSize(NULL, -_amount);
     }
@@ -1660,15 +1660,6 @@ void WiredTigerRecordStore::cappedTruncateAfter(OperationContext* opCtx,
                                                 bool inclusive) {
     // Only log messages at a lower level here for testing.
     int logLevel = getTestCommandsEnabled() ? 0 : 2;
-
-    if (_isOplog) {
-        // If we are truncating the oplog, we want to make sure that a forward cursor reads all
-        // committed oplog entries. Oplog visibility rules could prevent this if the oplog read
-        // timestamp has not yet been updated to reflect all committed oplog transactions. Setting
-        // the read timestamp to its maximum value should ensure that we read the effects of all
-        // previously committed transactions.
-        invariant(opCtx->recoveryUnit()->setPointInTimeReadTimestamp(Timestamp::max()).isOK());
-    }
 
     std::unique_ptr<SeekableRecordCursor> cursor = getCursor(opCtx, true);
     LOG(logLevel) << "Truncating capped collection '" << _ns

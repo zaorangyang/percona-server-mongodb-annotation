@@ -111,6 +111,9 @@ using IndexVersion = IndexDescriptor::IndexVersion;
 
 namespace repl {
 namespace {
+
+MONGO_FP_DECLARE(sleepBetweenInsertOpTimeGenerationAndLogOp);
+
 /**
  * The `_localOplogCollection` pointer is always valid (or null) because an
  * operation must take the global exclusive lock to set the pointer to null when
@@ -227,7 +230,7 @@ void createIndexForApplyOps(OperationContext* opCtx,
                             IncrementOpsAppliedStatsFn incrementOpsAppliedStats,
                             OplogApplication::Mode mode) {
     // Check if collection exists.
-    Database* db = dbHolder().get(opCtx, indexNss.ns());
+    Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, indexNss.ns());
     auto indexCollection = db ? db->getCollection(opCtx, indexNss) : nullptr;
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "Failed to create index due to missing collection: " << indexNss.ns(),
@@ -391,32 +394,25 @@ void _logOpsInner(OperationContext* opCtx,
     checkOplogInsert(oplogCollection->insertDocumentsForOplog(opCtx, writers, timestamps, nDocs));
 
     // Set replCoord last optime only after we're sure the WUOW didn't abort and roll back.
-    opCtx->recoveryUnit()->onCommit([opCtx, replCoord, finalOpTime] {
+    opCtx->recoveryUnit()->onCommit(
+        [opCtx, replCoord, finalOpTime](boost::optional<Timestamp> commitTime) {
+            if (commitTime) {
+                // The `finalOpTime` may be less than the `commitTime` if multiple oplog entries
+                // are logging within one WriteUnitOfWork.
+                invariant(finalOpTime.getTimestamp() <= *commitTime,
+                          str::stream() << "Final OpTime: " << finalOpTime.toString()
+                                        << ". Commit Time: "
+                                        << commitTime->toString());
+            }
 
-        auto lastAppliedTimestamp = finalOpTime.getTimestamp();
-        const auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
-        if (storageEngine->supportsDocLocking()) {
-            // If the storage engine supports document level locking, then it is possible for
-            // oplog writes to commit out of order. In that case, we only want to set our last
-            // applied optime to the all committed timestamp to ensure that all operations earlier
-            // than the last applied optime have been storage-committed. We are guaranteed that
-            // whatever operation occurred at the all committed timestamp occurred during the same
-            // term as 'finalOpTime'. When a primary enters a new term, it first commits a
-            // 'new primary' oplog entry in the new term before accepting any new writes. This
-            // will ensure that the all committed timestamp is in the new term before any client
-            // writes are committed.
-            lastAppliedTimestamp = storageEngine->getAllCommittedTimestamp(opCtx);
-        }
+            // Optimes on the primary should always represent consistent database states.
+            replCoord->setMyLastAppliedOpTimeForward(
+                finalOpTime, ReplicationCoordinator::DataConsistency::Consistent);
 
-        // Optimes on the primary should always represent consistent database states.
-        replCoord->setMyLastAppliedOpTimeForward(
-            OpTime(lastAppliedTimestamp, finalOpTime.getTerm()),
-            ReplicationCoordinator::DataConsistency::Consistent);
-
-        // We set the last op on the client to 'finalOpTime', because that contains the timestamp
-        // of the operation that the client actually performed.
-        ReplClientInfo::forClient(opCtx->getClient()).setLastOp(finalOpTime);
-    });
+            // We set the last op on the client to 'finalOpTime', because that contains the
+            // timestamp of the operation that the client actually performed.
+            ReplClientInfo::forClient(opCtx->getClient()).setLastOp(finalOpTime);
+        });
 }
 
 OpTime logOp(OperationContext* opCtx,
@@ -533,6 +529,14 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
         opTimes.push_back(insertStatementOplogSlot.opTime);
     }
 
+    MONGO_FAIL_POINT_BLOCK(sleepBetweenInsertOpTimeGenerationAndLogOp, customWait) {
+        const BSONObj& data = customWait.getData();
+        auto numMillis = data["waitForMillis"].numberInt();
+        log() << "Sleeping for " << numMillis << "ms after receiving " << count << " optimes from "
+              << opTimes.front() << " to " << opTimes.back();
+        sleepmillis(numMillis);
+    }
+
     std::unique_ptr<DocWriter const* []> basePtrs(new DocWriter const*[count]);
     for (size_t i = 0; i < count; i++) {
         basePtrs[i] = &writers[i];
@@ -568,7 +572,7 @@ long long getNewOplogSizeBytes(OperationContext* opCtx, const ReplSettings& repl
 #else
     long long lowerBound = 0;
     double bytes = 0;
-    if (opCtx->getClient()->getServiceContext()->getGlobalStorageEngine()->isEphemeral()) {
+    if (opCtx->getClient()->getServiceContext()->getStorageEngine()->isEphemeral()) {
         // in memory: 50MB minimum size
         lowerBound = 50LL * 1024 * 1024;
         bytes = pi.getMemSizeMB() * 1024 * 1024;
@@ -643,7 +647,7 @@ void createOplog(OperationContext* opCtx, const std::string& oplogCollectionName
     });
 
     /* sync here so we don't get any surprising lag later when we try to sync */
-    StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
+    StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
     storageEngine->flushAllFiles(opCtx, true);
 
     log() << "******" << endl;
@@ -817,9 +821,10 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
           NamespaceString nss;
-          BSONObjBuilder resultWeDontCareAbout;
           std::tie(std::ignore, nss) = parseCollModUUIDAndNss(opCtx, ui, ns, cmd);
-          return collMod(opCtx, nss, cmd, &resultWeDontCareAbout);
+          // The collMod for apply ops could be either a user driven collMod or a collMod triggered
+          // by an upgrade.
+          return collModWithUpgrade(opCtx, nss, cmd);
       },
       {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
     {"dbCheck", {dbCheckOplogCommand, {}}},
@@ -1516,7 +1521,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
         return {ErrorCodes::InvalidNamespace, "invalid ns: " + std::string(nss.ns())};
     }
     {
-        Database* db = dbHolder().get(opCtx, nss.ns());
+        Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.ns());
         if (db && !db->getCollection(opCtx, nss) && db->getViewCatalog()->lookup(opCtx, nss.ns())) {
             return {ErrorCodes::CommandNotSupportedOnView,
                     str::stream() << "applyOps not supported on view:" << nss.ns()};
@@ -1621,7 +1626,11 @@ Status applyCommand_inlock(OperationContext* opCtx,
 
                 Command* cmd = CommandHelpers::findCommand(o.firstElement().fieldName());
                 invariant(cmd);
-                BackgroundOperation::awaitNoBgOpInProgForNs(cmd->parseNs(nss.db().toString(), o));
+
+                // TODO: This parse could be expensive and not worth it.
+                BackgroundOperation::awaitNoBgOpInProgForNs(
+                    cmd->parse(opCtx, OpMsgRequest::fromDBAndBody(nss.db(), o))->ns().toString());
+
                 opCtx->recoveryUnit()->abandonSnapshot();
                 opCtx->checkForInterrupt();
                 break;
@@ -1678,7 +1687,6 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx) {
     if (!_oplogCollectionName.empty()) {
         AutoGetCollection autoColl(opCtx, NamespaceString(_oplogCollectionName), MODE_IX);
         _localOplogCollection = autoColl.getCollection();
-        fassert(13347, _localOplogCollection);
     }
 }
 

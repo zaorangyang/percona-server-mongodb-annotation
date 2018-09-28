@@ -48,6 +48,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/logical_time_metadata_hook.h"
@@ -122,30 +123,14 @@ MONGO_FP_DECLARE(dropPendingCollectionReaperHang);
 
 // Set this to specify maximum number of times the oplog fetcher will consecutively restart the
 // oplog tailing query on non-cancellation errors.
-server_parameter_storage_type<int, ServerParameterType::kStartupAndRuntime>::value_type
-    oplogFetcherMaxFetcherRestarts(3);
-class ExportedOplogFetcherMaxFetcherRestartsServerParameter
-    : public ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime> {
-public:
-    ExportedOplogFetcherMaxFetcherRestartsServerParameter();
-    Status validate(const int& potentialNewValue) override;
-} _exportedOplogFetcherMaxFetcherRestartsServerParameter;
-
-ExportedOplogFetcherMaxFetcherRestartsServerParameter::
-    ExportedOplogFetcherMaxFetcherRestartsServerParameter()
-    : ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime>(
-          ServerParameterSet::getGlobal(),
-          "oplogFetcherMaxFetcherRestarts",
-          &oplogFetcherMaxFetcherRestarts) {}
-
-Status ExportedOplogFetcherMaxFetcherRestartsServerParameter::validate(
-    const int& potentialNewValue) {
-    if (potentialNewValue < 0) {
-        return Status(ErrorCodes::BadValue,
-                      "oplogFetcherMaxFetcherRestarts must be greater than or equal to 0");
-    }
-    return Status::OK();
-}
+MONGO_EXPORT_SERVER_PARAMETER(oplogFetcherMaxFetcherRestarts, int, 3)
+    ->withValidator([](const int& potentialNewValue) {
+        if (potentialNewValue < 0) {
+            return Status(ErrorCodes::BadValue,
+                          "oplogFetcherMaxFetcherRestarts must be nonnegative");
+        }
+        return Status::OK();
+    });
 
 /**
  * Returns new thread pool for thread pool task executor.
@@ -168,7 +153,7 @@ auto makeTaskExecutor(ServiceContext* service, const std::string& poolName) {
     hookList->addHook(stdx::make_unique<rpc::LogicalTimeMetadataHook>(service));
     return stdx::make_unique<executor::ThreadPoolTaskExecutor>(
         makeThreadPool(poolName),
-        executor::makeNetworkInterface("NetworkInterfaceASIO-RS", nullptr, std::move(hookList)));
+        executor::makeNetworkInterface("RS", nullptr, std::move(hookList)));
 }
 
 /**
@@ -238,6 +223,8 @@ void ReplicationCoordinatorExternalStateImpl::startSteadyStateReplication(
                                                     _oplogBuffer.get(),
                                                     _bgSync.get(),
                                                     replCoord,
+                                                    _replicationProcess->getConsistencyMarkers(),
+                                                    _storageInterface,
                                                     OplogApplier::Options(),
                                                     _writerPool.get());
     _oplogApplierShutdownFuture = _oplogApplier->startup();
@@ -323,7 +310,7 @@ void ReplicationCoordinatorExternalStateImpl::startThreads(const ReplSettings& s
     }
 
     log() << "Starting replication storage threads";
-    _service->getGlobalStorageEngine()->setJournalListener(this);
+    _service->getStorageEngine()->setJournalListener(this);
 
     _oplogApplierTaskExecutor = makeTaskExecutor(_service, "rsSync");
     _oplogApplierTaskExecutor->startup();
@@ -384,7 +371,7 @@ ThreadPool* ReplicationCoordinatorExternalStateImpl::getDbWorkThreadPool() const
 Status ReplicationCoordinatorExternalStateImpl::runRepairOnLocalDB(OperationContext* opCtx) {
     try {
         Lock::GlobalWrite globalWrite(opCtx);
-        StorageEngine* engine = getGlobalServiceContext()->getGlobalStorageEngine();
+        StorageEngine* engine = getGlobalServiceContext()->getStorageEngine();
 
         if (!engine->isMmapV1()) {
             return Status::OK();
@@ -394,7 +381,7 @@ Status ReplicationCoordinatorExternalStateImpl::runRepairOnLocalDB(OperationCont
         Status status = repairDatabase(opCtx, engine, localDbName, false, false);
 
         // Open database before returning
-        dbHolder().openDb(opCtx, localDbName);
+        DatabaseHolder::getDatabaseHolder().openDb(opCtx, localDbName);
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
@@ -428,6 +415,30 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
                                waitForAllEarlierOplogWritesToBeVisible(opCtx);
                            });
 
+        // Update unique index format version for all non-replicated collections. It is possible
+        // for MongoDB to have a "clean startup", i.e., no non-local databases, but still have
+        // unique indexes on collections in the local database. On clean startup,
+        // setFeatureCompatibilityVersion (which updates the unique index format version of
+        // collections) is not called, so any pre-existing collections are upgraded here. We exclude
+        // ShardServers when updating indexes belonging to non-replicated collections on the primary
+        // because ShardServers are started up by default with featureCompatibilityVersion 4.0, so
+        // we don't want to update those indexes until the cluster's featureCompatibilityVersion is
+        // explicitly set to 4.2 by config server. The below unique index update for non-replicated
+        // collections only occurs on the primary; updates for unique indexes belonging to
+        // non-replicated collections are done on secondaries during InitialSync. When the config
+        // server sets the featureCompatibilityVersion to 4.2, the shard primary will update unique
+        // indexes belonging to all the collections. One special case here is if a shard is already
+        // in featureCompatibilityVersion 4.2 and a new node is started up with --shardsvr and added
+        // to that shard, the new node will still start up with featureCompatibilityVersion 4.0 and
+        // may need to have unique index version updated. Such indexes would be updated during
+        // InitialSync because the new node is a secondary.
+        // TODO(SERVER-34489) Add a check for latest FCV when upgrade/downgrade is ready.
+        if (FeatureCompatibilityVersion::isCleanStartUp() &&
+            serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
+            auto updateStatus = updateNonReplicatedUniqueIndexes(opCtx);
+            if (!updateStatus.isOK())
+                return updateStatus;
+        }
         FeatureCompatibilityVersion::setIfCleanStartup(opCtx, _storageInterface);
     } catch (const DBException& ex) {
         return ex.toStatus();
@@ -548,6 +559,10 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
     try {
         Status status =
             writeConflictRetry(opCtx, "save replica set lastVote", lastVoteCollectionName, [&] {
+                // If we are casting a vote in a new election immediately after stepping down, we
+                // don't want to have this process interrupted due to us stepping down, since we
+                // want to be able to cast our vote for a new primary right away.
+                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
                 Lock::DBLock dbWriteLock(opCtx, lastVoteDatabaseName, MODE_X);
 
                 // If there is no last vote document, we want to store one. Otherwise, we only want
@@ -753,6 +768,8 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
     }
 
     SessionCatalog::get(_service)->onStepUp(opCtx);
+
+    notifyFreeMonitoringOnTransitionToPrimary();
 }
 
 void ReplicationCoordinatorExternalStateImpl::signalApplierToChooseNewSyncSource() {
@@ -778,7 +795,7 @@ void ReplicationCoordinatorExternalStateImpl::startProducerIfStopped() {
 
 void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationContext* opCtx) {
     std::vector<std::string> dbNames;
-    StorageEngine* storageEngine = _service->getGlobalStorageEngine();
+    StorageEngine* storageEngine = _service->getStorageEngine();
     storageEngine->listDatabases(&dbNames);
 
     for (std::vector<std::string>::iterator it = dbNames.begin(); it != dbNames.end(); ++it) {
@@ -787,23 +804,23 @@ void ReplicationCoordinatorExternalStateImpl::_dropAllTempCollections(OperationC
         if (*it == "local")
             continue;
         LOG(2) << "Removing temporary collections from " << *it;
-        Database* db = dbHolder().get(opCtx, *it);
+        Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, *it);
         // Since we must be holding the global lock during this function, if listDatabases
         // returned this dbname, we should be able to get a reference to it - it can't have
         // been dropped.
-        invariant(db);
+        invariant(db, str::stream() << "Unable to get reference to database " << *it);
         db->clearTmpCollections(opCtx);
     }
 }
 
 void ReplicationCoordinatorExternalStateImpl::dropAllSnapshots() {
-    if (auto manager = _service->getGlobalStorageEngine()->getSnapshotManager())
+    if (auto manager = _service->getStorageEngine()->getSnapshotManager())
         manager->dropAllSnapshots();
 }
 
 void ReplicationCoordinatorExternalStateImpl::updateCommittedSnapshot(
     const OpTime& newCommitPoint) {
-    auto manager = _service->getGlobalStorageEngine()->getSnapshotManager();
+    auto manager = _service->getStorageEngine()->getSnapshotManager();
     if (manager) {
         manager->setCommittedSnapshot(newCommitPoint.getTimestamp());
     }
@@ -811,14 +828,14 @@ void ReplicationCoordinatorExternalStateImpl::updateCommittedSnapshot(
 }
 
 void ReplicationCoordinatorExternalStateImpl::updateLocalSnapshot(const OpTime& optime) {
-    auto manager = _service->getGlobalStorageEngine()->getSnapshotManager();
+    auto manager = _service->getStorageEngine()->getSnapshotManager();
     if (manager) {
         manager->setLocalSnapshot(optime.getTimestamp());
     }
 }
 
 bool ReplicationCoordinatorExternalStateImpl::snapshotsEnabled() const {
-    return _service->getGlobalStorageEngine()->getSnapshotManager() != nullptr;
+    return _service->getStorageEngine()->getSnapshotManager() != nullptr;
 }
 
 void ReplicationCoordinatorExternalStateImpl::notifyOplogMetadataWaiters(
@@ -860,7 +877,7 @@ double ReplicationCoordinatorExternalStateImpl::getElectionTimeoutOffsetLimitFra
 
 bool ReplicationCoordinatorExternalStateImpl::isReadCommittedSupportedByStorageEngine(
     OperationContext* opCtx) const {
-    auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     // This should never be called if the storage engine has not been initialized.
     invariant(storageEngine);
     return storageEngine->getSnapshotManager();
@@ -868,7 +885,7 @@ bool ReplicationCoordinatorExternalStateImpl::isReadCommittedSupportedByStorageE
 
 bool ReplicationCoordinatorExternalStateImpl::isReadConcernSnapshotSupportedByStorageEngine(
     OperationContext* opCtx) const {
-    auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     // This should never be called if the storage engine has not been initialized.
     invariant(storageEngine);
     return storageEngine->supportsReadConcernSnapshot();

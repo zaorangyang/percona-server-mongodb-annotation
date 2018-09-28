@@ -63,6 +63,7 @@ var blacklist = [
     'findAndModify_update_queue_unindexed.js',  // findAndModify requires a shard key
     'group.js',                // the group command cannot be issued against a sharded cluster
     'group_cond.js',           // the group command cannot be issued against a sharded cluster
+    'group_killop.js',         // the group command cannot be issued against a sharded cluster
     'indexed_insert_eval.js',  // eval doesn't work with sharded collections
     'indexed_insert_eval_nolock.js',  // eval doesn't work with sharded collections
 
@@ -108,6 +109,7 @@ var blacklist = [
     // Use getmores.
     'agg_base.js',
     'create_index_background.js',
+    'globally_managed_cursors.js',
     'indexed_insert_ordered_bulk.js',
     'indexed_insert_text.js',
     'indexed_insert_unordered_bulk.js',

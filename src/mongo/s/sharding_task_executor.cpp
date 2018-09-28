@@ -111,11 +111,13 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleWorkAt(
 }
 
 StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCommand(
-    const RemoteCommandRequest& request, const RemoteCommandCallbackFn& cb) {
+    const RemoteCommandRequest& request,
+    const RemoteCommandCallbackFn& cb,
+    const transport::BatonHandle& baton) {
 
     // schedule the user's callback if there is not opCtx
     if (!request.opCtx) {
-        return _executor->scheduleRemoteCommand(request, cb);
+        return _executor->scheduleRemoteCommand(request, cb, baton);
     }
 
     boost::optional<RemoteCommandRequest> newRequest;
@@ -136,12 +138,12 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCom
 
     auto clusterGLE = ClusterLastErrorInfo::get(request.opCtx->getClient());
 
-    auto shardingCb = [timeTracker, clusterGLE, cb](
+    auto shardingCb = [ timeTracker, clusterGLE, cb, grid = Grid::get(request.opCtx) ](
         const TaskExecutor::RemoteCommandCallbackArgs& args) {
         ON_BLOCK_EXIT([&cb, &args]() { cb(args); });
 
         // Update replica set monitor info.
-        auto shard = grid.shardRegistry()->getShardForHostNoReload(args.request.target);
+        auto shard = grid->shardRegistry()->getShardForHostNoReload(args.request.target);
         if (!shard) {
             LOG(1) << "Could not find shard containing host: " << args.request.target.toString();
         }
@@ -201,7 +203,7 @@ StatusWith<TaskExecutor::CallbackHandle> ShardingTaskExecutor::scheduleRemoteCom
         }
     };
 
-    return _executor->scheduleRemoteCommand(newRequest ? *newRequest : request, shardingCb);
+    return _executor->scheduleRemoteCommand(newRequest ? *newRequest : request, shardingCb, baton);
 }
 
 void ShardingTaskExecutor::cancel(const CallbackHandle& cbHandle) {

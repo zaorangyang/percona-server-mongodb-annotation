@@ -28,6 +28,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <boost/thread/synchronized_value.hpp>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -84,7 +85,7 @@ public:
     /**
      * Get the next retry duration.
      */
-    Seconds getNextDuration() {
+    Seconds getNextDuration() const {
         dassert(_current != Seconds(0));
         return _current;
     }
@@ -92,7 +93,7 @@ public:
     /**
      * Get the next retry deadline
      */
-    Date_t getNextDeadline(Client* client) {
+    Date_t getNextDeadline(Client* client) const {
         return client->getServiceContext()->getPreciseClockSource()->now() + _current;
     }
 
@@ -117,6 +118,10 @@ public:
     void reset() final;
 
     bool incrementError() final;
+
+    size_t getCount() const {
+        return _retryCount;
+    }
 
 private:
     // Random number generator for jitter
@@ -153,6 +158,10 @@ public:
     void reset() final;
 
     bool incrementError() final;
+
+    size_t getCount() const {
+        return _retryCount;
+    }
 
 private:
     // Random number generator for jitter
@@ -308,6 +317,11 @@ private:
     /**
      * Read the state from the database.
      */
+    void readState(OperationContext* opCtx);
+
+    /**
+     * Create a short-lived opCtx and read the state from the database.
+     */
     void readState(Client* client);
 
     /**
@@ -375,6 +389,47 @@ private:
     void doAsyncMetricsFail(
         Client* client, const FreeMonMessageWithPayload<FreeMonMessageType::AsyncMetricsFail>* msg);
 
+    /**
+     * Process a change to become a replica set primary
+     */
+    void doOnTransitionToPrimary(Client* client);
+
+    /**
+     * Process a notification that storage has received insert or update.
+     */
+    void doNotifyOnUpsert(Client* client,
+                          const FreeMonMessageWithPayload<FreeMonMessageType::NotifyOnUpsert>* msg);
+
+    /**
+     * Process a notification that storage has received delete or drop collection.
+     */
+    void doNotifyOnDelete(Client* client);
+
+
+    /**
+     * Process a notification that storage has rolled back.
+     */
+    void doNotifyOnRollback(Client* client);
+
+    /**
+     * Process a in-memory state transition of state.
+     */
+    void processInMemoryStateChange(const FreeMonStorageState& originalState,
+                                    const FreeMonStorageState& newState);
+
+protected:
+    friend class FreeMonController;
+
+    enum FreeMonGetStatusEnum {
+        kServerStatus,
+        kCommandStatus,
+    };
+
+    /**
+     *  Populate results for getFreeMonitoringStatus or serverStatus commands.
+     */
+    void getStatus(OperationContext* opCtx, BSONObjBuilder* status, FreeMonGetStatusEnum mode);
+
 private:
     // Collection of collectors to send on registration
     FreeMonCollectorCollection& _registration;
@@ -389,16 +444,19 @@ private:
     PseudoRandom _random;
 
     // Registration Retry logic
-    RegistrationRetryCounter _registrationRetry;
+    boost::synchronized_value<RegistrationRetryCounter> _registrationRetry;
 
     // Metrics Retry logic
-    MetricsRetryCounter _metricsRetry;
+    boost::synchronized_value<MetricsRetryCounter> _metricsRetry;
 
     // Interval for gathering metrics
     Seconds _metricsGatherInterval;
 
     // Buffer of metrics to upload
     MetricsBuffer _metricsBuffer;
+
+    // When did we last send a metrics batch?
+    boost::synchronized_value<boost::optional<Date_t>> _lastMetricsSend;
 
     // List of tags from server configuration registration
     std::vector<std::string> _tags;
@@ -410,10 +468,13 @@ private:
     std::vector<std::shared_ptr<FreeMonMessage>> _pendingRegisters;
 
     // Last read storage state
-    boost::optional<FreeMonStorageState> _lastReadState;
+    boost::synchronized_value<boost::optional<FreeMonStorageState>> _lastReadState;
+
+    // When we change to primary, do we register?
+    bool _registerOnTransitionToPrimary{false};
 
     // Pending update to disk
-    FreeMonStorageState _state;
+    boost::synchronized_value<FreeMonStorageState> _state;
 
     // Countdown launch to support manual cranking
     FreeMonCountdownLatch _countdown;

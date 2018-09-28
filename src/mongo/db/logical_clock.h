@@ -52,7 +52,13 @@ public:
         Seconds(365 * 24 * 60 * 60);  // 1 year
 
     /**
-     *  Creates an instance of LogicalClock.
+     * Returns the current cluster time if this is a replica set node, otherwise returns a null
+     * logical time.
+     */
+    static LogicalTime getClusterTimeForReplicaSet(OperationContext* opCtx);
+
+    /**
+     * Creates an instance of LogicalClock.
      */
     LogicalClock(ServiceContext*);
 
@@ -83,14 +89,15 @@ public:
     void setClusterTimeFromTrustedSource(LogicalTime newTime);
 
     /**
-     *  Returns true if the clock is enabled and can be used.
+     * Returns true if the clock is enabled and can be used. Defaults to true.
      */
     bool isEnabled() const;
 
     /**
-     * Passing "true" enables the clock.
+     * Disables the logical clock. A disabled clock won't process logical times and can't be
+     * re-enabled.
      */
-    void setEnabled(bool isEnabled);
+    void disable();
 
 private:
     /**

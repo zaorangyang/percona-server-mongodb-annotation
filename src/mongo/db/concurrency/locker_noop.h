@@ -69,6 +69,18 @@ public:
         MONGO_UNREACHABLE;
     }
 
+    void setMaxLockTimeout(Milliseconds maxTimeout) override {
+        MONGO_UNREACHABLE;
+    }
+
+    bool hasMaxLockTimeout() override {
+        MONGO_UNREACHABLE;
+    }
+
+    void unsetMaxLockTimeout() override {
+        MONGO_UNREACHABLE;
+    }
+
     virtual LockResult lockGlobal(OperationContext* opCtx, LockMode mode) {
         MONGO_UNREACHABLE;
     }

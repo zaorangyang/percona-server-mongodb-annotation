@@ -54,6 +54,14 @@ class WiredTigerRecordStore;
 class WiredTigerSessionCache;
 class WiredTigerSizeStorer;
 
+struct WiredTigerFileVersion {
+    enum class StartupVersion { IS_34, IS_36, IS_40 };
+
+    StartupVersion _startupVersion;
+    bool shouldDowngrade(bool readOnly, bool repairMode, bool hasRecoveryTimestamp);
+    std::string getDowngradeString();
+};
+
 class WiredTigerKVEngine final : public KVEngine {
 public:
     static const int kDefaultJournalDelayMillis;
@@ -136,6 +144,10 @@ public:
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident);
 
+    virtual void alterIdentMetadata(OperationContext* opCtx,
+                                    StringData ident,
+                                    const IndexDescriptor* desc);
+
     virtual Status okToRename(OperationContext* opCtx,
                               StringData fromNS,
                               StringData toNS,
@@ -189,7 +201,7 @@ public:
      */
     virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const override;
 
-    virtual Timestamp getAllCommittedTimestamp(OperationContext* opCtx) const override;
+    virtual Timestamp getAllCommittedTimestamp() const override;
 
     bool supportsReadConcernSnapshot() const final;
 
@@ -296,6 +308,7 @@ private:
 
     bool _durable;
     bool _ephemeral;
+    const bool _inRepairMode;
     bool _readOnly;
     std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
     std::unique_ptr<WiredTigerCheckpointThread> _checkpointThread;
@@ -311,5 +324,6 @@ private:
 
     std::unique_ptr<WiredTigerSession> _backupSession;
     Timestamp _recoveryTimestamp;
+    WiredTigerFileVersion _fileVersion;
 };
 }

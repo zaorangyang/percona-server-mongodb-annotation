@@ -13,8 +13,6 @@
         return;
     }
 
-    load("jstests/libs/profiler.js");  // For getLatestProfilerEntry.
-
     const dbName = "test";
     const collName = "coll";
 
@@ -31,13 +29,19 @@
         return;
     }
 
+    // Increase the timeout for the transaction reaper. This will make the test easier to debug if
+    // it hangs.
+    // TODO SERVER-34595: This should no longer be necessary once the transaction reaper timeout
+    // is increased for all noPassthrough tests.
+    assert.commandWorked(
+        db.adminCommand({"setParameter": 1, transactionLifetimeLimitSeconds: 60 * 60 * 3}));
+
     TestData.sessionId = assert.commandWorked(adminDB.runCommand({startSession: 1})).id;
     TestData.txnNumber = 0;
 
     // Set 'internalQueryExecYieldIterations' to 2 to ensure that commands yield on the second try
     // (i.e. after they have established a snapshot but before they have returned any documents).
     assert.commandWorked(db.adminCommand({setParameter: 1, internalQueryExecYieldIterations: 2}));
-    db.setProfilingLevel(2);
 
     function waitForOpId(curOpFilter) {
         let opId;
@@ -89,7 +93,7 @@
         }));
     }
 
-    function testCommand(awaitCommandFn, curOpFilter, profilerFilter, testWriteConflict) {
+    function testCommand(awaitCommandFn, curOpFilter, testWriteConflict) {
         //
         // Test that the command can be killed.
         //
@@ -139,13 +143,6 @@
 
         // Now the drop can complete.
         awaitDrop();
-
-        // Confirm that the command did not yield.
-        if (profilerFilter) {
-            let profilerEntry = getLatestProfilerEntry(db, profilerFilter);
-            assert(profilerEntry.hasOwnProperty("numYield"), tojson(profilerEntry));
-            assert.eq(0, profilerEntry.numYield, tojson(profilerEntry));
-        }
 
         //
         // Test that the command does not read data that is inserted during its execution.
@@ -216,7 +213,7 @@
             txnNumber: NumberLong(TestData.txnNumber)
         }));
         assert.eq(res.cursor.firstBatch.length, TestData.numDocs, tojson(res));
-    }, {"command.filter": {x: 1}}, {op: "query"});
+    }, {"command.filter": {x: 1}});
 
     // Test getMore on a find established cursor.
     testCommand(function() {
@@ -244,7 +241,7 @@
         }));
         assert.eq(
             res.cursor.nextBatch.length, TestData.numDocs - initialFindBatchSize, tojson(res));
-    }, {"originatingCommand.filter": {x: 1}}, {op: "getmore"});
+    }, {"originatingCommand.filter": {x: 1}});
 
     // Test aggregate.
     testCommand(function() {
@@ -257,7 +254,7 @@
             txnNumber: NumberLong(TestData.txnNumber)
         }));
         assert.eq(res.cursor.firstBatch.length, TestData.numDocs, tojson(res));
-    }, {"command.pipeline": [{$match: {x: 1}}]}, {"command.pipeline": [{$match: {x: 1}}]});
+    }, {"command.pipeline": [{$match: {x: 1}}]});
 
     // TODO: SERVER-34113 Remove this test when we completely remove snapshot
     // reads since this command is not supported with transaction api.
@@ -272,7 +269,7 @@
         }));
         assert(res.hasOwnProperty("results"));
         assert.eq(res.results.length, TestData.numDocs, tojson(res));
-    }, {"command.geoNear": "coll"}, {"command.geoNear": "coll"});
+    }, {"command.geoNear": "coll"});
 
     // Test getMore with an initial find batchSize of 0. Interrupt behavior of a getMore is not
     // expected to change with a change of batchSize in the originating command.
@@ -300,7 +297,7 @@
         }));
         assert.eq(
             res.cursor.nextBatch.length, TestData.numDocs - initialFindBatchSize, tojson(res));
-    }, {"originatingCommand.filter": {x: 1}}, {op: "getmore"});
+    }, {"originatingCommand.filter": {x: 1}});
 
     // Test count.
     testCommand(function() {
@@ -312,7 +309,7 @@
             txnNumber: NumberLong(TestData.txnNumber)
         }));
         assert.eq(res.n, 3, tojson(res));
-    }, {"command.count": "coll"}, {"command.count": "coll"});
+    }, {"command.count": "coll"});
 
     // Test distinct.
     testCommand(function() {
@@ -325,7 +322,7 @@
         }));
         assert(res.hasOwnProperty("values"));
         assert.eq(res.values.length, 4, tojson(res));
-    }, {"command.distinct": "coll"}, {"command.distinct": "coll"});
+    }, {"command.distinct": "coll"});
 
     // Test group.
     testCommand(function() {
@@ -337,11 +334,9 @@
         }));
         assert(res.hasOwnProperty("count"), tojson(res));
         assert.eq(res.count, 4);
-    }, {"command.group.ns": "coll"}, {"command.group.ns": "coll"});
+    }, {"command.group.ns": "coll"});
 
     // Test update.
-    // TODO SERVER-33548: We cannot provide a 'profilerFilter' because profiling is turned off for
-    // batch write commands in transactions.
     testCommand(function() {
         const res = assert.commandWorked(db.runCommand({
             update: "coll",
@@ -364,11 +359,9 @@
         // Only update one existing doc committed before the transaction.
         assert.eq(res.n, 1, tojson(res));
         assert.eq(res.nModified, 1, tojson(res));
-    }, {op: "update"}, null, true);
+    }, {op: "update"}, true);
 
     // Test delete.
-    // We cannot provide a 'profilerFilter' because profiling is turned off for write commands in
-    // transactions.
     testCommand(function() {
         const res = assert.commandWorked(db.runCommand({
             delete: "coll",
@@ -389,7 +382,7 @@
         }));
         // Only remove one existing doc committed before the transaction.
         assert.eq(res.n, 1, tojson(res));
-    }, {op: "remove"}, null, true);
+    }, {op: "remove"}, true);
 
     // Test findAndModify.
     testCommand(function() {
@@ -414,7 +407,7 @@
         assert(res.hasOwnProperty("lastErrorObject"));
         assert.eq(res.lastErrorObject.n, 0, tojson(res));
         assert.eq(res.lastErrorObject.updatedExisting, false, tojson(res));
-    }, {"command.findAndModify": "coll"}, {"command.findAndModify": "coll"}, true);
+    }, {"command.findAndModify": "coll"}, true);
 
     testCommand(function() {
         const res = assert.commandWorked(db.runCommand({
@@ -438,7 +431,7 @@
         assert(res.hasOwnProperty("lastErrorObject"));
         assert.eq(res.lastErrorObject.n, 0, tojson(res));
         assert.eq(res.lastErrorObject.updatedExisting, false, tojson(res));
-    }, {"command.findAndModify": "coll"}, {"command.findAndModify": "coll"}, true);
+    }, {"command.findAndModify": "coll"}, true);
 
     rst.stopSet();
 }());

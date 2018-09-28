@@ -34,7 +34,6 @@
 #include "mongo/stdx/mutex.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer.h"
-#include "mongo/util/net/message.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -87,6 +86,13 @@ public:
                                                             ServiceContext* ctx);
 
     static std::unique_ptr<TransportLayer> makeAndStartDefaultEgressTransportLayer();
+
+    BatonHandle makeBaton(OperationContext* opCtx) override {
+        stdx::lock_guard<stdx::mutex> lk(_tlsMutex);
+        // TODO: figure out what to do about managers with more than one transport layer.
+        invariant(_tls.size() == 1);
+        return _tls[0]->makeBaton(opCtx);
+    }
 
 private:
     template <typename Callable>

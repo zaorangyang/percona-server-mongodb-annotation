@@ -341,6 +341,12 @@ public:
                                                                  const NamespaceString& nss) = 0;
 
     /**
+     * Updates unique indexes belonging to all non-replicated collections. To be called at the
+     * end of initial sync.
+     */
+    virtual Status upgradeNonReplicatedUniqueIndexes(OperationContext* opCtx) = 0;
+
+    /**
      * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
      * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
      */
@@ -379,6 +385,19 @@ public:
      * batch.
      */
     virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) = 0;
+
+    /**
+     * Returns the all committed timestamp. All transactions with timestamps earlier than the
+     * all committed timestamp are committed. Only storage engines that support document level
+     * locking must provide an implementation. Other storage engines may provide a no-op
+     * implementation.
+     */
+    virtual Timestamp getAllCommittedTimestamp(ServiceContext* serviceCtx) const = 0;
+
+    /**
+     * Returns true if the storage engine supports document level locking.
+     */
+    virtual bool supportsDocLocking(ServiceContext* serviceCtx) const = 0;
 
     /**
      * Registers a timestamp with the storage engine so that it can enforce oplog visiblity rules.

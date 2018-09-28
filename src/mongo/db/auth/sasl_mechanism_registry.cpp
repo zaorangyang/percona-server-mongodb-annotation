@@ -36,7 +36,7 @@
 #include "mongo/db/auth/user.h"
 #include "mongo/util/icu.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/sequence_util.h"
 
@@ -126,6 +126,7 @@ bool SASLServerMechanismRegistry::_mechanismSupportedByConfig(StringData mechNam
 
 GlobalInitializerRegisterer SASLServerMechanismRegistryInitializer(
     "CreateSASLServerMechanismRegistry",
+    {"ServiceContext"},
     [](InitializerContext* context) {
         if (saslGlobalParams.hostName.empty())
             saslGlobalParams.hostName = getHostNameCached();
@@ -133,11 +134,11 @@ GlobalInitializerRegisterer SASLServerMechanismRegistryInitializer(
             saslGlobalParams.serviceName = "mongodb";
 
         auto registry = stdx::make_unique<SASLServerMechanismRegistry>();
-        SASLServerMechanismRegistry::set(context->serviceContext(), std::move(registry));
+        SASLServerMechanismRegistry::set(getGlobalServiceContext(), std::move(registry));
         return Status::OK();
     },
     [](DeinitializerContext* context) {
-        SASLServerMechanismRegistry::set(context->serviceContext(), nullptr);
+        SASLServerMechanismRegistry::set(getGlobalServiceContext(), nullptr);
 
         return Status::OK();
     });

@@ -137,7 +137,7 @@ class FreeMonWebServer {
         assert.soon(function() {
             const stats = qs();
             print("QS : " + tojson(stats));
-            return stats.registers == count;
+            return stats.registers >= count;
         }, "Failed to web server register", 60 * 1000);
     }
 
@@ -152,7 +152,7 @@ class FreeMonWebServer {
         assert.soon(function() {
             const stats = qs();
             print("QS : " + tojson(stats));
-            return stats.metrics == count;
+            return stats.metrics >= count;
         }, "Failed to web server metrics", 60 * 1000);
     }
 }
@@ -169,7 +169,7 @@ function WaitForRegistration(conn) {
     assert.soon(function() {
         const docs = admin.system.version.find({_id: "free_monitoring"});
         const da = docs.toArray();
-        return da.length != 0;
+        return da.length === 1 && da[0].state === "enabled";
     }, "Failed to register", 60 * 1000);
 }
 

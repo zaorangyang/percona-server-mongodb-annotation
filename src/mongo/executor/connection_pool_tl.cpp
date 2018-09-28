@@ -50,7 +50,9 @@ struct TimeoutHandler {
 
 void TLTimer::setTimeout(Milliseconds timeoutVal, TimeoutCallback cb) {
     _timer->waitFor(timeoutVal).getAsync([cb = std::move(cb)](Status status) {
-        if (status == ErrorCodes::CallbackCanceled) {
+        // TODO: verify why we still get broken promises when expliciting call stop and shutting
+        // down NITL's quickly.
+        if (status == ErrorCodes::CallbackCanceled || status == ErrorCodes::BrokenPromise) {
             return;
         }
 
@@ -108,6 +110,7 @@ void TLConnection::cancelTimeout() {
 }
 
 void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
+    auto anchor = shared_from_this();
 
     auto handler = std::make_shared<TimeoutHandler>();
     handler->promise.getFuture().getAsync(
@@ -125,10 +128,9 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
     });
 
     AsyncDBClient::connect(_peer, transport::kGlobalSSLMode, _serviceContext, _reactor)
-        .onError(
-            [this](StatusWith<AsyncDBClient::Handle> swc) -> StatusWith<AsyncDBClient::Handle> {
-                return Status(ErrorCodes::HostUnreachable, swc.getStatus().reason());
-            })
+        .onError([](StatusWith<AsyncDBClient::Handle> swc) -> StatusWith<AsyncDBClient::Handle> {
+            return Status(ErrorCodes::HostUnreachable, swc.getStatus().reason());
+        })
         .then([this](AsyncDBClient::Handle client) {
             _client = std::move(client);
             return _client->initWireVersion("NetworkInterfaceTL", _onConnectHook);
@@ -147,7 +149,7 @@ void TLConnection::setup(Milliseconds timeout, SetupCallback cb) {
                     return _onConnectHook->handleReply(_peer, std::move(response));
                 });
         })
-        .getAsync([this, handler](Status status) {
+        .getAsync([this, handler, anchor](Status status) {
             if (handler->done.swap(true)) {
                 return;
             }
@@ -168,6 +170,8 @@ void TLConnection::resetToUnknown() {
 }
 
 void TLConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
+    auto anchor = shared_from_this();
+
     auto handler = std::make_shared<TimeoutHandler>();
     handler->promise.getFuture().getAsync(
         [ this, cb = std::move(cb) ](Status status) { cb(this, status); });
@@ -186,10 +190,10 @@ void TLConnection::refresh(Milliseconds timeout, RefreshCallback cb) {
     _client
         ->runCommandRequest(
             {_peer, std::string("admin"), BSON("isMaster" << 1), BSONObj(), nullptr})
-        .then([this](executor::RemoteCommandResponse response) {
+        .then([](executor::RemoteCommandResponse response) {
             return Future<void>::makeReady(response.status);
         })
-        .getAsync([this, handler](Status status) {
+        .getAsync([this, handler, anchor](Status status) {
             if (handler->done.swap(true)) {
                 return;
             }
@@ -209,9 +213,9 @@ size_t TLConnection::getGeneration() const {
     return _generation;
 }
 
-std::unique_ptr<ConnectionPool::ConnectionInterface> TLTypeFactory::makeConnection(
+std::shared_ptr<ConnectionPool::ConnectionInterface> TLTypeFactory::makeConnection(
     const HostAndPort& hostAndPort, size_t generation) {
-    return std::make_unique<TLConnection>(
+    return std::make_shared<TLConnection>(
         _reactor, getGlobalServiceContext(), hostAndPort, generation, _onConnectHook.get());
 }
 

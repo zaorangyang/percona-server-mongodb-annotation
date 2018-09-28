@@ -393,7 +393,8 @@ void State::dropTempCollections() {
 
         writeConflictRetry(_opCtx, "M/R dropTempCollections", _config.incLong.ns(), [this] {
             Lock::DBLock lk(_opCtx, _config.incLong.db(), MODE_X);
-            if (Database* db = dbHolder().get(_opCtx, _config.incLong.ns())) {
+            if (Database* db =
+                    DatabaseHolder::getDatabaseHolder().get(_opCtx, _config.incLong.ns())) {
                 WriteUnitOfWork wunit(_opCtx);
                 uassertStatusOK(db->dropCollection(_opCtx, _config.incLong.ns()));
                 wunit.commit();
@@ -653,7 +654,7 @@ unsigned long long _collectionCount(OperationContext* opCtx,
     // If the global write lock is held, we must avoid using AutoGetCollectionForReadCommand as it
     // may lead to deadlock when waiting for a majority snapshot to be committed. See SERVER-24596.
     if (callerHoldsGlobalLock) {
-        Database* db = dbHolder().get(opCtx, nss.ns());
+        Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.ns());
         if (db) {
             coll = db->getCollection(opCtx, nss);
         }
@@ -1413,9 +1414,7 @@ public:
         auto client = opCtx->getClient();
 
         if (client->isInDirectClient()) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation, "Cannot run mapReduce command from eval()"));
+            uasserted(ErrorCodes::IllegalOperation, "Cannot run mapReduce command from eval()");
         }
 
         auto curOp = CurOp::get(opCtx);
@@ -1441,10 +1440,8 @@ public:
         try {
             State state(opCtx, config);
             if (!state.sourceExists()) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    Status(ErrorCodes::NamespaceNotFound,
-                           str::stream() << "namespace does not exist: " << config.nss.ns()));
+                uasserted(ErrorCodes::NamespaceNotFound,
+                          str::stream() << "namespace does not exist: " << config.nss.ns());
             }
 
             state.init();
@@ -1579,9 +1576,7 @@ public:
                         scopedAutoDb.reset(new AutoGetDb(opCtx, config.nss.db(), MODE_S));
 
                         auto restoreStatus = exec->restoreState();
-                        if (!restoreStatus.isOK()) {
-                            return CommandHelpers::appendCommandStatus(result, restoreStatus);
-                        }
+                        uassertStatusOK(restoreStatus);
 
                         reduceTime += t.micros();
 
@@ -1595,11 +1590,9 @@ public:
                 }
 
                 if (PlanExecutor::DEAD == execState || PlanExecutor::FAILURE == execState) {
-                    return CommandHelpers::appendCommandStatus(
-                        result,
-                        Status(ErrorCodes::OperationFailed,
-                               str::stream() << "Executor error during mapReduce command: "
-                                             << WorkingSetCommon::toStatusString(o)));
+                    uasserted(ErrorCodes::OperationFailed,
+                              str::stream() << "Executor error during mapReduce command: "
+                                            << WorkingSetCommon::toStatusString(o));
                 }
 
                 // Record the indexes used by the PlanExecutor.
@@ -1729,11 +1722,9 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) {
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::CommandNotSupported,
-                       str::stream() << "Can not execute mapReduce with output database " << dbname
-                                     << " which lives on config servers"));
+            uasserted(ErrorCodes::CommandNotSupported,
+                      str::stream() << "Can not execute mapReduce with output database " << dbname
+                                    << " which lives on config servers");
         }
 
         // Don't let any lock acquisitions get interrupted.
@@ -1808,10 +1799,7 @@ public:
         if (config.outputOptions.outType != Config::OutputType::INMEMORY) {
             auto outRoutingInfoStatus = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
                 opCtx, config.outputOptions.finalNamespace);
-            if (!outRoutingInfoStatus.isOK()) {
-                return CommandHelpers::appendCommandStatus(result,
-                                                           outRoutingInfoStatus.getStatus());
-            }
+            uassertStatusOK(outRoutingInfoStatus.getStatus());
 
             if (auto cm = outRoutingInfoStatus.getValue().cm()) {
                 // Fetch result from other shards 1 chunk at a time. It would be better to do just

@@ -205,7 +205,6 @@ InitialSyncer::InitialSyncer(
     uassert(ErrorCodes::BadValue, "invalid getMyLastOptime function", _opts.getMyLastOptime);
     uassert(ErrorCodes::BadValue, "invalid setMyLastOptime function", _opts.setMyLastOptime);
     uassert(ErrorCodes::BadValue, "invalid resetOptimes function", _opts.resetOptimes);
-    uassert(ErrorCodes::BadValue, "invalid getSlaveDelay function", _opts.getSlaveDelay);
     uassert(ErrorCodes::BadValue, "invalid sync source selector", _opts.syncSourceSelector);
     uassert(ErrorCodes::BadValue, "callback function cannot be null", _onCompletion);
 }
@@ -338,30 +337,38 @@ BSONObj InitialSyncer::getInitialSyncProgress() const {
     return _getInitialSyncProgress_inlock();
 }
 
+void InitialSyncer::_appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob) const {
+    _stats.append(bob);
+    if (!_initialSyncState) {
+        return;
+    }
+    bob->appendNumber("fetchedMissingDocs", _initialSyncState->fetchedMissingDocs);
+    bob->appendNumber("appliedOps", _initialSyncState->appliedOps);
+    if (!_initialSyncState->beginTimestamp.isNull()) {
+        bob->append("initialSyncOplogStart", _initialSyncState->beginTimestamp);
+    }
+    if (!_initialSyncState->stopTimestamp.isNull()) {
+        bob->append("initialSyncOplogEnd", _initialSyncState->stopTimestamp);
+    }
+}
+
 BSONObj InitialSyncer::_getInitialSyncProgress_inlock() const {
-    BSONObjBuilder bob;
     try {
-        _stats.append(&bob);
+        BSONObjBuilder bob;
+        _appendInitialSyncProgressMinimal_inlock(&bob);
         if (_initialSyncState) {
-            bob.appendNumber("fetchedMissingDocs", _initialSyncState->fetchedMissingDocs);
-            bob.appendNumber("appliedOps", _initialSyncState->appliedOps);
-            if (!_initialSyncState->beginTimestamp.isNull()) {
-                bob.append("initialSyncOplogStart", _initialSyncState->beginTimestamp);
-            }
-            if (!_initialSyncState->stopTimestamp.isNull()) {
-                bob.append("initialSyncOplogEnd", _initialSyncState->stopTimestamp);
-            }
             if (_initialSyncState->dbsCloner) {
                 BSONObjBuilder dbsBuilder(bob.subobjStart("databases"));
                 _initialSyncState->dbsCloner->getStats().append(&dbsBuilder);
                 dbsBuilder.doneFast();
             }
         }
+        return bob.obj();
     } catch (const DBException& e) {
-        bob.resetToEmpty();
-        bob.append("error", e.toString());
         log() << "Error creating initial sync progress object: " << e.toString();
     }
+    BSONObjBuilder bob;
+    _appendInitialSyncProgressMinimal_inlock(&bob);
     return bob.obj();
 }
 
@@ -958,14 +965,8 @@ void InitialSyncer::_getNextApplierBatchCallback(
     const auto& ops = batchResult.getValue();
     if (!ops.empty()) {
         _fetchCount.store(0);
-        MultiApplier::ApplyOperationFn applyOperationsForEachReplicationWorkerThreadFn =
-            [](OperationContext*, MultiApplier::OperationPtrs*, WorkerMultikeyPathInfo*) {
-                return Status::OK();
-            };
         MultiApplier::MultiApplyFn applyBatchOfOperationsFn =
-            [ =, source = _syncSource ](OperationContext * opCtx,
-                                        MultiApplier::Operations ops,
-                                        MultiApplier::ApplyOperationFn apply) {
+            [ =, source = _syncSource ](OperationContext * opCtx, MultiApplier::Operations ops) {
             InitialSyncApplyObserver observer(&_fetchCount);
             return _dataReplicatorExternalState->_multiApply(
                 opCtx, ops, &observer, source, _writerPool);
@@ -978,11 +979,7 @@ void InitialSyncer::_getNextApplierBatchCallback(
         };
 
         _applier = stdx::make_unique<MultiApplier>(
-            _exec,
-            ops,
-            std::move(applyOperationsForEachReplicationWorkerThreadFn),
-            std::move(applyBatchOfOperationsFn),
-            std::move(onCompletionFn));
+            _exec, ops, std::move(applyBatchOfOperationsFn), std::move(onCompletionFn));
         status = _startupComponent_inlock(_applier);
         if (!status.isOK()) {
             onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, status);
@@ -1110,6 +1107,20 @@ void InitialSyncer::_rollbackCheckerCheckForRollbackCallback(
                    str::stream() << "Rollback occurred on our sync source " << _syncSource
                                  << " during initial sync"));
         return;
+    }
+
+    // Update all unique indexes belonging to non-replicated collections on secondaries. See comment
+    // in ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage() for the explanation of
+    // why we do this.
+    // TODO: SERVER-34489 should add a check for latest FCV before making the upgrade call when
+    // upgrade downgrade is ready.
+    if (createTimestampSafeUniqueIndex) {
+        auto opCtx = makeOpCtx();
+        auto updateStatus = _storage->upgradeNonReplicatedUniqueIndexes(opCtx.get());
+        if (!updateStatus.isOK()) {
+            onCompletionGuard->setResultAndCancelRemainingWork_inlock(lock, updateStatus);
+            return;
+        }
     }
 
     // Success!
@@ -1448,81 +1459,10 @@ StatusWith<Operations> InitialSyncer::_getNextApplierBatch_inlock() {
         return Operations();
     }
 
-    const int slaveDelaySecs = durationCount<Seconds>(_opts.getSlaveDelay());
-
-    std::uint32_t totalBytes = 0;
-    Operations ops;
-    BSONObj op;
-
-    // Return a new batch of ops to apply.
-    // A batch may consist of:
-    //      * at most "replBatchLimitOperations" OplogEntries
-    //      * at most "replBatchLimitBytes" worth of OplogEntries
-    //      * only OplogEntries from before the slaveDelay point
-    //      * a single command OplogEntry (including index builds, which appear to be inserts)
-    //          * consequently, commands bound the previous batch to be in a batch of their own
+    // Access common batching logic in OplogApplier using passthrough function in
+    // DataReplicatorExternalState.
     auto opCtx = makeOpCtx();
-    while (_oplogBuffer->peek(opCtx.get(), &op)) {
-        auto entry = OplogEntry(op);
-
-        // Check for oplog version change. If it is absent, its value is one.
-        if (entry.getVersion() != OplogEntry::kOplogVersion) {
-            std::string message = str::stream()
-                << "expected oplog version " << OplogEntry::kOplogVersion << " but found version "
-                << entry.getVersion() << " in oplog entry: " << redact(entry.toBSON());
-            severe() << message;
-            return {ErrorCodes::BadValue, message};
-        }
-
-        // Check for ops that must be processed one at a time.
-        if (entry.isCommand() ||
-            // Index builds are achieved through the use of an insert op, not a command op.
-            // The following line is the same as what the insert code uses to detect an index
-            // build.
-            (entry.getNamespace().isSystemDotIndexes())) {
-            if (ops.empty()) {
-                // Apply commands one-at-a-time.
-                ops.push_back(std::move(entry));
-                BSONObj opToPopAndDiscard;
-                invariant(_oplogBuffer->tryPop(opCtx.get(), &opToPopAndDiscard));
-                dassert(ops.back() == OplogEntry(opToPopAndDiscard));
-            }
-
-            // Otherwise, apply what we have so far and come back for the command.
-            return std::move(ops);
-        }
-
-        // Apply replication batch limits.
-        if (ops.size() >= _opts.replBatchLimitOperations) {
-            return std::move(ops);
-        }
-        if (totalBytes + entry.getRawObjSizeBytes() >= _opts.replBatchLimitBytes) {
-            return std::move(ops);
-        }
-
-        // Check slaveDelay boundary.
-        if (slaveDelaySecs > 0) {
-            const auto opTimestampSecs = entry.getTimestamp().getSecs();
-            const unsigned int slaveDelayBoundary =
-                static_cast<unsigned int>(time(0) - slaveDelaySecs);
-
-            // Stop the batch as the lastOp is too new to be applied. If we continue
-            // on, we can get ops that are way ahead of the delay and this will
-            // make this thread sleep longer when handleSlaveDelay is called
-            // and apply ops much sooner than we like.
-            if (opTimestampSecs > slaveDelayBoundary) {
-                return std::move(ops);
-            }
-        }
-
-        // Add op to buffer.
-        ops.push_back(std::move(entry));
-        totalBytes += entry.getRawObjSizeBytes();
-        BSONObj opToPopAndDiscard;
-        invariant(_oplogBuffer->tryPop(opCtx.get(), &opToPopAndDiscard));
-        dassert(ops.back() == OplogEntry(opToPopAndDiscard));
-    }
-    return std::move(ops);
+    return _dataReplicatorExternalState->getNextApplierBatch(opCtx.get(), _oplogBuffer.get());
 }
 
 StatusWith<HostAndPort> InitialSyncer::_chooseSyncSource_inlock() {

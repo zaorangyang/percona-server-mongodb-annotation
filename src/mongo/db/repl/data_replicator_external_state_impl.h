@@ -59,6 +59,9 @@ public:
 
     std::unique_ptr<OplogBuffer> makeInitialSyncOplogBuffer(OperationContext* opCtx) const override;
 
+    StatusWith<OplogApplier::Operations> getNextApplierBatch(OperationContext* opCtx,
+                                                             OplogBuffer* oplogBuffer) final;
+
     StatusWith<ReplSetConfig> getCurrentConfig() const override;
 
 private:

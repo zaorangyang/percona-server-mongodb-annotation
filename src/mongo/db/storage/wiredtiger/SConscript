@@ -36,6 +36,7 @@ if wiredtiger:
     wtEnv.Library(
         target='storage_wiredtiger_core',
         source= [
+            'wiredtiger_begin_transaction_block.cpp',
             'wiredtiger_global_options.cpp',
             'wiredtiger_index.cpp',
             'wiredtiger_kv_engine.cpp',
@@ -60,6 +61,7 @@ if wiredtiger:
             '$BUILD_DIR/mongo/db/index/index_descriptor',
             '$BUILD_DIR/mongo/db/global_settings',
             '$BUILD_DIR/mongo/db/namespace_string',
+            '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
             '$BUILD_DIR/mongo/db/repl/repl_settings',
             '$BUILD_DIR/mongo/db/server_options_core',
             '$BUILD_DIR/mongo/db/service_context',
@@ -102,6 +104,8 @@ if wiredtiger:
         LIBDEPS_PRIVATE=[
             '$BUILD_DIR/mongo/db/commands/server_status',
             '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+            '$BUILD_DIR/mongo/db/storage/storage_engine_common',
+            '$BUILD_DIR/mongo/util/options_parser/options_parser',
         ],
     )
 
@@ -119,6 +123,7 @@ if wiredtiger:
         source=['wiredtiger_init_test.cpp',
                 ],
         LIBDEPS=[
+            '$BUILD_DIR/mongo/db/auth/authmocks',
             '$BUILD_DIR/mongo/db/serveronly',
             '$BUILD_DIR/mongo/db/service_context',
             '$BUILD_DIR/mongo/db/service_context_d',
@@ -137,7 +142,11 @@ if wiredtiger:
             'storage_wiredtiger_mock',
             '$BUILD_DIR/mongo/db/storage/recovery_unit_test_harness',
             '$BUILD_DIR/mongo/util/clock_source_mock',
-        ]
+        ],
+        LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+            '$BUILD_DIR/mongo/db/repl/replmocks',
+        ],
     )
 
     wtEnv.Library(
@@ -167,7 +176,7 @@ if wiredtiger:
     )
 
     # All of these tests fail to compile under undefined behavior
-    # sanitizer due to unexpressed circular dependency edges. In particualr
+    # sanitizer due to unexpressed circular dependency edges. In particular
     # they all need a definition from the 'catalog'.
     if not using_ubsan:
         wtEnv.CppUnitTest(
@@ -178,6 +187,10 @@ if wiredtiger:
             LIBDEPS=[
                 'additional_wiredtiger_record_store_tests',
             ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+                '$BUILD_DIR/mongo/db/repl/replmocks',
+            ],
         )
 
         wtEnv.CppUnitTest(
@@ -187,6 +200,10 @@ if wiredtiger:
             ],
             LIBDEPS=[
                 'additional_wiredtiger_record_store_tests',
+            ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+                '$BUILD_DIR/mongo/db/repl/replmocks',
             ],
         )
 
@@ -216,9 +233,13 @@ if wiredtiger:
                 'wiredtiger_kv_engine_test.cpp',
             ],
             LIBDEPS=[
-                '$BUILD_DIR/mongo/db/auth/authorization_manager_mock_init',
+                '$BUILD_DIR/mongo/db/auth/authmocks',
                 '$BUILD_DIR/mongo/db/storage/kv/kv_engine_test_harness',
                 'storage_wiredtiger_mock',
+            ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+                '$BUILD_DIR/mongo/db/repl/replmocks',
             ],
         )
 

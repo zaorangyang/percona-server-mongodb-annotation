@@ -188,7 +188,7 @@ Status _doTxn(OperationContext* opCtx,
             // lock or any database locks. We release all locks temporarily while the fail
             // point is enabled to allow other threads to make progress.
             boost::optional<Lock::TempRelease> release;
-            auto storageEngine = opCtx->getServiceContext()->getGlobalStorageEngine();
+            auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
             if (storageEngine->isMmapV1() && !opCtx->lockState()->isW()) {
                 release.emplace(opCtx->lockState());
             }
@@ -289,7 +289,7 @@ Status doTxn(OperationContext* opCtx,
 
 
     // Acquire global lock in IX mode so that the replication state check will remain valid.
-    Lock::GlobalLock globalLock(opCtx, MODE_IX, Date_t::max());
+    Lock::GlobalLock globalLock(opCtx, MODE_IX);
 
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     bool userInitiatedWritesAndNotPrimary =

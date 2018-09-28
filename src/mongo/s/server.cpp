@@ -100,9 +100,8 @@
 #include "mongo/util/exit.h"
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/log.h"
-#include "mongo/util/net/message.h"
-#include "mongo/util/net/sock.h"
 #include "mongo/util/net/socket_exception.h"
+#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/options_parser/startup_options.h"
@@ -435,8 +434,8 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     PeriodicTask::startRunningPeriodicTasks();
 
     // Set up the periodic runner for background job execution
-    auto runner = makePeriodicRunner();
-    runner->startup().transitional_ignore();
+    auto runner = makePeriodicRunner(serviceContext);
+    runner->startup();
     serviceContext->setPeriodicRunner(std::move(runner));
 
     SessionKiller::set(serviceContext,
@@ -529,6 +528,7 @@ ExitCode main(ServiceContext* serviceContext) {
     return runMongosServer(serviceContext);
 }
 
+namespace {
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     forkServerOrDie();
@@ -547,11 +547,6 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersion40, ("EndStar
     return Status::OK();
 }
 
-MONGO_INITIALIZER(CreateAuthorizationExternalStateFactory)(InitializerContext* context) {
-    AuthzManagerExternalState::create = &createAuthzManagerExternalStateMongos;
-    return Status::OK();
-}
-
 ServiceContextRegistrar serviceContextCreator([]() {
     auto service = std::make_unique<ServiceContextNoop>();
     service->setTickSource(std::make_unique<SystemTickSource>());
@@ -559,7 +554,6 @@ ServiceContextRegistrar serviceContextCreator([]() {
     service->setPreciseClockSource(std::make_unique<SystemClockSource>());
     return service;
 });
-
 
 #ifdef MONGO_CONFIG_SSL
 MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManager"))
@@ -581,8 +575,7 @@ ExitCode mongoSMain(int argc, char* argv[], char** envp) {
 
     setupSignalHandlers();
 
-    setGlobalServiceContext(createServiceContext());
-    Status status = runGlobalInitializers(argc, argv, envp, getGlobalServiceContext());
+    Status status = runGlobalInitializers(argc, argv, envp);
     if (!status.isOK()) {
         severe(LogComponent::kDefault) << "Failed global initialization: " << status;
         return EXIT_ABRUPT;
@@ -614,6 +607,7 @@ ExitCode mongoSMain(int argc, char* argv[], char** envp) {
     }
 }
 
+}  // namespace
 }  // namespace mongo
 
 #if defined(_WIN32)

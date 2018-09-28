@@ -55,7 +55,7 @@ public:
     AddIndexChange(OperationContext* opCtx, KVCollectionCatalogEntry* cce, StringData ident)
         : _opCtx(opCtx), _cce(cce), _ident(ident.toString()) {}
 
-    virtual void commit() {}
+    virtual void commit(boost::optional<Timestamp>) {}
     virtual void rollback() {
         // Intentionally ignoring failure.
         _cce->_engine->dropIdent(_opCtx, _ident).transitional_ignore();
@@ -72,7 +72,7 @@ public:
         : _opCtx(opCtx), _cce(cce), _ident(ident.toString()) {}
 
     virtual void rollback() {}
-    virtual void commit() {
+    virtual void commit(boost::optional<Timestamp>) {
         // Intentionally ignoring failure here. Since we've removed the metadata pointing to the
         // index, we should never see it again anyway.
         _cce->_engine->dropIdent(_opCtx, _ident).transitional_ignore();
@@ -233,6 +233,12 @@ void KVCollectionCatalogEntry::updateTTLSetting(OperationContext* opCtx,
     _catalog->putMetaData(opCtx, ns().toString(), md);
 }
 
+void KVCollectionCatalogEntry::updateIndexMetadata(OperationContext* opCtx,
+                                                   const IndexDescriptor* desc) {
+    // Update any metadata Ident has for this index
+    const string ident = _catalog->getIndexIdent(opCtx, ns().ns(), desc->indexName());
+    _engine->alterIdentMetadata(opCtx, ident, desc);
+}
 void KVCollectionCatalogEntry::addUUID(OperationContext* opCtx,
                                        CollectionUUID uuid,
                                        Collection* coll) {

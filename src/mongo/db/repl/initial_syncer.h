@@ -35,6 +35,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/callback_completion_guard.h"
@@ -89,9 +90,6 @@ struct InitialSyncerOptions {
     /** Function to sets this node into a specific follower mode. */
     using SetFollowerModeFn = stdx::function<bool(const MemberState&)>;
 
-    /** Function to get this node's slaveDelay. */
-    using GetSlaveDelayFn = stdx::function<Seconds()>;
-
     // Error and retry values
     Milliseconds syncSourceRetryWait{1000};
     Milliseconds initialSyncRetryWait{1000};
@@ -104,10 +102,6 @@ struct InitialSyncerOptions {
     // SyncTail::tryPopAndWaitForMore().
     Milliseconds getApplierBatchCallbackRetryWait{1000};
 
-    // Batching settings.
-    std::uint32_t replBatchLimitBytes = 512 * 1024 * 1024;
-    std::uint32_t replBatchLimitOperations = 5000;
-
     // Replication settings
     NamespaceString localOplogNS = NamespaceString("local.oplog.rs");
     NamespaceString remoteOplogNS = NamespaceString("local.oplog.rs");
@@ -115,7 +109,6 @@ struct InitialSyncerOptions {
     GetMyLastOptimeFn getMyLastOptime;
     SetMyLastOptimeFn setMyLastOptime;
     ResetOptimesFn resetOptimes;
-    GetSlaveDelayFn getSlaveDelay;
 
     SyncSourceSelector* syncSourceSelector = nullptr;
 
@@ -484,6 +477,7 @@ private:
                              Fetcher::Documents::const_iterator end,
                              const OplogFetcher::DocumentsInfo& info);
 
+    void _appendInitialSyncProgressMinimal_inlock(BSONObjBuilder* bob) const;
     BSONObj _getInitialSyncProgress_inlock() const;
 
     StatusWith<MultiApplier::Operations> _getNextApplierBatch_inlock();

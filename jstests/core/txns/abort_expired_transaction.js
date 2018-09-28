@@ -27,7 +27,7 @@
             db.adminCommand({setParameter: 1, transactionLifetimeLimitSeconds: 1}));
 
         jsTest.log("Create a collection '" + ns + "' outside of the transaction.");
-        assert.writeOK(testColl.insert({foo: "bar"}));
+        assert.writeOK(testColl.insert({foo: "bar"}, {writeConcern: {w: "majority"}}));
 
         jsTest.log("Set up the session.");
         const sessionOptions = {causalConsistency: false};
@@ -54,8 +54,9 @@
                 const sessionFilter = {
                     active: false,
                     opid: {$exists: false},
-                    desc: "inactive transaction", "lsid.id": session.getSessionId().id,
-                    txnNumber: NumberLong(txnNumber),
+                    desc: "inactive transaction",
+                    "transaction.parameters.txnNumber": NumberLong(txnNumber),
+                    "lsid.id": session.getSessionId().id
                 };
                 const res = db.getSiblingDB("admin").aggregate(
                     [{$currentOp: {allUsers: true, idleSessions: true}}, {$match: sessionFilter}]);

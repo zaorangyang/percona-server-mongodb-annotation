@@ -130,7 +130,7 @@ void FeatureCompatibilityVersion::setIfCleanStartup(OperationContext* opCtx,
 
 bool FeatureCompatibilityVersion::isCleanStartUp() {
     std::vector<std::string> dbNames;
-    StorageEngine* storageEngine = getGlobalServiceContext()->getGlobalStorageEngine();
+    StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
     storageEngine->listDatabases(&dbNames);
 
     for (auto&& dbName : dbNames) {
@@ -159,7 +159,7 @@ void FeatureCompatibilityVersion::onInsertOrUpdate(OperationContext* opCtx, cons
               << FeatureCompatibilityVersionParser::toString(newVersion);
     }
 
-    opCtx->recoveryUnit()->onCommit([opCtx, newVersion]() {
+    opCtx->recoveryUnit()->onCommit([opCtx, newVersion](boost::optional<Timestamp>) {
         serverGlobalParams.featureCompatibility.setVersion(newVersion);
         updateMinWireVersion();
 

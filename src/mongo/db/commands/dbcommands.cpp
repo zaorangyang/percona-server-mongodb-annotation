@@ -87,6 +87,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/stats/storage_stats.h"
+#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
@@ -94,6 +95,7 @@
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/version.h"
 
 namespace mongo {
 
@@ -135,37 +137,33 @@ public:
         // disallow dropping the config database
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
             (dbname == NamespaceString::kConfigDb)) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation,
-                       "Cannot drop 'config' database if mongod started "
-                       "with --configsvr"));
+            uasserted(ErrorCodes::IllegalOperation,
+                      "Cannot drop 'config' database if mongod started "
+                      "with --configsvr");
         }
 
         if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
              repl::ReplicationCoordinator::modeNone) &&
             (dbname == NamespaceString::kLocalDb)) {
-            return CommandHelpers::appendCommandStatus(
-                result,
-                Status(ErrorCodes::IllegalOperation,
-                       str::stream() << "Cannot drop '" << dbname
-                                     << "' database while replication is active"));
+            uasserted(ErrorCodes::IllegalOperation,
+                      str::stream() << "Cannot drop '" << dbname
+                                    << "' database while replication is active");
         }
         BSONElement e = cmdObj.firstElement();
         int p = (int)e.number();
         if (p != 1) {
-            return CommandHelpers::appendCommandStatus(
-                result, Status(ErrorCodes::IllegalOperation, "have to pass 1 as db parameter"));
+            uasserted(ErrorCodes::IllegalOperation, "have to pass 1 as db parameter");
         }
 
         Status status = dropDatabase(opCtx, dbname);
         if (status == ErrorCodes::NamespaceNotFound) {
-            return CommandHelpers::appendCommandStatus(result, Status::OK());
+            return true;
         }
         if (status.isOK()) {
             result.append("dropped", dbname);
         }
-        return CommandHelpers::appendCommandStatus(result, status);
+        uassertStatusOK(status);
+        return true;
     }
 
 } cmdDropDatabase;
@@ -210,18 +208,17 @@ public:
 
         // Closing a database requires a global lock.
         Lock::GlobalWrite lk(opCtx);
-        auto db = dbHolder().get(opCtx, dbname);
+        auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, dbname);
         if (db) {
             if (db->isDropPending(opCtx)) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    Status(ErrorCodes::DatabaseDropPending,
-                           str::stream() << "Cannot repair database " << dbname
-                                         << " since it is pending being dropped."));
+                uasserted(ErrorCodes::DatabaseDropPending,
+                          str::stream() << "Cannot repair database " << dbname
+                                        << " since it is pending being dropped.");
             }
         } else {
             // If the name doesn't make an exact match, check for a case insensitive match.
-            std::set<std::string> otherCasing = dbHolder().getNamesWithConflictingCasing(dbname);
+            std::set<std::string> otherCasing =
+                DatabaseHolder::getDatabaseHolder().getNamesWithConflictingCasing(dbname);
             if (otherCasing.empty()) {
                 // Database doesn't exist. Treat this as a success (historical behavior).
                 return true;
@@ -249,14 +246,15 @@ public:
         e = cmdObj.getField("backupOriginalFiles");
         bool backupOriginalFiles = e.isBoolean() && e.boolean();
 
-        StorageEngine* engine = getGlobalServiceContext()->getGlobalStorageEngine();
+        StorageEngine* engine = getGlobalServiceContext()->getStorageEngine();
         repl::UnreplicatedWritesBlock uwb(opCtx);
         Status status = repairDatabase(
             opCtx, engine, dbname, preserveClonedFilesOnFailure, backupOriginalFiles);
 
         // Open database before returning
-        dbHolder().openDb(opCtx, dbname);
-        return CommandHelpers::appendCommandStatus(result, status);
+        DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbname);
+        uassertStatusOK(status);
+        return true;
     }
 } cmdRepairDatabase;
 
@@ -305,13 +303,13 @@ public:
             return false;
         }
 
-        return CommandHelpers::appendCommandStatus(
-            result,
+        uassertStatusOK(
             dropCollection(opCtx,
                            nsToDrop,
                            result,
                            {},
                            DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
+        return true;
     }
 
 } cmdDrop;
@@ -359,24 +357,19 @@ public:
         // Validate _id index spec and fill in missing fields.
         if (auto idIndexElem = cmdObj["idIndex"]) {
             if (cmdObj["viewOn"]) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    {ErrorCodes::InvalidOptions,
-                     str::stream() << "'idIndex' is not allowed with 'viewOn': " << idIndexElem});
+                uasserted(ErrorCodes::InvalidOptions,
+                          str::stream() << "'idIndex' is not allowed with 'viewOn': "
+                                        << idIndexElem);
             }
             if (cmdObj["autoIndexId"]) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    {ErrorCodes::InvalidOptions,
-                     str::stream() << "'idIndex' is not allowed with 'autoIndexId': "
-                                   << idIndexElem});
+                uasserted(ErrorCodes::InvalidOptions,
+                          str::stream() << "'idIndex' is not allowed with 'autoIndexId': "
+                                        << idIndexElem);
             }
 
             if (idIndexElem.type() != BSONType::Object) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    {ErrorCodes::TypeMismatch,
-                     str::stream() << "'idIndex' has to be a document: " << idIndexElem});
+                uasserted(ErrorCodes::TypeMismatch,
+                          str::stream() << "'idIndex' has to be a document: " << idIndexElem);
             }
 
             auto idIndexSpec = idIndexElem.Obj();
@@ -390,16 +383,13 @@ public:
             std::unique_ptr<CollatorInterface> defaultCollator;
             if (auto collationElem = cmdObj["collation"]) {
                 if (collationElem.type() != BSONType::Object) {
-                    return CommandHelpers::appendCommandStatus(
-                        result,
-                        {ErrorCodes::TypeMismatch,
-                         str::stream() << "'collation' has to be a document: " << collationElem});
+                    uasserted(ErrorCodes::TypeMismatch,
+                              str::stream() << "'collation' has to be a document: "
+                                            << collationElem);
                 }
                 auto collatorStatus = CollatorFactoryInterface::get(opCtx->getServiceContext())
                                           ->makeFromBSON(collationElem.Obj());
-                if (!collatorStatus.isOK()) {
-                    return CommandHelpers::appendCommandStatus(result, collatorStatus.getStatus());
-                }
+                uassertStatusOK(collatorStatus.getStatus());
                 defaultCollator = std::move(collatorStatus.getValue());
             }
             idIndexSpec = uassertStatusOK(index_key_validate::validateIndexSpecCollation(
@@ -414,22 +404,20 @@ public:
                 idIndexCollator = std::move(collatorStatus.getValue());
             }
             if (!CollatorInterface::collatorsMatch(defaultCollator.get(), idIndexCollator.get())) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    {ErrorCodes::BadValue,
-                     "'idIndex' must have the same collation as the collection."});
+                uasserted(ErrorCodes::BadValue,
+                          "'idIndex' must have the same collation as the collection.");
             }
 
             // Remove "idIndex" field from command.
             auto resolvedCmdObj = cmdObj.removeField("idIndex");
 
-            return CommandHelpers::appendCommandStatus(
-                result, createCollection(opCtx, dbname, resolvedCmdObj, idIndexSpec));
+            uassertStatusOK(createCollection(opCtx, dbname, resolvedCmdObj, idIndexSpec));
+            return true;
         }
 
         BSONObj idIndexSpec;
-        return CommandHelpers::appendCommandStatus(
-            result, createCollection(opCtx, dbname, cmdObj, idIndexSpec));
+        uassertStatusOK(createCollection(opCtx, dbname, cmdObj, idIndexSpec));
+        return true;
     }
 } cmdCreate;
 
@@ -566,10 +554,8 @@ public:
 
         if (PlanExecutor::FAILURE == state || PlanExecutor::DEAD == state) {
             warning() << "Internal error while reading " << ns;
-            return CommandHelpers::appendCommandStatus(
-                result,
-                WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                    "Executor error while reading during dataSize command"));
+            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                "Executor error while reading during dataSize command"));
         }
 
         ostringstream os;
@@ -662,7 +648,8 @@ public:
              const BSONObj& jsobj,
              BSONObjBuilder& result) {
         const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, jsobj));
-        return CommandHelpers::appendCommandStatus(result, collMod(opCtx, nss, jsobj, &result));
+        uassertStatusOK(collMod(opCtx, nss, jsobj, &result));
+        return true;
     }
 
 } collectionModCommand;
@@ -744,7 +731,7 @@ public:
             result.appendNumber("indexes", 0);
             result.appendNumber("indexSize", 0);
             result.appendNumber("fileSize", 0);
-            if (!getGlobalServiceContext()->getGlobalStorageEngine()->isEphemeral()) {
+            if (!getGlobalServiceContext()->getStorageEngine()->isEphemeral()) {
                 result.appendNumber("fsUsedSize", 0);
                 result.appendNumber("fsTotalSize", 0);
             }
@@ -762,6 +749,43 @@ public:
     }
 
 } cmdDBStats;
+
+class CmdBuildInfo : public BasicCommand {
+public:
+    CmdBuildInfo() : BasicCommand("buildInfo", "buildinfo") {}
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool requiresAuth() const override {
+        return false;
+    }
+
+    virtual bool adminOnly() const {
+        return false;
+    }
+    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+    virtual void addRequiredPrivileges(const std::string& dbname,
+                                       const BSONObj& cmdObj,
+                                       std::vector<Privilege>* out) const {}  // No auth required
+    std::string help() const override {
+        return "get version #, etc.\n"
+               "{ buildinfo:1 }";
+    }
+
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& jsobj,
+             BSONObjBuilder& result) {
+        VersionInfoInterface::instance().appendBuildInfo(&result);
+        appendStorageEngineList(opCtx->getServiceContext(), &result);
+        return true;
+    }
+
+} cmdBuildInfo;
 
 }  // namespace
 }  // namespace mongo

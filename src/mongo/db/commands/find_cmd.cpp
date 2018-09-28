@@ -48,6 +48,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/log.h"
@@ -229,20 +230,20 @@ public:
         // Pass parseNs to makeFromFindCommand in case cmdObj does not have a UUID.
         auto qrStatus = QueryRequest::makeFromFindCommand(
             NamespaceString(parseNs(dbname, cmdObj)), cmdObj, isExplain);
-        if (!qrStatus.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, qrStatus.getStatus());
-        }
+        uassertStatusOK(qrStatus.getStatus());
 
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         auto& qr = qrStatus.getValue();
+        const auto session = OperationContextSession::get(opCtx);
+        uassert(ErrorCodes::InvalidOptions,
+                "It is illegal to open a tailable cursor in a transaction",
+                session == nullptr || !(session->inMultiDocumentTransaction() && qr->isTailable()));
 
         // Validate term before acquiring locks, if provided.
         if (auto term = qr->getReplicationTerm()) {
-            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
             Status status = replCoord->updateTerm(opCtx, *term);
             // Note: updateTerm returns ok if term stayed the same.
-            if (!status.isOK()) {
-                return CommandHelpers::appendCommandStatus(result, status);
-            }
+            uassertStatusOK(status);
         }
 
         // Acquire locks. If the query is on a view, we release our locks and convert the query
@@ -254,6 +255,10 @@ public:
         const auto& nss = ctx->getNss();
 
         qr->refreshNSS(opCtx);
+
+        // Check whether we are allowed to read from this node after acquiring our locks.
+        uassertStatusOK(replCoord->checkCanServeReadsFor(
+            opCtx, nss, ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
 
         // Fill out curop information.
         //
@@ -273,9 +278,7 @@ public:
                                          expCtx,
                                          extensionsCallback,
                                          MatchExpressionParser::kAllowAllSpecialFeatures);
-        if (!statusWithCQ.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, statusWithCQ.getStatus());
-        }
+        uassertStatusOK(statusWithCQ.getStatus());
         std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
         if (ctx->getView()) {
@@ -286,19 +289,15 @@ public:
             // necessary), if possible.
             const auto& qr = cq->getQueryRequest();
             auto viewAggregationCommand = qr.asAggregationCommand();
-            if (!viewAggregationCommand.isOK())
-                return CommandHelpers::appendCommandStatus(result,
-                                                           viewAggregationCommand.getStatus());
+            uassertStatusOK(viewAggregationCommand.getStatus());
 
             BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx,
                 OpMsgRequest::fromDBAndBody(dbname, std::move(viewAggregationCommand.getValue())));
             auto status = getStatusFromCommandResult(aggResult);
             if (status.code() == ErrorCodes::InvalidPipelineOperator) {
-                return CommandHelpers::appendCommandStatus(
-                    result,
-                    {ErrorCodes::InvalidPipelineOperator,
-                     str::stream() << "Unsupported in view pipeline: " << status.reason()});
+                uasserted(ErrorCodes::InvalidPipelineOperator,
+                          str::stream() << "Unsupported in view pipeline: " << status.reason());
             }
             result.resetToEmpty();
             result.appendElements(aggResult);
@@ -309,9 +308,7 @@ public:
 
         // Get the execution plan for the query.
         auto statusWithPlanExecutor = getExecutorFind(opCtx, collection, nss, std::move(cq));
-        if (!statusWithPlanExecutor.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, statusWithPlanExecutor.getStatus());
-        }
+        uassertStatusOK(statusWithPlanExecutor.getStatus());
 
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -359,10 +356,8 @@ public:
             error() << "Plan executor error during find command: " << PlanExecutor::statestr(state)
                     << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
-            return CommandHelpers::appendCommandStatus(
-                result,
-                WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                    "Executor error during find command"));
+            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                "Executor error during find command"));
         }
 
         // Before saving the cursor, ensure that whatever plan we established happened with the
@@ -380,7 +375,7 @@ public:
                 {std::move(exec),
                  nss,
                  AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-                 opCtx->recoveryUnit()->getReadConcernLevel(),
+                 repl::ReadConcernArgs::get(opCtx).getLevel(),
                  cmdObj});
             cursorId = pinnedCursor.getCursor()->cursorid();
 

@@ -210,10 +210,8 @@ public:
                     << PlanExecutor::statestr(state)
                     << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
-            return CommandHelpers::appendCommandStatus(
-                result,
-                WorkingSetCommon::getMemberObjectStatus(obj).withContext(
-                    "Executor error during StageDebug command"));
+            uassertStatusOK(WorkingSetCommon::getMemberObjectStatus(obj).withContext(
+                "Executor error during StageDebug command"));
         }
 
         return true;
@@ -518,12 +516,6 @@ public:
     }
 };
 
-MONGO_INITIALIZER(RegisterStageDebugCmd)(InitializerContext* context) {
-    if (getTestCommandsEnabled()) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new StageDebugCmd();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(StageDebugCmd);
 
 }  // namespace mongo

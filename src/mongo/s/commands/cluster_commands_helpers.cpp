@@ -350,7 +350,7 @@ bool appendRawResponses(OperationContext* opCtx,
             // Convert the error status back into the form of a command result and append it as the
             // raw response.
             BSONObjBuilder statusObjBob;
-            CommandHelpers::appendCommandStatus(statusObjBob, sendStatus);
+            CommandHelpers::appendCommandStatusNoThrow(statusObjBob, sendStatus);
             subobj.append(shardConnStr, statusObjBob.obj());
 
             errors.push_back(std::make_pair(shardConnStr, sendStatus));
@@ -495,14 +495,15 @@ bool appendEmptyResultSet(OperationContext* opCtx,
         return true;
     }
 
-    return CommandHelpers::appendCommandStatus(result, status);
+    uassertStatusOK(status);
+    return true;
 }
 
 StatusWith<CachedDatabaseInfo> createShardDatabase(OperationContext* opCtx, StringData dbName) {
     auto dbStatus = Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, dbName);
     if (dbStatus == ErrorCodes::NamespaceNotFound) {
-        ConfigsvrCreateDatabase configCreateDatabaseRequest;
-        configCreateDatabaseRequest.set_configsvrCreateDatabase(dbName);
+        ConfigsvrCreateDatabase configCreateDatabaseRequest(dbName.toString());
+        configCreateDatabaseRequest.setDbName(NamespaceString::kAdminDb);
 
         auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
@@ -512,7 +513,7 @@ StatusWith<CachedDatabaseInfo> createShardDatabase(OperationContext* opCtx, Stri
                                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                                 "admin",
                                 CommandHelpers::appendMajorityWriteConcern(
-                                    configCreateDatabaseRequest.toBSON()),
+                                    configCreateDatabaseRequest.toBSON({})),
                                 Shard::RetryPolicy::kIdempotent))
                 .commandStatus;
 

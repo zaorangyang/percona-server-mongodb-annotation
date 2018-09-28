@@ -76,21 +76,13 @@ public:
         auto client = opCtx->getClient();
 
         auto res = cache->reapNow(client);
-        if (!res.isOK()) {
-            return CommandHelpers::appendCommandStatus(result, res);
-        }
+        uassertStatusOK(res);
 
         return true;
     }
 };
 
-MONGO_INITIALIZER(RegisterReapLogicalSessionCacheNowCommand)(InitializerContext* context) {
-    if (getTestCommandsEnabled()) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new ReapLogicalSessionCacheNowCommand();
-    }
-    return Status::OK();
-}
+MONGO_REGISTER_TEST_COMMAND(ReapLogicalSessionCacheNowCommand);
 
 }  // namespace
 

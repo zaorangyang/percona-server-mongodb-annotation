@@ -45,6 +45,7 @@
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -55,14 +56,20 @@
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
 
-// Server parameter that dictates the lifetime given to each transaction.
-// Transactions must eventually expire to preempt storage cache pressure immobilizing the system.
-server_parameter_storage_type<int, ServerParameterType::kStartupAndRuntime>::value_type
-    transactionLifetimeLimitSeconds(60);
+// Server parameter that dictates the max number of milliseconds that any transaction lock request
+// will wait for lock acquisition. If an operation provides a greater timeout in a lock request,
+// maxTransactionLockRequestTimeoutMillis will override it. If this is set to a negative value, it
+// is inactive and nothing will be overridden.
+//
+// The default of 0 milliseconds will ensure that transaction operations will immediately give up
+// trying to take any lock if it is not immediately available. This prevents deadlocks between
+// transactions. Setting a non-zero, positive value will also help obviate deadlocks, but won't
+// abort a deadlocked transaction operation to eliminate the deadlock for however long has been set.
+MONGO_EXPORT_SERVER_PARAMETER(maxTransactionLockRequestTimeoutMillis, int, 0);
 
 const OperationContext::Decoration<Session::TransactionState> Session::TransactionState::get =
     OperationContext::declareDecoration<Session::TransactionState>();
@@ -70,31 +77,46 @@ const OperationContext::Decoration<Session::TransactionState> Session::Transacti
 Session::CursorKillFunction Session::_cursorKillFunction;
 Session::CursorExistsFunction Session::_cursorExistsFunction;
 
-/**
- * Implements a validation function for server parameter 'transactionLifetimeLimitSeconds'
- * instantiated above. 'transactionLifetimeLimitSeconds' can only be set to >= 1.
- */
-class ExportedTransactionLifetimeLimitSeconds
-    : public ExportedServerParameter<std::int32_t, ServerParameterType::kStartupAndRuntime> {
-public:
-    ExportedTransactionLifetimeLimitSeconds()
-        : ExportedServerParameter<std::int32_t, ServerParameterType::kStartupAndRuntime>(
-              ServerParameterSet::getGlobal(),
-              "transactionLifetimeLimitSeconds",
-              &transactionLifetimeLimitSeconds) {}
-
-    Status validate(const std::int32_t& potentialNewValue) override {
+// Server parameter that dictates the lifetime given to each transaction.
+// Transactions must eventually expire to preempt storage cache pressure immobilizing the system.
+MONGO_EXPORT_SERVER_PARAMETER(transactionLifetimeLimitSeconds, std::int32_t, 60)
+    ->withValidator([](const auto& potentialNewValue) {
         if (potentialNewValue < 1) {
             return Status(ErrorCodes::BadValue,
                           "transactionLifetimeLimitSeconds must be greater than or equal to 1s");
         }
 
         return Status::OK();
-    }
+    });
 
-} exportedTransactionLifetimeLimitSeconds;
 
 namespace {
+
+// The command names that are allowed in a multi-document transaction.
+const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
+                                        {"aggregate", 1},
+                                        {"commitTransaction", 1},
+                                        {"count", 1},
+                                        {"delete", 1},
+                                        {"distinct", 1},
+                                        {"doTxn", 1},
+                                        {"find", 1},
+                                        {"findandmodify", 1},
+                                        {"findAndModify", 1},
+                                        {"geoSearch", 1},
+                                        {"getMore", 1},
+                                        {"insert", 1},
+                                        {"killCursors", 1},
+                                        {"prepareTransaction", 1},
+                                        {"update", 1}};
+
+// The command names that are allowed in a multi-document transaction only when test commands are
+// enabled.
+const StringMap<int> txnCmdForTestingWhitelist = {{"dbHash", 1}};
+
+// The commands that can be run on the 'admin' database in multi-document transactions.
+const StringMap<int> txnAdminCommands = {
+    {"abortTransaction", 1}, {"commitTransaction", 1}, {"doTxn", 1}, {"prepareTransaction", 1}};
 
 void fassertOnRepeatedExecution(const LogicalSessionId& lsid,
                                 TxnNumber txnNumber,
@@ -318,22 +340,27 @@ void Session::refreshFromStorageIfNeeded(OperationContext* opCtx) {
 void Session::beginOrContinueTxn(OperationContext* opCtx,
                                  TxnNumber txnNumber,
                                  boost::optional<bool> autocommit,
-                                 boost::optional<bool> startTransaction) {
+                                 boost::optional<bool> startTransaction,
+                                 StringData dbName,
+                                 StringData cmdName) {
     if (opCtx->getClient()->isInDirectClient()) {
         return;
     }
 
-    // If the command specified a read preference that allows it to run on a secondary, and it is
-    // trying to execute an operation on a multi-statement transaction, then we throw an error.
-    // Transactions are only allowed to be run on a primary.
-    if (!getTestCommandsEnabled()) {
-        uassert(50789,
-                "readPreference=primary is the only allowed readPreference for multi-statement "
-                "transactions.",
-                !(autocommit && ReadPreferenceSetting::get(opCtx).canRunOnSecondary()));
-    }
-
     invariant(!opCtx->lockState()->isLocked());
+
+    uassert(50767,
+            str::stream() << "Cannot run '" << cmdName << "' in a multi-document transaction.",
+            !autocommit || txnCmdWhitelist.find(cmdName) != txnCmdWhitelist.cend() ||
+                (getTestCommandsEnabled() &&
+                 txnCmdForTestingWhitelist.find(cmdName) != txnCmdForTestingWhitelist.cend()));
+
+    uassert(50844,
+            str::stream() << "Cannot run command against the '" << dbName
+                          << "' database in a transaction",
+            !autocommit || (dbName != "config"_sd && dbName != "local"_sd &&
+                            (dbName != "admin"_sd ||
+                             txnAdminCommands.find(cmdName) != txnAdminCommands.cend())));
 
     TxnNumber txnNumberAtStart;
     bool canKillCursors = false;
@@ -364,6 +391,27 @@ void Session::beginOrContinueTxnOnMigration(OperationContext* opCtx, TxnNumber t
     }
 }
 
+void Session::setSpeculativeTransactionOpTimeToLastApplied(OperationContext* opCtx) {
+    // TODO: This check can be removed once SERVER-34113 is completed. Certain commands that use
+    // DBDirectClient can use snapshot readConcern, but are not supported in transactions. These
+    // commands are only allowed when test commands are enabled, but violate an invariant that the
+    // read timestamp cannot be changed on a RecoveryUnit while it is active.
+    if (opCtx->getClient()->isInDirectClient() &&
+        opCtx->recoveryUnit()->getTimestampReadSource() != RecoveryUnit::ReadSource::kNone) {
+        return;
+    }
+
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    repl::ReplicationCoordinator* replCoord =
+        repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
+    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kLastAppliedSnapshot);
+    opCtx->recoveryUnit()->preallocateSnapshot();
+    auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+    invariant(readTimestamp);
+    // Transactions do not survive term changes, so combining "getTerm" here with the
+    // recovery unit timestamp does not cause races.
+    _speculativeTransactionReadOpTime = {*readTimestamp, replCoord->getTerm()};
+}
 
 void Session::onWriteOpCompletedOnPrimary(OperationContext* opCtx,
                                           TxnNumber txnNumber,
@@ -451,6 +499,7 @@ void Session::invalidate() {
 
     _activeTxnNumber = kUninitializedTxnNumber;
     _activeTxnCommittedStatements.clear();
+    _speculativeTransactionReadOpTime = repl::OpTime();
     _hasIncompleteHistory = false;
 }
 
@@ -575,8 +624,9 @@ void Session::_beginOrContinueTxn(WithLock wl,
                           << "See "
                           << feature_compatibility_version_documentation::kCompatibilityLink
                           << " for more information.",
-            (serverGlobalParams.featureCompatibility.getVersion() ==
-             ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40));
+            (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+             serverGlobalParams.featureCompatibility.getVersion() ==
+                 ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40));
 
         _setActiveTxn(wl, opCtx, txnNumber, canKillCursors);
         _autocommit = false;
@@ -612,8 +662,15 @@ Session::TxnResources::TxnResources(OperationContext* opCtx) {
     _locker->releaseTicket();
     _locker->unsetThreadId();
 
+    // This thread must still respect the transaction lock timeout, since it can prevent the
+    // transaction from making progress.
+    auto maxTransactionLockMillis = maxTransactionLockRequestTimeoutMillis.load();
+    if (maxTransactionLockMillis >= 0) {
+        opCtx->lockState()->setMaxLockTimeout(Milliseconds(maxTransactionLockMillis));
+    }
+
     _recoveryUnit = std::unique_ptr<RecoveryUnit>(opCtx->releaseRecoveryUnit());
-    opCtx->setRecoveryUnit(opCtx->getServiceContext()->getGlobalStorageEngine()->newRecoveryUnit(),
+    opCtx->setRecoveryUnit(opCtx->getServiceContext()->getStorageEngine()->newRecoveryUnit(),
                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
     _readConcernArgs = repl::ReadConcernArgs::get(opCtx);
@@ -755,6 +812,18 @@ void Session::unstashTransactionResources(OperationContext* opCtx, const std::st
                 opCtx->recoveryUnit()->preallocateSnapshot();
                 snapshotPreallocated = true;
 
+                if (_txnState == MultiDocumentTransactionState::kInProgress) {
+                    // If maxTransactionLockRequestTimeoutMillis is set, then we will ensure no
+                    // future lock request waits longer than maxTransactionLockRequestTimeoutMillis
+                    // to acquire a lock. This is to avoid deadlocks and minimize non-transaction
+                    // operation performance degradations.
+                    auto maxTransactionLockMillis = maxTransactionLockRequestTimeoutMillis.load();
+                    if (maxTransactionLockMillis >= 0) {
+                        opCtx->lockState()->setMaxLockTimeout(
+                            Milliseconds(maxTransactionLockMillis));
+                    }
+                }
+
                 if (_txnState != MultiDocumentTransactionState::kInProgress) {
                     _txnState = MultiDocumentTransactionState::kInSnapshotRead;
                 }
@@ -830,6 +899,11 @@ void Session::abortActiveTransaction(OperationContext* opCtx) {
         if (opCtx->getWriteUnitOfWork()) {
             opCtx->setWriteUnitOfWork(nullptr);
         }
+        // We must clear the recovery unit and locker so any post-transaction writes can run without
+        // transactional settings such as a read timestamp.
+        opCtx->setRecoveryUnit(opCtx->getServiceContext()->getStorageEngine()->newRecoveryUnit(),
+                               WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        opCtx->lockState()->unsetMaxLockTimeout();
     }
     if (canKillCursors) {
         _killTransactionCursors(opCtx, _sessionId, txnNumberAtStart);
@@ -859,6 +933,7 @@ void Session::_abortTransaction(WithLock wl, OperationContext* opCtx, bool* canK
     _transactionOperationBytes = 0;
     _transactionOperations.clear();
     _txnState = MultiDocumentTransactionState::kAborted;
+    _speculativeTransactionReadOpTime = repl::OpTime();
     *canKillCursors = true;
 }
 
@@ -889,6 +964,8 @@ void Session::_setActiveTxn(WithLock wl,
     _activeTxnCommittedStatements.clear();
     _hasIncompleteHistory = false;
     _txnState = MultiDocumentTransactionState::kNone;
+    _speculativeTransactionReadOpTime = repl::OpTime();
+    _multikeyPathInfo.clear();
 }
 
 void Session::addTransactionOperation(OperationContext* opCtx,
@@ -978,6 +1055,11 @@ void Session::_commitTransaction(stdx::unique_lock<stdx::mutex> lk, OperationCon
                 _txnState = MultiDocumentTransactionState::kAborted;
             }
         }
+        // We must clear the recovery unit and locker so any post-transaction writes can run without
+        // transactional settings such as a read timestamp.
+        opCtx->setRecoveryUnit(opCtx->getServiceContext()->getStorageEngine()->newRecoveryUnit(),
+                               WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        opCtx->lockState()->unsetMaxLockTimeout();
         _commitcv.notify_all();
     });
     lk.unlock();
@@ -985,6 +1067,15 @@ void Session::_commitTransaction(stdx::unique_lock<stdx::mutex> lk, OperationCon
     opCtx->setWriteUnitOfWork(nullptr);
     committed = true;
     lk.lock();
+    auto& clientInfo = repl::ReplClientInfo::forClient(opCtx->getClient());
+    // If no writes have been done, set the client optime forward to the read timestamp so waiting
+    // for write concern will ensure all read data was committed.
+    //
+    // TODO(SERVER-34881): Once the default read concern is speculative majority, only set the
+    // client optime forward if the original read concern level is "majority" or "snapshot".
+    if (_speculativeTransactionReadOpTime > clientInfo.getLastOp()) {
+        clientInfo.setLastOp(_speculativeTransactionReadOpTime);
+    }
     _txnState = MultiDocumentTransactionState::kCommitted;
 }
 
@@ -1006,7 +1097,8 @@ void Session::reportStashedState(BSONObjBuilder* builder) const {
                 BSONObjBuilder lsid(builder->subobjStart("lsid"));
                 getSessionId().serialize(&lsid);
             }
-            builder->append("txnNumber", _activeTxnNumber);
+            builder->append("transaction",
+                            BSON("parameters" << BSON("txnNumber" << _activeTxnNumber)));
             builder->append("waitingForLock", false);
             builder->append("active", false);
             fillLockerInfo(*lockerInfo, *builder);
@@ -1101,7 +1193,8 @@ void Session::_registerUpdateCacheOnCommit(OperationContext* opCtx,
                                            std::vector<StmtId> stmtIdsWritten,
                                            const repl::OpTime& lastStmtIdWriteOpTime) {
     opCtx->recoveryUnit()->onCommit(
-        [ this, newTxnNumber, stmtIdsWritten = std::move(stmtIdsWritten), lastStmtIdWriteOpTime ] {
+        [ this, newTxnNumber, stmtIdsWritten = std::move(stmtIdsWritten), lastStmtIdWriteOpTime ](
+            boost::optional<Timestamp>) {
             RetryableWritesStats::get(getGlobalServiceContext())
                 ->incrementTransactionsCollectionWriteCount();
 
@@ -1175,21 +1268,6 @@ void Session::_registerUpdateCacheOnCommit(OperationContext* opCtx,
                                     << " due to failpoint. The write must not be reflected.");
         }
     }
-}
-
-std::vector<repl::OplogEntry> Session::addOpsForReplicatingTxnTable(
-    const std::vector<repl::OplogEntry>& ops) {
-    std::vector<repl::OplogEntry> newOps;
-
-    for (auto&& op : ops) {
-        newOps.push_back(op);
-
-        if (auto updateTxnTableOp = createMatchingTransactionTableUpdate(op)) {
-            newOps.push_back(*updateTxnTableOp);
-        }
-    }
-
-    return newOps;
 }
 
 boost::optional<repl::OplogEntry> Session::createMatchingTransactionTableUpdate(

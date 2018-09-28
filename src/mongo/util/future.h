@@ -41,6 +41,7 @@
 #include "mongo/stdx/mutex.h"
 #include "mongo/stdx/utility.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/debug_util.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/scopeguard.h"
 
@@ -356,6 +357,27 @@ public:
 
         dassert(oldState == SSBState::kWaiting);
 
+        DEV {
+            // If you hit this limit one of two things has probably happened
+            //
+            // 1. The justForContinuation optimization isn't working.
+            // 2. You may be creating a variable length chain.
+            //
+            // If those statements don't mean anything to you, please ask an editor of this file.
+            // If they don't work here anymore, I'm sorry.
+            const size_t kMaxDepth = 32;
+
+            size_t depth = 0;
+            for (auto ssb = continuation.get(); ssb;
+                 ssb = ssb->state.load(std::memory_order_acquire) == SSBState::kWaiting
+                     ? ssb->continuation.get()
+                     : nullptr) {
+                depth++;
+
+                invariant(depth < kMaxDepth);
+            }
+        }
+
         if (callback) {
             callback(this);
         }
@@ -535,6 +557,11 @@ public:
     void setError(Status status) noexcept {
         invariant(!status.isOK());
         setImpl([&] { sharedState->setError(std::move(status)); });
+    }
+
+    // TODO rename to not XXXWith and handle void
+    void setFromStatusWith(StatusWith<T> sw) noexcept {
+        setImpl([&] { sharedState->setFromStatusWith(std::move(sw)); });
     }
 
     /**
@@ -1008,6 +1035,15 @@ public:
                        [](Func && func, const Status& status) noexcept { call(func, status); });
     }
 
+    /**
+     * Ignores the return value of a future, transforming it down into a Future<void>.
+     *
+     * This only ignores values, not errors.  Those remain propogated until an onError handler.
+     *
+     * Equivalent to then([](auto&&){});
+     */
+    Future<void> ignoreValue() && noexcept;
+
 private:
     template <typename T2>
     friend class Future;
@@ -1203,6 +1239,10 @@ public:
         return std::move(inner).tapAll(std::forward<Func>(func));
     }
 
+    Future<void> ignoreValue() && noexcept {
+        return std::move(*this);
+    }
+
 private:
     template <typename T>
     friend class Future;
@@ -1224,6 +1264,11 @@ private:
 
     Future<FakeVoid> inner;
 };
+
+template <typename T>
+    Future<void> Future<T>::ignoreValue() && noexcept {
+    return std::move(*this).then([](auto&&) {});
+}
 
 /**
  * Makes a ready Future with the return value of a nullary function. This has the same semantics as

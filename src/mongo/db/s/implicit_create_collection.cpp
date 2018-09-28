@@ -93,7 +93,7 @@ public:
             // Take the DBLock and CollectionLock directly rather than using AutoGetCollection
             // (which calls AutoGetDb) to avoid doing database and shard version checks.
             Lock::DBLock dbLock(opCtx, _ns.db(), MODE_IS);
-            const auto db = dbHolder().get(opCtx, _ns.db());
+            const auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, _ns.db());
             if (db) {
                 Lock::CollectionLock collLock(opCtx->lockState(), _ns.ns(), MODE_IS);
                 if (db->getCollection(opCtx, _ns.ns())) {
@@ -105,15 +105,15 @@ public:
             return ex.toStatus();
         }
 
-        ConfigsvrCreateCollection configCreateCmd;
-        configCreateCmd.setNs(_ns);
+        ConfigsvrCreateCollection configCreateCmd(_ns);
+        configCreateCmd.setDbName(NamespaceString::kAdminDb);
 
         auto statusWith =
             Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
                 opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                "admin",
-                CommandHelpers::appendMajorityWriteConcern(configCreateCmd.toBSON()),
+                NamespaceString::kAdminDb.toString(),
+                CommandHelpers::appendMajorityWriteConcern(configCreateCmd.toBSON({})),
                 Shard::RetryPolicy::kIdempotent);
 
         if (!statusWith.isOK()) {

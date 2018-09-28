@@ -38,6 +38,8 @@
 #include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/oplog_buffer.h"
 #include "mongo/db/repl/oplog_entry.h"
+#include "mongo/db/repl/replication_consistency_markers.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
@@ -69,16 +71,22 @@ public:
                               WorkerMultikeyPathInfo* workerMultikeyPathInfo)>;
 
     /**
-     *
-     * Constructs a SyncTail.
-     * During steady state replication, oplogApplication() obtains batches of operations to apply
-     * from 'observer'. It is not required to provide 'observer' at construction if we do not plan
-     * on using oplogApplication(). During the oplog application phase, the batch of operations is
-     * distributed across writer threads in 'writerPool'. Each writer thread applies its own vector
-     * of operations using 'func'. The writer thread pool is not owned by us.
+     * Maximum number of operations in each batch that can be applied using multiApply().
      */
-    SyncTail(OplogApplier::Observer* observer, MultiSyncApplyFunc func, ThreadPool* writerPool);
-    virtual ~SyncTail();
+    static AtomicInt32 replBatchLimitOperations;
+
+    /**
+     * Lower bound of batch limit size (in bytes) returned by calculateBatchLimitBytes().
+     */
+    static const unsigned int replBatchLimitBytes = 100 * 1024 * 1024;
+
+    /**
+     * Calculates batch limit size (in bytes) using the maximum capped collection size of the oplog
+     * size.
+     * Batches are limited to 10% of the oplog.
+     */
+    static std::size_t calculateBatchLimitBytes(OperationContext* opCtx,
+                                                StorageInterface* storageInterface);
 
     /**
      * Creates thread pool for writer tasks.
@@ -94,6 +102,33 @@ public:
     static Status syncApply(OperationContext* opCtx,
                             const BSONObj& o,
                             OplogApplication::Mode oplogApplicationMode);
+
+    /**
+     *
+     * Constructs a SyncTail.
+     * During steady state replication, oplogApplication() obtains batches of operations to apply
+     * from 'observer'. It is not required to provide 'observer' at construction if we do not plan
+     * on using oplogApplication(). During the oplog application phase, the batch of operations is
+     * distributed across writer threads in 'writerPool'. Each writer thread applies its own vector
+     * of operations using 'func'. The writer thread pool is not owned by us.
+     */
+    SyncTail(OplogApplier::Observer* observer,
+             ReplicationConsistencyMarkers* consistencyMarkers,
+             StorageInterface* storageInterface,
+             MultiSyncApplyFunc func,
+             ThreadPool* writerPool,
+             const OplogApplier::Options& options);
+    SyncTail(OplogApplier::Observer* observer,
+             ReplicationConsistencyMarkers* consistencyMarkers,
+             StorageInterface* storageInterface,
+             MultiSyncApplyFunc func,
+             ThreadPool* writerPool);
+    virtual ~SyncTail();
+
+    /**
+     * Returns options for oplog application.
+     */
+    const OplogApplier::Options& getOptions() const;
 
     /**
      * Runs oplog application in a loop until shutdown() is called.
@@ -115,8 +150,8 @@ public:
 
     class OpQueue {
     public:
-        OpQueue() : _bytes(0) {
-            _batch.reserve(replBatchLimitOperations.load());
+        explicit OpQueue(std::size_t batchLimitOps) : _bytes(0) {
+            _batch.reserve(batchLimitOps);
         }
 
         size_t getBytes() const {
@@ -179,15 +214,7 @@ public:
         bool _mustShutdown = false;
     };
 
-    struct BatchLimits {
-        size_t bytes = replBatchLimitBytes;
-        size_t ops = replBatchLimitOperations.load();
-
-        // If provided, the batch will not include any operations with timestamps after this point.
-        // This is intended for implementing slaveDelay, so it should be some number of seconds
-        // before now.
-        boost::optional<Date_t> slaveDelayLatestTimestamp = {};
-    };
+    using BatchLimits = OplogApplier::BatchLimits;
 
     /**
      * Attempts to pop an OplogEntry off the BGSync queue and add it to ops.
@@ -216,8 +243,6 @@ public:
 
     void setHostname(const std::string& hostname);
 
-    static AtomicInt32 replBatchLimitOperations;
-
     /**
      * Applies a batch of oplog entries by writing the oplog entries to the local oplog and then
      * using a set of threads to apply the operations.
@@ -232,10 +257,6 @@ public:
      */
     StatusWith<OpTime> multiApply(OperationContext* opCtx, MultiApplier::Operations ops);
 
-protected:
-    static const unsigned int replBatchLimitBytes = 100 * 1024 * 1024;
-    static const int replBatchLimitSeconds = 1;
-
 private:
     /**
      * Pops the operation at the front of the OplogBuffer.
@@ -248,6 +269,8 @@ private:
     std::string _hostname;
 
     OplogApplier::Observer* const _observer;
+    ReplicationConsistencyMarkers* const _consistencyMarkers;
+    StorageInterface* const _storageInterface;
 
     // Function to use during applyOps
     MultiSyncApplyFunc _applyFunc;
@@ -255,6 +278,9 @@ private:
     // Pool of worker threads for writing ops to the databases.
     // Not owned by us.
     ThreadPool* const _writerPool;
+
+    // Used to configure multiApply() behavior.
+    const OplogApplier::Options _options;
 
     // Protects member data of SyncTail.
     mutable stdx::mutex _mutex;

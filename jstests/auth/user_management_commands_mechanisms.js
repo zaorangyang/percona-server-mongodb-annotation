@@ -1,9 +1,10 @@
 // Ensure that created/updated users have the correct credentials.
+// @tags: [requires_persistence]
 
 (function() {
     'use strict';
 
-    const mongod = MongoRunner.runMongod(
+    let mongod = MongoRunner.runMongod(
         {auth: "", setParameter: "authenticationMechanisms=SCRAM-SHA-1,SCRAM-SHA-256,PLAIN"});
     assert(mongod);
     const admin = mongod.getDB('admin');
@@ -223,4 +224,25 @@
     assert.eq(["sha256user", "user"], foundUsers);
 
     MongoRunner.stopMongod(mongod);
+
+    // Ensure mechanisms can be enabled and disabled.
+    mongod = MongoRunner.runMongod({
+        auth: "",
+        setParameter: "authenticationMechanisms=SCRAM-SHA-1",
+        restart: mongod,
+        noCleanData: true
+    });
+    assert(mongod.getDB("test").auth("sha1user", "pass"));
+    assert(!mongod.getDB("test").auth("sha256user", "pass"));
+    MongoRunner.stopMongod(mongod);
+    mongod = MongoRunner.runMongod({
+        auth: "",
+        setParameter: "authenticationMechanisms=SCRAM-SHA-256",
+        restart: mongod,
+        noCleanData: true
+    });
+    assert(!mongod.getDB("test").auth("sha1user", "pass"));
+    assert(mongod.getDB("test").auth("sha256user", "pass"));
+    MongoRunner.stopMongod(mongod);
+
 })();

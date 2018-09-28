@@ -40,7 +40,7 @@ namespace {
 
 TEST(Commands, appendCommandStatusOK) {
     BSONObjBuilder actualResult;
-    CommandHelpers::appendCommandStatus(actualResult, Status::OK());
+    CommandHelpers::appendCommandStatusNoThrow(actualResult, Status::OK());
 
     BSONObjBuilder expectedResult;
     expectedResult.append("ok", 1.0);
@@ -51,7 +51,7 @@ TEST(Commands, appendCommandStatusOK) {
 TEST(Commands, appendCommandStatusError) {
     BSONObjBuilder actualResult;
     const Status status(ErrorCodes::InvalidLength, "Response payload too long");
-    CommandHelpers::appendCommandStatus(actualResult, status);
+    CommandHelpers::appendCommandStatusNoThrow(actualResult, status);
 
     BSONObjBuilder expectedResult;
     expectedResult.append("ok", 0.0);
@@ -68,7 +68,7 @@ TEST(Commands, appendCommandStatusNoOverwrite) {
     actualResult.append("c", "d");
     actualResult.append("ok", "not ok");
     const Status status(ErrorCodes::InvalidLength, "Response payload too long");
-    CommandHelpers::appendCommandStatus(actualResult, status);
+    CommandHelpers::appendCommandStatusNoThrow(actualResult, status);
 
     BSONObjBuilder expectedResult;
     expectedResult.append("a", "b");
@@ -84,7 +84,7 @@ TEST(Commands, appendCommandStatusNoOverwrite) {
 TEST(Commands, appendCommandStatusErrorExtraInfo) {
     BSONObjBuilder actualResult;
     const Status status(ErrorExtraInfoExample(123), "not again!");
-    CommandHelpers::appendCommandStatus(actualResult, status);
+    CommandHelpers::appendCommandStatusNoThrow(actualResult, status);
 
     BSONObjBuilder expectedResult;
     expectedResult.append("ok", 0.0);
@@ -326,15 +326,11 @@ private:
 template <typename Fn>
 using CmdT = MyCommand<typename std::decay<Fn>::type>;
 
-auto okFn = [] { return Status::OK(); };
-auto errFn = [] { return Status(ErrorCodes::UnknownError, "some error"); };
-auto throwFn = []() -> Status { uasserted(ErrorCodes::UnknownError, "some error"); };
+auto throwFn = [] { uasserted(ErrorCodes::UnknownError, "some error"); };
 
 ExampleIncrementCommand exampleIncrementCommand;
 ExampleMinimalCommand exampleMinimalCommand;
 ExampleVoidCommand exampleVoidCommand;
-CmdT<decltype(okFn)> okStatusCommand("okStatus", okFn);
-CmdT<decltype(errFn)> errStatusCommand("notOkStatus", errFn);
 CmdT<decltype(throwFn)> throwStatusCommand("throwsStatus", throwFn);
 
 struct IncrementTestCommon {
@@ -362,7 +358,7 @@ struct IncrementTestCommon {
                     CommandHelpers::extractOrAppendOk(bob);
                 } catch (const DBException& e) {
                     auto bob = crb.getBodyBuilder();
-                    CommandHelpers::appendCommandStatus(bob, e.toStatus());
+                    CommandHelpers::appendCommandStatusNoThrow(bob, e.toStatus());
                 }
                 return BSONObj(bb.release());
             }();
@@ -390,21 +386,6 @@ TEST(TypedCommand, runVoid) {
     IncrementTestCommon{}.run(exampleVoidCommand, [](int i, const BSONObj& reply) {
         ASSERT_EQ(reply["ok"].Double(), 1.0);
         ASSERT_EQ(exampleVoidCommand.iCapture, i + 1);
-    });
-}
-
-TEST(TypedCommand, runOkStatus) {
-    IncrementTestCommon{}.run(
-        okStatusCommand, [](int i, const BSONObj& reply) { ASSERT_EQ(reply["ok"].Double(), 1.0); });
-}
-
-TEST(TypedCommand, runErrStatus) {
-    IncrementTestCommon{}.run(errStatusCommand, [](int i, const BSONObj& reply) {
-        Status status = errFn();
-        ASSERT_EQ(reply["ok"].Double(), 0.0);
-        ASSERT_EQ(reply["errmsg"].String(), status.reason());
-        ASSERT_EQ(reply["code"].Int(), status.code());
-        ASSERT_EQ(reply["codeName"].String(), ErrorCodes::errorString(status.code()));
     });
 }
 

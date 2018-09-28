@@ -266,6 +266,14 @@ connect = function(url, user, pass) {
         chatty("WARNING: shell and server versions do not match");
     }
 
+    // Optionally display free monitoring message.
+    const freemonStatus = db.adminCommand({getFreeMonitoringStatus: 1});
+    if (freemonStatus.ok) {
+        if (freemonStatus.userReminder) {
+            chatty(freemonStatus.userReminder);
+        }
+    }
+
     return db;
 };
 
@@ -485,9 +493,9 @@ Mongo.prototype.watch = function(pipeline, options) {
         delete options.resumeAfter;
     }
 
-    if (options.hasOwnProperty("startAtClusterTime")) {
-        changeStreamStage.startAtClusterTime = options.startAtClusterTime;
-        delete options.startAtClusterTime;
+    if (options.hasOwnProperty("startAtOperationTime")) {
+        changeStreamStage.startAtOperationTime = options.startAtOperationTime;
+        delete options.startAtOperationTime;
     }
 
     pipeline.unshift({$changeStream: changeStreamStage});

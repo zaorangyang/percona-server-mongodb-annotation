@@ -61,16 +61,15 @@
     testSnapshotAggFailsWithCode(kCollName, [{$out: "out"}], ErrorCodes.InvalidOptions);
 
     // Test that $listSessions is disallowed with snapshot reads. This stage must be run against
-    // 'system.sessions' in the config database.
+    // 'system.sessions' in the config database, which cannot be queried in a transaction.
     sessionDB = session.getDatabase(kConfigDB);
-    testSnapshotAggFailsWithCode(
-        "system.sessions", [{$listSessions: {}}], kIllegalStageForSnapshotReadCode);
+    testSnapshotAggFailsWithCode("system.sessions", [{$listSessions: {}}], 50844);
 
     // Test that $currentOp is disallowed with snapshot reads. We have to reassign 'sessionDB' to
     // refer to the admin database, because $currentOp pipelines are required to run against
-    // 'admin'.
+    // 'admin'. Queries against 'admin' are not permitted in a transaction.
     sessionDB = session.getDatabase(kAdminDB);
-    testSnapshotAggFailsWithCode(1, [{$currentOp: {}}], ErrorCodes.InvalidOptions);
+    testSnapshotAggFailsWithCode(1, [{$currentOp: {}}], 50844);
     sessionDB = session.getDatabase(kDBName);
 
     // Helper for testing that aggregation stages which involve a local and foreign collection
@@ -82,10 +81,10 @@
     // cursor and verifies that the result set matches 'expectedResults'.
     function testLookupReadConcernSnapshotIsolation(
         {localDocsPre, foreignDocsPre, localDocsPost, foreignDocsPost, pipeline, expectedResults}) {
+        sessionDB.runCommand({drop: "local", writeConcern: {w: "majority"}});
+        sessionDB.runCommand({drop: "foreign", writeConcern: {w: "majority"}});
         let localColl = sessionDB.local;
         let foreignColl = sessionDB.foreign;
-        localColl.drop();
-        foreignColl.drop();
         assert.commandWorked(localColl.insert(localDocsPre, kWCMajority));
         assert.commandWorked(foreignColl.insert(foreignDocsPre, kWCMajority));
         let cmdRes = sessionDB.runCommand({
@@ -168,14 +167,14 @@
 
     // Test that snapshot isolation works for $geoNear. Special care is taken to test snapshot
     // isolation across getMore for $geoNear as it is an initial document source.
-    const coll = sessionDB.getCollection(kCollName);
-    coll.drop();
+    assert.commandWorked(sessionDB.runCommand({drop: kCollName, writeConcern: {w: "majority"}}));
     assert.commandWorked(sessionDB.runCommand({
         createIndexes: kCollName,
         indexes: [{key: {geo: "2dsphere"}, name: "geo_2dsphere"}],
         writeConcern: {w: "majority"}
     }));
 
+    const coll = sessionDB.getCollection(kCollName);
     let bulk = coll.initializeUnorderedBulkOp();
     const numInitialGeoInsert = 4;
     for (let i = 0; i < numInitialGeoInsert; ++i) {
@@ -219,7 +218,7 @@
     assert.eq(cmdRes.cursor.nextBatch.length, numInitialGeoInsert);
 
     // Test that snapshot reads are legal for $facet.
-    coll.drop();
+    assert.commandWorked(sessionDB.runCommand({drop: kCollName, writeConcern: {w: "majority"}}));
     assert.commandWorked(coll.insert(
         [
           {group1: 1, group2: 1, val: 1},
