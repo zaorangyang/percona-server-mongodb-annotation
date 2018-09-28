@@ -18,13 +18,14 @@ auditTest(
         m.getDB('admin').shutdownServer();
         var auditPath = getDBPath() + '/auditLog.json';
         removeFile(auditPath);
+        const beforeCmd = Date.now();
         m = restartServer();
 
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(0, auditColl.count({
             atype: "createDatabase",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.ns': testDBName,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));

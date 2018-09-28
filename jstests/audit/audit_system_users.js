@@ -17,24 +17,28 @@ auditTest(
         var adminDB = m.getDB('admin');
         adminDB.auth('admin','admin');
 
+        const beforeAuthChecks = Date.now();
+        const beforeCreateUser = Date.now();
         var userObj = { user: 'john', pwd: 'john', roles: [ { role:'userAdmin', db:testDBName} ] };
         testDB.createUser(userObj);
 
+        const beforeUpdateUser = Date.now();
         var updateObj = { roles: [ { role:'userAdmin', db:testDBName}, { role:'dbAdmin', db:testDBName} ] }
         testDB.updateUser(userObj.user, updateObj);
         assert.eq(1, adminDB.system.users.count({ user: userObj.user, roles: updateObj.roles }),
                      "system.users update did not update role for user: " + userObj.user);
 
+        const beforeDropUser = Date.now();
         testDB.removeUser(userObj.user);
         assert.eq(0, testDB.system.users.count({ user: userObj.user }),
                      "removeUser did not remove user:" + userObj.user);
 
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m, testDBName);
 
         assert.eq(1, auditColl.count({
             atype: "createUser",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCreateUser, beforeLoad),
             'param.db': testDBName,
             'param.user': userObj.user,
             //'param.roles': userObj.roles,
@@ -44,7 +48,7 @@ auditTest(
 
         assert.eq(1, auditColl.count({
             atype: "updateUser",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeUpdateUser, beforeLoad),
             'param.db': testDBName,
             'param.user': userObj.user,
             //'param.roles': updateObj.roles,
@@ -55,7 +59,7 @@ auditTest(
 
         assert.eq(1, auditColl.count({
             atype: "dropUser",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeDropUser, beforeLoad),
             'param.db': testDBName,
             'param.user': userObj.user,
             result: 0,
@@ -65,7 +69,7 @@ auditTest(
         // 'auditAuthorizationSuccess' is false
         assert.eq(0, auditColl.count({
             atype: "authCheck",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeAuthChecks, beforeLoad),
             'param.ns': 'admin.system.users',
             result: 0, // <-- Authorization successful
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));

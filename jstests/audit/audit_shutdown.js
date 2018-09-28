@@ -11,15 +11,15 @@ var testDBName = 'audit_shutdown';
 auditTest(
     'shutdown',
     function(m, restartServer) {
+        const beforeCmd = Date.now();
         m.getDB('admin').shutdownServer();
         m = restartServer();
 
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(1, auditColl.count({
             atype: "shutdown",
-            // Give 10 seconds of slack in case shutdown / restart was particularly slow
-            ts: withinFewSecondsBefore(beforeLoad, 10),
+            ts: withinInterval(beforeCmd, beforeLoad),
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
     },

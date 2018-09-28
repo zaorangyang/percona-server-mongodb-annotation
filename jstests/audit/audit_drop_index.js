@@ -16,13 +16,14 @@ auditTest(
         var idxName = 'fooIdx';
         var coll = testDB.getCollection(collName);
         assert.commandWorked(coll.createIndex({ a: 1 }, { name: idxName }));
+        const beforeCmd = Date.now();
         assert.commandWorked(coll.dropIndex({ a: 1 }));
 
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(1, auditColl.count({
             atype: "dropIndex",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.ns': testDBName + '.' + collName,
             'param.indexName': idxName,
             result: 0,

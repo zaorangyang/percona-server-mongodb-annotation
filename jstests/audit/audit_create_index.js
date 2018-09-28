@@ -14,16 +14,18 @@ auditTest(
         testDB = m.getDB(testDBName);
         assert.commandWorked(testDB.dropDatabase());
 
+        const beforeCmd = Date.now();
+
         assert.commandWorked(testDB.coll.createIndex({ a: 1 }, { name: 'cold', background: false }));
 
         assert.commandWorked(testDB.coll.createIndex({ b: 1 }, { name: 'hot', background: true }));
 
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m, testDBName);
 
         assert.eq(1, auditColl.count({
             atype: "createIndex",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.ns': testDBName + '.coll',
             'param.indexSpec.key': { a: 1 },
             'param.indexName': 'cold',
@@ -32,7 +34,7 @@ auditTest(
 
         assert.eq(1, auditColl.count({
             atype: "createIndex",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.ns': testDBName + '.coll' ,
             'param.indexSpec.key': { b: 1 },
             'param.indexName': 'hot',

@@ -13,13 +13,14 @@ auditTestShard(
         var conn1 = MongoRunner.runMongod({dbpath: '/data/db/' + jsTestName() + '-extraShard-' + port, port: port,  shardsvr: ""});
 
         var hostandport = conn1.host;
+        const beforeCmd = Date.now();
         assert.commandWorked(st.s0.adminCommand({addshard: hostandport}));
 
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         auditColl = loadAuditEventsIntoCollection(st.s0, getDBPath() + '/auditLog-s0.json', jsTestName(), 'auditEvents');
         assert.eq(1, auditColl.count({
             atype: "addShard",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.connectionString': hostandport,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));

@@ -15,17 +15,18 @@ auditTestShard(
         var hostandport = conn1.host;
         assert.commandWorked(st.s0.adminCommand({addshard: hostandport, name: 'removable'}));
 
+        const beforeCmd = Date.now();
         var removeRet;
         do {
             removeRet = st.s0.adminCommand({removeShard: 'removable'});
             assert.commandWorked(removeRet);
         } while (removeRet.state != 'completed');
 
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         auditColl = loadAuditEventsIntoCollection(st.s0, getDBPath() + '/auditLog-c0.json', jsTestName(), 'auditEvents');
         assert.eq(1, auditColl.count({
             atype: "removeShard",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.shard': 'removable',
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
