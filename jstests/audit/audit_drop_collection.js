@@ -15,13 +15,14 @@ auditTest(
         var collName = 'foo';
         var coll = testDB.getCollection(collName);
         assert.writeOK(coll.insert({ a: 17 }));
+        const beforeCmd = Date.now();
         assert(coll.drop());
 
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(1, auditColl.count({
             atype: "dropCollection",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.ns': testDBName + '.' + collName,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));

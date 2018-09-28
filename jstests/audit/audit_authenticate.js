@@ -23,19 +23,21 @@ auditTest(
         var userObj = { user: 'john', pwd: 'john', roles: [ { role:'userAdmin', db:testDBName} ] };
         createUserFromObj(m, testDB, userObj);
 
+        let beforeCmd = Date.now();
         assert(testDB.auth('john', 'john'), "could not auth as john (pwd john)");
 
-        beforeLoad = Date.now();
+        let beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m, testDBName, undefined, true);
         assert.eq(1, auditColl.count({
             atype: 'authenticate',
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.user': 'john',
             'param.mechanism': 'SCRAM-SHA-1',
             'param.db': testDBName,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
 
+        beforeCmd = Date.now();
         assert( !testDB.auth('john', 'nope'), "incorrectly able to auth as john (pwd nope)");
 
         // ErrorCodes::AuthenticationFailed in src/mongo/base/error_codes.err
@@ -45,7 +47,7 @@ auditTest(
         var auditColl = getAuditEventsCollection(m, testDBName, undefined, true);
         assert.eq(1, auditColl.count({
             atype: 'authenticate',
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.user': 'john',
             'param.mechanism': 'SCRAM-SHA-1',
             'param.db': testDBName,
