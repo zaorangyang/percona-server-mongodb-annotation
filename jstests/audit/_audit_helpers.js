@@ -186,6 +186,12 @@ var withinFewSecondsBefore = function(t, n) {
     return { '$gte' : new Date(fewSecondsAgo), '$lte': new Date() };
 }
 
+// Get a query that matches any timestamp generated in the interval
+// of t <= x <= e for some timestamps t and e.
+var withinInterval = function(t, e = Date.now())  {
+    return { '$gte': new Date(t), '$lte': new Date(e) };
+}
+
 // Create Admin user.  Used for authz tests.
 var createAdminUserForAudit = function (m) {
     var adminDB = m.getDB('admin');

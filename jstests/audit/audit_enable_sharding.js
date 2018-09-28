@@ -11,13 +11,14 @@ auditTestShard(
     function(st) {
         testDB = st.s0.getDB(jsTestName());
         assert.commandWorked(testDB.dropDatabase());
+        const beforeCmd = Date.now();
         assert.commandWorked(st.s0.adminCommand({enableSharding: jsTestName()}));
 
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         auditColl = loadAuditEventsIntoCollection(st.s0, getDBPath() + '/auditLog-s0.json', testDB.getName(), 'auditEvents');
         assert.eq(1, auditColl.count({
             atype: "enableSharding",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.ns': jsTestName(),
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));

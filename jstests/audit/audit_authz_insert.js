@@ -15,6 +15,8 @@ auditTest(
         var testDB = m.getDB(testDBName);
         var user = createNoPermissionUserForAudit(m, testDB);
 
+        const beforeCmd = Date.now();
+
         // Admin should be allowed to perform the operation.
         // NOTE: We expect NOT to see an audit event when 'admin' user
         // performs this operation with auditAuthorizationSuccess=false
@@ -31,7 +33,7 @@ auditTest(
 
         // User with no permissions logs in.
         testDB.auth('tom', 'tom');
-        
+
         // Tom inserts data.
         assert.writeError(testDB.foo.insert({'_id': 2}));
 
@@ -39,13 +41,13 @@ auditTest(
         testDB.logout();
 
         // Verify that audit event was inserted.
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m, testDBName, undefined, true);
 
         // Audit event for user tom
         assert.eq(1, auditColl.count({
             atype: "authCheck",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             users: { $elemMatch: { user:'tom', db:testDBName} },
             'param.ns': testDBName + '.' + 'foo',
             'param.command': 'insert',
@@ -55,7 +57,7 @@ auditTest(
         // Audit event for user admin
         assert.eq(1, auditColl.count({
             atype: "authCheck",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             users: { $elemMatch: { user:'admin', db:'admin'} },
             'param.ns': testDBName + '.' + 'foo',
             'param.command': 'insert',

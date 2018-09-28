@@ -24,20 +24,21 @@ auditTestRepl(
         //    print('caught exception ' + e + ' while running reconfig, checking audit logs anyway..');
         //}
 
+        const beforeCmd = Date.now();
         reconfig(replTest, newConfig);
         // MAGIC MAGIC MAGIC MAGIC!
         sleep(5000);
 
         // Ensure that the reconfig audit event got logged on every member.
-        withinTheLast20Seconds = withinFewSecondsBefore(Date.now(), 20);
-        replTest.nodes.forEach(function(m) { 
+        const withinRightInterval = withinInterval(beforeCmd, Date.now());
+        replTest.nodes.forEach(function(m) {
             print('audit check looking for old, new: ' +tojson(oldConfig)+', '+tojson(newConfig));
             // We need to import the audit events collection into the master node.
             auditColl = getAuditEventsCollection(m, testDBName, replTest.getPrimary());
             assert.eq(1, auditColl.count({
                 atype: "replSetReconfig",
                 // Allow timestamps up to 20 seconds old, since replSetReconfig may be slow
-                ts: withinTheLast20Seconds,
+                ts: withinRightInterval,
                 // old version is not set, so we do not query for it here
                 'param.old._id': oldConfig._id,
                 'param.old.version': 1,

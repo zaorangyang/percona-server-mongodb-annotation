@@ -13,13 +13,14 @@ auditTest(
     function(m) {
         testDB = m.getDB(testDBName);
         assert.commandWorked(testDB.dropDatabase());
+        const beforeCmd = Date.now();
         assert.commandWorked(testDB.createCollection('foo'));
 
-        beforeLoad = Date.now();
+        const beforeLoad = Date.now();
         auditColl = getAuditEventsCollection(m, testDBName);
         assert.eq(1, auditColl.count({
             atype: "createDatabase",
-            ts: withinFewSecondsBefore(beforeLoad),
+            ts: withinInterval(beforeCmd, beforeLoad),
             'param.ns': testDBName,
             result: 0,
         }), "FAILED, audit log: " + tojson(auditColl.find().toArray()));
