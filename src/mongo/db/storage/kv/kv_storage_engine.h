@@ -68,7 +68,7 @@ using KVDatabaseCatalogEntryFactory = decltype(defaultDatabaseCatalogEntryFactor
 
 class KVStorageEngine final : public StorageEngine {
     // percona::EngineExtension implementaion
-    Status hotBackup(const std::string& path) override;
+    Status hotBackup(OperationContext* opCtx, const std::string& path) override;
     bool isFcv36Supported() const override;
 
 public:

@@ -40,6 +40,7 @@
 #include "mongo/bson/ordering.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/wiredtiger/encryption_keydb.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/stdx/functional.h"
@@ -148,7 +149,7 @@ public:
 
     virtual void endBackup(OperationContext* opCtx);
 
-    virtual Status hotBackup(const std::string& path);
+    virtual Status hotBackup(OperationContext* opCtx, const std::string& path) override;
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident);
 
@@ -196,6 +197,10 @@ public:
 
     std::string getCanonicalName() const {
         return _canonicalName;
+    }
+
+    EncryptionKeyDB* getEncryptionKeyDB() {
+        return _encryptionKeyDB.get();
     }
 
     /*
@@ -280,6 +285,7 @@ private:
 
     const bool _keepDataHistory;
 
+    std::unique_ptr<EncryptionKeyDB> _encryptionKeyDB;
     WT_CONNECTION* _conn;
     WT_EVENT_HANDLER _eventHandler;
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;

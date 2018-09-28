@@ -233,16 +233,27 @@ void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint, bool stableC
     if (forceCheckpoint && _engine->isDurable()) {
         UniqueWiredTigerSession session = getSession();
         WT_SESSION* s = session->getSession();
+        auto encryptionKeyDB = _engine->getEncryptionKeyDB();
+        std::unique_ptr<WiredTigerSession> session2;
+        WT_SESSION* s2 = nullptr;
+        if (encryptionKeyDB) {
+            session2 = stdx::make_unique<WiredTigerSession>(encryptionKeyDB->getConnection());
+            s2 = session2->getSession();
+        }
         {
             stdx::unique_lock<stdx::mutex> lk(_journalListenerMutex);
             JournalListener::Token token = _journalListener->getToken();
             const bool keepOldBehavior = true;
             if (keepOldBehavior) {
                 invariantWTOK(s->checkpoint(s, nullptr));
+                if (s2)
+                    invariantWTOK(s2->checkpoint(s2, nullptr));
             } else {
                 std::string config =
                     stableCheckpoint ? "use_timestamp=true" : "use_timestamp=false";
                 invariantWTOK(s->checkpoint(s, config.c_str()));
+                if (s2)
+                    invariantWTOK(s2->checkpoint(s2, config.c_str()));
             }
             _journalListener->onDurable(token);
         }
@@ -273,6 +284,14 @@ void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint, bool stableC
         invariantWTOK(
             _conn->open_session(_conn, NULL, "isolation=snapshot", &_waitUntilDurableSession));
     }
+    if (!_keyDBSession) {
+        auto encryptionKeyDB = _engine->getEncryptionKeyDB();
+        if (encryptionKeyDB) {
+            auto conn = encryptionKeyDB->getConnection();
+            invariantWTOK(
+                conn->open_session(conn, nullptr, "isolation=snapshot", &_keyDBSession));
+        }
+    }
 
     // Use the journal when available, or a checkpoint otherwise.
     if (_engine && _engine->isDurable()) {
@@ -282,6 +301,12 @@ void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint, bool stableC
         invariantWTOK(_waitUntilDurableSession->checkpoint(_waitUntilDurableSession, NULL));
         LOG(4) << "created checkpoint";
     }
+
+    // keyDB is always durable (opened with journal enabled)
+    if (_keyDBSession) {
+        invariantWTOK(_keyDBSession->log_flush(_keyDBSession, "sync=on"));
+    }
+
     _journalListener->onDurable(token);
 }
 
