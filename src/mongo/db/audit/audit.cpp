@@ -33,6 +33,7 @@ Copyright (c) 2006, 2015, Percona and/or its affiliates. All rights reserved.
 #include <boost/scoped_ptr.hpp>
 
 #include "mongo/util/debug_util.h"
+#include "mongo/util/net/socket_utils.h"
 
 /*
  * See this link for explanation of the MONGO_LOG macro:

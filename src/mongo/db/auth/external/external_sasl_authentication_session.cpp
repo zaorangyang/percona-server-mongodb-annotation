@@ -34,7 +34,7 @@ Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
 
