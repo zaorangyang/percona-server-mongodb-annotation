@@ -149,7 +149,7 @@ private:
 };
 }  // namespace
 
-MONGO_INITIALIZER(InMemoryEngineInit)
+MONGO_INITIALIZER_WITH_PREREQUISITES(InMemoryEngineInit, ("ServiceContext"))
 (InitializerContext* context) {
     registerStorageEngine(getGlobalServiceContext(), std::make_unique<InMemoryFactory>());
 
