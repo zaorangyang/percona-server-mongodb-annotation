@@ -91,7 +91,7 @@ bool CreateBackupCommand::errmsgRun(mongo::OperationContext* txn,
     }
 
     // Flush all files first.
-    auto se = getGlobalServiceContext()->getGlobalStorageEngine();
+    auto se = getGlobalServiceContext()->getStorageEngine();
     se->flushAllFiles(txn, true);
 
     // Do the backup itself.
