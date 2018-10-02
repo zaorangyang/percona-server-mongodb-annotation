@@ -220,21 +220,6 @@ optionalExternalSaslDeps = []
 if env['MONGO_BUILD_SASL_CLIENT']:
     optionalExternalSaslDeps = ['external/externalsaslauth']
 
-env.Library('authservercommon',
-            [
-                'authz_session_external_state_server_common.cpp',
-                'sasl_commands.cpp',
-                'security_key.cpp',
-            ],
-            LIBDEPS=[
-                '$BUILD_DIR/mongo/db/commands/core',
-                'authcommon',
-                'authcore',
-                'authorization_manager_global',
-                'saslauth',
-                'security_file',
-            ] + optionalExternalSaslDeps)
-
 env.Library(
     target='authservercommon',
     source=[
@@ -249,7 +234,7 @@ env.Library(
         'authorization_manager_global',
         'saslauth',
         'security_file',
-    ],
+    ] + optionalExternalSaslDeps,
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/client/sasl_client',
         '$BUILD_DIR/mongo/db/audit',
