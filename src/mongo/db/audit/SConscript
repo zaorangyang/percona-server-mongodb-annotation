@@ -14,6 +14,8 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+        '$BUILD_DIR/mongo/db/matcher/expressions',
+        '$BUILD_DIR/mongo/db/pipeline/expression_context',
     ],
     LIBDEPS_DEPENDENTS=[
         '$BUILD_DIR/mongo/db/commands',
