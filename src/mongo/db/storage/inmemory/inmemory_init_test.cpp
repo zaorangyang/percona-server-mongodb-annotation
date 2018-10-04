@@ -23,6 +23,7 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/db/service_context.h"
 #include "mongo/db/json.h"
+#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/storage_options.h"
@@ -40,27 +41,15 @@ private:
     virtual void setUp() {
         ServiceContext* globalEnv = getGlobalServiceContext();
         ASSERT_TRUE(globalEnv);
-        ASSERT_TRUE(getGlobalServiceContext()->isRegisteredStorageEngine(kInMemoryEngineName));
-        std::unique_ptr<StorageFactoriesIterator> sfi(
-            getGlobalServiceContext()->makeStorageFactoriesIterator());
-        ASSERT_TRUE(sfi);
-        bool found = false;
-        while (sfi->more()) {
-            const StorageEngine::Factory* currentFactory = sfi->next();
-            if (currentFactory->getCanonicalName() == kInMemoryEngineName) {
-                found = true;
-                factory = currentFactory;
-                break;
-            }
-            found = true;
-        }
-        ASSERT_TRUE(found);
+        ASSERT_TRUE(isRegisteredStorageEngine(globalEnv, kInMemoryEngineName));
+        factory = getFactoryForStorageEngine(globalEnv, kInMemoryEngineName);
+        ASSERT_TRUE(factory);
         _oldOptions = wiredTigerGlobalOptions;
     }
 
     virtual void tearDown() {
         wiredTigerGlobalOptions = _oldOptions;
-        factory = NULL;
+        factory = nullptr;
     }
 
     WiredTigerGlobalOptions _oldOptions;
