@@ -1,5 +1,3 @@
-// inmemory_kv_engine_test.cpp
-
 /*======
 This file is part of Percona Server for MongoDB.
 
@@ -23,6 +21,9 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/storage/kv/kv_engine_test_harness.h"
 
 #include "mongo/base/init.h"
+#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/temp_dir.h"
@@ -46,6 +47,10 @@ public:
             "file_manager=(close_idle_time=0),"
             "checkpoint=(wait=0,log_size=0)",
             100, false, true, false, readOnly));
+        repl::ReplicationCoordinator::set(
+            getGlobalServiceContext(),
+            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
+                getGlobalServiceContext(), repl::ReplSettings())));
     }
 
     virtual ~InMemoryKVHarnessHelper() {
