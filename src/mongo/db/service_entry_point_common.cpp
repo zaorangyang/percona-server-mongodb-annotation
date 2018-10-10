@@ -134,9 +134,18 @@ const StringMap<int> sessionCheckoutWhitelist = {{"abortTransaction", 1},
                                                  {"refreshLogicalSessionCacheNow", 1},
                                                  {"update", 1}};
 
-// The command names that are ignored by the 'failCommand' failpoint.
-const StringMap<int> failCommandIgnoreList = {
-    {"buildInfo", 1}, {"configureFailPoint", 1}, {"isMaster", 1}, {"ping", 1}};
+bool shouldActivateFailCommandFailPoint(const BSONObj& data, StringData cmdName) {
+    if (cmdName == "configureFailPoint"_sd)  // Banned even if in failCommands.
+        return false;
+
+    for (auto&& failCommand : data.getObjectField("failCommands")) {
+        if (failCommand.type() == String && failCommand.valueStringData() == cmdName) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 void generateLegacyQueryErrorResponse(const AssertionException* exception,
                                       const QueryMessage& queryMessage,
@@ -509,15 +518,26 @@ bool runCommandImpl(OperationContext* opCtx,
         ON_BLOCK_EXIT([&] { opCtx->setWriteConcern(oldWC); });
         opCtx->setWriteConcern(wcResult);
 
+        auto waitForWriteConcern = [&](auto&& bb) {
+            MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
+                return shouldActivateFailCommandFailPoint(data, request.getCommandName()) &&
+                    data.hasField("writeConcernError");
+            }) {
+                bb.append(data.getData()["writeConcernError"]);
+                return;  // Don't do normal waiting.
+            }
+
+            behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, bb);
+        };
+
         try {
             invokeInTransaction(opCtx, invocation, &crb);
         } catch (const DBException&) {
-            behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, *extraFieldsBuilder);
+            waitForWriteConcern(*extraFieldsBuilder);
             throw;
         }
 
-        auto bb = crb.getBodyBuilder();
-        behaviors.waitForWriteConcern(opCtx, invocation, lastOpBeforeRun, bb);
+        waitForWriteConcern(crb.getBodyBuilder());
 
         // Nothing in run() should change the writeConcern.
         dassert(SimpleBSONObjComparator::kInstance.evaluate(opCtx->getWriteConcern().toBSON() ==
@@ -561,17 +581,23 @@ bool runCommandImpl(OperationContext* opCtx,
  */
 void evaluateFailCommandFailPoint(OperationContext* opCtx, StringData commandName) {
     MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
-        return failCommandIgnoreList.find(commandName) == failCommandIgnoreList.cend();
+        return shouldActivateFailCommandFailPoint(data, commandName) &&
+            (data.hasField("closeConnection") || data.hasField("errorCode"));
     }) {
         bool closeConnection;
         if (bsonExtractBooleanField(data.getData(), "closeConnection", &closeConnection).isOK() &&
             closeConnection) {
             opCtx->getClient()->session()->end();
+            log() << "Failing command '" << commandName
+                  << "' via 'failCommand' failpoint. Action: closing connection.";
             uasserted(50838, "Failing command due to 'failCommand' failpoint");
         }
 
         long long errorCode;
         if (bsonExtractIntegerField(data.getData(), "errorCode", &errorCode).isOK()) {
+            log() << "Failing command '" << commandName
+                  << "' via 'failCommand' failpoint. Action: returning error code " << errorCode
+                  << ".";
             uasserted(ErrorCodes::Error(errorCode),
                       "Failing command due to 'failCommand' failpoint");
         }

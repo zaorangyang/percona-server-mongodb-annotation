@@ -393,6 +393,282 @@ variables:
   timeout:
   - func: "run hang analyzer"
 
+# Use this template for enterprise Windows testing coverage on non-pushing
+# variants
+- &enterprise-windows-64-2k8-nopush-template
+  name: enterprise-windows-64-2k8-nopush-template
+  run_on:
+  - windows-64-vs2015-small
+  modules:
+  - enterprise
+  display_tasks:
+  - *replica_sets_auth
+  - *replica_sets_ese
+  - *sharding_auth
+  - *sharding_auth_audit
+  - *sharding_ese
+  - *unittests
+  expansions: &enterprise-windows-64-2k8-nopush-expansions-template
+    test_flags: --excludeWithAnyTags=requires_mmapv1
+    platform_decompress: unzip
+    exe: ".exe"
+    msi_target: msi
+    content_type: application/zip
+    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
+    # spawning a large number of linker processes.
+    num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
+    python: python
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    ext: zip
+    use_scons_cache: true
+    multiversion_platform: windows
+    multiversion_edition: enterprise
+    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: false
+    jstestfuzz_num_generated_files: 35
+  tasks:
+  - name: compile_all_run_unittests_TG
+    requires:
+    - name: burn_in_tests
+    distros:
+    - windows-64-vs2015-large
+  - name: compile_benchmarks
+    distros:
+    - windows-64-vs2015-large
+  - name: burn_in_tests
+  - name: audit
+  - name: auth_audit
+  - name: benchmarks_orphaned
+  - name: benchmarks_sharding
+  - name: buildscripts_test
+  - name: dbtest
+  - name: ese
+  - name: external_auth
+  - name: jsCore
+  - name: jsCore_ese
+  - name: jsCore_decimal
+  - name: jsCore_auth
+  - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: aggregation_fuzzer
+  - name: jstestfuzz
+  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_concurrent_replication
+  - name: jstestfuzz_concurrent_sharded
+  - name: jstestfuzz_replication
+  - name: jstestfuzz_sharded
+  - name: replica_sets_auth_0
+  - name: replica_sets_auth_1
+  - name: replica_sets_auth_2
+  - name: replica_sets_auth_3
+  - name: replica_sets_auth_4
+  - name: replica_sets_auth_5
+  - name: replica_sets_auth_6
+  - name: replica_sets_auth_misc
+  - name: replica_sets_ese_0
+  - name: replica_sets_ese_1
+  - name: replica_sets_ese_2
+  - name: replica_sets_ese_3
+  - name: replica_sets_ese_4
+  - name: replica_sets_ese_5
+  - name: replica_sets_ese_6
+  - name: replica_sets_ese_misc
+  - name: sasl
+  - name: sharding_auth_0
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_1
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_2
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_3
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_4
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_5
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_6
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_7
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_8
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_9
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_10
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_11
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_12
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_13
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_14
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_15
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_16
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_17
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_18
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_19
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_misc
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_0
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_1
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_2
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_3
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_4
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_5
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_6
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_7
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_8
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_9
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_10
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_11
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_12
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_13
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_14
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_15
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_16
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_17
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_18
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_auth_audit_misc
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_0
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_1
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_2
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_3
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_4
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_5
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_6
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_7
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_8
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_9
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_10
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_11
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_12
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_13
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_14
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_15
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_16
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_17
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_18
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_19
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_20
+    distros:
+    - windows-64-vs2015-large
+  - name: sharding_ese_misc
+    distros:
+    - windows-64-vs2015-large
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+
 
 #######################################
 #            Functions                #
@@ -787,26 +1063,17 @@ functions:
         WORKDIR=${workdir}
 
         if [ "${build_cdriver|}" = "true" ]; then
-        CDRIVER_VERSION=1.9.2
+        CDRIVER_VERSION=1.10.1
         rm -rf mongo-c-driver-$CDRIVER_VERSION
         rm -rf mongo-c-driver
         curl -LO https://github.com/mongodb/mongo-c-driver/releases/download/$CDRIVER_VERSION/mongo-c-driver-$CDRIVER_VERSION.tar.gz
         tar xzf mongo-c-driver-$CDRIVER_VERSION.tar.gz
         mv mongo-c-driver-$CDRIVER_VERSION mongo-c-driver
         cd mongo-c-driver
-        # remove this patch once SERVER-33101 is released
-        patch -p1 < ../src/buildscripts/mongoc-stat.c.diff
-        # remove this once CDRIVER-2631 and CDRIVER-2630 are released
-        patch -p1 < ../src/buildscripts/mongo-c-driver_CMakeLists.txt.diff
 
         trap "cat CMakeFiles/CMakeOutput.log" EXIT
         export ${compile_env|}
-        (
-            cd src/libbson
-            ${cmake_path|/opt/cmake/bin/cmake} -DCMAKE_INSTALL_PREFIX=$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp -DCMAKE_PREFIX_PATH=$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp -DENABLE_SNAPPY=OFF -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF -DENABLE_ZLIB=OFF -DENABLE_SSL=OFF -DENABLE_SASL=OFF -DENABLE_TESTS=OFF -DENABLE_SRV=OFF -DENABLE_EXAMPLES=OFF -DENABLE_STATIC=OFF ${libbson_cmake_flags}
-            make install VERBOSE=1
-        )
-        ${cmake_path|/opt/cmake/bin/cmake} -DCMAKE_INSTALL_PREFIX=$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp -DCMAKE_PREFIX_PATH=$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp -DENABLE_SNAPPY=OFF -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF -DENABLE_ZLIB=OFF -DENABLE_SSL=OFF -DENABLE_SASL=OFF -DENABLE_TESTS=OFF -DENABLE_SRV=OFF -DENABLE_EXAMPLES=OFF -DENABLE_STATIC=OFF ${cdriver_cmake_flags}
+        ${cmake_path|/opt/cmake/bin/cmake} -DCMAKE_INSTALL_PREFIX=$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp -DENABLE_SHM_COUNTERS=OFF -DENABLE_SNAPPY=OFF -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF -DENABLE_ZLIB=OFF -DENABLE_SSL=OFF -DENABLE_SASL=OFF -DENABLE_TESTS=OFF -DENABLE_SRV=OFF -DENABLE_EXAMPLES=OFF -DENABLE_STATIC=OFF ${cdriver_cmake_flags}
         make install VERBOSE=1
         mv $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp $WORKDIR/src/build/mongo-embedded-sdk-$VERSION
         fi
@@ -1431,16 +1698,16 @@ functions:
         ${activate_virtualenv}
         if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" ]; then
             ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_capi_test" --tempPath /data
-            ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_transport_test" --tempPath /data
+            ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_mongoc_client_test" --tempPath /data
         elif [ ${enable_embedded_tests|false} = "android_emulator" ]; then
             # strip because the binaries with debug symbols are too big for the default storage on the emulator
             find build/mongo-embedded-sdk-${version}/bin -type f | xargs $(dirname $(pwd))/android_toolchain/bin/*-linux-android*-strip
             find build/mongo-embedded-sdk-${version}/lib -type f -name "*.so" | xargs $(dirname $(pwd))/android_toolchain/bin/*-linux-android*-strip
             ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_capi_test" --tempPath /data
-            ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_transport_test" --tempPath /data
+            ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_mongoc_client_test" --tempPath /data
         elif [ ${enable_embedded_tests|false} = "native" ]; then
           "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_capi_test"
-          "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_transport_test"
+          "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_mongoc_client_test"
         fi
 
   "run powercycle test" :
@@ -2941,7 +3208,7 @@ tasks:
           - "./test*"
           - "./dbtest*"
           - "./mongobridge*"
-          - "./mongoe*"
+          - "./mongoed*"
           - "buildscripts/**"
           - "*Example"
           - "*Test"
@@ -3007,7 +3274,7 @@ tasks:
         content_type: ${content_type|application/x-gzip}
         display_name: Source tarball
         # We only need to upload the source tarball from one of the build variants
-        # because it should be the same everywhere, so just use linux-64/windows-64-2k8.
+        # because it should be the same everywhere, so just use linux-64/windows-64-2k8-ssl.
         build_variants: [ linux-64, windows-64-2k8-ssl ]
     # For patch builds that bypass compile, we upload links to pre-existing tarballs, except for the
     # artifacts.tgz.
@@ -4119,7 +4386,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core --mongod=./mongoe --excludeWithAnyTags=requires_scripting,requires_auth,requires_sharding,does_not_support_stepdowns,requires_eval_command,requires_background_index,incompatible_with_embedded,incompatible_with_embedded_todo_investigate,requires_replication,SERVER-32997
+      resmoke_args: --suites=core --mongod=./mongoed --excludeWithAnyTags=requires_scripting,requires_auth,requires_sharding,does_not_support_stepdowns,requires_eval_command,requires_background_index,incompatible_with_embedded,incompatible_with_embedded_todo_investigate,requires_replication,SERVER-32997
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4495,7 +4762,6 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=concurrency_sharded_with_stepdowns --storageEngine=wiredTiger
-      timeout_secs: 21600 # 6 hour timeout for each test
 
 - <<: *task_template
   name: concurrency_sharded_with_stepdowns_and_balancer
@@ -4504,7 +4770,6 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=concurrency_sharded_with_stepdowns_and_balancer --storageEngine=wiredTiger
-      timeout_secs: 21600 # 6 hour timeout for each test
 
 - <<: *task_template
   name: concurrency_simultaneous
@@ -4513,7 +4778,6 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=concurrency_simultaneous --storageEngine=wiredTiger
-      timeout_secs: 21600 # 6 hour timeout
 
 - <<: *task_template
   name: rlp
@@ -6640,6 +6904,7 @@ tasks:
     type: test
     params:
       working_dir: src
+      silent: true
       script: |
         set -o errexit
 
@@ -6650,7 +6915,7 @@ tasks:
         export GIT_SSH_COMMAND="ssh -i ~/.ssh/test_lifecycle.pem"
 
         # Create the jira credentials configuration file
-        cat > ~/.jira.yml <<END_OF_CREDS
+        cat > .jira.yml <<END_OF_CREDS
         server: "https://jira.mongodb.org"
         access_token: "${testlifecycle_jira_access_token}"
         access_token_secret: "${testlifecycle_jira_access_token_secret}"
@@ -6676,7 +6941,7 @@ tasks:
             --referencesFile "references.yml"                           \
             --gitUserName "Test Lifecycle"                              \
             --gitUserEmail "build+testlifecycle@mongodb.com"            \
-            --jiraConfig ~/.jira.yml
+            --jiraConfig .jira.yml
 
 
 #######################################
@@ -6803,6 +7068,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -6856,11 +7123,17 @@ buildvariants:
   - name: parallel
   - name: concurrency
   - name: concurrency_replication
-  # TODO: SERVER-35057 Disable temporarily since the test suite cannot finish in
-  # 6 hours right now.
-  # - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
+  - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication_with_balancer
+    distros:
+    - rhel62-large
   - name: concurrency_simultaneous
 
 - &linux-64-debug-template
@@ -7155,6 +7428,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - ubuntu1404-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7270,6 +7545,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - ubuntu1604-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7488,6 +7765,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - linux-64-amzn-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7759,6 +8038,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - amazon2-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7970,13 +8251,9 @@ buildvariants:
     test_flags: --excludeWithAnyTags=requires_mmapv1
     platform_decompress: unzip
     exe: ".exe"
-    push_path: win32
-    push_bucket: downloads.mongodb.org
-    push_name: win32-debug
-    push_arch: x86_64-2008plus
     content_type: application/zip
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    compile_flags: --dbg=on --opt=on --win-version-min=ws08r2 -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) MONGO_DISTMOD=2008plus
+    compile_flags: --dbg=on --opt=on --win-version-min=ws08r2 -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) MONGO_DISTMOD=2012plus
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
@@ -8113,8 +8390,7 @@ buildvariants:
     distros:
     - windows-64-vs2015-large
 
-- &enterprise-windows-64-2k8-template
-  name: enterprise-windows-64-2k8
+- name: enterprise-windows-64-2k8
   display_name: "! Enterprise Windows 2008R2"
   modules:
   - enterprise
@@ -8394,7 +8670,7 @@ buildvariants:
     distros:
     - rhel70-small
 
-- <<: *enterprise-windows-64-2k8-template
+- <<: *enterprise-windows-64-2k8-nopush-template
   name: enterprise-windows-64-2k8-compile-all
   display_name: "* Enterprise Windows 2008R2 compile_all"
   display_tasks:
@@ -8405,29 +8681,13 @@ buildvariants:
     - windows-64-vs2015-large
   # Do not add more tasks to this list.
 
-- <<: *enterprise-windows-64-2k8-template
+- <<: *enterprise-windows-64-2k8-nopush-template
   name: enterprise-windows-64-2k8-openssl
   display_name: "~ Enterprise Windows 2008R2 OpenSSL"
   batchtime: 1440 # 1 day
-  modules:
-  - enterprise
   expansions:
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    platform_decompress: unzip
-    exe: ".exe"
-    msi_target: msi
-    content_type: application/zip
+    <<: *enterprise-windows-64-2k8-nopush-expansions-template
     compile_flags: --release --ssl --ssl-provider=openssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
-    # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
-    # spawning a large number of linker processes.
-    num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
-    python: python
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    ext: zip
-    use_scons_cache: true
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
-    tooltags: "-tags 'ssl sasl'"
-    build_mongoreplay: false
 
 - name: enterprise-windows-64-2k8-async
   display_name: "~ Enterprise Windows 2008R2 async"
@@ -8440,10 +8700,6 @@ buildvariants:
   expansions:
     platform_decompress: unzip
     exe: ".exe"
-    push_path: win32
-    push_bucket: downloads.10gen.com
-    push_name: win32
-    push_arch: x86_64-enterprise-windows-64
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
@@ -8476,10 +8732,6 @@ buildvariants:
   expansions:
     platform_decompress: unzip
     exe: ".exe"
-    push_path: win32
-    push_bucket: downloads.10gen.com
-    push_name: win32
-    push_arch: x86_64-enterprise-windows-64
     msi_target: msi
     content_type: application/zip
     compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
@@ -8506,10 +8758,10 @@ buildvariants:
   - name: auth_audit
   - name: dbtest
   - name: concurrency
-    distros:
-    - windows-64-vs2015-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - windows-64-vs2015-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8539,7 +8791,7 @@ buildvariants:
   - name: sslSpecial
 
 - name: windows-64-2k8-ssl
-  display_name: SSL Windows 2008R2
+  display_name: Windows 2008R2
   run_on:
   - windows-64-vs2015-small
   batchtime: 1440 # 1 day
@@ -8550,11 +8802,11 @@ buildvariants:
     push_path: win32
     push_bucket: downloads.mongodb.org
     push_name: win32
-    push_arch: x86_64-2008plus-ssl
+    push_arch: x86_64-2012plus
     multiversion_platform: windows_x86_64-2008plus-ssl
     msi_target: msi
     content_type: application/zip
-    compile_flags: --release --ssl MONGO_DISTMOD=2008plus-ssl CPPPATH="c:/openssl/include" LIBPATH="c:/openssl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --release --ssl MONGO_DISTMOD=2012plus CPPPATH="c:/openssl/include" LIBPATH="c:/openssl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
@@ -8581,6 +8833,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - windows-64-vs2015-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8667,7 +8921,7 @@ buildvariants:
     platform_decompress: unzip
     exe: ".exe"
     content_type: application/zip
-    compile_flags: --dbg=on --opt=off --ssl MONGO_DISTMOD=2008plus CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --dbg=on --opt=off --ssl MONGO_DISTMOD=2012plus CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
@@ -8692,8 +8946,8 @@ buildvariants:
 #             OSX buildvariants           #
 ###########################################
 
-- name: osx-1010-ssl
-  display_name: SSL OS X 10.10
+- name: osx-1010
+  display_name: macOS 10.10
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -8701,11 +8955,11 @@ buildvariants:
     test_flags: --excludeWithAnyTags=requires_mmapv1,requires_ssl_mongo_tools
     push_path: osx
     push_bucket: downloads.mongodb.org
-    push_name: osx-ssl
+    push_name: macos
     push_arch: x86_64
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
-    multiversion_platform: osx-ssl
+    multiversion_platform: macos
     num_jobs_available: 1
     gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     tooltags: "-tags 'ssl openssl_pre_1.0'"
@@ -8805,15 +9059,11 @@ buildvariants:
     - rhel70-small
 
 - name: osx-1010-debug
-  display_name: "* OS X 10.10 DEBUG"
+  display_name: "* macOS 10.10 DEBUG"
   run_on:
   - macos-1012
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    push_path: osx
-    push_bucket: downloads.mongodb.org
-    push_name: osx-debug
-    push_arch: x86_64
     num_jobs_available: 1
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --dbg=on --opt=on -j$(sysctl -n hw.logicalcpu) --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
@@ -8838,9 +9088,8 @@ buildvariants:
   - name: replica_sets
   - name: tool
 
-- &enterprise-osx-1010-template
-  name: enterprise-osx-1010
-  display_name: Enterprise OS X 10.10
+- name: enterprise-osx-1010
+  display_name: Enterprise macOS 10.10
   modules:
   - enterprise
   run_on:
@@ -8850,7 +9099,7 @@ buildvariants:
     test_flags: --excludeWithAnyTags=requires_mmapv1,requires_ssl_mongo_tools
     push_path: osx
     push_bucket: downloads.10gen.com
-    push_name: osx
+    push_name: macos
     push_arch: x86_64-enterprise
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
@@ -8887,9 +9136,13 @@ buildvariants:
     distros:
     - rhel70-small
 
-- <<: *enterprise-osx-1010-template
-  name: enterprise-osx-1010-openssl
-  display_name: Enterprise OS X 10.10 OpenSSL
+- name: enterprise-osx-1010-openssl
+  display_name: ~ Enterprise macOS 10.10 OpenSSL
+  modules:
+  - enterprise
+  run_on:
+  - macos-1012
+  batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1,requires_ssl_mongo_tools
     push_path: osx
@@ -8907,6 +9160,29 @@ buildvariants:
     build_openssl: true
     openssl_config_flags: "-mmacosx-version-min=10.10"
     openssl_make_flags: "-j$(sysctl -n hw.logicalcpu)"
+  display_tasks:
+  - *unittests
+  tasks:
+  - name: compile_all_run_unittests_TG
+  - name: audit
+  - name: auth_audit
+  - name: dbtest
+  - name: ese
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: aggregation_fuzzer
+  - name: jstestfuzz
+  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_concurrent_replication
+  - name: jstestfuzz_concurrent_sharded
+  - name: jstestfuzz_replication
+  - name: jstestfuzz_sharded
+  - name: replica_sets_auth
+  - name: sasl
+  - name: ssl
+  - name: sslSpecial
 
 
 ###########################################
@@ -8931,18 +9207,6 @@ buildvariants:
       --variables-files=etc/scons/xcode_macos.vars
       --use-system-mongo-c=on
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    libbson_cmake_flags: >-
-        -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_SYSTEM_PROCESSOR=x86_64
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk macosx --show-sdk-path)"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10"
-        -DCMAKE_LINKER_FLAGS="-isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
     cdriver_cmake_flags: >-
         -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_SYSTEM_NAME=Darwin
@@ -8977,17 +9241,6 @@ buildvariants:
       --variables-files=etc/scons/xcode_ios.vars
       --use-system-mongo-c=on
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    libbson_cmake_flags: >-
-        -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2"
-        -DCMAKE_LINKER_FLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
     cdriver_cmake_flags: >-
         -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_SYSTEM_NAME=Darwin
@@ -9022,17 +9275,6 @@ buildvariants:
       --variables-files=etc/scons/xcode_ios_sim.vars
       --use-system-mongo-c=on
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    libbson_cmake_flags: >-
-        -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk iphonesimulator --show-sdk-path)"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
-        -DCMAKE_LINKER_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
     cdriver_cmake_flags: >-
         -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_SYSTEM_NAME=Darwin
@@ -9069,17 +9311,6 @@ buildvariants:
       --variables-files=etc/scons/xcode_tvos.vars
       --use-system-mongo-c=on
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    libbson_cmake_flags: >-
-        -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk appletvos --show-sdk-path)"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch arm64 -isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2"
-        -DCMAKE_LINKER_FLAGS="-isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
     cdriver_cmake_flags: >-
         -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_SYSTEM_NAME=Darwin
@@ -9113,17 +9344,6 @@ buildvariants:
       --variables-files=etc/scons/xcode_tvos_sim.vars
       --use-system-mongo-c=on
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    libbson_cmake_flags: >-
-        -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk appletvsimulator --show-sdk-path)"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
-        -DCMAKE_LINKER_FLAGS="-isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
     cdriver_cmake_flags: >-
         -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_SYSTEM_NAME=Darwin
@@ -9160,10 +9380,6 @@ buildvariants:
       --allocator=system
       --use-system-mongo-c=on
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    libbson_cmake_flags:
-        -DCMAKE_C_COMPILER=/opt/mongodbtoolchain/v2/bin/gcc
-        -DCMAKE_CXX_COMPILER=/opt/mongodbtoolchain/v2/bin/g++
-        -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
     cdriver_cmake_flags:
         -DCMAKE_C_COMPILER=/opt/mongodbtoolchain/v2/bin/gcc
         -DCMAKE_CXX_COMPILER=/opt/mongodbtoolchain/v2/bin/g++
@@ -9194,17 +9410,6 @@ buildvariants:
       --use-system-mongo-c=on
       LIBS=clang_rt.builtins-arm-android
       LIBPATH="$(dirname $($(dirname $(pwd))/android_toolchain/bin/clang -print-file-name=libclang_rt.builtins-arm-android.a)) \$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    libbson_cmake_flags: >-
-        -DANDROID_NATIVE_API_LEVEL=24
-        -DANDROID_ABI=armeabi-v7a
-        -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
-        -DCMAKE_FIND_ROOT_PATH=$WORKDIR/android_toolchain
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
     cdriver_cmake_flags: >-
         -DANDROID_NATIVE_API_LEVEL=24
         -DANDROID_ABI=armeabi-v7a
@@ -9244,17 +9449,6 @@ buildvariants:
       --variables-files=etc/scons/android_toolchain.vars
       --use-system-mongo-c=on
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    libbson_cmake_flags: >-
-        -DANDROID_NATIVE_API_LEVEL=24
-        -DANDROID_ABI=arm64-v8a
-        -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
-        -DCMAKE_FIND_ROOT_PATH=$WORKDIR/android_toolchain
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
     cdriver_cmake_flags: >-
         -DANDROID_NATIVE_API_LEVEL=24
         -DANDROID_ABI=arm64-v8a
@@ -9294,17 +9488,6 @@ buildvariants:
       --variables-files=etc/scons/android_toolchain.vars
       --use-system-mongo-c=on
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    libbson_cmake_flags: >-
-        -DANDROID_NATIVE_API_LEVEL=24
-        -DANDROID_ABI=x86_64
-        -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
-        -DCMAKE_FIND_ROOT_PATH=$WORKDIR/android_toolchain
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
     cdriver_cmake_flags: >-
         -DANDROID_NATIVE_API_LEVEL=24
         -DANDROID_ABI=x86_64
@@ -9420,6 +9603,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -10198,6 +10383,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -10638,6 +10825,39 @@ buildvariants:
     distros:
     - rhel62-large
 
+- name: rhel-67-s390x
+  display_name: SSL RHEL 6.7 s390x
+  run_on:
+  - rhel67-zseries-test
+  batchtime: 1440 # 1 day
+  expansions:
+    compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_gcc.vars --use-s390x-crc32=off
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    test_flags: --excludeWithAnyTags=requires_mmapv1
+    has_packages: true
+    packager_script: packager.py
+    packager_arch: s390x
+    packager_distro: rhel67
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: s390x-rhel67
+    repo_edition: org
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    build_mongoreplay: true
+    tooltags: "-tags ssl"
+  display_tasks:
+  - *unittests
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel67-zseries-build
+  - name: jsCore
+  - name: ssl
+  - name: push
+    distros:
+    - rhel62-large
+
 ###########################################
 #          Ubuntu buildvariants           #
 ###########################################
@@ -10926,6 +11146,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - suse12-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11058,6 +11280,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - debian81-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11204,6 +11428,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - debian92-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11434,6 +11660,8 @@ buildvariants:
     - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -11539,7 +11767,7 @@ buildvariants:
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
-    additional_targets: mongoe
+    additional_targets: mongoed
   display_tasks:
   - *unittests
   tasks:
@@ -11606,7 +11834,7 @@ buildvariants:
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto libsasl2)" -tags 'sasl ssl'
     build_mongoreplay: true
-    additional_targets: mongoe
+    additional_targets: mongoed
   display_tasks:
   - *unittests
   tasks:
@@ -11666,7 +11894,7 @@ buildvariants:
   - name: jsCore_mobile
 
 - name: enterprise-osx-1010-mobile
-  display_name: Enterprise OS X 10.10 (mobile)
+  display_name: Enterprise macOS 10.10 (mobile)
   modules:
   - enterprise
   run_on:
@@ -11697,7 +11925,7 @@ buildvariants:
     gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
     build_mongoreplay: true
-    additional_targets: mongoe
+    additional_targets: mongoed
   display_tasks:
   - *unittests
   tasks:
@@ -11761,6 +11989,8 @@ buildvariants:
     - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -12258,6 +12488,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -12408,6 +12640,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -12753,7 +12987,7 @@ buildvariants:
   - name: update_fuzzer_replication
 
 - name: enterprise-osx-1010-mmapv1
-  display_name: Enterprise OS X 10.10 MMAPv1
+  display_name: Enterprise macOS 10.10 MMAPv1
   modules:
   - enterprise
   run_on:

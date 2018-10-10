@@ -31,9 +31,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
-#include "mongo/client/embedded/embedded.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/embedded/embedded.h"
+#include "mongo/embedded/service_entry_point_embedded.h"
+#include "mongo/transport/service_entry_point_impl.h"
 #include "mongo/transport/transport_layer.h"
 #include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/exit.h"
@@ -48,6 +50,20 @@
 namespace mongo {
 namespace {
 
+class ServiceEntryPointMongoe : public ServiceEntryPointImpl {
+public:
+    explicit ServiceEntryPointMongoe(ServiceContext* svcCtx)
+        : ServiceEntryPointImpl(svcCtx),
+          _sepEmbedded(std::make_unique<ServiceEntryPointEmbedded>()) {}
+
+    DbResponse handleRequest(OperationContext* opCtx, const Message& request) final {
+        return _sepEmbedded->handleRequest(opCtx, request);
+    }
+
+private:
+    std::unique_ptr<ServiceEntryPointEmbedded> _sepEmbedded;
+};
+
 MONGO_INITIALIZER_WITH_PREREQUISITES(SignalProcessingStartup, ("ThreadNameInitializer"))
 (InitializerContext*) {
     // Make sure we call this as soon as possible but before any other threads are started. Before
@@ -57,7 +73,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SignalProcessingStartup, ("ThreadNameInitia
     return Status::OK();
 }
 
-int mongoeMain(int argc, char* argv[], char** envp) {
+int mongoedMain(int argc, char* argv[], char** envp) {
     ServiceContext* serviceContext = nullptr;
 
     registerShutdownTask([&]() {
@@ -100,6 +116,10 @@ int mongoeMain(int argc, char* argv[], char** envp) {
         YAML::Emitter yaml;
         serviceContext = embedded::initialize(yaml.c_str());
 
+        // Override the ServiceEntryPoint with one that can support transport layers.
+        serviceContext->setServiceEntryPoint(
+            std::make_unique<ServiceEntryPointMongoe>(serviceContext));
+
         auto tl =
             transport::TransportLayerManager::createWithConfig(&serverGlobalParams, serviceContext);
         uassertStatusOK(tl->setup());
@@ -127,10 +147,10 @@ int mongoeMain(int argc, char* argv[], char** envp) {
 // to process UTF-8 encoded arguments and environment variables without regard to platform.
 int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
     mongo::WindowsCommandLine wcl(argc, argvW, envpW);
-    return mongo::mongoeMain(argc, wcl.argv(), wcl.envp());
+    return mongo::mongoedMain(argc, wcl.argv(), wcl.envp());
 }
 #else
 int main(int argc, char* argv[], char** envp) {
-    return mongo::mongoeMain(argc, argv, envp);
+    return mongo::mongoedMain(argc, argv, envp);
 }
 #endif

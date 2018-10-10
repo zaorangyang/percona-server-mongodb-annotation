@@ -32,8 +32,6 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
-#include "mongo/client/embedded/service_context_embedded.h"
-#include "mongo/client/embedded/service_entry_point_embedded.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/operation_context.h"
@@ -42,6 +40,8 @@
 #include "mongo/db/storage/storage_engine_lock_file.h"
 #include "mongo/db/storage/storage_engine_metadata.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/embedded/service_context_embedded.h"
+#include "mongo/embedded/service_entry_point_embedded.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/map_util.h"
@@ -54,7 +54,7 @@ namespace mongo {
 namespace {
 ServiceContextRegistrar serviceContextCreator([]() {
     auto service = std::make_unique<ServiceContextMongoEmbedded>();
-    service->setServiceEntryPoint(std::make_unique<ServiceEntryPointEmbedded>(service.get()));
+    service->setServiceEntryPoint(std::make_unique<ServiceEntryPointEmbedded>());
     service->setTickSource(std::make_unique<SystemTickSource>());
     service->setFastClockSource(std::make_unique<SystemClockSource>());
     service->setPreciseClockSource(std::make_unique<SystemClockSource>());
