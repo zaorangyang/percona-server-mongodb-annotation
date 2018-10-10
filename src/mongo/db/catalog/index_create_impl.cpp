@@ -145,9 +145,8 @@ MultiIndexBlockImpl::~MultiIndexBlockImpl() {
     if (!_needToCleanup || _indexes.empty())
         return;
 
-    // Make lock acquisition uninterruptible because onOpMessage() and WUOW.commit() could take
-    // locks.
-    UninterruptibleLockGuard(_opCtx->lockState());
+    // Make lock acquisition uninterruptible because onOpMessage() can take locks.
+    UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
 
     while (true) {
         try {
@@ -166,8 +165,6 @@ MultiIndexBlockImpl::~MultiIndexBlockImpl() {
             // timestamp already set.
             if (_opCtx->recoveryUnit()->getCommitTimestamp().isNull() &&
                 replCoord->canAcceptWritesForDatabase(_opCtx, "admin")) {
-
-                // Make lock acquisition uninterruptible because writing an op message takes a lock.
                 _opCtx->getServiceContext()->getOpObserver()->onOpMessage(
                     _opCtx,
                     BSON("msg" << std::string(str::stream() << "Failing index builds. Coll: "
@@ -509,7 +506,7 @@ void MultiIndexBlockImpl::abortWithoutCleanup() {
     _needToCleanup = false;
 }
 
-void MultiIndexBlockImpl::commit() {
+void MultiIndexBlockImpl::commit(stdx::function<void(const BSONObj& spec)> onCreateFn) {
     // Do not interfere with writing multikey information when committing index builds.
     auto restartTracker =
         MakeGuard([this] { MultikeyPathTracker::get(_opCtx).startTrackingMultikeyPathInfo(); });
@@ -519,6 +516,10 @@ void MultiIndexBlockImpl::commit() {
     MultikeyPathTracker::get(_opCtx).stopTrackingMultikeyPathInfo();
 
     for (size_t i = 0; i < _indexes.size(); i++) {
+        if (onCreateFn) {
+            onCreateFn(_indexes[i].block->getSpec());
+        }
+
         _indexes[i].block->success();
 
         // The bulk builder will track multikey information itself. Non-bulk builders re-use the

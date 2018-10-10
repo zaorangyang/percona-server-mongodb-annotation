@@ -45,6 +45,7 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/md5.hpp"
@@ -114,10 +115,11 @@ public:
         // We lock the entire database in S-mode in order to ensure that the contents will not
         // change for the snapshot.
         auto lockMode = LockMode::MODE_S;
-        if (repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()) {
-            // However, if we are using "atClusterTime" to read from a consistent snapshot, then we
-            // only need to lock the database in intent mode to ensure that none of the collections
-            // get dropped.
+        auto* session = OperationContextSession::get(opCtx);
+        if (session && session->inSnapshotReadOrMultiDocumentTransaction()) {
+            // However, if we are inside a multi-statement transaction or using snapshot reads to
+            // read from a consistent snapshot, then we only need to lock the database in intent
+            // mode to ensure that none of the collections get dropped.
             lockMode = getLockModeForQuery(opCtx);
         }
         AutoGetDb autoDb(opCtx, ns, lockMode);
@@ -142,6 +144,8 @@ public:
                                                                "system.version",
                                                                "system.views"};
 
+        BSONArrayBuilder cappedCollections;
+        BSONObjBuilder collectionsByUUID;
 
         BSONObjBuilder bb(result.subobjStart("collections"));
         for (const auto& collectionName : colls) {
@@ -159,6 +163,11 @@ public:
             if (collNss.isSystem() && !isReplicatedSystemColl)
                 continue;
 
+            if (collNss.coll().startsWith("tmp.mr.")) {
+                // We skip any incremental map reduce collections as they also aren't replicated.
+                continue;
+            }
+
             if (desiredCollections.size() > 0 &&
                 desiredCollections.count(collNss.coll().toString()) == 0)
                 continue;
@@ -167,6 +176,16 @@ public:
             if (collNss.isDropPendingNamespace())
                 continue;
 
+            if (Collection* collection = db->getCollection(opCtx, collectionName)) {
+                if (collection->isCapped()) {
+                    cappedCollections.append(collNss.coll());
+                }
+
+                if (OptionalCollectionUUID uuid = collection->uuid()) {
+                    uuid->appendToBuilder(&collectionsByUUID, collNss.coll());
+                }
+            }
+
             // Compute the hash for this collection.
             std::string hash = _hashCollection(opCtx, db, collNss.toString());
 
@@ -174,6 +193,9 @@ public:
             md5_append(&globalState, (const md5_byte_t*)hash.c_str(), hash.size());
         }
         bb.done();
+
+        result.append("capped", BSONArray(cappedCollections.done()));
+        result.append("uuids", collectionsByUUID.done());
 
         md5digest d;
         md5_finish(&globalState, d);
@@ -197,11 +219,14 @@ private:
             return "";
 
         boost::optional<Lock::CollectionLock> collLock;
-        if (repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime()) {
-            // When using "atClusterTime", we are only holding the database lock in intent mode. We
-            // need to also acquire the collection lock in intent mode to ensure reading from the
-            // consistent snapshot doesn't overlap with any catalog operations on the collection.
-            invariant(opCtx->lockState()->isDbLockedForMode(db->name(), MODE_IS));
+        auto* session = OperationContextSession::get(opCtx);
+        if (session && session->inSnapshotReadOrMultiDocumentTransaction()) {
+            // When inside a multi-statement transaction or using snapshot reads, we are only
+            // holding the database lock in intent mode. We need to also acquire the collection lock
+            // in intent mode to ensure reading from the consistent snapshot doesn't overlap with
+            // any catalog operations on the collection.
+            invariant(
+                opCtx->lockState()->isDbLockedForMode(db->name(), getLockModeForQuery(opCtx)));
             collLock.emplace(opCtx->lockState(), fullCollectionName, getLockModeForQuery(opCtx));
 
             auto minSnapshot = collection->getMinimumVisibleSnapshot();

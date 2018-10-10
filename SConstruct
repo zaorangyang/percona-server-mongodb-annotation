@@ -3258,6 +3258,7 @@ def doConfigure(myenv):
             break
  
     mongoc_mode = get_option('use-system-mongo-c')
+    conf.env['MONGO_HAVE_LIBMONGOC'] = False
     if mongoc_mode != 'off':
         conf.env['MONGO_HAVE_LIBMONGOC'] = conf.CheckLibWithHeader(
                 ["mongoc-1.0"],

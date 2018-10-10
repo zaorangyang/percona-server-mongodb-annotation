@@ -1340,9 +1340,15 @@ Status ReplicationCoordinatorImpl::_waitUntilClusterTimeForRead(OperationContext
     auto targetOpTime = OpTime(clusterTime.asTimestamp(), OpTime::kUninitializedTerm);
     invariant(!readConcern.getArgsOpTime());
 
+    // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
+    auto session = OperationContextSession::get(opCtx);
+    const bool speculative = session && session->inSnapshotReadOrMultiDocumentTransaction() &&
+        !readConcern.getArgsAtClusterTime();
+
     const bool isMajorityCommittedRead =
-        readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern ||
-        readConcern.getLevel() == ReadConcernLevel::kSnapshotReadConcern;
+        (readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern ||
+         readConcern.getLevel() == ReadConcernLevel::kSnapshotReadConcern) &&
+        !speculative;
 
     return _waitUntilOpTime(opCtx, isMajorityCommittedRead, targetOpTime, deadline);
 }
@@ -1765,6 +1771,14 @@ void ReplicationCoordinatorImpl::_signalStepDownWaiterIfReady_inlock() {
 void ReplicationCoordinatorImpl::_handleTimePassing(
     const executor::TaskExecutor::CallbackArgs& cbData) {
     if (!cbData.status.isOK()) {
+        return;
+    }
+
+    // For election protocol v1, call _startElectSelfIfEligibleV1 to avoid race
+    // against other elections caused by events like election timeout, replSetStepUp etc.
+    if (isV1ElectionProtocol()) {
+        _startElectSelfIfEligibleV1(
+            TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout);
         return;
     }
 
@@ -3331,7 +3345,7 @@ Status ReplicationCoordinatorImpl::updateTerm(OperationContext* opCtx, long long
     }
 
     // Check we haven't acquired any lock, because potential stepdown needs global lock.
-    dassert(!opCtx->lockState()->isLocked());
+    dassert(!opCtx->lockState()->isLocked() || opCtx->lockState()->isNoop());
     TopologyCoordinator::UpdateTermResult updateTermResult;
     EventHandle finishEvh;
 

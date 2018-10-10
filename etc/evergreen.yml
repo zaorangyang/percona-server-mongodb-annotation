@@ -384,7 +384,6 @@ variables:
   - func: "get buildnumber"
   - func: "set up credentials"
   - func: "fetch and build OpenSSL"
-  - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
   - func: "generate compile expansions"
   teardown_group:
   - func: "scons cache pruning"
@@ -423,7 +422,6 @@ functions:
       revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
         enterprise: ${enterprise_rev}
         rocksdb: ${rocksdb_rev}
-        wtdevelop: ${wtdevelop_rev}
 
   "fetch artifacts" : &fetch_artifacts
     command: s3.get
@@ -493,7 +491,7 @@ functions:
   "get buildnumber" : &get_buildnumber
     command: keyval.inc
     params:
-      key: "${build_variant}_master"
+      key: "${build_variant}_v4.0"
       destination: "builder_num"
 
   "run diskstats": &run_diskstats
@@ -718,21 +716,6 @@ functions:
             if [ "${build_openssl|}" = "true" ]; then
                 bash buildscripts/fetch_and_build_openssl.sh "${python|python}" "${openssl_make_flags|}" "${openssl_config_flags|}"
             fi
-
-  "use WiredTiger develop" :
-    command: shell.exec
-    params:
-      working_dir: src
-      script: |
-        set -o errexit
-        set -o verbose
-        if [ "${use_wt_develop|}" = "true" ]; then
-        cd src/third_party
-        for wtdir in api dist examples ext lang src test tools ; do
-          rm -rf wiredtiger/$wtdir
-          mv wtdevelop/$wtdir wiredtiger/
-        done
-        fi
 
   "setup android toolchain" :
     command: shell.exec
@@ -969,14 +952,15 @@ functions:
 
           python_loc=$(which ${python|/opt/mongodbtoolchain/v2/bin/python2})
           python3_loc=$(which ${python|/opt/mongodbtoolchain/v2/bin/python3})
+          virtualenv_loc=$(which ${virtualenv|virtualenv})
           if [ "Windows_NT" = "$OS" ]; then
             python_loc=$(cygpath -w $python_loc)
             python3_loc=$(cygpath -w c:/python/Python36/python.exe)
           fi
           # Set up virtualenv in ${workdir}
-          virtualenv --python "$python_loc" --system-site-packages "${workdir}/venv"
+          "$virtualenv_loc" --python "$python_loc" --system-site-packages "${workdir}/venv"
           # Add virtualenv for python3 in ${workdir}
-          virtualenv --python "$python3_loc" --system-site-packages "${workdir}/venv_3"
+          "$virtualenv_loc" --python "$python3_loc" --system-site-packages "${workdir}/venv_3"
 
   "run tests" :
     - *determine_task_timeout
@@ -1450,8 +1434,8 @@ functions:
             ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_transport_test" --tempPath /data
         elif [ ${enable_embedded_tests|false} = "android_emulator" ]; then
             # strip because the binaries with debug symbols are too big for the default storage on the emulator
-            find build/mongo-embedded-sdk-${version}/bin -type f | xargs $(dirname $(pwd))/android_toolchain/bin/*-linux-android-strip
-            find build/mongo-embedded-sdk-${version}/lib -type f -name "*.so" | xargs $(dirname $(pwd))/android_toolchain/bin/*-linux-android-strip
+            find build/mongo-embedded-sdk-${version}/bin -type f | xargs $(dirname $(pwd))/android_toolchain/bin/*-linux-android*-strip
+            find build/mongo-embedded-sdk-${version}/lib -type f -name "*.so" | xargs $(dirname $(pwd))/android_toolchain/bin/*-linux-android*-strip
             ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_capi_test" --tempPath /data
             ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_transport_test" --tempPath /data
         elif [ ${enable_embedded_tests|false} = "native" ]; then
@@ -3102,7 +3086,6 @@ tasks:
           --link-model=dynamic
           --prefix='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION'
           CPPPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libbson-1.0 $BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libmongoc-1.0'
-          LIBPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/lib'
 
     # Need to sign artifacts on iOS-ish.
     - command: shell.exec
@@ -3174,7 +3157,6 @@ tasks:
     - func: "git get project"
     - func: "get buildnumber"
     - func: "set up credentials"
-    - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
     - func: "generate compile expansions"
     # Then we load the generated version data into the agent so we can use it in task definitions
     - func: "apply compile expansions"
@@ -4205,6 +4187,15 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: causally_consistent_jscore_txns_passthrough
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=causally_consistent_jscore_txns_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: replica_sets_jscore_passthrough
   depends_on:
   - name: jsCore
@@ -4213,6 +4204,17 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=replica_sets_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: replica_sets_multi_stmt_txn_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_multi_stmt_txn_jscore_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4445,6 +4447,14 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=concurrency_replication --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: concurrency_replication_causal_consistency
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_replication_causal_consistency --storageEngine=wiredTiger
 
 - <<: *task_template
   name: concurrency_sharded_replication
@@ -6694,17 +6704,12 @@ modules:
 - name: enterprise
   repo: git@github.com:10gen/mongo-enterprise-modules.git
   prefix: src/mongo/db/modules
-  branch: master
+  branch: v4.0
 
 - name: rocksdb
   repo: git@github.com:mongodb-partners/mongo-rocks.git
   prefix: src/mongo/db/modules
-  branch: master
-
-- name: wtdevelop
-  repo: git@github.com:wiredtiger/wiredtiger.git
-  prefix: src/third_party
-  branch: develop
+  branch: v4.0
 
 #######################################
 #            Buildvariants            #
@@ -6778,6 +6783,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -6796,6 +6802,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -6849,6 +6856,9 @@ buildvariants:
   - name: parallel
   - name: concurrency
   - name: concurrency_replication
+  # TODO: SERVER-35057 Disable temporarily since the test suite cannot finish in
+  # 6 hours right now.
+  # - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -6901,6 +6911,7 @@ buildvariants:
   - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -6920,6 +6931,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
   - name: mongosTest
   - name: noPassthrough
@@ -6942,6 +6954,7 @@ buildvariants:
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
   - name: replica_sets_jscore_passthrough
+  - name: replica_sets_multi_stmt_txn_jscore_passthrough
   - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
@@ -6995,19 +7008,6 @@ buildvariants:
   - name: tool
   - name: write_concern_majority_passthrough
 
-- <<: *linux-64-debug-template
-  name: linux-64-debug-wtdevelop
-  display_name: "~ Linux DEBUG WiredTiger develop"
-  batchtime: 1440 # 1 day
-  modules:
-  - wtdevelop
-  expansions:
-    use_wt_develop: true
-    num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 2)) # Avoid starting too many mongod's
-    compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off
-    use_scons_cache: true
-    build_mongoreplay: true
-
 - name: linux-64-duroff
   display_name: Linux (No Journal)
   run_on:
@@ -7048,6 +7048,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7136,6 +7137,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7152,6 +7154,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7249,6 +7252,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7265,6 +7269,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7332,6 +7337,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7352,6 +7358,9 @@ buildvariants:
     # hosts from the ubuntu1604-arm64-small pool to work around this issue.
     - ubuntu1604-arm64-small
   - name: concurrency_replication
+    distros:
+    - ubuntu1604-arm64-small
+  - name: concurrency_replication_causal_consistency
     distros:
     - ubuntu1604-arm64-small
   - name: concurrency_sharded_replication
@@ -7462,6 +7471,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7477,6 +7487,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7539,6 +7550,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7559,6 +7571,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7625,6 +7638,7 @@ buildvariants:
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
+    virtualenv: /opt/mongodbtoolchain/v2/bin/virtualenv
   display_tasks:
   - *unittests
   tasks:
@@ -7644,6 +7658,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7700,6 +7715,7 @@ buildvariants:
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: "-tags 'ssl'"
     build_mongoreplay: true
+    virtualenv: /opt/mongodbtoolchain/v2/bin/virtualenv
   display_tasks:
   - *unittests
   tasks:
@@ -7725,6 +7741,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7741,6 +7758,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7812,6 +7830,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7898,6 +7917,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -7914,6 +7934,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8002,6 +8023,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
   - name: mongosTest
   - name: noPassthrough
@@ -8018,6 +8040,9 @@ buildvariants:
     distros:
     - windows-64-vs2015-large
   - name: concurrency_replication
+    distros:
+    - windows-64-vs2015-large
+  - name: concurrency_replication_causal_consistency
     distros:
     - windows-64-vs2015-large
   - name: concurrency_sharded_replication
@@ -8061,7 +8086,12 @@ buildvariants:
   - name: replica_sets_initsync_static_jscore_passthrough
     distros:
     - windows-64-vs2015-large
+  - name: replica_sets_multi_stmt_txn_jscore_passthrough
+    distros:
+    - windows-64-vs2015-large
   - name: replica_sets_kill_primary_jscore_passthrough
+    distros:
+    - windows-64-vs2015-large
   - name: replica_sets_terminate_primary_jscore_passthrough
     distros:
     - windows-64-vs2015-large
@@ -8143,6 +8173,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -8375,32 +8406,6 @@ buildvariants:
   # Do not add more tasks to this list.
 
 - <<: *enterprise-windows-64-2k8-template
-  name: enterprise-windows-64-2k8-wtdevelop
-  display_name: "~ Enterprise Windows 2008R2 WiredTiger develop"
-  batchtime: 1440 # 1 day
-  modules:
-  - enterprise
-  - wtdevelop
-  expansions:
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    use_wt_develop: true
-    platform_decompress: unzip
-    exe: ".exe"
-    msi_target: msi
-    content_type: application/zip
-    compile_flags: --release --ssl MONGO_DISTMOD=windows-64 CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
-    # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
-    # spawning a large number of linker processes.
-    num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
-    python: python
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    ext: zip
-    use_scons_cache: true
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
-    tooltags: "-tags 'ssl sasl'"
-    build_mongoreplay: false
-
-- <<: *enterprise-windows-64-2k8-template
   name: enterprise-windows-64-2k8-openssl
   display_name: "~ Enterprise Windows 2008R2 OpenSSL"
   batchtime: 1440 # 1 day
@@ -8504,12 +8509,14 @@ buildvariants:
     distros:
     - windows-64-vs2015-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -8573,6 +8580,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8588,6 +8596,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
   - name: aggregation_fuzzer
   - name: jstestfuzz
@@ -8727,6 +8736,7 @@ buildvariants:
   - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -8746,6 +8756,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -8822,6 +8833,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: mongosTest
   - name: replica_sets
   - name: tool
@@ -8859,6 +8871,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -8917,6 +8930,7 @@ buildvariants:
       --enable-free-mon=off
       --variables-files=etc/scons/xcode_macos.vars
       --use-system-mongo-c=on
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
     libbson_cmake_flags: >-
         -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_SYSTEM_NAME=Darwin
@@ -8962,6 +8976,7 @@ buildvariants:
       --enable-free-mon=off
       --variables-files=etc/scons/xcode_ios.vars
       --use-system-mongo-c=on
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
     libbson_cmake_flags: >-
         -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_SYSTEM_NAME=Darwin
@@ -9006,6 +9021,7 @@ buildvariants:
       --enable-free-mon=off
       --variables-files=etc/scons/xcode_ios_sim.vars
       --use-system-mongo-c=on
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
     libbson_cmake_flags: >-
         -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_SYSTEM_NAME=Darwin
@@ -9052,6 +9068,7 @@ buildvariants:
       --enable-free-mon=off
       --variables-files=etc/scons/xcode_tvos.vars
       --use-system-mongo-c=on
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
     libbson_cmake_flags: >-
         -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_SYSTEM_NAME=Darwin
@@ -9095,6 +9112,7 @@ buildvariants:
       --enable-free-mon=off
       --variables-files=etc/scons/xcode_tvos_sim.vars
       --use-system-mongo-c=on
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
     libbson_cmake_flags: >-
         -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_SYSTEM_NAME=Darwin
@@ -9141,6 +9159,7 @@ buildvariants:
       --variables-files=etc/scons/mongodbtoolchain_gcc.vars
       --allocator=system
       --use-system-mongo-c=on
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
     libbson_cmake_flags:
         -DCMAKE_C_COMPILER=/opt/mongodbtoolchain/v2/bin/gcc
         -DCMAKE_CXX_COMPILER=/opt/mongodbtoolchain/v2/bin/g++
@@ -9153,6 +9172,57 @@ buildvariants:
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     disable_unit_tests: true
     enable_embedded_tests: native
+  tasks:
+  - name: compile_mobile
+
+- name: embedded-sdk-android-arm32
+  display_name: "Embedded SDK - Android arm32"
+  run_on:
+  - ubuntu1604-build
+  batchtime: 1440 # 1 day
+  expansions:
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
+    build_cdriver: true
+    compile_env: JAVA_HOME=/opt/java/jdk8/
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --dbg=off
+      --opt=size
+      --enable-free-mon=off
+      --android-toolchain-path=$(dirname $(pwd))/android_toolchain
+      --variables-files=etc/scons/android_toolchain.vars
+      --use-system-mongo-c=on
+      LIBS=clang_rt.builtins-arm-android
+      LIBPATH="$(dirname $($(dirname $(pwd))/android_toolchain/bin/clang -print-file-name=libclang_rt.builtins-arm-android.a)) \$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+    libbson_cmake_flags: >-
+        -DANDROID_NATIVE_API_LEVEL=24
+        -DANDROID_ABI=armeabi-v7a
+        -DTHREADS_PTHREAD_ARG=2
+        -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
+        -DCMAKE_FIND_ROOT_PATH=$WORKDIR/android_toolchain
+        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
+        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
+        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
+    cdriver_cmake_flags: >-
+        -DANDROID_NATIVE_API_LEVEL=24
+        -DANDROID_ABI=armeabi-v7a
+        -DTHREADS_PTHREAD_ARG=2
+        -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
+        -DCMAKE_FIND_ROOT_PATH="$WORKDIR/android_toolchain;$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
+        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
+        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
+        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
+    test_flags: --excludeWithAnyTags=requires_mmapv1
+    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
+    disable_unit_tests: true
+    enable_embedded_tests: android_emulator
+    setup_android_toolchain: true
+    android_toolchain_system_image_arch: "armeabi-v7a"
+    android_toolchain_target_arch: "arm"
   tasks:
   - name: compile_mobile
 
@@ -9173,6 +9243,7 @@ buildvariants:
       --android-toolchain-path=$(dirname $(pwd))/android_toolchain
       --variables-files=etc/scons/android_toolchain.vars
       --use-system-mongo-c=on
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
     libbson_cmake_flags: >-
         -DANDROID_NATIVE_API_LEVEL=24
         -DANDROID_ABI=arm64-v8a
@@ -9222,6 +9293,7 @@ buildvariants:
       --android-toolchain-path=$(dirname $(pwd))/android_toolchain
       --variables-files=etc/scons/android_toolchain.vars
       --use-system-mongo-c=on
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
     libbson_cmake_flags: >-
         -DANDROID_NATIVE_API_LEVEL=24
         -DANDROID_ABI=x86_64
@@ -9347,6 +9419,7 @@ buildvariants:
   - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -9375,6 +9448,7 @@ buildvariants:
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
   - name: aggregation_fuzzer
   - name: jstestfuzz
@@ -9470,7 +9544,12 @@ buildvariants:
   - name: replica_sets_initsync_static_jscore_passthrough
     distros:
     - rhel62-large
+  - name: replica_sets_multi_stmt_txn_jscore_passthrough
+    distros:
+    - rhel62-large
   - name: replica_sets_kill_primary_jscore_passthrough
+    distros:
+    - rhel62-large
   - name: replica_sets_terminate_primary_jscore_passthrough
     distros:
     - rhel62-large
@@ -9887,6 +9966,7 @@ buildvariants:
   - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -9914,6 +9994,7 @@ buildvariants:
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion
@@ -9932,6 +10013,7 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
+  - name: replica_sets_multi_stmt_txn_jscore_passthrough
   - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
@@ -10003,6 +10085,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10097,6 +10180,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10113,6 +10197,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -10183,6 +10268,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10201,6 +10287,9 @@ buildvariants:
     distros:
     - rhel70
   - name: concurrency_replication
+    distros:
+    - rhel70
+  - name: concurrency_replication_causal_consistency
     distros:
     - rhel70
   - name: concurrency_sharded_replication
@@ -10275,6 +10364,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -10295,6 +10385,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10382,6 +10473,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -10402,6 +10494,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10486,6 +10579,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -10507,6 +10601,7 @@ buildvariants:
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: mongosTest
   - name: noPassthroughWithMongod
   - name: noPassthrough
@@ -10583,6 +10678,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10661,6 +10757,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10764,6 +10861,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10827,6 +10925,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -10847,6 +10946,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10940,6 +11040,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10956,6 +11057,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11016,6 +11118,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -11033,7 +11136,6 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: push
-
 
 - name: debian81
   display_name: SSL Debian 8.1
@@ -11084,6 +11186,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -11100,6 +11203,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11162,6 +11266,7 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -11232,6 +11337,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -11248,6 +11354,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11326,6 +11433,7 @@ buildvariants:
     distros:
     - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -11348,6 +11456,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: aggregation_fuzzer
@@ -11651,6 +11760,7 @@ buildvariants:
     distros:
     - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11735,6 +11845,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11753,6 +11864,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -11818,6 +11930,9 @@ buildvariants:
   - name: concurrency_replication
     distros:
     - rhel72-zseries-build
+  - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel72-zseries-build
   - name: concurrency_sharded_replication
     distros:
     - rhel72-zseries-build
@@ -11842,6 +11957,7 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -11961,6 +12077,7 @@ buildvariants:
   - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -11988,6 +12105,7 @@ buildvariants:
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
   - name: mongosTest
   - name: multiversion_auth
@@ -12007,6 +12125,7 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
+  - name: replica_sets_multi_stmt_txn_jscore_passthrough
   - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
@@ -12138,6 +12257,7 @@ buildvariants:
   - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -12166,6 +12286,7 @@ buildvariants:
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
   - name: mongosTest
   - name: multiversion_auth
@@ -12185,6 +12306,7 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
+  - name: replica_sets_multi_stmt_txn_jscore_passthrough
   - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
@@ -12241,6 +12363,8 @@ buildvariants:
   - name: compile_all_run_unittests_TG
   - name: dbtest
   - name: jsCore
+  - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: watchdog_wiredtiger
 
 - name: ubuntu1604-debug-aubsan-async
@@ -12283,6 +12407,7 @@ buildvariants:
   - name: sharded_causally_consistent_jscore_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -12306,6 +12431,7 @@ buildvariants:
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
   - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion
@@ -12376,7 +12502,9 @@ buildvariants:
   batchtime: 1440 # 1 day
   stepback: false
   tasks:
-  - name: update_test_lifecycle
+  # TODO SERVER-35165: Re-enable the update_test_lifecycle task once Evergreen has 28 days worth of
+  # task history.
+  # - name: update_test_lifecycle
   - name: fetch_test_lifecycle
     distros:
     - rhel62-small
@@ -12419,6 +12547,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -12539,6 +12668,9 @@ buildvariants:
   - name: concurrency_replication
     distros:
     - windows-64-vs2015-large
+  - name: concurrency_replication_causal_consistency
+    distros:
+    - windows-64-vs2015-large
   - name: concurrency_sharded_replication
     distros:
     - windows-64-vs2015-large
@@ -12650,6 +12782,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -12737,6 +12870,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous

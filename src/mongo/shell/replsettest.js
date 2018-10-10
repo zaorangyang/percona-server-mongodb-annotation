@@ -146,6 +146,17 @@ var ReplSetTest = function(opts) {
         return self._master || false;
     }
 
+    /**
+     * Attempt to connect to all nodes and returns a list of slaves in which the connection was
+     * successful.
+     */
+    function _determineLiveSlaves() {
+        _callIsMaster();
+        return self._slaves.filter(function(n) {
+            return self._liveNodes.indexOf(n) !== -1;
+        });
+    }
+
     function asCluster(conn, fn, keyFileParam = self.keyFile) {
         if (keyFileParam) {
             return authutil.asCluster(conn, keyFileParam, fn);
@@ -1257,6 +1268,7 @@ var ReplSetTest = function(opts) {
     // on all secondary nodes or just 'slaves', if specified.
     this.awaitReplication = function(timeout, secondaryOpTimeType, slaves) {
         timeout = timeout || self.kDefaultTimeoutMS;
+
         secondaryOpTimeType = secondaryOpTimeType || ReplSetTest.OpTimeType.LAST_APPLIED;
 
         var masterLatestOpTime;
@@ -1383,37 +1395,147 @@ var ReplSetTest = function(opts) {
         }, "awaiting replication", timeout);
     };
 
+    this.getHashesUsingSessions = function(sessions, dbName, {
+        filterCapped: filterCapped = true,
+        filterMapReduce: filterMapReduce = true,
+    } = {}) {
+        return sessions.map(session => {
+            const db = session.getDatabase(dbName);
+            const res = assert.commandWorked(db.runCommand({dbHash: 1}));
+
+            // The "capped" field in the dbHash command response is new as of MongoDB 4.0.
+            const cappedCollections = new Set(filterCapped ? res.capped : []);
+
+            for (let collName of Object.keys(res.collections)) {
+                // Capped collections are not necessarily truncated at the same points across
+                // replica set members and may therefore not have the same md5sum. We remove them
+                // from the dbHash command response to avoid an already known case of a mismatch.
+                // See SERVER-16049 for more details.
+                //
+                // If a map-reduce operation is interrupted by the server stepping down, then an
+                // unreplicated "tmp.mr." collection may be left behind. We remove it from the
+                // dbHash command response to avoid an already known case of a mismatch.
+                // TODO SERVER-27147: Stop filtering out "tmp.mr." collections.
+                if (cappedCollections.has(collName) ||
+                    (filterMapReduce && collName.startsWith("tmp.mr."))) {
+                    delete res.collections[collName];
+                    // The "uuids" field in the dbHash command response is new as of MongoDB 4.0.
+                    if (res.hasOwnProperty("uuids")) {
+                        delete res.uuids[collName];
+                    }
+                }
+            }
+
+            return res;
+        });
+    };
+
+    this.getCollectionDiffUsingSessions = function(
+        primarySession, secondarySession, dbName, collNameOrUUID) {
+        function PeekableCursor(cursor) {
+            let _stashedDoc;
+
+            this.hasNext = function hasNext() {
+                return cursor.hasNext();
+            };
+
+            this.peekNext = function peekNext() {
+                if (_stashedDoc === undefined) {
+                    _stashedDoc = cursor.next();
+                }
+                return _stashedDoc;
+            };
+
+            this.next = function next() {
+                const result = (_stashedDoc === undefined) ? cursor.next() : _stashedDoc;
+                _stashedDoc = undefined;
+                return result;
+            };
+        }
+
+        const docsWithDifferentContents = [];
+        const docsMissingOnPrimary = [];
+        const docsMissingOnSecondary = [];
+
+        const primaryDB = primarySession.getDatabase(dbName);
+        const secondaryDB = secondarySession.getDatabase(dbName);
+
+        const primaryCursor = new PeekableCursor(new DBCommandCursor(
+            primaryDB, primaryDB.runCommand({find: collNameOrUUID, sort: {_id: 1}})));
+
+        const secondaryCursor = new PeekableCursor(new DBCommandCursor(
+            secondaryDB, secondaryDB.runCommand({find: collNameOrUUID, sort: {_id: 1}})));
+
+        while (primaryCursor.hasNext() && secondaryCursor.hasNext()) {
+            const primaryDoc = primaryCursor.peekNext();
+            const secondaryDoc = secondaryCursor.peekNext();
+
+            if (bsonBinaryEqual(primaryDoc, secondaryDoc)) {
+                // The same document was found on the primary and secondary so we just move on to
+                // the next document for both cursors.
+                primaryCursor.next();
+                secondaryCursor.next();
+                continue;
+            }
+
+            const ordering = bsonWoCompare({_: primaryDoc._id}, {_: secondaryDoc._id});
+            if (ordering === 0) {
+                // The documents have the same _id but have different contents.
+                docsWithDifferentContents.push({primary: primaryDoc, secondary: secondaryDoc});
+                primaryCursor.next();
+                secondaryCursor.next();
+            } else if (ordering < 0) {
+                // The primary's next document has a smaller _id than the secondary's next document.
+                // Since we are iterating the documents in ascending order by their _id, we'll never
+                // see a document with 'primaryDoc._id' on the secondary.
+                docsMissingOnSecondary.push(primaryDoc);
+                primaryCursor.next();
+            } else if (ordering > 0) {
+                // The primary's next document has a larger _id than the secondary's next document.
+                // Since we are iterating the documents in ascending order by their _id, we'll never
+                // see a document with 'secondaryDoc._id' on the primary.
+                docsMissingOnPrimary.push(secondaryDoc);
+                secondaryCursor.next();
+            }
+        }
+
+        while (primaryCursor.hasNext()) {
+            // We've exhausted the secondary's cursor already, so everything remaining from the
+            // primary's cursor must be missing from secondary.
+            docsMissingOnSecondary.push(primaryCursor.next());
+        }
+
+        while (secondaryCursor.hasNext()) {
+            // We've exhausted the primary's cursor already, so everything remaining from the
+            // secondary's cursor must be missing from primary.
+            docsMissingOnPrimary.push(secondaryCursor.next());
+        }
+
+        return {docsWithDifferentContents, docsMissingOnPrimary, docsMissingOnSecondary};
+    };
+
     // Gets the dbhash for the current primary and for all secondaries (or the members of 'slaves',
     // if specified).
-    this.getHashes = function(db, slaves) {
-        assert.neq(db, 'local', 'Cannot run getHashes() on the "local" database');
+    this.getHashes = function(dbName, slaves) {
+        assert.neq(dbName, 'local', 'Cannot run getHashes() on the "local" database');
 
         // getPrimary() repopulates 'self._slaves'.
         this.getPrimary();
-        var res = {};
         slaves = slaves || this._slaves;
 
-        // If MapReduce is interrupted by a stepdown, it could still have 'tmp.mr' collections that
-        // it will not be able to delete. Excluding them from dbhash will prevent a mismatch.
-        // TODO SERVER-27147: no need to exclude 'tmp.mr' collections
-        var collections = this._master.getDB(db).getCollectionNames();
-        var colls_excluding_tmp_mr = collections.filter(coll => !coll.startsWith("tmp.mr."));
-        res.master =
-            this._master.getDB(db).runCommand({dbhash: 1, collections: colls_excluding_tmp_mr});
-        res.slaves = [];
-        slaves.forEach(function(node) {
-            var isArbiter = node.getDB('admin').isMaster('admin').arbiterOnly;
-            if (!isArbiter) {
-                collections = node.getDB(db).getCollectionNames();
-                colls_excluding_tmp_mr = collections.filter(coll => {
-                    return !coll.startsWith("tmp.mr.");
-                });
-                var slaveRes =
-                    node.getDB(db).runCommand({dbhash: 1, collections: colls_excluding_tmp_mr});
-                res.slaves.push(slaveRes);
-            }
-        });
-        return res;
+        const sessions = [
+            this._master,
+            ...slaves.filter(conn => {
+                return !conn.adminCommand({isMaster: 1}).arbiterOnly;
+            })
+        ].map(conn => conn.getDB('test').getSession());
+
+        // getHashes() is sometimes called for versions of MongoDB earlier than 4.0 so we cannot use
+        // the dbHash command directly to filter out capped collections. checkReplicatedDataHashes()
+        // uses the listCollections command after awaiting replication to determine if a collection
+        // is capped.
+        const hashes = this.getHashesUsingSessions(sessions, dbName, {filterCapped: false});
+        return {master: hashes[0], slaves: hashes.slice(1)};
     };
 
     this.dumpOplog = function(conn, query = {}, limit = 10) {
@@ -1578,60 +1700,28 @@ var ReplSetTest = function(opts) {
                 return;
             }
 
-            var primaryColl = primary.getDB(dbName).getCollection(collName);
-            var secondaryColl = secondary.getDB(dbName).getCollection(collName);
+            const primarySession = primary.getDB('test').getSession();
+            const secondarySession = secondary.getDB('test').getSession();
+            const diff = self.getCollectionDiffUsingSessions(
+                primarySession, secondarySession, dbName, collName);
 
-            var primaryDocs = primaryColl.find().sort({_id: 1}).toArray();
-            var secondaryDocs = secondaryColl.find().sort({_id: 1}).toArray();
-
-            var primaryIndex = primaryDocs.length - 1;
-            var secondaryIndex = secondaryDocs.length - 1;
-
-            var missingOnPrimary = [];
-            var missingOnSecondary = [];
-
-            while (primaryIndex >= 0 || secondaryIndex >= 0) {
-                var primaryDoc = primaryDocs[primaryIndex];
-                var secondaryDoc = secondaryDocs[secondaryIndex];
-
-                if (primaryIndex < 0) {
-                    missingOnPrimary.push(tojsononeline(secondaryDoc));
-                    secondaryIndex--;
-                } else if (secondaryIndex < 0) {
-                    missingOnSecondary.push(tojsononeline(primaryDoc));
-                    primaryIndex--;
-                } else {
-                    if (!bsonBinaryEqual(primaryDoc, secondaryDoc)) {
-                        print('Mismatching documents:');
-                        print('    primary: ' + tojsononeline(primaryDoc));
-                        print('    secondary: ' + tojsononeline(secondaryDoc));
-                        var ordering =
-                            bsonWoCompare({wrapper: primaryDoc._id}, {wrapper: secondaryDoc._id});
-                        if (ordering === 0) {
-                            primaryIndex--;
-                            secondaryIndex--;
-                        } else if (ordering < 0) {
-                            missingOnPrimary.push(tojsononeline(secondaryDoc));
-                            secondaryIndex--;
-                        } else if (ordering > 0) {
-                            missingOnSecondary.push(tojsononeline(primaryDoc));
-                            primaryIndex--;
-                        }
-                    } else {
-                        // Latest document matched.
-                        primaryIndex--;
-                        secondaryIndex--;
-                    }
-                }
+            for (let {
+                     primary: primaryDoc, secondary: secondaryDoc,
+                 } of diff.docsWithDifferentContents) {
+                print(`Mismatching documents between the primary ${primary.host}` +
+                      ` and the secondary ${secondary.host}:`);
+                print('    primary:   ' + tojsononeline(primaryDoc));
+                print('    secondary: ' + tojsononeline(secondaryDoc));
             }
 
-            if (missingOnPrimary.length) {
-                print('The following documents are missing on the primary:');
-                print(missingOnPrimary.join('\n'));
+            if (diff.docsMissingOnPrimary.length > 0) {
+                print(`The following documents are missing on the primary ${primary.host}:`);
+                print(diff.docsMissingOnPrimary.map(doc => tojsononeline(doc)).join('\n'));
             }
-            if (missingOnSecondary.length) {
-                print('The following documents are missing on the secondary:');
-                print(missingOnSecondary.join('\n'));
+
+            if (diff.docsMissingOnSecondary.length > 0) {
+                print(`The following documents are missing on the secondary ${secondary.host}:`);
+                print(diff.docsMissingOnSecondary.map(doc => tojsononeline(doc)).join('\n'));
             }
         }
 
@@ -1796,10 +1886,7 @@ var ReplSetTest = function(opts) {
             assert(success, 'dbhash mismatch between primary and secondary');
         }
 
-        _callIsMaster();
-        var liveSlaves = self._slaves.filter(function(n) {
-            return self._liveNodes.indexOf(n) !== -1;
-        });
+        var liveSlaves = _determineLiveSlaves();
         this.checkReplicaSet(checkDBHashesForReplSet,
                              liveSlaves,
                              this,
@@ -1810,7 +1897,8 @@ var ReplSetTest = function(opts) {
     };
 
     this.checkOplogs = function(msgPrefix) {
-        this.checkReplicaSet(checkOplogs, null, this, msgPrefix);
+        var liveSlaves = _determineLiveSlaves();
+        this.checkReplicaSet(checkOplogs, liveSlaves, this, msgPrefix);
     };
 
     /**
@@ -1833,7 +1921,20 @@ var ReplSetTest = function(opts) {
             this.hasNext = function() {
                 if (!this.cursor)
                     throw new Error("OplogReader is not open!");
-                return this.cursor.hasNext();
+                try {
+                    return this.cursor.hasNext();
+                } catch (err) {
+                    print("Error: hasNext threw '" + err.message + "' on " + this.mongo.host);
+                    // Occasionally, the capped collection will get truncated while we are iterating
+                    // over it. Since we are iterating over the collection in reverse, getting a
+                    // truncated item means we've reached the end of the list, so return false.
+                    if (err.code === ErrorCodes.CappedPositionLost) {
+                        this.cursor.close();
+                        return false;
+                    }
+
+                    throw err;
+                }
             };
 
             this.query = function(ts) {
@@ -1865,13 +1966,20 @@ var ReplSetTest = function(opts) {
             var rsSize = nodes.length;
             var firstReaderIndex;
             for (var i = 0; i < rsSize; i++) {
+                const node = nodes[i];
+
+                // Only look at nodes that are up.
+                if (rst.master !== node && !rst._liveNodes.includes(node)) {
+                    continue;
+                }
+
                 // Arbiters have no documents in the oplog.
-                const isArbiter = nodes[i].getDB('admin').isMaster('admin').arbiterOnly;
+                const isArbiter = node.getDB('admin').isMaster('admin').arbiterOnly;
                 if (isArbiter) {
                     continue;
                 }
 
-                readers[i] = new OplogReader(nodes[i]);
+                readers[i] = new OplogReader(node);
                 var currTS = readers[i].getFirstDoc().ts;
                 // Find the reader which has the smallestTS. This reader should have the most
                 // number of documents in the oplog.
@@ -2211,6 +2319,7 @@ var ReplSetTest = function(opts) {
             if (_callIsMaster() && this._liveNodes.length > 1) {  // skip for sets with 1 live node
                 // Auth only on live nodes because authutil.assertAuthenticate
                 // refuses to log in live connections if some secondaries are down.
+                asCluster(this._liveNodes, () => this.checkOplogs());
                 asCluster(this._liveNodes, () => this.checkReplicatedDataHashes());
             }
         }
