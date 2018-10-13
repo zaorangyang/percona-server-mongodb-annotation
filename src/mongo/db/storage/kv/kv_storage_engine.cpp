@@ -55,6 +55,7 @@ public:
 
     virtual void commit() {
         delete _entry;
+        _engine->keydbDropDatabase(_db);
     }
 
     virtual void rollback() {
@@ -73,6 +74,10 @@ Status KVStorageEngine::hotBackup(OperationContext* opCtx, const std::string& pa
 
 bool KVStorageEngine::isFcv36Supported() const {
     return _engine->isFcv36Supported();
+}
+
+void KVStorageEngine::keydbDropDatabase(const std::string& db) {
+    _engine->keydbDropDatabase(db);
 }
 
 KVStorageEngine::KVStorageEngine(

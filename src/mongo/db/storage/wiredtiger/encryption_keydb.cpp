@@ -255,6 +255,36 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
     return 0;
 }
 
+int EncryptionKeyDB::delete_key_by_id(const std::string&  keyid) {
+    LOG(4) << "delete_key_by_id for keyid: '" << keyid << "'";
+
+    int res;
+    // open cursor
+    WT_CURSOR *cursor;
+    {
+        stdx::lock_guard<stdx::mutex> lk(_lock_sess);
+        res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
+        if (res){
+            error() << "delete_key_by_id: error opening cursor: " << wiredtiger_strerror(res);
+            return res;
+        }
+    }
+
+    // create cursor delete guard
+    std::unique_ptr<WT_CURSOR, std::function<void(WT_CURSOR*)>> cursor_guard(cursor, [](WT_CURSOR* c)
+        {
+            c->close(c);
+        });
+
+    // delete key
+    cursor->set_key(cursor, keyid.c_str());
+    res = cursor->remove(cursor);
+    if (res) {
+        error() << "cursor->remove error " << res << " : " << wiredtiger_strerror(res);
+    }
+    return res;
+}
+
 int EncryptionKeyDB::store_gcm_iv_reserved() {
     uint8_t tmp[_gcm_iv_bytes];
     auto end = export_bits(_gcm_iv_reserved, tmp, 8, false);
