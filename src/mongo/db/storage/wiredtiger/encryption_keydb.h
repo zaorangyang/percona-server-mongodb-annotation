@@ -46,6 +46,9 @@ public:
     // return key from keyfile if len == 0
     int get_key_by_id(const char *keyid, size_t len, unsigned char *key);
 
+    // drop key for specific keyid (used in dropDatabase)
+    int delete_key_by_id(const std::string&  keyid);
+
     // get new counter value for IV in GCM mode
     int get_iv_gcm(uint8_t *buf, int len);
 

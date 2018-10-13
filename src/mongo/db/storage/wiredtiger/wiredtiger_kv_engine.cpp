@@ -1368,6 +1368,17 @@ Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, StringData ident) 
     return Status::OK();
 }
 
+void WiredTigerKVEngine::keydbDropDatabase(const std::string& db) {
+    if (_encryptionKeyDB) {
+        int res = _encryptionKeyDB->delete_key_by_id(db);
+        if (res) {
+            // we cannot throw exceptions here because we are inside WUOW::commit
+            // every other part of DB is already dropped so we just log error message
+            error() << "failed to delete encryption key for db: " << db;
+        }
+    }
+}
+
 std::list<WiredTigerCachedCursor> WiredTigerKVEngine::filterCursorsWithQueuedDrops(
     std::list<WiredTigerCachedCursor>* cache) {
     std::list<WiredTigerCachedCursor> toDrop;
