@@ -1,7 +1,7 @@
 /*======
 This file is part of Percona Server for MongoDB.
 
-Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
+Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
     Percona Server for MongoDB is free software: you can redistribute
     it and/or modify it under the terms of the GNU Affero General
@@ -20,15 +20,21 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-#include "mongo/db/backup/backupable.h"
-#include "mongo/db/storage/keydb_api.h"
-
 namespace percona {
 
 /**
- * Storage engine extension interface.
+ * The interface which provides the ability to execute KeyDB-related
+ * functions in an engine independent way
  */
-class EngineExtension : public Backupable, public KeyDBAPI {
+struct KeyDBAPI {
+    virtual ~KeyDBAPI() {}
+
+    /**
+     * Returns whether the engine supports feature compatibility version 3.6
+     */
+    virtual void keydbDropDatabase(const std::string& db) {
+        // do nothing for engines which do not support KeyDB
+    }
 };
 
 }  // end of percona namespace.

@@ -152,6 +152,8 @@ public:
                                     StringData ident,
                                     const IndexDescriptor* desc) override;
 
+    virtual void keydbDropDatabase(const std::string& db) override;
+
     virtual Status okToRename(OperationContext* opCtx,
                               StringData fromNS,
                               StringData toNS,

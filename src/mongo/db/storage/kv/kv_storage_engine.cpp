@@ -66,6 +66,7 @@ public:
 
     virtual void commit(boost::optional<Timestamp>) {
         delete _entry;
+        _engine->keydbDropDatabase(_db);
     }
 
     virtual void rollback() {
@@ -80,6 +81,10 @@ public:
 
 Status KVStorageEngine::hotBackup(OperationContext* opCtx, const std::string& path) {
     return _engine->hotBackup(opCtx, path);
+}
+
+void KVStorageEngine::keydbDropDatabase(const std::string& db) {
+    _engine->keydbDropDatabase(db);
 }
 
 KVStorageEngine::KVStorageEngine(
