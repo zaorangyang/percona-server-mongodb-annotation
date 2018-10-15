@@ -4338,6 +4338,22 @@ struct __wt_encryptor {
 	 * @snippet nop_encrypt.c WT_ENCRYPTOR terminate
 	 */
 	int (*terminate)(WT_ENCRYPTOR *encryptor, WT_SESSION *session);
+
+	/*!
+	 * If non-NULL, this callback is called when new session is created
+	 * on existing encryptor. It is used to allow encryptor to generate
+	 * or load new encryption key if the old key was dropped but keyid
+	 * is reused.
+	 * In current implementation it is not called for the very first session,
+	 * that is for the session for which customize and sizing are called.
+	 * This can be fixed if necessary.
+	 *
+	 * @param[in] encrypt_config the "encryption" portion of the
+	 *    configuration from the wiredtiger_open or WT_SESSION::create call
+	 * @returns zero for success, non-zero to indicate an error.
+	 */
+	int (*sessioncreate)(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
+	    WT_CONFIG_ARG *encrypt_config);
 };
 
 /*!
