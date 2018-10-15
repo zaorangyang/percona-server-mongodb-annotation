@@ -20,7 +20,7 @@ Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-#include <set>
+#include <map>
 #include <string>
 #include <boost/multiprecision/cpp_int.hpp>
 #include <wiredtiger.h>
@@ -44,7 +44,7 @@ public:
     // returns encryption key from keys DB
     // create key if it does not exists
     // return key from keyfile if len == 0
-    int get_key_by_id(const char *keyid, size_t len, unsigned char *key);
+    int get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe);
 
     // drop key for specific keyid (used in dropDatabase)
     int delete_key_by_id(const std::string&  keyid);
@@ -77,6 +77,10 @@ private:
     _gcm_iv_type _gcm_iv{0};
     _gcm_iv_type _gcm_iv_reserved{0};
     static constexpr int _gcm_iv_bytes = (std::numeric_limits<decltype(_gcm_iv)>::digits + 7) / 8;
+    // encryptors per db name
+    // get_key_by_id creates entry
+    // delete_key_by_it lets encryptor know that DB was deleted and deletes entry
+    std::map<std::string, void*> _encryptors;
 };
 
 }  // namespace mongo
