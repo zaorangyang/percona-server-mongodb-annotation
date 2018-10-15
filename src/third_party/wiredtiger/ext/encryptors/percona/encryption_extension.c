@@ -148,7 +148,7 @@ static int parse_customization_config(PERCONA_ENCRYPTOR *pe, WT_SESSION *session
     WT_CONFIG_ITEM k, v;
     while (parser->next(parser, &k, &v) == 0) {
         if (!strncmp("keyid", k.str, (int)k.len)) {
-            if (0 != get_key_by_id(v.str, v.len, pe->key)) {
+            if (0 != get_key_by_id(v.str, v.len, pe->key, pe)) {
                 ret = report_error(pe, session, EINVAL, "cannot get key by keyid");
                 break;
             }
@@ -465,6 +465,22 @@ static int percona_customize(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     return 0;
 }
 
+static int percona_sessioncreate(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
+    WT_CONFIG_ARG *encrypt_config)
+{
+    PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
+    DBG_MSG("entering sessioncreate");
+    DBG dump_config_arg(pe, session, encrypt_config);
+    // get/generate encryption key
+    // possible errors are reported from parse_customization_config
+    int ret = parse_customization_config(pe, session, encrypt_config);
+    // if everything is ok we don't need this callback until next DB drop
+    if (!ret) {
+        pe->encryptor.sessioncreate = NULL;
+    }
+    return ret;
+}
+
 static int percona_terminate(WT_ENCRYPTOR *encryptor, WT_SESSION *session)
 {
     PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
@@ -525,6 +541,7 @@ int percona_encryption_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *
 
     pe->encryptor.customize = percona_customize;
     pe->encryptor.terminate = percona_terminate;
+    pe->encryptor.sessioncreate = NULL;
 
     ret = init_from_config(pe, config);
     if (ret != 0)
@@ -545,3 +562,15 @@ failure:
     return ret;
 }
 
+// This is called when database is dropped.
+// It should configure encryptor in a way to request new encryption key
+// if new database with the same name will be created.
+// (If this happens before connection is closed wiredTiger uses
+// existing encryptor with old encryption key for specific keyid.
+// This function configures encryptor to give it a chance to get new
+// encryption key.)
+int percona_encryption_extension_drop_keyid(void *vp) {
+    PERCONA_ENCRYPTOR *pe = vp;
+    pe->encryptor.sessioncreate = percona_sessioncreate;
+    return 0;
+}
