@@ -7765,8 +7765,6 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
-    distros:
-    - linux-64-amzn-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8039,7 +8037,7 @@ buildvariants:
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
     distros:
-    - amazon2-build
+    - linux-64-amzn-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8216,6 +8214,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - amazon2-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8253,7 +8253,7 @@ buildvariants:
     exe: ".exe"
     content_type: application/zip
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    compile_flags: --dbg=on --opt=on --win-version-min=ws08r2 -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) MONGO_DISTMOD=2012plus
+    compile_flags: --dbg=on --opt=on --win-version-min=ws08r2 -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) MONGO_DISTMOD=2008plus
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
@@ -8802,11 +8802,11 @@ buildvariants:
     push_path: win32
     push_bucket: downloads.mongodb.org
     push_name: win32
-    push_arch: x86_64-2012plus
+    push_arch: x86_64-2008plus-ssl
     multiversion_platform: windows_x86_64-2008plus-ssl
     msi_target: msi
     content_type: application/zip
-    compile_flags: --release --ssl MONGO_DISTMOD=2012plus CPPPATH="c:/openssl/include" LIBPATH="c:/openssl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --release --ssl MONGO_DISTMOD=2008plus-ssl CPPPATH="c:/openssl/include" LIBPATH="c:/openssl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
@@ -8921,7 +8921,7 @@ buildvariants:
     platform_decompress: unzip
     exe: ".exe"
     content_type: application/zip
-    compile_flags: --dbg=on --opt=off --ssl MONGO_DISTMOD=2012plus CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
+    compile_flags: --dbg=on --opt=off --ssl MONGO_DISTMOD=2008plus CPPPATH="c:/openssl/include c:/sasl/include c:/snmp/include c:/curl/include" LIBPATH="c:/openssl/lib c:/sasl/lib c:/snmp/lib c:/curl/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --dynamic-windows --win-version-min=ws08r2
     # We invoke SCons using --jobs = (# of CPUs / 4) to avoid causing out of memory errors due to
     # spawning a large number of linker processes.
     num_scons_link_jobs_available: $(( $(grep -c ^processor /proc/cpuinfo) / 4 ))
@@ -8955,11 +8955,11 @@ buildvariants:
     test_flags: --excludeWithAnyTags=requires_mmapv1,requires_ssl_mongo_tools
     push_path: osx
     push_bucket: downloads.mongodb.org
-    push_name: macos
+    push_name: osx-ssl
     push_arch: x86_64
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
-    multiversion_platform: macos
+    multiversion_platform: osx-ssl
     num_jobs_available: 1
     gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     tooltags: "-tags 'ssl openssl_pre_1.0'"
@@ -9099,7 +9099,7 @@ buildvariants:
     test_flags: --excludeWithAnyTags=requires_mmapv1,requires_ssl_mongo_tools
     push_path: osx
     push_bucket: downloads.10gen.com
-    push_name: macos
+    push_name: osx
     push_arch: x86_64-enterprise
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
@@ -10228,13 +10228,14 @@ buildvariants:
   - name: write_concern_majority_passthrough
   - name: secondary_reads_passthrough
 
-- name: enterprise-rhel-70-64-bit
+- &enterprise-rhel-70-64-bit-template
+  name: enterprise-rhel-70-64-bit
   display_name: "* Enterprise RHEL 7.0"
   modules:
   - enterprise
   run_on:
   - rhel70-small
-  expansions:
+  expansions: &enterprise-rhel-70-64-bit-expansions-template
     test_flags: --excludeWithAnyTags=requires_mmapv1
     push_path: linux
     push_bucket: downloads.10gen.com
@@ -10290,6 +10291,23 @@ buildvariants:
     distros:
     - ubuntu1604-packer
   - name: push
+
+# This variant is to intentionally test uncommon features nightly
+- <<: *enterprise-rhel-70-64-bit-template
+  name: enterprise-rhel-70-64-bit-kitchen-sink
+  display_name: "~ Enterprise RHEL 7.0 (Dagger, gperftools)"
+  expansions:
+    <<: *enterprise-rhel-70-64-bit-expansions-template
+    compile_flags: --ssl --use-cpu-profiler MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    additional_targets: dagger
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel70
+  - name: compile_benchmarks
+    distros:
+    - rhel70
+  - name: jsCore
 
 - name: ubuntu1604-debug
   display_name: "* Ubuntu 16.04 DEBUG"
@@ -10919,7 +10937,7 @@ buildvariants:
 
 
 - name: enterprise-ubuntu1604-64
-  display_name: Enterprise Ubuntu 16.04 (+Dagger)
+  display_name: Enterprise Ubuntu 16.04 (GCC 5.4)
   modules:
   - enterprise
   run_on:
@@ -10943,7 +10961,6 @@ buildvariants:
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
-    additional_targets: dagger
   display_tasks:
   - *unittests
   tasks:
@@ -11146,8 +11163,6 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
-    distros:
-    - suse12-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11281,7 +11296,7 @@ buildvariants:
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
     distros:
-    - debian81-build
+    - suse12-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11429,7 +11444,7 @@ buildvariants:
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
     distros:
-    - debian92-build
+    - debian81-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11581,6 +11596,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - debian92-build
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11739,15 +11756,12 @@ buildvariants:
   - name: write_concern_majority_passthrough
   - name: secondary_reads_passthrough
 
-- name: enterprise-rhel-62-64-bit-mobile
-  display_name: Enterprise RHEL 6.2 (mobile)
-  modules:
-  - enterprise
+- name: rhel-62-64-bit-mobile
+  display_name: RHEL 6.2 (mobile)
   run_on:
   - rhel62-small
   batchtime: 1440 # 1 day
-  expansions: &enterprise-rhel-62-64-bit-mobile-expansions
-    rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
+  expansions: &rhel-62-64-bit-mobile-expansions
     # Transactions are only supported on replica sets, and replication is not supported by the
     # mobile storage engine.
     test_flags: >-
@@ -11757,15 +11771,12 @@ buildvariants:
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --mobile-se=on
-      --ssl
-      --use-basis-tech-rosette-linguistics-platform=on
       --variables-files=etc/scons/mongodbtoolchain_gcc.vars
       CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include"
       MONGO_DISTMOD=rhel62
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
     additional_targets: mongoed
   display_tasks:
@@ -11777,9 +11788,7 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough
-  - name: audit
   - name: auth
-  - name: auth_audit
   - name: dbtest
   # TODO SERVER-32993: Re-enable the concurrency suite on the mobile storage engine builders.
   # - name: concurrency
@@ -11803,16 +11812,11 @@ buildvariants:
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
-  - name: rlp
-  - name: sasl
   - name: serial_run
   - name: session_jscore_passthrough
-  - name: snmp
 
 - name: ubuntu1604-arm64-mobile
   display_name: "Ubuntu 16.04 arm64 (mobile)"
-  modules:
-  - enterprise
   run_on:
   - ubuntu1604-arm64-large
   batchtime: 1440 # 1 day
@@ -11824,7 +11828,6 @@ buildvariants:
     compile_flags: >-
         -j$(grep -c ^processor /proc/cpuinfo)
         --mobile-se=on
-        --ssl
         --release
         --variables-files=etc/scons/mongodbtoolchain_gcc.vars
         CCFLAGS="-march=armv8-a+crc -mtune=generic"
@@ -11832,7 +11835,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     max_jobs: 8 # Avoid starting too many mongod's on ARM test servers
     gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto libsasl2)" -tags 'sasl ssl'
+    tooltags: -gccgoflags "$(pkg-config --libs)"
     build_mongoreplay: true
     additional_targets: mongoed
   display_tasks:
@@ -11842,9 +11845,7 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough
-  - name: audit
   - name: auth
-  - name: auth_audit
   - name: dbtest
   # TODO SERVER-32993: Re-enable the concurrency suite on the mobile storage engine builders.
   # - name: concurrency
@@ -11866,23 +11867,20 @@ buildvariants:
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
-  - name: sasl
   - name: serial_run
   - name: session_jscore_passthrough
 
-- name: enterprise-rhel-62-64-bit-required-mobile
-  display_name: "! Enterprise RHEL 6.2 (mobile)"
-  modules:
-  - enterprise
+- name: rhel-62-64-bit-required-mobile
+  display_name: "! RHEL 6.2 (mobile)"
   run_on:
   - rhel62-small
   expansions:
-    <<: *enterprise-rhel-62-64-bit-mobile-expansions
-    burn_in_tests_build_variant: enterprise-rhel-62-64-bit-mobile
+    <<: *rhel-62-64-bit-mobile-expansions
+    burn_in_tests_build_variant: rhel-62-64-bit-mobile
   tasks:
   # This build variant exists specifically to test that newly added or modified JavaScript tests are
   # correctly tagged with "requires_replication" and "requires_sharding" prior to the changes being
-  # pushed. It uses the task list from the enterprise-rhel-62-64-bit-mobile build variant to
+  # pushed. It uses the task list from the rhel-62-64-bit-mobile build variant to
   # determine the resmoke.py YAML suite configurations to run the tests under. Do not add more tasks
   # to this list.
   - name: compile_TG
@@ -11893,10 +11891,8 @@ buildvariants:
   - name: burn_in_tests
   - name: jsCore_mobile
 
-- name: enterprise-osx-1010-mobile
-  display_name: Enterprise macOS 10.10 (mobile)
-  modules:
-  - enterprise
+- name: osx-1010-mobile
+  display_name: macOS 10.10 (mobile)
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -11904,12 +11900,12 @@ buildvariants:
     push_path: osx
     push_bucket: downloads.10gen.com
     push_name: osx
-    push_arch: x86_64-enterprise
+    push_arch: x86_64
     # Transactions are only supported on replica sets, and replication is not supported by the
     # mobile storage engine.
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_ssl_mongo_tools
+      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions
       --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993,SERVER-32997
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: >-
@@ -11917,13 +11913,11 @@ buildvariants:
       --libc++
       --mobile-se=on
       --release
-      --ssl
       CCFLAGS="-mmacosx-version-min=10.10"
       CPPPATH=/opt/mongodbtoolchain/v2/include
       LINKFLAGS="-mmacosx-version-min=10.10"
     num_jobs_available: 1
     gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
-    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
     build_mongoreplay: true
     additional_targets: mongoed
   display_tasks:
@@ -11933,9 +11927,7 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough
-  - name: audit
   - name: auth
-  - name: auth_audit
   - name: dbtest
   # TODO SERVER-32993: Re-enable the concurrency suite on the mobile storage engine builders.
   # - name: concurrency
@@ -11957,7 +11949,6 @@ buildvariants:
   - name: noPassthroughWithMongod
   - name: parallel
   - name: parallel_compatibility
-  - name: sasl
   - name: serial_run
   - name: session_jscore_passthrough
 
@@ -12488,8 +12479,6 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
-    distros:
-    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -12640,8 +12629,6 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
-    distros:
-    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -12782,6 +12769,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -13105,6 +13094,8 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
