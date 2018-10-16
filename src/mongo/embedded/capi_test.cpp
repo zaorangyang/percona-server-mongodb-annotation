@@ -522,6 +522,8 @@ TEST_F(MongodbCAPITest, RunListCommands) {
     auto client = createClient();
 
     std::vector<std::string> whitelist = {"_hashBSONElement",
+                                          "auditGetOptions",
+                                          "logApplicationMessage",
                                           "aggregate",
                                           "buildInfo",
                                           "collMod",
