@@ -293,7 +293,7 @@ functions:
         script: |
           set -o errexit
           set -o verbose
-          TAG="3.4.14-Baseline"
+          TAG="3.6.5-Baseline"
           OVERRIDEFILE="../src/dsi/dsi/analysis/${branch_name}/system_perf_override.json"
           python -u ../src/dsi/dsi/analysis/post_run_check.py ${script_flags} --reports-analysis reports --perf-file perf.json --rev ${revision} --refTag $TAG --overrideFile $OVERRIDEFILE --project_id sys-perf --variant ${build_variant} --task ${task_name}
 
@@ -643,7 +643,6 @@ buildvariants:
       - "rhel70"
   tasks:
     - name: compile
-    - name: compile_wtdevelop
 
 
 #######################################
@@ -974,82 +973,3 @@ buildvariants:
         variant: compile-rhel70
   tasks:
     - name: initialsync
-
-#######################################
-#  WT Develop Linux Buildvariants     #
-#######################################
-- name: wtdevelop-1-node-replSet
-  display_name: WT Develop 1-Node ReplSet
-  batchtime: 1440 # 24 hours
-  modules: *modules
-  expansions:
-    setup: single-replica
-    cluster: single
-    platform: linux
-    project_dir: *project_dir
-    wtdevelop: -wtdevelop
-    authentication: enabled
-    storageEngine: wiredTiger
-  run_on:
-      - "rhel70-perf-single"
-  depends_on:
-      - name: compile_wtdevelop
-        variant: compile-rhel70
-  tasks: *1nodetasks
-
-- name: wtdevelop-standalone
-  display_name: WT Develop Standalone
-  batchtime: 1440 # 24 hours
-  modules: *modules
-  expansions:
-    setup: standalone
-    cluster: single
-    platform: linux
-    project_dir: *project_dir
-    wtdevelop: -wtdevelop
-    authentication: enabled
-    storageEngine: wiredTiger
-  run_on:
-      - "rhel70-perf-single"
-  depends_on:
-      - name: compile_wtdevelop
-        variant: compile-rhel70
-  tasks: *standalonetasks
-
-- name: wtdevelop-3-node-replSet
-  display_name: WT Develop 3-Node ReplSet
-  batchtime: 1440  # 24 hours
-  modules: *modules
-  expansions:
-    setup: replica
-    cluster: replica
-    platform: linux
-    project_dir: *project_dir
-    wtdevelop: -wtdevelop
-    authentication: enabled
-    storageEngine: wiredTiger
-  run_on:
-      - "rhel70-perf-replset"
-  depends_on:
-      - name: compile_wtdevelop
-        variant: compile-rhel70
-  tasks: *3nodetasks
-
-- name: wtdevelop-shard-lite
-  display_name: WT Develop Shard Lite Cluster
-  batchtime: 1440  # 24 hours
-  modules: *modules
-  expansions:
-    setup: shard-lite
-    cluster: shard-lite
-    platform: linux
-    project_dir: *project_dir
-    wtdevelop: -wtdevelop
-    authentication: enabled
-    storageEngine: wiredTiger
-  run_on:
-      - "rhel70-perf-shard-lite"
-  depends_on:
-      - name: compile_wtdevelop
-        variant: compile-rhel70
-  tasks: *shardlitetasks

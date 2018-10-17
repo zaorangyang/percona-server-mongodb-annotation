@@ -376,8 +376,13 @@ LogicalTime getClientOperationTime(OperationContext* opCtx) {
  * The latest in-memory clusterTime is returned if the start operationTime is uninitialized.
  */
 LogicalTime computeOperationTime(OperationContext* opCtx, LogicalTime startOperationTime) {
+    auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
+    const bool isReplSet =
+        replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+    invariant(isReplSet);
+
     if (startOperationTime == LogicalTime::kUninitialized) {
-        return LogicalClock::get(opCtx)->getClusterTime();
+        return LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
     }
 
     auto operationTime = getClientOperationTime(opCtx);
@@ -386,7 +391,6 @@ LogicalTime computeOperationTime(OperationContext* opCtx, LogicalTime startOpera
     // If the last operationTime has not changed, consider this command a read, and, for replica set
     // members, construct the operationTime with the proper optime for its read concern level.
     if (operationTime == startOperationTime) {
-        auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
 
         // Note: ReadConcernArgs::getLevel returns kLocal if none was set.
@@ -423,7 +427,7 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
         auto signedTime = SignedLogicalTime(
             LogicalClock::get(opCtx)->getClusterTime(), TimeProofService::TimeProof(), 0);
 
-        invariant(signedTime.getTime() >= operationTime);
+        // TODO SERVER-35663: invariant that signedTime.getTime() >= operationTime.
         rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
         operationTime.appendAsOperationTime(commandBodyFieldsBob);
 
@@ -445,7 +449,7 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
         return;
     }
 
-    invariant(signedTime.getTime() >= operationTime);
+    // TODO SERVER-35663: invariant that signedTime.getTime() >= operationTime.
     rpc::LogicalTimeMetadata(signedTime).writeToMetadata(metadataBob);
     operationTime.appendAsOperationTime(commandBodyFieldsBob);
 }
@@ -638,7 +642,8 @@ void execCommandDatabase(OperationContext* opCtx,
             request.body,
             command->requiresAuth(),
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet,
-            opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking());
+            opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking(),
+            opCtx->getServiceContext()->getStorageEngine()->supportsRecoverToStableTimestamp());
 
         evaluateFailCommandFailPoint(opCtx, command->getName());
 

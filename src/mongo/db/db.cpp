@@ -228,7 +228,11 @@ void logStartup(OperationContext* opCtx) {
     if (!collection) {
         BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
         repl::UnreplicatedWritesBlock uwb(opCtx);
-        uassertStatusOK(Database::userCreateNS(opCtx, db, startupLogCollectionName.ns(), options));
+        CollectionOptions collectionOptions;
+        uassertStatusOK(
+            collectionOptions.parse(options, CollectionOptions::ParseKind::parseForCommand));
+        uassertStatusOK(
+            Database::userCreateNS(opCtx, db, startupLogCollectionName.ns(), collectionOptions));
         collection = db->getCollection(opCtx, startupLogCollectionName);
     }
     invariant(collection);
@@ -334,7 +338,7 @@ ExitCode _initAndListen(int listenPort) {
         serviceContext->setTransportLayer(std::move(tl));
     }
 
-    initializeStorageEngine(serviceContext);
+    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
     if (EncryptionHooks::get(serviceContext)->restartRequired()) {

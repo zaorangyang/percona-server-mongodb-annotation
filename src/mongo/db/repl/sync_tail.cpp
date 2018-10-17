@@ -87,7 +87,7 @@ using std::endl;
 
 namespace repl {
 
-AtomicInt32 SyncTail::replBatchLimitOperations{50 * 1000};
+AtomicInt32 SyncTail::replBatchLimitOperations{5 * 1000};
 
 namespace {
 
@@ -1252,6 +1252,9 @@ Status multiSyncApply(OperationContext* opCtx,
     UnreplicatedWritesBlock uwb(opCtx);
     DisableDocumentValidation validationDisabler(opCtx);
     ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(opCtx->lockState());
+
+    // Explicitly start future read transactions without a timestamp.
+    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
 
     ApplierHelpers::stableSortByNamespace(ops);
 

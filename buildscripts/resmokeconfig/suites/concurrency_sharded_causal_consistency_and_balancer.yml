@@ -122,6 +122,11 @@ selector:
   # TODO Unblacklist (SERVER-35538).
   - jstests/concurrency/fsm_workloads/database_versioning.js
 
+  exclude_with_any_tags:
+  - uses_transactions
+  - assumes_balancer_off
+  - requires_replication
+
 executor:
   archive:
     hooks:
