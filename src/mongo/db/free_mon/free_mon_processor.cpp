@@ -65,6 +65,8 @@ constexpr Seconds kDefaultMetricsGatherInterval(1);
 constexpr auto kReportingIntervalMinutesMin = 1;
 constexpr auto kReportingIntervalMinutesMax = 60 * 60 * 24;
 
+constexpr auto kMetricsRequestArrayElement = "data"_sd;
+
 int64_t randomJitter(PseudoRandom& random, int64_t min, int64_t max) {
     dassert(max > min);
     return (std::abs(random.nextInt64()) % (max - min)) + min;
@@ -316,6 +318,9 @@ void FreeMonProcessor::writeState(Client* client) {
 void FreeMonProcessor::doServerRegister(
     Client* client, const FreeMonMessageWithPayload<FreeMonMessageType::RegisterServer>* msg) {
 
+    // Enqueue the first metrics gather first so we have something to send on intial registration
+    enqueue(FreeMonMessage::createNow(FreeMonMessageType::MetricsCollect));
+
     // If we are asked to register now, then kick off a registration request
     const auto regType = msg->getPayload().first;
     if (regType == RegistrationType::RegisterOnStart) {
@@ -348,9 +353,6 @@ void FreeMonProcessor::doServerRegister(
             }
         }
     }
-
-    // Enqueue the first metrics gather unless we are not going to register
-    enqueue(FreeMonMessage::createNow(FreeMonMessageType::MetricsCollect));
 }
 
 namespace {
@@ -411,6 +413,8 @@ void FreeMonProcessor::doCommandRegister(Client* client,
     }
 
     req.setVersion(kProtocolVersion);
+
+    req.setLocalTime(client->getServiceContext()->getPreciseClockSource()->now());
 
     if (!msg->getPayload().empty()) {
         // Cache the tags for subsequent retries
@@ -621,6 +625,7 @@ void FreeMonProcessor::doAsyncRegisterComplete(
 
     // Update in-memory state
     _registrationRetry->setMin(Seconds(resp.getReportingInterval()));
+    _metricsGatherInterval = Seconds(resp.getReportingInterval());
 
     {
         auto state = _state.synchronize();
@@ -649,9 +654,8 @@ void FreeMonProcessor::doAsyncRegisterComplete(
 
     log() << "Free Monitoring is Enabled. Frequency: " << resp.getReportingInterval() << " seconds";
 
-    // Enqueue next metrics upload
-    enqueue(FreeMonMessage::createWithDeadline(FreeMonMessageType::MetricsSend,
-                                               _registrationRetry->getNextDeadline(client)));
+    // Enqueue next metrics upload immediately to deliver a good experience
+    enqueue(FreeMonMessage::createNow(FreeMonMessageType::MetricsSend));
 }
 
 void FreeMonProcessor::doAsyncRegisterFail(
@@ -710,15 +714,20 @@ void FreeMonProcessor::doMetricsCollect(Client* client) {
 }
 
 std::string compressMetrics(MetricsBuffer& buffer) {
-    BSONArrayBuilder payload;
+    BSONObjBuilder builder;
 
-    for (const auto& obj : buffer) {
-        payload.append(obj);
+    {
+        BSONArrayBuilder arrayBuilder(builder.subarrayStart(kMetricsRequestArrayElement));
+
+        for (const auto& obj : buffer) {
+            arrayBuilder.append(obj);
+        }
     }
-    auto arr = payload.arr();
+
+    BSONObj obj = builder.done();
 
     std::string outBuffer;
-    snappy::Compress(arr.objdata(), arr.objsize(), &outBuffer);
+    snappy::Compress(obj.objdata(), obj.objsize(), &outBuffer);
 
     return outBuffer;
 }
@@ -736,6 +745,7 @@ void FreeMonProcessor::doMetricsSend(Client* client) {
     invariant(!_state->getRegistrationId().empty());
 
     req.setVersion(kProtocolVersion);
+    req.setLocalTime(client->getServiceContext()->getPreciseClockSource()->now());
     req.setEncoding(MetricsEncodingEnum::snappy);
 
     req.setId(_state->getRegistrationId());
@@ -784,6 +794,11 @@ void FreeMonProcessor::doAsyncMetricsComplete(
         auto opCtxUnique = client->makeOperationContext();
         FreeMonStorage::deleteState(opCtxUnique.get());
 
+        _state->setState(StorageStateEnum::pending);
+
+        // Clear out the in-memory state
+        _lastReadState = boost::none;
+
         return;
     }
 
@@ -816,12 +831,13 @@ void FreeMonProcessor::doAsyncMetricsComplete(
     writeState(client);
 
     // Reset retry counter
+    _metricsGatherInterval = Seconds(resp.getReportingInterval());
     _metricsRetry->setMin(Seconds(resp.getReportingInterval()));
     _metricsRetry->reset();
 
     // Enqueue next metrics upload
     enqueue(FreeMonMessage::createWithDeadline(FreeMonMessageType::MetricsSend,
-                                               _registrationRetry->getNextDeadline(client)));
+                                               _metricsRetry->getNextDeadline(client)));
 }
 
 void FreeMonProcessor::doAsyncMetricsFail(
@@ -899,7 +915,6 @@ void FreeMonProcessor::processInMemoryStateChange(const FreeMonStorageState& ori
     }
 }
 
-
 void FreeMonProcessor::doNotifyOnUpsert(
     Client* client, const FreeMonMessageWithPayload<FreeMonMessageType::NotifyOnUpsert>* msg) {
     try {
@@ -938,7 +953,10 @@ void FreeMonProcessor::doNotifyOnDelete(Client* client) {
     // the same and stop free monitoring. We continue collecting though.
 
     // So we mark the internal state as disabled which stop registration and metrics send
-    _state->setState(StorageStateEnum::disabled);
+    _state->setState(StorageStateEnum::pending);
+
+    // Clear out the in-memory state
+    _lastReadState = boost::none;
 }
 
 void FreeMonProcessor::doNotifyOnRollback(Client* client) {

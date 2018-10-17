@@ -65,8 +65,8 @@ namespace repl {
 
 namespace {
 
-MONGO_FP_DECLARE(blockHeartbeatStepdown);
-MONGO_FP_DECLARE(blockHeartbeatReconfigFinish);
+MONGO_FAIL_POINT_DEFINE(blockHeartbeatStepdown);
+MONGO_FAIL_POINT_DEFINE(blockHeartbeatReconfigFinish);
 
 }  // namespace
 
@@ -402,10 +402,6 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
     _externalState->killAllUserOperations(opCtx.get());
     globalExclusiveLock.waitForLockUntil(Date_t::max());
     invariant(globalExclusiveLock.isLocked());
-
-    // TODO SERVER-34395: Remove this method and kill cursors as part of killAllUserOperations call
-    // when the CursorManager no longer requires collection locks to kill cursors.
-    _externalState->killAllTransactionCursors(opCtx.get());
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 

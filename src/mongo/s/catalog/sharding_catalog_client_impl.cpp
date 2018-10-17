@@ -74,7 +74,7 @@
 
 namespace mongo {
 
-MONGO_FP_DECLARE(failApplyChunkOps);
+MONGO_FAIL_POINT_DEFINE(failApplyChunkOps);
 
 using repl::OpTime;
 using std::set;
@@ -148,20 +148,6 @@ Status ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
                                         upsert,
                                         ShardingCatalogClient::kMajorityWriteConcern);
     return status.getStatus().withContext(str::stream() << "Collection metadata write failed");
-}
-
-Status ShardingCatalogClientImpl::updateDatabase(OperationContext* opCtx,
-                                                 const std::string& dbName,
-                                                 const DatabaseType& db) {
-    fassert(28616, db.validate());
-
-    auto status = updateConfigDocument(opCtx,
-                                       DatabaseType::ConfigNS,
-                                       BSON(DatabaseType::name(dbName)),
-                                       db.toBSON(),
-                                       true,
-                                       ShardingCatalogClient::kMajorityWriteConcern);
-    return status.getStatus().withContext(str::stream() << "Database metadata write failed");
 }
 
 Status ShardingCatalogClientImpl::logAction(OperationContext* opCtx,

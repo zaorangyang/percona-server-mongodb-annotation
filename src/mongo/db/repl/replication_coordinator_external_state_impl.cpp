@@ -119,7 +119,7 @@ const char meCollectionName[] = "local.me";
 const auto meDatabaseName = localDbName;
 const char tsFieldName[] = "ts";
 
-MONGO_FP_DECLARE(dropPendingCollectionReaperHang);
+MONGO_FAIL_POINT_DEFINE(dropPendingCollectionReaperHang);
 
 // Set this to specify maximum number of times the oplog fetcher will consecutively restart the
 // oplog tailing query on non-cancellation errors.
@@ -613,7 +613,12 @@ StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
         }
 
         BSONObj oplogEntry;
-        if (!Helpers::getLast(opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry)) {
+
+        if (!writeConflictRetry(
+                opCtx, "Load last opTime", NamespaceString::kRsOplogNamespace.ns().c_str(), [&] {
+                    return Helpers::getLast(
+                        opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
+                })) {
             return StatusWith<OpTime>(ErrorCodes::NoMatchingDocument,
                                       str::stream() << "Did not find any entries in "
                                                     << NamespaceString::kRsOplogNamespace.ns());
@@ -661,14 +666,7 @@ void ReplicationCoordinatorExternalStateImpl::killAllUserOperations(OperationCon
     // Destroy all stashed transaction resources, in order to release locks.
     SessionKiller::Matcher matcherAllSessions(
         KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
-    bool killCursors = false;
-    killSessionsLocalKillTransactions(opCtx, matcherAllSessions, killCursors);
-}
-
-void ReplicationCoordinatorExternalStateImpl::killAllTransactionCursors(OperationContext* opCtx) {
-    SessionKiller::Matcher matcherAllSessions(
-        KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
-    killSessionsLocalKillTransactionCursors(opCtx, matcherAllSessions);
+    killSessionsLocalKillTransactions(opCtx, matcherAllSessions);
 }
 
 void ReplicationCoordinatorExternalStateImpl::shardingOnStepDownHook() {

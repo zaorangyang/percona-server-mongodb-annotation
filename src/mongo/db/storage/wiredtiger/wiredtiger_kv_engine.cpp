@@ -1225,7 +1225,7 @@ void WiredTigerKVEngine::setOldestTimestamp(Timestamp oldestTimestamp) {
 
 namespace {
 
-MONGO_FP_DECLARE(WTPreserveSnapshotHistoryIndefinitely);
+MONGO_FAIL_POINT_DEFINE(WTPreserveSnapshotHistoryIndefinitely);
 
 }  // namespace
 

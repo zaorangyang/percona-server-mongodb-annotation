@@ -214,6 +214,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/progress_meter',
+        'server_options',
     ],
 )
 
@@ -395,13 +396,24 @@ env.Clone().InjectModule("enterprise").Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/util/cmdline_utils/cmdline_utils',
         '$BUILD_DIR/mongo/util/fail_point',
-        '$BUILD_DIR/mongo/transport/message_compressor',
-        # The dependency on net/ssl_manager is a temporary crutch that should go away once the
-        # networking library has separate options
-        '$BUILD_DIR/mongo/util/net/ssl_manager',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         'server_options_core',
         'server_parameters',
+    ],
+)
+
+env.Library(
+    target="server_options_servers",
+    source=[
+        "server_options_server_helpers.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/transport/message_compressor',
+        '$BUILD_DIR/mongo/util/net/network',
+        # The dependency on net/ssl_manager is a temporary crutch that should go away once the
+        # networking library has separate options
+        '$BUILD_DIR/mongo/util/net/ssl_manager',
+        'server_options',
     ],
 )
 
@@ -411,7 +423,7 @@ env.CppUnitTest(
         'server_options_test.cpp',
     ],
     LIBDEPS=[
-        'server_options',
+        'server_options_servers',
     ],
 )
 
@@ -459,7 +471,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/mmap_v1/mmap_v1_options',
         'repl/repl_settings',
         'repl/replica_set_messages',
-        'server_options',
+        'server_options_servers',
         'storage/storage_options',
     ],
     LIBDEPS_PRIVATE=[
@@ -777,6 +789,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
+        '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
         '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
     ],
@@ -1711,7 +1724,7 @@ env.Library(
     LIBDEPS=[
         'repl/repl_coordinator_interface',
         'repl/replica_set_messages',
-        'server_options',
+        'server_options_servers',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/util/net/network',
     ],

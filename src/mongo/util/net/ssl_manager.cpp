@@ -46,15 +46,11 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_options.h"
-#include "mongo/util/net/ssl_types.h"
 #include "mongo/util/text.h"
 
 namespace mongo {
 
 namespace {
-
-const transport::Session::Decoration<SSLPeerInfo> peerInfoForSession =
-    transport::Session::declareDecoration<SSLPeerInfo>();
 
 /**
  * Configurable via --setParameter disableNonSSLConnectionLogging=true. If false (default)
@@ -71,17 +67,6 @@ ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>
                                      "opensslDiffieHellmanParameters",
                                      &sslGlobalParams.sslPEMTempDHParam);
 }  // namespace
-
-
-SSLPeerInfo& SSLPeerInfo::forSession(const transport::SessionHandle& session) {
-    return peerInfoForSession(session.get());
-}
-
-SSLParams sslGlobalParams;
-
-const SSLParams& getSSLGlobalParams() {
-    return sslGlobalParams;
-}
 
 class OpenSSLCipherConfigParameter
     : public ExportedServerParameter<std::string, ServerParameterType::kStartupOnly> {
@@ -111,7 +96,7 @@ public:
 #ifdef MONGO_CONFIG_SSL
 
 namespace {
-#if MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_OPENSSL
+#if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 // OpenSSL has a more complete library of OID to SN mappings.
 std::string x509OidToShortName(const std::string& name) {
     const auto nid = OBJ_txt2nid(name.c_str());

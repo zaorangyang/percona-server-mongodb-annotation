@@ -67,28 +67,29 @@
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 namespace repl {
 
 // Failpoint for initial sync
-MONGO_FP_DECLARE(failInitialSyncWithBadHost);
+MONGO_FAIL_POINT_DEFINE(failInitialSyncWithBadHost);
 
 // Failpoint which fails initial sync and leaves an oplog entry in the buffer.
-MONGO_FP_DECLARE(failInitSyncWithBufferedEntriesLeft);
+MONGO_FAIL_POINT_DEFINE(failInitSyncWithBufferedEntriesLeft);
 
 // Failpoint which causes the initial sync function to hang before copying databases.
-MONGO_FP_DECLARE(initialSyncHangBeforeCopyingDatabases);
+MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeCopyingDatabases);
 
 // Failpoint which causes the initial sync function to hang before finishing.
-MONGO_FP_DECLARE(initialSyncHangBeforeFinish);
+MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeFinish);
 
 // Failpoint which causes the initial sync function to hang before calling shouldRetry on a failed
 // operation.
-MONGO_FP_DECLARE(initialSyncHangBeforeGettingMissingDocument);
+MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeGettingMissingDocument);
 
 // Failpoint which stops the applier.
-MONGO_FP_DECLARE(rsSyncApplyStop);
+MONGO_FAIL_POINT_DEFINE(rsSyncApplyStop);
 
 namespace {
 using namespace executor;
@@ -584,7 +585,9 @@ Status InitialSyncer::_truncateOplogAndDropReplicatedDatabases() {
 
     // 1.) Truncate the oplog.
     LOG(2) << "Truncating the existing oplog: " << _opts.localOplogNS;
+    Timer timer;
     auto status = _storage->truncateCollection(opCtx.get(), _opts.localOplogNS);
+    log() << "Initial syncer oplog truncation finished in: " << timer.millis() << "ms";
     if (!status.isOK()) {
         // 1a.) Create the oplog.
         LOG(2) << "Creating the oplog: " << _opts.localOplogNS;

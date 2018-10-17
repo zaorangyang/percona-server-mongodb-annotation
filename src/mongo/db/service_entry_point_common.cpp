@@ -93,10 +93,10 @@
 
 namespace mongo {
 
-MONGO_FP_DECLARE(failCommand);
-MONGO_FP_DECLARE(rsStopGetMore);
-MONGO_FP_DECLARE(respondWithNotPrimaryInCommandDispatch);
-MONGO_FP_DECLARE(skipCheckingForNotMasterInCommandDispatch);
+MONGO_FAIL_POINT_DEFINE(failCommand);
+MONGO_FAIL_POINT_DEFINE(rsStopGetMore);
+MONGO_FAIL_POINT_DEFINE(respondWithNotPrimaryInCommandDispatch);
+MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
 
 namespace {
 using logger::LogComponent;
@@ -817,6 +817,7 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
+            auto session = OperationContextSession::get(opCtx);
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot is only valid in multi-statement transactions",
                     // With test commands enabled, a read command with readConcern snapshot is
@@ -824,7 +825,7 @@ void execCommandDatabase(OperationContext* opCtx,
                     (getTestCommandsEnabled() &&
                      invocation->definition()->getReadWriteType() ==
                          BasicCommand::ReadWriteType::kRead) ||
-                        (autocommitVal != boost::none && *autocommitVal == false));
+                        (session && session->inMultiDocumentTransaction()));
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot requires a session ID",
                     opCtx->getLogicalSessionId());

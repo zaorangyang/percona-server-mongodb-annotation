@@ -89,8 +89,8 @@
 namespace mongo {
 namespace repl {
 
-MONGO_FP_DECLARE(stepdownHangBeforePerformingPostMemberStateUpdateActions);
-MONGO_FP_DECLARE(transitionToPrimaryHangBeforeTakingGlobalExclusiveLock);
+MONGO_FAIL_POINT_DEFINE(stepdownHangBeforePerformingPostMemberStateUpdateActions);
+MONGO_FAIL_POINT_DEFINE(transitionToPrimaryHangBeforeTakingGlobalExclusiveLock);
 
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -1641,10 +1641,6 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
                 "Could not acquire the global shared lock within the amount of time "
                 "specified that we should step down for"};
     }
-
-    // TODO SERVER-34395: Remove this method and kill cursors as part of killAllUserOperations call
-    // when the CursorManager no longer requires collection locks to kill cursors.
-    _externalState->killAllTransactionCursors(opCtx);
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
@@ -3422,7 +3418,7 @@ size_t ReplicationCoordinatorImpl::getNumUncommittedSnapshots() {
     return _uncommittedSnapshotsSize.load();
 }
 
-MONGO_FP_DECLARE(disableSnapshotting);
+MONGO_FAIL_POINT_DEFINE(disableSnapshotting);
 
 bool ReplicationCoordinatorImpl::_updateCommittedSnapshot_inlock(
     const OpTime& newCommittedSnapshot) {
