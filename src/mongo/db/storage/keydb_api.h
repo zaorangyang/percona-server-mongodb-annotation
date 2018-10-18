@@ -20,16 +20,21 @@ Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-void store_pseudo_bytes(uint8_t *buf, int len);
-int get_iv_gcm(uint8_t *buf, int len);
-int get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe);
+namespace percona {
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/**
+ * The interface which provides the ability to execute KeyDB-related
+ * functions in an engine independent way
+ */
+struct KeyDBAPI {
+    virtual ~KeyDBAPI() {}
 
-int percona_encryption_extension_drop_keyid(void *vp);
+    /**
+     * Returns whether the engine supports feature compatibility version 3.6
+     */
+    virtual void keydbDropDatabase(const std::string& db) {
+        // do nothing for engines which do not support KeyDB
+    }
+};
 
-#ifdef __cplusplus
-}
-#endif
+}  // end of percona namespace.

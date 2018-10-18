@@ -21,6 +21,7 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 #pragma once
 
 #include "mongo/db/backup/backupable.h"
+#include "mongo/db/storage/keydb_api.h"
 #include "mongo/engine_features.h"
 
 namespace percona {
@@ -28,7 +29,7 @@ namespace percona {
 /**
  * Storage engine extension interface.
  */
-class EngineExtension : public Backupable, public EngineFeatures {
+class EngineExtension : public Backupable, public EngineFeatures, public KeyDBAPI {
 };
 
 }  // end of percona namespace.

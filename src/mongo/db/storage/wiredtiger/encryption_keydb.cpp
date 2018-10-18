@@ -188,7 +188,7 @@ void EncryptionKeyDB::init() {
     }
 }
 
-int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char *key) {
+int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe) {
     LOG(4) << "get_key_by_id for keyid: '" << std::string(keyid, len) << "'";
     // return key from keyfile if len == 0
     if (len == 0) {
@@ -228,6 +228,7 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
         invariant(v.size == _key_len);
         memcpy(key, v.data, _key_len);
         DEV dump_key(key, _key_len, "loaded key from key DB");
+        _encryptors[c_str] = pe;
         return 0;
     }
     if (res != WT_NOTFOUND) {
@@ -252,7 +253,49 @@ int EncryptionKeyDB::get_key_by_id(const char *keyid, size_t len, unsigned char 
     }
 
     DEV dump_key(key, _key_len, "generated and stored key");
+    _encryptors[c_str] = pe;
     return 0;
+}
+
+int EncryptionKeyDB::delete_key_by_id(const std::string&  keyid) {
+    LOG(4) << "delete_key_by_id for keyid: '" << keyid << "'";
+
+    int res;
+    // open cursor
+    WT_CURSOR *cursor;
+    {
+        stdx::lock_guard<stdx::mutex> lk(_lock_sess);
+        res = _sess->open_cursor(_sess, "table:key", nullptr, nullptr, &cursor);
+        if (res){
+            error() << "delete_key_by_id: error opening cursor: " << wiredtiger_strerror(res);
+            return res;
+        }
+    }
+
+    // create cursor delete guard
+    std::unique_ptr<WT_CURSOR, std::function<void(WT_CURSOR*)>> cursor_guard(cursor, [](WT_CURSOR* c)
+        {
+            c->close(c);
+        });
+
+    // delete key
+    cursor->set_key(cursor, keyid.c_str());
+    res = cursor->remove(cursor);
+    if (res) {
+        error() << "cursor->remove error " << res << " : " << wiredtiger_strerror(res);
+    }
+
+    // prepare encryptor for reuse in case DB with the same name will be recreated
+    // it is not an error if encryptor is not found - that means customize was not called
+    // for the keyid and it will be called when necessary (in theory this may happen if
+    // DB is dropped just after mongod is started and before any read/write operations)
+    auto it = _encryptors.find(keyid);
+    if (it != _encryptors.end()) {
+        percona_encryption_extension_drop_keyid(it->second);
+        _encryptors.erase(it);
+    }
+
+    return res;
 }
 
 int EncryptionKeyDB::store_gcm_iv_reserved() {
@@ -332,9 +375,9 @@ extern "C" int get_iv_gcm(uint8_t *buf, int len) {
 // returns encryption key from keys DB
 // create key if it does not exists
 // return key from keyfile if len == 0
-extern "C" int get_key_by_id(const char *keyid, size_t len, unsigned char *key) {
+extern "C" int get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe) {
     invariant(encryptionKeyDB);
-    return encryptionKeyDB->get_key_by_id(keyid, len, key);
+    return encryptionKeyDB->get_key_by_id(keyid, len, key, pe);
 }
 
 }  // namespace mongo

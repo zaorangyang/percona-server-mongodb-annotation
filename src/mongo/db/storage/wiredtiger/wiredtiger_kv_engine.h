@@ -137,6 +137,8 @@ public:
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident);
 
+    virtual void keydbDropDatabase(const std::string& db) override;
+
     virtual Status okToRename(OperationContext* opCtx,
                               StringData fromNS,
                               StringData toNS,
