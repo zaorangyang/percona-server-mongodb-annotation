@@ -34,8 +34,6 @@ namespace mongo {
 
 class SaslExternalLDAPServerMechanism : public MakeServerMechanism<PLAINPolicy> {
 public:
-    static const bool isInternal = false;
-
     explicit SaslExternalLDAPServerMechanism(std::string authenticationDatabase)
         : MakeServerMechanism<PLAINPolicy>(std::move(authenticationDatabase)) {}
 
@@ -74,6 +72,8 @@ private:
 
 class ExternalLDAPServerFactory : public MakeServerFactory<SaslExternalLDAPServerMechanism> {
 public:
+    static constexpr bool isInternal = false;
+
     bool canMakeMechanismForUser(const User* user) const final {
         auto credentials = user->getCredentials();
         return credentials.isExternal && (credentials.scram<SHA1Block>().isValid() ||
