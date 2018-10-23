@@ -145,7 +145,7 @@ void serializeReply(OperationContext* opCtx,
             error.append("code", int(ErrorCodes::StaleShardVersion));  // Different from exception!
             {
                 BSONObjBuilder errInfo(error.subobjStart("errInfo"));
-                staleInfo->getVersionWanted().addToBSON(errInfo, "vWanted");
+                staleInfo->serialize(&errInfo);
             }
         } else {
             error.append("code", int(status.code()));
@@ -262,7 +262,7 @@ private:
 
     void _transactionChecks(OperationContext* opCtx) const {
         auto session = OperationContextSession::get(opCtx);
-        if (!session || !session->inSnapshotReadOrMultiDocumentTransaction())
+        if (!session || !session->inMultiDocumentTransaction())
             return;
         uassert(50791,
                 str::stream() << "Cannot write to system collection " << ns().toString()

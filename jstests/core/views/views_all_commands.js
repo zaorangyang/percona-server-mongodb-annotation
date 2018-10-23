@@ -324,6 +324,7 @@
         hostInfo: {skip: isUnrelated},
         insert: {command: {insert: "view", documents: [{x: 1}]}, expectFailure: true},
         invalidateUserCache: {skip: isUnrelated},
+        invalidateViewCatalog: {command: {invalidateViewCatalog: 1}},
         isdbgrid: {skip: isUnrelated},
         isMaster: {skip: isUnrelated},
         journalLatencyTest: {skip: isUnrelated},
@@ -508,7 +509,7 @@
                 max: {x: 0},
                 keyPattern: {x: 1},
                 splitKeys: [{x: -2}, {x: -1}],
-                shardVersion: [ObjectId(), 2]
+                shardVersion: [Timestamp(1, 2), ObjectId()]
             },
             skipSharded: true,
             expectFailure: true,

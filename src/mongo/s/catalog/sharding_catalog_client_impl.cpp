@@ -93,10 +93,10 @@ const int kMaxReadRetry = 3;
 const int kMaxWriteRetry = 3;
 
 const std::string kActionLogCollectionName("actionlog");
-const int kActionLogCollectionSizeMB = 2 * 1024 * 1024;
+const int kActionLogCollectionSizeMB = 20 * 1024 * 1024;
 
 const std::string kChangeLogCollectionName("changelog");
-const int kChangeLogCollectionSizeMB = 10 * 1024 * 1024;
+const int kChangeLogCollectionSizeMB = 200 * 1024 * 1024;
 
 const NamespaceString kSettingsNamespace("config", "settings");
 
@@ -774,7 +774,7 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
         // Look for the chunk in this shard whose version got bumped. We assume that if that
         // mod made it to the config server, then transaction was successful.
         BSONObjBuilder query;
-        lastChunkVersion.addToBSON(query, ChunkType::lastmod());
+        lastChunkVersion.appendLegacyWithField(&query, ChunkType::lastmod());
         query.append(ChunkType::ns(), nss.ns());
         auto chunkWithStatus = getChunks(opCtx, query.obj(), BSONObj(), 1, nullptr, readConcern);
 

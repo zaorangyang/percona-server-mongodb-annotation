@@ -139,7 +139,6 @@ selector:
   - jstests/core/max_doc_size.js
 
   # Calls res.getWriteError() or res.hasWriteError().
-  - jstests/core/big_object1.js
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
   - jstests/core/bulk_legacy_enforce_gle.js
@@ -222,6 +221,9 @@ selector:
   - jstests/core/list_all_local_cursors.js
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/views/views_all_commands.js
+
+  # Fails with implicit sessions because it will use multiple sessions on the same Mongo connection.
+  - jstests/core/dropdb.js
 
   # Committing a transaction when the server is fsync locked fails.
   - jstests/core/fsync.js

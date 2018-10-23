@@ -1,4 +1,4 @@
-// @tags: [requires_replication]
+// @tags: [requires_replication, uses_transactions]
 
 // Test the correct timestamping of insert, update, and delete writes along with their accompanying
 // index updates.
@@ -31,20 +31,16 @@
     const sessionDb = session.getDatabase(dbName);
     const response = assert.commandWorked(testDB.createCollection("coll"));
     const startTime = response.operationTime;
-    let txnNumber = 0;
 
     function check(atClusterTime, expected) {
+        session.startTransaction({readConcern: {level: "snapshot", atClusterTime: atClusterTime}});
         // Check both a collection scan and scanning the _id index.
         [{$natural: 1}, {_id: 1}].forEach(sort => {
-            let response = assert.commandWorked(sessionDb.runCommand({
-                find: collName,
-                sort: sort,
-                readConcern: {level: "snapshot", atClusterTime: atClusterTime},
-                txnNumber: NumberLong(txnNumber++),
-                singleBatch: true
-            }));
+            let response = assert.commandWorked(
+                sessionDb.runCommand({find: collName, sort: sort, singleBatch: true}));
             assert.eq(expected, response.cursor.firstBatch);
         });
+        session.commitTransaction();
     }
 
     // insert

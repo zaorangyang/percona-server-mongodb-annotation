@@ -1,12 +1,16 @@
 (function() {
     "use script";
 
+    // This test makes assertions about the number of sessions, which are not compatible with
+    // implicit sessions.
+    TestData.disableImplicitSessions = true;
+
     var res;
     var refresh = {refreshLogicalSessionCacheNow: 1};
     var startSession = {startSession: 1};
 
     // Start up a standalone server.
-    var conn = MongoRunner.runMongod({nojournal: ""});
+    var conn = MongoRunner.runMongod();
     var admin = conn.getDB("admin");
     var config = conn.getDB("config");
 

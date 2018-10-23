@@ -31,7 +31,7 @@
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/refresh_sessions_gen.h"
-#include "mongo/db/service_liason.h"
+#include "mongo/db/service_liaison.h"
 #include "mongo/db/sessions_collection.h"
 #include "mongo/db/time_proof_service.h"
 #include "mongo/db/transaction_reaper.h"
@@ -50,7 +50,7 @@ extern int logicalSessionRefreshMinutes;
 /**
  * A thread-safe cache structure for logical session records.
  *
- * The cache takes ownership of the passed-in ServiceLiason and
+ * The cache takes ownership of the passed-in ServiceLiaison and
  * SessionsCollection helper types.
  */
 class LogicalSessionCacheImpl final : public LogicalSessionCache {
@@ -87,7 +87,7 @@ public:
     /**
      * Construct a new session cache.
      */
-    explicit LogicalSessionCacheImpl(std::unique_ptr<ServiceLiason> service,
+    explicit LogicalSessionCacheImpl(std::unique_ptr<ServiceLiaison> service,
                                      std::shared_ptr<SessionsCollection> collection,
                                      std::shared_ptr<TransactionReaper> transactionReaper,
                                      Options options = Options{});
@@ -99,14 +99,14 @@ public:
 
     Status promote(LogicalSessionId lsid) override;
 
-    void startSession(OperationContext* opCtx, LogicalSessionRecord record) override;
+    Status startSession(OperationContext* opCtx, LogicalSessionRecord record) override;
 
     Status refreshSessions(OperationContext* opCtx,
                            const RefreshSessionsCmdFromClient& cmd) override;
     Status refreshSessions(OperationContext* opCtx,
                            const RefreshSessionsCmdFromClusterMember& cmd) override;
 
-    void vivify(OperationContext* opCtx, const LogicalSessionId& lsid) override;
+    Status vivify(OperationContext* opCtx, const LogicalSessionId& lsid) override;
 
     Status refreshNow(Client* client) override;
 
@@ -146,7 +146,7 @@ private:
     /**
      * Takes the lock and inserts the given record into the cache.
      */
-    void _addToCache(LogicalSessionRecord record);
+    Status _addToCache(LogicalSessionRecord record);
 
     const Minutes _refreshInterval;
     const Minutes _sessionTimeout;
@@ -155,7 +155,7 @@ private:
     // automatically by the background jobs.
     LogicalSessionCacheStats _stats;
 
-    std::unique_ptr<ServiceLiason> _service;
+    std::unique_ptr<ServiceLiaison> _service;
     std::shared_ptr<SessionsCollection> _sessionsColl;
 
     mutable stdx::mutex _reaperMutex;

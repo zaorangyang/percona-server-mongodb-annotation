@@ -317,7 +317,8 @@ InitialSyncerOptions createInitialSyncerOptions(
     };
     options.resetOptimes = [replCoord]() { replCoord->resetMyLastOpTimes(); };
     options.syncSourceSelector = replCoord;
-    options.oplogFetcherMaxFetcherRestarts = externalState->getOplogFetcherMaxFetcherRestarts();
+    options.oplogFetcherMaxFetcherRestarts =
+        externalState->getOplogFetcherInitialSyncMaxFetcherRestarts();
     return options;
 }
 }  // namespace
@@ -1345,8 +1346,8 @@ Status ReplicationCoordinatorImpl::_waitUntilClusterTimeForRead(OperationContext
 
     // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
     auto session = OperationContextSession::get(opCtx);
-    const bool speculative = session && session->inSnapshotReadOrMultiDocumentTransaction() &&
-        !readConcern.getArgsAtClusterTime();
+    const bool speculative =
+        session && session->inMultiDocumentTransaction() && !readConcern.getArgsAtClusterTime();
 
     const bool isMajorityCommittedRead =
         (readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern ||
@@ -1964,14 +1965,22 @@ Status ReplicationCoordinatorImpl::processReplSetGetStatus(
     BSONObjBuilder* response, ReplSetGetStatusResponseStyle responseStyle) {
 
     BSONObj initialSyncProgress;
-    stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (responseStyle == ReplSetGetStatusResponseStyle::kInitialSync) {
-        if (_initialSyncer) {
-            initialSyncProgress = _initialSyncer->getInitialSyncProgress();
+        std::shared_ptr<InitialSyncer> initialSyncerCopy;
+        {
+            stdx::lock_guard<stdx::mutex> lk(_mutex);
+            initialSyncerCopy = _initialSyncer;
+        }
+
+        // getInitialSyncProgress must be called outside the ReplicationCoordinatorImpl::_mutex
+        // lock. Else it might deadlock with InitialSyncer::_multiApplierCallback where it first
+        // acquires InitialSyncer::_mutex and then ReplicationCoordinatorImpl::_mutex.
+        if (initialSyncerCopy) {
+            initialSyncProgress = initialSyncerCopy->getInitialSyncProgress();
         }
     }
 
-
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     Status result(ErrorCodes::InternalError, "didn't set status in prepareStatusResponse");
     _topCoord->prepareStatusResponse(
         TopologyCoordinator::ReplSetStatusArgs{

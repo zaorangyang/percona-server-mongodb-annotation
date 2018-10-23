@@ -98,6 +98,10 @@ public:
         return _supportsDBLocking;
     }
 
+    virtual bool supportsCappedCollections() const {
+        return _supportsCappedCollections;
+    }
+
     virtual Status closeDatabase(OperationContext* opCtx, StringData db);
 
     virtual Status dropDatabase(OperationContext* opCtx, StringData db);
@@ -197,6 +201,7 @@ private:
 
     const bool _supportsDocLocking;
     const bool _supportsDBLocking;
+    const bool _supportsCappedCollections;
     Timestamp _initialDataTimestamp = Timestamp::kAllowUnstableCheckpointsSentinel;
 
     std::unique_ptr<RecordStore> _catalogRecordStore;

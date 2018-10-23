@@ -193,7 +193,6 @@
     const clusterOptions = {
         replication: {enabled: false},
         sharded: {enabled: false},
-        useExistingConnectionAsSeed: true,
     };
 
     const topology = DiscoverTopology.findConnectedNodes(db.getMongo());
@@ -218,6 +217,9 @@
     } else if (topology.type !== Topology.kStandalone) {
         throw new Error('Unrecognized topology format: ' + tojson(topology));
     }
+
+    clusterOptions.sameDB = TestData.sameDB;
+    clusterOptions.sameCollection = TestData.sameCollection;
 
     let workloads = TestData.fsmWorkloads;
 

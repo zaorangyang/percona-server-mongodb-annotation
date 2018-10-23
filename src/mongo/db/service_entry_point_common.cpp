@@ -147,13 +147,13 @@ bool shouldActivateFailCommandFailPoint(const BSONObj& data, StringData cmdName)
     return false;
 }
 
-void generateLegacyQueryErrorResponse(const AssertionException* exception,
+void generateLegacyQueryErrorResponse(const AssertionException& exception,
                                       const QueryMessage& queryMessage,
                                       CurOp* curop,
                                       Message* response) {
-    curop->debug().errInfo = exception->toStatus();
+    curop->debug().errInfo = exception.toStatus();
 
-    log(LogComponent::kQuery) << "assertion " << exception->toString() << " ns:" << queryMessage.ns
+    log(LogComponent::kQuery) << "assertion " << exception.toString() << " ns:" << queryMessage.ns
                               << " query:" << (queryMessage.query.valid(BSONVersion::kLatest)
                                                    ? redact(queryMessage.query)
                                                    : "query object is corrupt");
@@ -162,20 +162,18 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
                                   << " ntoreturn:" << queryMessage.ntoreturn;
     }
 
-    auto scex = exception->extraInfo<StaleConfigInfo>();
-
     BSONObjBuilder err;
-    err.append("$err", exception->reason());
-    err.append("code", exception->code());
-    if (scex) {
-        err.append("ok", 0.0);
-        err.append("ns", scex->getns());
-        scex->getVersionReceived().addToBSON(err, "vReceived");
-        scex->getVersionWanted().addToBSON(err, "vWanted");
+    err.append("$err", exception.reason());
+    err.append("code", exception.code());
+    err.append("ok", 0.0);
+    auto const extraInfo = exception.extraInfo();
+    if (extraInfo) {
+        extraInfo->serialize(&err);
     }
     BSONObj errObj = err.done();
 
-    if (scex) {
+    const bool isStaleConfig = exception.code() == ErrorCodes::StaleConfig;
+    if (isStaleConfig) {
         log(LogComponent::kQuery) << "stale version detected during query over " << queryMessage.ns
                                   << " : " << errObj;
     }
@@ -188,8 +186,9 @@ void generateLegacyQueryErrorResponse(const AssertionException* exception,
     QueryResult::View msgdata = bb.buf();
     QueryResult::View qr = msgdata;
     qr.setResultFlags(ResultFlag_ErrSet);
-    if (scex)
+    if (isStaleConfig) {
         qr.setResultFlags(qr.getResultFlags() | ResultFlag_ShardConfigStale);
+    }
     qr.msgdata().setLen(bb.len());
     qr.msgdata().setOperation(opReply);
     qr.setCursorId(0);
@@ -799,15 +798,13 @@ void execCommandDatabase(OperationContext* opCtx,
             uassert(40119,
                     "Illegal attempt to set operation deadline within DBDirectClient",
                     !opCtx->getClient()->isInDirectClient());
-            opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
+            opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
         }
 
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-        // TODO(SERVER-34113) replace below txnNumber/logicalSessionId checks with
-        // Session::inMultiDocumentTransaction().
-        if (!opCtx->getClient()->isInDirectClient() || !opCtx->getTxnNumber() ||
-            !opCtx->getLogicalSessionId()) {
-            auto session = OperationContextSession::get(opCtx);
+        auto session = OperationContextSession::get(opCtx);
+        if (!opCtx->getClient()->isInDirectClient() || !session ||
+            !session->inMultiDocumentTransaction()) {
             const bool upconvertToSnapshot = session && session->inMultiDocumentTransaction() &&
                 sessionOptions &&
                 (sessionOptions->getStartTransaction() == boost::optional<bool>(true));
@@ -825,12 +822,7 @@ void execCommandDatabase(OperationContext* opCtx,
             auto session = OperationContextSession::get(opCtx);
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot is only valid in multi-statement transactions",
-                    // With test commands enabled, a read command with readConcern snapshot is
-                    // a valid snapshot read.
-                    (getTestCommandsEnabled() &&
-                     invocation->definition()->getReadWriteType() ==
-                         BasicCommand::ReadWriteType::kRead) ||
-                        (session && session->inMultiDocumentTransaction()));
+                    session && session->inMultiDocumentTransaction());
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot requires a session ID",
                     opCtx->getLogicalSessionId());
@@ -888,7 +880,7 @@ void execCommandDatabase(OperationContext* opCtx,
                                 sessionOptions)) {
                 command->incrementCommandsFailed();
             }
-        } catch (DBException&) {
+        } catch (const DBException&) {
             command->incrementCommandsFailed();
             throw;
         }
@@ -898,9 +890,7 @@ void execCommandDatabase(OperationContext* opCtx,
             if (!opCtx->getClient()->isInDirectClient()) {
                 // We already have the StaleConfig exception, so just swallow any errors due to
                 // refresh
-                onShardVersionMismatch(
-                    opCtx, NamespaceString(sce->getns()), sce->getVersionReceived())
-                    .ignore();
+                onShardVersionMismatch(opCtx, sce->getNss(), sce->getVersionReceived()).ignore();
             }
         } else if (auto sce = e.extraInfo<StaleDbRoutingVersion>()) {
             if (!opCtx->getClient()->isInDirectClient()) {
@@ -960,9 +950,9 @@ void curOpCommandSetup(OperationContext* opCtx, const OpMsgRequest& request) {
     curop->setNS_inlock(nss.ns());
 }
 
-DbResponse runCommands(OperationContext* opCtx,
-                       const Message& message,
-                       const ServiceEntryPointCommon::Hooks& behaviors) {
+DbResponse receivedCommands(OperationContext* opCtx,
+                            const Message& message,
+                            const ServiceEntryPointCommon::Hooks& behaviors) {
     auto replyBuilder = rpc::makeReplyBuilder(rpc::protocolForMessage(message));
     [&] {
         OpMsgRequest request;
@@ -1075,14 +1065,12 @@ DbResponse receivedQuery(OperationContext* opCtx,
             if (!opCtx->getClient()->isInDirectClient()) {
                 // We already have the StaleConfig exception, so just swallow any errors due to
                 // refresh
-                onShardVersionMismatch(
-                    opCtx, NamespaceString(sce->getns()), sce->getVersionReceived())
-                    .ignore();
+                onShardVersionMismatch(opCtx, sce->getNss(), sce->getVersionReceived()).ignore();
             }
         }
 
         dbResponse.response.reset();
-        generateLegacyQueryErrorResponse(&e, q, &op, &dbResponse.response);
+        generateLegacyQueryErrorResponse(e, q, &op, &dbResponse.response);
     }
 
     op.debug().responseLength = dbResponse.response.header().dataLen();
@@ -1307,7 +1295,7 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
 
     DbResponse dbresponse;
     if (op == dbMsg || op == dbCommand || (op == dbQuery && isCommand)) {
-        dbresponse = runCommands(opCtx, m, behaviors);
+        dbresponse = receivedCommands(opCtx, m, behaviors);
     } else if (op == dbQuery) {
         invariant(!isCommand);
         dbresponse = receivedQuery(opCtx, nsString, c, m);

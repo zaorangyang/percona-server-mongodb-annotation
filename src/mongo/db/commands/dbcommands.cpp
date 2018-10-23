@@ -89,7 +89,6 @@
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/write_concern.h"
-#include "mongo/s/stale_exception.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -246,14 +245,22 @@ public:
         e = cmdObj.getField("backupOriginalFiles");
         bool backupOriginalFiles = e.isBoolean() && e.boolean();
 
-        StorageEngine* engine = getGlobalServiceContext()->getStorageEngine();
-        repl::UnreplicatedWritesBlock uwb(opCtx);
-        Status status = repairDatabase(
-            opCtx, engine, dbname, preserveClonedFilesOnFailure, backupOriginalFiles);
+        {
+            // Conceal UUIDCatalog changes for the duration of repairDatabase so that calls to
+            // UUIDCatalog::lookupNSSByUUID do not cause spurious NamespaceNotFound errors while
+            // repairDatabase makes updates.
+            ConcealUUIDCatalogChangesBlock cucc(opCtx);
 
-        // Open database before returning
-        DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbname);
-        uassertStatusOK(status);
+            StorageEngine* engine = getGlobalServiceContext()->getStorageEngine();
+            repl::UnreplicatedWritesBlock uwb(opCtx);
+            Status status = repairDatabase(
+                opCtx, engine, dbname, preserveClonedFilesOnFailure, backupOriginalFiles);
+
+            // Open database before returning
+            DatabaseHolder::getDatabaseHolder().openDb(opCtx, dbname);
+            uassertStatusOK(status);
+        }
+
         return true;
     }
 } cmdRepairDatabase;

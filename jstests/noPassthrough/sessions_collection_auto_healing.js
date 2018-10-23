@@ -3,8 +3,12 @@ load('jstests/libs/sessions_collection.js');
 (function() {
     "use strict";
 
+    // This test makes assertions about the number of sessions, which are not compatible with
+    // implicit sessions.
+    TestData.disableImplicitSessions = true;
+
     var startSession = {startSession: 1};
-    var conn = MongoRunner.runMongod({nojournal: ""});
+    var conn = MongoRunner.runMongod();
 
     var admin = conn.getDB("admin");
     var config = conn.getDB("config");

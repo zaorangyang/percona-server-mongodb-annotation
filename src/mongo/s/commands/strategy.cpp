@@ -320,7 +320,7 @@ void runCommand(OperationContext* opCtx,
     const int maxTimeMS = uassertStatusOK(
         QueryRequest::parseMaxTimeMS(request.body[QueryRequest::cmdOptionMaxTimeMS]));
     if (maxTimeMS > 0 && command->getLogicalOp() != LogicalOp::opGetMore) {
-        opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
+        opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
@@ -366,10 +366,10 @@ void runCommand(OperationContext* opCtx,
             } catch (const ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
                 const auto staleNs = [&] {
                     if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
-                        return NamespaceString(staleInfo->getns());
+                        return staleInfo->getNss();
                     } else if (auto implicitCreateInfo =
                                    ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-                        return NamespaceString(implicitCreateInfo->getNss());
+                        return implicitCreateInfo->getNss();
                     } else {
                         throw;
                     }
@@ -478,7 +478,8 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
         uassert(50749,
                 "Illegal attempt to set operation deadline within DBDirectClient",
                 !opCtx->getClient()->isInDirectClient());
-        opCtx->setDeadlineAfterNowBy(Milliseconds{queryRequest.getMaxTimeMS()});
+        opCtx->setDeadlineAfterNowBy(Milliseconds{queryRequest.getMaxTimeMS()},
+                                     ErrorCodes::MaxTimeMSExpired);
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
@@ -772,10 +773,10 @@ void Strategy::explainFind(OperationContext* opCtx,
         } catch (const ExceptionForCat<ErrorCategory::NeedRetargettingError>& ex) {
             const auto staleNs = [&] {
                 if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
-                    return NamespaceString(staleInfo->getns());
+                    return staleInfo->getNss();
                 } else if (auto implicitCreateInfo =
                                ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-                    return NamespaceString(implicitCreateInfo->getNss());
+                    return implicitCreateInfo->getNss();
                 } else {
                     throw;
                 }

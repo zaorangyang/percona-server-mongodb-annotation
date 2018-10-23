@@ -185,30 +185,6 @@ ChunkVersion getPersistedMaxChunkVersion(OperationContext* opCtx, const Namespac
 /**
  * This function will throw on error!
  *
- * Retrieves the persisted max db version for 'dbName', if there are any persisted dbs. If there
- * are none -- meaning there's no persisted metadata for 'dbName' --, returns boost::optional.
- */
-boost::optional<DatabaseVersion> getPersistedMaxDbVersion(OperationContext* opCtx,
-                                                          StringData dbName) {
-
-    auto statusWithDatabaseEntry = readShardDatabasesEntry(opCtx, dbName);
-    if (statusWithDatabaseEntry == ErrorCodes::NamespaceNotFound) {
-        // There is no persisted metadata.
-        return boost::none;
-    }
-    uassert(ErrorCodes::OperationFailed,
-            str::stream() << "Failed to read persisted database entry for db '" << dbName.toString()
-                          << "' due to '"
-                          << statusWithDatabaseEntry.getStatus().toString()
-                          << "'.",
-            statusWithDatabaseEntry.isOK());
-
-    return statusWithDatabaseEntry.getValue().getDbVersion();
-}
-
-/**
- * This function will throw on error!
- *
  * Tries to find persisted chunk metadata with chunk versions GTE to 'version'.
  *
  * If 'version's epoch matches persisted metadata, returns persisted metadata GTE 'version'.
@@ -1174,7 +1150,7 @@ void ShardServerCatalogCacheLoader::CollAndChunkTaskList::addTask(collAndChunkTa
     }
 
     if (task.dropped) {
-        invariant(_tasks.back().maxQueryVersion.equals(task.minQueryVersion));
+        invariant(_tasks.back().maxQueryVersion == task.minQueryVersion);
 
         // As an optimization, on collection drop, clear any pending tasks in order to prevent any
         // throw-away work from executing. Because we have no way to differentiate whether the
@@ -1188,7 +1164,7 @@ void ShardServerCatalogCacheLoader::CollAndChunkTaskList::addTask(collAndChunkTa
         }
     } else {
         // Tasks must have contiguous versions, unless a complete reload occurs.
-        invariant(_tasks.back().maxQueryVersion.equals(task.minQueryVersion) ||
+        invariant(_tasks.back().maxQueryVersion == task.minQueryVersion ||
                   !task.minQueryVersion.isSet());
 
         _tasks.emplace_back(std::move(task));

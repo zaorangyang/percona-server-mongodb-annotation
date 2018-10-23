@@ -366,6 +366,14 @@ ExitCode _initAndListen(int listenPort) {
         }
     }
 
+    // Disallow running a storage engine that doesn't support capped collections with --profile
+    if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections() &&
+        serverGlobalParams.defaultProfile != 0) {
+        log() << "Running " << storageGlobalParams.engine << " with profiling is not supported. "
+              << "Make sure you are not using --profile.";
+        exitCleanly(EXIT_BADOPTIONS);
+    }
+
     // Disallow running WiredTiger with --nojournal in a replica set
     if (storageGlobalParams.engine == "wiredTiger" && !storageGlobalParams.dur &&
         replSettings.usingReplSets()) {
@@ -478,6 +486,9 @@ ExitCode _initAndListen(int listenPort) {
             log() << redact(status);
             if (status == ErrorCodes::AuthSchemaIncompatible) {
                 exitCleanly(EXIT_NEED_UPGRADE);
+            } else if (status == ErrorCodes::NotMaster) {
+                // Try creating the indexes if we become master.  If we do not become master,
+                // the master will create the indexes and we will replicate them.
             } else {
                 quickExit(EXIT_FAILURE);
             }
@@ -526,8 +537,14 @@ ExitCode _initAndListen(int listenPort) {
         waitForShardRegistryReload(startupOpCtx.get()).transitional_ignore();
     }
 
+    auto storageEngine = serviceContext->getStorageEngine();
+    invariant(storageEngine);
+
     if (!storageGlobalParams.readOnly) {
-        logStartup(startupOpCtx.get());
+
+        if (storageEngine->supportsCappedCollections()) {
+            logStartup(startupOpCtx.get());
+        }
 
         startMongoDFTDC();
 
@@ -608,8 +625,6 @@ ExitCode _initAndListen(int listenPort) {
     // Start up a background task to periodically check for and kill expired transactions.
     // Only do this on storage engines supporting snapshot reads, which hold resources we wish to
     // release periodically in order to avoid storage cache pressure build up.
-    auto storageEngine = serviceContext->getStorageEngine();
-    invariant(storageEngine);
     if (storageEngine->supportsReadConcernSnapshot()) {
         startPeriodicThreadToAbortExpiredTransactions(serviceContext);
     }

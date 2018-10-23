@@ -200,21 +200,25 @@ var ReplSetTest = function(opts) {
      * @param states is a single state or list of states
      * @param ind is the indicator specified
      * @param timeout how long to wait for the state to be reached
+     * @param reconnectNode indicates that we should reconnect to a node that stepped down
      */
-    function _waitForIndicator(node, states, ind, timeout) {
+    function _waitForIndicator(node, states, ind, timeout, reconnectNode) {
+        timeout = timeout || self.kDefaultTimeoutMS;
+        if (reconnectNode === undefined) {
+            reconnectNode = true;
+        }
+
         if (node.length) {
             var nodes = node;
             for (var i = 0; i < nodes.length; i++) {
                 if (states.length)
-                    _waitForIndicator(nodes[i], states[i], ind, timeout);
+                    _waitForIndicator(nodes[i], states[i], ind, timeout, reconnectNode);
                 else
-                    _waitForIndicator(nodes[i], states, ind, timeout);
+                    _waitForIndicator(nodes[i], states, ind, timeout, reconnectNode);
             }
 
             return;
         }
-
-        timeout = timeout || self.kDefaultTimeoutMS;
 
         if (!node.getDB) {
             node = self.nodes[node];
@@ -232,6 +236,7 @@ var ReplSetTest = function(opts) {
         var currTime = new Date().getTime();
         var status;
 
+        let foundState;
         assert.soon(function() {
             try {
                 var conn = _callIsMaster();
@@ -285,6 +290,7 @@ var ReplSetTest = function(opts) {
                                             ", value:" + states[j]);
                         }
                         if (status.members[i][ind] == states[j]) {
+                            foundState = states[j];
                             return true;
                         }
                     }
@@ -294,6 +300,20 @@ var ReplSetTest = function(opts) {
             return false;
 
         }, "waiting for state indicator " + ind + " for " + timeout + "ms", timeout);
+
+        // If we were waiting for the node to step down, wait until we can connect to it again,
+        // since primaries close external connections upon stepdown. This ensures that the
+        // connection to the node is usable after the function returns.
+        if (reconnectNode && foundState === ReplSetTest.State.SECONDARY) {
+            assert.soon(function() {
+                try {
+                    node.getDB("foo").bar.stats();
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            }, "timed out waiting to reconnect to node " + node.name);
+        }
 
         print("ReplSetTest waitForIndicator final status:");
         printjson(status);
@@ -1796,6 +1816,7 @@ var ReplSetTest = function(opts) {
             // '_master' must have been populated.
             var primary = rst._master;
             var combinedDBs = new Set(primary.getDBNames());
+            const replSetConfig = rst.getReplSetConfigFromNode();
 
             slaves.forEach(secondary => {
                 secondary.getDBNames().forEach(dbName => combinedDBs.add(dbName));
@@ -1895,8 +1916,10 @@ var ReplSetTest = function(opts) {
                     // Check that the following collection stats are the same across replica set
                     // members:
                     //  capped
-                    //  nindexes
+                    //  nindexes, except on nodes with buildIndexes: false
                     //  ns
+                    const hasSecondaryIndexes =
+                        replSetConfig.members[rst.getNodeId(secondary)].buildIndexes !== false;
                     primaryCollections.forEach(collName => {
                         var primaryCollStats =
                             primary.getDB(dbName).runCommand({collStats: collName});
@@ -1908,7 +1931,8 @@ var ReplSetTest = function(opts) {
                             printCollectionInfo('secondary', secondary, dbName, collName);
                             success = false;
                         } else if (primaryCollStats.capped !== secondaryCollStats.capped ||
-                                   primaryCollStats.nindexes !== secondaryCollStats.nindexes ||
+                                   (hasSecondaryIndexes &&
+                                    primaryCollStats.nindexes !== secondaryCollStats.nindexes) ||
                                    primaryCollStats.ns !== secondaryCollStats.ns) {
                             print(msgPrefix +
                                   ', the primary and secondary have different stats for the ' +
@@ -1956,7 +1980,7 @@ var ReplSetTest = function(opts) {
 
     this.checkOplogs = function(msgPrefix) {
         var liveSlaves = _determineLiveSlaves();
-        this.checkReplicaSet(checkOplogs, liveSlaves, this, msgPrefix);
+        this.checkReplicaSet(checkOplogs, liveSlaves, this, liveSlaves, msgPrefix);
     };
 
     /**
@@ -1964,7 +1988,8 @@ var ReplSetTest = function(opts) {
      * collection, each node may not contain the same number of entries and stop if the cursor
      * is exhausted on any node being checked.
      */
-    function checkOplogs(rst, msgPrefix = 'checkOplogs') {
+    function checkOplogs(rst, slaves, msgPrefix = 'checkOplogs') {
+        slaves = slaves || rst._slaves;
         var OplogReader = function(mongo) {
             this.next = function() {
                 if (!this.cursor)
@@ -2017,7 +2042,7 @@ var ReplSetTest = function(opts) {
             this.mongo = mongo;
         };
 
-        if (rst.nodes.length && rst.nodes.length > 1) {
+        if (slaves.length >= 1) {
             var readers = [];
             var smallestTS = new Timestamp(Math.pow(2, 32) - 1, Math.pow(2, 32) - 1);
             var nodes = rst.nodes;
@@ -2026,8 +2051,7 @@ var ReplSetTest = function(opts) {
             for (var i = 0; i < rsSize; i++) {
                 const node = nodes[i];
 
-                // Only look at nodes that are up.
-                if (rst.master !== node && !rst._liveNodes.includes(node)) {
+                if (rst._master !== node && !slaves.includes(node)) {
                     continue;
                 }
 
@@ -2418,10 +2442,12 @@ var ReplSetTest = function(opts) {
      *
      * @param node is a single node or list of nodes, by id or conn
      * @param state is a single state or list of states
+     * @param timeout how long to wait for the state to be reached
+     * @param reconnectNode indicates that we should reconnect to a node that stepped down
      *
      */
-    this.waitForState = function(node, state, timeout) {
-        _waitForIndicator(node, state, "state", timeout);
+    this.waitForState = function(node, state, timeout, reconnectNode) {
+        _waitForIndicator(node, state, "state", timeout, reconnectNode);
     };
 
     /**

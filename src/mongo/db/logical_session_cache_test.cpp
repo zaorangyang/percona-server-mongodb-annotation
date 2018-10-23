@@ -41,7 +41,7 @@
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/service_context_noop.h"
-#include "mongo/db/service_liason_mock.h"
+#include "mongo/db/service_liaison_mock.h"
 #include "mongo/db/sessions_collection_mock.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
@@ -59,13 +59,13 @@ using SessionList = std::list<LogicalSessionId>;
 using unittest::EnsureFCV;
 
 /**
- * Test fixture that sets up a session cache attached to a mock service liason
+ * Test fixture that sets up a session cache attached to a mock service liaison
  * and mock sessions collection implementation.
  */
 class LogicalSessionCacheTest : public unittest::Test {
 public:
     LogicalSessionCacheTest()
-        : _service(std::make_shared<MockServiceLiasonImpl>()),
+        : _service(std::make_shared<MockServiceLiaisonImpl>()),
           _sessions(std::make_shared<MockSessionsCollectionImpl>()) {}
 
     void setUp() override {
@@ -76,7 +76,7 @@ public:
         _client = client.get();
         Client::setCurrent(std::move(client));
 
-        auto mockService = stdx::make_unique<MockServiceLiason>(_service);
+        auto mockService = stdx::make_unique<MockServiceLiaison>(_service);
         auto mockSessions = stdx::make_unique<MockSessionsCollection>(_sessions);
         _cache = stdx::make_unique<LogicalSessionCacheImpl>(
             std::move(mockService), std::move(mockSessions), nullptr);
@@ -101,7 +101,7 @@ public:
         return _cache;
     }
 
-    std::shared_ptr<MockServiceLiasonImpl> service() {
+    std::shared_ptr<MockServiceLiaisonImpl> service() {
         return _service;
     }
 
@@ -129,7 +129,7 @@ private:
     ServiceContextNoop serviceContext;
     ServiceContext::UniqueOperationContext _opCtx;
 
-    std::shared_ptr<MockServiceLiasonImpl> _service;
+    std::shared_ptr<MockServiceLiaisonImpl> _service;
     std::shared_ptr<MockSessionsCollectionImpl> _sessions;
 
     std::unique_ptr<LogicalSessionCache> _cache;
@@ -158,7 +158,7 @@ TEST_F(LogicalSessionCacheTest, PromoteUpdatesLastUse) {
     auto start = service()->now();
 
     // Insert the record into the sessions collection with 'start'
-    cache()->startSession(opCtx(), makeLogicalSessionRecord(lsid, start));
+    ASSERT_OK(cache()->startSession(opCtx(), makeLogicalSessionRecord(lsid, start)));
 
     // Fast forward time and promote
     service()->fastForward(Milliseconds(500));
@@ -198,7 +198,7 @@ TEST_F(LogicalSessionCacheTest, StartSession) {
     auto lsid = record.getId();
 
     // Test starting a new session
-    cache()->startSession(opCtx(), record);
+    ASSERT_OK(cache()->startSession(opCtx(), record));
 
     // Record will not be in the collection yet; refresh must happen first.
     ASSERT(!sessions()->has(lsid));
@@ -209,27 +209,27 @@ TEST_F(LogicalSessionCacheTest, StartSession) {
     ASSERT(sessions()->has(lsid));
 
     // Try to start the same session again, should succeed.
-    cache()->startSession(opCtx(), record);
+    ASSERT_OK(cache()->startSession(opCtx(), record));
 
     // Try to start a session that is already in the sessions collection but
     // is not in our local cache, should succeed.
     auto record2 = makeLogicalSessionRecord(makeLogicalSessionIdForTest(), service()->now());
     sessions()->add(record2);
-    cache()->startSession(opCtx(), record2);
+    ASSERT_OK(cache()->startSession(opCtx(), record2));
 
     // Try to start a session that has expired from our cache, and is no
     // longer in the sessions collection, should succeed
     service()->fastForward(Milliseconds(kSessionTimeout.count() + 5));
     sessions()->remove(lsid);
     ASSERT(!sessions()->has(lsid));
-    cache()->startSession(opCtx(), record);
+    ASSERT_OK(cache()->startSession(opCtx(), record));
 }
 
 // Test that session cache properly expires lsids after 30 minutes of no use
 TEST_F(LogicalSessionCacheTest, BasicSessionExpiration) {
     // Insert a lsid
     auto record = makeLogicalSessionRecordForTest();
-    cache()->startSession(opCtx(), record);
+    ASSERT_OK(cache()->startSession(opCtx(), record));
     auto res = cache()->promote(record.getId());
     ASSERT(res.isOK());
 
@@ -248,7 +248,7 @@ TEST_F(LogicalSessionCacheTest, ManySignedLsidsInCacheRefresh) {
     int count = 10000;
     for (int i = 0; i < count; i++) {
         auto record = makeLogicalSessionRecordForTest();
-        cache()->startSession(opCtx(), record);
+        ASSERT_OK(cache()->startSession(opCtx(), record));
     }
 
     // Check that all signedLsids refresh
@@ -360,7 +360,7 @@ TEST_F(LogicalSessionCacheTest, RefreshMatrixSessionState) {
             service()->add(lsid);
         }
         if (active) {
-            cache()->startSession(opCtx(), lsRecord);
+            ASSERT_OK(cache()->startSession(opCtx(), lsRecord));
         }
         if (!expired) {
             sessions()->add(lsRecord);

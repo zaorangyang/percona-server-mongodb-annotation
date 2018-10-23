@@ -78,6 +78,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/system_index.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -121,13 +122,25 @@ const char tsFieldName[] = "ts";
 
 MONGO_FAIL_POINT_DEFINE(dropPendingCollectionReaperHang);
 
-// Set this to specify maximum number of times the oplog fetcher will consecutively restart the
-// oplog tailing query on non-cancellation errors.
-MONGO_EXPORT_SERVER_PARAMETER(oplogFetcherMaxFetcherRestarts, int, 3)
+// Set this to specify the maximum number of times the oplog fetcher will consecutively restart the
+// oplog tailing query on non-cancellation errors during steady state replication.
+MONGO_EXPORT_SERVER_PARAMETER(oplogFetcherSteadyStateMaxFetcherRestarts, int, 1)
     ->withValidator([](const int& potentialNewValue) {
         if (potentialNewValue < 0) {
             return Status(ErrorCodes::BadValue,
-                          "oplogFetcherMaxFetcherRestarts must be nonnegative");
+                          "oplogFetcherSteadyStateMaxFetcherRestarts must be nonnegative");
+        }
+        return Status::OK();
+    });
+
+// Set this to specify the maximum number of times the oplog fetcher will consecutively restart the
+// oplog tailing query on non-cancellation errors during initial sync. By default we provide a
+// generous amount of restarts to avoid potentially restarting an entire initial sync from scratch.
+MONGO_EXPORT_SERVER_PARAMETER(oplogFetcherInitialSyncMaxFetcherRestarts, int, 10)
+    ->withValidator([](const int& potentialNewValue) {
+        if (potentialNewValue < 0) {
+            return Status(ErrorCodes::BadValue,
+                          "oplogFetcherInitialSyncMaxFetcherRestarts must be nonnegative");
         }
         return Status::OK();
     });
@@ -492,6 +505,16 @@ OpTime ReplicationCoordinatorExternalStateImpl::onTransitionToPrimary(OperationC
 
     _shardingOnTransitionToPrimaryHook(opCtx);
     _dropAllTempCollections(opCtx);
+
+    // It is only necessary to check the system indexes on the first transition to master.
+    // On subsequent transitions to master the indexes will have already been created.
+    static std::once_flag verifySystemIndexesOnce;
+    std::call_once(verifySystemIndexesOnce, [opCtx] {
+        const auto globalAuthzManager = AuthorizationManager::get(opCtx->getServiceContext());
+        if (globalAuthzManager->shouldValidateAuthSchemaOnStartup()) {
+            fassert(65536, verifySystemIndexes(opCtx));
+        }
+    });
 
     serverGlobalParams.validateFeaturesAsMaster.store(true);
 
@@ -889,8 +912,14 @@ bool ReplicationCoordinatorExternalStateImpl::isReadConcernSnapshotSupportedBySt
     return storageEngine->supportsReadConcernSnapshot();
 }
 
-std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherMaxFetcherRestarts() const {
-    return oplogFetcherMaxFetcherRestarts.load();
+std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherSteadyStateMaxFetcherRestarts()
+    const {
+    return oplogFetcherSteadyStateMaxFetcherRestarts.load();
+}
+
+std::size_t ReplicationCoordinatorExternalStateImpl::getOplogFetcherInitialSyncMaxFetcherRestarts()
+    const {
+    return oplogFetcherInitialSyncMaxFetcherRestarts.load();
 }
 
 JournalListener::Token ReplicationCoordinatorExternalStateImpl::getToken() {

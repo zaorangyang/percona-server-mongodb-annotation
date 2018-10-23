@@ -1124,6 +1124,9 @@ os_macros = {
     "iOS-sim": "defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR",
     "tvOS": "defined(__APPLE__) && TARGET_OS_TV && !TARGET_OS_SIMULATOR",
     "tvOS-sim": "defined(__APPLE__) && TARGET_OS_TV && TARGET_OS_SIMULATOR",
+    "watchOS": "defined(__APPLE__) && TARGET_OS_WATCH && !TARGET_OS_SIMULATOR",
+    "watchOS-sim": "defined(__APPLE__) && TARGET_OS_WATCH && TARGET_OS_SIMULATOR",
+
     # NOTE: Once we have XCode 8 required, we can rely on the value of TARGET_OS_OSX. In case
     # we are on an older XCode, use TARGET_OS_MAC and TARGET_OS_IPHONE. We don't need to correct
     # the above declarations since we will never target them with anything other than XCode 8.
@@ -2611,8 +2614,13 @@ def doConfigure(myenv):
         # Explicitly enable GNU build id's if the linker supports it.
         AddToLINKFLAGSIfSupported(myenv, '-Wl,--build-id')
 
-        # Explicitly use the new gnu hash section if the linker offers it.
-        AddToLINKFLAGSIfSupported(myenv, '-Wl,--hash-style=gnu')
+        # Explicitly use the new gnu hash section if the linker offers
+        # it, except on android since older runtimes seem to not
+        # support it. For that platform, use 'both'.
+        if env.TargetOSIs('android'):
+            AddToLINKFLAGSIfSupported(myenv, '-Wl,--hash-style=both')
+        else:
+            AddToLINKFLAGSIfSupported(myenv, '-Wl,--hash-style=gnu')
 
         # Try to have the linker tell us about ODR violations. Don't
         # use it when using clang with libstdc++, as libstdc++ was

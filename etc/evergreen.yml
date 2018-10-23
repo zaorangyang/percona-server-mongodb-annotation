@@ -131,7 +131,7 @@ variables:
 # TODO: Remove psutil from virtualenv_requirements when BUILD-3083 is done
 - &powercycle_ec2_instance
   aws_ec2_yml: aws_ec2.yml
-  expire_hours: "3"
+  ec2_expire_hours: "24"
   ec2_monitor_files: proc.json system.json
   monitor_proc_file: proc.json
   monitor_system_file: system.json
@@ -161,10 +161,12 @@ variables:
        value: /data/db
      - key: log_path
        value: ${remote_dir}/mongod.log
+     - key: exit_file
+       value: powercycle_exit.yml
 
 - &powercycle_test
   ec2_artifacts: ${log_path} ${db_path} ${backup_path_after} ${backup_path_before}
-  program_options: --logLevel=info --backupPathBefore=${backup_path_before} --backupPathAfter=${backup_path_after}
+  program_options:  --exitYamlFile=${exit_file} --logLevel=info --backupPathBefore=${backup_path_before} --backupPathAfter=${backup_path_after}
   connection_options: --sshUserHost=${private_ip_address} --sshConnection=\"${ssh_identity} ${ssh_connection_options}\"
   test_options: --testLoops=15 --seedDocNum=10000 --rsync --rsyncExcludeFiles=diagnostic.data/metrics.interim* --validate=local --canary=local
   crash_options: --crashMethod=internal --crashOption=${windows_crash_cmd} --crashWaitTime=45 --jitterForCrashWaitTime=5 --instanceId=${instance_id}
@@ -697,7 +699,6 @@ functions:
       directory: ${git_project_directory|src}
       revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
         enterprise: ${enterprise_rev}
-        rocksdb: ${rocksdb_rev}
 
   "fetch artifacts" : &fetch_artifacts
     command: s3.get
@@ -924,6 +925,31 @@ functions:
         https_validate_certificates = False
         EOF
 
+  "call BF Suggestion service":
+    command: shell.exec
+    params:
+      working_dir: src
+      shell: bash
+      silent: true
+      script: |
+        report_file="report.json"
+        # Check if the report file exists and has failures.
+        if [ -f $report_file ] && grep -Eq "\"failures\": [1-9]" $report_file; then
+          # Calling the BF Suggestion server endpoint to start feature extraction.
+          payload="{\"task_id\": \"${task_id}\", \"execution\": ${execution}}"
+          echo "Sending task info to the BF suggestion service"
+          # The --user option is passed through stdin to avoid showing in process list.
+          user_option="--user ${bfsuggestion_user}:${bfsuggestion_password}"
+          curl --header "Content-Type: application/json" \
+               --data "$payload" \
+               --max-time 10 \
+               --silent \
+               --show-error \
+               --config - \
+               https://bfsuggestion.corp.mongodb.com/tasks <<< $user_option
+          echo "Request to BF Suggestion service status: $?"
+        fi
+
   "upload debugsymbols" : &upload_debugsymbols
     command: s3.put
     params:
@@ -968,19 +994,6 @@ functions:
             rm -r mongodb*/*.$file_ext 2>/dev/null || true
         done
         rm mongo-debugsymbols.tgz 2>/dev/null || true
-
-  "build rocksdb" :
-    command: shell.exec
-    params:
-      script: |
-        set -o errexit
-        set -o verbose
-        if [ "${build_rocksdb|}" = "true" ]; then
-        rm -rf rocksdb
-        git clone https://github.com/facebook/rocksdb.git
-        cd rocksdb
-        make USE_RTTI=1 CC=/opt/mongodbtoolchain/v2/bin/gcc CXX=/opt/mongodbtoolchain/v2/bin/g++ static_lib
-        fi
 
   "fetch and build OpenSSL" :
     command: shell.exec
@@ -1050,32 +1063,6 @@ functions:
 
         if [ "${scons_cache_scope}" = "shared" ]; then
             sudo umount /efs || umount /efs || true
-        fi
-
-  "build cdriver" :
-    command: shell.exec
-    params:
-      script: |
-        set -o errexit
-        set -o verbose
-
-        VERSION=${version}
-        WORKDIR=${workdir}
-
-        if [ "${build_cdriver|}" = "true" ]; then
-        CDRIVER_VERSION=1.10.3
-        rm -rf mongo-c-driver-$CDRIVER_VERSION
-        rm -rf mongo-c-driver
-        curl -LO https://github.com/mongodb/mongo-c-driver/releases/download/$CDRIVER_VERSION/mongo-c-driver-$CDRIVER_VERSION.tar.gz
-        tar xzf mongo-c-driver-$CDRIVER_VERSION.tar.gz
-        mv mongo-c-driver-$CDRIVER_VERSION mongo-c-driver
-        cd mongo-c-driver
-
-        trap "cat CMakeFiles/CMakeOutput.log" EXIT
-        export ${compile_env|}
-        ${cmake_path|/opt/cmake/bin/cmake} -DCMAKE_INSTALL_PREFIX=$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp -DENABLE_SHM_COUNTERS=OFF -DENABLE_SNAPPY=OFF -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF -DENABLE_ZLIB=OFF -DENABLE_SSL=OFF -DENABLE_SASL=OFF -DENABLE_TESTS=OFF -DENABLE_SRV=OFF -DENABLE_EXAMPLES=OFF -DENABLE_STATIC=OFF ${cdriver_cmake_flags}
-        make install VERBOSE=1
-        mv $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp $WORKDIR/src/build/mongo-embedded-sdk-$VERSION
         fi
 
   "build new tools" :
@@ -1432,8 +1419,10 @@ functions:
         exit_status=$?
         # If compile fails we do not run any tests
         if [ $exit_status -ne 0 ]; then
-          echo "Dumping build/scons/config.log"
-          cat build/scons/config.log
+          if [ ${dump_scons_config_on_failure} = 'true' ]; then
+            echo "Dumping build/scons/config.log"
+            cat build/scons/config.log
+          fi
           touch ${skip_tests}
         fi
         exit $exit_status
@@ -1696,30 +1685,6 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/idl/run_tests.py
 
-  "run embedded tests" :
-    command: shell.exec
-    type: test
-    params:
-      working_dir: src
-      script: |
-        set -o verbose
-        set -o errexit
-
-        ${activate_virtualenv}
-        if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" ]; then
-            ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_capi_test" --tempPath /data
-            ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_mongoc_client_test" --tempPath /data
-        elif [ ${enable_embedded_tests|false} = "android_emulator" ]; then
-            # strip because the binaries with debug symbols are too big for the default storage on the emulator
-            find build/mongo-embedded-sdk-${version}/bin -type f | xargs $(dirname $(pwd))/android_toolchain-${android_toolchain_target_arch}-${android_toolchain_api_version}/bin/*-linux-android*-strip
-            find build/mongo-embedded-sdk-${version}/lib -type f -name "*.so" | xargs $(dirname $(pwd))/android_toolchain-${android_toolchain_target_arch}-${android_toolchain_api_version}/bin/*-linux-android*-strip
-            ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_capi_test" --tempPath /data
-            ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_mongoc_client_test" --tempPath /data
-        elif [ ${enable_embedded_tests|false} = "native" ]; then
-          "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_capi_test"
-          "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_mongoc_client_test"
-        fi
-
   "run powercycle test" :
     - command: shell.exec
       params:
@@ -1779,6 +1744,8 @@ functions:
             done
           fi
 
+          # Set an exit trap so we can save the real exit status (see SERVER-34033).
+          trap 'echo $? > error_exit.txt; exit 0' EXIT
           config_file=powertest.yml
           eval $python pytests/powertest.py \
             "--saveConfigOptions=$config_file \
@@ -1797,10 +1764,22 @@ functions:
             ${mongod_extra_options}"
           set +o errexit
           $python -u pytests/powertest.py --configFile=$config_file
-          # SERVER-34033: Figure out why shell.exec exits at this point.
-          test_status=$?
-          echo "Completed pytests/powertest.py, status: $test_status"
-          exit $test_status
+
+    - command: expansions.update
+      params:
+        ignore_missing_file: true
+        file: src/${exit_file}
+
+    - command: shell.exec
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          # Trigger a system failure if powertest.py failed due to ssh access.
+          if [ -n "${ec2_ssh_failure}" ]; then
+            echo "ec2_ssh_failure detected - $(cat ${exit_file})"
+            exit ${exit_code}
+          fi
 
     - command: shell.exec
       params:
@@ -1821,6 +1800,25 @@ functions:
       params:
         ignore_missing_file: true
         file: src/ec2_artifacts.yml
+
+    - command: shell.exec
+      type: test
+      params:
+        shell: bash
+        script: |
+          # Test exits from here with specified exit_code.
+          if [ -n "${exit_code}" ]; then
+            # Python program saved exit_code
+            exit_code=${exit_code}
+          elif [ -f error_exit.txt ]; then
+            # Bash trap exit_code
+            exit_code=$(cat error_exit.txt)
+          else
+            exit_code=0
+          fi
+          echo "Exiting powercycle with code $exit_code"
+          exit $exit_code
+
 
   "do multiversion setup" :
     command: shell.exec
@@ -2001,8 +1999,8 @@ functions:
           ${activate_virtualenv}
           # Specify '--mode start' to ensure the remote instance is running.
           monitor_ec2_yml=monitor_ec2.yml
-          aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode start --yamlFile $monitor_ec2_yml)
-          echo "AMI EC2 instance ${instance_id} status: $aws_ec2"
+          $python buildscripts/aws_ec2.py --imageId ${instance_id} --mode start --yamlFile $monitor_ec2_yml
+          echo "AMI EC2 instance ${instance_id} status: $(cat $monitor_ec2_yml)"
           private_ip_address=$($python buildscripts/yaml_key_value.py --yamlFile $monitor_ec2_yml --yamlKey private_ip_address)
           if [ -z "$private_ip_address" ]; then
             echo "Cannot determine the IP address for the remote monitor."
@@ -2027,7 +2025,7 @@ functions:
           sleep 30
         done
 
-  "set up EC2 instance": &set_ec2_instance
+  "set up EC2 instance": &set_up_ec2_instance
     - command: shell.exec
       params:
         working_dir: src
@@ -2054,8 +2052,12 @@ functions:
             done
           fi
 
-          if [ ! -z "${expire_hours}" ]; then
-            expire_hours="-e ${expire_hours}"
+          if [ -n "${ec2_expire_hours}" ]; then
+            expire_hours="-e ${ec2_expire_hours}"
+            # Since Windows hosts are expensive to keep running we'll expire it after 3 hours.
+            if [ "Windows_NT" = "$OS" ]; then
+              expire_hours="-e 3"
+            fi
           fi
 
           # Clone another instance of this host in EC2.
@@ -2354,8 +2356,14 @@ functions:
         # has been stopped and started.
         ${activate_virtualenv}
         # Specify '--mode start' to ensure the remote instance is running.
+        now=$(date +'%Y%m%d%H%M%S')
         aws_ec2_status_yml=aws_ec2_status.yml
-        aws_ec2=$($python buildscripts/aws_ec2.py --imageId ${instance_id} --mode start --yamlFile $aws_ec2_status_yml)
+        $python buildscripts/aws_ec2.py            \
+          --imageId ${instance_id}                 \
+          --mode start                             \
+          --yamlFile $aws_ec2_status_yml           \
+          --consoleOutputFile ec2_console_$now.log \
+          --consoleScreenshotFile ec2_console_screen_shot_$now.jpg
         private_ip_address=$($python buildscripts/yaml_key_value.py --yamlFile $aws_ec2_status_yml --yamlKey private_ip_address)
         echo "private_ip_address: $private_ip_address" > private_ip_address.yml
 
@@ -2372,7 +2380,7 @@ functions:
       working_dir: src
       script: |
         # Tar/zip artifacts on remote host.
-        if [ -z "${ec2_artifacts}" ]; then
+        if [[ -z "${ec2_artifacts}" || -n "${ec2_ssh_failure}" ]]; then
           exit 0
         fi
         cmd="${tar|tar} czf ec2_artifacts.tgz ${ec2_artifacts}"
@@ -2392,7 +2400,7 @@ functions:
       working_dir: src
       script: |
         # Copy remote artifacts.
-        if [ -z "${ec2_artifacts}" ]; then
+        if [[ -z "${ec2_artifacts}" || -n "${ec2_ssh_failure}" ]]; then
           exit 0
         fi
         ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
@@ -2408,9 +2416,11 @@ functions:
   "cleanup EC2 instance": &cleanup_ec2_instance
     command: shell.exec
     params:
+      shell: bash
       working_dir: src
       script: |
-        if [ -z ${instance_id} ]; then
+        # We do not terminate the EC2 instance if there was an ec2_ssh_failure.
+        if [[ -z ${instance_id|""} || -n "${ec2_ssh_failure}" ]]; then
           exit 0
         fi
         ${activate_virtualenv}
@@ -2421,9 +2431,10 @@ functions:
   "gather remote mongo coredumps": &gather_remote_mongo_coredumps
     command: shell.exec
     params:
+      shell: bash
       working_dir: "src"
       script: |
-        if [ ! -f ${aws_ec2_yml|""} ]; then
+        if [[ ! -f ${aws_ec2_yml|""} || -n "${ec2_ssh_failure}" ]]; then
           exit 0
         fi
         ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
@@ -2448,9 +2459,10 @@ functions:
   "copy remote mongo coredumps": &copy_remote_mongo_coredumps
     command: shell.exec
     params:
+      shell: bash
       working_dir: "src"
       script: |
-        if [ ! -f ${aws_ec2_yml|""} ]; then
+        if [[ ! -f ${aws_ec2_yml|""} || -n "${ec2_ssh_failure}" ]]; then
           exit 0
         fi
         ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
@@ -2495,6 +2507,29 @@ functions:
       display_name: Remote EC2 Monitor - Execution ${execution}
       optional: true
 
+  "gather EC2 console artifacts": &gather_ec2_console_artifacts
+    command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        ec2_console_files=$(ls ec2_console* 2> /dev/null)
+        if [ -n "$ec2_console_files" ]; then
+          ${tar|tar} czf ec2_console_files.tgz $ec2_console_files
+        fi
+
+  "archive EC2 console artifacts": &archive_ec2_console_artifacts
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/ec2_console_files.tgz
+      remote_file: ${project}/${build_variant}/${revision}/ec2/ec2_console-${task_id}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/x-gzip}
+      display_name: EC2 Console files - Execution ${execution}
+      optional: true
+
   "save ec2 task artifacts":
     - *get_ec2_address
     - *update_ec2_address
@@ -2502,6 +2537,8 @@ functions:
     - *copy_ec2_artifacts
     - *gather_remote_mongo_coredumps
     - *copy_remote_mongo_coredumps
+    - *gather_ec2_console_artifacts
+    - *archive_ec2_console_artifacts
     - *cleanup_ec2_instance
     - *archive_remote_ec2_artifacts
     - *archive_remote_ec2_monitor_files
@@ -2584,7 +2621,7 @@ functions:
       # For ssh disable the options GSSAPIAuthentication, CheckHostIP, StrictHostKeyChecking
       # & UserKnownHostsFile, since these are local connections from one AWS instance to another.
       - key: ssh_connection_options
-        value: -o GSSAPIAuthentication=no -o CheckHostIP=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 -o ConnectionAttempts=20
+        value: -o GSSAPIAuthentication=no -o CheckHostIP=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o ConnectionAttempts=20
       - key: ssh_retries
         value: "10"
       - key: set_sudo
@@ -3087,6 +3124,7 @@ post:
   - func: "attach report"
   - func: "attach artifacts"
   - func: "save ec2 task artifacts"
+  - func: "call BF Suggestion service"
   - func: "kill processes"
   - func: "save local client logs"
   - func: "save code coverage data"
@@ -3141,7 +3179,6 @@ tasks:
   depends_on: []
   commands:
     - func: "build new tools"
-    - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
     - func: "scons compile"
       vars:
         targets: core tools dbtest integration_tests dist dist-debugsymbols distsrc-${ext|tgz} ${msi_target|}
@@ -3299,7 +3336,6 @@ tasks:
 - name: compile_all
   commands:
     - func: "build new tools"
-    - func: "build rocksdb" # noop if ${build_rocksdb} is not "true"
     - func: "scons compile"
       vars:
         targets: all
@@ -3339,24 +3375,39 @@ tasks:
         resmoke_args: --suites=unittests
         run_multiple_jobs: true
 
-## compile_mobile - build the mobile-dev and mobile-test targets only ##
-- name: compile_mobile
+## embedded_sdk_build_and_test_* - build the mobile-dev and mobile-test targets only ##
+
+- name: embedded_sdk_build_cdriver
   commands:
-    - command: manifest.load
-    - func: "git get project"
-    - func: "get buildnumber"
-    - func: "set up credentials"
-    - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
-    - func: "generate compile expansions"
-    # Then we load the generated version data into the agent so we can use it in task definitions.
-    - func: "apply compile expansions"
+    - command: shell.exec
+      params:
+        script: |
+          set -o errexit
+          set -o verbose
 
-    - func: "build cdriver" # noop if ${build_cdriver} is not "true"
+          VERSION=${version}
+          WORKDIR=${workdir}
 
+          CDRIVER_VERSION=1.10.3
+          rm -rf mongo-c-driver-$CDRIVER_VERSION
+          rm -rf mongo-c-driver
+          curl -LO https://github.com/mongodb/mongo-c-driver/releases/download/$CDRIVER_VERSION/mongo-c-driver-$CDRIVER_VERSION.tar.gz
+          tar xzf mongo-c-driver-$CDRIVER_VERSION.tar.gz
+          mv mongo-c-driver-$CDRIVER_VERSION mongo-c-driver
+          cd mongo-c-driver
+
+          trap "cat CMakeFiles/CMakeOutput.log" EXIT
+          export ${compile_env|}
+          ${cmake_path|/opt/cmake/bin/cmake} -DCMAKE_INSTALL_PREFIX=$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp -DENABLE_SHM_COUNTERS=OFF -DENABLE_SNAPPY=OFF -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF -DENABLE_ZLIB=OFF -DENABLE_SSL=OFF -DENABLE_SASL=OFF -DENABLE_TESTS=OFF -DENABLE_SRV=OFF -DENABLE_EXAMPLES=OFF -DENABLE_STATIC=OFF ${cdriver_cmake_flags}
+          make install VERBOSE=1
+          mv $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp $WORKDIR/src/build/mongo-embedded-sdk-$VERSION
+
+- name: embedded_sdk_install_dev
+  commands:
     - func: "scons compile"
       vars:
-        targets: install-mobile-dev install-mobile-test
-        task_compile_flags: >-
+        targets: install-mobile-dev
+        task_compile_flags: &embedded_sdk_compile_flags >-
           --disable-warnings-as-errors
           --install-mode=hygienic
           --js-engine=none
@@ -3369,18 +3420,8 @@ tasks:
           --wiredtiger=off
           CPPPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libbson-1.0 $BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libmongoc-1.0'
 
-    # Need to sign artifacts on iOS-ish.
-    - command: shell.exec
-      params:
-        working_dir: "src/build/mongo-embedded-sdk-${version}"
-        script: |
-          set -o errexit
-          set -o verbose
-          if command -v xcrun; then
-            # Do ad-hoc signing for now, until we have a better answer
-            find ./lib -type f -name "*.dylib" -print0 | xargs -0 -L 1 xcrun codesign -s -
-          fi
-
+- name: embedded_sdk_s3_put
+  commands:
     # Not using archive.targz_pack here because I can't get it to work.
     - command: shell.exec
       params:
@@ -3397,13 +3438,53 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "src/build/embedded-sdk.tgz"
-        remote_file: ${project}/embedded-sdk/${build_variant}/${revision}/${build_id}.tgz
+        remote_file: ${project}/embedded-sdk/${build_variant}/${revision}/${version}.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: application/tar
         display_name: "Embedded SDK Tar Archive"
 
-    - func: "run embedded tests"
+- name: embedded_sdk_install_tests
+  commands:
+    - func: "scons compile"
+      vars:
+        targets: install-mobile-test
+        task_compile_flags: *embedded_sdk_compile_flags
+
+- name: embedded_sdk_run_tests
+  commands:
+    - command: shell.exec
+      params:
+        working_dir: "src/build/mongo-embedded-sdk-${version}"
+        script: |
+          set -o errexit
+          set -o verbose
+          if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" -a $(command -v xcrun) ]; then
+            find ./lib -type f -name "*.dylib" -print0 | xargs -0 -L 1 xcrun codesign -s -
+          fi
+
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        script: |
+          set -o verbose
+          set -o errexit
+
+          ${activate_virtualenv}
+          if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" ]; then
+              ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_capi_test" --tempPath /data
+              ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_mongoc_client_test" --tempPath /data
+          elif [ ${enable_embedded_tests|false} = "android_emulator" ]; then
+              # strip because the binaries with debug symbols are too big for the default storage on the emulator
+              find build/mongo-embedded-sdk-${version}/bin -type f | xargs $(dirname $(pwd))/android_toolchain-${android_toolchain_target_arch}-${android_toolchain_api_version}/bin/*-linux-android*-strip
+              find build/mongo-embedded-sdk-${version}/lib -type f -name "*.so" | xargs $(dirname $(pwd))/android_toolchain-${android_toolchain_target_arch}-${android_toolchain_api_version}/bin/*-linux-android*-strip
+              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_capi_test" --tempPath /data
+              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_mongoc_client_test" --tempPath /data
+          elif [ ${enable_embedded_tests|false} = "native" ]; then
+            "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_capi_test"
+            "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_mongoc_client_test"
+          fi
 
     # If this is a patch build, blow away the file so our subsequent and optional s3.put
     # doesn't run. That way, we won't overwrite the latest part in our patches.
@@ -3415,6 +3496,8 @@ tasks:
             rm -f src/build/embedded-sdk.tgz
           fi
 
+- name: embedded_sdk_s3_put_latest
+  commands:
     # A second put, this time to -latest, to give devs a reasonable
     # way to get the most recent build.
     - command: s3.put
@@ -3429,8 +3512,6 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
 
-    - func: "scons cache pruning"
-    - func: "umount shared scons directory"
 
 - name: compile_benchmarks
   depends_on: []
@@ -3484,7 +3565,7 @@ tasks:
           # Since mypy requires python3, we need to activate the venv_3
           ${activate_virtualenv_3}
           pip install -r buildscripts/requirements.txt
-          updated_mypy=$(which mypy)
+          updated_mypy=$(PATH=$PATH:/opt/mongodbtoolchain/v2/bin which mypy)
           deactivate
           ###
           ${activate_virtualenv}
@@ -4401,7 +4482,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core --mongod=./mongoed --excludeWithAnyTags=requires_scripting,requires_auth,requires_sharding,does_not_support_stepdowns,requires_eval_command,requires_background_index,incompatible_with_embedded,incompatible_with_embedded_todo_investigate,requires_replication,SERVER-32997
+      resmoke_args: --suites=core --mongod=./mongoed --excludeWithAnyTags=requires_scripting,requires_auth,requires_sharding,does_not_support_stepdowns,requires_eval_command,requires_background_index,incompatible_with_embedded,incompatible_with_embedded_todo_investigate,requires_replication,requires_capped,requires_profiling
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4737,6 +4818,22 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=concurrency_replication_causal_consistency --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: concurrency_replication_ubsan
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_replication_ubsan --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: concurrency_replication_causal_consistency_ubsan
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_replication_causal_consistency_ubsan --storageEngine=wiredTiger
 
 - <<: *task_template
   name: concurrency_sharded_replication
@@ -6307,6 +6404,27 @@ tasks:
       <<: *powercycle_test
       mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1 --setParameter logComponentVerbosity='{storage:{recovery:2}}' --storageEngine wiredTiger\"
 
+- name: powercycle_kill_mongod
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "set up remote credentials"
+    vars:
+      <<: *powercycle_remote_credentials
+  - func: "set up EC2 instance"
+    vars:
+      <<: *powercycle_ec2_instance
+  - command: expansions.update
+    <<: *powercycle_expansions
+  - func: "run powercycle test"
+    timeout_secs: 1800 # 30 minute timeout for no output
+    vars:
+      <<: *powercycle_test
+      crash_options: --crashMethod=kill --crashWaitTime=45 --jitterForCrashWaitTime=5 --instanceId=${instance_id}
+      mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1 --setParameter logComponentVerbosity='{storage:{recovery:2}}' --storageEngine wiredTiger\"
+
 - name: powercycle_fcv3.6
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on:
@@ -6974,6 +7092,29 @@ task_groups:
   - compile_unittests
   - unittests
   - compile_all
+- name: embedded_sdk_build_and_test
+  setup_group:
+    - command: manifest.load
+    - func: "git get project"
+    - func: "get buildnumber"
+    - func: "set up credentials"
+    - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
+    - func: "generate compile expansions"
+  teardown_group:
+    - func: "scons cache pruning"
+    - func: "umount shared scons directory"
+  setup_task:
+    - func: "set up virtualenv"
+    - func: "set task expansion macros"
+    - func: "apply compile expansions"
+  teardown_task:
+  tasks:
+  - "embedded_sdk_build_cdriver"
+  - "embedded_sdk_install_dev"
+  - "embedded_sdk_s3_put"
+  - "embedded_sdk_install_tests"
+  - "embedded_sdk_run_tests"
+  - "embedded_sdk_s3_put_latest"
 
 #######################################
 #               Modules               #
@@ -6983,11 +7124,6 @@ task_groups:
 modules:
 - name: enterprise
   repo: git@github.com:10gen/mongo-enterprise-modules.git
-  prefix: src/mongo/db/modules
-  branch: v4.0
-
-- name: rocksdb
-  repo: git@github.com:mongodb-partners/mongo-rocks.git
   prefix: src/mongo/db/modules
   branch: v4.0
 
@@ -7430,6 +7566,7 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
   - name: powercycle
   - name: powercycle_fcv3.6
+  - name: powercycle_kill_mongod
   - name: powercycle_replication
   - name: powercycle_replication_smalloplog
   - name: powercycle_syncdelay
@@ -7443,6 +7580,152 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
+  - name: package
+    distros:
+    - ubuntu1604-packer
+  - name: push
+
+- name: ubuntu1804
+  display_name: SSL Ubuntu 18.04
+  run_on:
+  - ubuntu1804-test
+  batchtime: 1440 # 1 day
+  expansions:
+    test_flags: --excludeWithAnyTags=requires_mmapv1
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: x86_64-ubuntu1804
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1804 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    multiversion_platform: ubuntu1804
+    multiversion_edition: targeted
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    has_packages: true
+    packager_script: packager.py
+    packager_arch: x86_64
+    packager_distro: ubuntu1804
+    repo_edition: org
+    scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags ssl"
+    build_mongoreplay: true
+  display_tasks:
+  - *unittests
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - ubuntu1804-build
+  - name: aggregation
+  - name: aggregation_auth
+  - name: auth
+  - name: dbtest
+  - name: disk_wiredtiger
+  - name: failpoints
+  - name: failpoints_auth
+  - name: free_monitoring
+  - name: gle_auth
+  - name: gle_auth_write_cmd
+  - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_write_cmd
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_compatibility
+  - name: jsCore_decimal
+  - name: jsCore_txns
+  - name: aggregation_fuzzer
+  - name: jstestfuzz
+  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_concurrent_replication
+  - name: jstestfuzz_concurrent_sharded
+  - name: jstestfuzz_replication
+  - name: jstestfuzz_sharded
+  - name: mongosTest
+  - name: multiversion
+  - name: noPassthrough
+  - name: noPassthroughWithMongod
+  - name: bulk_gle_passthrough
+  - name: parallel
+  - name: parallel_compatibility
+  - name: concurrency
+  - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
+    distros:
+    - ubuntu1804-build
+  - name: concurrency_sharded_replication
+  - name: concurrency_sharded_replication_with_balancer
+  - name: concurrency_simultaneous
+  - name: replica_sets
+  - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
+  - name: sharding
+  - name: sharding_auth
+  - name: slow1
+  - name: serial_run
+  - name: sharding_jscore_passthrough
+  - name: ssl
+  - name: sslSpecial
+  - name: tool
+  - name: package
+    distros:
+    - ubuntu1604-packer
+  - name: push
+
+- name: enterprise-ubuntu1804-64
+  display_name: Enterprise Ubuntu 18.04
+  modules:
+  - enterprise
+  run_on:
+  - ubuntu1804-test
+  batchtime: 1440 # 1 day
+  expansions:
+    test_flags: --excludeWithAnyTags=requires_mmapv1
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-ubuntu1804
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1804 --release -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
+    multiversion_platform: ubuntu1804
+    multiversion_edition: enterprise
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    has_packages: true
+    packager_script: packager_enterprise.py
+    packager_arch: x86_64
+    packager_distro: ubuntu1804
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: true
+  display_tasks:
+  - *unittests
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - ubuntu1804-build
+  - name: audit
+  - name: dbtest
+  - name: ese
+  - name: jsCore
+  - name: jsCore_auth
+  - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: aggregation_fuzzer
+  - name: jstestfuzz
+  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_concurrent_replication
+  - name: jstestfuzz_concurrent_sharded
+  - name: jstestfuzz_replication
+  - name: jstestfuzz_sharded
+  - name: replica_sets_auth
+  - name: sasl
+  - name: sharding_auth
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: watchdog_mmapv1
+  - name: watchdog_wiredtiger
   - name: package
     distros:
     - ubuntu1604-packer
@@ -7621,26 +7904,11 @@ buildvariants:
   - name: parallel
   - name: parallel_compatibility
   - name: concurrency
-    distros:
-    # There is a known performance issue with the ubuntu1604-arm64-1.linaro.build.10gen.cc host
-    # that's part of the ubuntu1604-arm64-large pool. We run the concurrency tests only on the
-    # hosts from the ubuntu1604-arm64-small pool to work around this issue.
-    - ubuntu1604-arm64-small
   - name: concurrency_replication
-    distros:
-    - ubuntu1604-arm64-small
   - name: concurrency_replication_causal_consistency
-    distros:
-    - ubuntu1604-arm64-small
   - name: concurrency_sharded_replication
-    distros:
-    - ubuntu1604-arm64-small
   - name: concurrency_sharded_replication_with_balancer
-    distros:
-    - ubuntu1604-arm64-small
   - name: concurrency_simultaneous
-    distros:
-    - ubuntu1604-arm64-small
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -8114,7 +8382,6 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: replica_sets_auth
   - name: replica_sets_ese
-  - name: powercycle
   - name: sasl
   - name: sharding_auth
   - name: sharding_auth_audit
@@ -8871,6 +9138,7 @@ buildvariants:
   - name: parallel_compatibility
   - name: powercycle
   - name: powercycle_fcv3.6
+  - name: powercycle_kill_mongod
   - name: powercycle_replication
   - name: powercycle_syncdelay
   - name: read_concern_linearizable_passthrough
@@ -8951,7 +9219,6 @@ buildvariants:
     push_arch: x86_64
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
-    multiversion_platform: osx-ssl
     num_jobs_available: 1
     gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     tooltags: "-tags 'ssl openssl_pre_1.0'"
@@ -9003,7 +9270,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9043,8 +9309,6 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
   - name: write_concern_majority_passthrough
   - name: push
     distros:
@@ -9099,8 +9363,6 @@ buildvariants:
     gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
     build_mongoreplay: true
-    multiversion_platform: osx
-    multiversion_edition: enterprise
   display_tasks:
   - *unittests
   tasks:
@@ -9113,7 +9375,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9147,8 +9408,6 @@ buildvariants:
     compile_flags: --ssl --ssl-provider=openssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" LIBPATH="$PWD/openssl_install_dir/lib" CPPPATH="$PWD/openssl_install_dir/include"
     num_jobs_available: 1
     build_mongoreplay: true
-    multiversion_platform: osx
-    multiversion_edition: enterprise
     build_openssl: true
     openssl_config_flags: "-mmacosx-version-min=10.10"
     openssl_make_flags: "-j$(sysctl -n hw.logicalcpu)"
@@ -9164,7 +9423,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9188,7 +9446,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
-    build_cdriver: true
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
     compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
     compile_flags: >-
@@ -9205,12 +9462,13 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
         -DCMAKE_C_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10"
-        -DCMAKE_LINKER_FLAGS="-isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10"
+        -DCMAKE_LINKER_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10"
         -DCMAKE_INSTALL_NAME_DIR=@rpath
     disable_unit_tests: true
     enable_embedded_tests: native
+    dump_scons_config_on_failure: true
   tasks:
-  - name: compile_mobile
+  - name: embedded_sdk_build_and_test
 
 - name: embedded-sdk-iphoneos-10.2
   display_name: "Embedded SDK - iOS 10.2"
@@ -9219,8 +9477,8 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
-    build_cdriver: true
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
+    compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_ios.vars
@@ -9233,13 +9491,13 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2"
-        -DCMAKE_LINKER_FLAGS="-isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2"
+        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2"
+        -DCMAKE_LINKER_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2"
         -DCMAKE_INSTALL_NAME_DIR=@rpath
-    compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
     disable_unit_tests: true
+    dump_scons_config_on_failure: true
   tasks:
-  - name: compile_mobile
+  - name: embedded_sdk_build_and_test
 
 - name: embedded-sdk-iphonesimulator-10.2
   display_name: "Embedded SDK - iOS Simulator 10.2"
@@ -9248,7 +9506,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
-    build_cdriver: true
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
     compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
     compile_flags: >-
@@ -9263,15 +9520,16 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
-        -DCMAKE_LINKER_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
+        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
+        -DCMAKE_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
         -DCMAKE_INSTALL_NAME_DIR=@rpath
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: iPhone-7
     ios_sim_runtime: iOS-10-2
+    dump_scons_config_on_failure: true
   tasks:
-  - name: compile_mobile
+  - name: embedded_sdk_build_and_test
 
 - name: embedded-sdk-appletvos-10.2
   display_name: "Embedded SDK - tvOS 10.2"
@@ -9279,7 +9537,6 @@ buildvariants:
   - macos-1012
   batchtime: 1440 # 1 day
   expansions:
-    build_cdriver: true
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
     test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
     compile_env: DEVELOPER_DIR=/Applications/XCode9.2.app
@@ -9295,12 +9552,13 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch arm64 -isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2"
-        -DCMAKE_LINKER_FLAGS="-isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2"
+        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2"
+        -DCMAKE_LINKER_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2"
         -DCMAKE_INSTALL_NAME_DIR=@rpath
     disable_unit_tests: true
+    dump_scons_config_on_failure: true
   tasks:
-  - name: compile_mobile
+  - name: embedded_sdk_build_and_test
 
 - name: embedded-sdk-appletvsimulator-10.2
   display_name: "Embedded SDK - tvOS Simulator 10.2"
@@ -9308,7 +9566,6 @@ buildvariants:
   - macos-1012
   batchtime: 1440 # 1 day
   expansions:
-    build_cdriver: true
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
     test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
     compile_env: DEVELOPER_DIR=/Applications/XCode9.2.app
@@ -9324,15 +9581,85 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
-        -DCMAKE_LINKER_FLAGS="-isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
+        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
+        -DCMAKE_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
         -DCMAKE_INSTALL_NAME_DIR=@rpath
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: Apple-TV-1080p
     ios_sim_runtime: tvOS-10-2
+    dump_scons_config_on_failure: true
   tasks:
-  - name: compile_mobile
+  - name: embedded_sdk_build_and_test
+
+- name: embedded-sdk-watchos-4.2
+  display_name: "Embedded SDK - watchOS 4.2"
+  run_on:
+  - macos-1012
+  batchtime: 1440 # 1 day
+  expansions:
+    cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
+    compile_env: DEVELOPER_DIR=/Applications/XCode9.2.app
+    compile_flags: >-
+      -j$(sysctl -n hw.logicalcpu)
+      --dbg=off
+      --opt=size
+      --enable-free-mon=off
+      --variables-files=etc/scons/xcode_watchos.vars
+      --use-system-mongo-c=on
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+    cdriver_cmake_flags: >-
+        -DTHREADS_PTHREAD_ARG=2
+        -DCMAKE_SYSTEM_NAME=Darwin
+        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk watchos --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
+        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
+        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
+        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DCMAKE_C_FLAGS="-arch armv7k -fembed-bitcode -isysroot $(xcrun --sdk watchos --show-sdk-path) -mwatchos-version-min=4.2"
+        -DCMAKE_LINKER_FLAGS="-arch armv7k -fembed-bitcode -isysroot $(xcrun --sdk watchos --show-sdk-path) -mwatchos-version-min=4.2"
+        -DCMAKE_INSTALL_NAME_DIR=@rpath
+    disable_unit_tests: true
+    dump_scons_config_on_failure: true
+  tasks:
+  - name: embedded_sdk_build_and_test
+
+- name: embedded-sdk-watchsimulator-4.2
+  display_name: "Embedded SDK - watchOS Simulator 4.2"
+  run_on:
+  - macos-1012
+  batchtime: 1440 # 1 day
+  expansions:
+    cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
+    test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
+    compile_env: DEVELOPER_DIR=/Applications/XCode9.2.app
+    compile_flags: >-
+      -j$(sysctl -n hw.logicalcpu)
+      --dbg=off
+      --opt=size
+      --enable-free-mon=off
+      --variables-files=etc/scons/xcode_watchos_sim.vars
+      --use-system-mongo-c=on
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+    cdriver_cmake_flags: >-
+        -DTHREADS_PTHREAD_ARG=2
+        -DCMAKE_SYSTEM_NAME=Darwin
+        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk watchsimulator --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
+        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
+        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
+        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DCMAKE_C_FLAGS="-arch i386 -fembed-bitcode -isysroot $(xcrun --sdk watchsimulator --show-sdk-path) -mwatchos-version-min=4.2"
+        -DCMAKE_LINKER_FLAGS="-arch i386 -fembed-bitcode -isysroot $(xcrun --sdk watchsimulator --show-sdk-path) -mwatchos-version-min=4.2"
+        -DCMAKE_INSTALL_NAME_DIR=@rpath
+    disable_unit_tests: true
+    enable_embedded_tests: ios_tvos_simulator
+    ios_sim_device: Apple-Watch-Series-3-42mm
+    ios_sim_runtime: watchOS-4-2
+    dump_scons_config_on_failure: true
+  tasks:
+  - name: embedded_sdk_build_and_test
 
 - name: embedded-sdk-ubuntu-1604-x86_64
   display_name: "Embedded SDK - Ubuntu 16.04 x86_64"
@@ -9341,7 +9668,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
-    build_cdriver: true
     # We need --allocator=system here to work around SERVER-XXXXX
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
@@ -9352,12 +9678,11 @@ buildvariants:
         -DCMAKE_C_COMPILER=/opt/mongodbtoolchain/v2/bin/gcc
         -DCMAKE_CXX_COMPILER=/opt/mongodbtoolchain/v2/bin/g++
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     disable_unit_tests: true
     enable_embedded_tests: native
+    dump_scons_config_on_failure: true
   tasks:
-  - name: compile_mobile
+  - name: embedded_sdk_build_and_test
 
 - name: embedded-sdk-android-arm32
   display_name: "Embedded SDK - Android arm32"
@@ -9366,7 +9691,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
-    build_cdriver: true
     compile_env: JAVA_HOME=/opt/java/jdk8/
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
@@ -9385,17 +9709,16 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     disable_unit_tests: true
     enable_embedded_tests: android_emulator
     setup_android_toolchain: true
     android_toolchain_system_image_arch: "armeabi-v7a"
-    android_system_image_version: "25"
+    android_system_image_version: "24"
     android_toolchain_target_arch: "arm"
     android_toolchain_api_version: "21"
+    dump_scons_config_on_failure: true
   tasks:
-  - name: compile_mobile
+  - name: embedded_sdk_build_and_test
 
 - name: embedded-sdk-android-arm64
   display_name: "Embedded SDK - Android arm64"
@@ -9404,7 +9727,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
-    build_cdriver: true
     compile_env: JAVA_HOME=/opt/java/jdk8/
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
@@ -9422,17 +9744,16 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
-    test_flags: --excludeWithAnyTags=requires_mmapv1
-    compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     disable_unit_tests: true
     enable_embedded_tests: android_emulator
     setup_android_toolchain: true
     android_toolchain_system_image_arch: "arm64-v8a"
-    android_system_image_version: "25"
+    android_system_image_version: "24"
     android_toolchain_target_arch: "arm64"
     android_toolchain_api_version: "21"
+    dump_scons_config_on_failure: true
   tasks:
-  - name: compile_mobile
+  - name: embedded_sdk_build_and_test
 
 - name: embedded-sdk-android-x86_64
   display_name: "Embedded SDK - Android x86_64"
@@ -9441,7 +9762,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1,uses_transactions
-    build_cdriver: true
     compile_env: JAVA_HOME=/opt/java/jdk8/
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
@@ -9459,17 +9779,17 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
-    compile_env: JAVA_HOME=/opt/java/jdk8/
     disable_unit_tests: true
     # The Android x86_64 emulator requires KVM.
     enable_embedded_tests: android_emulator
     setup_android_toolchain: true
     android_toolchain_system_image_arch: "x86_64"
-    android_system_image_version: 21
+    android_system_image_version: "24"
     android_toolchain_target_arch: "x86_64"
     android_toolchain_api_version: "21"
+    dump_scons_config_on_failure: true
   tasks:
-  - name: compile_mobile
+  - name: embedded_sdk_build_and_test
 
 ###########################################
 #          Redhat buildvariants           #
@@ -10718,7 +11038,7 @@ buildvariants:
   expansions:
     compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_gcc.vars --use-s390x-crc32=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    test_flags: --excludeWithAnyTags=requires_mmapv1,blacklist_from_rhel_67_s390x
     has_packages: true
     packager_script: packager_enterprise.py
     packager_arch: s390x
@@ -10815,7 +11135,7 @@ buildvariants:
   expansions:
     compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_gcc.vars --use-s390x-crc32=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    test_flags: --excludeWithAnyTags=requires_mmapv1
+    test_flags: --excludeWithAnyTags=requires_mmapv1,blacklist_from_rhel_67_s390x
     has_packages: true
     packager_script: packager.py
     packager_arch: s390x
@@ -11730,8 +12050,8 @@ buildvariants:
     # mobile storage engine.
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions
-      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993,SERVER-32997
+      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling
+      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --mobile-se=on
@@ -11754,7 +12074,8 @@ buildvariants:
   - name: aggregation_facet_unwind_passthrough
   - name: auth
   - name: dbtest
-  # TODO SERVER-32993: Re-enable the concurrency suite on the mobile storage engine builders.
+  # TODO SERVER-32993: Re-enable the concurrency and concurrency_simultaneous suite on the
+  # mobile storage engine builders.
   # - name: concurrency
   # - name: concurrency_simultaneous
   - name: disk_mobile
@@ -11770,6 +12091,7 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsonSchema
   - name: jstestfuzz
+  - name: jstestfuzz_concurrent
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: parallel
@@ -11785,8 +12107,8 @@ buildvariants:
   expansions:
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions
-      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993,SERVER-32997
+      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling
+      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993
     compile_flags: >-
         -j$(grep -c ^processor /proc/cpuinfo)
         --mobile-se=on
@@ -11809,7 +12131,8 @@ buildvariants:
   - name: aggregation_facet_unwind_passthrough
   - name: auth
   - name: dbtest
-  # TODO SERVER-32993: Re-enable the concurrency suite on the mobile storage engine builders.
+  # TODO SERVER-32993: Re-enable the concurrency and concurrency_simultaneous suite on the
+  # mobile storage engine builders.
   # - name: concurrency
   # - name: concurrency_simultaneous
   - name: disk_mobile
@@ -11825,6 +12148,7 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsonSchema
   - name: jstestfuzz
+  - name: jstestfuzz_concurrent
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: parallel
@@ -11867,8 +12191,8 @@ buildvariants:
     # mobile storage engine.
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions
-      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993,SERVER-32997
+      --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling
+      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
@@ -11891,7 +12215,8 @@ buildvariants:
   - name: aggregation_facet_unwind_passthrough
   - name: auth
   - name: dbtest
-  # TODO SERVER-32993: Re-enable the concurrency suite on the mobile storage engine builders.
+  # TODO SERVER-32993: Re-enable the concurrency and concurrency_simultaneous suite on the
+  # mobile storage engine builders.
   # - name: concurrency
   # - name: concurrency_simultaneous
   - name: disk_mobile
@@ -11907,6 +12232,7 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsonSchema
   - name: jstestfuzz
+  - name: jstestfuzz_concurrent
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: parallel
@@ -12171,30 +12497,6 @@ buildvariants:
   - name: write_concern_majority_passthrough
   - name: secondary_reads_passthrough
 
-- name: ubuntu1404-rocksdb
-  display_name: Ubuntu 14.04 (RocksDB)
-  modules:
-  - rocksdb
-  run_on:
-  - ubuntu1404-test
-  batchtime: 120960 # 12 weeks
-  expansions:
-    build_rocksdb: true
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on CPPPATH=$(readlink -f ../rocksdb/include/) LIBPATH=$(readlink -f ../rocksdb/) LIBS=rocksdb --variables-files=etc/scons/mongodbtoolchain_gcc.vars --runtime-hardening=off
-    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
-    # Transactions are not explicitly supported on the RocksDB storage engine.
-    test_flags: --storageEngine=rocksdb --excludeWithAnyTags=requires_mmapv1,requires_wiredtiger,uses_transactions
-    use_scons_cache: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: ""
-    build_mongoreplay: true
-  stepback: false
-  tasks:
-  - name: compile_TG
-    distros:
-    - ubuntu1404-build
-  - name: dbtest
-  - name: jsCore
 
 ###########################################
 #     Experimental buildvariants          #
@@ -12439,8 +12741,9 @@ buildvariants:
   - name: change_streams_whole_cluster_secondary_reads_passthrough
   - name: change_streams_whole_cluster_sharded_collections_passthrough
   - name: concurrency
-  - name: concurrency_replication
-  - name: concurrency_replication_causal_consistency
+  # TODO: SERVER-35964 revert the addition of UBSAN concurrency_replication suites.
+  - name: concurrency_replication_ubsan
+  - name: concurrency_replication_causal_consistency_ubsan
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -12685,9 +12988,7 @@ buildvariants:
   batchtime: 1440 # 1 day
   stepback: false
   tasks:
-  # TODO SERVER-35165: Re-enable the update_test_lifecycle task once Evergreen has 28 days worth of
-  # task history.
-  # - name: update_test_lifecycle
+  - name: update_test_lifecycle
   - name: fetch_test_lifecycle
     distros:
     - rhel62-small
