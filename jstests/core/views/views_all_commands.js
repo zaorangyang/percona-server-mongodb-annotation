@@ -67,6 +67,7 @@
 
     let viewsCommandTests = {
         _cloneCatalogData: {skip: isAnInternalCommand},
+        _cloneCollectionOptionsFromPrimaryShard: {skip: isAnInternalCommand},
         _configsvrAddShard: {skip: isAnInternalCommand},
         _configsvrAddShardToZone: {skip: isAnInternalCommand},
         _configsvrBalancerStart: {skip: isAnInternalCommand},
@@ -102,6 +103,7 @@
         _recvChunkCommit: {skip: isAnInternalCommand},
         _recvChunkStart: {skip: isAnInternalCommand},
         _recvChunkStatus: {skip: isAnInternalCommand},
+        _shardsvrShardCollection: {skip: isAnInternalCommand},
         _transferMods: {skip: isAnInternalCommand},
         abortTransaction: {skip: isUnrelated},
         addShard: {skip: isUnrelated},

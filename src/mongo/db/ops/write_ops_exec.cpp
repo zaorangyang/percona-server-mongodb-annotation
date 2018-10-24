@@ -36,6 +36,7 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog_raii.h"
@@ -62,8 +63,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/implicit_create_collection.h"
-#include "mongo/db/s/shard_filtering_metadata_refresh.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
@@ -125,16 +125,12 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
             boost::optional<Session::TxnResources> txnResources;
             if (session && session->inMultiDocumentTransaction()) {
                 // Stash the current transaction so that writes to the profile collection are not
-                // done as part of the transaction. This must be done under the client lock, since
-                // we are modifying 'opCtx'.
-                stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+                // done as part of the transaction.
                 txnResources = Session::TxnResources(opCtx);
             }
             ON_BLOCK_EXIT([&] {
                 if (txnResources) {
-                    // Restore the transaction state onto 'opCtx'. This must be done under the
-                    // client lock, since we are modifying 'opCtx'.
-                    stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+                    // Restore the transaction state onto 'opCtx'.
                     txnResources->release(opCtx);
                 }
             });
@@ -201,7 +197,7 @@ void assertCanWrite_inlock(OperationContext* opCtx, const NamespaceString& ns) {
 void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
     auto session = OperationContextSession::get(opCtx);
     auto inTransaction = session && session->inMultiDocumentTransaction();
-    uassert(ErrorCodes::NamespaceNotFound,
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot create namespace " << ns.ns()
                           << " in multi-document transaction.",
             !inTransaction);
@@ -243,24 +239,19 @@ bool handleError(OperationContext* opCtx,
         throw;
     }
 
-    if (auto staleInfo = ex.extraInfo<StaleConfigInfo>()) {
+    if (ex.extraInfo<StaleConfigInfo>()) {
         if (!opCtx->getClient()->isInDirectClient()) {
-            // We already have the StaleConfig exception, so just swallow any errors due to refresh
-            onShardVersionMismatch(opCtx, nss, staleInfo->getVersionReceived()).ignore();
+            auto& oss = OperationShardingState::get(opCtx);
+            oss.setShardingOperationFailedStatus(ex.toStatus());
         }
 
         // Don't try doing more ops since they will fail with the same error.
         // Command reply serializer will handle repeating this error if needed.
         out->results.emplace_back(ex.toStatus());
         return false;
-    } else if (auto cannotImplicitCreateCollInfo =
-                   ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-        if (ShardingState::get(opCtx)->enabled()) {
-            // Ignore status since we already put the cannot implicitly create error as the
-            // result of the write.
-            onCannotImplicitlyCreateCollection(opCtx, cannotImplicitCreateCollInfo->getNss())
-                .ignore();
-        }
+    } else if (ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
+        auto& oss = OperationShardingState::get(opCtx);
+        oss.setShardingOperationFailedStatus(ex.toStatus());
 
         // Don't try doing more ops since they will fail with the same error.
         // Command reply serializer will handle repeating this error if needed.
@@ -300,7 +291,7 @@ SingleWriteResult createIndex(OperationContext* opCtx,
     // Unlike normal inserts, it is not an error to "insert" a duplicate index.
     long long n =
         cmdResult["numIndexesAfter"].numberInt() - cmdResult["numIndexesBefore"].numberInt();
-    CurOp::get(opCtx)->debug().ninserted += n;
+    CurOp::get(opCtx)->debug().additiveMetrics.incrementNinserted(n);
 
     SingleWriteResult result;
     result.setN(n);
@@ -336,7 +327,8 @@ WriteResult performCreateIndexes(OperationContext* opCtx, const write_ops::Inser
 void insertDocuments(OperationContext* opCtx,
                      Collection* collection,
                      std::vector<InsertStatement>::iterator begin,
-                     std::vector<InsertStatement>::iterator end) {
+                     std::vector<InsertStatement>::iterator end,
+                     bool fromMigrate) {
     // Intentionally not using writeConflictRetry. That is handled by the caller so it can react to
     // oversized batches.
     WriteUnitOfWork wuow(opCtx);
@@ -365,7 +357,7 @@ void insertDocuments(OperationContext* opCtx,
     }
 
     uassertStatusOK(collection->insertDocuments(
-        opCtx, begin, end, &CurOp::get(opCtx)->debug(), /*enforceQuota*/ true));
+        opCtx, begin, end, &CurOp::get(opCtx)->debug(), /*enforceQuota*/ true, fromMigrate));
     wuow.commit();
 }
 
@@ -376,7 +368,8 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                                 const write_ops::Insert& wholeOp,
                                 std::vector<InsertStatement>& batch,
                                 LastOpFixer* lastOpFixer,
-                                WriteResult* out) {
+                                WriteResult* out,
+                                bool fromMigrate) {
     if (batch.empty())
         return true;
 
@@ -413,14 +406,15 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
             // First try doing it all together. If all goes well, this is all we need to do.
             // See Collection::_insertDocuments for why we do all capped inserts one-at-a-time.
             lastOpFixer->startingOp();
-            insertDocuments(opCtx, collection->getCollection(), batch.begin(), batch.end());
+            insertDocuments(
+                opCtx, collection->getCollection(), batch.begin(), batch.end(), fromMigrate);
             lastOpFixer->finishedOpSuccessfully();
             globalOpCounters.gotInserts(batch.size());
             SingleWriteResult result;
             result.setN(1);
 
             std::fill_n(std::back_inserter(out->results), batch.size(), std::move(result));
-            curOp.debug().ninserted += batch.size();
+            curOp.debug().additiveMetrics.incrementNinserted(batch.size());
             return true;
         }
     } catch (const DBException&) {
@@ -446,12 +440,12 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                     if (!collection)
                         acquireCollection();
                     lastOpFixer->startingOp();
-                    insertDocuments(opCtx, collection->getCollection(), it, it + 1);
+                    insertDocuments(opCtx, collection->getCollection(), it, it + 1, fromMigrate);
                     lastOpFixer->finishedOpSuccessfully();
                     SingleWriteResult result;
                     result.setN(1);
                     out->results.emplace_back(std::move(result));
-                    curOp.debug().ninserted++;
+                    curOp.debug().additiveMetrics.incrementNinserted(1);
                 } catch (...) {
                     // Release the lock following any error if we are not in multi-statement
                     // transaction. Among other things, this ensures that we don't sleep in the WCE
@@ -488,7 +482,9 @@ SingleWriteResult makeWriteResultForInsertOrDeleteRetry() {
 
 }  // namespace
 
-WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& wholeOp) {
+WriteResult performInserts(OperationContext* opCtx,
+                           const write_ops::Insert& wholeOp,
+                           bool fromMigrate) {
     // Insert performs its own retries, so we should only be within a WriteUnitOfWork when run in a
     // transaction.
     auto session = OperationContextSession::get(opCtx);
@@ -515,7 +511,7 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
         curOp.setNS_inlock(wholeOp.getNamespace().ns());
         curOp.setLogicalOp_inlock(LogicalOp::opInsert);
         curOp.ensureStarted();
-        curOp.debug().ninserted = 0;
+        curOp.debug().additiveMetrics.ninserted = 0;
     }
 
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
@@ -568,7 +564,8 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
                 continue;  // Add more to batch before inserting.
         }
 
-        bool canContinue = insertBatchAndHandleErrors(opCtx, wholeOp, batch, &lastOpFixer, &out);
+        bool canContinue =
+            insertBatchAndHandleErrors(opCtx, wholeOp, batch, &lastOpFixer, &out, fromMigrate);
         batch.clear();  // We won't need the current batch any more.
         bytesInBatch = 0;
 
@@ -772,7 +769,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         curOp.ensureStarted();
     }
 
-    curOp.debug().ndeleted = 0;
+    curOp.debug().additiveMetrics.ndeleted = 0;
 
     DeleteRequest request(ns);
     request.setQuery(op.getQ());
@@ -812,7 +809,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
 
     uassertStatusOK(exec->executePlan());
     long long n = DeleteStage::getNumDeleted(*exec);
-    curOp.debug().ndeleted = n;
+    curOp.debug().additiveMetrics.ndeleted = n;
 
     PlanSummaryStats summary;
     Explain::getSummaryStats(*exec, &summary);

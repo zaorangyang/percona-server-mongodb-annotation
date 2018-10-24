@@ -42,6 +42,7 @@ env.Library(
         'move_timing_helper.cpp',
         'namespace_metadata_change_notifications.cpp',
         'read_only_catalog_cache_loader.cpp',
+        'scoped_operation_completion_sharding_actions.cpp',
         'session_catalog_migration_destination.cpp',
         'session_catalog_migration_source.cpp',
         'shard_filtering_metadata_refresh.cpp',
@@ -58,6 +59,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/dbhelpers',
+        '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         '$BUILD_DIR/mongo/db/repl/oplog',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/rw_concern_d',
@@ -143,12 +145,12 @@ env.Library(
 env.Library(
     target='balancer',
     source=[
-        'balancer/balancer.cpp',
-        'balancer/balancer_chunk_selection_policy.cpp',
         'balancer/balancer_chunk_selection_policy_impl.cpp',
+        'balancer/balancer_chunk_selection_policy.cpp',
         'balancer/balancer_policy.cpp',
-        'balancer/cluster_statistics.cpp',
+        'balancer/balancer.cpp',
         'balancer/cluster_statistics_impl.cpp',
+        'balancer/cluster_statistics.cpp',
         'balancer/migration_manager.cpp',
         'balancer/scoped_migration_request.cpp',
         'balancer/type_migration.cpp',
@@ -184,13 +186,14 @@ env.CppUnitTest(
 env.Library(
     target='sharding_catalog_manager',
     source=[
+        'config/initial_split_policy.cpp',
+        'config/namespace_serializer.cpp',
         'config/sharding_catalog_manager_chunk_operations.cpp',
         'config/sharding_catalog_manager_collection_operations.cpp',
-        'config/sharding_catalog_manager.cpp',
         'config/sharding_catalog_manager_database_operations.cpp',
         'config/sharding_catalog_manager_shard_operations.cpp',
         'config/sharding_catalog_manager_zone_operations.cpp',
-        'config/namespace_serializer.cpp',
+        'config/sharding_catalog_manager.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/audit',
@@ -217,6 +220,7 @@ env.Library(
         'check_sharding_index_command.cpp',
         'cleanup_orphaned_cmd.cpp',
         'clone_catalog_data_command.cpp',
+        'clone_collection_options_from_primary_shard_cmd.cpp',
         'config/configsvr_add_shard_command.cpp',
         'config/configsvr_add_shard_to_zone_command.cpp',
         'config/configsvr_commit_chunk_migration_command.cpp',
@@ -245,6 +249,7 @@ env.Library(
         'move_chunk_command.cpp',
         'move_primary_command.cpp',
         'set_shard_version_command.cpp',
+        'shardsvr_shard_collection.cpp',
         'sharding_server_status.cpp',
         'sharding_state_command.cpp',
         'split_chunk_command.cpp',
@@ -384,6 +389,7 @@ env.CppUnitTest(
 env.CppUnitTest(
     target='sharding_catalog_manager_test',
     source=[
+        'config/initial_split_policy_test.cpp',
         'config/sharding_catalog_manager_add_shard_test.cpp',
         'config/sharding_catalog_manager_add_shard_to_zone_test.cpp',
         'config/sharding_catalog_manager_assign_key_range_to_zone_test.cpp',

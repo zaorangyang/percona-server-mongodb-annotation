@@ -50,7 +50,7 @@
             startTransaction: true,
             autocommit: false
         })),
-                                     [50767, 50768, 50851]);
+                                     ErrorCodes.OperationNotSupportedInTransaction);
         assert.commandFailedWithCode(sessionDb.adminCommand({
             commitTransaction: 1,
             txnNumber: NumberLong(txnNumber),
@@ -75,7 +75,7 @@
                 {},
                 command,
                 {txnNumber: NumberLong(txnNumber), stmtId: NumberInt(1), autocommit: false})),
-            [50767, 50768, 50851]);
+            ErrorCodes.OperationNotSupportedInTransaction);
         assert.commandWorked(sessionDb.adminCommand({
             commitTransaction: 1,
             txnNumber: NumberLong(txnNumber),
@@ -111,6 +111,10 @@
     //
 
     const nonSessionCommands = [
+        {isMaster: 1},
+        {buildInfo: 1},
+        {ping: 1},
+        {listCommands: 1},
         {create: "create_collection", writeConcern: {w: "majority"}},
         {drop: "drop_collection", writeConcern: {w: "majority"}},
         {
@@ -126,7 +130,7 @@
         setup();
         assert.commandFailedWithCode(
             sessionDb.runCommand(Object.assign({}, command, {txnNumber: NumberLong(++txnNumber)})),
-            50768);
+            [50768, 50889]);
     });
 
     //

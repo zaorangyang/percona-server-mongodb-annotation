@@ -152,6 +152,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
     }
 
     ReplSetHeartbeatResponse hbResponse;
+    OpTime lastOpCommitted;
     BSONObj resp;
     if (responseStatus.isOK()) {
         resp = cbData.response.data;
@@ -180,9 +181,11 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
             replMetadata = responseStatus;
         }
         if (replMetadata.isOK()) {
+            lastOpCommitted = replMetadata.getValue().getLastOpCommitted();
+
             // Arbiters are the only nodes allowed to advance their commit point via heartbeats.
             if (_getMemberState_inlock().arbiter()) {
-                _advanceCommitPoint_inlock(replMetadata.getValue().getLastOpCommitted());
+                _advanceCommitPoint_inlock(lastOpCommitted);
             }
             // Asynchronous stepdown could happen, but it will wait for _mutex and execute
             // after this function, so we cannot and don't need to wait for it to finish.
@@ -211,8 +214,8 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         hbStatusResponse = StatusWith<ReplSetHeartbeatResponse>(responseStatus);
     }
 
-    HeartbeatResponseAction action =
-        _topCoord->processHeartbeatResponse(now, networkTime, target, hbStatusResponse);
+    HeartbeatResponseAction action = _topCoord->processHeartbeatResponse(
+        now, networkTime, target, hbStatusResponse, lastOpCommitted);
 
     if (action.getAction() == HeartbeatResponseAction::NoAction && hbStatusResponse.isOK() &&
         hbStatusResponse.getValue().hasState() &&
@@ -220,9 +223,6 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         action.getAdvancedOpTime()) {
         _updateLastCommittedOpTime_inlock();
     }
-
-    // Wake the stepdown waiter when our updated OpTime allows it to finish stepping down.
-    _signalStepDownWaiterIfReady_inlock();
 
     // Abort catchup if we have caught up to the latest known optime after heartbeat refreshing.
     if (_catchupState) {
@@ -829,7 +829,7 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
     }
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     // If it is not a single node replica set, no need to start an election after stepdown timeout.
-    if (reason == TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout &&
+    if (reason == TopologyCoordinator::StartElectionReason::kSingleNodePromptElection &&
         _rsConfig.getNumMembers() != 1) {
         return;
     }
@@ -865,8 +865,8 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
                 log() << "Not starting an election for a catchup takeover, "
                       << "since we are not electable due to: " << status.reason();
                 break;
-            case TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout:
-                log() << "Not starting an election for a single node replica set stepdown timeout, "
+            case TopologyCoordinator::StartElectionReason::kSingleNodePromptElection:
+                log() << "Not starting an election for a single node replica set prompt election, "
                       << "since we are not electable due to: " << status.reason();
                 break;
         }
@@ -887,8 +887,8 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
         case TopologyCoordinator::StartElectionReason::kCatchupTakeover:
             log() << "Starting an election for a catchup takeover";
             break;
-        case TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout:
-            log() << "Starting an election due to single node replica set stepdown timeout";
+        case TopologyCoordinator::StartElectionReason::kSingleNodePromptElection:
+            log() << "Starting an election due to single node replica set prompt election";
             break;
     }
 

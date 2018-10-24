@@ -495,10 +495,22 @@ struct __wt_cursor {
 	 * \c S), or raw byte arrays accessed using a WT_ITEM structure (value
 	 * format type \c u).
 	 *
-	 * Calling the WT_CURSOR::modify method outside of snapshot isolation
-	 * can lead to unexpected results. While \c read-committed isolation
-	 * is supported with the WT_CURSOR::modify method, \c read-uncommitted
-	 * isolation is not.
+	 * The WT_CURSOR::modify method can only be called from within an
+	 * explicit transaction configured at a higher isolation level than
+	 * \c read-uncommitted. Using \c read-committed isolation is allowed,
+	 * but requires caution: reading a value, re-positioning the cursor
+	 * and then modifying the value based on the initial read could lead
+	 * to unexpected results. Using \c snapshot isolation is recommended.
+	 *
+	 * The WT_CURSOR::modify method stores a change record in cache and
+	 * writes a change record to the log instead of the usual complete
+	 * values. Note that WT_CURSOR::modify is generally slower than the
+	 * WT_CURSOR::update method, and can result in slower reads because
+	 * the complete value must be assembled during retrieval. The
+	 * WT_CURSOR::modify method is intended for applications modifying
+	 * large records where there is cache or I/O pressure, that is,
+	 * applications that will benefit when data updates require less cache
+	 * and they write less logging information.
 	 *
 	 * @snippet ex_all.c Modify an existing record
 	 *
@@ -509,12 +521,6 @@ struct __wt_cursor {
 	 * The maximum length of a single column stored in a table is not fixed
 	 * (as it partially depends on the underlying file configuration), but
 	 * is always a small number of bytes less than 4GB.
-	 *
-	 * The WT_CURSOR::modify method stores a change record in cache and
-	 * writes a change record to the log, instead of the usual complete
-	 * value. This can reduce cache and logging requirements, but may result
-	 * in slower reads because the complete value must be assembled during
-	 * retrieval.
 	 *
 	 * @param cursor the cursor handle
 	 * @param entries an array of modification data structures
@@ -1375,6 +1381,14 @@ struct __wt_session {
 	 * value of merge_max is used., an integer no more than 100; default \c
 	 * 0.}
 	 * @config{ ),,}
+	 * @config{memory_page_image_max, the maximum in-memory page image
+	 * represented by a single storage block.  Depending on compression
+	 * efficiency\, compression can create storage blocks which require
+	 * significant resources to re-instantiate in the cache\, penalizing the
+	 * performance of future point updates.  The value limits the maximum
+	 * in-memory page image a storage block will need.  If set to 0\, a
+	 * default of 4 times \c leaf_page_max is used., an integer greater than
+	 * or equal to 0; default \c 0.}
 	 * @config{memory_page_max, the maximum size a page can grow to in
 	 * memory before being reconciled to disk.  The specified size will be
 	 * adjusted to a lower bound of <code>leaf_page_max</code>\, and an
@@ -2334,15 +2348,15 @@ struct __wt_connection {
 	 * given as a list\, such as
 	 * <code>"verbose=[evictserver\,read]"</code>., a list\, with values
 	 * chosen from the following options: \c "api"\, \c "block"\, \c
-	 * "checkpoint"\, \c "checkpoint_progress"\, \c "compact"\, \c "evict"\,
-	 * \c "evict_stuck"\, \c "evictserver"\, \c "fileops"\, \c "handleops"\,
-	 * \c "log"\, \c "lookaside"\, \c "lookaside_activity"\, \c "lsm"\, \c
-	 * "lsm_manager"\, \c "metadata"\, \c "mutex"\, \c "overflow"\, \c
-	 * "read"\, \c "rebalance"\, \c "reconcile"\, \c "recovery"\, \c
-	 * "recovery_progress"\, \c "salvage"\, \c "shared_cache"\, \c "split"\,
-	 * \c "temporary"\, \c "thread_group"\, \c "timestamp"\, \c
-	 * "transaction"\, \c "verify"\, \c "version"\, \c "write"; default
-	 * empty.}
+	 * "checkpoint"\, \c "checkpoint_progress"\, \c "compact"\, \c
+	 * "error_returns"\, \c "evict"\, \c "evict_stuck"\, \c "evictserver"\,
+	 * \c "fileops"\, \c "handleops"\, \c "log"\, \c "lookaside"\, \c
+	 * "lookaside_activity"\, \c "lsm"\, \c "lsm_manager"\, \c "metadata"\,
+	 * \c "mutex"\, \c "overflow"\, \c "read"\, \c "rebalance"\, \c
+	 * "reconcile"\, \c "recovery"\, \c "recovery_progress"\, \c "salvage"\,
+	 * \c "shared_cache"\, \c "split"\, \c "temporary"\, \c "thread_group"\,
+	 * \c "timestamp"\, \c "transaction"\, \c "verify"\, \c "version"\, \c
+	 * "write"; default empty.}
 	 * @configend
 	 * @errors
 	 */
@@ -2862,8 +2876,12 @@ struct __wt_connection {
  * @config{file_extend, file extension configuration.  If set\, extend files of
  * the set type in allocations of the set size\, instead of a block at a time as
  * each new block is written.  For example\,
- * <code>file_extend=(data=16MB)</code>., a list\, with values chosen from the
- * following options: \c "data"\, \c "log"; default empty.}
+ * <code>file_extend=(data=16MB)</code>. If set to 0\, disable the file
+ * extension for the set type.  For log files\, the allowed range is between
+ * 100KB and 2GB; values larger than the configured maximum log size and the
+ * default config would extend log files in allocations of the maximum log file
+ * size., a list\, with values chosen from the following options: \c "data"\, \c
+ * "log"; default empty.}
  * @config{file_manager = (, control how file handles are managed., a set of
  * related configuration options defined below.}
  * @config{&nbsp;&nbsp;&nbsp;&nbsp;close_handle_minimum, number of handles open
@@ -2902,9 +2920,10 @@ struct __wt_connection {
  * flag; default \c true.}
  * @config{&nbsp;&nbsp;&nbsp;&nbsp;recover, run recovery
  * or error if recovery needs to run after an unclean shutdown., a string\,
- * chosen from the following options: \c "error"\, \c "on"; default \c on.}
- * @config{&nbsp;&nbsp;&nbsp;&nbsp;zero_fill, manually write zeroes into log
- * files., a boolean flag; default \c false.}
+ * chosen from the following options: \c "error"\, \c "on"\, \c "salvage";
+ * default \c on.}
+ * @config{&nbsp;&nbsp;&nbsp;&nbsp;zero_fill, manually write
+ * zeroes into log files., a boolean flag; default \c false.}
  * @config{ ),,}
  * @config{lsm_manager = (, configure database wide options for LSM tree
  * management.  The LSM manager is started automatically the first time an LSM
@@ -3017,14 +3036,14 @@ struct __wt_connection {
  * @config{verbose, enable messages for various events.  Options are given as a
  * list\, such as <code>"verbose=[evictserver\,read]"</code>., a list\, with
  * values chosen from the following options: \c "api"\, \c "block"\, \c
- * "checkpoint"\, \c "checkpoint_progress"\, \c "compact"\, \c "evict"\, \c
- * "evict_stuck"\, \c "evictserver"\, \c "fileops"\, \c "handleops"\, \c "log"\,
- * \c "lookaside"\, \c "lookaside_activity"\, \c "lsm"\, \c "lsm_manager"\, \c
- * "metadata"\, \c "mutex"\, \c "overflow"\, \c "read"\, \c "rebalance"\, \c
- * "reconcile"\, \c "recovery"\, \c "recovery_progress"\, \c "salvage"\, \c
- * "shared_cache"\, \c "split"\, \c "temporary"\, \c "thread_group"\, \c
- * "timestamp"\, \c "transaction"\, \c "verify"\, \c "version"\, \c "write";
- * default empty.}
+ * "checkpoint"\, \c "checkpoint_progress"\, \c "compact"\, \c "error_returns"\,
+ * \c "evict"\, \c "evict_stuck"\, \c "evictserver"\, \c "fileops"\, \c
+ * "handleops"\, \c "log"\, \c "lookaside"\, \c "lookaside_activity"\, \c
+ * "lsm"\, \c "lsm_manager"\, \c "metadata"\, \c "mutex"\, \c "overflow"\, \c
+ * "read"\, \c "rebalance"\, \c "reconcile"\, \c "recovery"\, \c
+ * "recovery_progress"\, \c "salvage"\, \c "shared_cache"\, \c "split"\, \c
+ * "temporary"\, \c "thread_group"\, \c "timestamp"\, \c "transaction"\, \c
+ * "verify"\, \c "version"\, \c "write"; default empty.}
  * @config{write_through, Use \c FILE_FLAG_WRITE_THROUGH on Windows to write to
  * files.  Ignored on non-Windows systems.  Options are given as a list\, such
  * as <code>"write_through=[data]"</code>. Configuring \c write_through requires
@@ -3549,18 +3568,17 @@ struct __wt_config_parser {
  */
 
 /*!
- * Return a buffer's CRC32C checksum.
+ * Return a pointer to a function that calculates a CRC32C checksum.
  *
  * The WiredTiger library CRC32C checksum function uses hardware support where
  * available, else it falls back to a software implementation.
  *
  * @snippet ex_all.c Checksum a buffer
  *
- * @param buffer a pointer to a buffer
- * @param len the number of valid bytes in the buffer
- * @returns the buffer's CRC32C checksum
+ * @returns a pointer to a function that takes a buffer and length and returns
+ * the CRC32C checksum
  */
-uint32_t wiredtiger_checksum_crc32c(const void *buffer, size_t len)
+uint32_t (*wiredtiger_crc32c_func(void))(const void *, size_t)
     WT_ATTRIBUTE_LIBRARY_VISIBLE;
 
 /*! @} */
@@ -5290,28 +5308,19 @@ extern int wiredtiger_extension_terminate(WT_CONNECTION *connection);
 /*! lock: checkpoint lock internal thread wait time (usecs) */
 #define	WT_STAT_CONN_LOCK_CHECKPOINT_WAIT_INTERNAL	1168
 /*!
- * lock: commit timestamp queue lock application thread time waiting for
- * the dhandle lock (usecs)
+ * lock: commit timestamp queue lock application thread time waiting
+ * (usecs)
  */
 #define	WT_STAT_CONN_LOCK_COMMIT_TIMESTAMP_WAIT_APPLICATION	1169
-/*!
- * lock: commit timestamp queue lock internal thread time waiting for the
- * dhandle lock (usecs)
- */
+/*! lock: commit timestamp queue lock internal thread time waiting (usecs) */
 #define	WT_STAT_CONN_LOCK_COMMIT_TIMESTAMP_WAIT_INTERNAL	1170
 /*! lock: commit timestamp queue read lock acquisitions */
 #define	WT_STAT_CONN_LOCK_COMMIT_TIMESTAMP_READ_COUNT	1171
 /*! lock: commit timestamp queue write lock acquisitions */
 #define	WT_STAT_CONN_LOCK_COMMIT_TIMESTAMP_WRITE_COUNT	1172
-/*!
- * lock: dhandle lock application thread time waiting for the dhandle
- * lock (usecs)
- */
+/*! lock: dhandle lock application thread time waiting (usecs) */
 #define	WT_STAT_CONN_LOCK_DHANDLE_WAIT_APPLICATION	1173
-/*!
- * lock: dhandle lock internal thread time waiting for the dhandle lock
- * (usecs)
- */
+/*! lock: dhandle lock internal thread time waiting (usecs) */
 #define	WT_STAT_CONN_LOCK_DHANDLE_WAIT_INTERNAL		1174
 /*! lock: dhandle read lock acquisitions */
 #define	WT_STAT_CONN_LOCK_DHANDLE_READ_COUNT		1175
@@ -5324,14 +5333,11 @@ extern int wiredtiger_extension_terminate(WT_CONNECTION *connection);
 /*! lock: metadata lock internal thread wait time (usecs) */
 #define	WT_STAT_CONN_LOCK_METADATA_WAIT_INTERNAL	1179
 /*!
- * lock: read timestamp queue lock application thread time waiting for
- * the dhandle lock (usecs)
+ * lock: read timestamp queue lock application thread time waiting
+ * (usecs)
  */
 #define	WT_STAT_CONN_LOCK_READ_TIMESTAMP_WAIT_APPLICATION	1180
-/*!
- * lock: read timestamp queue lock internal thread time waiting for the
- * dhandle lock (usecs)
- */
+/*! lock: read timestamp queue lock internal thread time waiting (usecs) */
 #define	WT_STAT_CONN_LOCK_READ_TIMESTAMP_WAIT_INTERNAL	1181
 /*! lock: read timestamp queue read lock acquisitions */
 #define	WT_STAT_CONN_LOCK_READ_TIMESTAMP_READ_COUNT	1182
@@ -5357,15 +5363,9 @@ extern int wiredtiger_extension_terminate(WT_CONNECTION *connection);
 #define	WT_STAT_CONN_LOCK_TABLE_READ_COUNT		1189
 /*! lock: table write lock acquisitions */
 #define	WT_STAT_CONN_LOCK_TABLE_WRITE_COUNT		1190
-/*!
- * lock: txn global lock application thread time waiting for the dhandle
- * lock (usecs)
- */
+/*! lock: txn global lock application thread time waiting (usecs) */
 #define	WT_STAT_CONN_LOCK_TXN_GLOBAL_WAIT_APPLICATION	1191
-/*!
- * lock: txn global lock internal thread time waiting for the dhandle
- * lock (usecs)
- */
+/*! lock: txn global lock internal thread time waiting (usecs) */
 #define	WT_STAT_CONN_LOCK_TXN_GLOBAL_WAIT_INTERNAL	1192
 /*! lock: txn global read lock acquisitions */
 #define	WT_STAT_CONN_LOCK_TXN_GLOBAL_READ_COUNT		1193

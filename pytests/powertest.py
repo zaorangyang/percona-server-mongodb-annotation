@@ -108,7 +108,7 @@ if _IS_WINDOWS:
 
 # pylint: disable=too-many-lines
 
-__version__ = "0.1"
+__version__ = "1.0"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -891,13 +891,22 @@ class WindowsService(object):
 
         return ret, output
 
-    def stop(self):
-        """Stop service. Return (code, output) tuple."""
+    def stop(self, timeout):
+        """Stop service, waiting for 'timeout' seconds. Return (code, output) tuple."""
         self.pids = []
         if self.status() not in self._states.values():
             return 1, "Service '{}' status: {}".format(self.name, self.status())
         try:
             win32serviceutil.StopService(serviceName=self.name)
+            start = time.time()
+            status = self.status()
+            while status == "stop pending":
+                if time.time() - start >= timeout:
+                    ret = 1
+                    output = "Service '{}' status is '{}'".format(self.name, status)
+                    break
+                time.sleep(3)
+                status = self.status()
             ret = 0
             output = "Service '{}' stopped".format(self.name)
         except pywintypes.error as err:
@@ -964,7 +973,7 @@ class PosixService(object):
             self.pids = proc.get_pids()
         return ret, output
 
-    def stop(self):
+    def stop(self, timeout):  # pylint: disable=unused-argument
         """Stop process. Returns (code, output) tuple."""
         proc = ProcessControl(name=self.bin_name)
         proc.kill()
@@ -1076,9 +1085,9 @@ class MongodControl(object):  # pylint: disable=too-many-instance-attributes
         """Return tuple (ret, ouput)."""
         return self.service.update()
 
-    def stop(self):
+    def stop(self, timeout=0):
         """Return tuple (ret, ouput)."""
-        return self.service.stop()
+        return self.service.stop(timeout)
 
     def status(self):
         """Return status of the process."""
@@ -1182,8 +1191,17 @@ def remote_handler(options, operations):  # pylint: disable=too-many-branches,to
                 pass
 
         elif operation == "kill_mongod":
-            # Unconditional kill of mongod
+            # Unconditional kill of mongod.
             ret, output = kill_mongod()
+            if ret:
+                LOGGER.error("kill_mongod failed %s", output)
+                return ret
+            # Ensure the mongod service is not in a running state.
+            mongod.stop(timeout=30)
+            status = mongod.status()
+            if status != "stopped":
+                LOGGER.error("Unable to stop the mongod service, in state '%s'", status)
+                ret = 1
 
         elif operation == "install_mongod":
             ret, output = mongod.install(root_dir, options.tarball_url)
@@ -1239,8 +1257,14 @@ def remote_handler(options, operations):  # pylint: disable=too-many-branches,to
             ret = wait_for_mongod_shutdown(mongod)
 
         elif operation == "rsync_data":
-            ret, output = rsync(options.db_path, options.rsync_dest, options.rsync_exclude_files)
-            LOGGER.info(output)
+            rsync_dir, new_rsync_dir = options.rsync_dest
+            ret, output = rsync(options.db_path, rsync_dir, options.rsync_exclude_files)
+            if output:
+                LOGGER.info(output)
+            # Rename the rsync_dir only if it has a different name than new_rsync_dir.
+            if ret == 0 and rsync_dir != new_rsync_dir:
+                LOGGER.info("Renaming directory %s to %s", rsync_dir, new_rsync_dir)
+                os.rename(rsync_dir, new_rsync_dir)
 
         elif operation == "seed_docs":
             mongo = pymongo.MongoClient(**mongo_client_opts)
@@ -1289,6 +1313,11 @@ def remote_handler(options, operations):  # pylint: disable=too-many-branches,to
             return ret
 
     return 0
+
+
+def get_backup_path(path, loop_num):
+    """Return the backup path based on the loop_num."""
+    return re.sub("-{}$".format(loop_num - 1), "-{}".format(loop_num), path)
 
 
 def rsync(src_dir, dest_dir, exclude_files=None):
@@ -1963,8 +1992,8 @@ Examples:
     program_options.add_option("--remoteOperation", dest="remote_operation",
                                help=optparse.SUPPRESS_HELP, action="store_true", default=False)
 
-    program_options.add_option("--rsyncDest", dest="rsync_dest", help=optparse.SUPPRESS_HELP,
-                               default=None)
+    program_options.add_option("--rsyncDest", dest="rsync_dest", nargs=2,
+                               help=optparse.SUPPRESS_HELP, default=None)
 
     parser.add_option_group(test_options)
     parser.add_option_group(crash_options)
@@ -2093,6 +2122,9 @@ Examples:
         backup_path_after = options.backup_path_after
         if not backup_path_after:
             backup_path_after = "{}/data-afterrecovery".format(options.root_dir)
+        # Set the first backup directory, for loop 1.
+        backup_path_before = "{}-1".format(backup_path_before)
+        backup_path_after = "{}-1".format(backup_path_after)
     else:
         rsync_cmd = ""
         rsync_opt = ""
@@ -2282,7 +2314,9 @@ Examples:
         # Since rsync requires Posix style paths, we do not use os.path.join to
         # construct the rsync destination directory.
         if rsync_cmd:
-            rsync_opt = "--rsyncDest {}".format(backup_path_before)
+            new_path_dir = get_backup_path(backup_path_before, loop_num)
+            rsync_opt = "--rsyncDest {} {}".format(backup_path_before, new_path_dir)
+            backup_path_before = new_path_dir
 
         # Optionally, rsync the pre-recovery database.
         # Start monogd on the secret port.
@@ -2348,7 +2382,9 @@ Examples:
         # Since rsync requires Posix style paths, we do not use os.path.join to
         # construct the rsync destination directory.
         if rsync_cmd:
-            rsync_opt = "--rsyncDest {}".format(backup_path_after)
+            new_path_dir = get_backup_path(backup_path_after, loop_num)
+            rsync_opt = "--rsyncDest {} {}".format(backup_path_after, new_path_dir)
+            backup_path_after = new_path_dir
 
         # Optionally, rsync the post-recovery database.
         # Start monogd on the standard port.

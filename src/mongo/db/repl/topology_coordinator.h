@@ -377,7 +377,7 @@ public:
     // Produce member data for the serverStatus command and diagnostic logging.
     void fillMemberData(BSONObjBuilder* result);
 
-    enum class PrepareFreezeResponseResult { kNoAction, kElectSelf };
+    enum class PrepareFreezeResponseResult { kNoAction, kSingleNodeSelfElect };
 
     /**
      * Produce a reply to a freeze request. Returns a PostMemberStateUpdateAction on success that
@@ -424,8 +424,8 @@ public:
         Date_t now, const std::string& ourSetName, const HostAndPort& target);
 
     /**
-     * Processes a heartbeat response from "target" that arrived around "now", having
-     * spent "networkRoundTripTime" millis on the network.
+     * Processes a heartbeat response from "target" that arrived around "now" with "lastOpCommitted"
+     * in the metadata, having spent "networkRoundTripTime" millis on the network.
      *
      * Updates internal topology coordinator state, and returns instructions about what action
      * to take next.
@@ -454,7 +454,8 @@ public:
         Date_t now,
         Milliseconds networkRoundTripTime,
         const HostAndPort& target,
-        const StatusWith<ReplSetHeartbeatResponse>& hbResponse);
+        const StatusWith<ReplSetHeartbeatResponse>& hbResponse,
+        OpTime lastOpCommitted);
 
     /**
      *  Returns whether or not at least 'numNodes' have reached the given opTime.
@@ -651,6 +652,13 @@ public:
     void finishUnconditionalStepDown();
 
     /**
+     * Returns the index of the most suitable candidate for an election handoff. The node must be
+     * caught up and electable. Ties are resolved first by highest priority, then by lowest member
+     * id.
+     */
+    int chooseElectionHandoffCandidate();
+
+    /**
      * Considers whether or not this node should stand for election, and returns true
      * if the node has transitioned to candidate role as a result of the call.
      */
@@ -707,7 +715,7 @@ public:
         kPriorityTakeover,
         kStepUpRequest,
         kCatchupTakeover,
-        kSingleNodeStepDownTimeout
+        kSingleNodePromptElection
     };
 
     /**
@@ -889,6 +897,11 @@ private:
      * attemptStepDown() for more details on the rules of when stepdown attempts succeed or fail.
      */
     bool _canCompleteStepDownAttempt(Date_t now, Date_t waitUntil, bool force);
+
+    /**
+     * Returns true if a node is both caught up to our last applied opTime and electable.
+     */
+    bool _isCaughtUpAndElectable(int memberIndex, OpTime lastApplied);
 
     void _stepDownSelfAndReplaceWith(int newPrimary);
 

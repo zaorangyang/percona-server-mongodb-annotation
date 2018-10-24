@@ -34,8 +34,15 @@
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/server_parameters.h"
 
 namespace mongo {
+
+// Allows multi-document transactions to run with the 'inMemory' storage engine. This flag should
+// ONLY be used for testing purposes. Production systems should not run transactions on the
+// 'inMemory' storage engines until "rollback to a timestamp" is supported on the 'inMemory' storage
+// engine (see SERVER-34165).
+MONGO_EXPORT_SERVER_PARAMETER(enableInMemoryTransactions, bool, false);
 
 boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
     OperationContext* opCtx,
@@ -44,8 +51,21 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
     bool isReplSetMemberOrMongos,
     bool supportsDocLocking,
     bool supportsRecoverToStableTimestamp) {
+    auto osi = OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, requestBody);
+
+    if (opCtx->getClient()->isInDirectClient()) {
+        uassert(50891,
+                "Invalid to set operation session info in a direct client",
+                !osi.getSessionId() && !osi.getTxnNumber() && !osi.getAutocommit() &&
+                    !osi.getStartTransaction());
+    }
 
     if (!requiresAuth) {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                "This command is not supported in transactions",
+                !osi.getAutocommit());
+        uassert(
+            50889, "It is illegal to provide a txnNumber for this command", !osi.getTxnNumber());
         return boost::none;
     }
 
@@ -59,8 +79,6 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
             return boost::none;
         }
     }
-
-    auto osi = OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, requestBody);
 
     if (osi.getSessionId()) {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -107,10 +125,18 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
         uassert(ErrorCodes::InvalidOptions,
                 "Specifying autocommit=true is not allowed.",
                 !osi.getAutocommit().value());
+
+        // We allow transactions to run on in-memory storage engines for testing purposes.
+        bool allowInMemoryTransactions = false;
+        auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+        if (storageEngine) {
+            allowInMemoryTransactions =
+                storageEngine->isEphemeral() && enableInMemoryTransactions.load();
+        }
         uassert(ErrorCodes::IllegalOperation,
                 "Multi-document transactions are only allowed on storage engines that support "
                 "recover to stable timestamp.",
-                supportsRecoverToStableTimestamp);
+                supportsRecoverToStableTimestamp || allowInMemoryTransactions);
     } else {
         uassert(ErrorCodes::InvalidOptions,
                 "'startTransaction' field requires 'autocommit' field to also be specified",

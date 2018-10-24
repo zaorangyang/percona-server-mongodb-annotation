@@ -26,27 +26,29 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#include "mongo/tools/mongoebench_options.h"
 
-#include "mongo/base/init.h"
-#include "mongo/db/catalog/index_create_impl.h"
+#include "mongo/util/options_parser/startup_option_init.h"
+#include "mongo/util/options_parser/startup_options.h"
+#include "mongo/util/quick_exit.h"
 
 namespace mongo {
 namespace {
 
-class MultiIndexBlockImplServers : public MultiIndexBlockImpl {
-    using MultiIndexBlockImpl::MultiIndexBlockImpl;
-
-    bool initBackgroundIndexFromSpec(const BSONObj& spec) const override {
-        return spec["background"].trueValue();
-    }
-};
-}  // namespace
-
-MONGO_REGISTER_SHIM(MultiIndexBlock::makeImpl)
-(OperationContext* const opCtx, Collection* const collection, PrivateTo<MultiIndexBlock>)
-    ->std::unique_ptr<MultiIndexBlock::Impl> {
-    return std::make_unique<MultiIndexBlockImplServers>(opCtx, collection);
+MONGO_GENERAL_STARTUP_OPTIONS_REGISTER(MongoeBenchOptions)(InitializerContext* context) {
+    return addMongoeBenchOptions(&moe::startupOptions);
 }
 
+GlobalInitializerRegisterer mongoeBenchOptionsStore(
+    "MongoeBenchOptions_Store",
+    {"BeginStartupOptionStorage", "EmbeddedOptions_Store"},
+    {"EndStartupOptionStorage"},
+    [](InitializerContext* context) {
+        if (!handlePreValidationMongoeBenchOptions(moe::startupOptionsParsed)) {
+            quickExit(EXIT_SUCCESS);
+        }
+        return storeMongoeBenchOptions(moe::startupOptionsParsed, context->args());
+    });
+
+}  // namespace
 }  // namespace mongo

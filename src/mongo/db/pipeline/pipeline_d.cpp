@@ -732,6 +732,10 @@ Status PipelineD::MongoDInterface::attachCursorSourceToPipeline(
 
     PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline);
 
+    // Optimize again, since there may be additional optimizations that can be done after adding
+    // the initial cursor stage.
+    pipeline->optimizePipeline();
+
     return Status::OK();
 }
 
@@ -842,8 +846,14 @@ BSONObj PipelineD::MongoDInterface::_reportCurrentOpForClient(
     CurOp::reportCurrentOpForClient(
         opCtx, client, (truncateOps == CurrentOpTruncateMode::kTruncateOps), &builder);
 
-    // Append lock stats before returning.
-    if (auto clientOpCtx = client->getOperationContext()) {
+    OperationContext* clientOpCtx = client->getOperationContext();
+
+    if (clientOpCtx) {
+        if (auto opCtxSession = OperationContextSession::get(clientOpCtx)) {
+            opCtxSession->reportUnstashedState(repl::ReadConcernArgs::get(clientOpCtx), &builder);
+        }
+
+        // Append lock stats before returning.
         if (auto lockerInfo = clientOpCtx->lockState()->getLockerInfo()) {
             fillLockerInfo(*lockerInfo, builder);
         }

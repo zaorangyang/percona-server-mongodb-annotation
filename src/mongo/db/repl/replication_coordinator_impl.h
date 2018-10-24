@@ -391,7 +391,7 @@ public:
     void waitForElectionDryRunFinish_forTest();
 
     /**
-     * Waits until a stepdown command has begun. Callers should ensure that the stepdown attempt
+     * Waits until a stepdown attempt has begun. Callers should ensure that the stepdown attempt
      * won't fully complete before this method is called, or this method may never return.
      */
     void waitForStepDownAttempt_forTest();
@@ -459,6 +459,9 @@ private:
 
         BSONObj toBSON() const;
         std::string toString() const;
+        // Controls whether or not this Waiter should stay on the WaiterList upon notification.
+        virtual bool runs_once() const = 0;
+
         // It is invalid to call notify_inlock() unless holding ReplicationCoordinatorImpl::_mutex.
         virtual void notify_inlock() = 0;
 
@@ -475,6 +478,9 @@ private:
                      const WriteConcernOptions* _writeConcern,
                      stdx::condition_variable* _condVar);
         void notify_inlock() override;
+        bool runs_once() const override {
+            return false;
+        }
 
         stdx::condition_variable* condVar = nullptr;
     };
@@ -488,6 +494,9 @@ private:
 
         CallbackWaiter(OpTime _opTime, FinishFunc _finishCallback);
         void notify_inlock() override;
+        bool runs_once() const override {
+            return true;
+        }
 
         // The callback that will be called when this waiter is notified.
         FinishFunc finishCallback = nullptr;
@@ -503,10 +512,10 @@ private:
         void add_inlock(WaiterType waiter);
         // Returns whether waiter is found and removed.
         bool remove_inlock(WaiterType waiter);
-        // Signals and removes all waiters that satisfy the condition.
-        void signalAndRemoveIf_inlock(stdx::function<bool(WaiterType)> fun);
-        // Signals and removes all waiters from the list.
-        void signalAndRemoveAll_inlock();
+        // Signals all waiters that satisfy the condition.
+        void signalIf_inlock(stdx::function<bool(WaiterType)> fun);
+        // Signals all waiters from the list.
+        void signalAll_inlock();
 
     private:
         std::vector<WaiterType> _list;
@@ -598,6 +607,11 @@ private:
     void _handleTimePassing(const executor::TaskExecutor::CallbackArgs& cbData);
 
     /**
+     * Chooses a candidate for election handoff and sends a ReplSetStepUp command to it.
+     */
+    void _performElectionHandoff();
+
+    /**
      * Helper method for _awaitReplication that takes an already locked unique_lock, but leaves
      * operation timing to the caller.
      */
@@ -616,13 +630,6 @@ private:
                                            const WriteConcernOptions& writeConcern);
 
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;
-
-    /**
-     * Wakes up threads in the process of handling a stepdown request based on whether the
-     * TopologyCoordinator now believes enough secondaries are caught up for the stepdown request to
-     * complete.
-     */
-    void _signalStepDownWaiterIfReady_inlock();
 
     bool _canAcceptWritesFor_inlock(const NamespaceString& ns);
 
@@ -1193,9 +1200,6 @@ private:
 
     // This member's index position in the current config.
     int _selfIndex;  // (M)
-
-    // Condition to signal when new heartbeat data comes in.
-    stdx::condition_variable _stepDownWaiters;  // (M)
 
     // State for conducting an election of this node.
     // the presence of a non-null _freshnessChecker pointer indicates that an election is

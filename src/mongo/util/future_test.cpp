@@ -73,10 +73,9 @@ void completePromise(Promise<void>* promise, Func&& func) {
 
 template <typename Func, typename Result = std::result_of_t<Func && ()>>
 Future<Result> async(Func&& func) {
-    Promise<Result> promise;
-    auto fut = promise.getFuture();
+    auto pf = makePromiseFuture<Result>();
 
-    stdx::thread([ promise = std::move(promise), func = std::forward<Func>(func) ]() mutable {
+    stdx::thread([ promise = std::move(pf.promise), func = std::forward<Func>(func) ]() mutable {
 #if !__has_feature(thread_sanitizer)
         // TSAN works better without this sleep, but it is useful for testing correctness.
         sleepmillis(100);  // Try to wait until after the Future has been handled.
@@ -88,7 +87,7 @@ Future<Result> async(Func&& func) {
         }
     }).detach();
 
-    return fut;
+    return std::move(pf.future);
 }
 
 const auto failStatus = Status(ErrorCodes::Error(50728), "expected failure");
@@ -111,10 +110,9 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
         test(Future<CompletionType>::makeReady(completion()));
     }
     {  // ready future from promise
-        Promise<CompletionType> promise;
-        auto fut = promise.getFuture();  // before setting value to bypass opt to immediate
-        promise.emplaceValue(completion());
-        test(std::move(fut));
+        auto pf = makePromiseFuture<CompletionType>();
+        pf.promise.emplaceValue(completion());
+        test(std::move(pf.future));
     }
 
     {  // async future
@@ -133,11 +131,10 @@ void FUTURE_SUCCESS_TEST(const CompletionFunc& completion, const TestFunc& test)
         test(Future<CompletionType>::makeReady());
     }
     {  // ready future from promise
-        Promise<CompletionType> promise;
-        auto fut = promise.getFuture();  // before setting value to bypass opt to immediate
+        auto pf = makePromiseFuture<CompletionType>();
         completion();
-        promise.emplaceValue();
-        test(std::move(fut));
+        pf.promise.emplaceValue();
+        test(std::move(pf.future));
     }
 
     {  // async future
@@ -151,10 +148,9 @@ void FUTURE_FAIL_TEST(const TestFunc& test) {
         test(Future<CompletionType>::makeReady(failStatus));
     }
     {  // ready future from promise
-        Promise<CompletionType> promise;
-        auto fut = promise.getFuture();  // before setting value to bypass opt to immediate
-        promise.setError(failStatus);
-        test(std::move(fut));
+        auto pf = makePromiseFuture<CompletionType>();
+        pf.promise.setError(failStatus);
+        test(std::move(pf.future));
     }
 
     {  // async future
@@ -197,13 +193,12 @@ TEST(Future, Success_getAsync) {
     FUTURE_SUCCESS_TEST(
         [] { return 1; },
         [](Future<int>&& fut) {
-            auto outside = Promise<int>();
-            auto outsideFut = outside.getFuture();
-            std::move(fut).getAsync([outside = outside.share()](StatusWith<int> sw) mutable {
+            auto pf = makePromiseFuture<int>();
+            std::move(fut).getAsync([outside = pf.promise.share()](StatusWith<int> sw) mutable {
                 ASSERT_OK(sw);
                 outside.emplaceValue(sw.getValue());
             });
-            ASSERT_EQ(std::move(outsideFut).get(), 1);
+            ASSERT_EQ(std::move(pf.future).get(), 1);
         });
 }
 
@@ -235,13 +230,12 @@ TEST(Future, Fail_getNothrowRvalue) {
 
 TEST(Future, Fail_getAsync) {
     FUTURE_FAIL_TEST<int>([](Future<int>&& fut) {
-        auto outside = Promise<int>();
-        auto outsideFut = outside.getFuture();
-        std::move(fut).getAsync([outside = outside.share()](StatusWith<int> sw) mutable {
+        auto pf = makePromiseFuture<int>();
+        std::move(fut).getAsync([outside = pf.promise.share()](StatusWith<int> sw) mutable {
             ASSERT(!sw.isOK());
             outside.setError(sw.getStatus());
         });
-        ASSERT_EQ(std::move(outsideFut).getNoThrow(), failStatus);
+        ASSERT_EQ(std::move(pf.future).getNoThrow(), failStatus);
     });
 }
 
@@ -358,10 +352,9 @@ TEST(Future, Success_thenFutureReady) {
                         [](Future<int>&& fut) {
                             ASSERT_EQ(std::move(fut)
                                           .then([](int i) {
-                                              Promise<int> promise;
-                                              auto fut = promise.getFuture();
-                                              promise.emplaceValue(i + 2);
-                                              return fut;
+                                              auto pf = makePromiseFuture<int>();
+                                              pf.promise.emplaceValue(i + 2);
+                                              return std::move(pf.future);
                                           })
                                           .get(),
                                       3);
@@ -491,10 +484,9 @@ TEST(Future, Fail_onErrorFutureReady) {
         ASSERT_EQ(std::move(fut)
                       .onError([](Status s) {
                           ASSERT_EQ(s, failStatus);
-                          Promise<int> promise;
-                          auto fut = promise.getFuture();
-                          promise.emplaceValue(3);
-                          return fut;
+                          auto pf = makePromiseFuture<int>();
+                          pf.promise.emplaceValue(3);
+                          return std::move(pf.future);
                       })
                       .get(),
                   3);
@@ -512,6 +504,64 @@ TEST(Future, Fail_onErrorFutureAsync) {
                   3);
     });
 }
+
+TEST(Future, Success_onErrorCode) {
+    FUTURE_SUCCESS_TEST([] { return 1; },
+                        [](Future<int>&& fut) {
+                            ASSERT_EQ(std::move(fut)
+                                          .onError<ErrorCodes::InternalError>([](Status) {
+                                              FAIL("onError<code>() callback was called");
+                                              return 0;
+                                          })
+                                          .then([](int i) { return i + 2; })
+                                          .get(),
+                                      3);
+                        });
+}
+
+TEST(Future, Fail_onErrorCodeMatch) {
+    FUTURE_FAIL_TEST<int>([](Future<int>&& fut) {
+        auto res =
+            std::move(fut)
+                .onError([](Status s) {
+                    ASSERT_EQ(s, failStatus);
+                    return StatusWith<int>(ErrorCodes::InternalError, "");
+                })
+                .onError<ErrorCodes::InternalError>([](Status&&) { return StatusWith<int>(3); })
+                .getNoThrow();
+        ASSERT_EQ(res, 3);
+    });
+}
+
+TEST(Future, Fail_onErrorCodeMatchFuture) {
+    FUTURE_FAIL_TEST<int>([](Future<int>&& fut) {
+        auto res = std::move(fut)
+                       .onError([](Status s) {
+                           ASSERT_EQ(s, failStatus);
+                           return StatusWith<int>(ErrorCodes::InternalError, "");
+                       })
+                       .onError<ErrorCodes::InternalError>([](Status&&) { return Future<int>(3); })
+                       .getNoThrow();
+        ASSERT_EQ(res, 3);
+    });
+}
+
+TEST(Future, Fail_onErrorCodeMismatch) {
+    FUTURE_FAIL_TEST<int>([](Future<int>&& fut) {
+        ASSERT_EQ(std::move(fut)
+                      .onError<ErrorCodes::InternalError>([](Status s) -> int {
+                          FAIL("Why was this called?") << s;
+                          MONGO_UNREACHABLE;
+                      })
+                      .onError([](Status s) {
+                          ASSERT_EQ(s, failStatus);
+                          return 3;
+                      })
+                      .getNoThrow(),
+                  3);
+    });
+}
+
 
 TEST(Future, Success_tap) {
     FUTURE_SUCCESS_TEST([] { return 1; },
@@ -687,13 +737,12 @@ TEST(Future_Void, Success_getAsync) {
     FUTURE_SUCCESS_TEST(
         [] {},
         [](Future<void>&& fut) {
-            auto outside = Promise<void>();
-            auto outsideFut = outside.getFuture();
-            std::move(fut).getAsync([outside = outside.share()](Status status) mutable {
+            auto pf = makePromiseFuture<void>();
+            std::move(fut).getAsync([outside = pf.promise.share()](Status status) mutable {
                 ASSERT_OK(status);
                 outside.emplaceValue();
             });
-            ASSERT_EQ(std::move(outsideFut).getNoThrow(), Status::OK());
+            ASSERT_EQ(std::move(pf.future).getNoThrow(), Status::OK());
         });
 }
 
@@ -726,13 +775,12 @@ TEST(Future_Void, Fail_getNothrowRvalue) {
 
 TEST(Future_Void, Fail_getAsync) {
     FUTURE_FAIL_TEST<void>([](Future<void>&& fut) {
-        auto outside = Promise<void>();
-        auto outsideFut = outside.getFuture();
-        std::move(fut).getAsync([outside = outside.share()](Status status) mutable {
+        auto pf = makePromiseFuture<void>();
+        std::move(fut).getAsync([outside = pf.promise.share()](Status status) mutable {
             ASSERT(!status.isOK());
             outside.setError(status);
         });
-        ASSERT_EQ(std::move(outsideFut).getNoThrow(), failStatus);
+        ASSERT_EQ(std::move(pf.future).getNoThrow(), failStatus);
     });
 }
 
@@ -827,10 +875,9 @@ TEST(Future_Void, Success_thenFutureReady) {
                         [](Future<void>&& fut) {
                             ASSERT_EQ(std::move(fut)
                                           .then([]() {
-                                              Promise<int> promise;
-                                              auto fut = promise.getFuture();
-                                              promise.emplaceValue(3);
-                                              return fut;
+                                              auto pf = makePromiseFuture<int>();
+                                              pf.promise.emplaceValue(3);
+                                              return std::move(pf.future);
                                           })
                                           .get(),
                                       3);
@@ -904,6 +951,7 @@ TEST(Future_Void, Fail_onErrorSimple) {
                   3);
     });
 }
+
 TEST(Future_Void, Fail_onErrorError_throw) {
     FUTURE_FAIL_TEST<void>([](Future<void>&& fut) {
         auto fut2 = std::move(fut).onError([](Status s) {
@@ -942,10 +990,9 @@ TEST(Future_Void, Fail_onErrorFutureReady) {
         ASSERT_EQ(std::move(fut)
                       .onError([](Status s) {
                           ASSERT_EQ(s, failStatus);
-                          Promise<void> promise;
-                          auto fut = promise.getFuture();
-                          promise.emplaceValue();
-                          return fut;
+                          auto pf = makePromiseFuture<void>();
+                          pf.promise.emplaceValue();
+                          return std::move(pf.future);
                       })
                       .then([] { return 3; })
                       .get(),
@@ -962,6 +1009,66 @@ TEST(Future_Void, Fail_onErrorFutureAsync) {
                       })
                       .then([] { return 3; })
                       .get(),
+                  3);
+    });
+}
+
+TEST(Future_Void, Success_onErrorCode) {
+    FUTURE_SUCCESS_TEST([] {},
+                        [](Future<void>&& fut) {
+                            ASSERT_EQ(std::move(fut)
+                                          .onError<ErrorCodes::InternalError>([](Status) {
+                                              FAIL("onError<code>() callback was called");
+                                          })
+                                          .then([] { return 3; })
+                                          .get(),
+                                      3);
+                        });
+}
+
+TEST(Future_Void, Fail_onErrorCodeMatch) {
+    FUTURE_FAIL_TEST<void>([](Future<void>&& fut) {
+        bool called = false;
+        auto res = std::move(fut)
+                       .onError([](Status s) {
+                           ASSERT_EQ(s, failStatus);
+                           return Status(ErrorCodes::InternalError, "");
+                       })
+                       .onError<ErrorCodes::InternalError>([&](Status&&) { called = true; })
+                       .then([] { return 3; })
+                       .getNoThrow();
+        ASSERT_EQ(res, 3);
+        ASSERT(called);
+    });
+}
+
+TEST(Future_Void, Fail_onErrorCodeMatchFuture) {
+    FUTURE_FAIL_TEST<void>([](Future<void>&& fut) {
+        bool called = false;
+        auto res = std::move(fut)
+                       .onError([](Status s) {
+                           ASSERT_EQ(s, failStatus);
+                           return Status(ErrorCodes::InternalError, "");
+                       })
+                       .onError<ErrorCodes::InternalError>([&](Status&&) {
+                           called = true;
+                           return Future<void>::makeReady();
+                       })
+                       .then([] { return 3; })
+                       .getNoThrow();
+        ASSERT_EQ(res, 3);
+        ASSERT(called);
+    });
+}
+
+TEST(Future_Void, Fail_onErrorCodeMismatch) {
+    FUTURE_FAIL_TEST<void>([](Future<void>&& fut) {
+        ASSERT_EQ(std::move(fut)
+                      .onError<ErrorCodes::InternalError>(
+                          [](Status s) { FAIL("Why was this called?") << s; })
+                      .onError([](Status s) { ASSERT_EQ(s, failStatus); })
+                      .then([] { return 3; })
+                      .getNoThrow(),
                   3);
     });
 }
@@ -1166,13 +1273,12 @@ TEST(Future_MoveOnly, Success_getAsync) {
     FUTURE_SUCCESS_TEST(
         [] { return Widget(1); },
         [](Future<Widget>&& fut) {
-            auto outside = Promise<Widget>();
-            auto outsideFut = outside.getFuture();
-            std::move(fut).getAsync([outside = outside.share()](StatusWith<Widget> sw) mutable {
+            auto pf = makePromiseFuture<Widget>();
+            std::move(fut).getAsync([outside = pf.promise.share()](StatusWith<Widget> sw) mutable {
                 ASSERT_OK(sw);
                 outside.emplaceValue(std::move(sw.getValue()));
             });
-            ASSERT_EQ(std::move(outsideFut).get(), 1);
+            ASSERT_EQ(std::move(pf.future).get(), 1);
         });
 }
 
@@ -1209,13 +1315,12 @@ TEST(Future_MoveOnly, Fail_getNothrowRvalue) {
 
 TEST(Future_MoveOnly, Fail_getAsync) {
     FUTURE_FAIL_TEST<Widget>([](Future<Widget>&& fut) {
-        auto outside = Promise<Widget>();
-        auto outsideFut = outside.getFuture();
-        std::move(fut).getAsync([outside = outside.share()](StatusWith<Widget> sw) mutable {
+        auto pf = makePromiseFuture<Widget>();
+        std::move(fut).getAsync([outside = pf.promise.share()](StatusWith<Widget> sw) mutable {
             ASSERT(!sw.isOK());
             outside.setError(sw.getStatus());
         });
-        ASSERT_EQ(std::move(outsideFut).getNoThrow(), failStatus);
+        ASSERT_EQ(std::move(pf.future).getNoThrow(), failStatus);
     });
 }
 
@@ -1295,10 +1400,9 @@ TEST(Future_MoveOnly, Success_thenFutureReady) {
                         [](Future<Widget>&& fut) {
                             ASSERT_EQ(std::move(fut)
                                           .then([](Widget i) {
-                                              Promise<Widget> promise;
-                                              auto fut = promise.getFuture();
-                                              promise.emplaceValue(i + 2);
-                                              return fut;
+                                              auto pf = makePromiseFuture<Widget>();
+                                              pf.promise.emplaceValue(i + 2);
+                                              return std::move(pf.future);
                                           })
                                           .get(),
                                       3);
@@ -1430,10 +1534,9 @@ TEST(Future_MoveOnly, Fail_onErrorFutureReady) {
         ASSERT_EQ(std::move(fut)
                       .onError([](Status s) {
                           ASSERT_EQ(s, failStatus);
-                          Promise<Widget> promise;
-                          auto fut = promise.getFuture();
-                          promise.emplaceValue(3);
-                          return fut;
+                          auto pf = makePromiseFuture<Widget>();
+                          pf.promise.emplaceValue(3);
+                          return std::move(pf.future);
                       })
                       .get(),
                   3);
@@ -1642,119 +1745,119 @@ DEATH_TEST(Future_EdgeCases, Success_getAsync_throw, "terminate() called") {
 TEST(Promise, Success_setFrom) {
     FUTURE_SUCCESS_TEST([] { return 1; },
                         [](Future<int>&& fut) {
-                            Promise<int> p;
-                            p.setFrom(std::move(fut));
-                            ASSERT_EQ(p.getFuture().get(), 1);
+                            auto pf = makePromiseFuture<int>();
+                            pf.promise.setFrom(std::move(fut));
+                            ASSERT_EQ(std::move(pf.future).get(), 1);
                         });
 }
 
 TEST(Promise, Fail_setFrom) {
     FUTURE_FAIL_TEST<int>([](Future<int>&& fut) {
-        Promise<int> p;
-        p.setFrom(std::move(fut));
-        ASSERT_THROWS_failStatus(p.getFuture().get());
+        auto pf = makePromiseFuture<int>();
+        pf.promise.setFrom(std::move(fut));
+        ASSERT_THROWS_failStatus(std::move(pf.future).get());
     });
 }
 
 TEST(Promise, Success_setWith_value) {
-    Promise<int> p;
-    p.setWith([&] { return 1; });
-    ASSERT_EQ(p.getFuture().get(), 1);
+    auto pf = makePromiseFuture<int>();
+    pf.promise.setWith([&] { return 1; });
+    ASSERT_EQ(std::move(pf.future).get(), 1);
 }
 
 TEST(Promise, Fail_setWith_throw) {
-    Promise<int> p;
-    p.setWith([&] {
+    auto pf = makePromiseFuture<int>();
+    pf.promise.setWith([&] {
         uassertStatusOK(failStatus);
         return 1;
     });
-    ASSERT_THROWS_failStatus(p.getFuture().get());
+    ASSERT_THROWS_failStatus(std::move(pf.future).get());
 }
 
 TEST(Promise, Success_setWith_StatusWith) {
-    Promise<int> p;
-    p.setWith([&] { return StatusWith<int>(1); });
-    ASSERT_EQ(p.getFuture().get(), 1);
+    auto pf = makePromiseFuture<int>();
+    pf.promise.setWith([&] { return StatusWith<int>(1); });
+    ASSERT_EQ(std::move(pf.future).get(), 1);
 }
 
 TEST(Promise, Fail_setWith_StatusWith) {
-    Promise<int> p;
-    p.setWith([&] { return StatusWith<int>(failStatus); });
-    ASSERT_THROWS_failStatus(p.getFuture().get());
+    auto pf = makePromiseFuture<int>();
+    pf.promise.setWith([&] { return StatusWith<int>(failStatus); });
+    ASSERT_THROWS_failStatus(std::move(pf.future).get());
 }
 
 TEST(Promise, Success_setWith_Future) {
     FUTURE_SUCCESS_TEST([] { return 1; },
                         [](Future<int>&& fut) {
-                            Promise<int> p;
-                            p.setWith([&] { return std::move(fut); });
-                            ASSERT_EQ(p.getFuture().get(), 1);
+                            auto pf = makePromiseFuture<int>();
+                            pf.promise.setWith([&] { return std::move(fut); });
+                            ASSERT_EQ(std::move(pf.future).get(), 1);
                         });
 }
 
 TEST(Promise, Fail_setWith_Future) {
     FUTURE_FAIL_TEST<int>([](Future<int>&& fut) {
-        Promise<int> p;
-        p.setWith([&] { return std::move(fut); });
-        ASSERT_THROWS_failStatus(p.getFuture().get());
+        auto pf = makePromiseFuture<int>();
+        pf.promise.setWith([&] { return std::move(fut); });
+        ASSERT_THROWS_failStatus(std::move(pf.future).get());
     });
 }
 
 TEST(Promise_void, Success_setFrom) {
     FUTURE_SUCCESS_TEST([] {},
                         [](Future<void>&& fut) {
-                            Promise<void> p;
-                            p.setFrom(std::move(fut));
-                            ASSERT_OK(p.getFuture().getNoThrow());
+                            auto pf = makePromiseFuture<void>();
+                            pf.promise.setFrom(std::move(fut));
+                            ASSERT_OK(std::move(pf.future).getNoThrow());
                         });
 }
 
 TEST(Promise_void, Fail_setFrom) {
     FUTURE_FAIL_TEST<void>([](Future<void>&& fut) {
-        Promise<void> p;
-        p.setFrom(std::move(fut));
-        ASSERT_THROWS_failStatus(p.getFuture().get());
+        auto pf = makePromiseFuture<void>();
+        pf.promise.setFrom(std::move(fut));
+        ASSERT_THROWS_failStatus(std::move(pf.future).get());
     });
 }
 
 TEST(Promise_void, Success_setWith_value) {
-    Promise<void> p;
-    p.setWith([&] {});
-    ASSERT_OK(p.getFuture().getNoThrow());
+    auto pf = makePromiseFuture<void>();
+    pf.promise.setWith([&] {});
+    ASSERT_OK(std::move(pf.future).getNoThrow());
 }
 
 TEST(Promise_void, Fail_setWith_throw) {
-    Promise<void> p;
-    p.setWith([&] { uassertStatusOK(failStatus); });
-    ASSERT_THROWS_failStatus(p.getFuture().get());
+    auto pf = makePromiseFuture<void>();
+    pf.promise.setWith([&] { uassertStatusOK(failStatus); });
+    ASSERT_THROWS_failStatus(std::move(pf.future).get());
 }
 
 TEST(Promise_void, Success_setWith_Status) {
-    Promise<void> p;
-    p.setWith([&] { return Status::OK(); });
-    ASSERT_OK(p.getFuture().getNoThrow());
+    auto pf = makePromiseFuture<void>();
+    pf.promise.setWith([&] { return Status::OK(); });
+    ASSERT_OK(std::move(pf.future).getNoThrow());
 }
 
 TEST(Promise_void, Fail_setWith_Status) {
-    Promise<void> p;
-    p.setWith([&] { return failStatus; });
-    ASSERT_THROWS_failStatus(p.getFuture().get());
+    auto pf = makePromiseFuture<void>();
+    pf.promise.setWith([&] { return failStatus; });
+    ASSERT_THROWS_failStatus(std::move(pf.future).get());
 }
 
 TEST(Promise_void, Success_setWith_Future) {
     FUTURE_SUCCESS_TEST([] {},
                         [](Future<void>&& fut) {
-                            Promise<void> p;
-                            p.setWith([&] { return std::move(fut); });
-                            ASSERT_OK(p.getFuture().getNoThrow());
+                            auto pf = makePromiseFuture<void>();
+                            pf.promise.setWith([&] { return std::move(fut); });
+                            ASSERT_OK(std::move(pf.future).getNoThrow());
                         });
 }
 
 TEST(Promise_void, Fail_setWith_Future) {
     FUTURE_FAIL_TEST<void>([](Future<void>&& fut) {
-        Promise<void> p;
-        p.setWith([&] { return std::move(fut); });
-        ASSERT_THROWS_failStatus(p.getFuture().get());
+        auto pf = makePromiseFuture<void>();
+        pf.promise.setWith([&] { return std::move(fut); });
+        ASSERT_THROWS_failStatus(std::move(pf.future).get());
     });
 }
 

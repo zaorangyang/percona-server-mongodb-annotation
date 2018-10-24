@@ -65,6 +65,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/implicit_create_collection.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_state.h"
@@ -341,6 +342,12 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(const CommandInvocation* i
     }
 
     if (!invocation->supportsReadConcern(readConcernArgs.getLevel())) {
+        // We must be in a transaction if the readConcern level was upconverted to snapshot and the
+        // command must support readConcern level snapshot in order to be supported in transactions.
+        if (upconvertToSnapshot) {
+            return {ErrorCodes::OperationNotSupportedInTransaction,
+                    str::stream() << "Command is not supported in a transaction"};
+        }
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "Command does not support read concern "
                               << readConcernArgs.toString()};
@@ -624,6 +631,7 @@ void execCommandDatabase(OperationContext* opCtx,
     auto startOperationTime = getClientOperationTime(opCtx);
     auto invocation = command->parse(opCtx, request);
     boost::optional<OperationSessionInfoFromClient> sessionOptions = boost::none;
+
     try {
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -632,7 +640,7 @@ void execCommandDatabase(OperationContext* opCtx,
 
         // TODO: move this back to runCommands when mongos supports OperationContext
         // see SERVER-18515 for details.
-        rpc::readRequestMetadata(opCtx, request.body);
+        rpc::readRequestMetadata(opCtx, request.body, command->requiresAuth());
         rpc::TrackingMetadata::get(opCtx).initWithOperName(command->getName());
 
         auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -679,6 +687,10 @@ void execCommandDatabase(OperationContext* opCtx,
         // the Session. Do not check this if we are in DBDirectClient because the outer command is
         // responsible for checking out the Session.
         if (!opCtx->getClient()->isInDirectClient()) {
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    str::stream() << "It is illegal to run command " << command->getName()
+                                  << " in a multi-document transaction.",
+                    shouldCheckoutSession || !autocommitVal || command->getName() == "doTxn");
             uassert(50768,
                     str::stream() << "It is illegal to provide a txnNumber for command "
                                   << command->getName(),
@@ -851,9 +863,19 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         oss.setAllowImplicitCollectionCreation(allowImplicitCollectionCreationField);
+        ScopedOperationCompletionShardingActions operationCompletionShardingActions(opCtx);
 
-        // Can throw
-        opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
+        // This may trigger the maxTimeAlwaysTimeOut failpoint.
+        auto status = opCtx->checkForInterruptNoAssert();
+
+        // We still proceed if the primary stepped down, but accept other kinds of interruptions.
+        // We defer to individual commands to allow themselves to be interruptible by stepdowns,
+        // since commands like 'voteRequest' should conversely continue executing.
+        if (status != ErrorCodes::PrimarySteppedDown &&
+            status != ErrorCodes::InterruptedDueToReplStateChange) {
+            uassertStatusOK(status);
+        }
+
 
         CurOp::get(opCtx)->ensureStarted();
 
