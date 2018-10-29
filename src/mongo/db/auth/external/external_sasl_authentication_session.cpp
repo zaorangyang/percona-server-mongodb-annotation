@@ -123,18 +123,19 @@ StringData SaslExternalLDAPServerMechanism::getPrincipalName() const {
     return "";
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SaslExternalLDAPServerMechanism,
-                                     ("CreateSASLServerMechanismRegistry"))
-(::mongo::InitializerContext* context) {
+// Mongo initializers will run before any ServiceContext is created
+// and before any ServiceContext::ConstructorActionRegisterer is executed
+// (see SERVER-36258 and SERVER-34798)
+MONGO_INITIALIZER(SaslExternalLDAPServerMechanism)(InitializerContext*) {
     int result = sasl_server_init(NULL, saslDefaultServiceName.rawData());
     if (result != SASL_OK) {
         log() << "Failed Initializing SASL " << std::endl;
         return getInitializationError(result);
     }
-
-    auto& registry = SASLServerMechanismRegistry::get(getGlobalServiceContext());
-    registry.registerFactory<ExternalLDAPServerFactory>();
     return Status::OK();
 }
 
+namespace {
+GlobalSASLMechanismRegisterer<ExternalLDAPServerFactory> externalLDAPRegisterer;
+}
 }  // namespace mongo
