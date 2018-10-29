@@ -36,6 +36,7 @@ Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
 #define KEY_LEN 32
 #define GCM_TAG_LEN 16
+#define CHKSUM_LEN sizeof(uint32_t)
 
 typedef struct {
     // WT_ENCRYPTOR must be the first field
@@ -44,6 +45,7 @@ typedef struct {
     const EVP_CIPHER *cipher;
     int iv_len;
     unsigned char key[KEY_LEN];
+    uint32_t (*wiredtiger_checksum_crc32c)(const void *, size_t);
 } PERCONA_ENCRYPTOR;
 
 
@@ -198,6 +200,9 @@ static int percona_encrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     memcpy(dbg_data->key, pe->key, KEY_LEN);
 #endif
 
+    *(uint32_t*)(dst + *result_lenp) = (pe->wiredtiger_checksum_crc32c)(src, src_len);
+    *result_lenp += CHKSUM_LEN;
+
     uint8_t *iv = dst + *result_lenp;
     store_IV(pe, iv);
     *result_lenp += pe->iv_len;
@@ -304,6 +309,7 @@ static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     int ret = 0;
     int decrypted_len = 0;
     PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
+    uint32_t crc32c = 0;
     DBG_MSG("entering decrypt %lu %lu", src_len, dst_len);
 
     *result_lenp = 0;
@@ -330,6 +336,10 @@ static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     src_len -= sizeof(DEBUG_DATA);
 #endif
 
+    crc32c = *(uint32_t*)src;
+    src += CHKSUM_LEN;
+    src_len -= CHKSUM_LEN;
+
     if(1 != EVP_DecryptInit_ex(ctx, pe->cipher, NULL, pe->key, src))
         goto err;
     src += pe->iv_len;
@@ -338,11 +348,15 @@ static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     if(1 != EVP_DecryptUpdate(ctx, dst, &decrypted_len, src, src_len))
         goto err;
     *result_lenp += decrypted_len;
-    dst += decrypted_len;
 
-    if(1 != EVP_DecryptFinal_ex(ctx, dst, &decrypted_len))
+    if(1 != EVP_DecryptFinal_ex(ctx, dst + *result_lenp, &decrypted_len))
         goto err;
     *result_lenp += decrypted_len;
+
+    if ((pe->wiredtiger_checksum_crc32c)(dst, *result_lenp) != crc32c) {
+        ret = report_error(pe, session, EINVAL, "Decrypted data integrity check has failed. Probably the encryption key was wrong.");
+        goto cleanup;
+    }
 
     ret = 0;
     goto cleanup;
@@ -426,8 +440,7 @@ static int percona_sizing_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     DBG_MSG("entering sizing");
     (void)session;              /* Unused parameters */
 
-    //*expansion_constantp = CHKSUM_LEN + pe->iv_len;
-    *expansion_constantp = pe->iv_len + EVP_CIPHER_block_size(pe->cipher);
+    *expansion_constantp = CHKSUM_LEN + pe->iv_len + EVP_CIPHER_block_size(pe->cipher);
 #ifdef DBG_ENC_EXT
     *expansion_constantp += sizeof(DEBUG_DATA);
 #endif
@@ -550,6 +563,9 @@ int percona_encryption_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *
     pe->iv_len = EVP_CIPHER_iv_length(pe->cipher);
     DBG_MSG("IV len is %d", pe->iv_len);
     DBG_MSG("key len is %d", EVP_CIPHER_key_length(pe->cipher));
+
+    // get wiredTiger's crc32c function
+    pe->wiredtiger_checksum_crc32c = wiredtiger_crc32c_func();
 
     // calloc initializes all allocated memory to zero
     // thus pe->key is filled with zeros
