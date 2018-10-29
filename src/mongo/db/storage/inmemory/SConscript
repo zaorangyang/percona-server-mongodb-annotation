@@ -34,6 +34,7 @@ if inmemory:
             '$BUILD_DIR/mongo/db/serveronly',
             '$BUILD_DIR/mongo/db/service_context',
             '$BUILD_DIR/mongo/db/service_context_d',
+            '$BUILD_DIR/mongo/db/service_context_test_fixture',
             ],
         )
 

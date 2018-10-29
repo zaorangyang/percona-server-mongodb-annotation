@@ -28,7 +28,6 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
 #include "mongo/db/storage/inmemory/inmemory_global_options.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
@@ -147,12 +146,10 @@ private:
         wiredTigerGlobalOptions.indexConfig += ",cache_resident=false";
     }
 };
+
+ServiceContext::ConstructorActionRegisterer registerInMemory(
+    "InMemoryEngineInit", [](ServiceContext* service) {
+        registerStorageEngine(service, std::make_unique<InMemoryFactory>());
+    });
 }  // namespace
-
-MONGO_INITIALIZER_WITH_PREREQUISITES(InMemoryEngineInit, ("ServiceContext"))
-(InitializerContext* context) {
-    registerStorageEngine(getGlobalServiceContext(), std::make_unique<InMemoryFactory>());
-
-    return Status::OK();
-}
-}
+}  // namespace

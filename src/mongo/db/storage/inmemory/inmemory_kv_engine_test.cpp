@@ -40,6 +40,8 @@ class InMemoryKVHarnessHelper : public KVHarnessHelper {
 public:
     InMemoryKVHarnessHelper() : _dbpath("inmem-kv-harness") {
         const bool readOnly = false;
+        if (!hasGlobalServiceContext())
+            setGlobalServiceContext(ServiceContext::make());
         _engine.reset(new WiredTigerKVEngine(
             kInMemoryEngineName, _dbpath.path(), _cs.get(),
             "in_memory=true,"
