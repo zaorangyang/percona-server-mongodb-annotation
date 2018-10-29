@@ -307,9 +307,11 @@ Status MigrationChunkClonerSourceLegacy::awaitUntilCriticalSectionIsAppropriate(
         }
 
         if (res["ns"].str() != _args.getNss().ns() ||
-            res["from"].str() != _donorConnStr.toString() || !res["min"].isABSONObj() ||
-            res["min"].Obj().woCompare(_args.getMinKey()) != 0 || !res["max"].isABSONObj() ||
-            res["max"].Obj().woCompare(_args.getMaxKey()) != 0 ||
+            (res.hasField("fromShardId")
+                 ? (res["fromShardId"].str() != _args.getFromShardId().toString())
+                 : (res["from"].str() != _donorConnStr.toString())) ||
+            !res["min"].isABSONObj() || res["min"].Obj().woCompare(_args.getMinKey()) != 0 ||
+            !res["max"].isABSONObj() || res["max"].Obj().woCompare(_args.getMaxKey()) != 0 ||
             !_sessionId.matches(migrationSessionIdStatus.getValue())) {
             // This can happen when the destination aborted the migration and received another
             // recvChunk before this thread sees the transition to the abort state. This is
@@ -558,7 +560,7 @@ StatusWith<BSONObj> MigrationChunkClonerSourceLegacy::_callRecipient(const BSONO
     executor::RemoteCommandResponse responseStatus(
         Status{ErrorCodes::InternalError, "Uninitialized value"});
 
-    auto executor = grid.getExecutorPool()->getFixedExecutor();
+    auto executor = Grid::get(getGlobalServiceContext())->getExecutorPool()->getFixedExecutor();
     auto scheduleStatus = executor->scheduleRemoteCommand(
         executor::RemoteCommandRequest(_recipientHost, "admin", cmdObj, nullptr),
         [&responseStatus](const executor::TaskExecutor::RemoteCommandCallbackArgs& args) {

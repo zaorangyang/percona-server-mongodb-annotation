@@ -35,13 +35,12 @@
 #include "mongo/client/remote_command_targeter_mock.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/query/query_request.h"
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/catalog/config_server_version.h"
-#include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/catalog/type_config_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_identity_loader.h"
@@ -67,17 +66,8 @@ BSONObj getReplSecondaryOkMetadata() {
 
 class ClusterIdentityTest : public ShardingTestFixture {
 public:
-    void setUp() override {
-        ShardingTestFixture::setUp();
-
+    ClusterIdentityTest() {
         configTargeter()->setFindHostReturnValue(configHost);
-    }
-
-    void tearDown() override {
-        ShardingTestFixture::tearDown();
-
-        // Reset the global service context so that the cluster identity gets cleared
-        setGlobalServiceContext(std::make_unique<ServiceContextNoop>());
     }
 
     void expectConfigVersionLoad(StatusWith<OID> result) {

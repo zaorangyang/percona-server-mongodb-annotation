@@ -78,7 +78,6 @@ public:
     virtual ThreadPool* getDbWorkThreadPool() const override;
     virtual Status runRepairOnLocalDB(OperationContext* opCtx) override;
     virtual Status initializeReplSetStorage(OperationContext* opCtx, const BSONObj& config);
-    virtual void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx);
     void onDrainComplete(OperationContext* opCtx) override;
     OpTime onTransitionToPrimary(OperationContext* opCtx, bool isV1ElectionProtocol) override;
     virtual void forwardSlaveProgress();
@@ -88,6 +87,7 @@ public:
     virtual StatusWith<LastVote> loadLocalLastVoteDocument(OperationContext* opCtx);
     virtual Status storeLocalLastVoteDocument(OperationContext* opCtx, const LastVote& lastVote);
     virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime);
+    bool oplogExists(OperationContext* opCtx) final;
     virtual StatusWith<OpTime> loadLastOpTime(OperationContext* opCtx);
     virtual HostAndPort getClientHostAndPort(const OperationContext* opCtx);
     virtual void closeConnections();

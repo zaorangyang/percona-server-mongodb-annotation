@@ -335,7 +335,7 @@ void runCommand(OperationContext* opCtx,
     // Fill out all currentOp details.
     CurOp::get(opCtx)->setGenericOpRequestDetails(opCtx, nss, command, request.body, opType);
 
-    initializeOperationSessionInfo(opCtx, request.body, command->requiresAuth(), true, true, true);
+    initializeOperationSessionInfo(opCtx, request.body, command->requiresAuth(), true, true);
 
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     auto readConcernParseStatus = readConcernArgs.initialize(request.body);
@@ -375,25 +375,14 @@ void runCommand(OperationContext* opCtx,
                     }
                 }();
 
-                if (staleNs.isEmpty()) {
-                    // This should be impossible but older versions tried incorrectly to handle
-                    // it here.
-                    log() << "Received a stale config error with an empty namespace while "
-                             "executing "
-                          << redact(request.body) << " : " << redact(ex);
-                    throw;
-                }
-
                 // Send setShardVersion on this thread's versioned connections to shards (to support
                 // commands that use the legacy (ShardConnection) versioning protocol).
                 if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError)) {
                     ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
                 }
 
-                // Mark collection entry in cache as stale.
-                if (staleNs.isValid()) {
-                    Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
-                }
+                Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
+
                 if (canRetry) {
                     continue;
                 }
@@ -782,25 +771,14 @@ void Strategy::explainFind(OperationContext* opCtx,
                 }
             }();
 
-            if (staleNs.isEmpty()) {
-                // This should be impossible but older versions tried incorrectly to handle
-                // it here.
-                log() << "Received a stale config error with an empty namespace while "
-                         "executing "
-                      << redact(explainCmd) << " : " << redact(ex);
-                throw;
-            }
-
             // Send setShardVersion on this thread's versioned connections to shards (to support
             // commands that use the legacy (ShardConnection) versioning protocol).
             if (!MONGO_FAIL_POINT(doNotRefreshShardsOnRetargettingError)) {
                 ShardConnection::checkMyConnectionVersions(opCtx, staleNs.ns());
             }
 
-            // Mark collection entry in cache as stale.
-            if (staleNs.isValid()) {
-                Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
-            }
+            Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNs);
+
             if (canRetry) {
                 continue;
             }

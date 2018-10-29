@@ -67,11 +67,14 @@ env.Library(
     ],
 )
 
-# Functionality for initializing global sharding state
+# Functionality for initializing all the services used by sharding, which are common between MongoS
+# and MongoD
 env.Library(
     target='sharding_initialization',
     source=[
         'sharding_initialization.cpp',
+        'client/sharding_connection_hook.cpp',
+        'client/sharding_network_connection_hook.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/logical_session_cache_factory_mongos',
@@ -83,7 +86,11 @@ env.Library(
         '$BUILD_DIR/mongo/s/catalog/replset_dist_lock_manager',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
         '$BUILD_DIR/mongo/util/periodic_runner_factory',
-        'client/sharding_connection_hook',
+        'sharding_legacy_api',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/internal_user_auth',
+        '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
         'coreshard',
         'sharding_task_executor',
     ],
@@ -178,7 +185,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_mock',
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/executor/task_executor_pool',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
@@ -198,9 +205,10 @@ env.Library(
         'sharding_mongod_test_fixture.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/op_observer_d',
         '$BUILD_DIR/mongo/db/repl/drop_pending_collection_reaper',
         '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/db/s/op_observer_sharding_impl',
+        '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         'sharding_test_fixture_common',
     ],
@@ -350,12 +358,10 @@ env.CppUnitTest(
         'catalog_cache_refresh_test.cpp',
         'chunk_manager_index_bounds_test.cpp',
         'chunk_manager_query_test.cpp',
-        'metadata_filtering_test.cpp',
         'shard_key_pattern_test.cpp',
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/auth/authmocks",
-        '$BUILD_DIR/mongo/db/s/sharding',
         '$BUILD_DIR/mongo/db/serveronly',
         'catalog_cache_test_fixture',
     ]
@@ -443,11 +449,9 @@ env.CppUnitTest(
         'client/shard_connection_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/dbtests/mocklib',
-        '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
         '$BUILD_DIR/mongo/util/net/network',
-        'client/sharding_connection_hook',
         'sharding_legacy_api',
     ]
 )

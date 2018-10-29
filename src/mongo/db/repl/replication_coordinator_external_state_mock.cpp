@@ -81,9 +81,6 @@ Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(Operati
     return storeLocalConfigDocument(opCtx, config);
 }
 
-void ReplicationCoordinatorExternalStateMock::waitForAllEarlierOplogWritesToBeVisible(
-    OperationContext* opCtx) {}
-
 void ReplicationCoordinatorExternalStateMock::shutdown(OperationContext*) {}
 
 executor::TaskExecutor* ReplicationCoordinatorExternalStateMock::getTaskExecutor() const {
@@ -161,6 +158,10 @@ void ReplicationCoordinatorExternalStateMock::setLocalLastVoteDocument(
 
 void ReplicationCoordinatorExternalStateMock::setGlobalTimestamp(ServiceContext* service,
                                                                  const Timestamp& newTime) {}
+
+bool ReplicationCoordinatorExternalStateMock::oplogExists(OperationContext* opCtx) {
+    return true;
+}
 
 StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::loadLastOpTime(
     OperationContext* opCtx) {

@@ -57,7 +57,7 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
@@ -829,10 +829,6 @@ TEST_F(ReplCoordTest, NodeReturnsWriteConcernFailedUntilASufficientNumberOfNodes
 
 TEST_F(ReplCoordTest,
        NodeReturnsUnknownReplWriteConcernWhenAwaitReplicationReceivesAnInvalidWriteConcernMode) {
-    auto service = stdx::make_unique<ServiceContextNoop>();
-    auto client = service->makeClient("test");
-    auto opCtx = client->makeOperationContext();
-
     assertStartSuccess(BSON("_id"
                             << "mySet"
                             << "version"
@@ -862,6 +858,7 @@ TEST_F(ReplCoordTest,
     invalidWriteConcern.wTimeout = WriteConcernOptions::kNoWaiting;
     invalidWriteConcern.wMode = "fakemode";
 
+    auto opCtx = makeOperationContext();
     ReplicationCoordinator::StatusAndDuration statusAndDur =
         getReplCoord()->awaitReplication(opCtx.get(), time1, invalidWriteConcern);
     ASSERT_EQUALS(ErrorCodes::UnknownReplWriteConcern, statusAndDur.status);
@@ -870,10 +867,6 @@ TEST_F(ReplCoordTest,
 TEST_F(
     ReplCoordTest,
     NodeReturnsWriteConcernFailedUntilASufficientSetOfNodesHaveTheWriteAndTheWriteIsInACommittedSnapshot) {
-    auto service = stdx::make_unique<ServiceContextNoop>();
-    auto client = service->makeClient("test");
-    auto opCtx = client->makeOperationContext();
-
     assertStartSuccess(
         BSON("_id"
              << "mySet"
@@ -941,7 +934,7 @@ TEST_F(
     multiRackWriteConcern.wTimeout = WriteConcernOptions::kNoWaiting;
     multiRackWriteConcern.wMode = "multiDCAndRack";
 
-
+    auto opCtx = makeOperationContext();
     // Nothing satisfied
     getReplCoord()->setMyLastAppliedOpTime(time1);
     getReplCoord()->setMyLastDurableOpTime(time1);
@@ -1674,6 +1667,67 @@ TEST_F(StepDownTest, StepDownCanCompleteBasedOnReplSetUpdatePositionAlone) {
     // Verify that stepDown completes successfully.
     ASSERT_OK(*result.second.get());
     ASSERT_TRUE(repl->getMemberState().secondary());
+}
+
+TEST_F(StepDownTest, StepDownFailureRestoresDrainState) {
+    const auto repl = getReplCoord();
+
+    OpTimeWithTermOne opTime1(100, 1);
+    OpTimeWithTermOne opTime2(200, 1);
+
+    repl->setMyLastAppliedOpTime(opTime2);
+    repl->setMyLastDurableOpTime(opTime2);
+
+    // Secondaries not caught up yet.
+    ASSERT_OK(repl->setLastAppliedOptime_forTest(1, 1, opTime1));
+    ASSERT_OK(repl->setLastAppliedOptime_forTest(1, 2, opTime1));
+
+    auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
+    simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTimeoutWhen);
+    ASSERT_TRUE(repl->getMemberState().primary());
+    ASSERT(repl->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
+
+    {
+        // We can't take writes yet since we're still in drain mode.
+        const auto opCtx = makeOperationContext();
+        Lock::GlobalLock lock(opCtx.get(), MODE_IX);
+        ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "admin"));
+    }
+
+    // Step down where the secondary actually has to catch up before the stepDown can succeed.
+    auto result = stepDown_nonBlocking(false, Seconds(10), Seconds(60));
+
+    // Interrupt the ongoing stepdown command so that the stepdown attempt will fail.
+    {
+        stdx::lock_guard<Client> lk(*result.first.client.get());
+        result.first.opCtx->markKilled(ErrorCodes::Interrupted);
+    }
+
+    // Ensure that the stepdown command failed.
+    auto stepDownStatus = *result.second.get();
+    ASSERT_NOT_OK(stepDownStatus);
+    // Which code is returned is racy.
+    ASSERT(stepDownStatus == ErrorCodes::PrimarySteppedDown ||
+           stepDownStatus == ErrorCodes::Interrupted);
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+    ASSERT(repl->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
+
+    // Ensure that the failed stepdown attempt didn't make us able to take writes since we're still
+    // in drain mode.
+    {
+        const auto opCtx = makeOperationContext();
+        Lock::GlobalLock lock(opCtx.get(), MODE_IX);
+        ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "admin"));
+    }
+
+    // Now complete drain mode and ensure that we become capable of taking writes.
+    auto opCtx = makeOperationContext();
+    signalDrainComplete(opCtx.get());
+    ASSERT(repl->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
+
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+    Lock::GlobalLock lock(opCtx.get(), MODE_IX);
+    ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "admin"));
 }
 
 class StepDownTestWithUnelectableNode : public StepDownTest {

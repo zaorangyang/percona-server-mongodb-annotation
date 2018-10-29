@@ -58,11 +58,11 @@ namespace {
 std::set<NamespaceString> _backgroundThreadNamespaces;
 stdx::mutex _backgroundThreadMutex;
 
-class WiredTigerRecordStoreThread : public BackgroundJob {
+class OplogTruncaterThread : public BackgroundJob {
 public:
-    WiredTigerRecordStoreThread(const NamespaceString& ns)
+    OplogTruncaterThread(const NamespaceString& ns)
         : BackgroundJob(true /* deleteSelf */), _ns(ns) {
-        _name = std::string("WT RecordStoreThread: ") + _ns.toString();
+        _name = std::string("WT OplogTruncaterThread: ") + _ns.toString();
     }
 
     virtual std::string name() const {
@@ -118,16 +118,17 @@ public:
         } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
             return false;
         } catch (const std::exception& e) {
-            severe() << "error in WiredTigerRecordStoreThread: " << e.what();
-            fassertFailedNoTrace(!"error in WiredTigerRecordStoreThread");
+            severe() << "error in OplogTruncaterThread: " << e.what();
+            fassertFailedNoTrace(!"error in OplogTruncaterThread");
         } catch (...) {
-            fassertFailedNoTrace(!"unknown error in WiredTigerRecordStoreThread");
+            fassertFailedNoTrace(!"unknown error in OplogTruncaterThread");
         }
         return true;
     }
 
     virtual void run() {
         Client::initThread(_name.c_str());
+        ON_BLOCK_EXIT([] { Client::destroy(); });
 
         while (!globalInShutdownDeprecated()) {
             if (!_deleteExcessDocuments()) {
@@ -147,7 +148,7 @@ bool initRsOplogBackgroundThread(StringData ns) {
     }
 
     if (storageGlobalParams.repair || storageGlobalParams.readOnly) {
-        LOG(1) << "not starting WiredTigerRecordStoreThread for " << ns
+        LOG(1) << "not starting OplogTruncaterThread for " << ns
                << " because we are either in repair or read-only mode";
         return false;
     }
@@ -155,10 +156,10 @@ bool initRsOplogBackgroundThread(StringData ns) {
     stdx::lock_guard<stdx::mutex> lock(_backgroundThreadMutex);
     NamespaceString nss(ns);
     if (_backgroundThreadNamespaces.count(nss)) {
-        log() << "WiredTigerRecordStoreThread " << ns << " already started";
+        log() << "OplogTruncaterThread " << ns << " already started";
     } else {
-        log() << "Starting WiredTigerRecordStoreThread " << ns;
-        BackgroundJob* backgroundThread = new WiredTigerRecordStoreThread(nss);
+        log() << "Starting OplogTruncaterThread " << ns;
+        BackgroundJob* backgroundThread = new OplogTruncaterThread(nss);
         backgroundThread->go();
         _backgroundThreadNamespaces.insert(nss);
     }

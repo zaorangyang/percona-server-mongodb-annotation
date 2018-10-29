@@ -71,7 +71,7 @@
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/chunk_splitter.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -423,7 +423,7 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
                                // retries and they will succeed.  Unfortunately, initial sync will
                                // fail if it finds its sync source has an empty oplog.  Thus, we
                                // need to wait here until the seed document is visible in our oplog.
-                               waitForAllEarlierOplogWritesToBeVisible(opCtx);
+                               _storageInterface->waitForAllEarlierOplogWritesToBeVisible(opCtx);
                            });
 
         // Update unique index format version for all non-replicated collections. It is possible
@@ -455,21 +455,6 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
         return ex.toStatus();
     }
     return Status::OK();
-}
-
-void ReplicationCoordinatorExternalStateImpl::waitForAllEarlierOplogWritesToBeVisible(
-    OperationContext* opCtx) {
-    Collection* oplog;
-    {
-        // We don't want to be holding the collection lock while blocking, to avoid deadlocks.
-        // It is safe to store and access the oplog's Collection object after dropping the lock
-        // because the oplog is special and cannot be deleted on a running process.
-        // TODO(spencer): It should be possible to get the pointer to the oplog Collection object
-        // without ever having to take the collection lock.
-        AutoGetCollection oplogLock(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
-        oplog = oplogLock.getCollection();
-    }
-    oplog->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
 }
 
 void ReplicationCoordinatorExternalStateImpl::onDrainComplete(OperationContext* opCtx) {
@@ -633,6 +618,11 @@ void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(ServiceContext*
     setNewTimestamp(ctx, newTime);
 }
 
+bool ReplicationCoordinatorExternalStateImpl::oplogExists(OperationContext* opCtx) {
+    AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
+    return oplog.getCollection() != nullptr;
+}
+
 StatusWith<OpTime> ReplicationCoordinatorExternalStateImpl::loadLastOpTime(
     OperationContext* opCtx) {
     // TODO: handle WriteConflictExceptions below
@@ -780,8 +770,8 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
 
         const auto configsvrConnStr =
             Grid::get(opCtx)->shardRegistry()->getConfigShard()->getConnString();
-        auto status = ShardingState::get(opCtx)->updateShardIdentityConfigString(
-            opCtx, configsvrConnStr.toString());
+        auto status = ShardingInitializationMongoD::get(opCtx)->updateShardIdentityConfigString(
+            opCtx, configsvrConnStr);
         if (!status.isOK()) {
             warning() << "error encountered while trying to update config connection string to "
                       << configsvrConnStr << causedBy(status);
@@ -908,7 +898,7 @@ bool ReplicationCoordinatorExternalStateImpl::isReadCommittedSupportedByStorageE
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
     // This should never be called if the storage engine has not been initialized.
     invariant(storageEngine);
-    return storageEngine->getSnapshotManager();
+    return storageEngine->supportsReadConcernMajority();
 }
 
 bool ReplicationCoordinatorExternalStateImpl::isReadConcernSnapshotSupportedByStorageEngine(

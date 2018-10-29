@@ -91,7 +91,6 @@
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/mongod_options.h"
-#include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
@@ -111,16 +110,13 @@
 #include "mongo/db/s/balancer/balancer.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/config_server_op_observer.h"
+#include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/shard_server_op_observer.h"
-#include "mongo/db/s/sharded_connection_info.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
-#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/service_context_registrar.h"
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/session_killer.h"
@@ -284,7 +280,7 @@ ExitCode _initAndListen(int listenPort) {
 
     serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
     auto opObserverRegistry = stdx::make_unique<OpObserverRegistry>();
-    opObserverRegistry->addObserver(stdx::make_unique<OpObserverImpl>());
+    opObserverRegistry->addObserver(stdx::make_unique<OpObserverShardingImpl>());
     opObserverRegistry->addObserver(stdx::make_unique<UUIDCatalogObserver>());
 
     if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
@@ -322,12 +318,10 @@ ExitCode _initAndListen(int listenPort) {
 
     logProcessDetails();
 
-    createLockFile(serviceContext);
-
     serviceContext->setServiceEntryPoint(
         stdx::make_unique<ServiceEntryPointMongod>(serviceContext));
 
-    {
+    if (!storageGlobalParams.repair) {
         auto tl =
             transport::TransportLayerManager::createWithConfig(&serverGlobalParams, serviceContext);
         auto res = tl->setup();
@@ -337,7 +331,6 @@ ExitCode _initAndListen(int listenPort) {
         }
         serviceContext->setTransportLayer(std::move(tl));
     }
-
     initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
@@ -367,7 +360,7 @@ ExitCode _initAndListen(int listenPort) {
     }
 
     // Disallow running a storage engine that doesn't support capped collections with --profile
-    if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections() &&
+    if (!serviceContext->getStorageEngine()->supportsCappedCollections() &&
         serverGlobalParams.defaultProfile != 0) {
         log() << "Running " << storageGlobalParams.engine << " with profiling is not supported. "
               << "Make sure you are not using --profile.";
@@ -530,9 +523,8 @@ ExitCode _initAndListen(int listenPort) {
     }
 
     // This function may take the global lock.
-    auto shardingInitialized =
-        uassertStatusOK(ShardingState::get(startupOpCtx.get())
-                            ->initializeShardingAwarenessIfNeeded(startupOpCtx.get()));
+    auto shardingInitialized = ShardingInitializationMongoD::get(startupOpCtx.get())
+                                   ->initializeShardingAwarenessIfNeeded(startupOpCtx.get());
     if (shardingInitialized) {
         waitForShardRegistryReload(startupOpCtx.get()).transitional_ignore();
     }
@@ -558,10 +550,9 @@ ExitCode _initAndListen(int listenPort) {
                 uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
             }
         } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            uassertStatusOK(
-                initializeGlobalShardingStateForMongod(startupOpCtx.get(),
-                                                       ConnectionString::forLocal(),
-                                                       kDistLockProcessIdForConfigServer));
+            initializeGlobalShardingStateForMongoD(startupOpCtx.get(),
+                                                   ConnectionString::forLocal(),
+                                                   kDistLockProcessIdForConfigServer);
 
             Balancer::create(startupOpCtx->getServiceContext());
 
@@ -639,7 +630,7 @@ ExitCode _initAndListen(int listenPort) {
         kind = LogicalSessionCacheServer::kReplicaSet;
     }
 
-    auto sessionCache = makeLogicalSessionCacheD(serviceContext, kind);
+    auto sessionCache = makeLogicalSessionCacheD(kind);
     LogicalSessionCache::set(serviceContext, std::move(sessionCache));
 
     // MessageServer::run will return when exit code closes its socket and we don't need the
@@ -652,10 +643,12 @@ ExitCode _initAndListen(int listenPort) {
         return EXIT_NET_ERROR;
     }
 
-    start = serviceContext->getTransportLayer()->start();
-    if (!start.isOK()) {
-        error() << "Failed to start the listener: " << start.toString();
-        return EXIT_NET_ERROR;
+    if (!storageGlobalParams.repair) {
+        start = serviceContext->getTransportLayer()->start();
+        if (!start.isOK()) {
+            error() << "Failed to start the listener: " << start.toString();
+            return EXIT_NET_ERROR;
+        }
     }
 
     serviceContext->notifyStartupComplete();
@@ -809,10 +802,7 @@ auto makeReplicationExecutor(ServiceContext* serviceContext) {
         executor::makeNetworkInterface("Replication", nullptr, std::move(hookList)));
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
-                                     ("SSLManager", "ServiceContext", "default"))
-(InitializerContext* context) {
-    auto serviceContext = getGlobalServiceContext();
+void setUpReplication(ServiceContext* serviceContext) {
     repl::StorageInterface::set(serviceContext, stdx::make_unique<repl::StorageInterfaceImpl>());
     auto storageInterface = repl::StorageInterface::get(serviceContext);
 
@@ -849,7 +839,6 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(CreateReplicationManager,
         static_cast<int64_t>(curTimeMillis64()));
     repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
     repl::setOplogCollectionName(serviceContext);
-    return Status::OK();
 }
 
 #ifdef MONGO_CONFIG_SSL
@@ -893,7 +882,7 @@ void shutdownTask() {
         // is building an index.
         repl::ReplicationCoordinator::get(serviceContext)->shutdown(opCtx);
 
-        ShardingState::get(serviceContext)->shutDown(opCtx);
+        ShardingInitializationMongoD::get(serviceContext)->shutDown(opCtx);
 
         // Destroy all stashed transaction resources, in order to release locks.
         SessionKiller::Matcher matcherAllSessions(
@@ -996,6 +985,18 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
         severe(LogComponent::kControl) << "Failed global initialization: " << status;
         quickExit(EXIT_FAILURE);
     }
+
+    try {
+        setGlobalServiceContext(ServiceContext::make());
+    } catch (...) {
+        auto cause = exceptionToStatus();
+        severe(LogComponent::kControl) << "Failed to create service context: " << redact(cause);
+        quickExit(EXIT_FAILURE);
+    }
+
+    auto service = getGlobalServiceContext();
+    setUpReplication(service);
+    service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
 
     ErrorExtraInfo::invariantHaveAllParsers();
 

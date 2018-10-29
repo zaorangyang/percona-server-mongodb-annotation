@@ -141,8 +141,7 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
             return Status::OK();
         }
 
-        auto myShard =
-            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardingState->getShardName());
+        auto myShard = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardingState->shardId());
         if (!myShard.isOK()) {
             return myShard.getStatus();
         }
@@ -309,7 +308,11 @@ Status waitForReadConcern(OperationContext* opCtx,
                     "Replica sets running protocol version 0 do not support readConcern: snapshot"};
         }
         if (speculative) {
-            session->setSpeculativeTransactionOpTimeToLastApplied(opCtx);
+            session->setSpeculativeTransactionOpTime(
+                opCtx,
+                readConcernArgs.getOriginalLevel() == repl::ReadConcernLevel::kSnapshotReadConcern
+                    ? SpeculativeTransactionOpTime::kAllCommitted
+                    : SpeculativeTransactionOpTime::kLastApplied);
         }
     }
 

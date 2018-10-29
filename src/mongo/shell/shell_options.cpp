@@ -223,6 +223,11 @@ Status addMongoShellOptions(moe::OptionSection* options) {
         moe::Switch,
         "automatically retry write operations upon transient network errors");
 
+    options->addOptionChaining("disableImplicitSessions",
+                               "disableImplicitSessions",
+                               moe::Switch,
+                               "do not automatically create and use implicit sessions");
+
     options
         ->addOptionChaining(
             "rpcProtocols", "rpcProtocols", moe::String, " none, opQueryOnly, opCommandOnly, all")
@@ -385,6 +390,9 @@ Status storeMongoShellOptions(const moe::Environment& params,
     if (params.count("retryWrites")) {
         shellGlobalParams.shouldRetryWrites = true;
     }
+    if (params.count("disableImplicitSessions")) {
+        shellGlobalParams.shouldUseImplicitSessions = false;
+    }
     if (params.count("rpcProtocols")) {
         std::string protos = params["rpcProtocols"].as<string>();
         auto parsedRPCProtos = rpc::parseProtocolSet(protos);
@@ -480,5 +488,55 @@ Status storeMongoShellOptions(const moe::Environment& params,
         return ret;
 
     return Status::OK();
+}
+
+void redactPasswordOptions(int argc, char** argv) {
+    constexpr auto kLongPasswordOption = "--password"_sd;
+    constexpr auto kShortPasswordOption = "-p"_sd;
+    for (int i = 0; i < argc; ++i) {
+        StringData arg(argv[i]);
+        if (arg.startsWith(kShortPasswordOption)) {
+            char* toRedact = nullptr;
+            // Handle -p password
+            if ((arg == kShortPasswordOption) && (i + 1 < argc)) {
+                toRedact = argv[++i];
+                // Handle -ppassword
+            } else {
+                toRedact = argv[i] + kShortPasswordOption.size();
+            }
+
+            invariant(toRedact);
+            // The arg should be null-terminated, replace everything up to \0 to 'x'
+            while (*toRedact) {
+                *toRedact++ = 'x';
+            }
+        }
+        if (arg.startsWith(kLongPasswordOption)) {
+            char* toRedact = nullptr;
+            // Handle --password password
+            if ((arg == kLongPasswordOption) && (i + 1 < argc)) {
+                toRedact = argv[++i];
+                // Handle --password=password
+            } else if (arg.size() != kLongPasswordOption.size()) {
+                toRedact = argv[i] + kLongPasswordOption.size();
+                // It's not valid to do --passwordpassword, make sure there's an = separator
+                invariant(*(toRedact++) == '=');
+            }
+
+            // If there's nothing to redact, just exit
+            if (!toRedact) {
+                continue;
+            }
+
+            // The arg should be null-terminated, replace everything up to \0 to 'x'
+            while (*toRedact) {
+                *toRedact++ = 'x';
+            }
+        } else if (MongoURI::isMongoURI(arg)) {
+            auto reformedURI = MongoURI::redact(arg);
+            auto length = arg.size();
+            ::strncpy(argv[i], reformedURI.data(), length);
+        }
+    }
 }
 }  // namespace mongo

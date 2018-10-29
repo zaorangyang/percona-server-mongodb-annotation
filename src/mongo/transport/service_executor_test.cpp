@@ -32,7 +32,7 @@
 
 #include "boost/optional.hpp"
 
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context.h"
 #include "mongo/transport/service_executor_adaptive.h"
 #include "mongo/transport/service_executor_synchronous.h"
 #include "mongo/transport/service_executor_task_names.h"
@@ -46,13 +46,19 @@ namespace mongo {
 namespace {
 using namespace transport;
 
+namespace {
+constexpr Milliseconds kWorkerThreadRunTime{1000};
+// Run time + generous scheduling time slice
+const Milliseconds kShutdownTime = kWorkerThreadRunTime + Milliseconds{50};
+}
+
 struct TestOptions : public ServiceExecutorAdaptive::Options {
     int reservedThreads() const final {
         return 1;
     }
 
     Milliseconds workerThreadRunTime() const final {
-        return Milliseconds{1000};
+        return kWorkerThreadRunTime;
     }
 
     int runTimeJitter() const final {
@@ -143,7 +149,7 @@ private:
 class ServiceExecutorAdaptiveFixture : public unittest::Test {
 protected:
     void setUp() override {
-        auto scOwned = stdx::make_unique<ServiceContextNoop>();
+        auto scOwned = ServiceContext::make();
         setGlobalServiceContext(std::move(scOwned));
 
         auto configOwned = stdx::make_unique<TestOptions>();
@@ -160,7 +166,7 @@ protected:
 class ServiceExecutorSynchronousFixture : public unittest::Test {
 protected:
     void setUp() override {
-        auto scOwned = stdx::make_unique<ServiceContextNoop>();
+        auto scOwned = ServiceContext::make();
         setGlobalServiceContext(std::move(scOwned));
 
         executor = stdx::make_unique<ServiceExecutorSynchronous>(getGlobalServiceContext());
@@ -190,7 +196,7 @@ void scheduleBasicTask(ServiceExecutor* exec, bool expectSuccess) {
 
 TEST_F(ServiceExecutorAdaptiveFixture, BasicTaskRuns) {
     ASSERT_OK(executor->start());
-    auto guard = MakeGuard([this] { ASSERT_OK(executor->shutdown(Milliseconds{500})); });
+    auto guard = MakeGuard([this] { ASSERT_OK(executor->shutdown(kShutdownTime)); });
 
     scheduleBasicTask(executor.get(), true);
 }
@@ -201,7 +207,7 @@ TEST_F(ServiceExecutorAdaptiveFixture, ScheduleFailsBeforeStartup) {
 
 TEST_F(ServiceExecutorSynchronousFixture, BasicTaskRuns) {
     ASSERT_OK(executor->start());
-    auto guard = MakeGuard([this] { ASSERT_OK(executor->shutdown(Milliseconds{500})); });
+    auto guard = MakeGuard([this] { ASSERT_OK(executor->shutdown(kShutdownTime)); });
 
     scheduleBasicTask(executor.get(), true);
 }

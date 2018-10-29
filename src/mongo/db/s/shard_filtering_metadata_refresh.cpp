@@ -36,7 +36,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
@@ -47,10 +47,12 @@
 
 namespace mongo {
 
-Status onShardVersionMismatch(OperationContext* opCtx,
-                              const NamespaceString& nss,
-                              ChunkVersion shardVersionReceived,
-                              bool forceRefreshFromThisThread) noexcept {
+namespace {
+
+void onShardVersionMismatch(OperationContext* opCtx,
+                            const NamespaceString& nss,
+                            ChunkVersion shardVersionReceived,
+                            bool forceRefreshFromThisThread) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(!opCtx->getClient()->isInDirectClient());
 
@@ -65,17 +67,13 @@ Status onShardVersionMismatch(OperationContext* opCtx,
     // Ensure any ongoing migrations have completed before trying to do the refresh. This wait is
     // just an optimization so that MongoS does not exhaust its maximum number of StaleConfig retry
     // attempts while the migration is being committed.
-    try {
-        auto& oss = OperationShardingState::get(opCtx);
-        oss.waitForMigrationCriticalSectionSignal(opCtx);
-    } catch (const DBException& ex) {
-        return ex.toStatus();
-    }
+    auto& oss = OperationShardingState::get(opCtx);
+    oss.waitForMigrationCriticalSectionSignal(opCtx);
 
     const auto currentShardVersion = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
         const auto currentMetadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
-        if (currentMetadata) {
+        if (currentMetadata->isSharded()) {
             return currentMetadata->getShardVersion();
         }
 
@@ -86,11 +84,43 @@ Status onShardVersionMismatch(OperationContext* opCtx,
         currentShardVersion.majorVersion() >= shardVersionReceived.majorVersion()) {
         // Don't need to remotely reload if we're in the same epoch and the requested version is
         // smaller than the one we know about. This means that the remote side is behind.
-        return Status::OK();
+        return;
     }
 
+    forceShardFilteringMetadataRefresh(opCtx, nss, forceRefreshFromThisThread);
+}
+
+void onDbVersionMismatch(OperationContext* opCtx,
+                         const StringData dbName,
+                         const DatabaseVersion& clientDbVersion,
+                         const boost::optional<DatabaseVersion>& serverDbVersion) {
+    invariant(!opCtx->lockState()->isLocked());
+    invariant(!opCtx->getClient()->isInDirectClient());
+
+    auto const shardingState = ShardingState::get(opCtx);
+    invariant(shardingState->canAcceptShardedCommands());
+
+    if (serverDbVersion && serverDbVersion->getUuid() == clientDbVersion.getUuid() &&
+        serverDbVersion->getLastMod() >= clientDbVersion.getLastMod()) {
+        // The client was stale; do not trigger server-side refresh.
+        return;
+    }
+
+    // TODO SERVER-33773 if the 'waitForMovePrimaryCriticalSection' flag is set on the
+    // OperationShardingState, wait for the movePrimary critical section to complete before
+    // attempting a refresh.
+
+    forceDatabaseRefresh(opCtx, dbName);
+}
+
+}  // namespace
+
+Status onShardVersionMismatchNoExcept(OperationContext* opCtx,
+                                      const NamespaceString& nss,
+                                      ChunkVersion shardVersionReceived,
+                                      bool forceRefreshFromThisThread) noexcept {
     try {
-        forceShardFilteringMetadataRefresh(opCtx, nss, forceRefreshFromThisThread);
+        onShardVersionMismatch(opCtx, nss, shardVersionReceived, forceRefreshFromThisThread);
         return Status::OK();
     } catch (const DBException& ex) {
         log() << "Failed to refresh metadata for collection" << nss << causedBy(redact(ex));
@@ -118,7 +148,7 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
         // Exclusive collection lock needed since we're now changing the metadata
         AutoGetCollection autoColl(opCtx, nss, MODE_IX, MODE_X);
 
-        auto css = CollectionShardingState::get(opCtx, nss);
+        auto* const css = CollectionShardingRuntime::get(opCtx, nss);
         css->refreshMetadata(opCtx, nullptr);
 
         return ChunkVersion::UNSHARDED();
@@ -129,7 +159,8 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
         auto metadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
 
         // We already have newer version
-        if (metadata && metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
+        if (metadata->isSharded() &&
+            metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
             metadata->getCollVersion() >= cm->getVersion()) {
             LOG(1) << "Skipping refresh of metadata for " << nss << " "
                    << metadata->getCollVersion() << " with an older " << cm->getVersion();
@@ -140,11 +171,12 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     // Exclusive collection lock needed since we're now changing the metadata
     AutoGetCollection autoColl(opCtx, nss, MODE_IX, MODE_X);
 
-    auto css = CollectionShardingState::get(opCtx, nss);
+    auto* const css = CollectionShardingRuntime::get(opCtx, nss);
+
     auto metadata = css->getMetadata(opCtx);
 
     // We already have newer version
-    if (metadata && metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
+    if (metadata->isSharded() && metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
         metadata->getCollVersion() >= cm->getVersion()) {
         LOG(1) << "Skipping refresh of metadata for " << nss << " " << metadata->getCollVersion()
                << " with an older " << cm->getVersion();
@@ -152,44 +184,25 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     }
 
     std::unique_ptr<CollectionMetadata> newCollectionMetadata =
-        stdx::make_unique<CollectionMetadata>(cm, shardingState->getShardName());
+        stdx::make_unique<CollectionMetadata>(cm, shardingState->shardId());
 
     css->refreshMetadata(opCtx, std::move(newCollectionMetadata));
 
     return css->getMetadata(opCtx)->getShardVersion();
 }
 
-void onDbVersionMismatch(OperationContext* opCtx,
-                         const StringData dbName,
-                         const DatabaseVersion& clientDbVersion,
-                         const boost::optional<DatabaseVersion>& serverDbVersion) noexcept {
-    invariant(!opCtx->lockState()->isLocked());
-    invariant(!opCtx->getClient()->isInDirectClient());
-
-    auto const shardingState = ShardingState::get(opCtx);
-    invariant(shardingState->canAcceptShardedCommands());
-
-    if (serverDbVersion && serverDbVersion->getUuid() == clientDbVersion.getUuid() &&
-        serverDbVersion->getLastMod() >= clientDbVersion.getLastMod()) {
-        // The client was stale; do not trigger server-side refresh.
-        return;
-    }
-
+Status onDbVersionMismatchNoExcept(
+    OperationContext* opCtx,
+    const StringData dbName,
+    const DatabaseVersion& clientDbVersion,
+    const boost::optional<DatabaseVersion>& serverDbVersion) noexcept {
     try {
-        // TODO SERVER-33773 if the 'waitForMovePrimaryCriticalSection' flag is set on the
-        // OperationShardingState, wait for the movePrimary critical section to complete before
-        // attempting a refresh.
-    } catch (const DBException& ex) {
-        log() << "Failed to wait for movePrimary critical section to complete "
-              << causedBy(redact(ex));
-        return;
-    }
-
-    try {
-        forceDatabaseRefresh(opCtx, dbName);
+        onDbVersionMismatch(opCtx, dbName, clientDbVersion, serverDbVersion);
+        return Status::OK();
     } catch (const DBException& ex) {
         log() << "Failed to refresh databaseVersion for database " << dbName
               << causedBy(redact(ex));
+        return ex.toStatus();
     }
 }
 

@@ -39,6 +39,7 @@
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
@@ -51,7 +52,8 @@ MONGO_FAIL_POINT_DEFINE(WTPausePrimaryOplogDurabilityLoop);
 
 void WiredTigerOplogManager::start(OperationContext* opCtx,
                                    const std::string& uri,
-                                   WiredTigerRecordStore* oplogRecordStore) {
+                                   WiredTigerRecordStore* oplogRecordStore,
+                                   bool updateOldestTimestamp) {
     invariant(!_isRunning);
     // Prime the oplog read timestamp.
     std::unique_ptr<SeekableRecordCursor> reverseOplogCursor =
@@ -79,7 +81,8 @@ void WiredTigerOplogManager::start(OperationContext* opCtx,
     _oplogJournalThread = stdx::thread(&WiredTigerOplogManager::_oplogJournalThreadLoop,
                                        this,
                                        WiredTigerRecoveryUnit::get(opCtx)->getSessionCache(),
-                                       oplogRecordStore);
+                                       oplogRecordStore,
+                                       updateOldestTimestamp);
 
     _isRunning = true;
     _shuttingDown = false;
@@ -100,7 +103,7 @@ void WiredTigerOplogManager::halt() {
 }
 
 void WiredTigerOplogManager::waitForAllEarlierOplogWritesToBeVisible(
-    const WiredTigerRecordStore* oplogRecordStore, OperationContext* opCtx) const {
+    const WiredTigerRecordStore* oplogRecordStore, OperationContext* opCtx) {
     invariant(opCtx->lockState()->isNoop() || !opCtx->lockState()->inAWriteUnitOfWork());
 
     // In order to reliably detect rollback situations, we need to fetch the latestVisibleTimestamp
@@ -122,6 +125,12 @@ void WiredTigerOplogManager::waitForAllEarlierOplogWritesToBeVisible(
     opCtx->recoveryUnit()->abandonSnapshot();
 
     stdx::unique_lock<stdx::mutex> lk(_oplogVisibilityStateMutex);
+
+    // Prevent any scheduled journal flushes from being delayed and blocking this wait excessively.
+    _opsWaitingForVisibility++;
+    invariant(_opsWaitingForVisibility > 0);
+    auto exitGuard = MakeGuard([&] { _opsWaitingForVisibility--; });
+
     opCtx->waitForConditionOrInterrupt(_opsBecameVisibleCV, lk, [&] {
         auto newLatestVisibleTimestamp = getOplogReadTimestamp();
         if (newLatestVisibleTimestamp < currentLatestVisibleTimestamp) {
@@ -154,8 +163,9 @@ void WiredTigerOplogManager::triggerJournalFlush() {
     }
 }
 
-void WiredTigerOplogManager::_oplogJournalThreadLoop(
-    WiredTigerSessionCache* sessionCache, WiredTigerRecordStore* oplogRecordStore) noexcept {
+void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* sessionCache,
+                                                     WiredTigerRecordStore* oplogRecordStore,
+                                                     const bool updateOldestTimestamp) noexcept {
     Client::initThread("WTOplogJournalThread");
 
     // This thread updates the oplog read timestamp, the timestamp used to read from the oplog with
@@ -177,15 +187,18 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(
             auto now = Date_t::now();
             auto deadline = now + journalDelay;
             auto shouldSyncOpsWaitingForJournal = [&] {
-                return _shuttingDown || oplogRecordStore->haveCappedWaiters();
+                return _shuttingDown || _opsWaitingForVisibility ||
+                    oplogRecordStore->haveCappedWaiters();
             };
 
             // Eventually it would be more optimal to merge this with the normal journal flushing
-            // and block for oplog tailers to show up. For now this loop will poll once a
-            // millisecond up to the journalDelay to see if we have any waiters yet. This reduces
-            // sync-related I/O on the primary when secondaries are lagged, but will avoid
-            // significant delays in confirming majority writes on replica sets with infrequent
-            // writes.
+            // and block for either oplog tailers or operations waiting for oplog visibility. For
+            // now this loop will poll once a millisecond up to the journalDelay to see if we have
+            // any waiters yet. This reduces sync-related I/O on the primary when secondaries are
+            // lagged, but will avoid significant delays in confirming majority writes on replica
+            // sets with infrequent writes.
+            // Callers of waitForAllEarlierOplogWritesToBeVisible() like causally consistent reads
+            // will preempt this delay.
             while (now < deadline &&
                    !_opsWaitingForJournalCV.wait_until(
                        lk, now.toSystemTimePoint(), shouldSyncOpsWaitingForJournal)) {
@@ -228,6 +241,11 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(
             _setOplogReadTimestamp(lk, newTimestamp);
         }
         lk.unlock();
+
+        if (updateOldestTimestamp) {
+            const bool force = false;
+            sessionCache->getKVEngine()->setOldestTimestamp(Timestamp(newTimestamp), force);
+        }
 
         // Wake up any await_data cursors and tell them more data might be visible now.
         oplogRecordStore->notifyCappedWaitersIfNeeded();

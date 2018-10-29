@@ -68,7 +68,9 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/journal_listener.h"
+#include "mongo/db/storage/storage_file_util.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_extensions.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
@@ -157,46 +159,6 @@ std::string WiredTigerFileVersion::getDowngradeString() {
     return "compatibility=(release=3.0)";
 }
 
-namespace {
-void openWiredTiger(const std::string& path,
-                    WT_EVENT_HANDLER* eventHandler,
-                    const std::string& wtOpenConfig,
-                    WT_CONNECTION** connOut,
-                    WiredTigerFileVersion* fileVersionOut) {
-    std::string configStr = wtOpenConfig + ",compatibility=(require_min=\"3.1.0\")";
-    int ret = wiredtiger_open(path.c_str(), eventHandler, configStr.c_str(), connOut);
-    if (!ret) {
-        *fileVersionOut = {WiredTigerFileVersion::StartupVersion::IS_40};
-        return;
-    }
-
-    configStr = wtOpenConfig + ",compatibility=(require_min=\"3.0.0\")";
-    ret = wiredtiger_open(path.c_str(), eventHandler, configStr.c_str(), connOut);
-    if (!ret) {
-        *fileVersionOut = {WiredTigerFileVersion::StartupVersion::IS_36};
-        return;
-    }
-
-    // Arbiters do not replicate the FCV document. Due to arbiter FCV semantics on 3.6, shutting
-    // down a 3.6 arbiter will downgrade the data files to WT compatibility 2.9. Thus, 4.0
-    // binaries must allow starting up on 2.9 files.
-    configStr = wtOpenConfig + ",compatibility=(require_min=\"2.9.0\")";
-    ret = wiredtiger_open(path.c_str(), eventHandler, configStr.c_str(), connOut);
-    if (!ret) {
-        *fileVersionOut = {WiredTigerFileVersion::StartupVersion::IS_34};
-        return;
-    }
-
-    severe() << "Failed to start up WiredTiger under any compatibility version.";
-    if (ret == EINVAL) {
-        fassertFailedNoTrace(28561);
-    }
-
-    severe() << wtRCToStatus(ret).reason();
-    fassertFailedNoTrace(28595);
-}
-}  // namespace
-
 using std::set;
 using std::string;
 
@@ -215,6 +177,7 @@ public:
 
     virtual void run() {
         Client::initThread(name().c_str());
+        ON_BLOCK_EXIT([] { Client::destroy(); });
 
         LOG(1) << "starting " << name() << " thread";
 
@@ -262,6 +225,7 @@ public:
 
     virtual void run() {
         Client::initThread(name().c_str());
+        ON_BLOCK_EXIT([] { Client::destroy(); });
 
         LOG(1) << "starting " << name() << " thread";
 
@@ -282,17 +246,28 @@ public:
                 // First, initialDataTimestamp is Timestamp(0, 1) -> Take full checkpoint. This is
                 // when there is no consistent view of the data (i.e: during initial sync).
                 //
-                // Second, stableTimestamp < initialDataTimestamp: Skip checkpoints. The data on
-                // disk is prone to being rolled back. Hold off on checkpoints.  Hope that the
-                // stable timestamp surpasses the data on disk, allowing storage to persist newer
-                // copies to disk.
+                // Second, enableMajorityReadConcern is false. In this case, we are not tracking a
+                // stable timestamp. Take a full checkpoint.
                 //
-                // Third, stableTimestamp >= initialDataTimestamp: Take stable checkpoint. Steady
+                // Third, stableTimestamp < initialDataTimestamp: Skip checkpoints. The data on disk
+                // is prone to being rolled back. Hold off on checkpoints.  Hope that the stable
+                // timestamp surpasses the data on disk, allowing storage to persist newer copies to
+                // disk.
+                //
+                // Fourth, stableTimestamp >= initialDataTimestamp: Take stable checkpoint. Steady
                 // state case.
                 if (initialDataTimestamp.asULL() <= 1) {
                     UniqueWiredTigerSession session = _sessionCache->getSession();
                     WT_SESSION* s = session->getSession();
                     invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
+                } else if (!serverGlobalParams.enableMajorityReadConcern) {
+                    UniqueWiredTigerSession session = _sessionCache->getSession();
+                    WT_SESSION* s = session->getSession();
+                    invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
+
+                    // Ensure '_lastStableCheckpointTimestamp' is set such that oplog truncation may
+                    // take place entirely based on the oplog size.
+                    _lastStableCheckpointTimestamp.store(std::numeric_limits<uint64_t>::max());
                 } else if (stableTimestamp < initialDataTimestamp) {
                     LOG_FOR_RECOVERY(2)
                         << "Stable timestamp is behind the initial data timestamp, skipping "
@@ -458,7 +433,8 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
       _durable(durable),
       _ephemeral(ephemeral),
       _inRepairMode(repair),
-      _readOnly(readOnly) {
+      _readOnly(readOnly),
+      _keepDataHistory(serverGlobalParams.enableMajorityReadConcern) {
     boost::filesystem::path journalPath = path;
     journalPath /= "journal";
     if (_durable) {
@@ -541,7 +517,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
 
     string config = ss.str();
     log() << "wiredtiger_open config: " << config;
-    openWiredTiger(path, _eventHandler.getWtEventHandler(), config, &_conn, &_fileVersion);
+    _openWiredTiger(path, config);
     _eventHandler.setStartupSuccessful();
     _wtOpenConfig = config;
 
@@ -611,6 +587,64 @@ void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
     bb.done();
 }
 
+void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::string& wtOpenConfig) {
+    std::string configStr = wtOpenConfig + ",compatibility=(require_min=\"3.1.0\")";
+
+    auto wtEventHandler = _eventHandler.getWtEventHandler();
+
+    int ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
+    if (!ret) {
+        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_40};
+        return;
+    }
+
+    // Arbiters do not replicate the FCV document. Due to arbiter FCV semantics on 4.0, shutting
+    // down a 4.0 arbiter may either downgrade the data files to WT compatibility 2.9 or 3.0. Thus,
+    // 4.2 binaries must allow starting up on 2.9 and 3.0 files.
+    configStr = wtOpenConfig + ",compatibility=(require_min=\"3.0.0\")";
+    ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
+    if (!ret) {
+        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_36};
+        return;
+    }
+
+    configStr = wtOpenConfig + ",compatibility=(require_min=\"2.9.0\")";
+    ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
+    if (!ret) {
+        _fileVersion = {WiredTigerFileVersion::StartupVersion::IS_34};
+        return;
+    }
+
+    warning() << "Failed to start up WiredTiger under any compatibility version.";
+    if (ret == EINVAL) {
+        fassertFailedNoTrace(28561);
+    }
+
+    if (ret == WT_TRY_SALVAGE) {
+        warning() << "WiredTiger metadata corruption detected";
+
+        if (!_inRepairMode) {
+            severe() << kWTRepairMsg;
+            fassertFailedNoTrace(50944);
+        }
+
+        warning() << "Attempting to salvage WiredTiger metadata";
+        configStr = wtOpenConfig + ",salvage=true";
+        ret = wiredtiger_open(path.c_str(), wtEventHandler, configStr.c_str(), &_conn);
+        if (!ret) {
+            StorageRepairObserver::get(getGlobalServiceContext())
+                ->onModification("WiredTiger metadata salvaged");
+            return;
+        }
+
+        severe() << "Failed to salvage WiredTiger metadata: " + wtRCToStatus(ret).reason();
+        fassertFailedNoTrace(50947);
+    }
+
+    severe() << "Reason: " << wtRCToStatus(ret).reason();
+    fassertFailedNoTrace(28595);
+}
+
 void WiredTigerKVEngine::cleanShutdown() {
     log() << "WiredTigerKVEngine shutting down";
     if (!_readOnly)
@@ -651,7 +685,8 @@ void WiredTigerKVEngine::cleanShutdown() {
     }
 
     if (!_fileVersion.shouldDowngrade(_readOnly, _inRepairMode, !_recoveryTimestamp.isNull())) {
-        closeConfig += "use_timestamp=true,";
+        closeConfig += (serverGlobalParams.enableMajorityReadConcern ? "use_timestamp=true,"
+                                                                     : "use_timestamp=false,");
         invariantWTOK(_conn->close(_conn, closeConfig.c_str()));
         return;
     }
@@ -753,30 +788,65 @@ Status WiredTigerKVEngine::_salvageIfNeeded(const char* uri) {
         warning() << "Data file is missing for " << uri
                   << ". Attempting to drop and re-create the collection.";
 
-        auto swMetadata = WiredTigerUtil::getMetadataRaw(session, uri);
-        if (!swMetadata.isOK()) {
-            error() << "Failed to get metadata for " << uri;
-            return swMetadata.getStatus();
-        }
-
-        rc = session->drop(session, uri, NULL);
-        if (rc != 0) {
-            error() << "Failed to drop " << uri;
-            return wtRCToStatus(rc);
-        }
-
-        rc = session->create(session, uri, swMetadata.getValue().c_str());
-        if (rc != 0) {
-            error() << "Failed to create " << uri << " with config: " << swMetadata.getValue();
-            return wtRCToStatus(rc);
-        }
-        log() << "Successfully re-created " << uri << ".";
-        return Status::OK();
+        return _rebuildIdent(session, uri);
     }
 
-    // TODO need to cleanup the sizeStorer cache after salvaging.
     log() << "Verify failed on uri " << uri << ". Running a salvage operation.";
-    return wtRCToStatus(session->salvage(session, uri, NULL), "Salvage failed:");
+    auto status = wtRCToStatus(session->salvage(session, uri, NULL), "Salvage failed:");
+    if (status.isOK()) {
+        return {ErrorCodes::DataModifiedByRepair, str::stream() << "Salvaged data for " << uri};
+    }
+
+    warning() << "Salvage failed for uri " << uri << ": " << status.reason()
+              << ". The file will be moved out of the way and a new ident will be created.";
+
+    //  If the data is unsalvageable, we should completely rebuild the ident.
+    return _rebuildIdent(session, uri);
+}
+
+Status WiredTigerKVEngine::_rebuildIdent(WT_SESSION* session, const char* uri) {
+    invariant(_inRepairMode);
+
+    static const char tablePrefix[] = "table:";
+    invariant(std::string(uri).find(tablePrefix) == 0);
+
+    const std::string identName(uri + sizeof(tablePrefix) - 1);
+    auto filePath = getDataFilePathForIdent(identName);
+    if (filePath) {
+        const boost::filesystem::path corruptFile(filePath->string() + ".corrupt");
+        warning() << "Moving data file " << filePath->string() << " to backup as "
+                  << corruptFile.string();
+
+        auto status = fsyncRename(filePath.get(), corruptFile);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    warning() << "Rebuilding ident " << identName;
+
+    // This is safe to call after moving the file because it only reads from the metadata, and not
+    // the data file itself.
+    auto swMetadata = WiredTigerUtil::getMetadataRaw(session, uri);
+    if (!swMetadata.isOK()) {
+        error() << "Failed to get metadata for " << uri;
+        return swMetadata.getStatus();
+    }
+
+    int rc = session->drop(session, uri, NULL);
+    if (rc != 0) {
+        error() << "Failed to drop " << uri;
+        return wtRCToStatus(rc);
+    }
+
+    rc = session->create(session, uri, swMetadata.getValue().c_str());
+    if (rc != 0) {
+        error() << "Failed to create " << uri << " with config: " << swMetadata.getValue();
+        return wtRCToStatus(rc);
+    }
+    log() << "Successfully re-created " << uri << ".";
+    return {ErrorCodes::DataModifiedByRepair,
+            str::stream() << "Re-created empty data file for " << uri};
 }
 
 int WiredTigerKVEngine::flushAllFiles(OperationContext* opCtx, bool sync) {
@@ -951,24 +1021,18 @@ Status WiredTigerKVEngine::recoverOrphanedIdent(OperationContext* opCtx,
 
     boost::filesystem::path tmpFile{*identFilePath};
     tmpFile += ".tmp";
-    if (boost::filesystem::exists(tmpFile, ec)) {
-        return {ErrorCodes::FileRenameFailed,
-                "Attempted to rename data file to an existing temporary file: " + tmpFile.string()};
-    }
 
     log() << "Renaming data file " + identFilePath->string() + " to temporary file " +
             tmpFile.string();
-
-    boost::filesystem::rename(*identFilePath, tmpFile, ec);
-    if (ec) {
-        return {ErrorCodes::FileRenameFailed,
-                "Error renaming data file to temporary file: " + ec.message()};
+    auto status = fsyncRename(identFilePath.get(), tmpFile);
+    if (!status.isOK()) {
+        return status;
     }
 
     log() << "Creating new RecordStore for collection " + ns + " with UUID: " +
             (options.uuid ? options.uuid->toString() : "none");
 
-    auto status = createGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
+    status = createGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
     if (!status.isOK()) {
         return status;
     }
@@ -979,18 +1043,29 @@ Status WiredTigerKVEngine::recoverOrphanedIdent(OperationContext* opCtx,
     if (ec) {
         return {ErrorCodes::UnknownError, "Error deleting empty data file: " + ec.message()};
     }
+    status = fsyncParentDirectory(*identFilePath);
+    if (!status.isOK()) {
+        return status;
+    }
 
-    boost::filesystem::rename(tmpFile, *identFilePath, ec);
-    if (ec) {
-        return {ErrorCodes::FileRenameFailed,
-                "Error renaming data file back from temporary file: " + ec.message()};
+    status = fsyncRename(tmpFile, identFilePath.get());
+    if (!status.isOK()) {
+        return status;
     }
 
     log() << "Salvaging ident " + ident;
 
     WiredTigerSession sessionWrapper(_conn);
     WT_SESSION* session = sessionWrapper.getSession();
-    return wtRCToStatus(session->salvage(session, _uri(ident).c_str(), NULL), "Salvage failed: ");
+    status = wtRCToStatus(session->salvage(session, _uri(ident).c_str(), NULL), "Salvage failed: ");
+    if (status.isOK()) {
+        return {ErrorCodes::DataModifiedByRepair,
+                str::stream() << "Salvaged data for ident " << ident};
+    }
+    warning() << "Could not salvage data. Rebuilding ident: " << status.reason();
+
+    //  If the data is unsalvageable, we should completely rebuild the ident.
+    return _rebuildIdent(session, _uri(ident).c_str());
 #endif
 }
 
@@ -1322,11 +1397,6 @@ bool WiredTigerKVEngine::initRsOplogBackgroundThread(StringData ns) {
     return initRsOplogBackgroundThreadCallback(ns);
 }
 
-void WiredTigerKVEngine::setOldestTimestamp(Timestamp oldestTimestamp) {
-    constexpr bool doForce = true;
-    _setOldestTimestamp(oldestTimestamp, doForce);
-}
-
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(WTPreserveSnapshotHistoryIndefinitely);
@@ -1334,6 +1404,10 @@ MONGO_FAIL_POINT_DEFINE(WTPreserveSnapshotHistoryIndefinitely);
 }  // namespace
 
 void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp) {
+    if (!_keepDataHistory) {
+        return;
+    }
+
     if (stableTimestamp.isNull()) {
         return;
     }
@@ -1373,10 +1447,11 @@ void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp) {
     // Communicate to WiredTiger that it can clean up timestamp data earlier than the timestamp
     // provided.  No future queries will need point-in-time reads at a timestamp prior to the one
     // provided here.
-    _setOldestTimestamp(stableTimestamp);
+    const bool force = false;
+    setOldestTimestamp(stableTimestamp, force);
 }
 
-void WiredTigerKVEngine::_setOldestTimestamp(Timestamp oldestTimestamp, bool force) {
+void WiredTigerKVEngine::setOldestTimestamp(Timestamp oldestTimestamp, bool force) {
     if (MONGO_FAIL_POINT(WTPreserveSnapshotHistoryIndefinitely)) {
         return;
     }
@@ -1393,6 +1468,17 @@ void WiredTigerKVEngine::_setOldestTimestamp(Timestamp oldestTimestamp, bool for
         // be serviced. When force is set, we respect the caller's request and do not lag the
         // oldest timestamp.
         oldestTimestamp = oplogReadTimestamp;
+    }
+    const auto localSnapshotTimestamp = _sessionCache->snapshotManager().getLocalSnapshot();
+    if (!force && localSnapshotTimestamp && oldestTimestamp > *localSnapshotTimestamp) {
+        // When force is not set, lag the `oldest timestamp` to the local snapshot timestamp.
+        // Secondary reads are performed at the local snapshot timestamp, so advancing the oldest
+        // timestamp beyond the local snapshot timestamp could cause secondary reads to fail. This
+        // is not a problem when majority read concern is enabled, since the replication system will
+        // not set the stable timestamp ahead of the local snapshot timestamp. However, when
+        // majority read concern is disabled and the oldest timestamp is set by the oplog manager,
+        // the oplog manager can set the oldest timestamp ahead of the local snapshot timestamp.
+        oldestTimestamp = *localSnapshotTimestamp;
     }
 
     char oldestTSConfigString["force=true,oldest_timestamp=,commit_timestamp="_sd.size() +
@@ -1433,6 +1519,14 @@ void WiredTigerKVEngine::setInitialDataTimestamp(Timestamp initialDataTimestamp)
 }
 
 bool WiredTigerKVEngine::supportsRecoverToStableTimestamp() const {
+    if (_ephemeral || !_keepDataHistory) {
+        return false;
+    }
+
+    return true;
+}
+
+bool WiredTigerKVEngine::supportsRecoveryTimestamp() const {
     if (_ephemeral) {
         return false;
     }
@@ -1494,8 +1588,8 @@ Timestamp WiredTigerKVEngine::getAllCommittedTimestamp() const {
 }
 
 boost::optional<Timestamp> WiredTigerKVEngine::getRecoveryTimestamp() const {
-    if (!supportsRecoverToStableTimestamp()) {
-        severe() << "WiredTiger is configured to not support recover to a stable timestamp";
+    if (!supportsRecoveryTimestamp()) {
+        severe() << "WiredTiger is configured to not support providing a recovery timestamp";
         fassertFailed(50745);
     }
 
@@ -1528,12 +1622,16 @@ bool WiredTigerKVEngine::supportsReadConcernSnapshot() const {
     return true;
 }
 
+bool WiredTigerKVEngine::supportsReadConcernMajority() const {
+    return _keepDataHistory;
+}
+
 void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,
                                            const std::string& uri,
                                            WiredTigerRecordStore* oplogRecordStore) {
     stdx::lock_guard<stdx::mutex> lock(_oplogManagerMutex);
     if (_oplogManagerCount == 0)
-        _oplogManager->start(opCtx, uri, oplogRecordStore);
+        _oplogManager->start(opCtx, uri, oplogRecordStore, !_keepDataHistory);
     _oplogManagerCount++;
 }
 

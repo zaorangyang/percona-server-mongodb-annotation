@@ -52,10 +52,12 @@ public:
     ~WiredTigerOplogManager() {}
 
     // This method will initialize the oplog read timestamp and start the background thread that
-    // refreshes the value.
+    // refreshes the value. If `updateOldestTimestamp` is true, the background thread will also take
+    // responsibility for updating the oldest timestamp.
     void start(OperationContext* opCtx,
                const std::string& uri,
-               WiredTigerRecordStore* oplogRecordStore);
+               WiredTigerRecordStore* oplogRecordStore,
+               bool updateOldestTimestamp);
 
     void halt();
 
@@ -76,7 +78,7 @@ public:
     // Waits until all committed writes at this point to become visible (that is, no holes exist in
     // the oplog.)
     void waitForAllEarlierOplogWritesToBeVisible(const WiredTigerRecordStore* oplogRecordStore,
-                                                 OperationContext* opCtx) const;
+                                                 OperationContext* opCtx);
 
     // Returns the all committed timestamp. All transactions with timestamps earlier than the
     // all committed timestamp are committed.
@@ -84,7 +86,8 @@ public:
 
 private:
     void _oplogJournalThreadLoop(WiredTigerSessionCache* sessionCache,
-                                 WiredTigerRecordStore* oplogRecordStore) noexcept;
+                                 WiredTigerRecordStore* oplogRecordStore,
+                                 const bool updateOldestTimestamp) noexcept;
 
     void _setOplogReadTimestamp(WithLock, uint64_t newTimestamp);
 
@@ -102,6 +105,10 @@ private:
     // floor in waitForAllEarlierOplogWritesToBeVisible().
     RecordId _oplogMaxAtStartup = RecordId(0);  // Guarded by oplogVisibilityStateMutex.
     bool _opsWaitingForJournal = false;         // Guarded by oplogVisibilityStateMutex.
+
+    // When greater than 0, indicates that there are operations waiting for oplog visibility, and
+    // journal flushing should not be delayed.
+    std::int64_t _opsWaitingForVisibility = 0;  // Guarded by oplogVisibilityStateMutex.
 
     AtomicUInt64 _oplogReadTimestamp;
 };

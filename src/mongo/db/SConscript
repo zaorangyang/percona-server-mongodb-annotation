@@ -132,14 +132,14 @@ env.CppUnitTest(
 )
 
 env.CppUnitTest(
-    target= 'op_observer_impl_test',
-    source= 'op_observer_impl_test.cpp',
+    target='op_observer_impl_test',
+    source='op_observer_impl_test.cpp',
     LIBDEPS=[
+        'auth/authmocks',
         'common',
-        'op_observer_d',
+        'op_observer_impl',
+        'repl/replmocks',
         'service_context_d_test_fixture',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/repl/replmocks',
     ],
 )
 
@@ -249,7 +249,6 @@ env.CppUnitTest(
         'logical_session_id_helpers',
         'service_context',
         '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/unittest/concurrency',
         '$BUILD_DIR/mongo/util/clock_source_mock',
     ],
@@ -515,8 +514,6 @@ env.Library(
         'operation_context.cpp',
         'operation_context_group.cpp',
         'service_context.cpp',
-        'service_context_noop.cpp',
-        'service_context_registrar.cpp',
         'server_recovery.cpp',
         'unclean_shutdown.cpp',
     ],
@@ -529,16 +526,6 @@ env.Library(
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/util/periodic_runner',
-    ],
-)
-
-env.Library(
-    target='service_context_noop_init',
-    source=[
-        'service_context_noop_init.cpp'
-    ],
-    LIBDEPS=[
-        'service_context',
     ],
 )
 
@@ -614,9 +601,9 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/idl/idl_parser',
         "commands",
-        "service_context_noop_init",
         "auth/authmocks",
         "repl/replmocks",
+        "service_context_test_fixture",
     ],
 )
 
@@ -631,7 +618,6 @@ env.Library(
         'catalog_raii',
         'curop',
         's/sharding_api_d',
-        's/sharding',
         'stats/top',
     ],
 )
@@ -657,6 +643,7 @@ env.Library(
         'catalog/database_holder',
         'catalog/uuid_catalog',
         'concurrency/lock_manager',
+        'curop_failpoint_helpers',
         'curop_metrics',
         'dbdirectclient',
         'index/index_access_method',
@@ -683,7 +670,7 @@ env.CppUnitTest(
         'auth/authmocks',
         'catalog/database_holder_mock',
         'catalog_raii',
-        'service_context_noop_init',
+        'service_context_test_fixture',
         'stats/fill_locker_info',
     ],
 )
@@ -732,7 +719,6 @@ env.Library(
 env.Library(
     target="service_context_d",
     source=[
-        "service_context_d.cpp",
         "service_entry_point_mongod.cpp",
     ],
     LIBDEPS=[
@@ -740,7 +726,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/ops/write_ops_parsers',
-        '$BUILD_DIR/mongo/db/s/sharding',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
@@ -769,7 +754,7 @@ env.Library(
 )
 
 env.Library(
-    target="op_observer_d",
+    target="op_observer_impl",
     source=[
         "op_observer_impl.cpp",
     ],
@@ -777,7 +762,7 @@ env.Library(
         'catalog/collection_options',
         'op_observer',
         'repl/oplog',
-        's/sharding_runtime_d',
+        's/sharding_api_d',
         'views/views_mongod',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/catalog/uuid_catalog',
@@ -903,7 +888,12 @@ env.Library(
         "repl/repl_coordinator_interface",
         "stats/timer_stats",
         "storage/storage_options",
-        "s/sharding",
+    ],
+    LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/s/grid",
+        "catalog_raii",
+        "commands/server_status_core",
+        "s/sharding_api_d",
     ],
 )
 
@@ -923,6 +913,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/document_validation',
         '$BUILD_DIR/mongo/db/catalog/index_create',
         '$BUILD_DIR/mongo/db/catalog/index_key_validate',
+        '$BUILD_DIR/mongo/db/storage/storage_repair_observer',
         '$BUILD_DIR/mongo/db/repl/oplog',
     ],
 )
@@ -1014,16 +1005,16 @@ env.Library(
         'audit',
         'background',
         'bson/dotted_path_support',
-        'catalog/collection',
         'catalog/collection_info_cache',
+        'catalog/collection',
         'catalog/database',
         'catalog/document_validation',
-        'catalog/index_catalog',
         'catalog/index_catalog_entry',
+        'catalog/index_catalog',
         'commands',
         'concurrency/write_conflict_exception',
-        'curop',
         'curop_failpoint_helpers',
+        'curop',
         'cursor_server_params',
         'db_raii',
         'dbdirectclient',
@@ -1038,7 +1029,7 @@ env.Library(
         'query/query_common',
         'query/query_planner',
         'repl/repl_coordinator_interface',
-        's/sharding',
+        's/sharding_api_d',
         'stats/serveronly_stats',
         'storage/oplog_hack',
         'storage/storage_options',
@@ -1060,8 +1051,6 @@ env.Library(
         "$BUILD_DIR/mongo/db/ttl_collection_cache",
         "$BUILD_DIR/mongo/executor/network_interface_factory",
         "$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl",
-        "$BUILD_DIR/mongo/s/client/sharding_connection_hook",
-        "$BUILD_DIR/mongo/s/coreshard",
         "$BUILD_DIR/mongo/scripting/scripting_server",
         "$BUILD_DIR/mongo/util/clock_sources",
         "$BUILD_DIR/mongo/util/elapsed_tracker",
@@ -1090,7 +1079,6 @@ env.Library(
         "index_d",
         "introspect",
         "matcher/expressions_mongod_only",
-        "op_observer_d",
         "ops/write_ops_parsers",
         "pipeline/aggregation",
         "prefetch",
@@ -1111,7 +1099,7 @@ env.Library(
         "repl/topology_coordinator",
         "rw_concern_d",
         "s/commands_db_s",
-        "s/sharding_api_d",
+        "s/op_observer_sharding_impl",
         "s/sharding_runtime_d",
         "startup_warnings_mongod",
         "stats/counters",
@@ -1148,6 +1136,7 @@ env.Library(
         'repair_database',
         'repl/drop_pending_collection_reaper',
         'repl/repl_settings',
+        'storage/storage_repair_observer',
     ],
 )
 
@@ -1203,13 +1192,12 @@ envWithAsio.CppUnitTest(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/auth/authorization_session_for_test',
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/transport/transport_layer_mock',
         'logical_session_cache',
         'logical_session_cache_impl',
         'logical_session_id',
         'logical_session_id_helpers',
+        'service_context_test_fixture',
         'service_liaison_mock',
         'sessions_collection_mock',
     ],
@@ -1405,7 +1393,6 @@ envWithAsio.CppUnitTest(
         'logical_session_cache_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/service_context_noop_init',
         '$BUILD_DIR/mongo/executor/async_timer_mock',
         'auth/authmocks',
         'keys_collection_manager',
@@ -1416,6 +1403,7 @@ envWithAsio.CppUnitTest(
         'logical_session_cache',
         'logical_session_cache_impl',
         'service_liaison_mock',
+        'service_context_test_fixture',
         'sessions_collection_mock',
     ],
 )
@@ -1715,6 +1703,20 @@ env.CppUnitTest(
 )
 
 env.Library(
+    target='service_context_test_fixture',
+    source=[
+        'service_context_test_fixture.cpp',
+    ],
+    LIBDEPS=[
+        'service_context',
+        '$BUILD_DIR/mongo/unittest/unittest',
+    ],
+    LIBDEPS_PRIVATE=[
+        'op_observer',
+    ],
+)
+
+env.Library(
     target= 'service_context_d_test_fixture',
     source= [
         'service_context_d_test_fixture.cpp',
@@ -1725,6 +1727,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/unittest/unittest',
         'service_context_d',
+        'service_context_test_fixture',
     ],
 )
 
@@ -1794,6 +1797,7 @@ asioEnv.CppIntegrationTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/executor/network_interface_fixture',
+        '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
     ],
 )
 

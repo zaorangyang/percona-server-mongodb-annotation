@@ -190,12 +190,15 @@ public:
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
     /**
-     * This method will force the oldest timestamp to the input value. Callers must be serialized
-     * along with `setStableTimestamp`
+     * This method will set the oldest timestamp and commit timestamp to the input value. Callers
+     * must be serialized along with `setStableTimestamp`. If force=false, this function does not
+     * set the commit timestamp and may choose to lag the oldest timestamp.
      */
-    void setOldestTimestamp(Timestamp oldestTimestamp);
+    void setOldestTimestamp(Timestamp oldestTimestamp, bool force) override;
 
     virtual bool supportsRecoverToStableTimestamp() const override;
+
+    virtual bool supportsRecoveryTimestamp() const override;
 
     virtual StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) override;
 
@@ -211,6 +214,8 @@ public:
     virtual Timestamp getAllCommittedTimestamp() const override;
 
     bool supportsReadConcernSnapshot() const final;
+
+    bool supportsReadConcernMajority() const final;
 
     // wiredtiger specific
     // Calls WT_CONNECTION::reconfigure on the underlying WT_CONNECTION
@@ -293,16 +298,33 @@ private:
     class WiredTigerJournalFlusher;
     class WiredTigerCheckpointThread;
 
+    /**
+     * Opens a connection on the WiredTiger database 'path' with the configuration 'wtOpenConfig'.
+     * Only returns when successful. Intializes both '_conn' and '_fileVersion'.
+     *
+     * If corruption is detected and _inRepairMode is 'true', attempts to salvage the WiredTiger
+     * metadata.
+     */
+    void _openWiredTiger(const std::string& path, const std::string& wtOpenConfig);
+
     Status _salvageIfNeeded(const char* uri);
     void _ensureIdentPath(StringData ident);
+
+    /**
+     * Recreates a WiredTiger ident from the provided URI by dropping and recreating the ident.
+     * This moves aside the existing data file, if one exists, with an added ".corrupt" suffix.
+     *
+     * Returns DataModifiedByRepair if the rebuild was successful, and any other error on failure.
+     * This will never return Status::OK().
+     */
+    Status _rebuildIdent(WT_SESSION* session, const char* uri);
 
     bool _hasUri(WT_SESSION* session, const std::string& uri) const;
 
     std::string _uri(StringData ident) const;
 
-    void _setOldestTimestamp(Timestamp oldestTimestamp, bool force = false);
-
     WT_CONNECTION* _conn;
+    WiredTigerFileVersion _fileVersion;
     WiredTigerEventHandler _eventHandler;
     std::unique_ptr<WiredTigerSessionCache> _sessionCache;
     ClockSource* const _clockSource;
@@ -324,6 +346,14 @@ private:
     bool _ephemeral;
     const bool _inRepairMode;
     bool _readOnly;
+
+    // If _keepDataHistory is true, then the storage engine keeps all history after the stable
+    // timestamp, and WiredTigerKVEngine is responsible for advancing the oldest timestamp. If
+    // _keepDataHistory is false (i.e. majority reads are disabled), then we only keep history after
+    // the "no holes point", and WiredTigerOplogManager is responsible for advancing the oldest
+    // timestamp.
+    const bool _keepDataHistory = true;
+
     std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
     std::unique_ptr<WiredTigerCheckpointThread> _checkpointThread;
 
@@ -338,6 +368,14 @@ private:
 
     std::unique_ptr<WiredTigerSession> _backupSession;
     Timestamp _recoveryTimestamp;
-    WiredTigerFileVersion _fileVersion;
+
+    // Tracks the stable and oldest timestamps we've set on the storage engine.
+    AtomicWord<std::uint64_t> _oldestTimestamp;
+    AtomicWord<std::uint64_t> _stableTimestamp;
+    AtomicWord<std::uint64_t> _oplogNeededForRollback{Timestamp::min().asULL()};
+
+    // Timestamp of data at startup. Used internally to advise checkpointing and recovery to a
+    // timestamp. Provided by replication layer because WT does not persist timestamps.
+    AtomicWord<std::uint64_t> _initialDataTimestamp;
 };
 }

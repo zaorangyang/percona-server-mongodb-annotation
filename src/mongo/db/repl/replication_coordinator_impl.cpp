@@ -495,6 +495,16 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
     ReplSetConfig localConfig;
     status = localConfig.initialize(cfg.getValue());
     if (!status.isOK()) {
+        if (status.code() == ErrorCodes::RepairedReplicaSetNode) {
+            severe()
+                << "This instance has been repaired and may contain modified replicated data that "
+                   "would not match other replica set members. To see your repaired data, start "
+                   "mongod without the --replSet option. When you are finished recovering your "
+                   "data and would like to perform a complete re-sync, please refer to the "
+                   "documentation here: "
+                   "https://docs.mongodb.com/manual/tutorial/resync-replica-set-member/";
+            fassertFailedNoTrace(50923);
+        }
         error() << "Locally stored replica set configuration does not parse; See "
                    "http://www.mongodb.org/dochub/core/recover-replica-set-from-invalid-config "
                    "for information on how to recover from this. Got \""
@@ -1269,10 +1279,9 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
                                                     OpTime targetOpTime,
                                                     boost::optional<Date_t> deadline) {
     if (!isMajorityCommittedRead) {
-        // This assumes the read concern is "local" level.
-        // We need to wait for all committed writes to be visible, even in the oplog (which uses
-        // special visibility rules).
-        _externalState->waitForAllEarlierOplogWritesToBeVisible(opCtx);
+        if (!_externalState->oplogExists(opCtx)) {
+            return {ErrorCodes::NotYetInitialized, "The oplog does not exist."};
+        }
     }
 
     stdx::unique_lock<stdx::mutex> lock(_mutex);
@@ -1334,6 +1343,18 @@ Status ReplicationCoordinatorImpl::_waitUntilOpTime(OperationContext* opCtx,
         if (!waitStatus.isOK()) {
             return waitStatus;
         }
+    }
+
+    lock.unlock();
+
+    if (!isMajorityCommittedRead) {
+        // This assumes the read concern is "local" level.
+        // We need to wait for all committed writes to be visible, even in the oplog (which uses
+        // special visibility rules).  We must do this after waiting for our target optime, because
+        // only then do we know that it will fill in all "holes" before that time.  If we do it
+        // earlier, we may return when the requested optime has been reached, but other writes
+        // at optimes before that time are not yet visible.
+        _storage->waitForAllEarlierOplogWritesToBeVisible(opCtx);
     }
 
     return Status::OK();
@@ -1671,13 +1692,14 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
 
     const long long termAtStart = _topCoord->getTerm();
 
-    status = _topCoord->prepareForStepDownAttempt();
-    if (!status.isOK()) {
+    auto statusWithAbortFn = _topCoord->prepareForStepDownAttempt();
+    if (!statusWithAbortFn.isOK()) {
         // This will cause us to fail if we're already in the process of stepping down.
         // It is also possible to get here even if we're done stepping down via another path,
         // and this will also elicit a failure from this call.
-        return status;
+        return statusWithAbortFn.getStatus();
     }
+    const auto& abortFn = statusWithAbortFn.getValue();
 
     // Update _canAcceptNonLocalWrites from the TopologyCoordinator now that we're in the middle
     // of a stepdown attempt.  This will prevent us from accepting writes so that if our stepdown
@@ -1713,7 +1735,7 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
         _performPostMemberStateUpdateAction(action);
     };
     ScopeGuard onExitGuard = MakeGuard([&] {
-        _topCoord->abortAttemptedStepDownIfNeeded();
+        abortFn();
         updateMemberState();
     });
 
@@ -1797,7 +1819,8 @@ void ReplicationCoordinatorImpl::_performElectionHandoff() {
     }
 
     auto target = _rsConfig.getMemberAt(candidateIndex).getHostAndPort();
-    executor::RemoteCommandRequest request(target, "admin", BSON("replSetStepUp" << 1), nullptr);
+    executor::RemoteCommandRequest request(
+        target, "admin", BSON("replSetStepUp" << 1 << "skipDryRun" << true), nullptr);
     log() << "Handing off election to " << target;
 
     auto callbackHandleSW = _replExecutor->scheduleRemoteCommand(
@@ -3604,13 +3627,16 @@ CallbackFn ReplicationCoordinatorImpl::_wrapAsCallbackFn(const stdx::function<vo
     };
 }
 
-Status ReplicationCoordinatorImpl::stepUpIfEligible() {
+Status ReplicationCoordinatorImpl::stepUpIfEligible(bool skipDryRun) {
     if (!isV1ElectionProtocol()) {
         return Status(ErrorCodes::CommandNotSupported,
                       "Step-up command is only supported by Protocol Version 1");
     }
 
-    _startElectSelfIfEligibleV1(TopologyCoordinator::StartElectionReason::kStepUpRequest);
+    auto reason = skipDryRun ? TopologyCoordinator::StartElectionReason::kStepUpRequestSkipDryRun
+                             : TopologyCoordinator::StartElectionReason::kStepUpRequest;
+    _startElectSelfIfEligibleV1(reason);
+
     EventHandle finishEvent;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);

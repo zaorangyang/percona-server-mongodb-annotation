@@ -71,6 +71,18 @@ variables:
       run_multiple_jobs: false
   - func: "send benchmark results"
 
+- &benchrun_embedded_template
+  name: benchrun_embedded_template
+  depends_on:
+  - generate_benchrun_embedded_files
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --help
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
 - &jepsen_config_vars
   jepsen_key_time_limit: --key-time-limit 15
   jepsen_protocol_version: --protocol-version 1
@@ -128,7 +140,6 @@ variables:
   aws_key_remote: ${powercycle_aws_key}
   aws_secret_remote: ${powercycle_aws_secret}
 
-# TODO: Remove psutil from virtualenv_requirements when BUILD-3083 is done
 - &powercycle_ec2_instance
   aws_ec2_yml: aws_ec2.yml
   ec2_expire_hours: "24"
@@ -144,7 +155,6 @@ variables:
   ssh_key_id: ${powercycle_ssh_key_id}
   standard_port: "20000"
   virtualenv_dir: venv_powercycle
-  virtualenv_requirements: psutil
   windows_crash_cmd: \"notmyfault/notmyfaultc64.exe -accepteula crash 1\"
   windows_crash_dl: https://download.sysinternals.com/files/NotMyFault.zip
   windows_crash_dir: notmyfault
@@ -176,6 +186,19 @@ variables:
   mongodb_options: --rootDir=${remote_dir}-${task_id} --mongodbBinDir=${remote_dir}
   mongod_options: --mongodUsablePorts ${standard_port} ${secret_port} --dbPath=${db_path} --logPath=${log_path}
   mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1 --setParameter logComponentVerbosity='{storage:{recovery:2}}'\"
+
+- &benchrun_embedded
+  name: benchrun_embedded
+  execution_tasks:
+  - benchrun_embedded_aggregation
+  - benchrun_embedded_commands
+  - benchrun_embedded_insert
+  - benchrun_embedded_misc
+  - benchrun_embedded_mixed_and_multi
+  - benchrun_embedded_queries
+  - benchrun_embedded_remove
+  - benchrun_embedded_update
+  - generate_benchrun_embedded_files
 
 - &replica_sets_auth
   name: replica_sets_auth
@@ -450,13 +473,14 @@ variables:
   - name: dbtest
   - name: ese
   - name: external_auth
+    distros:
+    - windows-64-2016
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_decimal
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -767,6 +791,15 @@ functions:
       bucket: mciuploads
       extract_to: src
 
+  "fetch benchrun embedded files" : &fetch_benchrun_embedded_files
+    command: s3.get
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      remote_file: ${project}/${build_variant}/${revision}/benchrun_json_files.tgz
+      bucket: mciuploads
+      extract_to: src/benchrun_embedded/testcases
+
   "get buildnumber" : &get_buildnumber
     command: keyval.inc
     params:
@@ -1064,7 +1097,8 @@ functions:
         set -o verbose
 
         if [ "${scons_cache_scope}" = "shared" ]; then
-            sudo umount /efs || umount /efs || true
+            ${set_sudo}
+            $sudo umount /efs || true
         fi
 
   "build new tools" :
@@ -1197,6 +1231,13 @@ functions:
   - *set_up_credentials
   - *fetch_benchmarks
 
+  "do benchmark embedded setup" :
+  - *git_get_project
+  - *fetch_artifacts
+  - *get_buildnumber
+  - *set_up_credentials
+  - *fetch_benchrun_embedded_files
+
   "set up virtualenv" :
     command: shell.exec
     type: test
@@ -1289,6 +1330,14 @@ functions:
                 echo "Reducing jobs from ${num_jobs_available|1} to $num_jobs_available"
                 ;;
               esac
+            fi
+
+            # Reduce the number of available jobs by two-thirds when running the
+            # secondary_reads_passthrough task on the Enterprise RHEL 6.2 InMemory build variant.
+            if [[ "${build_variant}" = "enterprise-rhel-62-64-bit-inmem" \
+                  && "${task_name}" = "secondary_reads_passthrough" ]]; then
+              num_jobs_available=$((${num_jobs_available|3} / 3))
+              echo "Reducing jobs from ${num_jobs_available|1} to $num_jobs_available"
             fi
 
             if [ ${max_jobs|0} -gt 0 ] && [ ${max_jobs|0} -lt $num_jobs_available ]; then
@@ -1417,7 +1466,7 @@ functions:
 
         ${activate_virtualenv}
         set +o errexit
-        ${compile_env|} $python ./buildscripts/scons.py ${compile_flags|} ${task_compile_flags|} ${scons_cache_args|} $extra_args ${targets} ${additional_targets|} MONGO_VERSION=${version}
+        ${compile_env|} $python ./buildscripts/scons.py ${compile_flags|} ${task_compile_flags|} ${task_compile_flags_extra|} ${scons_cache_args|} $extra_args ${targets} ${additional_targets|} MONGO_VERSION=${version}
         exit_status=$?
         # If compile fails we do not run any tests
         if [ $exit_status -ne 0 ]; then
@@ -1470,7 +1519,8 @@ functions:
               echo "Shared cache is already mounted"
             else
               echo "Shared cache - mounting file system"
-              sudo mount /efs || mount /efs
+              ${set_sudo}
+              $sudo mount /efs
             fi
             set -o errexit
           fi
@@ -1689,18 +1739,6 @@ functions:
 
   "run powercycle test" :
     - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          set -o verbose
-          set -o errexit
-
-          if [ ! -z "${virtualenv_requirements}" ]; then
-            ${activate_virtualenv}
-            pip install -r pytests/requirements.txt
-          fi
-
-    - command: shell.exec
       type: test
       params:
         working_dir: src
@@ -1841,7 +1879,7 @@ functions:
           --edition ${multiversion_edition|base}             \
           --platform ${multiversion_platform|linux}          \
           --architecture ${multiversion_architecture|x86_64} \
-          --useLatest 3.2 3.4 3.6
+          --useLatest 3.2 3.4 3.6 3.6.7
 
   "do snmp setup" :
     command: shell.exec
@@ -2163,8 +2201,8 @@ functions:
         working_dir: src
         script: |
           set -o errexit
-          # Copy buildscripts and mongoDB executables to the remote host.
-          file_param="--file buildscripts"
+          # Copy buildscripts, pytests and mongoDB executables to the remote host.
+          file_param="--file buildscripts --file pytests"
           mongo_executables="mongo mongod mongos"
           for executable in $mongo_executables
           do
@@ -2189,14 +2227,12 @@ functions:
           set -o errexit
           # Set up virtualenv on remote.
           cmds="python_loc=\$(which \${python|/opt/mongodbtoolchain/v2/bin/python2})"
-          cmds="$cmds; if [ \"Windows_NT\" = \"$OS\" ]; then python_loc=\$(cygpath -w \$python_loc); fi"
+          cmds="$cmds; remote_dir=${remote_dir|.}"
+          cmds="$cmds; if [ \"Windows_NT\" = \"$OS\" ]; then python_loc=\$(cygpath -w \$python_loc); remote_dir=\$(cygpath -w \$remote_dir); fi"
           cmds="$cmds; virtualenv --python \$python_loc --system-site-packages ${virtualenv_dir|venv}"
           cmds="$cmds; activate=\$(find ${virtualenv_dir|venv} -name 'activate')"
           cmds="$cmds; . \$activate"
-          # Install python modules on remote, if required.
-          if [ ! -z "${virtualenv_requirements}" ]; then
-            cmds="$cmds; pip install ${virtualenv_requirements}"
-          fi
+          cmds="$cmds; pip install -r \$remote_dir/pytests/requirements.txt"
           ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
           ${activate_virtualenv}
           $python buildscripts/remote_operations.py          \
@@ -2204,6 +2240,66 @@ functions:
             --userHost $USER@${private_ip_address}           \
             --sshConnectionOptions "$ssh_connection_options" \
             --retries ${ssh_retries|0}                       \
+            --commands "$cmds"
+
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src
+        script: |
+          if [ "Windows_NT" = "$OS" ]; then
+            exit 0
+          fi
+          # Enable core dumps on non-Windows remote hosts.
+          # The core pattern must specify a director, since mongod --fork will chdir("/")
+          # and cannot generate a core dump there (see SERVER-21635).
+          # We need to reboot the host for the core limits to take effect.
+          ${set_sudo}
+          core_pattern=${remote_dir}/dump_%e.%p.core
+          sysctl_conf=/etc/sysctl.conf
+          cmds="ulimit -a"
+          cmds="$cmds; echo \"$USER - core unlimited\" | $sudo tee -a /etc/security/limits.conf"
+          cmds="$cmds; if [ -f $sysctl_conf ]"
+          cmds="$cmds; then grep ^kernel.core_pattern $sysctl_conf"
+          cmds="$cmds;    if [ \$? -eq  0 ]"
+          cmds="$cmds;    then $sudo sed -i \"s,kernel.core_pattern=.*,kernel.core_pattern=$core_pattern,\" $sysctl_conf"
+          cmds="$cmds;    else echo \"kernel.core_pattern=$core_pattern\" | $sudo tee -a $sysctl_conf"
+          cmds="$cmds;    fi"
+          cmds="$cmds; else echo Cannot change the core pattern and no core dumps will be generated."
+          cmds="$cmds; fi"
+          cmds="$cmds; $sudo reboot"
+          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+          ${activate_virtualenv}
+          $python buildscripts/remote_operations.py          \
+            --verbose                                        \
+            --userHost $USER@${private_ip_address}           \
+            --sshConnectionOptions "$ssh_connection_options" \
+            --retries ${ssh_retries|0}                       \
+            --commands "$cmds"
+
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src
+        script: |
+          if [ "Windows_NT" = "$OS" ]; then
+            exit 0
+          fi
+          # Always exit successfully, as this is just informational.
+          trap 'echo "Trapped exit code $?, exiting with 0"; exit 0' EXIT
+          # Print the ulimit & kernel.core_pattern
+          cmds="uptime"
+          cmds="$cmds; ulimit -a"
+          cmds="$cmds; if [ -f /sbin/sysctl ]"
+          cmds="$cmds; then /sbin/sysctl kernel.core_pattern"
+          cmds="$cmds; fi"
+          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+          ${activate_virtualenv}
+          $python buildscripts/remote_operations.py          \
+            --verbose                                        \
+            --userHost $USER@${private_ip_address}           \
+            --sshConnectionOptions "$ssh_connection_options" \
+            --retries ${ssh_retries|3}                       \
             --commands "$cmds"
 
     - command: shell.exec
@@ -3158,9 +3254,9 @@ timeout:
 ##   - Non standard jstests, i.e., jstestfuzz
 ## Note that the task name supports glob patterns.
 test_lifecycle_excluded_tasks:
-- aggregation_fuzzer*
 - burn_in_tests
 - compile*
+- benchmarks*
 - dbtest*
 - idl_tests
 - integration*
@@ -3391,12 +3487,9 @@ tasks:
           VERSION=${version}
           WORKDIR=${workdir}
 
-          CDRIVER_VERSION=1.12.0
-          rm -rf mongo-c-driver-$CDRIVER_VERSION
           rm -rf mongo-c-driver
-          curl -LO https://github.com/mongodb/mongo-c-driver/releases/download/$CDRIVER_VERSION/mongo-c-driver-$CDRIVER_VERSION.tar.gz
-          tar xzf mongo-c-driver-$CDRIVER_VERSION.tar.gz
-          mv mongo-c-driver-$CDRIVER_VERSION mongo-c-driver
+
+          git clone --branch r1.13 --depth 1 https://github.com/mongodb/mongo-c-driver.git
           cd mongo-c-driver
 
           trap "cat CMakeFiles/CMakeOutput.log" EXIT
@@ -3411,10 +3504,8 @@ tasks:
       vars:
         targets: install-embedded-dev
         task_compile_flags: &embedded_sdk_compile_flags >-
-          --disable-warnings-as-errors
           --install-mode=hygienic
           --js-engine=none
-          --link-model=dynamic
           --prefix='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION'
           --dbg=off
           --opt=size
@@ -3423,6 +3514,8 @@ tasks:
           --wiredtiger=off
           --allocator=system
           CPPPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libbson-1.0 $BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libmongoc-1.0'
+        task_compile_flags_extra: >-
+          --link-model=dynamic-sdk
 
 - name: embedded_sdk_s3_put
   commands:
@@ -3455,6 +3548,8 @@ tasks:
       vars:
         targets: install-embedded-test
         task_compile_flags: *embedded_sdk_compile_flags
+        task_compile_flags_extra: >-
+          --link-model=dynamic
 
 - name: embedded_sdk_tests_s3_put
   commands:
@@ -3492,6 +3587,7 @@ tasks:
 
           if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" -a $(command -v xcrun) ]; then
             find ./lib -type f -name "*.dylib" -print0 | xargs -0 -L 1 xcrun codesign -s -
+            find ./Frameworks -type f -name "*" '!' -name "*.*" -print0 | xargs -0 -L 1 xcrun codesign -s -
           fi
 
     - command: shell.exec
@@ -3867,13 +3963,14 @@ tasks:
         if [ -n "${burn_in_tests_build_variant|}" ]; then
           build_variant=${burn_in_tests_build_variant|}
         fi
-        $python buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=$build_variant --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
+        # Evergreen executable is in $HOME.
+        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --branch=${branch_name} --buildVariant=$build_variant --testListOutfile=jstests/new_tests.json --noExec $burn_in_args
         # Copy the results to the src dir.
         cp jstests/new_tests.json ../src/jstests/new_tests.json
   - func: "do multiversion setup"
   - func: "run tests"
     vars:
-      task_path_suffix: /data/multiversion
+      task_path_suffix: /data/multiversion:$HOME
       resmoke_wrapper: $python buildscripts/burn_in_tests.py --testListFile=jstests/new_tests.json
       resmoke_args: --repeat=2
       run_multiple_jobs: true
@@ -3895,6 +3992,143 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=benchmarks_sharding
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *task_template
+  name: generate_benchrun_embedded_files
+  commands:
+  - func: "git get project"
+  - func: "fetch binaries"
+  - func: "extract binaries"
+  - command: shell.exec
+    params:
+      working_dir: src
+      script: |
+        set -o errexit
+        set -o verbose
+
+        ${activate_virtualenv}
+
+        mkdir -p /data/db
+        rm -rf /data/db/*
+
+        ./mongod --fork --logpath=/data/db/mongod.log
+        PATH="$(pwd):$PATH" ./src/third_party/scripts/mongo-perf_get_sources.sh
+        ./mongo --eval 'db.getSiblingDB("admin").shutdownServer()'
+  - command: archive.targz_pack
+    params:
+      target: "src/benchrun_json_files.tgz"
+      source_dir: "${workdir}/src/benchrun_embedded/testcases"
+      include:
+      - "**.json"
+  - command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: src/benchrun_json_files.tgz
+      remote_file: ${project}/${build_variant}/${revision}/benchrun_json_files.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: ${content_type|application/gzip}
+      display_name: benchrun embedded JSON config files
+
+- <<: *task_template
+  name: upload_benchrun_embedded_files
+  depends_on:
+  - generate_benchrun_embedded_files
+  patchable: false
+  commands:
+  - command: s3Copy.copy
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      s3_copy_files:
+      - source:
+          path: ${project}/${build_variant}/${revision}/benchrun_json_files.tgz
+          bucket: mciuploads
+        destination:
+          path: ${project}/benchrun_embedded/benchrun_json_files.tgz
+          bucket: mciuploads
+        build_variants: [rhel-62-64-bit-mobile]
+
+- <<: *benchrun_embedded_template
+  name: benchrun_embedded_aggregation
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_aggregation
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *benchrun_embedded_template
+  name: benchrun_embedded_commands
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_commands
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *benchrun_embedded_template
+  name: benchrun_embedded_insert
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_insert
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *benchrun_embedded_template
+  name: benchrun_embedded_misc
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_misc
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *benchrun_embedded_template
+  name: benchrun_embedded_mixed_and_multi
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_mixed_and_multi
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *benchrun_embedded_template
+  name: benchrun_embedded_queries
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_queries
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *benchrun_embedded_template
+  name: benchrun_embedded_remove
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_remove
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *benchrun_embedded_template
+  name: benchrun_embedded_update
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_update
       run_multiple_jobs: false
   - func: "send benchmark results"
 
@@ -3988,22 +4222,6 @@ tasks:
       jepsen_storage_engine: --storage-engine wiredTiger
       jepsen_test_name: read-concern-majority
       jepsen_write_concern: --write-concern w1
-
-## jstestfuzz standalone aggregation generational fuzzer ##
-- <<: *jstestfuzz_template
-  name: aggregation_fuzzer
-  commands:
-  - func: "do setup"
-  - func: "do multiversion setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles 50
-      npm_command: aggregation-fuzzer
-  - <<: *run_jstestfuzz_tests
-    vars:
-      <<: *jstestfuzz_config_vars
-      task_path_suffix: /data/multiversion
-      resmoke_args: --suites=generational_fuzzer
 
 ## jstestfuzz standalone update generational fuzzer ##
 - <<: *jstestfuzz_template
@@ -6915,7 +7133,7 @@ tasks:
           /usr/local/bin/notary-client.py --key-name "server-4.0" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-win32-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz}
 
           if [ "${has_packages|}" = "true" ]; then
-             CURATOR_RELEASE=${curator_release|"ea8d75dcc1a587111e7418e2428fb67e267af9fe"}
+             CURATOR_RELEASE=${curator_release|"37d930ea2eeb27acb3782f1aa4d69da1e9dac223"}
              curl -L -O http://boxes.10gen.com/build/curator/curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
              tar -zxvf curator-dist-rhel70-$CURATOR_RELEASE.tar.gz
              ./curator repo --config ./etc/repo_config.yaml --distro ${packager_distro} --edition ${repo_edition} --version ${version} --arch ${packager_arch} --packages repo
@@ -7362,7 +7580,8 @@ tasks:
 
         # We use a small batch size to avoid hitting the load balancer timeout if the Evergreen
         # API query is not fast enough.
-        $python buildscripts/update_test_lifecycle.py                   \
+        # Evergreen executable is in $HOME.
+        PATH=$PATH:$HOME $python buildscripts/update_test_lifecycle.py  \
             --project ${project}                                        \
             --requestBatchSize 20                                       \
             --commit                                                    \
@@ -7499,7 +7718,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -7777,7 +7995,6 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_sharded
@@ -7843,7 +8060,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -7939,7 +8155,6 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8017,7 +8232,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8109,7 +8323,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8197,7 +8410,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8317,7 +8529,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8419,7 +8630,6 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8506,7 +8716,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8589,7 +8798,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8681,7 +8889,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8767,7 +8974,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9018,13 +9224,14 @@ buildvariants:
   - name: dbtest
   - name: ese
   - name: external_auth
+    distros:
+    - windows-64-2016
   - name: jsCore
   - name: jsCore_ese
   - name: jsCore_decimal
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9343,7 +9550,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9426,7 +9632,6 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9766,21 +9971,18 @@ buildvariants:
     compile_env: DEVELOPER_DIR=/Applications/Xcode9.2.app
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
-      --variables-files=etc/scons/xcode_macos.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      --variables-files=etc/scons/xcode_macosx.vars
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
+      --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
         -DCMAKE_SYSTEM_PROCESSOR=x86_64
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk macosx --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -isysroot $(xcrun --sdk macosx --show-sdk-path) -mmacosx-version-min=10.10"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_C_FLAGS="-arch x86_64 -mmacosx-version-min=10.10 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -mmacosx-version-min=10.10 -flto"
     disable_unit_tests: true
     enable_embedded_tests: native
     dump_scons_config_on_failure: true
@@ -9799,19 +10001,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_ios.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
+      --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk iphoneos --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk iphoneos --show-sdk-path) -miphoneos-version-min=10.2"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch arm64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
     disable_unit_tests: true
     dump_scons_config_on_failure: true
   tasks:
@@ -9829,19 +10028,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_ios_sim.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
+      --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk iphonesimulator --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk iphonesimulator --show-sdk-path) -miphoneos-version-min=10.2"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: iPhone-7
@@ -9862,19 +10058,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_tvos.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
+      --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk appletvos --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch arm64 -fembed-bitcode -isysroot $(xcrun --sdk appletvos --show-sdk-path) -mtvos-version-min=10.2"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk appletvos --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch arm64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
     disable_unit_tests: true
     dump_scons_config_on_failure: true
   tasks:
@@ -9892,19 +10085,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_tvos_sim.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
+      --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk appletvsimulator --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -isysroot $(xcrun --sdk appletvsimulator --show-sdk-path) -mtvos-version-min=10.2"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk appletvsimulator --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: Apple-TV-1080p
@@ -9925,19 +10115,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_watchos.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
+      --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk watchos --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch armv7k -fembed-bitcode -isysroot $(xcrun --sdk watchos --show-sdk-path) -mwatchos-version-min=4.2"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch armv7k -fembed-bitcode -isysroot $(xcrun --sdk watchos --show-sdk-path) -mwatchos-version-min=4.2"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk watchos --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch armv7k -fembed-bitcode -mwatchos-version-min=4.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch armv7k -fembed-bitcode -mwatchos-version-min=4.2 -flto"
     disable_unit_tests: true
     dump_scons_config_on_failure: true
   tasks:
@@ -9955,19 +10142,16 @@ buildvariants:
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
       --variables-files=etc/scons/xcode_watchos_sim.vars
-      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
+      --lto
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DTHREADS_PTHREAD_ARG=2
-        -DCMAKE_SYSTEM_NAME=Darwin
-        -DCMAKE_FIND_ROOT_PATH="$(xcrun --sdk watchsimulator --show-sdk-path);$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
-        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
-        -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
-        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
-        -DCMAKE_C_FLAGS="-arch i386 -fembed-bitcode -isysroot $(xcrun --sdk watchsimulator --show-sdk-path) -mwatchos-version-min=4.2"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch i386 -fembed-bitcode -isysroot $(xcrun --sdk watchsimulator --show-sdk-path) -mwatchos-version-min=4.2"
-        -DCMAKE_INSTALL_NAME_DIR=@rpath
+        -DCMAKE_OSX_SYSROOT="$(xcrun --sdk watchsimulator --show-sdk-path)"
+        -DENABLE_APPLE_FRAMEWORK=ON
+        -DCMAKE_INSTALL_BINDIR=Frameworks
+        -DCMAKE_C_FLAGS="-arch i386 -fembed-bitcode -mwatchos-version-min=4.2 -flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-arch i386 -fembed-bitcode -mwatchos-version-min=4.2 -flto"
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: Apple-Watch-Series-3-42mm
@@ -9992,6 +10176,7 @@ buildvariants:
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DCMAKE_C_COMPILER=/opt/mongodbtoolchain/v2/bin/gcc
         -DCMAKE_CXX_COMPILER=/opt/mongodbtoolchain/v2/bin/g++
+        -DCMAKE_C_FLAGS="-flto"
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
     disable_unit_tests: true
     enable_embedded_tests: native
@@ -10013,6 +10198,8 @@ buildvariants:
       --variables-files=etc/scons/android_toolchain.vars
       LIBS=clang_rt.builtins-arm-android
       LIBPATH="$(dirname $($(dirname $(pwd))/android_toolchain-arm-21/bin/clang -print-file-name=libclang_rt.builtins-arm-android.a)) \$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      --lto
+      AR=$(dirname $(pwd))/android_toolchain-arm-21/bin/llvm-ar
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DANDROID_NATIVE_API_LEVEL=21
@@ -10024,6 +10211,8 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DCMAKE_C_FLAGS="-flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-flto"
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
     disable_unit_tests: true
     enable_embedded_tests: android_emulator
@@ -10049,6 +10238,8 @@ buildvariants:
       --android-toolchain-path=$(dirname $(pwd))/android_toolchain-arm64-21
       --variables-files=etc/scons/android_toolchain.vars
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      --lto
+      AR=$(dirname $(pwd))/android_toolchain-arm64-21/bin/llvm-ar
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DANDROID_NATIVE_API_LEVEL=21
@@ -10060,6 +10251,8 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DCMAKE_C_FLAGS="-flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-flto"
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
     disable_unit_tests: true
     enable_embedded_tests: android_emulator
@@ -10085,6 +10278,8 @@ buildvariants:
       --android-toolchain-path=$(dirname $(pwd))/android_toolchain-x86_64-21
       --variables-files=etc/scons/android_toolchain.vars
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
+      --lto
+      AR=$(dirname $(pwd))/android_toolchain-x86_64-21/bin/llvm-ar
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DANDROID_NATIVE_API_LEVEL=21
@@ -10096,6 +10291,8 @@ buildvariants:
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DCMAKE_C_FLAGS="-flto"
+        -DCMAKE_SHARED_LINKER_FLAGS="-flto"
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
     disable_unit_tests: true
     # The Android x86_64 emulator requires KVM.
@@ -10268,7 +10465,6 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -10726,6 +10922,527 @@ buildvariants:
     - ubuntu1604-packer
   - name: push
 
+- name: enterprise-rhel-62-64-bit-majority-read-concern-off
+  display_name: "Enterprise RHEL 6.2 (majority read concern off)"
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions:
+    test_flags: --majorityReadConcern=off --excludeWithAnyTags=requires_mmapv1,requires_majority_read_concern,uses_change_streams
+    rlp_environment: MONGOD_UNITTEST_RLP_LANGUAGE_TEST_BTROOT=/opt/basis
+    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars CPPPATH="/opt/basis/rlp/rlp/include /opt/basis/rlp/utilities/include" --use-basis-tech-rosette-linguistics-platform=on
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    tooltags: "-tags 'ssl sasl'"
+    build_mongoreplay: true
+  display_tasks:
+  - *unittests
+  - *replica_sets_auth
+  - *replica_sets_ese
+  - *sharding
+  - *sharding_auth
+  - *sharding_auth_audit
+  - *sharding_ese
+  - *sharding_last_stable_mongos_and_mixed_shards
+  - *sharding_op_query
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel62-large
+  - name: rollback_fuzzer
+  - name: rollback_fuzzer_clean_shutdowns
+  - name: rollback_fuzzer_unclean_shutdowns
+  - name: aggregation
+  - name: aggregation_ese
+  - name: aggregation_auth
+  - name: aggregation_facet_unwind_passthrough
+  - name: aggregation_mongos_passthrough
+  - name: aggregation_one_shard_sharded_collections
+  - name: aggregation_sharded_collections_passthrough
+  - name: audit
+  - name: auth
+  - name: auth_audit
+  - name: buildscripts_test
+  - name: bulk_gle_passthrough
+  - name: causally_consistent_jscore_passthrough
+  - name: causally_consistent_jscore_passthrough_auth
+  - name: sharded_causally_consistent_jscore_passthrough
+  - name: concurrency
+  - name: concurrency_replication
+  - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
+  - name: concurrency_replication_multi_stmt_txn
+  - name: concurrency_sharded_replication
+  - name: concurrency_sharded_replication_with_balancer
+  - name: concurrency_sharded_causal_consistency
+  - name: concurrency_sharded_causal_consistency_and_balancer
+  - name: concurrency_simultaneous
+  - name: dbtest
+  - name: disk_wiredtiger
+  - name: ese
+  - name: failpoints
+  - name: failpoints_auth
+  - name: gle_auth
+  - name: gle_auth_basics_passthrough
+  - name: gle_auth_basics_passthrough_write_cmd
+  - name: gle_auth_write_cmd
+  - name: integration_tests_replset
+  - name: integration_tests_sharded
+  - name: integration_tests_standalone
+  - name: jsCore
+  - name: jsCore_ese
+  - name: jsCore_compatibility
+  - name: jsCore_decimal
+  - name: jsCore_minimum_batch_size
+  - name: jsCore_op_query
+  - name: jsCore_txns
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: jsonSchema
+  - name: jstestfuzz
+  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_concurrent_replication
+  - name: jstestfuzz_concurrent_replication_session
+  - name: jstestfuzz_concurrent_sharded
+  - name: jstestfuzz_concurrent_sharded_causal_consistency
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
+  - name: jstestfuzz_concurrent_sharded_session
+  - name: jstestfuzz_interrupt
+  - name: jstestfuzz_interrupt_replication
+  - name: jstestfuzz_replication
+  - name: jstestfuzz_replication_initsync
+  - name: jstestfuzz_replication_session
+  - name: jstestfuzz_sharded
+  - name: jstestfuzz_sharded_causal_consistency
+  - name: jstestfuzz_sharded_continuous_stepdown
+  - name: jstestfuzz_sharded_session
+  - name: multiversion
+  - name: multiversion_multistorage_engine
+  - name: noPassthroughWithMongod
+  - name: noPassthrough
+  - name: parallel
+  - name: parallel_compatibility
+  - name: read_concern_linearizable_passthrough
+    distros:
+    - rhel62-large
+  - name: read_only
+  - name: read_only_sharded
+  - name: replica_sets
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_0
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_1
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_2
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_3
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_4
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_5
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_6
+    distros:
+    - rhel62-large
+  - name: replica_sets_auth_misc
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_0
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_1
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_2
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_3
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_4
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_5
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_6
+    distros:
+    - rhel62-large
+  - name: replica_sets_ese_misc
+    distros:
+    - rhel62-large
+  - name: replica_sets_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_initsync_static_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_multi_stmt_txn_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_kill_secondaries_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: retryable_writes_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: rlp
+  - name: sasl
+  - name: session_jscore_passthrough
+  - name: sharded_collections_jscore_passthrough
+  - name: sharding_0
+    distros:
+    - rhel62-large
+  - name: sharding_1
+    distros:
+    - rhel62-large
+  - name: sharding_2
+    distros:
+    - rhel62-large
+  - name: sharding_3
+    distros:
+    - rhel62-large
+  - name: sharding_4
+    distros:
+    - rhel62-large
+  - name: sharding_5
+    distros:
+    - rhel62-large
+  - name: sharding_6
+    distros:
+    - rhel62-large
+  - name: sharding_7
+    distros:
+    - rhel62-large
+  - name: sharding_8
+    distros:
+    - rhel62-large
+  - name: sharding_9
+    distros:
+    - rhel62-large
+  - name: sharding_10
+    distros:
+    - rhel62-large
+  - name: sharding_11
+    distros:
+    - rhel62-large
+  - name: sharding_12
+    distros:
+    - rhel62-large
+  - name: sharding_13
+    distros:
+    - rhel62-large
+  - name: sharding_14
+    distros:
+    - rhel62-large
+  - name: sharding_misc
+    distros:
+    - rhel62-large
+  - name: sharding_auth_0
+    distros:
+    - rhel62-large
+  - name: sharding_auth_1
+    distros:
+    - rhel62-large
+  - name: sharding_auth_2
+    distros:
+    - rhel62-large
+  - name: sharding_auth_3
+    distros:
+    - rhel62-large
+  - name: sharding_auth_4
+    distros:
+    - rhel62-large
+  - name: sharding_auth_5
+    distros:
+    - rhel62-large
+  - name: sharding_auth_6
+    distros:
+    - rhel62-large
+  - name: sharding_auth_7
+    distros:
+    - rhel62-large
+  - name: sharding_auth_8
+    distros:
+    - rhel62-large
+  - name: sharding_auth_9
+    distros:
+    - rhel62-large
+  - name: sharding_auth_10
+    distros:
+    - rhel62-large
+  - name: sharding_auth_11
+    distros:
+    - rhel62-large
+  - name: sharding_auth_12
+    distros:
+    - rhel62-large
+  - name: sharding_auth_13
+    distros:
+    - rhel62-large
+  - name: sharding_auth_14
+    distros:
+    - rhel62-large
+  - name: sharding_auth_15
+    distros:
+    - rhel62-large
+  - name: sharding_auth_16
+    distros:
+    - rhel62-large
+  - name: sharding_auth_17
+    distros:
+    - rhel62-large
+  - name: sharding_auth_18
+    distros:
+    - rhel62-large
+  - name: sharding_auth_19
+    distros:
+    - rhel62-large
+  - name: sharding_auth_misc
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_0
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_1
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_2
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_3
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_4
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_5
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_6
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_7
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_8
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_9
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_10
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_11
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_12
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_13
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_14
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_15
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_16
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_17
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_18
+    distros:
+    - rhel62-large
+  - name: sharding_auth_audit_misc
+    distros:
+    - rhel62-large
+  - name: sharding_ese_0
+    distros:
+    - rhel62-large
+  - name: sharding_ese_1
+    distros:
+    - rhel62-large
+  - name: sharding_ese_2
+    distros:
+    - rhel62-large
+  - name: sharding_ese_3
+    distros:
+    - rhel62-large
+  - name: sharding_ese_4
+    distros:
+    - rhel62-large
+  - name: sharding_ese_5
+    distros:
+    - rhel62-large
+  - name: sharding_ese_6
+    distros:
+    - rhel62-large
+  - name: sharding_ese_7
+    distros:
+    - rhel62-large
+  - name: sharding_ese_8
+    distros:
+    - rhel62-large
+  - name: sharding_ese_9
+    distros:
+    - rhel62-large
+  - name: sharding_ese_10
+    distros:
+    - rhel62-large
+  - name: sharding_ese_11
+    distros:
+    - rhel62-large
+  - name: sharding_ese_12
+    distros:
+    - rhel62-large
+  - name: sharding_ese_13
+    distros:
+    - rhel62-large
+  - name: sharding_ese_14
+    distros:
+    - rhel62-large
+  - name: sharding_ese_15
+    distros:
+    - rhel62-large
+  - name: sharding_ese_16
+    distros:
+    - rhel62-large
+  - name: sharding_ese_17
+    distros:
+    - rhel62-large
+  - name: sharding_ese_18
+    distros:
+    - rhel62-large
+  - name: sharding_ese_19
+    distros:
+    - rhel62-large
+  - name: sharding_ese_20
+    distros:
+    - rhel62-large
+  - name: sharding_ese_misc
+    distros:
+    - rhel62-large
+  - name: sharding_gle_auth_basics_passthrough
+  - name: sharding_gle_auth_basics_passthrough_write_cmd
+  - name: sharding_jscore_passthrough
+  - name: sharding_jscore_op_query_passthrough
+  - name: sharding_jscore_passthrough_wire_ops
+  - name: sharding_last_stable_mongos_and_mixed_shards_0
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_1
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_2
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_3
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_4
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_5
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_6
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_7
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_8
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_9
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_10
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_11
+    distros:
+    - rhel62-large
+  - name: sharding_last_stable_mongos_and_mixed_shards_misc
+    distros:
+    - rhel62-large
+  - name: sharding_csrs_continuous_config_stepdown
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_0
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_1
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_2
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_3
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_4
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_5
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_6
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_7
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_8
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_9
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_10
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_11
+    distros:
+    - rhel62-large
+  - name: sharding_op_query_misc
+    distros:
+    - rhel62-large
+  - name: slow1
+  - name: serial_run
+  - name: snmp
+  - name: ssl
+  - name: sslSpecial
+  - name: tool
+  - name: update_fuzzer
+  - name: update_fuzzer_replication
+  - name: write_concern_majority_passthrough
+    distros:
+    - rhel62-large
+  - name: secondary_reads_passthrough
+    distros:
+    - rhel62-large
+
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"
   modules:
@@ -10906,7 +11623,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -11018,7 +11734,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -11109,7 +11824,6 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -11230,7 +11944,6 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -11340,7 +12053,6 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -11558,7 +12270,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -11636,7 +12347,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -11740,7 +12450,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -11826,7 +12535,6 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -11920,7 +12628,6 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -12001,7 +12708,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -12069,7 +12775,6 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -12152,7 +12857,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -12223,7 +12927,6 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -12349,7 +13052,6 @@ buildvariants:
   - name: causally_consistent_jscore_txns_passthrough
   - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_continuous_stepdown
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -12400,6 +13102,8 @@ buildvariants:
   - name: update_fuzzer_replication
   - name: write_concern_majority_passthrough
   - name: secondary_reads_passthrough
+    distros:
+    - rhel62-large
 
 - name: rhel-62-64-bit-mobile
   display_name: RHEL 6.2 (mobile)
@@ -12425,6 +13129,7 @@ buildvariants:
     build_mongoreplay: true
     additional_targets: mongoebench mongoed
   display_tasks:
+  - *benchrun_embedded
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12435,10 +13140,35 @@ buildvariants:
   - name: aggregation_facet_unwind_passthrough
   - name: auth
   - name: concurrency
+  - name: benchrun_embedded_aggregation
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_commands
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_insert
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_misc
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_mixed_and_multi
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_queries
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_remove
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_update
+    distros:
+    - centos6-perf
   - name: dbtest
   - name: disk_mobile
   - name: failpoints
   - name: failpoints_auth
+  - name: generate_benchrun_embedded_files
   - name: integration_tests_standalone
   - name: jsCore
   - name: jsCore_auth
@@ -12455,6 +13185,7 @@ buildvariants:
   - name: powercycle_mobile
   - name: serial_run
   - name: session_jscore_passthrough
+  - name: upload_benchrun_embedded_files
 
 - name: ubuntu1604-arm64-mobile
   display_name: "Ubuntu 16.04 arm64 (mobile)"
@@ -12636,7 +13367,6 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_op_query
   - name: jsCore_compatibility
-  - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -13014,7 +13744,6 @@ buildvariants:
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
-  - name: aggregation_fuzzer
   - name: free_monitoring
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -13376,7 +14105,6 @@ buildvariants:
   tasks:
   - name: compile_TG
   - name: aggregation
-  - name: aggregation_fuzzer
   - name: audit
   - name: auth
   - name: auth_audit
@@ -13495,7 +14223,6 @@ buildvariants:
   tasks:
   - name: compile_TG
   - name: aggregation
-  - name: aggregation_fuzzer
   - name: audit
   - name: auth
   - name: auth_audit
@@ -13613,7 +14340,6 @@ buildvariants:
   tasks:
   - name: compile_TG
   - name: aggregation
-  - name: aggregation_fuzzer
   - name: audit
   - name: auth
   - name: auth_audit
@@ -13703,7 +14429,6 @@ buildvariants:
     - rhel62-large
   - name: aggregation
   - name: aggregation_auth
-  - name: aggregation_fuzzer
   - name: auth
   - name: bulk_gle_passthrough
   - name: concurrency

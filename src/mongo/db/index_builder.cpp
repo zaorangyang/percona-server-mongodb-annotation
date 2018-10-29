@@ -119,6 +119,7 @@ std::string IndexBuilder::name() const {
 
 void IndexBuilder::run() {
     Client::initThread(name().c_str());
+    ON_BLOCK_EXIT([] { Client::destroy(); });
     LOG(2) << "IndexBuilder building index " << _index;
 
     auto opCtx = cc().makeOperationContext();
@@ -242,10 +243,26 @@ Status IndexBuilder::_build(OperationContext* opCtx,
     writeConflictRetry(opCtx, "Commit index build", ns.ns(), [opCtx, &indexer, &ns] {
         WriteUnitOfWork wunit(opCtx);
         indexer.commit();
+
         if (requiresGhostCommitTimestamp(opCtx, ns)) {
-            fassert(50701,
-                    opCtx->recoveryUnit()->setTimestamp(
-                        LogicalClock::get(opCtx)->getClusterTime().asTimestamp()));
+
+            auto tryTimestamp = [opCtx] {
+                auto status = opCtx->recoveryUnit()->setTimestamp(
+                    LogicalClock::get(opCtx)->getClusterTime().asTimestamp());
+                if (status.code() == ErrorCodes::BadValue) {
+                    LOG(1) << "Temporarily could not timestamp the index build commit: "
+                           << status.reason();
+                    return false;
+                }
+                fassert(50701, status);
+                return true;
+            };
+
+            // Timestamping the index build may fail in rare cases if retrieving the cluster time
+            // races with the stable timestamp advancing. It should be retried immediately.
+            while (!tryTimestamp()) {
+                opCtx->checkForInterrupt();
+            }
         }
         wunit.commit();
     });

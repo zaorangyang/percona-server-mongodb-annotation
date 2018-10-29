@@ -113,6 +113,9 @@ scratch
 /clientTest
 /httpClientTest
 
+# benchrun files
+/benchrun_embedded
+
 # Linters
 .mypy_cache
 

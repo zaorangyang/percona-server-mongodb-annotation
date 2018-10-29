@@ -184,7 +184,20 @@ void WiredTigerRecordStore::OplogStones::awaitHasExcessStonesOrDead() {
             MONGO_IDLE_THREAD_BLOCK;
             stdx::lock_guard<stdx::mutex> lk(_mutex);
             if (hasExcessStones_inlock()) {
-                break;
+                // Always truncate the oplog on non-RTT storage engines.
+                if (!_rs->supportsRecoverToStableTimestamp()) {
+                    break;
+                }
+                auto lastStableCheckpointTimestamp = _rs->getLastStableCheckpointTimestamp();
+                auto persistedTimestamp = lastStableCheckpointTimestamp
+                    ? *lastStableCheckpointTimestamp
+                    : Timestamp::min();
+                auto stone = _stones.front();
+                invariant(stone.lastRecord.isNormal());
+                if (static_cast<std::uint64_t>(stone.lastRecord.repr()) <
+                    persistedTimestamp.asULL()) {
+                    break;
+                }
             }
         }
         _oplogReclaimCv.wait(lock);
@@ -936,6 +949,14 @@ int64_t WiredTigerRecordStore::cappedDeleteAsNeeded(OperationContext* opCtx,
     }
 
     return cappedDeleteAsNeeded_inlock(opCtx, justInserted);
+}
+
+boost::optional<Timestamp> WiredTigerRecordStore::getLastStableCheckpointTimestamp() const {
+    return _kvEngine->getLastStableCheckpointTimestamp();
+}
+
+bool WiredTigerRecordStore::supportsRecoverToStableTimestamp() const {
+    return _kvEngine->supportsRecoverToStableTimestamp();
 }
 
 int64_t WiredTigerRecordStore::cappedDeleteAsNeeded_inlock(OperationContext* opCtx,
@@ -1771,22 +1792,30 @@ void WiredTigerRecordStore::cappedTruncateAfter(OperationContext* opCtx,
         Timestamp truncTs(lastKeptId.repr());
         LOG(logLevel) << "Rewinding oplog visibility point to " << truncTs << " after truncation.";
 
+        if (!serverGlobalParams.enableMajorityReadConcern) {
+            // If majority read concern is disabled, we must set the oldest timestamp along with the
+            // commit timestamp. Otherwise, the commit timestamp might be set behind the oldest
+            // timestamp.
+            const bool force = true;
+            _kvEngine->setOldestTimestamp(truncTs, force);
+        } else {
+            char commitTSConfigString["commit_timestamp="_sd.size() +
+                                      (8 * 2) /* 8 hexadecimal characters */ +
+                                      1 /* trailing null */];
+            auto size = std::snprintf(commitTSConfigString,
+                                      sizeof(commitTSConfigString),
+                                      "commit_timestamp=%llx",
+                                      truncTs.asULL());
+            if (size < 0) {
+                int e = errno;
+                error() << "error snprintf " << errnoWithDescription(e);
+                fassertFailedNoTrace(40662);
+            }
 
-        char commitTSConfigString["commit_timestamp="_sd.size() +
-                                  (8 * 2) /* 8 hexadecimal characters */ + 1 /* trailing null */];
-        auto size = std::snprintf(commitTSConfigString,
-                                  sizeof(commitTSConfigString),
-                                  "commit_timestamp=%llx",
-                                  truncTs.asULL());
-        if (size < 0) {
-            int e = errno;
-            error() << "error snprintf " << errnoWithDescription(e);
-            fassertFailedNoTrace(40662);
+            invariant(static_cast<std::size_t>(size) < sizeof(commitTSConfigString));
+            auto conn = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn();
+            invariantWTOK(conn->set_timestamp(conn, commitTSConfigString));
         }
-
-        invariant(static_cast<std::size_t>(size) < sizeof(commitTSConfigString));
-        auto conn = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache()->conn();
-        invariantWTOK(conn->set_timestamp(conn, commitTSConfigString));
 
         _kvEngine->getOplogManager()->setOplogReadTimestamp(truncTs);
         LOG(1) << "truncation new read timestamp: " << truncTs;
@@ -1994,7 +2023,7 @@ void StandardWiredTigerRecordStore::setKey(WT_CURSOR* cursor, RecordId id) const
 
 std::unique_ptr<SeekableRecordCursor> StandardWiredTigerRecordStore::getCursor(
     OperationContext* opCtx, bool forward) const {
-    dassert(opCtx->lockState()->isReadLocked() || _isOplog);
+    dassert(opCtx->lockState()->isReadLocked());
 
     if (_isOplog && forward) {
         WiredTigerRecoveryUnit* wru = WiredTigerRecoveryUnit::get(opCtx);

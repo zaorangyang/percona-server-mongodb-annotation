@@ -68,6 +68,7 @@
 #include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharded_connection_info.h"
+#include "mongo/db/s/sharding_config_optime_gossip.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/session_catalog.h"
@@ -464,11 +465,8 @@ void invokeInTransaction(OperationContext* opCtx,
                          CommandInvocation* invocation,
                          CommandReplyBuilder* replyBuilder) {
     auto session = OperationContextSession::get(opCtx);
-    if (!session) {
-        // Run the command directly if we're not in a transaction.
-        invocation->run(opCtx, replyBuilder);
-        return;
-    }
+    invariant(session);
+    invariant(opCtx->getTxnNumber() || opCtx->getClient()->isInDirectClient());
 
     session->unstashTransactionResources(opCtx, invocation->definition()->getName());
     ScopeGuard guard = MakeGuard([session, opCtx]() { session->abortActiveTransaction(opCtx); });
@@ -507,13 +505,16 @@ bool runCommandImpl(OperationContext* opCtx,
 #endif
 
     CommandReplyBuilder crb(replyBuilder->getInPlaceReplyBuilder(bytesToReserve));
-
+    auto session = OperationContextSession::get(opCtx);
     if (!invocation->supportsWriteConcern()) {
         behaviors.uassertCommandDoesNotSpecifyWriteConcern(request.body);
-        invokeInTransaction(opCtx, invocation, &crb);
+        if (session) {
+            invokeInTransaction(opCtx, invocation, &crb);
+        } else {
+            invocation->run(opCtx, &crb);
+        }
     } else {
         auto wcResult = uassertStatusOK(extractWriteConcern(opCtx, request.body));
-        auto session = OperationContextSession::get(opCtx);
         uassert(ErrorCodes::InvalidOptions,
                 "writeConcern is not allowed within a multi-statement transaction",
                 wcResult.usedDefault || !session || !session->inMultiDocumentTransaction() ||
@@ -541,7 +542,11 @@ bool runCommandImpl(OperationContext* opCtx,
         };
 
         try {
-            invokeInTransaction(opCtx, invocation, &crb);
+            if (session) {
+                invokeInTransaction(opCtx, invocation, &crb);
+            } else {
+                invocation->run(opCtx, &crb);
+            }
         } catch (const DBException&) {
             waitForWriteConcern(*extraFieldsBuilder);
             throw;
@@ -649,8 +654,7 @@ void execCommandDatabase(OperationContext* opCtx,
             request.body,
             command->requiresAuth(),
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet,
-            opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking(),
-            opCtx->getServiceContext()->getStorageEngine()->supportsRecoverToStableTimestamp());
+            opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking());
 
         evaluateFailCommandFailPoint(opCtx, command->getName());
 
@@ -834,7 +838,7 @@ void execCommandDatabase(OperationContext* opCtx,
             auto session = OperationContextSession::get(opCtx);
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot is only valid in multi-statement transactions",
-                    session && session->inMultiDocumentTransaction());
+                    session && session->inActiveOrKilledMultiDocumentTransaction());
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot requires a session ID",
                     opCtx->getLogicalSessionId());
@@ -859,7 +863,7 @@ void execCommandDatabase(OperationContext* opCtx,
             }
 
             // Handle config optime information that may have been sent along with the command.
-            uassertStatusOK(shardingState->updateConfigServerOpTimeFromMetadata(opCtx));
+            rpc::advanceConfigOptimeFromRequestMetadata(opCtx);
         }
 
         oss.setAllowImplicitCollectionCreation(allowImplicitCollectionCreationField);
@@ -912,12 +916,14 @@ void execCommandDatabase(OperationContext* opCtx,
             if (!opCtx->getClient()->isInDirectClient()) {
                 // We already have the StaleConfig exception, so just swallow any errors due to
                 // refresh
-                onShardVersionMismatch(opCtx, sce->getNss(), sce->getVersionReceived()).ignore();
+                onShardVersionMismatchNoExcept(opCtx, sce->getNss(), sce->getVersionReceived())
+                    .ignore();
             }
         } else if (auto sce = e.extraInfo<StaleDbRoutingVersion>()) {
             if (!opCtx->getClient()->isInDirectClient()) {
-                onDbVersionMismatch(
-                    opCtx, sce->getDb(), sce->getVersionReceived(), sce->getVersionWanted());
+                onDbVersionMismatchNoExcept(
+                    opCtx, sce->getDb(), sce->getVersionReceived(), sce->getVersionWanted())
+                    .ignore();
             }
         } else if (auto cannotImplicitCreateCollInfo =
                        e.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
@@ -1087,7 +1093,8 @@ DbResponse receivedQuery(OperationContext* opCtx,
             if (!opCtx->getClient()->isInDirectClient()) {
                 // We already have the StaleConfig exception, so just swallow any errors due to
                 // refresh
-                onShardVersionMismatch(opCtx, sce->getNss(), sce->getVersionReceived()).ignore();
+                onShardVersionMismatchNoExcept(opCtx, sce->getNss(), sce->getVersionReceived())
+                    .ignore();
             }
         }
 

@@ -28,6 +28,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/db_raii.h"
@@ -44,6 +45,7 @@
 #include "mongo/db/storage/kv/kv_database_catalog_entry_mock.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
+#include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/unclean_shutdown.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/unittest/unittest.h"
@@ -51,26 +53,13 @@
 namespace mongo {
 namespace {
 
-class KVStorageEngineTest : public unittest::Test {
+class KVStorageEngineTest : public ServiceContextMongoDTest {
 public:
-    enum class RepairAction { kNoRepair, kRepair };
-
     KVStorageEngineTest() : KVStorageEngineTest(RepairAction::kNoRepair) {}
 
-    KVStorageEngineTest(RepairAction repair) {
-        KVStorageEngineOptions options;
-        options.forRepair = (repair == RepairAction::kRepair);
-        _storageEngine.reset(new KVStorageEngine(new EphemeralForTestEngine(), options));
-    }
-
-    void setUp() final {
-        _serviceContext.setUp();
-    }
-
-    void tearDown() final {
-        _storageEngine->cleanShutdown();
-        _serviceContext.tearDown();
-    }
+    KVStorageEngineTest(RepairAction repair)
+        : ServiceContextMongoDTest("ephemeralForTest", repair),
+          _storageEngine(checked_cast<KVStorageEngine*>(getServiceContext()->getStorageEngine())) {}
 
     /**
      * Create a collection in the catalog and in the KVEngine. Return the storage engine's `ident`.
@@ -153,13 +142,22 @@ public:
         return Status::OK();
     }
 
-    ServiceContextMongoDTest _serviceContext;
-    std::unique_ptr<KVStorageEngine> _storageEngine;
+    KVStorageEngine* _storageEngine;
 };
 
 class KVStorageEngineRepairTest : public KVStorageEngineTest {
 public:
     KVStorageEngineRepairTest() : KVStorageEngineTest(RepairAction::kRepair) {}
+
+    void tearDown() {
+        auto repairObserver = StorageRepairObserver::get(getGlobalServiceContext());
+        ASSERT(repairObserver->isDone());
+
+        unittest::log() << "Modifications: ";
+        for (const auto& mod : repairObserver->getModifications()) {
+            unittest::log() << "  " << mod;
+        }
+    }
 };
 
 TEST_F(KVStorageEngineTest, ReconcileIdentsTest) {
@@ -297,6 +295,8 @@ TEST_F(KVStorageEngineRepairTest, LoadCatalogRecoversOrphans) {
 
     ASSERT(identExists(opCtx.get(), swIdentName.getValue()));
     ASSERT(collectionExists(opCtx.get(), collNs));
+    StorageRepairObserver::get(getGlobalServiceContext())->onRepairDone(opCtx.get());
+    ASSERT_EQ(1U, StorageRepairObserver::get(getGlobalServiceContext())->getModifications().size());
 }
 
 TEST_F(KVStorageEngineRepairTest, ReconcileSucceeds) {
@@ -315,7 +315,64 @@ TEST_F(KVStorageEngineRepairTest, ReconcileSucceeds) {
 
     ASSERT(!identExists(opCtx.get(), swIdentName.getValue()));
     ASSERT(collectionExists(opCtx.get(), collNs));
+    StorageRepairObserver::get(getGlobalServiceContext())->onRepairDone(opCtx.get());
+    ASSERT_EQ(0U, StorageRepairObserver::get(getGlobalServiceContext())->getModifications().size());
 }
 
+TEST_F(KVStorageEngineRepairTest, LoadCatalogRecoversOrphansInCatalog) {
+    auto opCtx = cc().makeOperationContext();
+
+    const NamespaceString collNs("db.coll1");
+    auto swIdentName = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swIdentName);
+    ASSERT(collectionExists(opCtx.get(), collNs));
+
+    AutoGetDb db(opCtx.get(), collNs.db(), LockMode::MODE_X);
+    // Only drop the catalog entry; storage engine still knows about this ident.
+    // This simulates an unclean shutdown happening between dropping the catalog entry and
+    // the actual drop in storage engine.
+    ASSERT_OK(_storageEngine->getCatalog()->dropCollection(opCtx.get(), collNs.ns()));
+    ASSERT(!collectionExists(opCtx.get(), collNs));
+
+    // When in a repair context, loadCatalog() recreates catalog entries for orphaned idents.
+    _storageEngine->loadCatalog(opCtx.get());
+    auto identNs = swIdentName.getValue();
+    std::replace(identNs.begin(), identNs.end(), '-', '_');
+    NamespaceString orphanNs = NamespaceString("local.orphan." + identNs);
+
+    ASSERT(identExists(opCtx.get(), swIdentName.getValue()));
+    ASSERT(collectionExists(opCtx.get(), orphanNs));
+
+    StorageRepairObserver::get(getGlobalServiceContext())->onRepairDone(opCtx.get());
+    ASSERT_EQ(1U, StorageRepairObserver::get(getGlobalServiceContext())->getModifications().size());
+}
+
+TEST_F(KVStorageEngineTest, LoadCatalogDropsOrphans) {
+    auto opCtx = cc().makeOperationContext();
+
+    const NamespaceString collNs("db.coll1");
+    auto swIdentName = createCollection(opCtx.get(), collNs);
+    ASSERT_OK(swIdentName);
+    ASSERT(collectionExists(opCtx.get(), collNs));
+
+    AutoGetDb db(opCtx.get(), collNs.db(), LockMode::MODE_X);
+    // Only drop the catalog entry; storage engine still knows about this ident.
+    // This simulates an unclean shutdown happening between dropping the catalog entry and
+    // the actual drop in storage engine.
+    ASSERT_OK(_storageEngine->getCatalog()->dropCollection(opCtx.get(), collNs.ns()));
+    ASSERT(!collectionExists(opCtx.get(), collNs));
+
+    // When in a normal startup context, loadCatalog() does not recreate catalog entries for
+    // orphaned idents.
+    _storageEngine->loadCatalog(opCtx.get());
+    // reconcileCatalogAndIdents() drops orphaned idents.
+    ASSERT_OK(reconcile(opCtx.get()).getStatus());
+
+    ASSERT(!identExists(opCtx.get(), swIdentName.getValue()));
+    auto identNs = swIdentName.getValue();
+    std::replace(identNs.begin(), identNs.end(), '-', '_');
+    NamespaceString orphanNs = NamespaceString("local.orphan." + identNs);
+    ASSERT(!collectionExists(opCtx.get(), orphanNs));
+}
 }  // namespace
 }  // namespace mongo
