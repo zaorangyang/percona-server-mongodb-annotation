@@ -26,11 +26,14 @@
 *    it in the license file.
 */
 
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+
 #include <string>
 
 #include "mongo/db/fts/fts_query_parser.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stringutils.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -68,6 +71,41 @@ QueryToken FTSQueryParser::next() {
     _previousWhiteSpace = skipWhitespace();
 
     return QueryToken(type, ret, start, old);
+}
+
+/**
+ * This method will treat intermediate '-' as TEXT,
+ *   Original FTSQueryParser::next() will ignore intermediate '-'.
+*/
+QueryToken FTSQueryParser::nextForNgram() {
+	if (_pos >= _raw.size())
+		return QueryToken(QueryToken::INVALID, "", 0, false);
+
+	unsigned start = _pos++;
+	QueryToken::Type type = getType(_raw[start]);
+
+	// Query Parser should never land on whitespace
+	if (type == QueryToken::WHITESPACE) {
+		invariant(false);
+	}
+
+	if (type == QueryToken::TEXT) {
+		QueryToken::Type t;
+		while(_pos < _raw.size()){
+			t = getType(_raw[_pos]);
+			if(t==QueryToken::TEXT || (t==QueryToken::DELIMITER && '-'==_raw[_pos])){ // Regarding '-' as part of TEXT (if previous character is not SPACE)
+				pos++;
+			}else{
+				break;
+			}
+		}
+	}
+
+	StringData ret = _raw.substr(start, _pos - start);
+	bool old = _previousWhiteSpace;
+	_previousWhiteSpace = skipWhitespace();
+
+	return QueryToken(type, ret, start, old);
 }
 
 bool FTSQueryParser::skipWhitespace() {
