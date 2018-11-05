@@ -792,6 +792,10 @@ functions:
           set +o errexit
           npm test > npm_test-${task_id}.log 2>&1
           if [ $? -ne 0 ]; then
+            echo "jstestfuzz self-tests failure"
+            branch=$(git symbolic-ref --short HEAD)
+            commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
+            echo "Git branch: $branch, commit: $commit"
             which node
             node --version
             which npm
@@ -980,8 +984,6 @@ pre:
     params:
       system_log: true
       script: |
-        set -o errexit
-        set -o verbose
 
         ulimit -a
         # Clear the dmesg ring buffer. The "post" phase will check dmesg for OOM messages.
@@ -992,7 +994,6 @@ pre:
         else
           echo "Could not clear the dmesg ring buffer"
         fi
-
 
 
 post:

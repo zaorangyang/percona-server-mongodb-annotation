@@ -50,6 +50,7 @@ struct SSLParams {
     std::string sslClusterFile;      // --sslInternalKeyFile
     std::string sslClusterPassword;  // --sslInternalKeyPassword
     std::string sslCAFile;           // --sslCAFile
+    std::string sslClusterCAFile;    // --sslClusterCAFile
     std::string sslCRLFile;          // --sslCRLFile
     std::string sslCipherConfig;     // --sslCipherConfig
     std::vector<Protocols> sslDisabledProtocols;  // --sslDisabledProtocols
@@ -61,6 +62,7 @@ struct SSLParams {
         false;  // --setParameter disableNonSSLConnectionLogging=true
     bool suppressNoTLSPeerCertificateWarning =
         false;  // --setParameter suppressNoTLSPeerCertificateWarning
+    bool tlsWithholdClientCertificate = false;  // --setParameter tlsWithholdClientCertificate
 
     SSLParams() {
         sslMode.store(SSLMode_disabled);
