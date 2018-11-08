@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -369,7 +371,8 @@ void checkForExistingChunks(OperationContext* opCtx, const NamespaceString& nss)
     // Use readConcern local to guarantee we see any chunks that have been written and may
     // become committed; readConcern majority will not see the chunks if they have not made it
     // to the majority snapshot.
-    repl::ReadConcernArgs readConcern(repl::ReadConcernLevel::kLocalReadConcern);
+    repl::ReadConcernArgs readConcern(Grid::get(opCtx)->configOpTime(),
+                                      repl::ReadConcernLevel::kMajorityReadConcern);
     readConcern.appendInfo(&countBuilder);
 
     auto cmdResponse = uassertStatusOK(
@@ -542,43 +545,6 @@ void shardCollection(OperationContext* opCtx,
         .ignore();
 }
 
-std::vector<TagsType> getExistingTags(OperationContext* opCtx, const NamespaceString& nss) {
-    auto configServer = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-    auto tagStatus =
-        configServer->exhaustiveFindOnConfig(opCtx,
-                                             kConfigReadSelector,
-                                             repl::ReadConcernLevel::kMajorityReadConcern,
-                                             TagsType::ConfigNS,
-                                             BSON(TagsType::ns(nss.ns())),
-                                             BSONObj(),
-                                             0);
-    uassertStatusOK(tagStatus);
-
-    const auto& tagDocList = tagStatus.getValue().docs;
-    std::vector<TagsType> tags;
-    for (const auto& tagDoc : tagDocList) {
-        auto tagParseStatus = TagsType::fromBSON(tagDoc);
-        uassertStatusOK(tagParseStatus);
-        const auto& parsedTag = tagParseStatus.getValue();
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "the min and max of the existing zone " << parsedTag.getMinKey()
-                              << " -->> "
-                              << parsedTag.getMaxKey()
-                              << " have non-matching number of keys",
-                parsedTag.getMinKey().nFields() == parsedTag.getMaxKey().nFields());
-
-        const auto& rangeMin = parsedTag.getMinKey();
-        const auto& rangeMax = parsedTag.getMaxKey();
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "zone " << rangeMin << " -->> " << rangeMax
-                              << " has min greater than max",
-                rangeMin.woCompare(rangeMax) < 0);
-
-        tags.push_back(parsedTag);
-    }
-    return tags;
-}
-
 /**
  * Internal sharding command run on primary shard server to shard a collection.
  */
@@ -620,6 +586,7 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        auto const grid = Grid::get(opCtx);
         auto const shardingState = ShardingState::get(opCtx);
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
@@ -636,7 +603,8 @@ public:
         createCollectionOrValidateExisting(opCtx, nss, proposedKey, shardKeyPattern, request);
 
         // Read zone info
-        auto tags = getExistingTags(opCtx, nss);
+        const auto catalogClient = grid->catalogClient();
+        auto tags = uassertStatusOK(catalogClient->getTagsForCollection(opCtx, nss));
 
         if (!tags.empty()) {
             validateShardKeyAgainstExistingZones(opCtx, proposedKey, shardKeyPattern, tags);
@@ -649,8 +617,7 @@ public:
             uuid = UUID::gen();
         }
 
-        Grid::get(opCtx)->shardRegistry()->reload(opCtx);
-        auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+        const auto shardRegistry = grid->shardRegistry();
         shardRegistry->reload(opCtx);
 
         DBDirectClient localClient(opCtx);

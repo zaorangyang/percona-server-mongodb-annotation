@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -89,18 +91,18 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr) {
     return canonicalize(queryObj);
 }
 
-unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
-                                        const char* sortStr,
-                                        const char* projStr,
-                                        const char* collationStr) {
+unique_ptr<CanonicalQuery> canonicalize(BSONObj query,
+                                        BSONObj sort,
+                                        BSONObj proj,
+                                        BSONObj collation) {
     QueryTestServiceContext serviceContext;
     auto opCtx = serviceContext.makeOperationContext();
 
     auto qr = stdx::make_unique<QueryRequest>(nss);
-    qr->setFilter(fromjson(queryStr));
-    qr->setSort(fromjson(sortStr));
-    qr->setProj(fromjson(projStr));
-    qr->setCollation(fromjson(collationStr));
+    qr->setFilter(query);
+    qr->setSort(sort);
+    qr->setProj(proj);
+    qr->setCollation(collation);
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     auto statusWithCQ =
         CanonicalQuery::canonicalize(opCtx.get(),
@@ -110,6 +112,14 @@ unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
                                      MatchExpressionParser::kAllowAllSpecialFeatures);
     ASSERT_OK(statusWithCQ.getStatus());
     return std::move(statusWithCQ.getValue());
+}
+
+unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
+                                        const char* sortStr,
+                                        const char* projStr,
+                                        const char* collationStr) {
+    return canonicalize(
+        fromjson(queryStr), fromjson(sortStr), fromjson(projStr), fromjson(collationStr));
 }
 
 unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
@@ -1326,13 +1336,10 @@ TEST_F(CachePlanSelectionTest, ContainedOrAndIntersection) {
  * meaningful only within the current lifetime of the server process. Users should treat plan
  * cache keys as opaque.
  */
-void testComputeKey(const char* queryStr,
-                    const char* sortStr,
-                    const char* projStr,
-                    const char* expectedStr) {
+void testComputeKey(BSONObj query, BSONObj sort, BSONObj proj, const char* expectedStr) {
     PlanCache planCache;
-    const char* collationStr = "{}";
-    unique_ptr<CanonicalQuery> cq(canonicalize(queryStr, sortStr, projStr, collationStr));
+    BSONObj collation;
+    unique_ptr<CanonicalQuery> cq(canonicalize(query, sort, proj, collation));
     PlanCacheKey key = planCache.computeKey(*cq);
     PlanCacheKey expectedKey(expectedStr);
     if (key == expectedKey) {
@@ -1342,6 +1349,13 @@ void testComputeKey(const char* queryStr,
     ss << "Unexpected plan cache key. Expected: " << expectedKey << ". Actual: " << key
        << ". Query: " << cq->toString();
     FAIL(ss);
+}
+
+void testComputeKey(const char* queryStr,
+                    const char* sortStr,
+                    const char* projStr,
+                    const char* expectedStr) {
+    testComputeKey(fromjson(queryStr), fromjson(sortStr), fromjson(projStr), expectedStr);
 }
 
 TEST(PlanCacheTest, ComputeKey) {
@@ -1440,20 +1454,75 @@ TEST(PlanCacheTest, ComputeKeyRegexDependsOnFlags) {
     testComputeKey("{a: {$regex: \"sometext\"}}", "{}", "{}", "rea");
     testComputeKey("{a: {$regex: \"sometext\", $options: \"\"}}", "{}", "{}", "rea");
 
-    testComputeKey("{a: {$regex: \"sometext\", $options: \"s\"}}", "{}", "{}", "reas");
-    testComputeKey("{a: {$regex: \"sometext\", $options: \"ms\"}}", "{}", "{}", "reams");
+    testComputeKey("{a: {$regex: \"sometext\", $options: \"s\"}}", "{}", "{}", "rea/s/");
+    testComputeKey("{a: {$regex: \"sometext\", $options: \"ms\"}}", "{}", "{}", "rea/ms/");
 
     // Test that the ordering of $options doesn't matter.
-    testComputeKey("{a: {$regex: \"sometext\", $options: \"im\"}}", "{}", "{}", "reaim");
-    testComputeKey("{a: {$regex: \"sometext\", $options: \"mi\"}}", "{}", "{}", "reaim");
+    testComputeKey("{a: {$regex: \"sometext\", $options: \"im\"}}", "{}", "{}", "rea/im/");
+    testComputeKey("{a: {$regex: \"sometext\", $options: \"mi\"}}", "{}", "{}", "rea/im/");
 
     // Test that only the options affect the key. Two regex match expressions with the same options
     // but different $regex values should have the same shape.
-    testComputeKey("{a: {$regex: \"abc\", $options: \"mi\"}}", "{}", "{}", "reaim");
-    testComputeKey("{a: {$regex: \"efg\", $options: \"mi\"}}", "{}", "{}", "reaim");
+    testComputeKey("{a: {$regex: \"abc\", $options: \"mi\"}}", "{}", "{}", "rea/im/");
+    testComputeKey("{a: {$regex: \"efg\", $options: \"mi\"}}", "{}", "{}", "rea/im/");
 
-    testComputeKey("{a: {$regex: \"\", $options: \"ms\"}}", "{}", "{}", "reams");
-    testComputeKey("{a: {$regex: \"___\", $options: \"ms\"}}", "{}", "{}", "reams");
+    testComputeKey("{a: {$regex: \"\", $options: \"ms\"}}", "{}", "{}", "rea/ms/");
+    testComputeKey("{a: {$regex: \"___\", $options: \"ms\"}}", "{}", "{}", "rea/ms/");
+
+    // Test that only valid regex flags contribute to the plan cache key encoding.
+    testComputeKey(BSON("a" << BSON("$regex"
+                                    << "abc"
+                                    << "$options"
+                                    << "abcdefghijklmnopqrstuvwxyz")),
+                   {},
+                   {},
+                   "rea/imsx/");
+    testComputeKey("{a: /abc/gim}", "{}", "{}", "rea/im/");
+}
+
+TEST(PlanCacheTest, ComputeKeyMatchInDependsOnPresenceOfRegexAndFlags) {
+    // Test that an $in containing a single regex is unwrapped to $regex.
+    testComputeKey("{a: {$in: [/foo/]}}", "{}", "{}", "rea");
+    testComputeKey("{a: {$in: [/foo/i]}}", "{}", "{}", "rea/i/");
+
+    // Test that an $in with no regexes does not include any regex information.
+    testComputeKey("{a: {$in: [1, 'foo']}}", "{}", "{}", "ina");
+
+    // Test that an $in with a regex encodes the presence of the regex.
+    testComputeKey("{a: {$in: [1, /foo/]}}", "{}", "{}", "ina_re");
+
+    // Test that an $in with a regex encodes the presence of the regex and its flags.
+    testComputeKey("{a: {$in: [1, /foo/is]}}", "{}", "{}", "ina_re/is/");
+
+    // Test that the computed key is invariant to the order of the flags within each regex.
+    testComputeKey("{a: {$in: [1, /foo/si]}}", "{}", "{}", "ina_re/is/");
+
+    // Test that an $in with multiple regexes encodes all unique flags.
+    testComputeKey("{a: {$in: [1, /foo/i, /bar/m, /baz/s]}}", "{}", "{}", "ina_re/ims/");
+
+    // Test that an $in with multiple regexes deduplicates identical flags.
+    testComputeKey(
+        "{a: {$in: [1, /foo/i, /bar/m, /baz/s, /qux/i, /quux/s]}}", "{}", "{}", "ina_re/ims/");
+
+    // Test that the computed key is invariant to the ordering of the flags across regexes.
+    testComputeKey("{a: {$in: [1, /foo/ism, /bar/msi, /baz/im, /qux/si, /quux/im]}}",
+                   "{}",
+                   "{}",
+                   "ina_re/ims/");
+    testComputeKey("{a: {$in: [1, /foo/msi, /bar/ism, /baz/is, /qux/mi, /quux/im]}}",
+                   "{}",
+                   "{}",
+                   "ina_re/ims/");
+
+    // Test that $not-$in-$regex similarly records the presence and flags of any regexes.
+    testComputeKey("{a: {$not: {$in: [1, 'foo']}}}", "{}", "{}", "nt[ina]");
+    testComputeKey("{a: {$not: {$in: [1, /foo/]}}}", "{}", "{}", "nt[ina_re]");
+    testComputeKey(
+        "{a: {$not: {$in: [1, /foo/i, /bar/i, /baz/msi]}}}", "{}", "{}", "nt[ina_re/ims/]");
+
+    // Test that a $not-$in containing a single regex is unwrapped to $not-$regex.
+    testComputeKey("{a: {$not: {$in: [/foo/]}}}", "{}", "{}", "nt[rea]");
+    testComputeKey("{a: {$not: {$in: [/foo/i]}}}", "{}", "{}", "nt[rea/i/]");
 }
 
 // When a sparse index is present, computeKey() should generate different keys depending on

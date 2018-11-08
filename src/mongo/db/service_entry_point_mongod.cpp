@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,9 +39,16 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/implicit_create_collection.h"
+#include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
+#include "mongo/db/s/sharding_config_optime_gossip.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/logger/redaction.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/cannot_implicitly_create_collection_info.h"
+#include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -116,6 +125,40 @@ public:
 
     void attachCurOpErrInfo(OperationContext* opCtx, const BSONObj& replyObj) const override {
         CurOp::get(opCtx)->debug().errInfo = getStatusFromCommandResult(replyObj);
+    }
+
+    void handleException(const DBException& e, OperationContext* opCtx) const override {
+        // If we got a stale config, wait in case the operation is stuck in a critical section
+        if (auto sce = e.extraInfo<StaleConfigInfo>()) {
+            if (!opCtx->getClient()->isInDirectClient()) {
+                // We already have the StaleConfig exception, so just swallow any errors due to
+                // refresh
+                onShardVersionMismatchNoExcept(opCtx, sce->getNss(), sce->getVersionReceived())
+                    .ignore();
+            }
+        } else if (auto sce = e.extraInfo<StaleDbRoutingVersion>()) {
+            if (!opCtx->getClient()->isInDirectClient()) {
+                onDbVersionMismatchNoExcept(
+                    opCtx, sce->getDb(), sce->getVersionReceived(), sce->getVersionWanted())
+                    .ignore();
+            }
+        } else if (auto cannotImplicitCreateCollInfo =
+                       e.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
+            if (ShardingState::get(opCtx)->enabled()) {
+                onCannotImplicitlyCreateCollection(opCtx, cannotImplicitCreateCollInfo->getNss())
+                    .ignore();
+            }
+        }
+    }
+
+    void advanceConfigOptimeFromRequestMetadata(OperationContext* opCtx) const override {
+        // Handle config optime information that may have been sent along with the command.
+        rpc::advanceConfigOptimeFromRequestMetadata(opCtx);
+    }
+
+    std::unique_ptr<PolymorphicScoped> scopedOperationCompletionShardingActions(
+        OperationContext* opCtx) const override {
+        return std::make_unique<ScopedOperationCompletionShardingActions>(opCtx);
     }
 };
 

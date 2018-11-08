@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -225,7 +227,7 @@ TEST(LockerImpl, DefaultLocker) {
 
     // Make sure the flush lock IS NOT held
     Locker::LockerInfo info;
-    locker.getLockerInfo(&info);
+    locker.getLockerInfo(&info, boost::none);
     ASSERT(!info.waitingResource.isValid());
     ASSERT_EQUALS(2U, info.locks.size());
     ASSERT_EQUALS(RESOURCE_GLOBAL, info.locks[0].resourceId.getType());
@@ -243,7 +245,7 @@ TEST(LockerImpl, MMAPV1Locker) {
 
     // Make sure the flush lock IS held
     Locker::LockerInfo info;
-    locker.getLockerInfo(&info);
+    locker.getLockerInfo(&info, boost::none);
     ASSERT(!info.waitingResource.isValid());
     ASSERT_EQUALS(3U, info.locks.size());
     ASSERT_EQUALS(RESOURCE_GLOBAL, info.locks[0].resourceId.getType());
@@ -498,7 +500,7 @@ TEST(LockerImpl, GetLockerInfoShouldReportHeldLocks) {
 
     // Assert it shows up in the output of getLockerInfo().
     Locker::LockerInfo lockerInfo;
-    locker.getLockerInfo(&lockerInfo);
+    locker.getLockerInfo(&lockerInfo, boost::none);
 
     ASSERT(lockerInfoContainsLock(lockerInfo, globalId, MODE_IX));
     ASSERT(lockerInfoContainsLock(lockerInfo, dbId, MODE_IX));
@@ -529,7 +531,7 @@ TEST(LockerImpl, GetLockerInfoShouldReportPendingLocks) {
 
     // Assert the held locks show up in the output of getLockerInfo().
     Locker::LockerInfo lockerInfo;
-    conflictingLocker.getLockerInfo(&lockerInfo);
+    conflictingLocker.getLockerInfo(&lockerInfo, boost::none);
     ASSERT(lockerInfoContainsLock(lockerInfo, globalId, MODE_IS));
     ASSERT(lockerInfoContainsLock(lockerInfo, dbId, MODE_IS));
     ASSERT(lockerInfoContainsLock(lockerInfo, collectionId, MODE_IS));
@@ -547,7 +549,7 @@ TEST(LockerImpl, GetLockerInfoShouldReportPendingLocks) {
     ASSERT_EQ(LOCK_OK,
               conflictingLocker.lockComplete(collectionId, MODE_IS, Date_t::now(), checkDeadlock));
 
-    conflictingLocker.getLockerInfo(&lockerInfo);
+    conflictingLocker.getLockerInfo(&lockerInfo, boost::none);
     ASSERT_FALSE(lockerInfo.waitingResource.isValid());
 
     ASSERT(conflictingLocker.unlock(collectionId));

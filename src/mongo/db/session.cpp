@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -470,16 +472,9 @@ void Session::onMigrateCompletedOnPrimary(OperationContext* opCtx,
     _checkValid(ul);
     _checkIsActiveTransaction(ul, txnNumber, false);
 
-    // If the transaction has a populated lastWriteDate, we will use that as the most up-to-date
-    // value. Using the lastWriteDate from the oplog being migrated may move the lastWriteDate
-    // back. However, in the case that the transaction doesn't have the lastWriteDate populated,
-    // the oplog's value serves as a best-case fallback.
-    const auto txnLastStmtIdWriteDate = _getLastWriteDate(ul, txnNumber);
-    const auto updatedLastStmtIdWriteDate =
-        txnLastStmtIdWriteDate == Date_t::min() ? oplogLastStmtIdWriteDate : txnLastStmtIdWriteDate;
-
+    // We do not migrate transaction oplog entries.
     const auto updateRequest =
-        _makeUpdateRequest(ul, txnNumber, lastStmtIdWriteOpTime, updatedLastStmtIdWriteDate);
+        _makeUpdateRequest(ul, txnNumber, lastStmtIdWriteOpTime, oplogLastStmtIdWriteDate);
 
     ul.unlock();
 
@@ -689,9 +684,9 @@ Session::TxnResources::~TxnResources() {
         // This should only be reached when aborting a transaction that isn't active, i.e.
         // when starting a new transaction before completing an old one.  So we should
         // be at WUOW nesting level 1 (only the top level WriteUnitOfWork).
+        _recoveryUnit->abortUnitOfWork();
         _locker->endWriteUnitOfWork();
         invariant(!_locker->inAWriteUnitOfWork());
-        _recoveryUnit->abortUnitOfWork();
     }
 }
 
@@ -926,10 +921,11 @@ void Session::abortActiveTransaction(OperationContext* opCtx) {
     }
 
     // Log the transaction if its duration is longer than the slowMS command threshold.
-    _logSlowTransaction(lock,
-                        &(opCtx->lockState()->getLockerInfo())->stats,
-                        MultiDocumentTransactionState::kAborted,
-                        repl::ReadConcernArgs::get(opCtx));
+    _logSlowTransaction(
+        lock,
+        &(opCtx->lockState()->getLockerInfo(CurOp::get(opCtx)->getLockStatsBase()))->stats,
+        MultiDocumentTransactionState::kAborted,
+        repl::ReadConcernArgs::get(opCtx));
 }
 
 void Session::_abortTransaction(WithLock wl) {
@@ -953,7 +949,7 @@ void Session::_abortTransaction(WithLock wl) {
     // If the transaction is stashed, then we have aborted an inactive transaction.
     if (_txnResourceStash) {
         _logSlowTransaction(wl,
-                            &(_txnResourceStash->locker()->getLockerInfo())->stats,
+                            &(_txnResourceStash->locker()->getLockerInfo(boost::none))->stats,
                             MultiDocumentTransactionState::kAborted,
                             _txnResourceStash->getReadConcernArgs());
         ServerTransactionsMetrics::get(getGlobalServiceContext())->decrementCurrentInactive();
@@ -1101,10 +1097,12 @@ void Session::_commitTransaction(stdx::unique_lock<stdx::mutex> lk, OperationCon
                 }
 
                 // Log the transaction if its duration is longer than the slowMS command threshold.
-                _logSlowTransaction(lk,
-                                    &(opCtx->lockState()->getLockerInfo())->stats,
-                                    MultiDocumentTransactionState::kAborted,
-                                    repl::ReadConcernArgs::get(opCtx));
+                _logSlowTransaction(
+                    lk,
+                    &(opCtx->lockState()->getLockerInfo(CurOp::get(opCtx)->getLockStatsBase()))
+                         ->stats,
+                    MultiDocumentTransactionState::kAborted,
+                    repl::ReadConcernArgs::get(opCtx));
             }
         }
         // We must clear the recovery unit and locker so any post-transaction writes can run without
@@ -1155,10 +1153,11 @@ void Session::_commitTransaction(stdx::unique_lock<stdx::mutex> lk, OperationCon
     }
 
     // Log the transaction if its duration is longer than the slowMS command threshold.
-    _logSlowTransaction(lk,
-                        &(opCtx->lockState()->getLockerInfo())->stats,
-                        MultiDocumentTransactionState::kCommitted,
-                        repl::ReadConcernArgs::get(opCtx));
+    _logSlowTransaction(
+        lk,
+        &(opCtx->lockState()->getLockerInfo(CurOp::get(opCtx)->getLockStatsBase()))->stats,
+        MultiDocumentTransactionState::kCommitted,
+        repl::ReadConcernArgs::get(opCtx));
 }
 
 BSONObj Session::reportStashedState() const {
@@ -1171,7 +1170,7 @@ void Session::reportStashedState(BSONObjBuilder* builder) const {
     stdx::lock_guard<stdx::mutex> ls(_mutex);
 
     if (_txnResourceStash && _txnResourceStash->locker()) {
-        if (auto lockerInfo = _txnResourceStash->locker()->getLockerInfo()) {
+        if (auto lockerInfo = _txnResourceStash->locker()->getLockerInfo(boost::none)) {
             invariant(_activeTxnNumber != kUninitializedTxnNumber);
             builder->append("host", getHostNameCachedAndPort());
             builder->append("desc", "inactive transaction");

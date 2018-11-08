@@ -245,6 +245,15 @@ add_option('dbg',
     type='choice',
 )
 
+add_option('separate-debug',
+    choices=['on', 'off'],
+    const='on',
+    default='off',
+    help='Produce separate debug files (only effective in --install-mode=hygienic)',
+    nargs='?',
+    type='choice',
+)
+
 add_option('spider-monkey-dbg',
     choices=['on', 'off'],
     const='on',
@@ -1329,7 +1338,8 @@ if link_model.startswith("dynamic"):
     def library(env, target, source, *args, **kwargs):
         sharedLibrary = env.SharedLibrary(target, source, *args, **kwargs)
         sharedArchive = env.SharedArchive(target, source=sharedLibrary[0].sources, *args, **kwargs)
-        return (sharedLibrary, sharedArchive)
+        sharedLibrary.extend(sharedArchive)
+        return sharedLibrary
 
     env['BUILDERS']['Library'] = library
     env['BUILDERS']['LibraryObject'] = env['BUILDERS']['SharedObject']
@@ -2264,6 +2274,12 @@ def doConfigure(myenv):
         if conf.CheckNonVirtualDtor():
             myenv.Append( CXXFLAGS=["-Wnon-virtual-dtor"] )
         conf.Finish()
+
+        # As of XCode 9, this flag must be present (it is not enabled
+        # by -Wall), in order to enforce that -mXXX-version-min=YYY
+        # will enforce that you don't use APIs from ZZZ.
+        if env.TargetOSIs('darwin'):
+            AddToCCFLAGSIfSupported(env, '-Wunguarded-availability')
 
     if get_option('runtime-hardening') == "on":
         # Enable 'strong' stack protection preferentially, but fall back to 'all' if it is not
@@ -3454,6 +3470,10 @@ env = doConfigure( env )
 
 # TODO: Later, this should live somewhere more graceful.
 if get_option('install-mode') == 'hygienic':
+
+    if get_option('separate-debug') == "on":
+        env.Tool('separate_debug')
+
     env.Tool('auto_install_binaries')
     if env['PLATFORM'] == 'posix':
         env.AppendUnique(
@@ -3483,6 +3503,8 @@ if get_option('install-mode') == 'hygienic':
                 "-Wl,-install_name,@rpath/${TARGET.file}",
             ],
         )
+elif get_option('separate-debug') == "on":
+    env.FatalError('Cannot use --separate-debug without --install-mode=hygienic')
 
 # Now that we are done with configure checks, enable icecream, if available.
 env.Tool('icecream')

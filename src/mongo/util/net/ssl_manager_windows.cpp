@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kNetwork
@@ -272,10 +274,11 @@ public:
     SSLConnectionInterface* accept(Socket* socket, const char* initialBytes, int len) final;
 
     SSLPeerInfo parseAndValidatePeerCertificateDeprecated(const SSLConnectionInterface* conn,
-                                                          const std::string& remoteHost) final;
+                                                          const std::string& remoteHost,
+                                                          const HostAndPort& hostForLogging) final;
 
     StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
-        PCtxtHandle ssl, const std::string& remoteHost) final;
+        PCtxtHandle ssl, const std::string& remoteHost, const HostAndPort& hostForLogging) final;
 
 
     const SSLConfiguration& getSSLConfiguration() const final {
@@ -1482,11 +1485,14 @@ Status SSLManagerWindows::_validateCertificate(PCCERT_CONTEXT cert,
 }
 
 SSLPeerInfo SSLManagerWindows::parseAndValidatePeerCertificateDeprecated(
-    const SSLConnectionInterface* conn, const std::string& remoteHost) {
+    const SSLConnectionInterface* conn,
+    const std::string& remoteHost,
+    const HostAndPort& hostForLogging) {
     auto swPeerSubjectName = parseAndValidatePeerCertificate(
         const_cast<SSLConnectionWindows*>(static_cast<const SSLConnectionWindows*>(conn))
             ->_engine.native_handle(),
-        remoteHost);
+        remoteHost,
+        hostForLogging);
     // We can't use uassertStatusOK here because we need to throw a SocketException.
     if (!swPeerSubjectName.isOK()) {
         throwSocketError(SocketErrorKind::CONNECT_ERROR, swPeerSubjectName.getStatus().reason());
@@ -1657,7 +1663,7 @@ Status validatePeerCertificate(const std::string& remoteHost,
     return Status::OK();
 }
 
-Status recordTLSVersion(PCtxtHandle ssl) {
+StatusWith<TLSVersion> mapTLSVersion(PCtxtHandle ssl) {
     SecPkgContext_ConnectionInfo connInfo;
 
     SECURITY_STATUS ss = QueryContextAttributes(ssl, SECPKG_ATTR_CONNECTION_INFO, &connInfo);
@@ -1668,36 +1674,31 @@ Status recordTLSVersion(PCtxtHandle ssl) {
                                     << ss);
     }
 
-    auto& counts = mongo::TLSVersionCounts::get(getGlobalServiceContext());
     switch (connInfo.dwProtocol) {
         case SP_PROT_TLS1_CLIENT:
         case SP_PROT_TLS1_SERVER:
-            counts.tls10.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS10;
         case SP_PROT_TLS1_1_CLIENT:
         case SP_PROT_TLS1_1_SERVER:
-            counts.tls11.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS11;
         case SP_PROT_TLS1_2_CLIENT:
         case SP_PROT_TLS1_2_SERVER:
-            counts.tls12.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS12;
         default:
-            // Do nothing
-            break;
+            return TLSVersion::kUnknown;
     }
-
-    return Status::OK();
 }
 
 StatusWith<boost::optional<SSLPeerInfo>> SSLManagerWindows::parseAndValidatePeerCertificate(
-    PCtxtHandle ssl, const std::string& remoteHost) {
+    PCtxtHandle ssl, const std::string& remoteHost, const HostAndPort& hostForLogging) {
     PCCERT_CONTEXT cert;
 
-    auto countStatus = recordTLSVersion(ssl);
-    if (!countStatus.isOK()) {
-        return countStatus;
+    auto tlsVersionStatus = mapTLSVersion(ssl);
+    if (!tlsVersionStatus.isOK()) {
+        return tlsVersionStatus.getStatus();
     }
+
+    recordTLSVersion(tlsVersionStatus.getValue(), hostForLogging);
 
     if (!_sslConfiguration.hasCA && isSSLServer)
         return {boost::none};
