@@ -479,6 +479,10 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         }
         _encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(keyDBPath.string());
         _encryptionKeyDB->init();
+        // add Percona encryption extension
+        std::stringstream ss;
+        ss << "local=(entry=percona_encryption_extension_init,early_load=true,config=(cipher=" << encryptionGlobalParams.encryptionCipherMode << "))";
+        WiredTigerExtensions::get(getGlobalServiceContext())->addExtension(ss.str());
     }
 
     std::stringstream ss;
