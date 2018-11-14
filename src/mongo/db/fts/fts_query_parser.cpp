@@ -94,7 +94,7 @@ QueryToken FTSQueryParser::nextForNgram() {
 		while(_pos < _raw.size()){
 			t = getType(_raw[_pos]);
 			if(t==QueryToken::TEXT || (t==QueryToken::DELIMITER && '-'==_raw[_pos])){ // Regarding '-' as part of TEXT (if previous character is not SPACE)
-				pos++;
+				_pos++;
 			}else{
 				break;
 			}

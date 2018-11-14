@@ -139,11 +139,11 @@ Status FTSQueryImpl::parse(TextIndexVersion textIndexVersion) {
     std::unique_ptr<FTSTokenizer> tokenizer(ftsLanguage.getValue()->createTokenizer());
 
 	if(isNgram){
-		addTermsForNgram(tokenizer.get(), positiveTermSentence, false);
-		addTermsForNgram(tokenizer.get(), negativeTermSentence, true);
+		_addTermsForNgram(tokenizer.get(), positiveTermSentence, false);
+		_addTermsForNgram(tokenizer.get(), negativeTermSentence, true);
 	}else{
-		addTerms(tokenizer.get(), positiveTermSentence, false);
-		addTerms(tokenizer.get(), negativeTermSentence, true);
+		_addTerms(tokenizer.get(), positiveTermSentence, false);
+		_addTerms(tokenizer.get(), negativeTermSentence, true);
 	}
 
     return Status::OK();
@@ -225,7 +225,7 @@ void FTSQueryImpl::_addTermsForNgram(FTSTokenizer* tokenizer, const string& sent
 		string word = tokenizer->get().toString();
 
 		if (!negated) {
-			termsForBounds.insert(word);
+			_termsForBounds.insert(word);
 		}
 	}
 
