@@ -28,8 +28,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/db/fts/fts_language.h"
 
 #include <string>
@@ -45,7 +43,6 @@
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/stringutils.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -317,9 +314,9 @@ const FTSPhraseMatcher& BasicFTSLanguage::getPhraseMatcher() const {
 }
 
 std::unique_ptr<FTSTokenizer> UnicodeFTSLanguage::createTokenizer() const {
-	if("ngram" == str()){
-		return stdx::make_unique<UnicodeNgramFTSTokenizer>(this);
-	}
+    if("ngram" == str()){
+        return stdx::make_unique<UnicodeNgramFTSTokenizer>(this);
+    }
     return stdx::make_unique<UnicodeFTSTokenizer>(this);
 }
 

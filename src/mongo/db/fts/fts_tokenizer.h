@@ -79,7 +79,7 @@ public:
      * Generate delimiter based tokens for N-Gram
      * This is need for phrase search(Everything is compared as phrase search in N-gram)
      */
-    static const Options kGenerateDelimiterTokensForNGram = 1 << 3;
+    static const Options kGenerateDelimiterTokensForNGram = 1 << 7;
 
     /**
      * Process a new document, and discards any previous results.

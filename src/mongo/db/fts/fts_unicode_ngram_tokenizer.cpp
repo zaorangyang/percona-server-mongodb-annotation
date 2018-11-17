@@ -2,8 +2,6 @@
  * nGram tokenizer implementation for Kakao nGram Search
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/fts/fts_unicode_ngram_tokenizer.h"
@@ -16,7 +14,6 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stringutils.h"
-#include "mongo/util/log.h"
 
 /**
  * NGram token size is always 2
@@ -64,15 +61,15 @@ void UnicodeNgramFTSTokenizer::reset(StringData document, Options options) {
 }
 
 bool UnicodeNgramFTSTokenizer::moveNext() {
-	bool hasToken = false;
+    bool hasToken = false;
 
-	if(_options & kGenerateDelimiterTokensForNGram){
-		hasToken = moveNextForDelimiter();
-	}else{
-		hasToken = moveNextForNgram();
-	}
+    if(_options & kGenerateDelimiterTokensForNGram){
+        hasToken = moveNextForDelimiter();
+    }else{
+        hasToken = moveNextForNgram();
+    }
 
-	return hasToken;
+    return hasToken;
 }
 
 bool UnicodeNgramFTSTokenizer::moveNextForNgram(){
@@ -87,7 +84,7 @@ bool UnicodeNgramFTSTokenizer::moveNextForNgram(){
         while (_pos < _document.size()) {
             if(codepointIsDelimiter(_document[_pos])){
                 // Not sufficient characters for NGRAM_TOKEN_SIZE, Ignore this and move DELIMITER-TOKEN
-            	_skipDelimiters();
+                _skipDelimiters();
                 start = _pos;
                 continue;
             }

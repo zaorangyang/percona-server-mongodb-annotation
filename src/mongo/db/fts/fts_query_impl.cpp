@@ -28,8 +28,6 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/fts/fts_query_impl.h"
@@ -40,7 +38,6 @@
 #include "mongo/stdx/memory.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stringutils.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -72,7 +69,7 @@ Status FTSQueryImpl::parse(TextIndexVersion textIndexVersion) {
 
     FTSQueryParser i(getQuery());
     while (i.more()) {
-    	QueryToken t = (isNgram) ? i.nextForNgram() : i.next();
+        QueryToken t = (isNgram) ? i.nextForNgram() : i.next();
 
         if (t.type == QueryToken::TEXT) {
             string s = t.data.toString();
@@ -138,13 +135,13 @@ Status FTSQueryImpl::parse(TextIndexVersion textIndexVersion) {
 
     std::unique_ptr<FTSTokenizer> tokenizer(ftsLanguage.getValue()->createTokenizer());
 
-	if(isNgram){
-		_addTermsForNgram(tokenizer.get(), positiveTermSentence, false);
-		_addTermsForNgram(tokenizer.get(), negativeTermSentence, true);
-	}else{
-		_addTerms(tokenizer.get(), positiveTermSentence, false);
-		_addTerms(tokenizer.get(), negativeTermSentence, true);
-	}
+    if(isNgram){
+        _addTermsForNgram(tokenizer.get(), positiveTermSentence, false);
+        _addTermsForNgram(tokenizer.get(), negativeTermSentence, true);
+    }else{
+        _addTerms(tokenizer.get(), positiveTermSentence, false);
+        _addTerms(tokenizer.get(), negativeTermSentence, true);
+    }
 
     return Status::OK();
 }
@@ -217,35 +214,36 @@ void FTSQueryImpl::_addTerms(FTSTokenizer* tokenizer, const string& sentence, bo
  *   if(not NGRAM), token will be added to term list
 */
 void FTSQueryImpl::_addTermsForNgram(FTSTokenizer* tokenizer, const string& sentence, bool negated) {
-									 tokenizer->reset(sentence.c_str(), FTSTokenizer::kFilterStopWords);
-	// First, get all the terms for indexing, ie, lower cased words
-	// If we are case-insensitive, we can also used this for positive, and negative terms
-	// Some terms may be expanded into multiple words in some non-English languages
-	while (tokenizer->moveNext()) {
-		string word = tokenizer->get().toString();
+    tokenizer->reset(sentence.c_str(), FTSTokenizer::kFilterStopWords);
 
-		if (!negated) {
-			_termsForBounds.insert(word);
-		}
-	}
+    // First, get all the terms for indexing, ie, lower cased words
+    // If we are case-insensitive, we can also used this for positive, and negative terms
+    // Some terms may be expanded into multiple words in some non-English languages
+    while (tokenizer->moveNext()) {
+        string word = tokenizer->get().toString();
 
-	// If NGRAM, then add term to phrase list (not term list)
-	auto& activePhrases = negated ? _negatedPhrases : _positivePhrases;
+        if (!negated) {
+            _termsForBounds.insert(word);
+        }
+    }
 
-	// Do not ngram based tokenize even if current tokenizer is NGram mode
-	FTSTokenizer::Options newOptions = FTSTokenizer::kGenerateDelimiterTokensForNGram;
-	if (getCaseSensitive()) {
-		newOptions |= FTSTokenizer::kGenerateCaseSensitiveTokens;
-	}
-	if (getDiacriticSensitive()) {
-		newOptions |= FTSTokenizer::kGenerateDiacriticSensitiveTokens;
-	}
+    // If NGRAM, then add term to phrase list (not term list)
+    auto& activePhrases = negated ? _negatedPhrases : _positivePhrases;
 
-	tokenizer->reset(sentence.c_str(), newOptions);
-	while (tokenizer->moveNext()) {
-		string word = tokenizer->get().toString();
-		activePhrases.push_back(word);
-	}
+    // Do not ngram based tokenize even if current tokenizer is NGram mode
+    FTSTokenizer::Options newOptions = FTSTokenizer::kGenerateDelimiterTokensForNGram;
+    if (getCaseSensitive()) {
+        newOptions |= FTSTokenizer::kGenerateCaseSensitiveTokens;
+    }
+    if (getDiacriticSensitive()) {
+        newOptions |= FTSTokenizer::kGenerateDiacriticSensitiveTokens;
+    }
+
+    tokenizer->reset(sentence.c_str(), newOptions);
+    while (tokenizer->moveNext()) {
+        string word = tokenizer->get().toString();
+        activePhrases.push_back(word);
+    }
 }
 
 BSONObj FTSQueryImpl::toBSON() const {

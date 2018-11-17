@@ -28,15 +28,12 @@
 *    it in the license file.
 */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/fts/fts_element_iterator.h"
 #include "mongo/db/fts/fts_matcher.h"
 #include "mongo/db/fts/fts_phrase_matcher.h"
 #include "mongo/db/fts/fts_tokenizer.h"
-#include "mongo/util/log.h"
 
 namespace mongo {
 
@@ -48,21 +45,21 @@ FTSMatcher::FTSMatcher(const FTSQueryImpl& query, const FTSSpec& spec)
     : _query(query), _spec(spec) {}
 
 bool FTSMatcher::matches(const BSONObj& obj) const {
-	if(_query.getLanguage()!="ngram"){ // Always doing phrase match for Ngram
-		if (canSkipPositiveTermCheck()) {
-			// We can assume that 'obj' has at least one positive term, and dassert as a sanity
-			// check.
-			dassert(hasPositiveTerm(obj));
-		} else {
-			if (!hasPositiveTerm(obj)) {
-				return false;
-			}
-		}
+    if(_query.getLanguage()!="ngram"){ // Always doing phrase match for Ngram
+        if (canSkipPositiveTermCheck()) {
+            // We can assume that 'obj' has at least one positive term, and dassert as a sanity
+            // check.
+            dassert(hasPositiveTerm(obj));
+        } else {
+            if (!hasPositiveTerm(obj)) {
+                return false;
+            }
+        }
 
-		if (hasNegativeTerm(obj)) {
-			return false;
-		}
-	}
+        if (hasNegativeTerm(obj)) {
+            return false;
+        }
+    }
 
     if (!positivePhrasesMatch(obj)) {
         return false;
