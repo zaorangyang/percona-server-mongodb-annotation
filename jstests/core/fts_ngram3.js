@@ -17,14 +17,14 @@
 
     // Single character before and after special character
     res_count = coll.find({ $text: { $search: "6/2" } }).count();
-    assert.eq(1, res_count, "Result count is not matched for keyworkd '6/2'");
+    assert.eq(1, res_count, "Result count is not matched for keyword '6/2'");
 
     res_count = coll.find({ $text: { $search: "6-2" } }).count();
-    assert.eq(1, res_count, "Result count is not matched for keyworkd '6-2'");
+    assert.eq(1, res_count, "Result count is not matched for keyword '6-2'");
 
     // Not found
     res_count = coll.find({ $text: { $search: "6#2" } }).count();
-    assert.eq(0, res_count, "Result count is not matched for keyworkd '6#2'");
+    assert.eq(0, res_count, "Result count is not matched for keyword '6#2'");
 
 
     // Single character before and after special character & phrase search

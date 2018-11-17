@@ -14,47 +14,47 @@
 
     // Found
     res_count = coll.find({ $text: { $search: "go" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd 'go'");
+    assert.eq(1, res_count, "Not found for keyword 'go'");
 
     res_count = coll.find({ $text: { $search: "od" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd 'od'");
+    assert.eq(1, res_count, "Not found for keyword 'od'");
 
     res_count = coll.find({ $text: { $search: "좋은" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '좋은'");
+    assert.eq(1, res_count, "Not found for keyword '좋은'");
 
     res_count = coll.find({ $text: { $search: "계형" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '계형'");
+    assert.eq(1, res_count, "Not found for keyword '계형'");
 
     res_count = coll.find({ $text: { $search: "데이" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '데이'");
+    assert.eq(1, res_count, "Not found for keyword '데이'");
 
     res_count = coll.find({ $text: { $search: "이터" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '이터'");
+    assert.eq(1, res_count, "Not found for keyword '이터'");
 
     res_count = coll.find({ $text: { $search: "터베" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '터베'");
+    assert.eq(1, res_count, "Not found for keyword '터베'");
 
     res_count = coll.find({ $text: { $search: "베이" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '베이'");
+    assert.eq(1, res_count, "Not found for keyword '베이'");
 
     res_count = coll.find({ $text: { $search: "이스" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '이스'");
+    assert.eq(1, res_count, "Not found for keyword '이스'");
 
     res_count = coll.find({ $text: { $search: "서버" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '서버'");
+    assert.eq(1, res_count, "Not found for keyword '서버'");
 
     res_count = coll.find({ $text: { $search: "버입" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '버입'");
+    assert.eq(1, res_count, "Not found for keyword '버입'");
 
     res_count = coll.find({ $text: { $search: "입니" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '입니'");
+    assert.eq(1, res_count, "Not found for keyword '입니'");
 
     res_count = coll.find({ $text: { $search: "니다" } }).count();
-    assert.eq(1, res_count, "Not found for keyworkd '니다'");
+    assert.eq(1, res_count, "Not found for keyword '니다'");
 
     // Not found
     res_count = coll.find({ $text: { $search: "나다" } }).count();
-    assert.eq(0, res_count, "Not found for keyworkd '나다'");
+    assert.eq(0, res_count, "Not found for keyword '나다'");
 
     // Index meta info
     const index = coll.getIndexes().find(index => index.name === "x_ngramtext");
