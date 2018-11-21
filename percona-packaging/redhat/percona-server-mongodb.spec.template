@@ -1,7 +1,7 @@
 #
 %define         mongo_home /var/lib/mongo
 #
-Name:           Percona-Server-MongoDB-40
+Name:           Percona-Server-MongoDB
 Version:        @@VERSION@@
 Release:        @@RELEASE@@%{?dist}
 Summary:        High-performance MongoDB replacement from Percona (metapackage)
@@ -53,7 +53,8 @@ Requires: %{name}-shell = %{version}-%{release}
 Requires: %{name}-tools = %{version}-%{release}
 Requires: numactl
 
-Conflicts: Percona-Server-MongoDB Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 Percona-Server-MongoDB-36 mongodb-org
+Conflicts: Percona-Server-MongoDB < 4.0.0
+Conflicts: Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 Percona-Server-MongoDB-36 mongodb-org
 
 %description
 This package contains high-performance MongoDB replacement from Percona - Percona Server for MongoDB.

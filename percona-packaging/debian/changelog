@@ -1,4 +1,4 @@
-percona-server-mongodb-40 (4.0.0) UNRELEASED; urgency=medium
+percona-server-mongodb (4.0.3) UNRELEASED; urgency=medium
 
   * Updated to next upstream release. (Closes: #RM-564)
 

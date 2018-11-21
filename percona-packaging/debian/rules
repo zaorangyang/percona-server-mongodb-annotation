@@ -50,16 +50,16 @@ build: percona-server-mongodb compile-mongo-tools
 
 override_dh_auto_install:
 	dh_auto_install
-	cp -av mongos debian/percona-server-mongodb-40-mongos/usr/bin
-	cp -av mongo debian/percona-server-mongodb-40-shell/usr/bin
-	cp -av mongod debian/percona-server-mongodb-40-server/usr/bin
-	cp -av debian/percona-server-mongodb-helper.sh debian/percona-server-mongodb-40-server/usr/bin
-	cp -av debian/percona-server-mongodb-enable-auth.sh debian/percona-server-mongodb-40-server/usr/bin
-	cp -av debian/mongod.conf debian/percona-server-mongodb-40-server/etc/mongod.conf
-	cp -av $(PSMSRC)/bin/* debian/percona-server-mongodb-40-tools/usr/bin
+	cp -av mongos debian/percona-server-mongodb-mongos/usr/bin
+	cp -av mongo debian/percona-server-mongodb-shell/usr/bin
+	cp -av mongod debian/percona-server-mongodb-server/usr/bin
+	cp -av debian/percona-server-mongodb-helper.sh debian/percona-server-mongodb-server/usr/bin
+	cp -av debian/percona-server-mongodb-enable-auth.sh debian/percona-server-mongodb-server/usr/bin
+	cp -av debian/mongod.conf debian/percona-server-mongodb-server/etc/mongod.conf
+	cp -av $(PSMSRC)/bin/* debian/percona-server-mongodb-tools/usr/bin
 
 override_dh_strip:
-	dh_strip -a --dbg-package=percona-server-mongodb-40-dbg
+	dh_strip -a --dbg-package=percona-server-mongodb-dbg
 
 override_dh_installinit:
 	dh_installinit -a --name=mongod

@@ -168,13 +168,13 @@ get_sources(){
     source percona-server-mongodb-40.properties
     #
 
-    mv percona-server-mongodb ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
-    tar --owner=0 --group=0 --exclude=.* -czf ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
+    mv percona-server-mongodb ${PRODUCT}
+    tar --owner=0 --group=0 --exclude=.* -czf ${PRODUCT}.tar.gz ${PRODUCT}
     echo "UPLOAD=UPLOAD/experimental/BUILDS/${PRODUCT}-4.0/${PRODUCT}-${PSM_VER}-${PSM_RELEASE}/${PSM_BRANCH}/${REVISION}/${BUILD_ID}" >> percona-server-mongodb-40.properties
     mkdir $WORKDIR/source_tarball
     mkdir $CURDIR/source_tarball
-    cp ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz $WORKDIR/source_tarball
-    cp ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz $CURDIR/source_tarball
+    cp ${PRODUCT}.tar.gz $WORKDIR/source_tarball
+    cp ${PRODUCT}.tar.gz $CURDIR/source_tarball
     cd $CURDIR
     rm -rf percona-server-mongodb   
     return
@@ -384,7 +384,7 @@ build_srpm(){
     get_tar "source_tarball"
     rm -fr rpmbuild
     ls | grep -v tar.gz | xargs rm -rf
-    TARFILE=$(find . -name 'percona-server-mongodb-*.tar.gz' | sort | tail -n1)
+    TARFILE=$(find . -name 'percona-server-mongodb*.tar.gz' | sort | tail -n1)
     SRC_DIR=${TARFILE%.tar.gz}
     #
     mkdir -vp rpmbuild/{SOURCES,SPECS,BUILD,SRPMS,RPMS}
@@ -424,10 +424,10 @@ build_rpm(){
         echo "It is not possible to build rpm here"
         exit 1
     fi
-    SRC_RPM=$(basename $(find $WORKDIR/srpm -name 'Percona-Server-MongoDB-*.src.rpm' | sort | tail -n1))
+    SRC_RPM=$(basename $(find $WORKDIR/srpm -name 'Percona-Server-MongoDB*.src.rpm' | sort | tail -n1))
     if [ -z $SRC_RPM ]
     then
-        SRC_RPM=$(basename $(find $CURDIR/srpm -name 'Percona-Server-MongoDB-*.src.rpm' | sort | tail -n1))
+        SRC_RPM=$(basename $(find $CURDIR/srpm -name 'Percona-Server-MongoDB*.src.rpm' | sort | tail -n1))
         if [ -z $SRC_RPM ]
         then
             echo "There is no src rpm for build"
@@ -446,7 +446,7 @@ build_rpm(){
 
     cd rpmbuild/SRPMS/
     rpm2cpio ${SRC_RPM} | cpio -id
-    TARF=$(find . -name 'percona-server-mongodb-*.tar.gz' | sort | tail -n1)
+    TARF=$(find . -name 'percona-server-mongodb*.tar.gz' | sort | tail -n1)
     tar vxzf ${TARF} --wildcards '*/buildscripts' --strip=1
     if [ "x${RHEL}" == "x6" ]; then
     pip2.7 install --user -r buildscripts/requirements.txt
@@ -505,7 +505,7 @@ build_source_deb(){
     get_tar "source_tarball"
     rm -f *.dsc *.orig.tar.gz *.debian.tar.gz *.changes
     #
-    TARFILE=$(basename $(find . -name 'percona-server-mongodb-*.tar.gz' | sort | tail -n1))
+    TARFILE=$(basename $(find . -name 'percona-server-mongodb*.tar.gz' | sort | tail -n1))
     DEBIAN=$(lsb_release -sc)
     ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
     tar zxf ${TARFILE} 
@@ -520,10 +520,10 @@ build_source_deb(){
     sed -i 's:@@LOGDIR@@:mongodb:g' ${BUILDDIR}/debian/mongod.default
     sed -i 's:@@LOGDIR@@:mongodb:g' ${BUILDDIR}/debian/percona-server-mongodb-helper.sh
     #
-    mv ${BUILDDIR}/debian/mongod.default ${BUILDDIR}/debian/percona-server-mongodb-40-server.mongod.default
-    mv ${BUILDDIR}/debian/mongod.service ${BUILDDIR}/debian/percona-server-mongodb-40-server.mongod.service
+    mv ${BUILDDIR}/debian/mongod.default ${BUILDDIR}/debian/percona-server-mongodb-server.mongod.default
+    mv ${BUILDDIR}/debian/mongod.service ${BUILDDIR}/debian/percona-server-mongodb-server.mongod.service
     #
-    mv ${TARFILE} ${PRODUCT}-40_${VERSION}.orig.tar.gz
+    mv ${TARFILE} ${PRODUCT}_${VERSION}.orig.tar.gz
     cd ${BUILDDIR}
     pip install --user -r buildscripts/requirements.txt
 
@@ -574,7 +574,7 @@ build_deb(){
     #
     dpkg-source -x ${DSC}
     #
-    cd ${PRODUCT}-40-${VERSION}
+    cd ${PRODUCT}-${VERSION}
     pip install --user -r buildscripts/requirements.txt
     #
     set_compiler
@@ -596,7 +596,7 @@ build_tarball(){
     fi
     get_tar "source_tarball"
     cd $WORKDIR
-    TARFILE=$(basename $(find . -name 'percona-server-mongodb-*.tar.gz' | sort | tail -n1))
+    TARFILE=$(basename $(find . -name 'percona-server-mongodb*.tar.gz' | sort | tail -n1))
 
     if [ -f /opt/percona-devtoolset/enable ]; then
     source /opt/percona-devtoolset/enable
@@ -637,7 +637,7 @@ build_tarball(){
     fi
     #
     ARCH=$(uname -m 2>/dev/null||true)
-    TARFILE=$(basename $(find . -name 'percona-server-mongodb-*.tar.gz' | sort | grep -v "tools" | tail -n1))
+    TARFILE=$(basename $(find . -name 'percona-server-mongodb*.tar.gz' | sort | grep -v "tools" | tail -n1))
     PSMDIR=${TARFILE%.tar.gz}
     PSMDIR_ABS=${WORKDIR}/${PSMDIR}
     TOOLSDIR=${PSMDIR}/mongo-tools
@@ -743,7 +743,7 @@ RPM_RELEASE=1
 DEB_RELEASE=1
 REVISION=0
 BRANCH="v4.0"
-REPO="https://github.com/EvgeniyPatlan/percona-server-mongodb.git"
+REPO="https://github.com/percona/percona-server-mongodb.git"
 PSM_VER="4.0.3"
 PSM_RELEASE="1.1"
 MONGO_TOOLS_TAG="r4.0.3"
