@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -1470,6 +1472,40 @@ TEST(PlanCacheTest, ComputeKeyGeoNear) {
         "{}",
         "{}",
         "gnanrsp");
+}
+
+TEST(PlanCacheTest, ComputeKeyMatchInDependsOnPresenceOfRegex) {
+    // Test that an $in containing a single regex is unwrapped to $regex.
+    testComputeKey("{a: {$in: [/foo/]}}", "{}", "{}", "rea");
+    testComputeKey("{a: {$in: [/foo/i]}}", "{}", "{}", "rea");
+
+    // Test that an $in with no regexes does not include any regex information.
+    testComputeKey("{a: {$in: [1, 'foo']}}", "{}", "{}", "ina");
+
+    // Test that an $in with a regex encodes the presence of the regex.
+    testComputeKey("{a: {$in: [1, /foo/]}}", "{}", "{}", "ina_re");
+
+    // Test that an $in with a regex and flags encodes the presence of the regex.
+    testComputeKey("{a: {$in: [1, /foo/is]}}", "{}", "{}", "ina_re");
+    testComputeKey("{a: {$in: [1, /foo/i]}}", "{}", "{}", "ina_re");
+
+    // Test that an $in with multiple regexes encodes their presence only once.
+    testComputeKey("{a: {$in: [1, /foo/i, /bar/m, /baz/s]}}", "{}", "{}", "ina_re");
+    testComputeKey(
+        "{a: {$in: [1, /foo/i, /bar/m, /baz/s, /qux/i, /quux/s]}}", "{}", "{}", "ina_re");
+    testComputeKey(
+        "{a: {$in: [1, /foo/ism, /bar/msi, /baz/im, /qux/si, /quux/im]}}", "{}", "{}", "ina_re");
+    testComputeKey(
+        "{a: {$in: [1, /foo/msi, /bar/ism, /baz/is, /qux/mi, /quux/im]}}", "{}", "{}", "ina_re");
+
+    // Test that $not-$in-$regex similarly records the presence of any regexes.
+    testComputeKey("{a: {$not: {$in: [1, 'foo']}}}", "{}", "{}", "nt[ina]");
+    testComputeKey("{a: {$not: {$in: [1, /foo/]}}}", "{}", "{}", "nt[ina_re]");
+    testComputeKey("{a: {$not: {$in: [1, /foo/i, /bar/i, /baz/msi]}}}", "{}", "{}", "nt[ina_re]");
+
+    // Test that a $not-$in containing a single regex is unwrapped to $not-$regex.
+    testComputeKey("{a: {$not: {$in: [/foo/]}}}", "{}", "{}", "nt[rea]");
+    testComputeKey("{a: {$not: {$in: [/foo/i]}}}", "{}", "{}", "nt[rea]");
 }
 
 // When a sparse index is present, computeKey() should generate different keys depending on

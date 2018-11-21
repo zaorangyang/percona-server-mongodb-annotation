@@ -422,6 +422,7 @@ env.Install(
             'util/clock_sources',
             'util/fail_point',
             'util/ntservice',
+            'util/net/ssl_manager_status',
             'util/options_parser/options_parser_init',
             'util/version_impl',
         ]))
@@ -610,9 +611,9 @@ env.Append(MODULE_BANNERS = [distsrc.File('README'),
                              distsrc.File('THIRD-PARTY-NOTICES'),
                              distsrc.File('MPL-2')])
 
-# If no module has introduced a file named LICENSE.txt, then inject the AGPL.
+# If no module has introduced a file named LICENSE.txt, then inject the license.
 if sum(itertools.imap(lambda x: x.name == "LICENSE.txt", env['MODULE_BANNERS'])) == 0:
-    env.Append(MODULE_BANNERS = [distsrc.File('GNU-AGPL-3.0')])
+    env.Append(MODULE_BANNERS = [distsrc.File('LICENSE-Community.txt')])
 
 # All module banners get staged to the top level of the tarfile, so we
 # need to fail if we are going to have a name collision.

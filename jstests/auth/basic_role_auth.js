@@ -5,6 +5,12 @@
  * @tags: [rocks_requires_fcv36]
  */
 
+// This test runs connectionStatus on a connection with no logged in users and auth on, which is
+// rejected when run with an implicit session id.
+// TODO SERVER-34820: Remove once connectionStatus can be run with no users authenticated in an
+// implicit session.
+TestData.disableImplicitSessions = true;
+
 /**
  * Data structure that contains all the users that are going to be used in the tests.
  * The structure is as follows:
@@ -494,7 +500,7 @@ var runTests = function(conn) {
             testFunc.test(newConn);
         } catch (x) {
             failures.push(testFunc.name);
-            jsTestLog(x);
+            jsTestLog(tojson(x));
         }
     });
 

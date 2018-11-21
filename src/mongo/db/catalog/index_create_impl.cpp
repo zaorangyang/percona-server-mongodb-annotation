@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -145,6 +147,10 @@ MultiIndexBlockImpl::MultiIndexBlockImpl(OperationContext* opCtx, Collection* co
       _needToCleanup(true) {}
 
 MultiIndexBlockImpl::~MultiIndexBlockImpl() {
+    if (!_needToCleanup && !_indexes.empty()) {
+        _collection->infoCache()->clearQueryCache();
+    }
+
     if (!_needToCleanup || _indexes.empty())
         return;
     while (true) {
@@ -286,7 +292,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlockImpl::init(const std::vector<BSO
         log() << "Index build interrupted due to 'crashAfterStartingIndexBuild' failpoint. Exiting "
                  "after waiting for changes to become durable.";
         Locker::LockSnapshot lockInfo;
-        _opCtx->lockState()->saveLockStateAndUnlock(&lockInfo);
+        invariant(_opCtx->lockState()->saveLockStateAndUnlock(&lockInfo));
         if (_opCtx->recoveryUnit()->waitUntilDurable()) {
             quickExit(EXIT_TEST);
         }
@@ -411,7 +417,7 @@ Status MultiIndexBlockImpl::insertAllDocumentsInCollection(std::set<RecordId>* d
     if (MONGO_FAIL_POINT(hangAfterStartingIndexBuildUnlocked)) {
         // Unlock before hanging so replication recognizes we've completed.
         Locker::LockSnapshot lockInfo;
-        _opCtx->lockState()->saveLockStateAndUnlock(&lockInfo);
+        invariant(_opCtx->lockState()->saveLockStateAndUnlock(&lockInfo));
         while (MONGO_FAIL_POINT(hangAfterStartingIndexBuildUnlocked)) {
             log() << "Hanging index build with no locks due to "
                      "'hangAfterStartingIndexBuildUnlocked' failpoint";

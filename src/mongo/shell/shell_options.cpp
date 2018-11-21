@@ -1,29 +1,31 @@
-/*
- *    Copyright (C) 2013 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault;
@@ -214,6 +216,11 @@ Status addMongoShellOptions(moe::OptionSection* options) {
         moe::Switch,
         "automatically retry write operations upon transient network errors");
 
+    options->addOptionChaining("disableImplicitSessions",
+                               "disableImplicitSessions",
+                               moe::Switch,
+                               "do not automatically create and use implicit sessions");
+
     options
         ->addOptionChaining(
             "rpcProtocols", "rpcProtocols", moe::String, " none, opQueryOnly, opCommandOnly, all")
@@ -372,6 +379,9 @@ Status storeMongoShellOptions(const moe::Environment& params,
     if (params.count("retryWrites")) {
         shellGlobalParams.shouldRetryWrites = true;
     }
+    if (params.count("disableImplicitSessions")) {
+        shellGlobalParams.shouldUseImplicitSessions = false;
+    }
     if (params.count("rpcProtocols")) {
         std::string protos = params["rpcProtocols"].as<string>();
         auto parsedRPCProtos = rpc::parseProtocolSet(protos);
@@ -467,5 +477,55 @@ Status storeMongoShellOptions(const moe::Environment& params,
         return ret;
 
     return Status::OK();
+}
+
+void redactPasswordOptions(int argc, char** argv) {
+    constexpr auto kLongPasswordOption = "--password"_sd;
+    constexpr auto kShortPasswordOption = "-p"_sd;
+    for (int i = 0; i < argc; ++i) {
+        StringData arg(argv[i]);
+        if (arg.startsWith(kShortPasswordOption)) {
+            char* toRedact = nullptr;
+            // Handle -p password
+            if ((arg == kShortPasswordOption) && (i + 1 < argc)) {
+                toRedact = argv[++i];
+                // Handle -ppassword
+            } else {
+                toRedact = argv[i] + kShortPasswordOption.size();
+            }
+
+            invariant(toRedact);
+            // The arg should be null-terminated, replace everything up to \0 to 'x'
+            while (*toRedact) {
+                *toRedact++ = 'x';
+            }
+        }
+        if (arg.startsWith(kLongPasswordOption)) {
+            char* toRedact = nullptr;
+            // Handle --password password
+            if ((arg == kLongPasswordOption) && (i + 1 < argc)) {
+                toRedact = argv[++i];
+                // Handle --password=password
+            } else if (arg.size() != kLongPasswordOption.size()) {
+                toRedact = argv[i] + kLongPasswordOption.size();
+                // It's not valid to do --passwordpassword, make sure there's an = separator
+                invariant(*(toRedact++) == '=');
+            }
+
+            // If there's nothing to redact, just exit
+            if (!toRedact) {
+                continue;
+            }
+
+            // The arg should be null-terminated, replace everything up to \0 to 'x'
+            while (*toRedact) {
+                *toRedact++ = 'x';
+            }
+        } else if (MongoURI::isMongoURI(arg)) {
+            auto reformedURI = MongoURI::redact(arg);
+            auto length = arg.size();
+            ::strncpy(argv[i], reformedURI.data(), length);
+        }
+    }
 }
 }  // namespace mongo

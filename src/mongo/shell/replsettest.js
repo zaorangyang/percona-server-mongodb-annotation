@@ -68,9 +68,6 @@
  *  nodes {Array.<Mongo>} - connection to replica set members
  */
 
-/* Global default timeout variable */
-const kReplDefaultTimeoutMS = 10 * 60 * 1000;
-
 var ReplSetTest = function(opts) {
     'use strict';
 
@@ -92,10 +89,14 @@ var ReplSetTest = function(opts) {
     var _bridgeOptions;
     var _unbridgedPorts;
     var _unbridgedNodes;
+    var _allocatePortForNode;
+    var _allocatePortForBridge;
 
     var _causalConsistency;
 
-    this.kDefaultTimeoutMS = kReplDefaultTimeoutMS;
+    // Some code still references kDefaultTimeoutMS as a (non-static) member variable, so make sure
+    // it's still accessible that way.
+    this.kDefaultTimeoutMS = ReplSetTest.kDefaultTimeoutMS;
     var oplogName = 'oplog.rs';
 
     // Publicly exposed variables
@@ -729,6 +730,29 @@ var ReplSetTest = function(opts) {
         return this.getSecondaries(timeout)[0];
     };
 
+    this.getArbiters = function() {
+        var arbiters = [];
+        for (var i = 0; i < this.nodes.length; i++) {
+            var node = this.nodes[i];
+
+            let isArbiter = false;
+
+            assert.retryNoExcept(() => {
+                isArbiter = node.getDB('admin').isMaster('admin').arbiterOnly;
+                return true;
+            }, `Could not call 'isMaster' on ${node}.`, 3, 1000);
+
+            if (isArbiter) {
+                arbiters.push(node);
+            }
+        }
+        return arbiters;
+    };
+
+    this.getArbiter = function() {
+        return this.getArbiters()[0];
+    };
+
     this.status = function(timeout) {
         var master = _callIsMaster();
         if (!master) {
@@ -742,14 +766,14 @@ var ReplSetTest = function(opts) {
      * Adds a node to the replica set managed by this instance.
      */
     this.add = function(config) {
-        var nextPort = allocatePort();
+        var nextPort = _allocatePortForNode();
         print("ReplSetTest Next port: " + nextPort);
 
         this.ports.push(nextPort);
         printjson(this.ports);
 
         if (_useBridge) {
-            _unbridgedPorts.push(allocatePort());
+            _unbridgedPorts.push(_allocatePortForBridge());
         }
 
         var nextId = this.nodes.length;
@@ -1375,6 +1399,9 @@ var ReplSetTest = function(opts) {
         msgPrefix = 'checkReplicatedDataHashes', excludedDBs = [], ignoreUUIDs = false) {
         // Return items that are in either Array `a` or `b` but not both. Note that this will
         // not work with arrays containing NaN. Array.indexOf(NaN) will always return -1.
+
+        var collectionPrinted = new Set();
+
         function arraySymmetricDifference(a, b) {
             var inAOnly = a.filter(function(elem) {
                 return b.indexOf(elem) < 0;
@@ -1387,8 +1414,66 @@ var ReplSetTest = function(opts) {
             return inAOnly.concat(inBOnly);
         }
 
+        function printCollectionInfo(connName, conn, dbName, collName) {
+            var ns = dbName + '.' + collName;
+            var hostColl = `${conn.host}--${ns}`;
+            var alreadyPrinted = collectionPrinted.has(hostColl);
+
+            // Extract basic collection info.
+            var coll = conn.getDB(dbName).getCollection(collName);
+            var res = conn.getDB(dbName).runCommand({listCollections: 1, filter: {name: collName}});
+            var collInfo = null;
+            if (res.ok === 1 && res.cursor.firstBatch.length !== 0) {
+                collInfo = {
+                    ns: ns,
+                    host: conn.host,
+                    UUID: res.cursor.firstBatch[0].info.uuid,
+                    count: coll.find().itcount()
+                };
+            }
+            var infoPrefix = `${connName}(${conn.host}) info for ${ns} : `;
+            if (collInfo !== null) {
+                if (alreadyPrinted) {
+                    print(`${connName} info for ${ns} already printed. Search for ` +
+                          `'${infoPrefix}'`);
+                } else {
+                    print(infoPrefix + tojsononeline(collInfo));
+                }
+            } else {
+                print(infoPrefix + 'collection does not exist');
+            }
+
+            var collStats = conn.getDB(dbName).runCommand({collStats: collName});
+            var statsPrefix = `${connName}(${conn.host}) collStats for ${ns}: `;
+            if (collStats.ok === 1) {
+                if (alreadyPrinted) {
+                    print(`${connName} collStats for ${ns} already printed. Search for ` +
+                          `'${statsPrefix}'`);
+                } else {
+                    print(statsPrefix + tojsononeline(collStats));
+                }
+            } else {
+                print(`${statsPrefix}  error: ${tojsononeline(collStats)}`);
+            }
+
+            collectionPrinted.add(hostColl);
+
+            // Return true if collInfo & collStats can be retrieved for conn.
+            return collInfo !== null && collStats.ok === 1;
+        }
+
         function dumpCollectionDiff(primary, secondary, dbName, collName) {
-            print('Dumping collection: ' + dbName + '.' + collName);
+            var ns = dbName + '.' + collName;
+            print('Dumping collection: ' + ns);
+
+            var primaryExists = printCollectionInfo('primary', primary, dbName, collName);
+            var secondaryExists = printCollectionInfo('secondary', secondary, dbName, collName);
+
+            if (!primaryExists || !secondaryExists) {
+                print(`Skipping checking collection differences for ${ns} since it does not ` +
+                      'exist on primary and secondary');
+                return;
+            }
 
             var primaryColl = primary.getDB(dbName).getCollection(collName);
             var secondaryColl = secondary.getDB(dbName).getCollection(collName);
@@ -1551,9 +1636,8 @@ var ReplSetTest = function(opts) {
                                           ', the primary and secondary have different ' +
                                           'attributes for the collection or view' + dbName + '.' +
                                           secondaryInfo.name);
-                                    print('Collection info on the primary: ' + tojson(primaryInfo));
-                                    print('Collection info on the secondary: ' +
-                                          tojson(secondaryInfo));
+                                    dumpCollectionDiff(
+                                        primary, secondary, dbName, secondaryInfo.name);
                                     success = false;
                                 }
                             }
@@ -1570,21 +1654,21 @@ var ReplSetTest = function(opts) {
                     primaryCollections.forEach(collName => {
                         var primaryCollStats =
                             primary.getDB(dbName).runCommand({collStats: collName});
-                        assert.commandWorked(primaryCollStats);
                         var secondaryCollStats =
                             secondary.getDB(dbName).runCommand({collStats: collName});
-                        assert.commandWorked(secondaryCollStats);
 
-                        if (primaryCollStats.capped !== secondaryCollStats.capped ||
-                            (hasSecondaryIndexes &&
-                             primaryCollStats.nindexes !== secondaryCollStats.nindexes) ||
-                            primaryCollStats.ns !== secondaryCollStats.ns) {
+                        if (primaryCollStats.ok !== 1 || secondaryCollStats.ok !== 1) {
+                            printCollectionInfo('primary', primary, dbName, collName);
+                            printCollectionInfo('secondary', secondary, dbName, collName);
+                            success = false;
+                        } else if (primaryCollStats.capped !== secondaryCollStats.capped ||
+                                   (hasSecondaryIndexes &&
+                                    primaryCollStats.nindexes !== secondaryCollStats.nindexes) ||
+                                   primaryCollStats.ns !== secondaryCollStats.ns) {
                             print(msgPrefix +
                                   ', the primary and secondary have different stats for the ' +
                                   'collection ' + dbName + '.' + collName);
-                            print('Collection stats on the primary: ' + tojson(primaryCollStats));
-                            print('Collection stats on the secondary: ' +
-                                  tojson(secondaryCollStats));
+                            dumpCollectionDiff(primary, secondary, dbName, collName);
                             success = false;
                         }
                     });
@@ -2000,6 +2084,13 @@ var ReplSetTest = function(opts) {
     };
 
     /**
+     * Returns whether or not this ReplSetTest uses mongobridge.
+     */
+    this.usesBridge = function() {
+        return _useBridge;
+    };
+
+    /**
      * Wait for a state indicator to go to a particular state or states.
      *
      * @param node is a single node or list of nodes, by id or conn
@@ -2079,12 +2170,39 @@ var ReplSetTest = function(opts) {
             numNodes = opts.nodes;
         }
 
-        self.ports = allocatePorts(numNodes);
+        if (_useBridge) {
+            let makeAllocatePortFn = (preallocatedPorts) => {
+                let idxNextNodePort = 0;
+
+                return function() {
+                    if (idxNextNodePort >= preallocatedPorts.length) {
+                        throw new Error("Cannot use a replica set larger than " +
+                                        preallocatedPorts.length + " members with useBridge=true");
+                    }
+
+                    const nextPort = preallocatedPorts[idxNextNodePort];
+                    ++idxNextNodePort;
+                    return nextPort;
+                };
+            };
+
+            _allocatePortForBridge = makeAllocatePortFn(allocatePorts(MongoBridge.kBridgeOffset));
+            _allocatePortForNode = makeAllocatePortFn(allocatePorts(MongoBridge.kBridgeOffset));
+        } else {
+            _allocatePortForBridge = function() {
+                throw new Error("Using mongobridge isn't enabled for this replica set");
+            };
+            _allocatePortForNode = allocatePort;
+        }
+
         self.nodes = [];
 
         if (_useBridge) {
-            _unbridgedPorts = allocatePorts(numNodes);
+            self.ports = Array.from({length: numNodes}, _allocatePortForBridge);
+            _unbridgedPorts = Array.from({length: numNodes}, _allocatePortForNode);
             _unbridgedNodes = [];
+        } else {
+            self.ports = Array.from({length: numNodes}, _allocatePortForNode);
         }
     }
 
@@ -2118,10 +2236,9 @@ var ReplSetTest = function(opts) {
 };
 
 /**
- * Declare kDefaultTimeoutMS as a static property so we don't have to initialize
- * a ReplSetTest object to use it.
+ *  Global default timeout (10 minutes).
  */
-ReplSetTest.kDefaultTimeoutMS = kReplDefaultTimeoutMS;
+ReplSetTest.kDefaultTimeoutMS = 10 * 60 * 1000;
 
 /**
  * Set of states that the replica set can be in. Used for the wait functions.

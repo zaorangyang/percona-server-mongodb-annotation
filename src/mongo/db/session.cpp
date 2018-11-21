@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -306,17 +308,9 @@ void Session::onMigrateCompletedOnPrimary(OperationContext* opCtx,
     _checkValid(ul);
     _checkIsActiveTransaction(ul, txnNumber);
 
-    // If the transaction has a populated lastWriteDate, we will use that as the most up-to-date
-    // value. Using the lastWriteDate from the oplog being migrated may move the lastWriteDate
-    // back. However, in the case that the transaction doesn't have the lastWriteDate populated,
-    // the oplog's value serves as a best-case fallback.
-    const auto txnLastStmtIdWriteDate = _getLastWriteDate(ul, txnNumber);
-    const auto updatedLastStmtIdWriteDate =
-        txnLastStmtIdWriteDate == Date_t::fromMillisSinceEpoch(0) ? oplogLastStmtIdWriteDate
-                                                                  : txnLastStmtIdWriteDate;
-
+    // We do not migrate transaction oplog entries.
     const auto updateRequest =
-        _makeUpdateRequest(ul, txnNumber, lastStmtIdWriteOpTime, updatedLastStmtIdWriteDate);
+        _makeUpdateRequest(ul, txnNumber, lastStmtIdWriteOpTime, oplogLastStmtIdWriteDate);
 
     ul.unlock();
 

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -25,6 +27,8 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
@@ -53,6 +57,7 @@
 #include "mongo/db/storage/record_fetcher.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/stacktrace.h"
 
@@ -74,6 +79,7 @@ struct CappedInsertNotifierData {
 namespace {
 
 MONGO_FP_DECLARE(planExecutorAlwaysFails);
+MONGO_FP_DECLARE(planExecutorHangBeforeShouldWaitForInserts);
 
 /**
  * Constructs a PlanYieldPolicy based on 'policy'.
@@ -418,22 +424,27 @@ PlanExecutor::ExecState PlanExecutor::getNextSnapshotted(Snapshotted<BSONObj>* o
     return getNextImpl(objOut, dlOut);
 }
 
+bool PlanExecutor::shouldListenForInserts() {
+    return _cq && _cq->getQueryRequest().isTailableAndAwaitData() &&
+        awaitDataState(_opCtx).shouldWaitForInserts && _opCtx->checkForInterruptNoAssert().isOK() &&
+        awaitDataState(_opCtx).waitForInsertsDeadline >
+        _opCtx->getServiceContext()->getPreciseClockSource()->now();
+}
 
 bool PlanExecutor::shouldWaitForInserts() {
     // If this is an awaitData-respecting operation and we have time left and we're not interrupted,
     // we should wait for inserts.
-    if (_cq && _cq->getQueryRequest().isTailableAndAwaitData() &&
-        awaitDataState(_opCtx).shouldWaitForInserts && _opCtx->checkForInterruptNoAssert().isOK() &&
-        awaitDataState(_opCtx).waitForInsertsDeadline >
-            _opCtx->getServiceContext()->getPreciseClockSource()->now()) {
+    if (shouldListenForInserts()) {
         // We expect awaitData cursors to be yielding.
         invariant(_yieldPolicy->canReleaseLocksDuringExecution());
 
         // For operations with a last committed opTime, we should not wait if the replication
-        // coordinator's lastCommittedOpTime has changed.
+        // coordinator's lastCommittedOpTime has progressed past the client's lastCommittedOpTime.
+        // In that case, we will return early so that we can inform the client of the new
+        // lastCommittedOpTime immediately.
         if (!clientsLastKnownCommittedOpTime(_opCtx).isNull()) {
             auto replCoord = repl::ReplicationCoordinator::get(_opCtx);
-            return clientsLastKnownCommittedOpTime(_opCtx) == replCoord->getLastCommittedOpTime();
+            return clientsLastKnownCommittedOpTime(_opCtx) >= replCoord->getLastCommittedOpTime();
         }
         return true;
     }
@@ -528,7 +539,8 @@ PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, 
     // insert notifier the entire time we are in the loop.  Holding a shared pointer to the capped
     // insert notifier is necessary for the notifierVersion to advance.
     CappedInsertNotifierData cappedInsertNotifierData;
-    if (shouldWaitForInserts()) {
+    if (shouldListenForInserts()) {
+        // We always construct the CappedInsertNotifier for awaitData cursors.
         cappedInsertNotifierData.notifier = getCappedInsertNotifier();
     }
     for (;;) {
@@ -617,6 +629,11 @@ PlanExecutor::ExecState PlanExecutor::getNextImpl(Snapshotted<BSONObj>* objOut, 
         } else if (PlanStage::NEED_TIME == code) {
             // Fall through to yield check at end of large conditional.
         } else if (PlanStage::IS_EOF == code) {
+            if (MONGO_FAIL_POINT(planExecutorHangBeforeShouldWaitForInserts)) {
+                log() << "PlanExecutor - planExecutorHangBeforeShouldWaitForInserts fail point "
+                         "enabled. Blocking until fail point is disabled.";
+                MONGO_FAIL_POINT_PAUSE_WHILE_SET(planExecutorHangBeforeShouldWaitForInserts);
+            }
             if (!shouldWaitForInserts()) {
                 return PlanExecutor::IS_EOF;
             }

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -37,6 +39,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/client/fetcher.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -1721,11 +1724,14 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
 
     const long long termAtStart = _topCoord->getTerm();
 
-    status = _topCoord->prepareForStepDownAttempt();
-    if (!status.isOK()) {
+    auto statusWithAbortFn = _topCoord->prepareForStepDownAttempt();
+    if (!statusWithAbortFn.isOK()) {
         // This will cause us to fail if we're already in the process of stepping down.
-        return status;
+        // It is also possible to get here even if we're done stepping down via another path,
+        // and this will also elicit a failure from this call.
+        return statusWithAbortFn.getStatus();
     }
+    const auto& abortFn = statusWithAbortFn.getValue();
 
     // Wake up threads blocked in waitForStepDownAttempt_forTest.
     _stepDownWaiters.notify_all();
@@ -1764,7 +1770,7 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
         _performPostMemberStateUpdateAction(action);
     };
     ScopeGuard onExitGuard = MakeGuard([&] {
-        _topCoord->abortAttemptedStepDownIfNeeded();
+        abortFn();
         updateMemberState();
     });
 
@@ -1822,8 +1828,8 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
         stdx::bind(&ReplicationCoordinatorImpl::_handleTimePassing, this, stdx::placeholders::_1));
 
     // If election handoff is enabled, schedule a step-up immediately instead of waiting for the
-    // election timeout to expire.
-    if (!force && enableElectionHandoff.load()) {
+    // election timeout to expire. ReplSetStepUp is only supported in PV1.
+    if (isV1ElectionProtocol() && !force && enableElectionHandoff.load()) {
         _performElectionHandoff();
     }
     return Status::OK();
@@ -1845,7 +1851,8 @@ void ReplicationCoordinatorImpl::_performElectionHandoff() {
     }
 
     auto target = _rsConfig.getMemberAt(candidateIndex).getHostAndPort();
-    executor::RemoteCommandRequest request(target, "admin", BSON("replSetStepUp" << 1), nullptr);
+    executor::RemoteCommandRequest request(
+        target, "admin", BSON("replSetStepUp" << 1 << "skipDryRun" << true), nullptr);
     log() << "Handing off election to " << target;
 
     auto callbackHandleSW = _replExecutor->scheduleRemoteCommand(
@@ -2362,8 +2369,12 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
         newConfigObj = incrementConfigVersionByRandom(newConfigObj);
     }
 
+    BSONObj oldConfigObj = oldConfig.toBSON();
+    audit::logReplSetReconfig(opCtx->getClient(), &oldConfigObj, &newConfigObj);
+
     Status status = newConfig.initialize(
         newConfigObj, oldConfig.getProtocolVersion() == 1, oldConfig.getReplicaSetId());
+
     if (!status.isOK()) {
         error() << "replSetReconfig got " << status << " while parsing " << newConfigObj;
         return Status(ErrorCodes::InvalidReplicaSetConfig, status.reason());
@@ -3807,13 +3818,16 @@ CallbackFn ReplicationCoordinatorImpl::_wrapAsCallbackFn(const stdx::function<vo
     };
 }
 
-Status ReplicationCoordinatorImpl::stepUpIfEligible() {
+Status ReplicationCoordinatorImpl::stepUpIfEligible(bool skipDryRun) {
     if (!isV1ElectionProtocol()) {
         return Status(ErrorCodes::CommandNotSupported,
                       "Step-up command is only supported by Protocol Version 1");
     }
 
-    _startElectSelfIfEligibleV1(TopologyCoordinator::StartElectionReason::kStepUpRequest);
+    auto reason = skipDryRun ? TopologyCoordinator::StartElectionReason::kStepUpRequestSkipDryRun
+                             : TopologyCoordinator::StartElectionReason::kStepUpRequest;
+    _startElectSelfIfEligibleV1(reason);
+
     EventHandle finishEvent;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);

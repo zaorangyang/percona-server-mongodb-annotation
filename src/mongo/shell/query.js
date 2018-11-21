@@ -116,6 +116,14 @@ DBQuery.prototype._exec = function() {
             var cmdRes = this._db.runReadCommand(findCmd, null, this._options);
             this._cursor = new DBCommandCursor(this._db, cmdRes, this._batchSize);
         } else {
+            // The exhaust cursor option is disallowed under a session because it doesn't work as
+            // expected, but all requests from the shell use implicit sessions, so to allow users
+            // to continue using exhaust cursors through the shell, they are only disallowed with
+            // explicit sessions.
+            if (this._db.getSession()._isExplicit) {
+                throw new Error("Cannot run a legacy query on a session.");
+            }
+
             if (this._special && this._query.readConcern) {
                 throw new Error("readConcern requires use of read commands");
             }

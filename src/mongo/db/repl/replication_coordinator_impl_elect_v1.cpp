@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -139,6 +141,14 @@ void ReplicationCoordinatorImpl::_startElectSelfV1_inlock(
     long long term = _topCoord->getTerm();
     int primaryIndex = -1;
 
+    if (reason == TopologyCoordinator::StartElectionReason::kStepUpRequestSkipDryRun) {
+        long long newTerm = term + 1;
+        log() << "skipping dry run and running for election in term " << newTerm;
+        _startRealElection_inlock(newTerm);
+        lossGuard.dismiss();
+        return;
+    }
+
     log() << "conducting a dry run election to see if we could be elected. current term: " << term;
     _voteRequester.reset(new VoteRequester);
 
@@ -160,12 +170,12 @@ void ReplicationCoordinatorImpl::_startElectSelfV1_inlock(
     fassert(28685, nextPhaseEvh.getStatus());
     _replExecutor
         ->onEvent(nextPhaseEvh.getValue(),
-                  stdx::bind(&ReplicationCoordinatorImpl::_onDryRunComplete, this, term))
+                  stdx::bind(&ReplicationCoordinatorImpl::_processDryRunResult, this, term))
         .status_with_transitional_ignore();
     lossGuard.dismiss();
 }
 
-void ReplicationCoordinatorImpl::_onDryRunComplete(long long originalTerm) {
+void ReplicationCoordinatorImpl::_processDryRunResult(long long originalTerm) {
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     LoseElectionDryRunGuardV1 lossGuard(this);
 
@@ -195,9 +205,20 @@ void ReplicationCoordinatorImpl::_onDryRunComplete(long long originalTerm) {
 
     long long newTerm = originalTerm + 1;
     log() << "dry election run succeeded, running for election in term " << newTerm;
-    // Stepdown is impossible from this term update.
+
+    _startRealElection_inlock(newTerm);
+    lossGuard.dismiss();
+}
+
+void ReplicationCoordinatorImpl::_startRealElection_inlock(long long newTerm) {
+    LoseElectionDryRunGuardV1 lossGuard(this);
+
     TopologyCoordinator::UpdateTermResult updateTermResult;
     _updateTerm_inlock(newTerm, &updateTermResult);
+    // This is the only valid result from this term update. If we are here, then we are not a
+    // primary, so a stepdown is not possible. We have also not yet learned of a higher term from
+    // someone else: seeing an update in the topology coordinator mid-election requires releasing
+    // the mutex. This only happens during a dry run, which makes sure to check for term updates.
     invariant(updateTermResult == TopologyCoordinator::UpdateTermResult::kUpdatedTerm);
     // Secure our vote for ourself first
     _topCoord->voteForMyselfV1();
@@ -231,7 +252,6 @@ void ReplicationCoordinatorImpl::_writeLastVoteForMyElection(
     }();
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
-    invariant(_voteRequester);
     LoseElectionDryRunGuardV1 lossGuard(this);
     if (status == ErrorCodes::CallbackCanceled) {
         return;
@@ -255,8 +275,6 @@ void ReplicationCoordinatorImpl::_writeLastVoteForMyElection(
 }
 
 void ReplicationCoordinatorImpl::_startVoteRequester_inlock(long long newTerm) {
-    invariant(_voteRequester);
-
     const auto lastOpTime = _getMyLastAppliedOpTime_inlock();
 
     _voteRequester.reset(new VoteRequester);

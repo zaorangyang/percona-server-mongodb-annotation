@@ -3,6 +3,9 @@
 (function() {
     'use strict';
 
+    // Direct writes to config.transactions cannot be part of a session.
+    TestData.disableImplicitSessions = true;
+
     load("jstests/libs/retryable_writes_util.js");
 
     if (!RetryableWritesUtil.storageEngineSupportsRetryableWrites(jsTest.options().storageEngine)) {

@@ -173,7 +173,8 @@ var BackupRestoreTest = function(options) {
                         };
                         var result = db.getSiblingDB('test').fsm_teardown.insert({a: 1}, wc);
                         assert.writeOK(result, 'teardown insert failed: ' + tojson(result));
-                        result = db.getSiblingDB('test').fsm_teardown.drop();
+                        result = db.getSiblingDB('test').fsm_teardown.drop(
+                            {writeConcern: {w: "majority"}});
                         assert(result, 'teardown drop failed');
                     });
                 } catch (e) {
@@ -200,6 +201,10 @@ var BackupRestoreTest = function(options) {
         var options = this.options;
 
         jsTestLog("Backup restore " + tojson(options));
+
+        // skipValidationOnNamespaceNotFound must be set to true for correct operation of this test.
+        assert(typeof TestData.skipValidationOnNamespaceNotFound === 'undefined' ||
+               TestData.skipValidationOnNamespaceNotFound);
 
         // Test options
         // Test name
@@ -304,15 +309,9 @@ var BackupRestoreTest = function(options) {
                 _runCmd(rsyncCmd);
                 sleep(10000);
             }
-            // Set an option to skip 'ns not found' error during collection validation
-            // when shutting down mongod.
-            TestData.skipValidationOnNamespaceNotFound = true;
 
             // Stop the mongod process
             rst.stop(secondary.nodeId);
-
-            // Unset to allow future collection validation on stopMongod.
-            TestData.skipValidationOnNamespaceNotFound = false;
 
             // One final rsync
             _runCmd(rsyncCmd);
@@ -323,15 +322,8 @@ var BackupRestoreTest = function(options) {
             assert.gt(copiedFiles.length, 0, testName + ' no files copied');
             rst.start(secondary.nodeId, {}, true);
         } else if (options.backup == 'stopStart') {
-            // Set an option to skip 'ns not found' error during collection validation
-            // when shutting down mongod.
-            TestData.skipValidationOnNamespaceNotFound = true;
-
             // Stop the mongod process
             rst.stop(secondary.nodeId);
-
-            // Unset to allow future collection validation on stopMongod.
-            TestData.skipValidationOnNamespaceNotFound = false;
 
             copyDbpath(dbpathSecondary, hiddenDbpath);
             removeFile(hiddenDbpath + '/mongod.lock');
@@ -384,6 +376,8 @@ var BackupRestoreTest = function(options) {
         // Wait up to 5 minutes until the new hidden node is in state RECOVERING.
         rst.waitForState(hiddenNode, [ReplSetTest.State.RECOVERING, ReplSetTest.State.SECONDARY]);
 
+        jsTestLog('Stopping CRUD and FSM clients');
+
         // Stop CRUD client and FSM client.
         var crudStatus = checkProgram(crudPid);
         assert(crudStatus.alive,
@@ -396,6 +390,14 @@ var BackupRestoreTest = function(options) {
                testName + ' FSM client was not running at end of test and exited with code: ' +
                    fsmStatus.exitCode);
         stopMongoProgramByPid(fsmPid);
+
+        // Make sure the test database is not in a drop-pending state. This can happen if we
+        // killed the FSM client while it was in the middle of dropping it.
+        assert.soonNoExcept(function() {
+            let result = primary.getDB("test").afterClientKills.insert(
+                {"a": 1}, {writeConcern: {w: "majority"}});
+            return (result.nInserted === 1);
+        }, "failed to insert to test collection", 10 * 60 * 1000);
 
         // Wait up to 5 minutes until the new hidden node is in state SECONDARY.
         jsTestLog('CRUD and FSM clients stopped. Waiting for hidden node ' + hiddenHost +
