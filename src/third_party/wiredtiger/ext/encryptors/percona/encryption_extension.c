@@ -45,6 +45,7 @@ typedef struct {
     const EVP_CIPHER *cipher;
     int iv_len;
     unsigned char key[KEY_LEN];
+    uint32_t (*wiredtiger_checksum_crc32c)(const void *, size_t);
 } PERCONA_ENCRYPTOR;
 
 
@@ -199,7 +200,7 @@ static int percona_encrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     memcpy(dbg_data->key, pe->key, KEY_LEN);
 #endif
 
-    *(uint32_t*)(dst + *result_lenp) = wiredtiger_checksum_crc32c(src, src_len);
+    *(uint32_t*)(dst + *result_lenp) = (pe->wiredtiger_checksum_crc32c)(src, src_len);
     *result_lenp += CHKSUM_LEN;
 
     uint8_t *iv = dst + *result_lenp;
@@ -352,7 +353,7 @@ static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
         goto err;
     *result_lenp += decrypted_len;
 
-    if (wiredtiger_checksum_crc32c(dst, *result_lenp) != crc32c) {
+    if ((pe->wiredtiger_checksum_crc32c)(dst, *result_lenp) != crc32c) {
         ret = report_error(pe, session, EINVAL, "Decrypted data integrity check has failed. Probably the encryption key was wrong.");
         goto cleanup;
     }
@@ -562,6 +563,9 @@ int percona_encryption_extension_init(WT_CONNECTION *connection, WT_CONFIG_ARG *
     pe->iv_len = EVP_CIPHER_iv_length(pe->cipher);
     DBG_MSG("IV len is %d", pe->iv_len);
     DBG_MSG("key len is %d", EVP_CIPHER_key_length(pe->cipher));
+
+    // get wiredTiger's crc32c function
+    pe->wiredtiger_checksum_crc32c = wiredtiger_crc32c_func();
 
     // calloc initializes all allocated memory to zero
     // thus pe->key is filled with zeros
