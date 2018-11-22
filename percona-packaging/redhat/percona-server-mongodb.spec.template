@@ -7,7 +7,7 @@ Release:        @@RELEASE@@%{?dist}
 Summary:        High-performance MongoDB replacement from Percona (metapackage)
 Group:          Applications/Databases
 
-License:        AGPL
+License:        AGPL 3.0
 URL:            https://github.com/percona/percona-server-mongodb.git
 Source0:        @@SOURCE_TARBALL@@
 Source1:        mongod.conf
