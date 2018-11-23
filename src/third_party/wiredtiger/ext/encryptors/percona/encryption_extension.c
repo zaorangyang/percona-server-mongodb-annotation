@@ -171,7 +171,7 @@ static int percona_encrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     uint8_t *dst, size_t dst_len,
     size_t *result_lenp)
 {
-    int ret = 0;
+    int ret = EINVAL;
     int encrypted_len = 0;
     PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
     DBG_MSG("entering encrypt %lu %lu", src_len, dst_len);
@@ -221,7 +221,7 @@ static int percona_encrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     goto cleanup;
 
 err:
-    ret = handleErrors(pe, session);
+    handleErrors(pe, session);
 
 cleanup:
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
@@ -241,7 +241,7 @@ static int percona_encrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     uint8_t *dst, size_t dst_len,
     size_t *result_lenp)
 {
-    int ret = 0;
+    int ret = EINVAL;
     int encrypted_len = 0;
     PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
     DBG_MSG("entering encrypt %lu %lu", src_len, dst_len);
@@ -288,7 +288,7 @@ static int percona_encrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     goto cleanup;
 
 err:
-    ret = handleErrors(pe, session);
+    handleErrors(pe, session);
 
 cleanup:
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
@@ -305,7 +305,7 @@ static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     uint8_t *dst, size_t dst_len,
     size_t *result_lenp)
 {
-    int ret = 0;
+    int ret = EINVAL;
     int decrypted_len = 0;
     PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
     uint32_t crc32c = 0;
@@ -361,7 +361,7 @@ static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     goto cleanup;
 
 err:
-    ret = handleErrors(pe, session);
+    handleErrors(pe, session);
 
 cleanup:
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
@@ -378,7 +378,7 @@ static int percona_decrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     uint8_t *dst, size_t dst_len,
     size_t *result_lenp)
 {
-    int ret = 0;
+    int ret = EINVAL;
     int decrypted_len = 0;
     PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
     DBG_MSG("entering decrypt %lu %lu", src_len, dst_len);
@@ -420,7 +420,7 @@ static int percona_decrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     goto cleanup;
 
 err:
-    ret = handleErrors(pe, session);
+    handleErrors(pe, session);
 
 cleanup:
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
