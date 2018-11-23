@@ -77,22 +77,47 @@ static int report_error(
 typedef struct {
     WT_EXTENSION_API *wt_api;
     WT_SESSION *session;
+    int *pret;
 } ERR_PARAM;
 
-// callback for ERR_print_errors_cb
-static int err_print_cb(const char *str, size_t len, void *param) {
+static void print_errors_cb(int (*cb) (const char *str, size_t len, void *u, unsigned long ecode),
+                         void *u)
+{
+    unsigned long l;
+    char buf[256];
+    char buf2[4096];
+    const char *file, *data;
+    int line, flags;
+
+    while ((l = ERR_get_error_line_data(&file, &line, &data, &flags)) != 0) {
+        ERR_error_string_n(l, buf, sizeof(buf));
+        BIO_snprintf(buf2, sizeof(buf2), "%s:%s:%d:%s\n", buf,
+                     file, line, (flags & ERR_TXT_STRING) ? data : "");
+        if (cb(buf2, strlen(buf2), u, l) <= 0)
+            break;              /* abort outputting the error report */
+    }
+}
+
+// callback for print_errors_cb
+static int err_print_cb(const char *str, size_t len, void *param, unsigned long ecode) {
     ERR_PARAM *p = (ERR_PARAM*)param;
     p->wt_api->err_printf(p->wt_api, p->session,
                               "libcrypto: %s", str);
+    if (ERR_GET_REASON(ecode) == EVP_R_BAD_DECRYPT) {
+        *(p->pret) = WT_PANIC;
+        p->wt_api->err_printf(p->wt_api, p->session,
+                              "setting return code to WT_PANIC");
+    }
     return 1;
 }
 
-static int handleErrors(PERCONA_ENCRYPTOR *pe, WT_SESSION *session) {
+static int handleErrors(PERCONA_ENCRYPTOR *pe, WT_SESSION *session, int *pret) {
     ERR_PARAM param;
     param.wt_api = pe->wt_api;
     param.session = session;
+    param.pret = pret;
 
-    ERR_print_errors_cb(&err_print_cb, &param);
+    print_errors_cb(&err_print_cb, &param);
     return 0;
 }
 
@@ -167,6 +192,16 @@ static void store_IV(PERCONA_ENCRYPTOR *pe, uint8_t *dst) {
     memcpy(dst, buf, pe->iv_len);
 }
 
+static int panic_encrypt(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
+    uint8_t *src, size_t src_len,
+    uint8_t *dst, size_t dst_len,
+    size_t *result_lenp)
+{
+    PERCONA_ENCRYPTOR *pe = (PERCONA_ENCRYPTOR*)encryptor;
+    DBG_MSG("wiredTiger attempted to encrypt data block after encryptor paniced");
+    return WT_PANIC;
+}
+
 static int percona_encrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     uint8_t *src, size_t src_len,
     uint8_t *dst, size_t dst_len,
@@ -222,7 +257,7 @@ static int percona_encrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     goto cleanup;
 
 err:
-    handleErrors(pe, session);
+    handleErrors(pe, session, &ret);
 
 cleanup:
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
@@ -289,7 +324,7 @@ static int percona_encrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     goto cleanup;
 
 err:
-    handleErrors(pe, session);
+    handleErrors(pe, session, &ret);
 
 cleanup:
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
@@ -355,14 +390,19 @@ static int percona_decrypt_cbc(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
 
     if ((pe->wiredtiger_checksum_crc32c)(dst, *result_lenp) != crc32c) {
         ret = report_error(pe, session, EINVAL, "Decrypted data integrity check has failed. Probably the encryption key was wrong.");
-        goto cleanup;
+        ret = WT_PANIC;
+        goto err;
     }
 
     ret = 0;
     goto cleanup;
 
 err:
-    handleErrors(pe, session);
+    handleErrors(pe, session, &ret);
+    if (ret == WT_PANIC) {
+        // go to readonly mode because the encryption key is probably wrong
+        encryptor->encrypt = panic_encrypt;
+    }
 
 cleanup:
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
@@ -421,7 +461,11 @@ static int percona_decrypt_gcm(WT_ENCRYPTOR *encryptor, WT_SESSION *session,
     goto cleanup;
 
 err:
-    handleErrors(pe, session);
+    handleErrors(pe, session, &ret);
+    if (ret == WT_PANIC) {
+        // go to readonly mode because the encryption key is probably wrong
+        encryptor->encrypt = panic_encrypt;
+    }
 
 cleanup:
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
