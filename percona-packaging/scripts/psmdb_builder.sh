@@ -712,15 +712,16 @@ build_tarball(){
     cp ${PSMDIR_ABS}/percona-packaging/conf/percona-server-mongodb-enable-auth.sh ${PSMDIR_ABS}/${PSMDIR}/bin
 
     cd ${PSMDIR_ABS}
-    tar --owner=0 --group=0 -czf ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${PSMDIR}
+    mv ${PSMDIR} ${PRODUCT_FULL}
+    tar --owner=0 --group=0 -czf ${WORKDIR}/${PRODUCT_FULL}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${PRODUCT_FULL}
     DIRNAME="tarball"
     if [ "${DEBUG}" = 1 ]; then
     DIRNAME="debug"
     fi
     mkdir -p ${WORKDIR}/${DIRNAME}
     mkdir -p ${CURDIR}/${DIRNAME}
-    cp ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${WORKDIR}/${DIRNAME}
-    cp ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${CURDIR}/${DIRNAME}
+    cp ${WORKDIR}/${PRODUCT_FULL}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${WORKDIR}/${DIRNAME}
+    cp ${WORKDIR}/${PRODUCT_FULL}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${CURDIR}/${DIRNAME}
 }
 
 #main
