@@ -429,8 +429,14 @@ __wt_encryptor_config(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval,
 	hash = __wt_hash_city64(keyid->str, keyid->len);
 	bucket = hash % WT_HASH_ARRAY_SIZE;
 	TAILQ_FOREACH(kenc, &nenc->keyedhashqh[bucket], q)
-		if (WT_STRING_MATCH(kenc->keyid, keyid->str, keyid->len))
+		if (WT_STRING_MATCH(kenc->keyid, keyid->str, keyid->len)) {
+			encryptor = kenc->encryptor;
+			if (encryptor->sessioncreate != NULL) {
+				WT_ERR(encryptor->sessioncreate(encryptor, &session->iface,
+					cfg_arg));
+			}
 			goto out;
+		}
 
 	WT_ERR(__wt_calloc_one(session, &kenc));
 	WT_ERR(__wt_strndup(session, keyid->str, keyid->len, &kenc->keyid));

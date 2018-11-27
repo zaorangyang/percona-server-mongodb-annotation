@@ -42,6 +42,7 @@
 #include "mongo/bson/ordering.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/storage/kv/kv_engine.h"
+#include "mongo/db/storage/wiredtiger/encryption_keydb.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_oplog_manager.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
@@ -151,6 +152,8 @@ public:
                                     StringData ident,
                                     const IndexDescriptor* desc) override;
 
+    virtual void keydbDropDatabase(const std::string& db) override;
+
     virtual Status okToRename(OperationContext* opCtx,
                               StringData fromNS,
                               StringData toNS,
@@ -163,7 +166,7 @@ public:
 
     virtual void endBackup(OperationContext* opCtx);
 
-    virtual Status hotBackup(const std::string& path) override;
+    virtual Status hotBackup(OperationContext* opCtx, const std::string& path) override;
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) override;
 
@@ -235,6 +238,10 @@ public:
 
     std::string getCanonicalName() const {
         return _canonicalName;
+    }
+
+    EncryptionKeyDB* getEncryptionKeyDB() {
+        return _encryptionKeyDB.get();
     }
 
     /*
@@ -324,6 +331,7 @@ private:
 
     std::string _uri(StringData ident) const;
 
+    std::unique_ptr<EncryptionKeyDB> _encryptionKeyDB;
     WT_CONNECTION* _conn;
     WiredTigerFileVersion _fileVersion;
     WiredTigerEventHandler _eventHandler;

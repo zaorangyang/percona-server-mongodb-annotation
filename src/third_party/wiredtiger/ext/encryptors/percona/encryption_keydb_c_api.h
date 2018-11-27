@@ -1,7 +1,7 @@
 /*======
 This file is part of Percona Server for MongoDB.
 
-Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
+Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
     Percona Server for MongoDB is free software: you can redistribute
     it and/or modify it under the terms of the GNU Affero General
@@ -20,15 +20,16 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-#include "mongo/db/backup/backupable.h"
-#include "mongo/db/storage/keydb_api.h"
+void store_pseudo_bytes(uint8_t *buf, int len);
+int get_iv_gcm(uint8_t *buf, int len);
+int get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe);
 
-namespace percona {
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-/**
- * Storage engine extension interface.
- */
-class EngineExtension : public Backupable, public KeyDBAPI {
-};
+int percona_encryption_extension_drop_keyid(void *vp);
 
-}  // end of percona namespace.
+#ifdef __cplusplus
+}
+#endif
