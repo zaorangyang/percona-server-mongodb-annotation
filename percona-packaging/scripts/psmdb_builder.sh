@@ -168,13 +168,13 @@ get_sources(){
     source percona-server-mongodb-40.properties
     #
 
-    mv percona-server-mongodb ${PRODUCT}
-    tar --owner=0 --group=0 --exclude=.* -czf ${PRODUCT}.tar.gz ${PRODUCT}
+    mv percona-server-mongodb ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
+    tar --owner=0 --group=0 --exclude=.* -czf ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
     echo "UPLOAD=UPLOAD/experimental/BUILDS/${PRODUCT}-4.0/${PRODUCT}-${PSM_VER}-${PSM_RELEASE}/${PSM_BRANCH}/${REVISION}/${BUILD_ID}" >> percona-server-mongodb-40.properties
     mkdir $WORKDIR/source_tarball
     mkdir $CURDIR/source_tarball
-    cp ${PRODUCT}.tar.gz $WORKDIR/source_tarball
-    cp ${PRODUCT}.tar.gz $CURDIR/source_tarball
+    cp ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz $WORKDIR/source_tarball
+    cp ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz $CURDIR/source_tarball
     cd $CURDIR
     rm -rf percona-server-mongodb   
     return
@@ -233,15 +233,15 @@ install_gcc_54_deb(){
 set_compiler(){
     if [ x"${DEBIAN}" = xjessie -o x"${DEBIAN}" = xwheezy -o x"${DEBIAN}" = xtrusty -o x"${DEBIAN}" = xxenial ]; then
         export CC=/usr/local/gcc-5.4.0/bin/gcc-5.4
-	    export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
+            export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
     fi
     if [ x"${DEBIAN}" = xstretch ]; then
         export CC=/usr/bin/gcc-6
-	    export CXX=/usr/bin/g++-6
+            export CXX=/usr/bin/g++-6
     fi
     if [ x"${DEBIAN}" = xartful -o x"${DEBIAN}" = xbionic ]; then
         export CC=/usr/bin/gcc-7
-	    export CXX=/usr/bin/g++-7
+            export CXX=/usr/bin/g++-7
     fi
 }
 
@@ -610,6 +610,10 @@ build_tarball(){
         if [ x"${DEBIAN}" = xwheezy -o x"${DEBIAN}" = xjessie -o x"${DEBIAN}" = xtrusty -o x"${DEBIAN}" = xxenial ]; then
             export CC=/usr/local/gcc-5.4.0/bin/gcc-5.4
             export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
+        elif [ x"${DEBIAN}" = xbionic ]; then
+            export CC=/usr/bin/gcc-7
+            export CXX=/usr/bin/g++-7
+
         else
             export CC=gcc-5
             export CXX=g++-5
@@ -666,7 +670,7 @@ build_tarball(){
     cd ${PSMDIR_ABS}
     pip install --user -r buildscripts/requirements.txt
     if [ ${DEBUG} = 0 ]; then
-        buildscripts/scons.py CC=${CC} CXX=${CXX} --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
+        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
     else
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --ssl --dbg=on -j$NJOBS --use-sasl-client \
         CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
@@ -712,16 +716,15 @@ build_tarball(){
     cp ${PSMDIR_ABS}/percona-packaging/conf/percona-server-mongodb-enable-auth.sh ${PSMDIR_ABS}/${PSMDIR}/bin
 
     cd ${PSMDIR_ABS}
-    mv ${PSMDIR} ${PRODUCT_FULL}
-    tar --owner=0 --group=0 -czf ${WORKDIR}/${PRODUCT_FULL}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${PRODUCT_FULL}
+    tar --owner=0 --group=0 -czf ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${PSMDIR}
     DIRNAME="tarball"
     if [ "${DEBUG}" = 1 ]; then
     DIRNAME="debug"
     fi
     mkdir -p ${WORKDIR}/${DIRNAME}
     mkdir -p ${CURDIR}/${DIRNAME}
-    cp ${WORKDIR}/${PRODUCT_FULL}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${WORKDIR}/${DIRNAME}
-    cp ${WORKDIR}/${PRODUCT_FULL}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${CURDIR}/${DIRNAME}
+    cp ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${WORKDIR}/${DIRNAME}
+    cp ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${CURDIR}/${DIRNAME}
 }
 
 #main
@@ -745,9 +748,9 @@ DEB_RELEASE=1
 REVISION=0
 BRANCH="v4.0"
 REPO="https://github.com/percona/percona-server-mongodb.git"
-PSM_VER="4.0.3"
+PSM_VER="4.0.4"
 PSM_RELEASE="1.1"
-MONGO_TOOLS_TAG="r4.0.3"
+MONGO_TOOLS_TAG="r4.0.4"
 PRODUCT=percona-server-mongodb
 DEBUG=0
 parse_arguments PICK-ARGS-FROM-ARGV "$@"
