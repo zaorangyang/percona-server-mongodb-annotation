@@ -154,7 +154,6 @@ variables:
   aws_key_remote: ${powercycle_aws_key}
   aws_secret_remote: ${powercycle_aws_secret}
 
-# TODO: Remove psutil from virtualenv_requirements when BUILD-3083 is done
 - &powercycle_ec2_instance
   aws_ec2_yml: aws_ec2.yml
   ec2_expire_hours: "24"
@@ -170,7 +169,6 @@ variables:
   ssh_key_id: ${powercycle_ssh_key_id}
   standard_port: "20000"
   virtualenv_dir: venv_powercycle
-  virtualenv_requirements: psutil
   windows_crash_cmd: \"notmyfault/notmyfaultc64.exe -accepteula crash 1\"
   windows_crash_dl: https://download.sysinternals.com/files/NotMyFault.zip
   windows_crash_dir: notmyfault
@@ -657,6 +655,14 @@ functions:
               esac
             fi
 
+            # Reduce the number of available jobs by two-thirds when running the
+            # secondary_reads_passthrough task on the Enterprise RHEL 6.2 InMemory build variant.
+            if [[ "${build_variant}" = "enterprise-rhel-62-64-bit-inmem" \
+                  && "${task_name}" = "secondary_reads_passthrough" ]]; then
+              num_jobs_available=$((${num_jobs_available|3} / 3))
+              echo "Reducing jobs from ${num_jobs_available|1} to $num_jobs_available"
+            fi
+
             if [ ${max_jobs|0} -gt 0 ] && [ ${max_jobs|0} -lt $num_jobs_available ]; then
               extra_args="$extra_args --jobs=${max_jobs}"
             else
@@ -950,6 +956,10 @@ functions:
           set +o errexit
           npm test > npm_test-${task_id}.log 2>&1
           if [ $? -ne 0 ]; then
+            echo "jstestfuzz self-tests failure"
+            branch=$(git symbolic-ref --short HEAD)
+            commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
+            echo "Git branch: $branch, commit: $commit"
             which node
             node --version
             which npm
@@ -993,18 +1003,6 @@ functions:
           $python buildscripts/idl/run_tests.py
 
   "run powercycle test" :
-    - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          set -o verbose
-          set -o errexit
-
-          ${activate_virtualenv}
-          if [ ! -z "${virtualenv_requirements}" ]; then
-            pip install ${virtualenv_requirements}
-          fi
-
     - command: shell.exec
       type: test
       params:
@@ -1351,7 +1349,8 @@ functions:
 
           set -o errexit
           ${activate_virtualenv}
-          pip install boto3==1.5.27
+          pip install -r buildscripts/requirements.txt
+          pip install -r pytests/requirements.txt
 
           if [ ! -z "${subnet_id}" ]; then
             subnet_id="-n ${subnet_id}"
@@ -1479,8 +1478,8 @@ functions:
         script: |
           set -o errexit
           ${activate_virtualenv}
-          # Copy buildscripts and mongoDB executables to the remote host.
-          file_param="--file buildscripts"
+          # Copy buildscripts, pytests and mongoDB executables to the remote host.
+          file_param="--file buildscripts --file pytests"
           mongo_executables="mongo mongod mongos"
           for executable in $mongo_executables
           do
@@ -1503,22 +1502,81 @@ functions:
         script: |
           set -o errexit
           ${activate_virtualenv}
-          # Set up virtualenv and install python modules on remote, if required
-          if [ ! -z "${virtualenv_requirements}" ]; then
-            cmds="python_loc=\$(which ${python|/opt/mongodbtoolchain/v2/bin/python2})"
-            cmds="$cmds; if [ \"Windows_NT\" = \"$OS\" ]; then python_loc=\$(cygpath -w \$python_loc); fi"
-            cmds="$cmds; virtualenv --python \$python_loc --system-site-packages ${virtualenv_dir|venv}"
-            cmds="$cmds; activate=\$(find ${virtualenv_dir|venv} -name 'activate')"
-            cmds="$cmds; source \$activate"
-            cmds="$cmds; pip install ${virtualenv_requirements}"
-            ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
-            $python buildscripts/remote_operations.py          \
-              --verbose                                        \
-              --userHost $USER@${private_ip_address}                   \
-              --sshConnectionOptions "$ssh_connection_options" \
-              --retries ${ssh_retries|0}                       \
-              --commands "$cmds"
+          # Set up virtualenv on remote.
+          cmds="python_loc=\$(which \${python|/opt/mongodbtoolchain/v2/bin/python2})"
+          cmds="$cmds; remote_dir=${remote_dir|.}"
+          cmds="$cmds; if [ \"Windows_NT\" = \"$OS\" ]; then python_loc=\$(cygpath -w \$python_loc); remote_dir=\$(cygpath -w \$remote_dir); fi"
+          cmds="$cmds; virtualenv --python \$python_loc --system-site-packages ${virtualenv_dir|venv}"
+          cmds="$cmds; activate=\$(find ${virtualenv_dir|venv} -name 'activate')"
+          cmds="$cmds; . \$activate"
+          cmds="$cmds; pip install -r \$remote_dir/pytests/requirements.txt"
+          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+          $python buildscripts/remote_operations.py          \
+            --verbose                                        \
+            --userHost $USER@${private_ip_address}           \
+            --sshConnectionOptions "$ssh_connection_options" \
+            --retries ${ssh_retries|0}                       \
+            --commands "$cmds"
+
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src
+        script: |
+          if [ "Windows_NT" = "$OS" ]; then
+            exit 0
           fi
+          # Enable core dumps on non-Windows remote hosts.
+          # The core pattern must specify a director, since mongod --fork will chdir("/")
+          # and cannot generate a core dump there (see SERVER-21635).
+          # We need to reboot the host for the core limits to take effect.
+          ${set_sudo}
+          core_pattern=${remote_dir}/dump_%e.%p.core
+          sysctl_conf=/etc/sysctl.conf
+          cmds="ulimit -a"
+          cmds="$cmds; echo \"$USER - core unlimited\" | $sudo tee -a /etc/security/limits.conf"
+          cmds="$cmds; if [ -f $sysctl_conf ]"
+          cmds="$cmds; then grep ^kernel.core_pattern $sysctl_conf"
+          cmds="$cmds;    if [ \$? -eq  0 ]"
+          cmds="$cmds;    then $sudo sed -i \"s,kernel.core_pattern=.*,kernel.core_pattern=$core_pattern,\" $sysctl_conf"
+          cmds="$cmds;    else echo \"kernel.core_pattern=$core_pattern\" | $sudo tee -a $sysctl_conf"
+          cmds="$cmds;    fi"
+          cmds="$cmds; else echo Cannot change the core pattern and no core dumps will be generated."
+          cmds="$cmds; fi"
+          cmds="$cmds; $sudo reboot"
+          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+          ${activate_virtualenv}
+          $python buildscripts/remote_operations.py          \
+            --verbose                                        \
+            --userHost $USER@${private_ip_address}           \
+            --sshConnectionOptions "$ssh_connection_options" \
+            --retries ${ssh_retries|0}                       \
+            --commands "$cmds"
+
+    - command: shell.exec
+      params:
+        shell: bash
+        working_dir: src
+        script: |
+          if [ "Windows_NT" = "$OS" ]; then
+            exit 0
+          fi
+          # Always exit successfully, as this is just informational.
+          trap 'echo "Trapped exit code $?, exiting with 0"; exit 0' EXIT
+          # Print the ulimit & kernel.core_pattern
+          cmds="uptime"
+          cmds="$cmds; ulimit -a"
+          cmds="$cmds; if [ -f /sbin/sysctl ]"
+          cmds="$cmds; then /sbin/sysctl kernel.core_pattern"
+          cmds="$cmds; fi"
+          ssh_connection_options="${ssh_identity} ${ssh_connection_options}"
+          ${activate_virtualenv}
+          $python buildscripts/remote_operations.py          \
+            --verbose                                        \
+            --userHost $USER@${private_ip_address}           \
+            --sshConnectionOptions "$ssh_connection_options" \
+            --retries ${ssh_retries|3}                       \
+            --commands "$cmds"
 
     - command: shell.exec
       params:
@@ -2454,10 +2512,11 @@ tasks:
           $python ../buildscripts/make_archive.py -o mongodb-shell.${ext|tgz} $(find mongodb-* -type f)
           cd ..
 
-    - func: "fetch test_lifecycle.yml"
-      vars:
-        # Do not fail the task if we fail to fetch the test_lifecycle.yml file
-        fail_task_on_error: false
+  # Test lifecycle is temporarily disabled to reduce load on Evergreen API.
+  # - func: "fetch test_lifecycle.yml"
+  #   vars:
+  #     # Do not fail the task if we fail to fetch the test_lifecycle.yml file
+  #     fail_task_on_error: false
 
     - command: archive.targz_pack
       params:
@@ -4718,6 +4777,270 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
+  name: logical_session_cache_replication_default_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_default_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_replication_default_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_default_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_100ms_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_100ms_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_1sec_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_1sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_10sec_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_replication_10sec_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_replication_10sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_default_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_default_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_default_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_default_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_100ms_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_100ms_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_1sec_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_1sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_10sec_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_sharding_10sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_default_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_default_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_default_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_default_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_100ms_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_100ms_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_1sec_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_1sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_10sec_refresh_jscore_passthrough --storageEngine=mmapv1
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough_WT
+  depends_on:
+  - name: jsCore_WT
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=logical_session_cache_standalone_10sec_refresh_jscore_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
   name: retryable_writes_jscore_stepdown_passthrough_WT
   depends_on:
   - name: jsCore_WT
@@ -5532,6 +5855,9 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: read_concern_linearizable_passthrough_WT
   - name: read_concern_majority_passthrough_WT
   - name: read_only_WT
@@ -5582,6 +5908,18 @@ buildvariants:
   - name: integration_tests_replset
   - name: integration_tests_sharded
   - name: jsCore_WT
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough_WT
   - name: parallel_WT
   - name: concurrency_WT
   - name: concurrency_replication_WT
@@ -5640,6 +5978,18 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsonSchema
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod_WT
@@ -5788,6 +6138,9 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: replica_sets_WT
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough_WT
@@ -5891,6 +6244,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: multiversion_WT
   - name: noPassthrough_WT
@@ -5973,6 +6329,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod_WT
@@ -6099,6 +6458,9 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: replica_sets_WT
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough_WT
@@ -6186,6 +6548,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
@@ -6274,6 +6639,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: noPassthrough_WT
   - name: noPassthroughWithMongod_WT
   - name: bulk_gle_passthrough_WT
@@ -6365,6 +6733,9 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: replica_sets_WT
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough_WT
@@ -6441,6 +6812,9 @@ buildvariants:
   - name: jsCore_compatibility_WT
   - name: jsCore_decimal_WT
   - name: jsonSchema
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: master_slave_WT
   - name: master_slave_jscore_passthrough_WT
   - name: mongosTest
@@ -6698,6 +7072,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: master_slave_WT
   - name: master_slave_jscore_passthrough_WT
   - name: mongosTest
@@ -6785,6 +7162,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: read_concern_linearizable_passthrough
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
@@ -6867,6 +7247,9 @@ buildvariants:
   - name: jstestfuzz_sharded_causal_consistency_WT
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: master_slave_WT
   - name: master_slave_jscore_passthrough_WT
   - name: mongosTest
@@ -7014,6 +7397,9 @@ buildvariants:
   - name: jstestfuzz_sharded_causal_consistency_WT
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: master_slave_WT
   - name: master_slave_jscore_passthrough_WT
   - name: mongosTest
@@ -7115,6 +7501,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: sasl
   - name: ssl
@@ -7237,6 +7626,18 @@ buildvariants:
   - name: jstestfuzz_sharded_causal_consistency_WT
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session_WT
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough_WT
   - name: master_slave_WT
   - name: master_slave_auth
   - name: master_slave_jscore_passthrough_WT
@@ -7587,6 +7988,9 @@ buildvariants:
   - name: jsCore_decimal_WT
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: master_slave_WT
   - name: master_slave_auth
   - name: master_slave_jscore_passthrough_WT
@@ -7680,6 +8084,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: external_auth_WT
   - name: replica_sets_auth
   - name: sasl
@@ -7771,6 +8178,18 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: multiversion_WT
   - name: noPassthrough_WT
@@ -7857,6 +8276,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: multiversion_WT
   - name: noPassthrough_WT
@@ -7967,6 +8389,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
@@ -8075,6 +8500,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
@@ -8193,6 +8621,9 @@ buildvariants:
   # - name: jsCore_minimum_batch_size_WT
   # - name: jsCore_op_query
   - name: jsCore_op_query_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   # - name: mmap
   - name: mongosTest
   # - name: noPassthrough
@@ -8296,6 +8727,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
@@ -8372,6 +8806,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
@@ -8452,6 +8889,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
@@ -8533,6 +8973,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: noPassthroughWithMongod_WT
   - name: noPassthrough_WT
@@ -8637,6 +9080,9 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: replica_sets_WT
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough_WT
@@ -8703,6 +9149,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
@@ -8756,6 +9205,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
@@ -8832,6 +9284,9 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: replica_sets_WT
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough_WT
@@ -8922,6 +9377,9 @@ buildvariants:
   - name: concurrency_replication_WT
   - name: concurrency_sharded_WT
   - name: concurrency_simultaneous_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: replica_sets_WT
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough_WT
@@ -9029,6 +9487,18 @@ buildvariants:
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session_WT
   - name: jstestfuzz_sharded_causal_consistency_WT
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough_WT
   - name: master_slave_WT
   - name: master_slave_auth
   - name: master_slave_jscore_passthrough
@@ -9067,6 +9537,8 @@ buildvariants:
   - name: sslSpecial
   - name: tool
   - name: secondary_reads_passthrough
+    distros:
+    - rhel62-large
   - name: update_fuzzer_WT
   - name: update_fuzzer_replication_WT
   - name: write_concern_majority_passthrough_WT
@@ -9077,7 +9549,7 @@ buildvariants:
   - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_document_locking
+    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,requires_document_locking
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     use_scons_cache: true
@@ -9121,6 +9593,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded_WT
   - name: jstestfuzz_replication_WT
   - name: jstestfuzz_sharded_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -9202,6 +9677,9 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -9293,6 +9771,9 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_compatibility
   - name: jsCore_op_query
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -9403,6 +9884,18 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query_WT
   - name: jsonSchema
+  - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_replication_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_default_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_100ms_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_10sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_default_refresh_jscore_passthrough_WT
   - name: master_slave_WT
   - name: master_slave_auth
   - name: master_slave_jscore_passthrough_WT
@@ -9563,6 +10056,9 @@ buildvariants:
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query_WT
   - name: jsonSchema
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: master_slave_WT
   - name: master_slave_auth
   - name: master_slave_jscore_passthrough_WT
@@ -9639,6 +10135,9 @@ buildvariants:
   - name: compile_all
   - name: dbtest_WT
   - name: jsCore_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: watchdog_WT
 
 - name: ubuntu1604-debug-aubsan-async
@@ -9703,6 +10202,9 @@ buildvariants:
   - name: jsCore_decimal_WT
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion_WT
@@ -9811,6 +10313,9 @@ buildvariants:
   - name: jsCore_decimal_WT
   - name: jsCore_minimum_batch_size_WT
   - name: jsCore_op_query_WT
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough_WT
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough_WT
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion_WT
@@ -9886,7 +10391,8 @@ buildvariants:
   batchtime: 1440 # 1 day
   stepback: false
   tasks:
-  - name: update_test_lifecycle
+# Test lifecycle is temporarily disabled to reduce load on Evergreen API.
+# - name: update_test_lifecycle
   - name: fetch_test_lifecycle
     distros:
     - rhel62-small
@@ -9959,6 +10465,9 @@ buildvariants:
   - name: jstestfuzz_sharded_causal_consistency
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: master_slave
   - name: master_slave_jscore_passthrough
   - name: mmap
@@ -10088,6 +10597,9 @@ buildvariants:
   - name: jstestfuzz_sharded_causal_consistency
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: master_slave
   - name: master_slave_jscore_passthrough
   - name: mmap
@@ -10197,6 +10709,9 @@ buildvariants:
   - name: jstestfuzz_sharded_causal_consistency
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_session
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: master_slave
   - name: master_slave_jscore_passthrough
   - name: mmap
@@ -10269,6 +10784,9 @@ buildvariants:
   - name: jstestfuzz_concurrent_sharded
   - name: jstestfuzz_replication
   - name: jstestfuzz_sharded
+  - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
+  - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: master_slave
   - name: master_slave_jscore_passthrough
   - name: mmap

@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
@@ -1042,6 +1044,12 @@ ExitCode _initAndListen(int listenPort) {
         return EXIT_NET_ERROR;
     }
 
+    start = serviceContext->getServiceEntryPoint()->start();
+    if (!start.isOK()) {
+        error() << "Failed to start the service entry point: " << start;
+        return EXIT_NET_ERROR;
+    }
+
     start = serviceContext->getTransportLayer()->start();
     if (!start.isOK()) {
         error() << "Failed to start the listener: " << start.toString();
@@ -1263,6 +1271,12 @@ void shutdownTask() {
     auto const client = Client::getCurrent();
     auto const serviceContext = client->getServiceContext();
 
+    // Terminate the balancer thread so it doesn't leak memory.
+    if (auto balancer = Balancer::get(serviceContext)) {
+        balancer->interruptBalancer();
+        balancer->waitForBalancerToStop();
+    }
+
     // Shutdown the TransportLayer so that new connections aren't accepted
     if (auto tl = serviceContext->getTransportLayer()) {
         log(LogComponent::kNetwork) << "shutdown: going to close listening sockets...";
@@ -1271,6 +1285,11 @@ void shutdownTask() {
 
     // Shut down the global dbclient pool so callers stop waiting for connections.
     globalConnPool.shutdown();
+
+    // Shut down the background periodic task runner
+    if (auto runner = serviceContext->getPeriodicRunner()) {
+        runner->shutdown();
+    }
 
     if (serviceContext->getGlobalStorageEngine()) {
         ServiceContext::UniqueOperationContext uniqueOpCtx;
@@ -1310,11 +1329,6 @@ void shutdownTask() {
     }
 
     serviceContext->setKillAllOperations();
-
-    // Shut down the background periodic task runner
-    if (auto runner = serviceContext->getPeriodicRunner()) {
-        runner->shutdown();
-    }
 
     ReplicaSetMonitor::shutdown();
 

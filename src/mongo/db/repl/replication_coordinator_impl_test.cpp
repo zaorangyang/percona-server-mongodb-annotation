@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -1627,6 +1629,67 @@ TEST_F(StepDownTest, StepDownCanCompleteBasedOnReplSetUpdatePositionAlone) {
     // Verify that stepDown completes successfully.
     ASSERT_OK(*result.second.get());
     ASSERT_TRUE(repl->getMemberState().secondary());
+}
+
+TEST_F(StepDownTest, StepDownFailureRestoresDrainState) {
+    const auto repl = getReplCoord();
+
+    OpTimeWithTermOne opTime1(100, 1);
+    OpTimeWithTermOne opTime2(200, 1);
+
+    repl->setMyLastAppliedOpTime(opTime2);
+    repl->setMyLastDurableOpTime(opTime2);
+
+    // Secondaries not caught up yet.
+    ASSERT_OK(repl->setLastAppliedOptime_forTest(1, 1, opTime1));
+    ASSERT_OK(repl->setLastAppliedOptime_forTest(1, 2, opTime1));
+
+    auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
+    simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTimeoutWhen);
+    ASSERT_TRUE(repl->getMemberState().primary());
+    ASSERT(repl->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
+
+    {
+        // We can't take writes yet since we're still in drain mode.
+        const auto opCtx = makeOperationContext();
+        Lock::GlobalLock lock(opCtx.get(), MODE_IX, UINT_MAX);
+        ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "admin"));
+    }
+
+    // Step down where the secondary actually has to catch up before the stepDown can succeed.
+    auto result = stepDown_nonBlocking(false, Seconds(10), Seconds(60));
+
+    // Interrupt the ongoing stepdown command so that the stepdown attempt will fail.
+    {
+        stdx::lock_guard<Client> lk(*result.first.client.get());
+        result.first.opCtx->markKilled(ErrorCodes::Interrupted);
+    }
+
+    // Ensure that the stepdown command failed.
+    auto stepDownStatus = *result.second.get();
+    ASSERT_NOT_OK(stepDownStatus);
+    // Which code is returned is racy.
+    ASSERT(stepDownStatus == ErrorCodes::PrimarySteppedDown ||
+           stepDownStatus == ErrorCodes::Interrupted);
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+    ASSERT(repl->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
+
+    // Ensure that the failed stepdown attempt didn't make us able to take writes since we're still
+    // in drain mode.
+    {
+        const auto opCtx = makeOperationContext();
+        Lock::GlobalLock lock(opCtx.get(), MODE_IX, UINT_MAX);
+        ASSERT_FALSE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "admin"));
+    }
+
+    // Now complete drain mode and ensure that we become capable of taking writes.
+    auto opCtx = makeOperationContext();
+    signalDrainComplete(opCtx.get());
+    ASSERT(repl->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
+
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+    Lock::GlobalLock lock(opCtx.get(), MODE_IX, UINT_MAX);
+    ASSERT_TRUE(getReplCoord()->canAcceptWritesForDatabase(opCtx.get(), "admin"));
 }
 
 class StepDownTestWithUnelectableNode : public StepDownTest {

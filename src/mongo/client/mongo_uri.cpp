@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -235,7 +237,85 @@ MongoURI::OptionsMap addTXTOptions(std::map<std::string, std::string> options,
 
     return {std::make_move_iterator(begin(options)), std::make_move_iterator(end(options))};
 }
+
+// Contains the parts of a MongoURI as unowned StringData's. Any code that needs to break up
+// URIs into their basic components without fully parsing them can use this struct.
+// Internally, MongoURI uses this to do basic parsing of the input URI string.
+struct URIParts {
+    explicit URIParts(StringData uri);
+    StringData scheme;
+    StringData username;
+    StringData password;
+    StringData hostIdentifiers;
+    StringData database;
+    StringData options;
+};
+
+URIParts::URIParts(StringData uri) {
+    // 1. Strip off the scheme ("mongo://")
+    auto schemeEnd = uri.find("://");
+    if (schemeEnd == std::string::npos) {
+        uasserted(ErrorCodes::FailedToParse,
+                  str::stream() << "URI must begin with " << kURIPrefix << " or " << kURISRVPrefix
+                                << ": "
+                                << uri);
+    }
+    const auto uriWithoutPrefix = uri.substr(schemeEnd + 3);
+    scheme = uri.substr(0, schemeEnd);
+
+    // 2. Split the string by the first, unescaped / (if any), yielding:
+    // split[0]: User information and host identifers
+    // split[1]: Auth database and connection options
+    const auto userAndDb = partitionForward(uriWithoutPrefix, '/');
+    const auto userAndHostInfo = userAndDb.first;
+
+    // 2.b Make sure that there are no question marks in the left side of the /
+    //     as any options after the ? must still have the / delimeter
+    if (userAndDb.second.empty() && userAndHostInfo.find('?') != std::string::npos) {
+        uasserted(
+            ErrorCodes::FailedToParse,
+            str::stream()
+                << "URI must contain slash delimeter between hosts and options for mongodb:// URL: "
+                << uri);
+    }
+
+    // 3. Split the user information and host identifiers string by the last, unescaped @,
+    const auto userAndHost = partitionBackward(userAndHostInfo, '@');
+    const auto userInfo = userAndHost.first;
+    hostIdentifiers = userAndHost.second;
+
+    // 4. Split up the username and password
+    const auto userAndPass = partitionForward(userInfo, ':');
+    username = userAndPass.first;
+    password = userAndPass.second;
+
+    // 5. Split the database name from the list of options
+    const auto databaseAndOptions = partitionForward(userAndDb.second, '?');
+    database = databaseAndOptions.first;
+    options = databaseAndOptions.second;
+}
 }  // namespace
+
+bool MongoURI::isMongoURI(StringData uri) {
+    return (uri.startsWith(kURIPrefix) || uri.startsWith(kURISRVPrefix));
+}
+
+std::string MongoURI::redact(StringData url) {
+    uassert(50892, "String passed to MongoURI::redact wasn't a MongoURI", isMongoURI(url));
+    URIParts parts(url);
+    std::ostringstream out;
+
+    out << parts.scheme << "://";
+    if (!parts.username.empty()) {
+        out << parts.username << "@";
+    }
+    out << parts.hostIdentifiers;
+    if (!parts.database.empty()) {
+        out << "/" << parts.database;
+    }
+
+    return out.str();
+}
 
 MongoURI MongoURI::parseImpl(const std::string& url) {
     const StringData urlSD(url);
@@ -245,40 +325,16 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
     if (!(urlSD.startsWith(kURIPrefix) || isSeedlist)) {
         return MongoURI(uassertStatusOK(ConnectionString::parse(url)));
     }
-    const auto uriWithoutPrefix = urlSD.substr(urlSD.find("://") + 3);
 
-    // 2. Split the string by the first, unescaped / (if any), yielding:
-    // split[0]: User information and host identifers
-    // split[1]: Auth database and connection options
-    const auto userAndDb = partitionForward(uriWithoutPrefix, '/');
-    const auto userAndHostInfo = userAndDb.first;
-    const auto databaseAndOptions = userAndDb.second;
+    // 2. Split up the URI into its components for further parsing and validation
+    URIParts parts(url);
+    const auto hostIdentifiers = parts.hostIdentifiers;
+    const auto usernameSD = parts.username;
+    const auto passwordSD = parts.password;
+    const auto databaseSD = parts.database;
+    const auto connectionOptions = parts.options;
 
-    // 2.b Make sure that there are no question marks in the left side of the /
-    //     as any options after the ? must still have the / delimeter
-    if (databaseAndOptions.empty() && userAndHostInfo.find('?') != std::string::npos) {
-        uasserted(
-            ErrorCodes::FailedToParse,
-            str::stream()
-                << "URI must contain slash delimeter between hosts and options for mongodb:// URL: "
-                << url);
-    }
-
-    // 3. Split the user information and host identifiers string by the last, unescaped @,
-    // yielding:
-    // split[0]: User information
-    // split[1]: Host identifiers;
-    const auto userAndHost = partitionBackward(userAndHostInfo, '@');
-    const auto userInfo = userAndHost.first;
-    const auto hostIdentifiers = userAndHost.second;
-
-    // 4. Validate, split (if applicable), and URL decode the user information, yielding:
-    // split[0] = username
-    // split[1] = password
-    const auto userAndPass = partitionForward(userInfo, ':');
-    const auto usernameSD = userAndPass.first;
-    const auto passwordSD = userAndPass.second;
-
+    // 3. URI decode and validate the username/password
     const auto containsColonOrAt = [](StringData str) {
         return (str.find(':') != std::string::npos) || (str.find('@') != std::string::npos);
     };
@@ -310,7 +366,7 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
                                 << url);
     const auto password = passwordWithStatus.getValue();
 
-    // 5. Validate, split, and URL decode the host identifiers.
+    // 4. Validate, split, and URL decode the host identifiers.
     const auto hostIdentifiersStr = hostIdentifiers.toString();
     std::vector<HostAndPort> servers;
     for (auto i = boost::make_split_iterator(hostIdentifiersStr,
@@ -386,13 +442,7 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
             });
     }
 
-    // 6. Split the auth database and connection options string by the first, unescaped ?,
-    // yielding:
-    // split[0] = auth database
-    // split[1] = connection options
-    const auto dbAndOpts = partitionForward(databaseAndOptions, '?');
-    const auto databaseSD = dbAndOpts.first;
-    const auto connectionOptions = dbAndOpts.second;
+    // 5. Decode the database name
     const auto databaseWithStatus = uriDecode(databaseSD);
     if (!databaseWithStatus.isOK()) {
         uasserted(ErrorCodes::FailedToParse,
@@ -402,7 +452,7 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
     }
     const auto database = databaseWithStatus.getValue();
 
-    // 7. Validate the database contains no prohibited characters
+    // 6. Validate the database contains no prohibited characters
     // Prohibited characters:
     // slash ("/"), backslash ("\"), space (" "), double-quote ("""), or dollar sign ("$")
     // period (".") is also prohibited, but drivers MAY allow periods
@@ -415,7 +465,7 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
                                 << url);
     }
 
-    // 8. Validate, split, and URL decode the connection options
+    // 7. Validate, split, and URL decode the connection options
     auto options =
         addTXTOptions(parseOptions(connectionOptions, url), canonicalHost, url, isSeedlist);
 

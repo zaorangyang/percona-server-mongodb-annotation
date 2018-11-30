@@ -1,24 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,6 +40,7 @@
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/log.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 namespace {
@@ -99,7 +101,7 @@ void WiredTigerOplogManager::halt() {
 }
 
 void WiredTigerOplogManager::waitForAllEarlierOplogWritesToBeVisible(
-    const WiredTigerRecordStore* oplogRecordStore, OperationContext* opCtx) const {
+    const WiredTigerRecordStore* oplogRecordStore, OperationContext* opCtx) {
     invariant(opCtx->lockState()->isNoop() || !opCtx->lockState()->inAWriteUnitOfWork());
 
     // In order to reliably detect rollback situations, we need to fetch the latestVisibleTimestamp
@@ -121,6 +123,12 @@ void WiredTigerOplogManager::waitForAllEarlierOplogWritesToBeVisible(
     opCtx->recoveryUnit()->abandonSnapshot();
 
     stdx::unique_lock<stdx::mutex> lk(_oplogVisibilityStateMutex);
+
+    // Prevent any scheduled journal flushes from being delayed and blocking this wait excessively.
+    _opsWaitingForVisibility++;
+    invariant(_opsWaitingForVisibility > 0);
+    auto exitGuard = MakeGuard([&] { _opsWaitingForVisibility--; });
+
     opCtx->waitForConditionOrInterrupt(_opsBecameVisibleCV, lk, [&] {
         auto newLatestVisibleTimestamp = getOplogReadTimestamp();
         if (newLatestVisibleTimestamp < currentLatestVisibleTimestamp) {
@@ -177,17 +185,20 @@ void WiredTigerOplogManager::_oplogJournalThreadLoop(WiredTigerSessionCache* ses
             auto now = Date_t::now();
             auto deadline = now + journalDelay;
             auto shouldSyncOpsWaitingForJournal = [&] {
-                return _shuttingDown || oplogRecordStore->haveCappedWaiters() ||
+                return _shuttingDown || _opsWaitingForVisibility ||
+                    oplogRecordStore->haveCappedWaiters() ||
                     serverGlobalParams.featureCompatibility.getVersion() !=
                     ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo36;
             };
 
             // Eventually it would be more optimal to merge this with the normal journal flushing
-            // and block for oplog tailers to show up. For now this loop will poll once a
-            // millisecond up to the journalDelay to see if we have any waiters yet. This reduces
-            // sync-related I/O on the primary when secondaries are lagged, but will avoid
-            // significant delays in confirming majority writes on replica sets with infrequent
-            // writes.
+            // and block for either oplog tailers or operations waiting for oplog visibility. For
+            // now this loop will poll once a millisecond up to the journalDelay to see if we have
+            // any waiters yet. This reduces sync-related I/O on the primary when secondaries are
+            // lagged, but will avoid significant delays in confirming majority writes on replica
+            // sets with infrequent writes.
+            // Callers of waitForAllEarlierOplogWritesToBeVisible() like causally consistent reads
+            // will preempt this delay.
             while (now < deadline &&
                    !_opsWaitingForJournalCV.wait_until(
                        lk, now.toSystemTimePoint(), shouldSyncOpsWaitingForJournal)) {

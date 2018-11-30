@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -239,10 +241,8 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
     rs.reset(NULL);
 
     {
-        long long numRecords;
-        long long dataSize;
-        ss.loadFromCache(uri, &numRecords, &dataSize);
-        ASSERT_EQUALS(N, numRecords);
+        auto& info = *ss.load(uri);
+        ASSERT_EQUALS(N, info.numRecords.load());
     }
 
     {
@@ -279,21 +279,18 @@ TEST(WiredTigerRecordStoreTest, SizeStorer1) {
             uow.commit();
         }
 
-        ss.syncCache(true);
+        ss.flush(true);
     }
 
     {
         ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
         const bool enableWtLogging = false;
         WiredTigerSizeStorer ss2(harnessHelper->conn(), indexUri, enableWtLogging);
-        ss2.fillCache();
-        long long numRecords;
-        long long dataSize;
-        ss2.loadFromCache(uri, &numRecords, &dataSize);
-        ASSERT_EQUALS(N, numRecords);
+        auto info = ss2.load(uri);
+        ASSERT_EQUALS(N, info->numRecords.load());
     }
 
-    rs.reset(NULL);  // this has to be deleted before ss
+    rs.reset(nullptr);  // this has to be deleted before ss
 }
 
 class GoodValidateAdaptor : public ValidateAdaptor {
@@ -324,7 +321,7 @@ private:
         wtrs->setSizeStorer(sizeStorer.get());
         uri = wtrs->getURI();
 
-        expectedNumRecords = 10000;
+        expectedNumRecords = 100;
         expectedDataSize = expectedNumRecords * 2;
         {
             ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
@@ -334,33 +331,28 @@ private:
             }
             uow.commit();
         }
-        ASSERT_EQUALS(expectedNumRecords, rs->numRecords(NULL));
-        ASSERT_EQUALS(expectedDataSize, rs->dataSize(NULL));
-        sizeStorer->storeToCache(uri, 0, 0);
+        auto info = sizeStorer->load(uri);
+        info->numRecords.store(0);
+        info->dataSize.store(0);
+        sizeStorer->store(uri, info);
     }
     virtual void tearDown() {
         expectedNumRecords = 0;
         expectedDataSize = 0;
 
-        rs.reset(NULL);
-        sizeStorer.reset(NULL);
-        harnessHelper.reset(NULL);
-        rs.reset(NULL);
+        rs.reset(nullptr);
+        sizeStorer->flush(false);
+        sizeStorer.reset(nullptr);
+        harnessHelper.reset(nullptr);
     }
 
 protected:
     long long getNumRecords() const {
-        long long numRecords;
-        long long unused;
-        sizeStorer->loadFromCache(uri, &numRecords, &unused);
-        return numRecords;
+        return sizeStorer->load(uri)->numRecords.load();
     }
 
     long long getDataSize() const {
-        long long unused;
-        long long dataSize;
-        sizeStorer->loadFromCache(uri, &unused, &dataSize);
-        return dataSize;
+        return sizeStorer->load(uri)->dataSize.load();
     }
 
     std::unique_ptr<WiredTigerHarnessHelper> harnessHelper;
@@ -416,7 +408,10 @@ TEST_F(SizeStorerValidateTest, InvalidSizeStorerAtCreation) {
     rs.reset(NULL);
 
     ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
-    sizeStorer->storeToCache(uri, expectedNumRecords * 2, expectedDataSize * 2);
+    auto info = sizeStorer->load(uri);
+    info->numRecords.store(expectedNumRecords * 2);
+    info->dataSize.store(expectedDataSize * 2);
+    sizeStorer->store(uri, info);
 
     WiredTigerRecordStore::Params params;
     params.ns = "a.b"_sd;

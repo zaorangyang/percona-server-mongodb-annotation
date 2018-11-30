@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -48,17 +50,17 @@ namespace mongo {
     ASSERT_TRUE(st.isOK());  \
     ASSERT_FALSE(st.getValue().is_initialized());
 
-#define ASSERT_SCHEMA_CHANGED(st)                                 \
-    ASSERT_TRUE(st.isOK());                                       \
-    ASSERT_TRUE(std::get<1>(st.getValue().get()) ==               \
-                FTDCCompressor::CompressorState::kSchemaChanged); \
-    ASSERT_TRUE(st.getValue().is_initialized());
+#define ASSERT_SCHEMA_CHANGED(st)                   \
+    ASSERT_TRUE(st.isOK());                         \
+    ASSERT_TRUE(st.getValue().is_initialized());    \
+    ASSERT_TRUE(std::get<1>(st.getValue().get()) == \
+                FTDCCompressor::CompressorState::kSchemaChanged);
 
-#define ASSERT_FULL(st)                                            \
-    ASSERT_TRUE(st.isOK());                                        \
-    ASSERT_TRUE(std::get<1>(st.getValue().get()) ==                \
-                FTDCCompressor::CompressorState::kCompressorFull); \
-    ASSERT_TRUE(st.getValue().is_initialized());
+#define ASSERT_FULL(st)                             \
+    ASSERT_TRUE(st.isOK());                         \
+    ASSERT_TRUE(st.getValue().is_initialized());    \
+    ASSERT_TRUE(std::get<1>(st.getValue().get()) == \
+                FTDCCompressor::CompressorState::kCompressorFull);
 
 // Sanity check
 TEST(FTDCCompressor, TestBasic) {
@@ -125,7 +127,8 @@ TEST(FTDCCompressor, TestStrings) {
  */
 class TestTie {
 public:
-    TestTie() : _compressor(&_config) {}
+    TestTie(FTDCValidationMode mode = FTDCValidationMode::kStrict)
+        : _compressor(&_config), _mode(mode) {}
 
     ~TestTie() {
         validate(boost::none);
@@ -169,7 +172,7 @@ public:
             list = sw.getValue();
         }
 
-        ValidateDocumentList(list, _docs);
+        ValidateDocumentList(list, _docs, _mode);
     }
 
 private:
@@ -177,6 +180,7 @@ private:
     FTDCConfig _config;
     FTDCCompressor _compressor;
     FTDCDecompressor _decompressor;
+    FTDCValidationMode _mode;
 };
 
 // Test various schema changes
@@ -337,6 +341,114 @@ TEST(FTDCCompressor, TestSchemaChanges) {
 
     // Change field from object to oid
     st = c.addSample(BSON(GENOID));
+    ASSERT_SCHEMA_CHANGED(st);
+}
+
+// Test various schema changes with strings
+TEST(FTDCCompressorTest, TestStringSchemaChanges) {
+    TestTie c(FTDCValidationMode::kWeak);
+
+    auto st = c.addSample(BSON("str1"
+                               << "joe"
+                               << "int1"
+                               << 42));
+    ASSERT_HAS_SPACE(st);
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "int1"
+                          << 45));
+    ASSERT_HAS_SPACE(st);
+
+    // Add string field
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "str2"
+                          << "smith"
+                          << "int1"
+                          << 47));
+    ASSERT_HAS_SPACE(st);
+
+    // Reset schema by renaming a int field
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "str2"
+                          << "smith"
+                          << "int2"
+                          << 48));
+    ASSERT_SCHEMA_CHANGED(st);
+
+    // Remove string field
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "int2"
+                          << 49));
+    ASSERT_HAS_SPACE(st);
+
+
+    // Add string field as last element
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "int2"
+                          << 50
+                          << "str3"
+                          << "bar"));
+    ASSERT_HAS_SPACE(st);
+
+    // Reset schema by renaming a int field
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "int1"
+                          << 51
+                          << "str3"
+                          << "bar"));
+    ASSERT_SCHEMA_CHANGED(st);
+
+    // Remove string field as last element
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "int1"
+                          << 52));
+    ASSERT_HAS_SPACE(st);
+
+
+    // Add 2 string fields
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "str2"
+                          << "smith"
+                          << "str3"
+                          << "foo"
+                          << "int1"
+                          << 53));
+    ASSERT_HAS_SPACE(st);
+
+    // Reset schema by renaming a int field
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "str2"
+                          << "smith"
+                          << "str3"
+                          << "foo"
+                          << "int2"
+                          << 54));
+    ASSERT_SCHEMA_CHANGED(st);
+
+    // Remove 2 string fields
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "int2"
+                          << 55));
+    ASSERT_HAS_SPACE(st);
+
+    // Change string to number
+    st = c.addSample(BSON("str1" << 12 << "int1" << 56));
+    ASSERT_SCHEMA_CHANGED(st);
+
+    // Change number to string
+    st = c.addSample(BSON("str1"
+                          << "joe"
+                          << "int1"
+                          << 67));
     ASSERT_SCHEMA_CHANGED(st);
 }
 

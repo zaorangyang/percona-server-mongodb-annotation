@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -425,8 +427,55 @@ TEST_F(QueryPlannerTest, BasicSkipWithIndex) {
     ASSERT_EQUALS(getNumSolutions(), 2U);
     assertSolutionExists("{skip: {n: 8, node: {cscan: {dir: 1, filter: {a: 5}}}}}");
     assertSolutionExists(
-        "{skip: {n: 8, node: {fetch: {filter: null, node: "
+        "{fetch: {filter: null, node: {skip: {n: 8, node: "
         "{ixscan: {filter: null, pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, CoveredSkipWithIndex) {
+    addIndex(fromjson("{a: 1, b: 1}"));
+
+    runQuerySortProjSkipNToReturn(
+        fromjson("{a: 5}"), BSONObj(), fromjson("{_id: 0, a: 1, b: 1}"), 8, 0);
+
+    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1, b: 1}, node: "
+        "{skip: {n: 8, node: {cscan: {dir: 1, filter: {a: 5}}}}}}}");
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, a: 1, b: 1}, "
+        "node: {skip: {n: 8, node: {ixscan: {filter: null, pattern: {a: 1, b: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, SkipEvaluatesAfterFetchWithPredicate) {
+    addIndex(fromjson("{a: 1}"));
+
+    runQuerySkipNToReturn(fromjson("{a: 5, b: 7}"), 8, 0);
+
+    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertSolutionExists("{skip: {n: 8, node: {cscan: {dir: 1, filter: {a: 5, b: 7}}}}}");
+
+    // When a plan includes a fetch with no predicate, the skip should execute first, so we avoid
+    // fetching a document that we will always discard. When the fetch does have a predicate (as in
+    // this case), however, that optimization would be invalid; we need to fetch the document and
+    // evaluate the filter to determine if the document should count towards the number of skipped
+    // documents.
+    assertSolutionExists(
+        "{skip: {n: 8, node: {fetch: {filter: {b: 7}, node: "
+        "{ixscan: {filter: null, pattern: {a: 1}}}}}}}");
+}
+
+TEST_F(QueryPlannerTest, SkipEvaluatesBeforeFetchForIndexedOr) {
+    addIndex(fromjson("{a: 1}"));
+
+    runQuerySkipNToReturn(fromjson("{$or: [{a: 5}, {a: 7}]}"), 8, 0);
+
+    ASSERT_EQUALS(getNumSolutions(), 2U);
+    assertSolutionExists(
+        "{skip: {n: 8, node: "
+        "{cscan: {dir: 1, filter: {$or: [{a: 5}, {a: 7}]}}}}}");
+    assertSolutionExists(
+        "{fetch: {filter: null, node: {skip: {n: 8, node: "
+        "{ixscan: {filter: null, pattern: {a: 1}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, BasicLimitNoIndex) {
@@ -481,9 +530,8 @@ TEST_F(QueryPlannerTest, SkipAndLimit) {
         "{limit: {n: 2, node: {skip: {n: 7, node: "
         "{cscan: {dir: 1, filter: {x: {$lte: 4}}}}}}}}");
     assertSolutionExists(
-        "{limit: {n: 2, node: {skip: {n: 7, node: {fetch: "
-        "{filter: null, node: {ixscan: "
-        "{filter: null, pattern: {x: 1}}}}}}}}}");
+        "{limit: {n: 2, node: {fetch: {filter: null, node: "
+        "{skip: {n: 7, node: {ixscan: {filter: null, pattern: {x: 1}}}}}}}}}");
 }
 
 TEST_F(QueryPlannerTest, SkipAndSoftLimit) {
@@ -496,9 +544,8 @@ TEST_F(QueryPlannerTest, SkipAndSoftLimit) {
         "{skip: {n: 7, node: "
         "{cscan: {dir: 1, filter: {x: {$lte: 4}}}}}}");
     assertSolutionExists(
-        "{skip: {n: 7, node: {fetch: "
-        "{filter: null, node: {ixscan: "
-        "{filter: null, pattern: {x: 1}}}}}}}");
+        "{fetch: {filter: null, node: {skip: {n: 7, node: "
+        "{ixscan: {filter: null, pattern: {x: 1}}}}}}}");
 }
 
 //
@@ -5395,6 +5442,27 @@ TEST_F(QueryPlannerTest, ContainedOrPathLevelMultikeyCannotCompoundTrailingField
         "true]]}}}}},"
         "{ixscan: {pattern: {e: 1}, bounds: {e: [[8, 8, true, true]]}}}"
         "]}}}}");
+    assertSolutionExists("{cscan: {dir: 1}}}}");
+}
+
+TEST_F(QueryPlannerTest, ContainedOrPushdownIndexedExpr) {
+    addIndex(BSON("a" << 1 << "b" << 1));
+
+    runQuery(
+        fromjson("{$expr: {$and: [{$eq: ['$d', 'd']}, {$eq: ['$a', 'a']}]},"
+                 "$or: [{b: 'b'}, {b: 'c'}]}"));
+    assertNumSolutions(3);
+    // When we have path-level multikey info, we ensure that predicates are assigned in order of
+    // index position.
+    assertSolutionExists(
+        "{fetch: {node: {or: {nodes: ["
+        "{ixscan: {pattern: {a: 1, b: 1}, filter: null, bounds: {a: [['a', 'a', true, true]], b: "
+        "[['b', 'b', true, true]]}}},"
+        "{ixscan: {pattern: {a: 1, b: 1}, filter: null, bounds: {a: [['a', 'a', true, true]], b: "
+        "[['c', 'c', true, true]]}}}]}}}}");
+    assertSolutionExists(
+        "{fetch: {node: {ixscan: {pattern: {a: 1, b: 1}, filter: null,"
+        "bounds: {a: [['a', 'a', true, true]], b: [['MinKey', 'MaxKey', true, true]]}}}}}");
     assertSolutionExists("{cscan: {dir: 1}}}}");
 }
 

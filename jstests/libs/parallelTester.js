@@ -161,7 +161,6 @@ if (typeof _threadInject != "undefined") {
             "index_bigkeys_validation.js",
 
             "mr3.js",
-            "evald.js",
             "run_program1.js",
             "notablescan.js",
             "bench_test1.js",
@@ -200,7 +199,6 @@ if (typeof _threadInject != "undefined") {
             "views/views_all_commands.js",    // Drops test DB.
 
             // Use eval command and potentially cause deadlock.
-            "apitest_db.js",
             "constructors.js",
             "error2.js",
             "eval0.js",
@@ -216,16 +214,18 @@ if (typeof _threadInject != "undefined") {
             "evald.js",
             "evale.js",
             "evalg.js",
+            "evalh.js",
+            "evalj.js",
             "eval_mr.js",
             "eval_nolock.js",
             "fsync.js",
-            "recursion.js",
             "js3.js",
             "js7.js",
             "js9.js",
+            "json_schema/misc_validation.js",
+            "recursion.js",
             "remove8.js",
             "rename4.js",
-            "shellkillop.js",
             "storefunc.js",
         ]);
 
@@ -294,6 +294,13 @@ if (typeof _threadInject != "undefined") {
             parallelFilesDir + "/profile_repair_cursor.js",
             parallelFilesDir + "/profile_sampling.js",
             parallelFilesDir + "/profile_update.js",
+
+            // These tests rely on a deterministically refreshable logical session cache. If they
+            // run in parallel, they could interfere with the cache and cause failures.
+            parallelFilesDir + "/list_all_local_sessions.js",
+            parallelFilesDir + "/list_all_sessions.js",
+            parallelFilesDir + "/list_local_sessions.js",
+            parallelFilesDir + "/list_sessions.js",
         ];
         var serialTests = makeKeys(serialTestsArr);
 

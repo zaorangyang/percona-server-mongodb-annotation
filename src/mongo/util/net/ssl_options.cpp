@@ -1,28 +1,31 @@
-/* Copyright 2013 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kControl
@@ -83,6 +86,11 @@ Status addSSLServerOptions(moe::OptionSection* options) {
     options->addOptionChaining(
         "net.ssl.CAFile", "sslCAFile", moe::String, "Certificate Authority file for SSL");
 
+    options->addOptionChaining("net.ssl.clusterCAFile",
+                               "sslClusterCAFile",
+                               moe::String,
+                               "CA used for verifying remotes during outbound connections");
+
     options->addOptionChaining(
         "net.ssl.CRLFile", "sslCRLFile", moe::String, "Certificate Revocation List file for SSL");
 
@@ -98,6 +106,14 @@ Status addSSLServerOptions(moe::OptionSection* options) {
         "sslDisabledProtocols",
         moe::String,
         "Comma separated list of TLS protocols to disable [TLS1_0,TLS1_1,TLS1_2]");
+
+    options
+        ->addOptionChaining(
+            "net.tls.logVersions",
+            "tlsLogVersions",
+            moe::String,
+            "Comma separated list of TLS protocols to log on connect [TLS1_0,TLS1_1,TLS1_2]")
+        .hidden();
 
     options->addOptionChaining("net.ssl.weakCertificateValidation",
                                "sslWeakCertificateValidation",
@@ -126,6 +142,34 @@ Status addSSLServerOptions(moe::OptionSection* options) {
 
     return Status::OK();
 }
+
+Status storeTLSLogVersion(const std::string& loggedProtocols) {
+    // The tlsLogVersion field is composed of a comma separated list of protocols to
+    // log. First, tokenize the field.
+    const auto tokens = StringSplitter::split(loggedProtocols, ",");
+
+    // All universally accepted tokens, and their corresponding enum representation.
+    const std::map<std::string, SSLParams::Protocols> validConfigs{
+        {"TLS1_0", SSLParams::Protocols::TLS1_0},
+        {"TLS1_1", SSLParams::Protocols::TLS1_1},
+        {"TLS1_2", SSLParams::Protocols::TLS1_2},
+        {"TLS1_3", SSLParams::Protocols::TLS1_3},
+    };
+
+    // Map the tokens to their enum values, and push them onto the list of logged protocols.
+    for (const std::string& token : tokens) {
+        auto mappedToken = validConfigs.find(token);
+        if (mappedToken != validConfigs.end()) {
+            sslGlobalParams.tlsLogVersions.push_back(mappedToken->second);
+            continue;
+        }
+
+        return Status(ErrorCodes::BadValue, "Unrecognized tlsLogVersions '" + token + "'");
+    }
+
+    return Status::OK();
+}
+
 
 Status addSSLClientOptions(moe::OptionSection* options) {
     options->addOptionChaining("ssl", "ssl", moe::Switch, "use SSL for all connections");
@@ -257,6 +301,7 @@ Status storeDisabledProtocols(const std::string& disabledProtocols,
         {"TLS1_0", SSLParams::Protocols::TLS1_0},
         {"TLS1_1", SSLParams::Protocols::TLS1_1},
         {"TLS1_2", SSLParams::Protocols::TLS1_2},
+        {"TLS1_3", SSLParams::Protocols::TLS1_3},
     };
 
     // These noTLS* tokens exist for backwards compatibility.
@@ -264,6 +309,7 @@ Status storeDisabledProtocols(const std::string& disabledProtocols,
         {"noTLS1_0", SSLParams::Protocols::TLS1_0},
         {"noTLS1_1", SSLParams::Protocols::TLS1_1},
         {"noTLS1_2", SSLParams::Protocols::TLS1_2},
+        {"noTLS1_3", SSLParams::Protocols::TLS1_3},
     };
 
     // Map the tokens to their enum values, and push them onto the list of disabled protocols.
@@ -329,6 +375,12 @@ Status storeSSLServerOptions(const moe::Environment& params) {
                 .generic_string();
     }
 
+    if (params.count("net.ssl.clusterCAFile")) {
+        sslGlobalParams.sslClusterCAFile =
+            boost::filesystem::absolute(params["net.ssl.clusterCAFile"].as<std::string>())
+                .generic_string();
+    }
+
     if (params.count("net.ssl.CRLFile")) {
         sslGlobalParams.sslCRLFile =
             boost::filesystem::absolute(params["net.ssl.CRLFile"].as<std::string>())
@@ -349,6 +401,13 @@ Status storeSSLServerOptions(const moe::Environment& params) {
     if (params.count("net.ssl.disabledProtocols")) {
         const auto status = storeDisabledProtocols(params["net.ssl.disabledProtocols"].as<string>(),
                                                    DisabledProtocolsMode::kAcceptNegativePrefix);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    if (params.count("net.tls.logVersions")) {
+        const auto status = storeTLSLogVersion(params["net.tls.logVersions"].as<string>());
         if (!status.isOK()) {
             return status;
         }

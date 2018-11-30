@@ -8,6 +8,10 @@ in jstests/auth/commands.js.
 @tags: [rocks_requires_fcv36]
 */
 
+// TODO SERVER-35447: This test involves killing all sessions, which will not work as expected if
+// the kill command is sent with an implicit session.
+TestData.disableImplicitSessions = true;
+
 load("jstests/auth/lib/commands_lib.js");
 
 var roles = [

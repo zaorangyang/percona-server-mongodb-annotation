@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -1773,6 +1775,23 @@ TEST_F(TopoCoordTest, HeartbeatFrequencyShouldBeHalfElectionTimeoutWhenArbiter) 
         requestDate, Milliseconds(0), target, makeStatusWith<ReplSetHeartbeatResponse>());
     Date_t expected(now() + Milliseconds(2500));
     ASSERT_EQUALS(expected, action.getNextHeartbeatStartDate());
+}
+
+TEST_F(TopoCoordTest, PrepareStepDownAttemptFailsIfNotLeader) {
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version"
+                      << 5
+                      << "members"
+                      << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                               << "host1:27017"))
+                      << "protocolVersion"
+                      << 1),
+                 0);
+    getTopoCoord().changeMemberState_forTest(MemberState::RS_SECONDARY);
+    Status expectedStatus(ErrorCodes::NotMaster, "This node is not a primary. ");
+
+    ASSERT_EQUALS(expectedStatus, getTopoCoord().prepareForStepDownAttempt().getStatus());
 }
 
 class PrepareHeartbeatResponseV1Test : public TopoCoordTest {
@@ -4150,7 +4169,7 @@ TEST_F(TopoCoordTest, StepDownAttemptFailsForDifferentTerm) {
     Date_t futureTime = curTime + Seconds(1);
 
     makeSelfPrimary();
-    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt());
+    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt().getStatus());
 
     ASSERT_THROWS_CODE(
         getTopoCoord().attemptStepDown(term - 1, curTime, futureTime, futureTime, false),
@@ -4180,7 +4199,7 @@ TEST_F(TopoCoordTest, StepDownAttemptFailsIfPastStepDownUntil) {
     Date_t futureTime = curTime + Seconds(1);
 
     makeSelfPrimary();
-    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt());
+    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt().getStatus());
 
     ASSERT_THROWS_CODE_AND_WHAT(
         getTopoCoord().attemptStepDown(term, curTime, futureTime, curTime, false),
@@ -4212,7 +4231,7 @@ TEST_F(TopoCoordTest, StepDownAttemptFailsIfPastWaitUntil) {
     Date_t futureTime = curTime + Seconds(1);
 
     makeSelfPrimary();
-    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt());
+    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt().getStatus());
 
     std::string expectedWhat = str::stream()
         << "No electable secondaries caught up as of " << dateToISOStringLocal(curTime)
@@ -4248,7 +4267,7 @@ TEST_F(TopoCoordTest, StepDownAttemptFailsIfNoSecondariesCaughtUp) {
 
     makeSelfPrimary();
     setMyOpTime(OpTime(Timestamp(5, 0), term));
-    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt());
+    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt().getStatus());
 
     heartbeatFromMember(
         HostAndPort("host2"), "rs0", MemberState::RS_SECONDARY, OpTime(Timestamp(4, 0), term));
@@ -4281,7 +4300,7 @@ TEST_F(TopoCoordTest, StepDownAttemptFailsIfNoSecondariesCaughtUpForceIsTrueButN
 
     makeSelfPrimary();
     setMyOpTime(OpTime(Timestamp(5, 0), term));
-    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt());
+    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt().getStatus());
 
     heartbeatFromMember(
         HostAndPort("host2"), "rs0", MemberState::RS_SECONDARY, OpTime(Timestamp(4, 0), term));
@@ -4314,7 +4333,7 @@ TEST_F(TopoCoordTest, StepDownAttemptSucceedsIfNoSecondariesCaughtUpForceIsTrueA
 
     makeSelfPrimary();
     setMyOpTime(OpTime(Timestamp(5, 0), term));
-    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt());
+    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt().getStatus());
 
     heartbeatFromMember(
         HostAndPort("host2"), "rs0", MemberState::RS_SECONDARY, OpTime(Timestamp(4, 0), term));
@@ -4347,7 +4366,7 @@ TEST_F(TopoCoordTest, StepDownAttemptSucceedsIfSecondariesCaughtUp) {
 
     makeSelfPrimary();
     setMyOpTime(OpTime(Timestamp(5, 0), term));
-    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt());
+    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt().getStatus());
 
     heartbeatFromMember(
         HostAndPort("host2"), "rs0", MemberState::RS_SECONDARY, OpTime(Timestamp(5, 0), term));
@@ -4384,7 +4403,7 @@ TEST_F(TopoCoordTest, StepDownAttemptFailsIfSecondaryCaughtUpButNotElectable) {
 
     makeSelfPrimary();
     setMyOpTime(OpTime(Timestamp(5, 0), term));
-    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt());
+    ASSERT_OK(getTopoCoord().prepareForStepDownAttempt().getStatus());
 
     heartbeatFromMember(
         HostAndPort("host2"), "rs0", MemberState::RS_SECONDARY, OpTime(Timestamp(5, 0), term));
