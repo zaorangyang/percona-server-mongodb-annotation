@@ -309,6 +309,13 @@ public:
                     // from it.
                     _oplogNeededForCrashRecovery.store(oplogNeededForRollback.asULL());
                 }
+                // Do KeysDB checkpoint
+                auto encryptionKeyDB = _sessionCache->getKVEngine()->getEncryptionKeyDB();
+                if (encryptionKeyDB) {
+                    std::unique_ptr<WiredTigerSession> sess = stdx::make_unique<WiredTigerSession>(encryptionKeyDB->getConnection());
+                    WT_SESSION* s = sess->getSession();
+                    invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
+                }
             } catch (const WriteConflictException&) {
                 // Temporary: remove this after WT-3483
                 warning() << "Checkpoint encountered a write conflict exception.";
