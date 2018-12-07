@@ -36,6 +36,7 @@
     };
 
     let testCases = {
+        _addShard: {skip: "primary only"},
         _cloneCatalogData: {skip: "primary only"},
         _configsvrAddShard: {skip: "primary only"},
         _configsvrAddShardToZone: {skip: "primary only"},
@@ -153,7 +154,7 @@
         emptycapped: {skip: "primary only"},
         enableSharding: {skip: "primary only"},
         endSessions: {skip: "does not return user data"},
-        eval: {skip: "primary only"},
+        eval: {skip: "must define test coverage for 4.0 backwards compatibility"},
         explain: {skip: "TODO SERVER-30068"},
         features: {skip: "does not return user data"},
         filemd5: {skip: "does not return user data"},
@@ -174,20 +175,7 @@
         forceerror: {skip: "does not return user data"},
         fsync: {skip: "does not return user data"},
         fsyncUnlock: {skip: "does not return user data"},
-        geoNear: {
-            setUp: function(mongosConn) {
-                assert.commandWorked(mongosConn.getCollection(nss).runCommand(
-                    {createIndexes: coll, indexes: [{key: {loc: "2d"}, name: "loc_2d"}]}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, loc: [1, 1]}));
-            },
-            command: {geoNear: coll, near: [1, 1]},
-            checkResults: function(res) {
-                // The command should work and return correct results due to rerouting
-                assert.commandWorked(res);
-                assert.eq(1, res.results.length, tojson(res));
-            },
-            behavior: "versioned"
-        },
+        geoNear: {skip: "must define test coverage for 4.0 backwards compatibility"},
         geoSearch: {skip: "not supported in mongos"},
         getCmdLineOpts: {skip: "does not return user data"},
         getDiagnosticData: {skip: "does not return user data"},
@@ -203,27 +191,13 @@
         grantPrivilegesToRole: {skip: "primary only"},
         grantRolesToRole: {skip: "primary only"},
         grantRolesToUser: {skip: "primary only"},
-        group: {
-            setUp: function(mongosConn) {
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 1, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 2, y: 1}));
-                assert.writeOK(mongosConn.getCollection(nss).insert({x: 2, y: 1}));
-            },
-            command: {group: {ns: coll, key: {x: 1}}},
-            checkResults: function(res) {
-                // Expect the command to fail, since it cannot run on sharded collections.
-                assert.commandFailedWithCode(res, ErrorCodes.IllegalOperation, tojson(res));
-            },
-            behavior: "unshardedOnly"
-        },
+        group: {skip: "must define test coverage for 4.0 backwards compatibility"},
         handshake: {skip: "does not return user data"},
         hostInfo: {skip: "does not return user data"},
         insert: {skip: "primary only"},
         invalidateUserCache: {skip: "does not return user data"},
         isdbgrid: {skip: "does not return user data"},
         isMaster: {skip: "does not return user data"},
-        journalLatencyTest: {skip: "does not return user data"},
         killAllSessions: {skip: "does not return user data"},
         killAllSessionsByPattern: {skip: "does not return user data"},
         killCursors: {skip: "does not return user data"},
@@ -267,7 +241,6 @@
         movePrimary: {skip: "primary only"},
         multicast: {skip: "does not return user data"},
         netstat: {skip: "does not return user data"},
-        parallelCollectionScan: {skip: "is an internal command"},
         ping: {skip: "does not return user data"},
         planCacheClear: {skip: "does not return user data"},
         planCacheClearFilters: {skip: "does not return user data"},
@@ -287,9 +260,7 @@
         repairCursor: {skip: "does not return user data"},
         repairDatabase: {skip: "does not return user data"},
         replSetAbortPrimaryCatchUp: {skip: "does not return user data"},
-        replSetElect: {skip: "does not return user data"},
         replSetFreeze: {skip: "does not return user data"},
-        replSetFresh: {skip: "does not return user data"},
         replSetGetConfig: {skip: "does not return user data"},
         replSetGetRBID: {skip: "does not return user data"},
         replSetGetStatus: {skip: "does not return user data"},
@@ -376,6 +347,12 @@
         assert.commandWorked(staleMongos.adminCommand({enableSharding: db}));
         st.ensurePrimaryShard(db, st.shard0.shardName);
         assert.commandWorked(staleMongos.adminCommand({shardCollection: nss, key: {x: 1}}));
+
+        // We do this because we expect freshMongos to see that the collection is sharded, which it
+        // may not if the "nearest" config server it contacts has not replicated the shardCollection
+        // writes (or has not heard that they have reached a majority).
+        st.configRS.awaitReplication();
+
         assert.commandWorked(staleMongos.adminCommand({split: nss, middle: {x: 0}}));
 
         // Do dummy read from the stale mongos so it loads the routing table into memory once.

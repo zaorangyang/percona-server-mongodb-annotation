@@ -69,7 +69,8 @@ AsyncRequestsSender::AsyncRequestsSender(OperationContext* opCtx,
       _readPreference(readPreference),
       _retryPolicy(retryPolicy) {
     for (const auto& request : requests) {
-        _remotes.emplace_back(request.shardId, request.cmdObj);
+        auto cmdObj = request.cmdObj;
+        _remotes.emplace_back(request.shardId, cmdObj);
     }
 
     // Initialize command metadata to handle the read preference.
@@ -293,6 +294,7 @@ void AsyncRequestsSender::_makeProgress(OperationContext* opCtx) {
     if (job->cbData.response.status.isOK()) {
         remote.swResponse = std::move(job->cbData.response);
     } else {
+        // TODO: call participant.markAsCommandSent on "transaction already started" errors?
         remote.swResponse = std::move(job->cbData.response.status);
     }
 }
@@ -346,25 +348,24 @@ Status AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPort(
         // If it's going to take a while to target, we spin up a background thread to do our
         // targeting, while running the baton on the calling thread.  This allows us to make forward
         // progress on previous requests.
-        Promise<HostAndPort> promise;
-        auto future = promise.getFuture();
+        auto pf = makePromiseFuture<HostAndPort>();
 
         ars->_batonRequests++;
         stdx::thread bgChecker([&] {
-            promise.setWith(
+            pf.promise.setWith(
                 [&] { return targeter->findHostWithMaxWait(readPref, deadline - clock->now()); });
 
             ars->_baton->schedule([ars] { ars->_batonRequests--; });
         });
         const auto guard = MakeGuard([&] { bgChecker.join(); });
 
-        while (!future.isReady()) {
+        while (!pf.future.isReady()) {
             if (!ars->_baton->run(nullptr, deadline)) {
                 break;
             }
         }
 
-        return future.getNoThrow();
+        return pf.future.getNoThrow();
     }();
 
     if (!findHostStatus.isOK()) {
@@ -378,7 +379,7 @@ Status AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPort(
 
 std::shared_ptr<Shard> AsyncRequestsSender::RemoteData::getShard() {
     // TODO: Pass down an OperationContext* to use here.
-    return grid.shardRegistry()->getShardNoReload(shardId);
+    return Grid::get(getGlobalServiceContext())->shardRegistry()->getShardNoReload(shardId);
 }
 
 AsyncRequestsSender::BatonDetacher::BatonDetacher(OperationContext* opCtx)

@@ -1,5 +1,3 @@
-// TODO: SERVER-34388 Simplify this test by wrapping all the statements
-// in one transaction once a failing command won't abort the transaction
 /**
  * Test that explained aggregation commands behave correctly with the readConcern option.
  */
@@ -41,7 +39,7 @@
     }));
 
     // Test that explain is illegal with other readConcern levels.
-    const nonLocalReadConcerns = ["majority", "available", "linearizable", "snapshot"];
+    const nonLocalReadConcerns = ["majority", "available", "linearizable"];
     nonLocalReadConcerns.forEach(function(readConcernLevel) {
         let aggCmd = {
             aggregate: coll.getName(),
@@ -54,21 +52,11 @@
             readConcern: {level: readConcernLevel}
         };
 
-        if (readConcernLevel === "snapshot") {
-            if (!sessionDB.serverStatus().storageEngine.supportsSnapshotReadConcern) {
-                return;
-            }
-            aggCmd.txnNumber = NumberLong(0);
-            explainCmd.txnNumber = NumberLong(1);
-
-        } else {
-            assert.throws(
-                () => coll.explain().aggregate([], {readConcern: {level: readConcernLevel}}));
-        }
+        assert.throws(() => coll.explain().aggregate([], {readConcern: {level: readConcernLevel}}));
 
         let cmdRes = sessionDB.runCommand(aggCmd);
         assert.commandFailedWithCode(cmdRes, ErrorCodes.InvalidOptions, tojson(cmdRes));
-        let expectedErrStr = "aggregate command does not support non-local readConcern";
+        let expectedErrStr = "aggregate command cannot run with a readConcern other than 'local'";
         assert.neq(cmdRes.errmsg.indexOf(expectedErrStr), -1, tojson(cmdRes));
 
         cmdRes = sessionDB.runCommand(explainCmd);

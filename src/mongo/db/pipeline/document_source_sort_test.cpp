@@ -164,12 +164,12 @@ TEST_F(DocumentSourceSortTest, SortWithLimit) {
 TEST_F(DocumentSourceSortTest, Dependencies) {
     createSort(BSON("a" << 1 << "b.c" << -1));
     DepsTracker dependencies;
-    ASSERT_EQUALS(DocumentSource::SEE_NEXT, sort()->getDependencies(&dependencies));
+    ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, sort()->getDependencies(&dependencies));
     ASSERT_EQUALS(2U, dependencies.fields.size());
     ASSERT_EQUALS(1U, dependencies.fields.count("a"));
     ASSERT_EQUALS(1U, dependencies.fields.count("b.c"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 TEST_F(DocumentSourceSortTest, OutputSort) {

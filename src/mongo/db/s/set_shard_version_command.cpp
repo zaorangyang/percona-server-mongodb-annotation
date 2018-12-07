@@ -48,14 +48,11 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/util/log.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
-
-using std::string;
-using str::stream;
-
 namespace {
 
 class SetShardVersion : public ErrmsgCommandDeprecated {
@@ -89,7 +86,7 @@ public:
     bool errmsgRun(OperationContext* opCtx,
                    const std::string&,
                    const BSONObj& cmdObj,
-                   string& errmsg,
+                   std::string& errmsg,
                    BSONObjBuilder& result) {
         uassert(ErrorCodes::IllegalOperation,
                 "can't issue setShardVersion from 'eval'",
@@ -133,6 +130,12 @@ public:
         LastError::get(client).disable();
 
         const bool authoritative = cmdObj.getBoolField("authoritative");
+        // A flag that specifies whether the set shard version catalog refresh
+        // is allowed to join an in-progress refresh triggered by an other
+        // thread, or whether it's required to either a) trigger its own
+        // refresh or b) wait for a refresh to be started after it has entered the
+        // getCollectionRoutingInfoWithRefresh function
+        const bool forceRefresh = cmdObj.getBoolField("forceRefresh");
         const bool noConnectionVersioning = cmdObj.getBoolField("noConnectionVersioning");
 
         ShardedConnectionInfo dummyInfo;
@@ -191,8 +194,8 @@ public:
                 nss.isValid());
 
         // Validate chunk version parameter.
-        const ChunkVersion requestedVersion =
-            uassertStatusOK(ChunkVersion::parseFromBSONForSetShardVersion(cmdObj));
+        const ChunkVersion requestedVersion = uassertStatusOK(
+            ChunkVersion::parseLegacyWithField(cmdObj, SetShardVersionRequest::kVersion));
 
         // Step 4
 
@@ -204,7 +207,7 @@ public:
         // as UNSHARDED is the legacy way to achieve this purpose.
         const auto connectionVersion =
             (connectionVersionOrNotSet ? *connectionVersionOrNotSet : ChunkVersion::UNSHARDED());
-        connectionVersion.addToBSON(result, "oldVersion");
+        connectionVersion.appendLegacyWithField(&result, "oldVersion");
 
         {
             boost::optional<AutoGetDb> autoDb;
@@ -227,10 +230,12 @@ public:
             boost::optional<Lock::CollectionLock> collLock;
             collLock.emplace(opCtx->lockState(), nss.ns(), MODE_IS);
 
-            auto css = CollectionShardingState::get(opCtx, nss);
-            const ChunkVersion collectionShardVersion =
-                (css->getMetadata(opCtx) ? css->getMetadata(opCtx)->getShardVersion()
-                                         : ChunkVersion::UNSHARDED());
+            auto const css = CollectionShardingState::get(opCtx, nss);
+            const ChunkVersion collectionShardVersion = [&] {
+                auto metadata = css->getMetadata(opCtx);
+                return metadata->isSharded() ? metadata->getShardVersion()
+                                             : ChunkVersion::UNSHARDED();
+            }();
 
             if (requestedVersion.isWriteCompatibleWith(collectionShardVersion)) {
                 // MongoS and MongoD agree on what is the collection's shard version
@@ -267,7 +272,7 @@ public:
                 if (!authoritative) {
                     result.appendBool("need_authoritative", true);
                     result.append("ns", nss.ns());
-                    collectionShardVersion.addToBSON(result, "globalVersion");
+                    collectionShardVersion.appendLegacyWithField(&result, "globalVersion");
                     errmsg = "dropping needs to be authoritative";
                     return false;
                 }
@@ -284,8 +289,8 @@ public:
                     errmsg = str::stream() << "this connection already had a newer version "
                                            << "of collection '" << nss.ns() << "'";
                     result.append("ns", nss.ns());
-                    requestedVersion.addToBSON(result, "newVersion");
-                    collectionShardVersion.addToBSON(result, "globalVersion");
+                    requestedVersion.appendLegacyWithField(&result, "newVersion");
+                    collectionShardVersion.appendLegacyWithField(&result, "globalVersion");
                     return false;
                 }
 
@@ -304,8 +309,8 @@ public:
                     errmsg = str::stream() << "shard global version for collection is higher "
                                            << "than trying to set to '" << nss.ns() << "'";
                     result.append("ns", nss.ns());
-                    requestedVersion.addToBSON(result, "version");
-                    collectionShardVersion.addToBSON(result, "globalVersion");
+                    requestedVersion.appendLegacyWithField(&result, "version");
+                    collectionShardVersion.appendLegacyWithField(&result, "globalVersion");
                     result.appendBool("reloadConfig", true);
                     return false;
                 }
@@ -335,15 +340,18 @@ public:
 
         // Step 7
 
-        const auto status = onShardVersionMismatch(opCtx, nss, requestedVersion);
+        // Note: The forceRefresh flag controls whether we make sure to do our
+        // own refresh or if we're okay with joining another thread
+        const auto status = onShardVersionMismatch(
+            opCtx, nss, requestedVersion, forceRefresh /*forceRefreshFromThisThread*/);
 
         {
             AutoGetCollection autoColl(opCtx, nss, MODE_IS);
 
             ChunkVersion currVersion = ChunkVersion::UNSHARDED();
-            auto collMetadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
-            if (collMetadata) {
-                currVersion = collMetadata->getShardVersion();
+            auto metadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
+            if (metadata->isSharded()) {
+                currVersion = metadata->getShardVersion();
             }
 
             if (!status.isOK()) {
@@ -358,8 +366,8 @@ public:
                 warning() << errmsg;
 
                 result.append("ns", nss.ns());
-                requestedVersion.addToBSON(result, "version");
-                currVersion.addToBSON(result, "globalVersion");
+                requestedVersion.appendLegacyWithField(&result, "version");
+                currVersion.appendLegacyWithField(&result, "globalVersion");
                 result.appendBool("reloadConfig", true);
 
                 return false;
@@ -377,7 +385,7 @@ public:
                 // version reload.
 
                 result.append("ns", nss.ns());
-                currVersion.addToBSON(result, "globalVersion");
+                currVersion.appendLegacyWithField(&result, "globalVersion");
 
                 // If this was a reset of a collection or the last chunk moved out, inform mongos to
                 // do a full reload.
@@ -385,11 +393,11 @@ public:
                     result.appendBool("reloadConfig", true);
                     // Zero-version also needed to trigger full mongos reload, sadly
                     // TODO: Make this saner, and less impactful (full reload on last chunk is bad)
-                    ChunkVersion(0, 0, OID()).addToBSON(result, "version");
+                    ChunkVersion(0, 0, OID()).appendLegacyWithField(&result, "version");
                     // For debugging
-                    requestedVersion.addToBSON(result, "origVersion");
+                    requestedVersion.appendLegacyWithField(&result, "origVersion");
                 } else {
-                    requestedVersion.addToBSON(result, "version");
+                    requestedVersion.appendLegacyWithField(&result, "version");
                 }
 
                 return false;

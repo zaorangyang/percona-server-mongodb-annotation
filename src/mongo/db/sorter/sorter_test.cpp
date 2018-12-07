@@ -36,9 +36,7 @@
 #include "mongo/base/init.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/config.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/db/service_context_registrar.h"
+#include "mongo/platform/random.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/unittest/temp_dir.h"
 #include "mongo/unittest/unittest.h"
@@ -53,14 +51,6 @@ namespace mongo {
 using namespace mongo::sorter;
 using std::make_shared;
 using std::pair;
-
-namespace {
-
-// Stub to avoid including the server environment library.
-ServiceContextRegistrar serviceContextCreator([]() {
-    return std::make_unique<ServiceContextNoop>();
-});
-}  // namespace
 
 //
 // Sorter framework testing utilities
@@ -477,12 +467,12 @@ class Dupes : public Basic {
 template <bool Random = true>
 class LotsOfDataLittleMemory : public Basic {
 public:
-    LotsOfDataLittleMemory() : _array(new int[NUM_ITEMS]) {
+    LotsOfDataLittleMemory() : _array(new int[NUM_ITEMS]), _random(int64_t(time(0))) {
         for (int i = 0; i < NUM_ITEMS; i++)
             _array[i] = i;
 
         if (Random)
-            std::random_shuffle(_array.get(), _array.get() + NUM_ITEMS);
+            std::shuffle(_array.get(), _array.get() + NUM_ITEMS, _random.urbg());
     }
 
     SortOptions adjustSortOptions(SortOptions opts) {
@@ -516,6 +506,7 @@ public:
         MEM_LIMIT = 64 * 1024,
     };
     std::unique_ptr<int[]> _array;
+    PseudoRandom _random;
 };
 
 

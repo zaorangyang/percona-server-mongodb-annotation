@@ -66,13 +66,8 @@ public:
      * contains the currently active metadata.  When the usageCounter goes to zero, the RAII
      * object going out of scope will call _removeMetadata.
      */
-    ScopedCollectionMetadata getActiveMetadata(std::shared_ptr<MetadataManager> self);
-
-    /**
-     * Creates the metadata on demand for a specific point in time. The object is not tracked by
-     * the metadata manager.
-     */
-    ScopedCollectionMetadata createMetadataAt(OperationContext* opCtx, LogicalTime atCusterTime);
+    ScopedCollectionMetadata getActiveMetadata(std::shared_ptr<MetadataManager> self,
+                                               const boost::optional<LogicalTime>& atClusterTime);
 
     /**
      * Returns the number of CollectionMetadata objects being maintained on behalf of running
@@ -116,14 +111,6 @@ public:
      * Call waitStatus(opCtx) on the result to wait for the deletion to complete or fail.
      */
     CleanupNotification cleanUpRange(ChunkRange const& range, Date_t whenToDelete);
-
-    /**
-     * Returns a vector of ScopedCollectionMetadata objects representing metadata instances in use
-     * by running queries that overlap the argument range, suitable for identifying and invalidating
-     * those queries.
-     */
-    std::vector<ScopedCollectionMetadata> overlappingMetadata(
-        std::shared_ptr<MetadataManager> const& itself, ChunkRange const& range);
 
     /**
      * Returns the number of ranges scheduled to be cleaned, exclusive of such ranges that might
@@ -184,7 +171,7 @@ private:
 
     /**
      * Cancels all scheduled deletions of orphan ranges, notifying listeners with status
-     * InterruptedDueToReplStateChange.
+     * InterruptedDueToStepDown.
      */
     void _clearAllCleanups(WithLock);
 
@@ -270,44 +257,22 @@ public:
     ScopedCollectionMetadata(ScopedCollectionMetadata&& other);
     ScopedCollectionMetadata& operator=(ScopedCollectionMetadata&& other);
 
-    /**
-     * Dereferencing the ScopedCollectionMetadata dereferences the private CollectionMetadata.
-     */
-    CollectionMetadata* getMetadata() const;
-
-    CollectionMetadata* operator->() const {
-        return getMetadata();
+    const CollectionMetadata& get() const {
+        invariant(_metadataTracker);
+        return _metadataTracker->metadata;
     }
 
-    /**
-     * True if the ScopedCollectionMetadata stores a metadata (is not empty) and the collection is
-     * sharded.
-     */
-    operator bool() const {
-        return getMetadata() != nullptr;
+    const auto* operator-> () const {
+        return &get();
     }
 
-    /**
-     * Returns just the shard key fields, if collection is sharded, and the _id field, from `doc`.
-     * Does not alter any field values (e.g. by hashing); values are copied verbatim.
-     */
-    BSONObj extractDocumentKey(BSONObj const& doc) const;
+    const auto& operator*() const {
+        return get();
+    }
 
 private:
     friend ScopedCollectionMetadata MetadataManager::getActiveMetadata(
-        std::shared_ptr<MetadataManager>);
-
-    friend ScopedCollectionMetadata MetadataManager::createMetadataAt(OperationContext*,
-                                                                      LogicalTime);
-
-    friend std::vector<ScopedCollectionMetadata> MetadataManager::overlappingMetadata(
-        std::shared_ptr<MetadataManager> const&, ChunkRange const&);
-
-    /**
-     * Creates an empty ScopedCollectionMetadata, which is interpreted as if the collection is
-     * unsharded.
-     */
-    ScopedCollectionMetadata();
+        std::shared_ptr<MetadataManager>, const boost::optional<LogicalTime>&);
 
     /**
      * Increments the usageCounter in the specified CollectionMetadata.

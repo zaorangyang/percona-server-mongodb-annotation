@@ -46,6 +46,7 @@
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/query/explain_options.h"
 #include "mongo/db/query/tailable_mode.h"
+#include "mongo/db/server_options.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/string_map.h"
 #include "mongo/util/uuid.h"
@@ -102,7 +103,8 @@ public:
                       const AggregationRequest& request,
                       std::unique_ptr<CollatorInterface> collator,
                       std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
-                      StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces);
+                      StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces,
+                      boost::optional<UUID> collUUID);
 
     /**
      * Constructs an ExpressionContext to be used for MatchExpression parsing outside of the context
@@ -185,6 +187,14 @@ public:
         return tailableMode == TailableModeEnum::kTailableAndAwaitData;
     }
 
+    /**
+     * Sets the resolved definition for an involved namespace.
+     */
+    void setResolvedNamespace_forTest(const NamespaceString& nss,
+                                      ResolvedNamespace resolvedNamespace) {
+        _resolvedNamespaces[nss.coll()] = std::move(resolvedNamespace);
+    }
+
     // The explain verbosity requested by the user, or boost::none if no explain was requested.
     boost::optional<ExplainOptions::Verbosity> explain;
 
@@ -196,10 +206,13 @@ public:
     bool inMongos = false;
     bool allowDiskUse = false;
     bool bypassDocumentValidation = false;
-    bool inSnapshotReadOrMultiDocumentTransaction = false;
+    bool inMultiDocumentTransaction = false;
 
     NamespaceString ns;
+
+    // If known, the UUID of the execution namespace for this aggregation command.
     boost::optional<UUID> uuid;
+
     std::string tempDir;  // Defaults to empty to prevent external sorting in mongos.
 
     OperationContext* opCtx;

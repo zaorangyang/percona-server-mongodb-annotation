@@ -38,8 +38,6 @@
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/db/service_context_registrar.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/random.h"
 #include "mongo/rpc/command_request.h"
@@ -84,10 +82,6 @@ boost::optional<HostAndPort> extractHostInfo(const OpMsgRequest& request) {
     }
     return boost::none;
 }
-
-ServiceContextRegistrar serviceContextCreator([]() {
-    return std::make_unique<ServiceContextNoop>();
-});
 
 }  // namespace
 
@@ -142,7 +136,7 @@ private:
     HostSettingsMap _settings;
 };
 
-const ServiceContextNoop::Decoration<BridgeContext> BridgeContext::_get =
+const ServiceContext::Decoration<BridgeContext> BridgeContext::_get =
     ServiceContext::declareDecoration<BridgeContext>();
 
 BridgeContext* BridgeContext::get() {
@@ -156,6 +150,14 @@ public:
 
     transport::Session* operator->() {
         return _dest.get();
+    }
+
+    transport::SessionHandle& getSession() {
+        return _dest;
+    }
+
+    void setSession(transport::SessionHandle session) {
+        _dest = std::move(session);
     }
 
     const boost::optional<HostAndPort>& host() const {
@@ -224,48 +226,43 @@ class ServiceEntryPointBridge final : public ServiceEntryPointImpl {
 public:
     explicit ServiceEntryPointBridge(ServiceContext* svcCtx) : ServiceEntryPointImpl(svcCtx) {}
 
-    void startSession(transport::SessionHandle session) final;
     DbResponse handleRequest(OperationContext* opCtx, const Message& request) final;
 };
-
-void ServiceEntryPointBridge::startSession(transport::SessionHandle session) {
-    transport::SessionHandle dest = []() -> transport::SessionHandle {
-        HostAndPort destAddr{mongoBridgeGlobalParams.destUri};
-        const Seconds kConnectTimeout(30);
-        auto now = getGlobalServiceContext()->getFastClockSource()->now();
-        const auto connectExpiration = now + kConnectTimeout;
-        while (now < connectExpiration) {
-            auto tl = getGlobalServiceContext()->getTransportLayer();
-            auto sws = tl->connect(destAddr, transport::kGlobalSSLMode, connectExpiration - now);
-            auto status = sws.getStatus();
-            if (!status.isOK()) {
-                warning() << "Unable to establish connection to " << destAddr << ": " << status;
-                now = getGlobalServiceContext()->getFastClockSource()->now();
-            } else {
-                return std::move(sws.getValue());
-            }
-
-            sleepmillis(500);
-        }
-
-        return nullptr;
-    }();
-
-    if (!dest) {
-        log() << "end connection " << session->remote();
-        return;
-    }
-
-    auto& proxiedConn = ProxiedConnection::get(session);
-    proxiedConn._dest = std::move(dest);
-
-    ServiceEntryPointImpl::startSession(std::move(session));
-}
 
 DbResponse ServiceEntryPointBridge::handleRequest(OperationContext* opCtx, const Message& request) {
     const auto& source = opCtx->getClient()->session();
     auto& dest = ProxiedConnection::get(source);
     auto brCtx = BridgeContext::get();
+
+    if (!dest.getSession()) {
+        dest.setSession([]() -> transport::SessionHandle {
+            HostAndPort destAddr{mongoBridgeGlobalParams.destUri};
+            const Seconds kConnectTimeout(30);
+            auto now = getGlobalServiceContext()->getFastClockSource()->now();
+            const auto connectExpiration = now + kConnectTimeout;
+            while (now < connectExpiration) {
+                auto tl = getGlobalServiceContext()->getTransportLayer();
+                auto sws =
+                    tl->connect(destAddr, transport::kGlobalSSLMode, connectExpiration - now);
+                auto status = sws.getStatus();
+                if (!status.isOK()) {
+                    warning() << "Unable to establish connection to " << destAddr << ": " << status;
+                    now = getGlobalServiceContext()->getFastClockSource()->now();
+                } else {
+                    return std::move(sws.getValue());
+                }
+
+                sleepmillis(500);
+            }
+
+            return nullptr;
+        }());
+
+        if (!dest.getSession()) {
+            source->end();
+            uasserted(50861, str::stream() << "Unable to connect to " << source->remote());
+        }
+    }
 
     if (dest.inExhaust()) {
         DbMessage dbm(request);
@@ -424,7 +421,7 @@ int bridgeMain(int argc, char** argv, char** envp) {
     fassert(50766, serviceContext->getServiceExecutor()->start());
 
     transport::TransportLayerASIO::Options opts;
-    opts.ipList = "0.0.0.0";
+    opts.ipList.emplace_back("0.0.0.0");
     opts.port = mongoBridgeGlobalParams.port;
 
     serviceContext->setTransportLayer(std::make_unique<mongo::transport::TransportLayerASIO>(

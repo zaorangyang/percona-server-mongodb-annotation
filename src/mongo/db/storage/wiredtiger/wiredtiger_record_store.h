@@ -31,6 +31,7 @@
 
 #pragma once
 
+#include <memory>
 #include <set>
 #include <string>
 #include <wiredtiger.h>
@@ -41,6 +42,7 @@
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/mutex.h"
@@ -141,11 +143,12 @@ public:
 
     virtual Status insertRecords(OperationContext* opCtx,
                                  std::vector<Record>* records,
-                                 std::vector<Timestamp>* timestamps,
-                                 bool enforceQuota);
+                                 std::vector<Timestamp>* timestamps);
 
-    virtual StatusWith<RecordId> insertRecord(
-        OperationContext* opCtx, const char* data, int len, Timestamp timestamp, bool enforceQuota);
+    virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
+                                              const char* data,
+                                              int len,
+                                              Timestamp timestamp);
 
     virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
                                               const DocWriter* const* docs,
@@ -157,7 +160,6 @@ public:
                                 const RecordId& oldLocation,
                                 const char* data,
                                 int len,
-                                bool enforceQuota,
                                 UpdateNotifier* notifier);
 
     virtual bool updateWithDamagesSupported() const;
@@ -186,6 +188,10 @@ public:
     virtual bool compactsInPlace() const {
         return true;
     }
+
+    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const final;
+
+    virtual bool supportsRecoverToStableTimestamp() const final;
 
     virtual Status compact(OperationContext* opCtx,
                            RecordStoreCompactAdaptor* adaptor,
@@ -237,6 +243,11 @@ public:
     const std::string& getURI() const {
         return _uri;
     }
+
+    const std::string& getIdent() const override {
+        return _uri;
+    }
+
     uint64_t tableId() const {
         return _tableId;
     }
@@ -256,10 +267,6 @@ public:
      * restart. `reclaimOplog` will not truncate oplog entries in front of this time.
      */
     void reclaimOplog(OperationContext* opCtx, Timestamp persistedTimestamp);
-
-    int64_t cappedDeleteAsNeeded(OperationContext* opCtx, const RecordId& justInserted);
-
-    int64_t cappedDeleteAsNeeded_inlock(OperationContext* opCtx, const RecordId& justInserted);
 
     // Returns false if the oplog was dropped while waiting for a deletion request.
     bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx);
@@ -299,6 +306,16 @@ private:
     RecordData _getData(const WiredTigerCursor& cursor) const;
 
     /**
+     * Position the cursor at the first key. The previously known first key is
+     * provided, as well as an indicator that this is being positioned for
+     * use by a truncate call.
+     */
+    void _positionAtFirstRecordId(OperationContext* opCtx,
+                                  WT_CURSOR* cursor,
+                                  const RecordId& firstKey,
+                                  bool forTruncate) const;
+
+    /**
      * Adjusts the record count and data size metadata for this record store, respectively. These
      * functions consult the SizeRecoveryState to determine whether or not to actually change the
      * size metadata if the server is undergoing recovery.
@@ -318,6 +335,14 @@ private:
     void _changeNumRecords(OperationContext* opCtx, int64_t diff);
     void _increaseDataSize(OperationContext* opCtx, int64_t amount);
 
+    /**
+     * Delete records from this record store as needed while _cappedMaxSize or _cappedMaxDocs is
+     * exceeded.
+     *
+     * _inlock version to be called once a lock has been acquired.
+     */
+    int64_t _cappedDeleteAsNeeded(OperationContext* opCtx, const RecordId& justInserted);
+    int64_t _cappedDeleteAsNeeded_inlock(OperationContext* opCtx, const RecordId& justInserted);
 
     const std::string _uri;
     const uint64_t _tableId;  // not persisted
@@ -345,12 +370,9 @@ private:
     mutable stdx::timed_mutex _cappedDeleterMutex;
 
     AtomicInt64 _nextIdNum;
-    AtomicInt64 _dataSize;
-    AtomicInt64 _numRecords;
 
     WiredTigerSizeStorer* _sizeStorer;  // not owned, can be NULL
-    int _sizeStorerCounter;
-
+    std::shared_ptr<WiredTigerSizeStorer::SizeInfo> _sizeInfo;
     WiredTigerKVEngine* _kvEngine;  // not owned.
 
     // Non-null if this record store is underlying the active oplog.
@@ -505,11 +527,11 @@ private:
 
 
 // WT failpoint to throw write conflict exceptions randomly
-MONGO_FP_FORWARD_DECLARE(WTWriteConflictException);
-MONGO_FP_FORWARD_DECLARE(WTWriteConflictExceptionForReads);
+MONGO_FAIL_POINT_DECLARE(WTWriteConflictException);
+MONGO_FAIL_POINT_DECLARE(WTWriteConflictExceptionForReads);
 
 // Prevents oplog writes from being considered durable on the primary. Once activated, new writes
 // will not be considered durable until deactivated. It is unspecified whether writes that commit
 // before activation will become visible while active.
-MONGO_FP_FORWARD_DECLARE(WTPausePrimaryOplogDurabilityLoop);
+MONGO_FAIL_POINT_DECLARE(WTPausePrimaryOplogDurabilityLoop);
 }

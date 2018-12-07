@@ -98,6 +98,10 @@ public:
         return _supportsDBLocking;
     }
 
+    virtual bool supportsCappedCollections() const {
+        return _supportsCappedCollections;
+    }
+
     virtual Status closeDatabase(OperationContext* opCtx, StringData db);
 
     virtual Status dropDatabase(OperationContext* opCtx, StringData db);
@@ -120,7 +124,13 @@ public:
 
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
-    virtual void setOldestTimestamp(Timestamp oldestTimestamp) override;
+    virtual void setOldestTimestampFromStable() override;
+
+    virtual void setOldestTimestamp(Timestamp newOldestTimestamp) override;
+
+    virtual bool isCacheUnderPressure(OperationContext* opCtx) const override;
+
+    virtual void setCachePressureForTest(int pressure) override;
 
     virtual bool supportsRecoverToStableTimestamp() const override;
 
@@ -197,6 +207,7 @@ private:
 
     const bool _supportsDocLocking;
     const bool _supportsDBLocking;
+    const bool _supportsCappedCollections;
     Timestamp _initialDataTimestamp = Timestamp::kAllowUnstableCheckpointsSentinel;
 
     std::unique_ptr<RecordStore> _catalogRecordStore;

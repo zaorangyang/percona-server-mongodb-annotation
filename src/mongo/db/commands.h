@@ -216,12 +216,26 @@ struct CommandHelpers {
      */
     static BSONObj runCommandDirectly(OperationContext* opCtx, const OpMsgRequest& request);
 
-    static void logAuthViolation(OperationContext* opCtx,
-                                 const CommandInvocation* invocation,
-                                 const OpMsgRequest& request,
-                                 ErrorCodes::Error err);
+    /**
+     * If '!invocation', we're logging about a Command pre-parse. It has to punt on the logged
+     * namespace, giving only the request's $db. Since the Command hasn't parsed the request body,
+     * we can't know the collection part of that namespace, so we leave it blank in the audit log.
+     */
+    static void auditLogAuthEvent(OperationContext* opCtx,
+                                  const CommandInvocation* invocation,
+                                  const OpMsgRequest& request,
+                                  ErrorCodes::Error err);
 
     static void uassertNoDocumentSequences(StringData commandName, const OpMsgRequest& request);
+
+    /**
+     * Should be called before trying to Command::parse a request. Throws 'Unauthorized',
+     * and emits an audit log entry, as an early failure if the calling client can't invoke that
+     * Command. Returns true if no more auth checks should be performed.
+     */
+    static bool uassertShouldAttemptParse(OperationContext* opCtx,
+                                          const Command* command,
+                                          const OpMsgRequest& request);
 
     static constexpr StringData kHelpFieldName = "help"_sd;
 };
@@ -241,6 +255,9 @@ public:
      * @param oldName an optional old, deprecated name for the command
      */
     Command(StringData name, StringData oldName = StringData());
+
+    Command(const Command&) = delete;
+    Command& operator=(const Command&) = delete;
 
     // Do not remove or relocate the definition of this "key function".
     // See https://gcc.gnu.org/wiki/VerboseDiagnostics#missing_vtable
@@ -356,12 +373,12 @@ public:
     }
 
     /**
-     * Returns whether this operation is a read, write, or command.
+     * Returns whether this operation is a read, write, command, or multi-document transaction.
      *
      * Commands which implement database read or write logic should override this to return kRead
      * or kWrite as appropriate.
      */
-    enum class ReadWriteType { kCommand, kRead, kWrite };
+    enum class ReadWriteType { kCommand, kRead, kWrite, kTransaction };
     virtual ReadWriteType getReadWriteType() const {
         return ReadWriteType::kCommand;
     }
@@ -400,58 +417,16 @@ private:
     ServerStatusMetricField<Counter64> _commandsFailedMetric;
 };
 
-class CommandReplyBuilder {
-public:
-    explicit CommandReplyBuilder(BSONObjBuilder bodyObj);
-
-    CommandReplyBuilder(const CommandReplyBuilder&) = delete;
-    CommandReplyBuilder& operator=(const CommandReplyBuilder&) = delete;
-
-    /**
-     * Returns a BSONObjBuilder that can be used to build the reply in-place. The returned
-     * builder (or an object into which it has been moved) must be completed before calling
-     * any more methods on this object. A builder is completed by a call to `done()` or by
-     * its destructor. Can be called repeatedly to append multiple things to the reply, as
-     * long as each returned builder must be completed between calls.
-     */
-    BSONObjBuilder getBodyBuilder() const;
-
-    void reset();
-
-    /**
-     * Appends a key:object field to this reply.
-     */
-    template <typename T>
-    void append(StringData key, const T& object) {
-        getBodyBuilder() << key << object;
-    }
-
-    /**
-     * The specified 'object' must be BSON-serializable.
-     *
-     * BSONSerializable 'x' means 'x.serialize(bob)' appends a representation of 'x'
-     * into 'BSONObjBuilder* bob'.
-     */
-    template <typename T>
-    void fillFrom(const T& object) {
-        static_assert(!isStatusOrStatusWith<std::decay_t<T>>,
-                      "Status and StatusWith<T> aren't supported by TypedCommand and fillFrom(). "
-                      "Use uassertStatusOK() instead.");
-        auto bob = getBodyBuilder();
-        object.serialize(&bob);
-    }
-
-private:
-    BufBuilder* const _bodyBuf;
-    const std::size_t _bodyOffset;
-};
-
 /**
  * Represents a single invocation of a given command.
  */
 class CommandInvocation {
 public:
     CommandInvocation(const Command* definition) : _definition(definition) {}
+
+    CommandInvocation(const CommandInvocation&) = delete;
+    CommandInvocation& operator=(const CommandInvocation&) = delete;
+
     virtual ~CommandInvocation();
 
     /**
@@ -462,7 +437,7 @@ public:
      * indicated either by throwing (preferred), or by calling
      * `CommandHelpers::extractOrAppendOk`.
      */
-    virtual void run(OperationContext* opCtx, CommandReplyBuilder* result) = 0;
+    virtual void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) = 0;
 
     virtual void explain(OperationContext* opCtx,
                          ExplainOptions::Verbosity verbosity,
@@ -533,8 +508,6 @@ private:
      * Throws unless `opCtx`'s client is authorized to `run()` this.
      */
     virtual void doCheckAuthorization(OperationContext* opCtx) const = 0;
-
-    void _checkAuthorizationImpl(OperationContext* opCtx, const OpMsgRequest& request) const;
 
     const Command* const _definition;
 };
@@ -796,14 +769,14 @@ private:
     decltype(auto) _callTypedRun(OperationContext* opCtx) {
         return static_cast<Invocation*>(this)->typedRun(opCtx);
     }
-    void _runImpl(std::true_type, OperationContext* opCtx, CommandReplyBuilder*) {
+    void _runImpl(std::true_type, OperationContext* opCtx, rpc::ReplyBuilderInterface*) {
         _callTypedRun(opCtx);
     }
-    void _runImpl(std::false_type, OperationContext* opCtx, CommandReplyBuilder* reply) {
+    void _runImpl(std::false_type, OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) {
         reply->fillFrom(_callTypedRun(opCtx));
     }
 
-    void run(OperationContext* opCtx, CommandReplyBuilder* reply) final {
+    void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) final {
         using VoidResultTag = std::is_void<decltype(_callTypedRun(opCtx))>;
         _runImpl(VoidResultTag{}, opCtx, reply);
     }

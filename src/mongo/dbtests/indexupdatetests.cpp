@@ -40,7 +40,6 @@
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/dbtests/dbtests.h"
 
@@ -95,7 +94,7 @@ protected:
 
     const ServiceContext::UniqueOperationContext _txnPtr = cc().makeOperationContext();
     OperationContext& _opCtx = *_txnPtr;
-    OldClientWriteContext _ctx;
+    dbtests::WriteContextForTests _ctx;
     DBDirectClient _client;
 };
 
@@ -284,11 +283,11 @@ public:
             coll = db->createCollection(&_opCtx, _ns);
             // Drop all indexes including id index.
             coll->getIndexCatalog()->dropAllIndexes(&_opCtx, true);
-            // Insert some documents with enforceQuota=true.
+            // Insert some documents.
             int32_t nDocs = 1000;
             OpDebug* const nullOpDebug = nullptr;
             for (int32_t i = 0; i < nDocs; ++i) {
-                coll->insertDocument(&_opCtx, InsertStatement(BSON("a" << i)), nullOpDebug, true)
+                coll->insertDocument(&_opCtx, InsertStatement(BSON("a" << i)), nullOpDebug)
                     .transitional_ignore();
             }
             wunit.commit();
@@ -348,6 +347,11 @@ public:
 class InsertBuildIdIndexInterrupt : public IndexBuildBase {
 public:
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         // Recreate the collection as capped, without an _id index.
         Database* db = _ctx.db();
         Collection* coll;
@@ -387,6 +391,11 @@ public:
 class InsertBuildIdIndexInterruptDisallowed : public IndexBuildBase {
 public:
     void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
+        }
+
         // Recreate the collection as capped, without an _id index.
         Database* db = _ctx.db();
         Collection* coll;

@@ -11,23 +11,30 @@ load("jstests/free_mon/libs/free_mon.js");
 
     let options = {
         setParameter: "cloudFreeMonitoringEndpointURL=" + mock_web.getURL(),
-        enableFreeMonitoring: "on",
         verbose: 1,
     };
 
     const rst = new ReplSetTest({nodes: 2, nodeOptions: options});
+
     rst.startSet();
     rst.initiate();
     rst.awaitReplication();
 
+    sleep(10 * 1000);
+    assert.eq(0, mock_web.queryStats().registers, "mongod registered without enabling free_mod");
+
+    assert.commandWorked(rst.getPrimary().adminCommand({setFreeMonitoring: 1, action: "enable"}));
     WaitForRegistration(rst.getPrimary());
 
     mock_web.waitRegisters(2);
 
+    assert.eq(FreeMonGetServerStatus(rst.getPrimary()).state, 'enabled');
+    assert.eq(FreeMonGetServerStatus(rst.getSecondary()).state, 'enabled');
+
     const last_register = mock_web.query("last_register");
     print(tojson(last_register));
 
-    assert.eq(last_register.version, 1);
+    assert.eq(last_register.version, 2);
     assert.eq(last_register.payload.buildInfo.bits, 64);
     assert.eq(last_register.payload.buildInfo.ok, 1);
     assert.eq(last_register.payload.storageEngine.readOnly, false);

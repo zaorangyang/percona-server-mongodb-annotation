@@ -5,10 +5,7 @@
  *  - find command
  *  - aggregation
  *  - distinct
- *  - group
  *  - count
- *  - parallelCollectionScan
- *  - geoNear
  *  - geoSearch
  *
  * Each operation is tested on a single node, and (if supported) through mongos on both sharded and
@@ -56,12 +53,12 @@
                     'aggregate',
                     {readConcern: {level: 'majority'}, cursor: {batchSize: 0}, pipeline: []})));
         },
-        parallelCollectionScan: function(coll) {
-            var res = coll.runCommand('parallelCollectionScan',
-                                      {readConcern: {level: 'majority'}, numCursors: 1});
-            assert.commandWorked(res);
-            assert.eq(res.cursors.length, 1, tojson(res));
-            return makeCursor(coll.getDB(), res.cursors[0]);
+        aggregateGeoNear: function(coll) {
+            return makeCursor(coll.getDB(), assert.commandWorked(coll.runCommand('aggregate', {
+                readConcern: {level: 'majority'},
+                cursor: {batchSize: 0},
+                pipeline: [{$geoNear: {near: [0, 0], distanceField: "d", spherical: true}}]
+            })));
         },
     };
 
@@ -102,20 +99,6 @@
             expectedBefore: 'before',
             expectedAfter: 'after',
         },
-        geoNear: {
-            run: function(coll) {
-                var res = coll.runCommand('geoNear', {
-                    readConcern: {level: 'majority'},
-                    near: [0, 0],
-                    spherical: true,
-                });
-                assert.commandWorked(res);
-                assert.eq(res.results.length, 1, tojson(res));
-                return res.results[0].obj.state;
-            },
-            expectedBefore: 'before',
-            expectedAfter: 'after',
-        },
         geoSearch: {
             run: function(coll) {
                 var res = coll.runCommand('geoSearch', {
@@ -131,26 +114,6 @@
             expectedBefore: 'before',
             expectedAfter: 'after',
         },
-        group: {
-            run: function(coll) {
-                var res = coll.runCommand({
-                    'group': {
-                        ns: coll.getName(),
-                        key: {_id: 1},
-                        initial: {},
-                        $reduce: function(curr, result) {
-                            result.state = curr.state;
-                        },
-                    },
-                    readConcern: {level: 'majority'},
-                });
-                assert.commandWorked(res);
-                assert.eq(res.retval.length, 1, tojson(res));
-                return res.retval[0].state;
-            },
-            expectedBefore: 'before',
-            expectedAfter: 'after',
-        },
     };
 
     function runTests(coll, mongodConnection) {
@@ -161,20 +124,21 @@
             assert.commandWorked(mongodConnection.adminCommand({"setCommittedSnapshot": snapshot}));
         }
 
+        assert.commandWorked(coll.createIndex({point: '2dsphere'}));
         for (var testName in cursorTestCases) {
             jsTestLog('Running ' + testName + ' against ' + coll.toString());
             var getCursor = cursorTestCases[testName];
 
             // Setup initial state.
             assert.writeOK(coll.remove({}));
-            assert.writeOK(coll.save({_id: 1, state: 'before'}));
+            assert.writeOK(coll.save({_id: 1, state: 'before', point: [0, 0]}));
             setCommittedSnapshot(makeSnapshot());
 
             // Check initial conditions.
             assert.eq(getCursor(coll).next().state, 'before');
 
             // Change state without making it committed.
-            assert.writeOK(coll.save({_id: 1, state: 'after'}));
+            assert.writeOK(coll.save({_id: 1, state: 'after', point: [0, 0]}));
 
             // Cursor still sees old state.
             assert.eq(getCursor(coll).next().state, 'before');
@@ -192,7 +156,6 @@
             assert.eq(oldCursor.next().state, 'after');
         }
 
-        assert.commandWorked(coll.ensureIndex({point: '2dsphere'}));
         assert.commandWorked(coll.ensureIndex({point: 'geoHaystack', _id: 1}, {bucketSize: 1}));
         for (var testName in nonCursorTestCases) {
             jsTestLog('Running ' + testName + ' against ' + coll.toString());
@@ -253,7 +216,7 @@
 
     // Remove tests of commands that aren't supported at all through mongos, even on unsharded
     // collections.
-    ['parallelCollectionScan', 'geoSearch'].forEach(function(cmd) {
+    ['geoSearch'].forEach(function(cmd) {
         // Make sure it really isn't supported.
         assert.eq(shardingTest.getDB('test').coll.runCommand(cmd).code, ErrorCodes.CommandNotFound);
         delete cursorTestCases[cmd];
@@ -276,13 +239,6 @@
         var db = shardingTest.getDB("throughMongos");
         var collection = db.shardedCollection;
         shardingTest.adminCommand({shardCollection: collection.getFullName(), key: {_id: 1}});
-
-        // The group command isn't supported on sharded collections. It also uses a weird syntax so
-        // code to check that it isn't supported can't be reused with other commands.
-        assert.eq(collection.runCommand({'group': {ns: collection.getName()}}).code,
-                  ErrorCodes.IllegalOperation);
-        delete nonCursorTestCases.group;
-
         runTests(collection, mongod);
     })();
 

@@ -30,7 +30,7 @@
 
 #include "vm/PosixNSPR.h"
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/scripting/mozjs/engine.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/functional.h"
@@ -111,13 +111,16 @@ public:
 
     void reset() override;
 
+    /**
+     * Thread safe. Kills the running operation
+     */
+    void kill() override;
+
     bool isKillPending() const override;
 
     void registerOperation(OperationContext* opCtx) override;
 
     void unregisterOperation() override;
-
-    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) override;
 
     void externalSetup() override;
 
@@ -170,11 +173,6 @@ public:
     ScriptingFunction _createFunction(const char* code) override;
 
     OperationContext* getOpContext() const;
-
-    /**
-     * Thread safe. Kills the running operation
-     */
-    void kill();
 
     void interrupt();
 

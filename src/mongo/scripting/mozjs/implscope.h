@@ -31,7 +31,7 @@
 #include <jsapi.h>
 #include <vm/PosixNSPR.h>
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/scripting/mozjs/bindata.h"
 #include "mongo/scripting/mozjs/bson.h"
 #include "mongo/scripting/mozjs/code.h"
@@ -91,7 +91,7 @@ public:
 
     void reset() override;
 
-    void kill();
+    void kill() override;
 
     void interrupt();
 
@@ -102,8 +102,6 @@ public:
     void registerOperation(OperationContext* opCtx) override;
 
     void unregisterOperation() override;
-
-    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) override;
 
     void externalSetup() override;
 
@@ -245,11 +243,6 @@ public:
     }
 
     template <typename T>
-    typename std::enable_if<std::is_same<T, MongoLocalInfo>::value, WrapType<T>&>::type getProto() {
-        return _mongoLocalProto;
-    }
-
-    template <typename T>
     typename std::enable_if<std::is_same<T, NativeFunctionInfo>::value, WrapType<T>&>::type
     getProto() {
         return _nativeFunctionProto;
@@ -364,6 +357,8 @@ public:
         static ASANHandles* getThreadASANHandles();
     };
 
+    void setStatus(Status status);
+
 private:
     template <typename ImplScopeFunction>
     auto _runSafely(ImplScopeFunction&& functionToRun) -> decltype(functionToRun());
@@ -387,12 +382,9 @@ private:
 
     /**
      * The connection state of the scope.
-     *
-     * This is for dbeval and the shell
      */
     enum class ConnectState : char {
         Not,
-        Local,
         External,
     };
 
@@ -419,8 +411,8 @@ private:
     JS::HandleObject _global;
     std::vector<JS::PersistentRootedValue> _funcs;
     InternedStringTable _internedStrings;
-    std::atomic<bool> _pendingKill;
-    std::mutex _sleepMutex;
+    Status _killStatus;
+    mutable std::mutex _mutex;
     std::condition_variable _sleepCondition;
     std::string _error;
     unsigned int _opId;        // op id for this scope
@@ -451,7 +443,6 @@ private:
     WrapType<MinKeyInfo> _minKeyProto;
     WrapType<MongoExternalInfo> _mongoExternalProto;
     WrapType<MongoHelpersInfo> _mongoHelpersProto;
-    WrapType<MongoLocalInfo> _mongoLocalProto;
     WrapType<NativeFunctionInfo> _nativeFunctionProto;
     WrapType<NumberDecimalInfo> _numberDecimalProto;
     WrapType<NumberIntInfo> _numberIntProto;

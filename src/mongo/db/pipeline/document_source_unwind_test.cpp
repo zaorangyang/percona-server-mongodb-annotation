@@ -676,11 +676,11 @@ TEST_F(UnwindStageTest, AddsUnwoundPathToDependencies) {
     auto unwind =
         DocumentSourceUnwind::create(getExpCtx(), "x.y.z", false, boost::optional<string>("index"));
     DepsTracker dependencies;
-    ASSERT_EQUALS(DocumentSource::SEE_NEXT, unwind->getDependencies(&dependencies));
+    ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, unwind->getDependencies(&dependencies));
     ASSERT_EQUALS(1U, dependencies.fields.size());
     ASSERT_EQUALS(1U, dependencies.fields.count("x.y.z"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 TEST_F(UnwindStageTest, TruncatesOutputSortAtUnwoundPath) {

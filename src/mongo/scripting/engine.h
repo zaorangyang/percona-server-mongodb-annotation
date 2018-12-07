@@ -63,7 +63,6 @@ public:
         init(&o);
     }
 
-    virtual void localConnectForDbEval(OperationContext* opCtx, const char* dbName) = 0;
     virtual void externalSetup() = 0;
     virtual void setLocalDB(const std::string& localDBName) {
         _localDBName = localDBName;
@@ -95,6 +94,8 @@ public:
     virtual std::string getError() = 0;
 
     virtual bool hasOutOfMemoryException() = 0;
+
+    virtual void kill() = 0;
 
     virtual bool isKillPending() const = 0;
 

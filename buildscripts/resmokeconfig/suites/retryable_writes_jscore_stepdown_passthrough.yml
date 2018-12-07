@@ -72,6 +72,10 @@ selector:
   - jstests/core/startup_log.js # Checks pid, which is different on each server.
   - jstests/core/validate_cmd_ns.js # Calls _exec() directly, not retryable.
 
+  # Runs an explain expected to run for several seconds -- failovers may
+  # exhaust retry attempts
+  - jstests/core/explain2.js
+
   exclude_with_any_tags:
   ##
   # The next four tags correspond to the special errors thrown by the auto_retry_on_network_error.js
@@ -106,9 +110,6 @@ selector:
   - assumes_read_concern_unchanged
   # "Cowardly refusing to override write concern of command: ..."
   - assumes_write_concern_unchanged
-  # "Cowardly refusing to run test with overridden write concern when it uses a command that can
-  #  only perform w=1 writes: ..."
-  - requires_eval_command
 
 executor:
   archive:
@@ -162,6 +163,4 @@ executor:
     num_nodes: 3
     replset_config_options:
       settings:
-        # Speeds up failover, reduces chance DBClientRS times out retargeting the primary.
-        electionTimeoutMillis: 6500
         catchUpTimeoutMillis: 0

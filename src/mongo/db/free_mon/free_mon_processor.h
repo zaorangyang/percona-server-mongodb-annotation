@@ -247,7 +247,9 @@ public:
 
         if (_count > 0) {
             --_count;
-            _condvar.notify_one();
+            if (_count == 0) {
+                _condvar.notify_one();
+            }
         }
     }
 
@@ -270,6 +272,27 @@ private:
     size_t _count;
 };
 
+/**
+ * In-memory registration status
+ *
+ * Ensures primaries and secondaries register separately
+ */
+enum class FreeMonRegistrationStatus {
+    /**
+     * Free monitoring is not enabled - default state.
+     */
+    kDisabled,
+
+    /**
+     * Registration in progress.
+     */
+    kPending,
+
+    /**
+     * Free Monitoring is enabled.
+     */
+    kEnabled,
+};
 
 /**
  * Process in an Agent in a Agent/Message Passing model.
@@ -281,7 +304,8 @@ public:
     FreeMonProcessor(FreeMonCollectorCollection& registration,
                      FreeMonCollectorCollection& metrics,
                      FreeMonNetworkInterface* network,
-                     bool useCrankForTest);
+                     bool useCrankForTest,
+                     Seconds metricsGatherInterval);
 
     /**
      * Enqueue a message to process
@@ -471,10 +495,13 @@ private:
     boost::synchronized_value<boost::optional<FreeMonStorageState>> _lastReadState;
 
     // When we change to primary, do we register?
-    bool _registerOnTransitionToPrimary{false};
+    RegistrationType _registerOnTransitionToPrimary{RegistrationType::DoNotRegister};
 
     // Pending update to disk
     boost::synchronized_value<FreeMonStorageState> _state;
+
+    // In-memory registration status
+    FreeMonRegistrationStatus _registrationStatus{FreeMonRegistrationStatus::kDisabled};
 
     // Countdown launch to support manual cranking
     FreeMonCountdownLatch _countdown;

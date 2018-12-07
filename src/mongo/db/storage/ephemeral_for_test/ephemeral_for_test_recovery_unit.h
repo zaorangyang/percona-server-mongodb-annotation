@@ -64,17 +64,21 @@ public:
         _changes.push_back(ChangePtr(change));
     }
 
-    virtual void* writingPtr(void* data, size_t len) {
-        MONGO_UNREACHABLE;
-    }
-
-    virtual void setRollbackWritesDisabled() {}
-
     virtual SnapshotId getSnapshotId() const {
         return SnapshotId();
     }
 
     virtual void setOrderedCommit(bool orderedCommit) {}
+
+    virtual void prepareUnitOfWork() override {}
+
+    virtual void setPrepareTimestamp(Timestamp ts) override {
+        _prepareTimestamp = ts;
+    }
+
+    virtual Timestamp getPrepareTimestamp() const override {
+        return _prepareTimestamp;
+    }
 
 private:
     typedef std::shared_ptr<Change> ChangePtr;
@@ -82,6 +86,8 @@ private:
 
     Changes _changes;
     stdx::function<void()> _waitUntilDurableCallback;
+
+    Timestamp _prepareTimestamp = Timestamp::min();
 };
 
 }  // namespace mongo

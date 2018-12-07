@@ -113,7 +113,7 @@ mongo::Status mongo::cloneCollectionAsCapped(OperationContext* opCtx,
                                              Database* db,
                                              const std::string& shortFrom,
                                              const std::string& shortTo,
-                                             double size,
+                                             long long size,
                                              bool temp) {
     NamespaceString fromNss(db->name(), shortFrom);
     NamespaceString toNss(db->name(), shortTo);
@@ -231,7 +231,7 @@ mongo::Status mongo::cloneCollectionAsCapped(OperationContext* opCtx,
             // Go to the next document
             retries = 0;
         } catch (const WriteConflictException&) {
-            CurOp::get(opCtx)->debug().writeConflicts++;
+            CurOp::get(opCtx)->debug().additiveMetrics.incrementWriteConflicts(1);
             retries++;  // logAndBackoff expects this to be 1 on first call.
             WriteConflictException::logAndBackoff(retries, "cloneCollectionAsCapped", fromNss.ns());
 
@@ -251,7 +251,7 @@ mongo::Status mongo::cloneCollectionAsCapped(OperationContext* opCtx,
 
 mongo::Status mongo::convertToCapped(OperationContext* opCtx,
                                      const NamespaceString& collectionName,
-                                     double size) {
+                                     long long size) {
     StringData dbname = collectionName.db();
     StringData shortSource = collectionName.coll();
 

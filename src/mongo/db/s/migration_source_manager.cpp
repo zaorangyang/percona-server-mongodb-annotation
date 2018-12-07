@@ -54,7 +54,6 @@
 #include "mongo/s/request_types/commit_chunk_migration_request_type.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
-#include "mongo/s/stale_exception.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/exit.h"
@@ -74,7 +73,6 @@ const auto msmForCss = CollectionShardingState::declareDecoration<MigrationSourc
 // entered
 const Hours kMaxWaitToEnterCriticalSectionTimeout(6);
 const char kMigratedChunkVersionField[] = "migratedChunkVersion";
-const char kControlChunkVersionField[] = "controlChunkVersion";
 const char kWriteConcernField[] = "writeConcern";
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
@@ -112,7 +110,7 @@ void refreshRecipientRoutingTable(OperationContext* opCtx,
 }
 
 Status checkCollectionEpochMatches(const ScopedCollectionMetadata& metadata, OID expectedEpoch) {
-    if (metadata && metadata->getCollVersion().epoch() == expectedEpoch)
+    if (metadata->isSharded() && metadata->getCollVersion().epoch() == expectedEpoch)
         return Status::OK();
 
     return {ErrorCodes::IncompatibleShardingMetadata,
@@ -120,16 +118,16 @@ Status checkCollectionEpochMatches(const ScopedCollectionMetadata& metadata, OID
                           << "Expected collection epoch: "
                           << expectedEpoch.toString()
                           << ", but found: "
-                          << (metadata ? metadata->getCollVersion().epoch().toString()
-                                       : "unsharded collection.")};
+                          << (metadata->isSharded() ? metadata->getCollVersion().epoch().toString()
+                                                    : "unsharded collection.")};
 }
 
 }  // namespace
 
-MONGO_FP_DECLARE(doNotRefreshRecipientAfterCommit);
-MONGO_FP_DECLARE(failMigrationCommit);
-MONGO_FP_DECLARE(hangBeforeLeavingCriticalSection);
-MONGO_FP_DECLARE(migrationCommitNetworkError);
+MONGO_FAIL_POINT_DEFINE(doNotRefreshRecipientAfterCommit);
+MONGO_FAIL_POINT_DEFINE(failMigrationCommit);
+MONGO_FAIL_POINT_DEFINE(hangBeforeLeavingCriticalSection);
+MONGO_FAIL_POINT_DEFINE(migrationCommitNetworkError);
 
 MigrationSourceManager* MigrationSourceManager::get(CollectionShardingState& css) {
     return msmForCss(css);
@@ -172,7 +170,7 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
         auto metadata = CollectionShardingState::get(opCtx, getNss())->getMetadata(opCtx);
         uassert(ErrorCodes::IncompatibleShardingMetadata,
                 str::stream() << "cannot move chunks for an unsharded collection",
-                metadata);
+                metadata->isSharded());
 
         return std::make_tuple(std::move(metadata), std::move(collectionUUID));
     }();
@@ -319,17 +317,7 @@ Status MigrationSourceManager::enterCriticalSection(OperationContext* opCtx) {
         return status;
     }
 
-    {
-        // The critical section must be entered with collection X lock in order to ensure there are
-        // no writes which could have entered and passed the version check just before we entered
-        // the crticial section, but managed to complete after we left it.
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-        AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_X);
-
-        // IMPORTANT: After this line, the critical section is in place and needs to be signaled
-        CollectionShardingState::get(opCtx, _args.getNss())
-            ->enterCriticalSectionCatchUpPhase(opCtx);
-    }
+    _critSec.emplace(opCtx, _args.getNss());
 
     _state = kCriticalSection;
 
@@ -403,14 +391,6 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
         if (!status.isOK())
             return status;
 
-        boost::optional<ChunkType> controlChunkType = boost::none;
-        ChunkType differentChunk;
-        if (metadata->getDifferentChunk(_args.getMinKey(), &differentChunk)) {
-            controlChunkType = std::move(differentChunk);
-        } else {
-            log() << "Moving last chunk for the collection out";
-        }
-
         ChunkType migratedChunkType;
         migratedChunkType.setMin(_args.getMinKey());
         migratedChunkType.setMax(_args.getMaxKey());
@@ -421,7 +401,6 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
             _args.getFromShardId(),
             _args.getToShardId(),
             migratedChunkType,
-            controlChunkType,
             metadata->getCollVersion(),
             LogicalClock::get(opCtx)->getClusterTime().asTimestamp());
 
@@ -430,11 +409,7 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
 
     // Read operations must begin to wait on the critical section just before we send the commit
     // operation to the config server
-    {
-        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-        AutoGetCollection autoColl(opCtx, getNss(), MODE_IX, MODE_X);
-        CollectionShardingState::get(opCtx, _args.getNss())->enterCriticalSectionCommitPhase(opCtx);
-    }
+    _critSec->enterCommitPhase();
 
     Timer t;
 
@@ -554,7 +529,7 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig(OperationContext* opC
         return CollectionShardingState::get(opCtx, getNss())->getMetadata(opCtx);
     }();
 
-    if (!refreshedMetadata) {
+    if (!refreshedMetadata->isSharded()) {
         return {ErrorCodes::NamespaceNotSharded,
                 str::stream() << "Chunk move failed because collection '" << getNss().ns()
                               << "' is no longer sharded. The migration commit error was: "
@@ -698,7 +673,7 @@ void MigrationSourceManager::_cleanup(OperationContext* opCtx) {
         auto css = CollectionShardingState::get(opCtx, getNss());
 
         invariant(this == std::exchange(msmForCss(css), nullptr));
-        css->exitCriticalSection(opCtx);
+        _critSec.reset();
         return std::move(_cloneDriver);
     }();
 

@@ -51,7 +51,7 @@ namespace {
 // transaction is not prepared. This should always be enabled if WTPrepareConflictForReads is
 // used, which fails randomly. If this is not enabled, no prepare conflicts will be resolved,
 // because the recovery unit may not ever actually be in a prepared state.
-MONGO_FP_DECLARE(WTAlwaysNotifyPrepareConflictWaiters);
+MONGO_FAIL_POINT_DEFINE(WTAlwaysNotifyPrepareConflictWaiters);
 
 // SnapshotIds need to be globally unique, as they are used in a WorkingSetMember to
 // determine if documents changed, but a different recovery unit may be used across a getMore,
@@ -236,11 +236,6 @@ void WiredTigerRecoveryUnit::preallocateSnapshot() {
     getSession();
 }
 
-void* WiredTigerRecoveryUnit::writingPtr(void* data, size_t len) {
-    // This API should not be used for anything other than the MMAP V1 storage engine
-    MONGO_UNREACHABLE;
-}
-
 void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     invariant(_active);
     WT_SESSION* s = _session->getSession();
@@ -344,7 +339,8 @@ void WiredTigerRecoveryUnit::_txnOpen() {
     WT_SESSION* session = _session->getSession();
 
     switch (_timestampReadSource) {
-        case ReadSource::kNone: {
+        case ReadSource::kUnset:
+        case ReadSource::kNoTimestamp: {
             WiredTigerBeginTxnBlock txnOpen(session, _ignorePrepared);
 
             if (_isOplogReader) {
@@ -458,10 +454,35 @@ void WiredTigerRecoveryUnit::clearCommitTimestamp() {
 
 void WiredTigerRecoveryUnit::setPrepareTimestamp(Timestamp timestamp) {
     invariant(_inUnitOfWork);
-    invariant(_prepareTimestamp.isNull());
-    invariant(_commitTimestamp.isNull());
+    invariant(_prepareTimestamp.isNull(),
+              str::stream() << "Trying to set prepare timestamp to " << timestamp.toString()
+                            << ". It's already set to "
+                            << _prepareTimestamp.toString());
+    invariant(_commitTimestamp.isNull(),
+              str::stream() << "Commit timestamp is " << _commitTimestamp.toString()
+                            << " and trying to set prepare timestamp to "
+                            << timestamp.toString());
+    invariant(!_lastTimestampSet,
+              str::stream() << "Last timestamp set is " << _lastTimestampSet->toString()
+                            << " and trying to set prepare timestamp to "
+                            << timestamp.toString());
 
     _prepareTimestamp = timestamp;
+}
+
+Timestamp WiredTigerRecoveryUnit::getPrepareTimestamp() const {
+    invariant(_inUnitOfWork);
+    invariant(!_prepareTimestamp.isNull());
+    invariant(_commitTimestamp.isNull(),
+              str::stream() << "Commit timestamp is " << _commitTimestamp.toString()
+                            << " and trying to get prepare timestamp of "
+                            << _prepareTimestamp.toString());
+    invariant(!_lastTimestampSet,
+              str::stream() << "Last timestamp set is " << _lastTimestampSet->toString()
+                            << " and trying to get prepare timestamp of "
+                            << _prepareTimestamp.toString());
+
+    return _prepareTimestamp;
 }
 
 void WiredTigerRecoveryUnit::setIgnorePrepared(bool value) {
@@ -474,7 +495,7 @@ void WiredTigerRecoveryUnit::setTimestampReadSource(ReadSource readSource,
     LOG(3) << "setting timestamp read source: " << static_cast<int>(readSource)
            << ", provided timestamp: " << ((provided) ? provided->toString() : "none");
 
-    invariant(!_active || _timestampReadSource == ReadSource::kNone ||
+    invariant(!_active || _timestampReadSource == ReadSource::kUnset ||
               _timestampReadSource == readSource);
     invariant(!provided == (readSource != ReadSource::kProvided));
     invariant(!(provided && provided->isNull()));

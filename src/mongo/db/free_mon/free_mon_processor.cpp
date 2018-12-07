@@ -52,7 +52,8 @@ namespace mongo {
 
 namespace {
 
-constexpr auto kProtocolVersion = 1;
+constexpr auto kMinProtocolVersion = 1;
+constexpr auto kMaxProtocolVersion = 2;
 constexpr auto kStorageVersion = 1;
 
 constexpr auto kRegistrationIdMaxLength = 4096;
@@ -60,10 +61,10 @@ constexpr auto kInformationalURLMaxLength = 4096;
 constexpr auto kInformationalMessageMaxLength = 4096;
 constexpr auto kUserReminderMaxLength = 4096;
 
-constexpr Seconds kDefaultMetricsGatherInterval(1);
+constexpr auto kReportingIntervalSecondsMin = 1;
+constexpr auto kReportingIntervalSecondsMax = 30 * 60 * 60 * 24;
 
-constexpr auto kReportingIntervalMinutesMin = 1;
-constexpr auto kReportingIntervalMinutesMax = 60 * 60 * 24;
+constexpr auto kMetricsRequestArrayElement = "data"_sd;
 
 int64_t randomJitter(PseudoRandom& random, int64_t min, int64_t max) {
     dassert(max > min);
@@ -121,14 +122,15 @@ bool MetricsRetryCounter::incrementError() {
 FreeMonProcessor::FreeMonProcessor(FreeMonCollectorCollection& registration,
                                    FreeMonCollectorCollection& metrics,
                                    FreeMonNetworkInterface* network,
-                                   bool useCrankForTest)
+                                   bool useCrankForTest,
+                                   Seconds metricsGatherInterval)
     : _registration(registration),
       _metrics(metrics),
       _network(network),
       _random(Date_t::now().asInt64()),
       _registrationRetry(RegistrationRetryCounter(_random)),
       _metricsRetry(MetricsRetryCounter(_random)),
-      _metricsGatherInterval(kDefaultMetricsGatherInterval),
+      _metricsGatherInterval(metricsGatherInterval),
       _queue(useCrankForTest) {
     _registrationRetry->reset();
     _metricsRetry->reset();
@@ -268,13 +270,13 @@ void FreeMonProcessor::readState(OperationContext* opCtx) {
     _lastReadState = state;
 
     if (state.is_initialized()) {
-        invariant(state.get().getVersion() == kProtocolVersion);
+        invariant(state.get().getVersion() == kStorageVersion);
 
         _state = state.get();
     } else if (!state.is_initialized()) {
         // Default the state
         auto state = _state.synchronize();
-        state->setVersion(kProtocolVersion);
+        state->setVersion(kStorageVersion);
         state->setState(StorageStateEnum::disabled);
         state->setRegistrationId("");
         state->setInformationalURL("");
@@ -316,10 +318,16 @@ void FreeMonProcessor::writeState(Client* client) {
 void FreeMonProcessor::doServerRegister(
     Client* client, const FreeMonMessageWithPayload<FreeMonMessageType::RegisterServer>* msg) {
 
+    // Enqueue the first metrics gather first so we have something to send on intial registration
+    enqueue(FreeMonMessage::createNow(FreeMonMessageType::MetricsCollect));
+
     // If we are asked to register now, then kick off a registration request
-    if (msg->getPayload().first == RegistrationType::RegisterOnStart) {
+    const auto regType = msg->getPayload().first;
+    if (regType == RegistrationType::RegisterOnStart) {
         enqueue(FreeMonRegisterCommandMessage::createNow(msg->getPayload().second));
-    } else if (msg->getPayload().first == RegistrationType::RegisterAfterOnTransitionToPrimary) {
+    } else {
+        invariant((regType == RegistrationType::RegisterAfterOnTransitionToPrimary) ||
+                  (regType == RegistrationType::RegisterAfterOnTransitionToPrimaryIfEnabled));
         // Check if we need to wait to become primary:
         // If the 'admin.system.version' has content, do not wait and just re-register
         // If the collection is empty, wait until we become primary
@@ -336,7 +344,7 @@ void FreeMonProcessor::doServerRegister(
         // 2. a standalone which has never been registered
         //
         if (!state.is_initialized()) {
-            _registerOnTransitionToPrimary = true;
+            _registerOnTransitionToPrimary = regType;
         } else {
             // We are standalone, if we have a registration id, then send a registration
             // notification, else wait for the user to register us
@@ -344,12 +352,7 @@ void FreeMonProcessor::doServerRegister(
                 enqueue(FreeMonRegisterCommandMessage::createNow(msg->getPayload().second));
             }
         }
-    } else {
-        MONGO_UNREACHABLE;
     }
-
-    // Enqueue the first metrics gather unless we are not going to register
-    enqueue(FreeMonMessage::createNow(FreeMonMessageType::MetricsCollect));
 }
 
 namespace {
@@ -409,7 +412,9 @@ void FreeMonProcessor::doCommandRegister(Client* client,
         req.setId(regid);
     }
 
-    req.setVersion(kProtocolVersion);
+    req.setVersion(kMaxProtocolVersion);
+
+    req.setLocalTime(client->getServiceContext()->getPreciseClockSource()->now());
 
     if (!msg->getPayload().empty()) {
         // Cache the tags for subsequent retries
@@ -427,6 +432,7 @@ void FreeMonProcessor::doCommandRegister(Client* client,
 
     // Record that the registration is pending
     _state->setState(StorageStateEnum::pending);
+    _registrationStatus = FreeMonRegistrationStatus::kPending;
 
     writeState(client);
 
@@ -447,12 +453,14 @@ void FreeMonProcessor::doCommandRegister(Client* client,
 
 Status FreeMonProcessor::validateRegistrationResponse(const FreeMonRegistrationResponse& resp) {
     // Any validation failure stops registration from proceeding to upload
-    if (resp.getVersion() != kProtocolVersion) {
+    if (!(resp.getVersion() >= kMinProtocolVersion && resp.getVersion() <= kMaxProtocolVersion)) {
         return Status(ErrorCodes::FreeMonHttpPermanentFailure,
                       str::stream()
-                          << "Unexpected registration response protocol version, expected '"
-                          << kProtocolVersion
-                          << "', received '"
+                          << "Unexpected registration response protocol version, expected ("
+                          << kMinProtocolVersion
+                          << ", "
+                          << kMaxProtocolVersion
+                          << "), received '"
                           << resp.getVersion()
                           << "'");
     }
@@ -490,14 +498,14 @@ Status FreeMonProcessor::validateRegistrationResponse(const FreeMonRegistrationR
                                     << "'");
     }
 
-    if (resp.getReportingInterval() < kReportingIntervalMinutesMin ||
-        resp.getReportingInterval() > kReportingIntervalMinutesMax) {
+    if (resp.getReportingInterval() < kReportingIntervalSecondsMin ||
+        resp.getReportingInterval() > kReportingIntervalSecondsMax) {
         return Status(ErrorCodes::FreeMonHttpPermanentFailure,
                       str::stream() << "Reporting Interval '" << resp.getReportingInterval()
                                     << "' must be in the range ["
-                                    << kReportingIntervalMinutesMin
+                                    << kReportingIntervalSecondsMin
                                     << ","
-                                    << kReportingIntervalMinutesMax
+                                    << kReportingIntervalSecondsMax
                                     << "]");
     }
 
@@ -521,11 +529,13 @@ void FreeMonProcessor::notifyPendingRegisters(const Status s) {
 
 Status FreeMonProcessor::validateMetricsResponse(const FreeMonMetricsResponse& resp) {
     // Any validation failure stops registration from proceeding to upload
-    if (resp.getVersion() != kProtocolVersion) {
+    if (!(resp.getVersion() >= kMinProtocolVersion && resp.getVersion() <= kMaxProtocolVersion)) {
         return Status(ErrorCodes::FreeMonHttpPermanentFailure,
-                      str::stream() << "Unexpected metrics response protocol version, expected '"
-                                    << kProtocolVersion
-                                    << "', received '"
+                      str::stream() << "Unexpected metrics response protocol version, expected ("
+                                    << kMinProtocolVersion
+                                    << ", "
+                                    << kMaxProtocolVersion
+                                    << "), received '"
                                     << resp.getVersion()
                                     << "'");
     }
@@ -566,14 +576,14 @@ Status FreeMonProcessor::validateMetricsResponse(const FreeMonMetricsResponse& r
                                     << "'");
     }
 
-    if (resp.getReportingInterval() < kReportingIntervalMinutesMin ||
-        resp.getReportingInterval() > kReportingIntervalMinutesMax) {
+    if (resp.getReportingInterval() < kReportingIntervalSecondsMin ||
+        resp.getReportingInterval() > kReportingIntervalSecondsMax) {
         return Status(ErrorCodes::FreeMonHttpPermanentFailure,
                       str::stream() << "Reporting Interval '" << resp.getReportingInterval()
                                     << "' must be in the range ["
-                                    << kReportingIntervalMinutesMin
+                                    << kReportingIntervalSecondsMin
                                     << ","
-                                    << kReportingIntervalMinutesMax
+                                    << kReportingIntervalSecondsMax
                                     << "]");
     }
 
@@ -594,7 +604,7 @@ void FreeMonProcessor::doAsyncRegisterComplete(
     // Our request is no longer in-progress so delete it
     _futureRegistrationResponse.reset();
 
-    if (_state->getState() != StorageStateEnum::pending) {
+    if (_registrationStatus != FreeMonRegistrationStatus::kPending) {
         notifyPendingRegisters(Status(ErrorCodes::BadValue, "Registration was canceled"));
 
         return;
@@ -608,6 +618,7 @@ void FreeMonProcessor::doAsyncRegisterComplete(
 
         // Disable on any error
         _state->setState(StorageStateEnum::disabled);
+        _registrationStatus = FreeMonRegistrationStatus::kDisabled;
 
         // Persist state
         writeState(client);
@@ -620,6 +631,7 @@ void FreeMonProcessor::doAsyncRegisterComplete(
 
     // Update in-memory state
     _registrationRetry->setMin(Seconds(resp.getReportingInterval()));
+    _metricsGatherInterval = Seconds(resp.getReportingInterval());
 
     {
         auto state = _state.synchronize();
@@ -637,6 +649,8 @@ void FreeMonProcessor::doAsyncRegisterComplete(
         state->setState(StorageStateEnum::enabled);
     }
 
+    _registrationStatus = FreeMonRegistrationStatus::kEnabled;
+
     // Persist state
     writeState(client);
 
@@ -648,9 +662,8 @@ void FreeMonProcessor::doAsyncRegisterComplete(
 
     log() << "Free Monitoring is Enabled. Frequency: " << resp.getReportingInterval() << " seconds";
 
-    // Enqueue next metrics upload
-    enqueue(FreeMonMessage::createWithDeadline(FreeMonMessageType::MetricsSend,
-                                               _registrationRetry->getNextDeadline(client)));
+    // Enqueue next metrics upload immediately to deliver a good experience
+    enqueue(FreeMonMessage::createNow(FreeMonMessageType::MetricsSend));
 }
 
 void FreeMonProcessor::doAsyncRegisterFail(
@@ -659,7 +672,7 @@ void FreeMonProcessor::doAsyncRegisterFail(
     // Our request is no longer in-progress so delete it
     _futureRegistrationResponse.reset();
 
-    if (_state->getState() != StorageStateEnum::pending) {
+    if (_registrationStatus != FreeMonRegistrationStatus::kPending) {
         notifyPendingRegisters(Status(ErrorCodes::BadValue, "Registration was canceled"));
 
         return;
@@ -682,14 +695,14 @@ void FreeMonProcessor::doAsyncRegisterFail(
 void FreeMonProcessor::doCommandUnregister(
     Client* client, FreeMonWaitableMessageWithPayload<FreeMonMessageType::UnregisterCommand>* msg) {
     // Treat this request as idempotent
-    if (_state->getState() != StorageStateEnum::disabled) {
+    readState(client);
 
-        _state->setState(StorageStateEnum::disabled);
+    _state->setState(StorageStateEnum::disabled);
+    _registrationStatus = FreeMonRegistrationStatus::kDisabled;
 
-        writeState(client);
+    writeState(client);
 
-        log() << "Free Monitoring is Disabled";
-    }
+    log() << "Free Monitoring is Disabled";
 
     msg->setStatus(Status::OK());
 }
@@ -709,15 +722,20 @@ void FreeMonProcessor::doMetricsCollect(Client* client) {
 }
 
 std::string compressMetrics(MetricsBuffer& buffer) {
-    BSONArrayBuilder payload;
+    BSONObjBuilder builder;
 
-    for (const auto& obj : buffer) {
-        payload.append(obj);
+    {
+        BSONArrayBuilder arrayBuilder(builder.subarrayStart(kMetricsRequestArrayElement));
+
+        for (const auto& obj : buffer) {
+            arrayBuilder.append(obj);
+        }
     }
-    auto arr = payload.arr();
+
+    BSONObj obj = builder.done();
 
     std::string outBuffer;
-    snappy::Compress(arr.objdata(), arr.objsize(), &outBuffer);
+    snappy::Compress(obj.objdata(), obj.objsize(), &outBuffer);
 
     return outBuffer;
 }
@@ -725,16 +743,19 @@ std::string compressMetrics(MetricsBuffer& buffer) {
 void FreeMonProcessor::doMetricsSend(Client* client) {
     readState(client);
 
-    if (_state->getState() != StorageStateEnum::enabled) {
+    // Only continue metrics send if the local disk state (in-case user deleted local document)
+    // and in-memory status both say to continue.
+    if (_registrationStatus != FreeMonRegistrationStatus::kEnabled ||
+        _state->getState() != StorageStateEnum::enabled) {
         // If we are recently disabled, then stop sending metrics
         return;
     }
 
     // Build outbound request
     FreeMonMetricsRequest req;
-    invariant(!_state->getRegistrationId().empty());
 
-    req.setVersion(kProtocolVersion);
+    req.setVersion(kMaxProtocolVersion);
+    req.setLocalTime(client->getServiceContext()->getPreciseClockSource()->now());
     req.setEncoding(MetricsEncodingEnum::snappy);
 
     req.setId(_state->getRegistrationId());
@@ -772,6 +793,8 @@ void FreeMonProcessor::doAsyncMetricsComplete(
 
         // Disable free monitoring on validation errors
         _state->setState(StorageStateEnum::disabled);
+        _registrationStatus = FreeMonRegistrationStatus::kDisabled;
+
         writeState(client);
 
         // If validation fails, we do not retry
@@ -782,6 +805,12 @@ void FreeMonProcessor::doAsyncMetricsComplete(
     if (resp.getPermanentlyDelete() == true) {
         auto opCtxUnique = client->makeOperationContext();
         FreeMonStorage::deleteState(opCtxUnique.get());
+
+        _state->setState(StorageStateEnum::pending);
+        _registrationStatus = FreeMonRegistrationStatus::kDisabled;
+
+        // Clear out the in-memory state
+        _lastReadState = boost::none;
 
         return;
     }
@@ -815,12 +844,17 @@ void FreeMonProcessor::doAsyncMetricsComplete(
     writeState(client);
 
     // Reset retry counter
+    _metricsGatherInterval = Seconds(resp.getReportingInterval());
     _metricsRetry->setMin(Seconds(resp.getReportingInterval()));
     _metricsRetry->reset();
 
-    // Enqueue next metrics upload
-    enqueue(FreeMonMessage::createWithDeadline(FreeMonMessageType::MetricsSend,
-                                               _registrationRetry->getNextDeadline(client)));
+    if (resp.getResendRegistration().is_initialized() && resp.getResendRegistration()) {
+        enqueue(FreeMonRegisterCommandMessage::createNow(_tags));
+    } else {
+        // Enqueue next metrics upload
+        enqueue(FreeMonMessage::createWithDeadline(FreeMonMessageType::MetricsSend,
+                                                   _metricsRetry->getNextDeadline(client)));
+    }
 }
 
 void FreeMonProcessor::doAsyncMetricsFail(
@@ -870,12 +904,19 @@ void FreeMonProcessor::getStatus(OperationContext* opCtx,
 }
 
 void FreeMonProcessor::doOnTransitionToPrimary(Client* client) {
-    if (_registerOnTransitionToPrimary) {
+    if (_registerOnTransitionToPrimary == RegistrationType::RegisterAfterOnTransitionToPrimary) {
         enqueue(FreeMonRegisterCommandMessage::createNow(std::vector<std::string>()));
 
-        // On transition to primary once
-        _registerOnTransitionToPrimary = false;
+    } else if (_registerOnTransitionToPrimary ==
+               RegistrationType::RegisterAfterOnTransitionToPrimaryIfEnabled) {
+        readState(client);
+        if (_state->getState() == StorageStateEnum::enabled) {
+            enqueue(FreeMonRegisterCommandMessage::createNow(std::vector<std::string>()));
+        }
     }
+
+    // On transition to primary once
+    _registerOnTransitionToPrimary = RegistrationType::DoNotRegister;
 }
 
 void FreeMonProcessor::processInMemoryStateChange(const FreeMonStorageState& originalState,
@@ -890,7 +931,6 @@ void FreeMonProcessor::processInMemoryStateChange(const FreeMonStorageState& ori
         }
     }
 }
-
 
 void FreeMonProcessor::doNotifyOnUpsert(
     Client* client, const FreeMonMessageWithPayload<FreeMonMessageType::NotifyOnUpsert>* msg) {
@@ -930,7 +970,11 @@ void FreeMonProcessor::doNotifyOnDelete(Client* client) {
     // the same and stop free monitoring. We continue collecting though.
 
     // So we mark the internal state as disabled which stop registration and metrics send
-    _state->setState(StorageStateEnum::disabled);
+    _state->setState(StorageStateEnum::pending);
+    _registrationStatus = FreeMonRegistrationStatus::kDisabled;
+
+    // Clear out the in-memory state
+    _lastReadState = boost::none;
 }
 
 void FreeMonProcessor::doNotifyOnRollback(Client* client) {

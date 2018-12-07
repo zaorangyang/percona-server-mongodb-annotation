@@ -33,8 +33,8 @@
 #include "mongo/s/client/parallel.h"
 
 #include "mongo/client/constants.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/dbclient_rs.h"
-#include "mongo/client/dbclientcursor.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/query/query_request.h"
@@ -43,7 +43,6 @@
 #include "mongo/s/client/shard_connection.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_exception.h"
 
@@ -612,13 +611,9 @@ void ParallelSortClusteredCursor::startInit(OperationContext* opCtx) {
         } catch (StaleConfigException& e) {
             // Our version isn't compatible with the current version anymore on at least one shard,
             // need to retry immediately
-            NamespaceString staleNS(e->getns());
-
-            // For legacy reasons, this may not be set in the exception :-(
-            if (staleNS.size() == 0)
-                staleNS = nss;  // ns is the *versioned* namespace, be careful of this
-
+            NamespaceString staleNS(e->getNss());
             _markStaleNS(staleNS, e);
+
             Grid::get(opCtx)->catalogCache()->invalidateShardedCollection(staleNS);
 
             LOG(1) << "stale config of ns " << staleNS << " during initialization, will retry"
@@ -767,10 +762,7 @@ void ParallelSortClusteredCursor::finishInit(OperationContext* opCtx) {
         } catch (StaleConfigException& e) {
             retry = true;
 
-            string staleNS = e->getns();
-            // For legacy reasons, ns may not always be set in exception :-(
-            if (staleNS.size() == 0)
-                staleNS = ns;  // ns is versioned namespace, be careful of this
+            std::string staleNS = e->getNss().ns();
 
             // Will retry all at once
             staleNSExceptions.emplace(staleNS, e);
@@ -1153,7 +1145,9 @@ void ParallelSortClusteredCursor::_oldInit() {
 
         if (throwException && staleConfigExs.size() > 0) {
             // Version is zero b/c this is deprecated codepath
-            uasserted(StaleConfigInfo(_ns, ChunkVersion(0, 0, OID()), ChunkVersion(0, 0, OID())),
+            uasserted(StaleConfigInfo(NamespaceString(_ns),
+                                      ChunkVersion(0, 0, OID()),
+                                      ChunkVersion(0, 0, OID())),
                       errMsg.str());
         } else if (throwException) {
             uasserted(14827, errMsg.str());
@@ -1337,7 +1331,8 @@ void throwCursorStale(DBClientCursor* cursor) {
     if (cursor->hasResultFlag(ResultFlag_ShardConfigStale)) {
         BSONObj error;
         cursor->peekError(&error);
-        uasserted(StaleConfigInfo(error), "query returned a stale config error");
+        uasserted(StaleConfigInfo::parseFromCommandError(error),
+                  "query returned a stale config error");
     }
 
     if (NamespaceString(cursor->getns()).isCommand()) {

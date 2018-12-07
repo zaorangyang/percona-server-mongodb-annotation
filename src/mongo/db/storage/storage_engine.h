@@ -192,6 +192,13 @@ public:
     }
 
     /**
+     * Returns whether the storage engine supports capped collections.
+     */
+    virtual bool supportsCappedCollections() const {
+        return true;
+    }
+
+    /**
      * Returns whether the engine supports a journalling concept or not.
      */
     virtual bool isDurable() const = 0;
@@ -200,13 +207,6 @@ public:
      * Returns true if the engine does not persist data to disk; false otherwise.
      */
     virtual bool isEphemeral() const = 0;
-
-    /**
-     * Only MMAPv1 should override this and return true to trigger MMAPv1-specific behavior.
-     */
-    virtual bool isMmapV1() const {
-        return false;
-    }
 
     /**
      * Populates and tears down in-memory data structures, respectively. Only required for storage
@@ -372,10 +372,39 @@ public:
     virtual void setInitialDataTimestamp(Timestamp timestamp) {}
 
     /**
+     * Uses the current stable timestamp to set the oldest timestamp for which the storage engine
+     * must maintain snapshot history through.
+     *
+     * oldest_timestamp will be set to stable_timestamp adjusted by
+     * 'targetSnapshotHistoryWindowInSeconds' to create a window of available snapshots on the
+     * storage engine from oldest to stable. Furthermore, oldest_timestamp will never be set ahead
+     * of the oplog read timestamp, ensuring the oplog reader's 'read_timestamp' can always be
+     * serviced.
+     */
+    virtual void setOldestTimestampFromStable() {}
+
+    /**
      * Sets the oldest timestamp for which the storage engine must maintain snapshot history
      * through. Additionally, all future writes must be newer or equal to this value.
      */
-    virtual void setOldestTimestamp(Timestamp timestampa) {}
+    virtual void setOldestTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Indicates whether the storage engine cache is under pressure.
+     *
+     * Retrieves a cache pressure value in the range [0, 100] from the storage engine, and compares
+     * it against storageGlobalParams.cachePressureThreshold, a dynamic server parameter, to
+     * determine whether cache pressure is too high.
+     */
+    virtual bool isCacheUnderPressure(OperationContext* opCtx) const {
+        return false;
+    }
+
+    /**
+     * For unit tests only. Sets the cache pressure value with which isCacheUnderPressure()
+     * evalutates to 'pressure'.
+     */
+    virtual void setCachePressureForTest(int pressure) {}
 
     /**
      *  Notifies the storage engine that a replication batch has completed.

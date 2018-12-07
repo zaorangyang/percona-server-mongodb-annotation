@@ -34,7 +34,7 @@
 
 #include <iostream>
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/client.h"
@@ -80,7 +80,7 @@ public:
         // Ensure N is significantly larger then internalQueryPlanEvaluationWorks.
         ASSERT_GTE(N, internalQueryPlanEvaluationWorks.load() + 1000);
 
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         _client.dropCollection(nss.ns());
     }
 
@@ -91,7 +91,7 @@ public:
     }
 
     void insert(const BSONObj& obj) {
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         _client.insert(nss.ns(), obj);
     }
 

@@ -36,27 +36,30 @@
 
 namespace mongo {
 
-QueryTestServiceContext::QueryTestServiceContext() {
-    CollatorFactoryInterface::set(&_serviceContext, stdx::make_unique<CollatorFactoryMock>());
-    _uniqueClient = _serviceContext.makeClient("QueryTest");
+QueryTestServiceContext::QueryTestServiceContext()
+    : _service(ServiceContext::make()), _client(_service->makeClient("query_test")) {
+    CollatorFactoryInterface::set(getServiceContext(), stdx::make_unique<CollatorFactoryMock>());
 }
 
+QueryTestServiceContext::~QueryTestServiceContext() = default;
+
 ServiceContext::UniqueOperationContext QueryTestServiceContext::makeOperationContext() {
-    return _uniqueClient->makeOperationContext();
+    return getClient()->makeOperationContext();
 }
 
 ServiceContext::UniqueOperationContext QueryTestServiceContext::makeOperationContext(
-    LogicalSessionId lsid, boost::optional<TxnNumber> txnNumber) {
+    LogicalSessionId lsid) {
     auto opCtx = makeOperationContext();
     opCtx->setLogicalSessionId(lsid);
-    if (txnNumber) {
-        opCtx->setTxnNumber(*txnNumber);
-    }
     return opCtx;
 }
 
 Client* QueryTestServiceContext::getClient() const {
-    return _uniqueClient.get();
+    return _client.get();
+}
+
+ServiceContext* QueryTestServiceContext::getServiceContext() {
+    return _service.get();
 }
 
 }  // namespace mongo

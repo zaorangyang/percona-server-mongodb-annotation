@@ -79,7 +79,8 @@ const auto getShardingState = ServiceContext::declareDecoration<ShardingState>()
  */
 void updateShardIdentityConfigStringCB(const std::string& setName,
                                        const std::string& newConnectionString) {
-    auto configsvrConnStr = grid.shardRegistry()->getConfigServerConnectionString();
+    auto configsvrConnStr =
+        Grid::get(getGlobalServiceContext())->shardRegistry()->getConfigServerConnectionString();
     if (configsvrConnStr.getSetName() != setName) {
         // Ignore all change notification for other sets that are not the config server.
         return;
@@ -190,7 +191,7 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* opCtx,
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
-    auto configSvrConnStr = shardIdentity.getConfigsvrConnString();
+    const auto& configSvrConnStr = shardIdentity.getConfigsvrConnectionString();
 
     if (enabled()) {
         invariant(!_shardName.empty());
@@ -241,7 +242,7 @@ Status ShardingState::initializeFromShardIdentity(OperationContext* opCtx,
             _initializationStatus = status;
             _setInitializationState(InitializationState::kError);
         }
-        _shardName = shardIdentity.getShardName();
+        _shardName = shardIdentity.getShardName().toString();
         _clusterId = shardIdentity.getClusterId();
 
         return status;
@@ -275,8 +276,8 @@ StatusWith<bool> ShardingState::initializeShardingAwarenessIfNeeded(OperationCon
                         "If started with --shardsvr in queryableBackupMode, a shardIdentity "
                         "document must be provided through --overrideShardIdentity"};
             }
-            auto swOverrideShardIdentity =
-                ShardIdentityType::fromBSON(serverGlobalParams.overrideShardIdentity);
+            auto swOverrideShardIdentity = ShardIdentityType::fromShardIdentityDocument(
+                serverGlobalParams.overrideShardIdentity);
             if (!swOverrideShardIdentity.isOK()) {
                 return swOverrideShardIdentity.getStatus();
             }
@@ -345,7 +346,7 @@ StatusWith<bool> ShardingState::initializeShardingAwarenessIfNeeded(OperationCon
 
             invariant(!shardIdentityBSON.isEmpty());
 
-            auto swShardIdentity = ShardIdentityType::fromBSON(shardIdentityBSON);
+            auto swShardIdentity = ShardIdentityType::fromShardIdentityDocument(shardIdentityBSON);
             if (!swShardIdentity.isOK()) {
                 return swShardIdentity.getStatus();
             }

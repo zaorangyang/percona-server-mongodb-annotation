@@ -36,7 +36,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -161,11 +161,7 @@ bool isSelf(const HostAndPort& hostAndPort, ServiceContext* const ctx) {
     // of the interfaces on this machine.
     // No need for ip match if the ports do not match
     if (hostAndPort.port() == serverGlobalParams.port) {
-        std::vector<std::string> myAddrs;
-
-        if (!serverGlobalParams.bind_ip.empty()) {
-            boost::split(myAddrs, serverGlobalParams.bind_ip, boost::is_any_of(", "));
-        }
+        std::vector<std::string> myAddrs = serverGlobalParams.bind_ips;
 
         // If any of the bound addresses is the default route (0.0.0.0 on IPv4) it means we are
         // listening on all network interfaces and need to check against any of them.

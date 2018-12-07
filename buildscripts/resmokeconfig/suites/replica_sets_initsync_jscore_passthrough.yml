@@ -14,7 +14,6 @@ selector:
   - jstests/core/collation.js
   - jstests/core/commands_that_do_not_write_do_not_accept_wc.js
   - jstests/core/constructors.js
-  - jstests/core/eval_mr.js
   - jstests/core/function_string_representations.js
   - jstests/core/geo_big_polygon3.js
   - jstests/core/geo_mapreduce.js
@@ -51,7 +50,6 @@ selector:
   # may insert unexpected operations into the profile collection.
   - jstests/core/profile_list_collections.js
   - jstests/core/profile_list_indexes.js
-  - jstests/core/profile_parallel_collection_scan.js
   - jstests/core/profile_repair_cursor.js
   - jstests/core/recursion.js
   - jstests/core/system_profile.js
@@ -69,9 +67,7 @@ selector:
   - jstests/core/profile_distinct.js
   - jstests/core/profile_find.js
   - jstests/core/profile_findandmodify.js
-  - jstests/core/profile_geonear.js
   - jstests/core/profile_getmore.js
-  - jstests/core/profile_group.js
   - jstests/core/profile_insert.js
   - jstests/core/profile_sampling.js
   - jstests/core/profile_update.js

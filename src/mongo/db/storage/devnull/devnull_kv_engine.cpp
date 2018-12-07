@@ -31,6 +31,7 @@
 #include "mongo/db/storage/devnull/devnull_kv_engine.h"
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/db/snapshot_window_options.h"
 #include "mongo/db/storage/ephemeral_for_test/ephemeral_for_test_record_store.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
@@ -66,6 +67,10 @@ public:
         return "devnull";
     }
 
+    const std::string& getIdent() const override {
+        MONGO_UNREACHABLE;
+    }
+
     virtual void setCappedCallback(CappedCallback*) {}
 
     virtual long long dataSize(OperationContext* opCtx) const {
@@ -96,8 +101,10 @@ public:
 
     virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl) {}
 
-    virtual StatusWith<RecordId> insertRecord(
-        OperationContext* opCtx, const char* data, int len, Timestamp, bool enforceQuota) {
+    virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
+                                              const char* data,
+                                              int len,
+                                              Timestamp) {
         _numInserts++;
         return StatusWith<RecordId>(RecordId(6, 4));
     }
@@ -120,7 +127,6 @@ public:
                                 const RecordId& oldLocation,
                                 const char* data,
                                 int len,
-                                bool enforceQuota,
                                 UpdateNotifier* notifier) {
         return Status::OK();
     }
@@ -258,4 +264,14 @@ SortedDataInterface* DevNullKVEngine::getSortedDataInterface(OperationContext* o
                                                              const IndexDescriptor* desc) {
     return new DevNullSortedDataInterface();
 }
+
+bool DevNullKVEngine::isCacheUnderPressure(OperationContext* opCtx) const {
+    return (_cachePressureForTest >= snapshotWindowParams.cachePressureThreshold.load());
 }
+
+void DevNullKVEngine::setCachePressureForTest(int pressure) {
+    invariant(pressure >= 0 && pressure <= 100);
+    _cachePressureForTest = pressure;
+}
+
+}  // namespace mongo

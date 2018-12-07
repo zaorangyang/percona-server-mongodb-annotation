@@ -137,17 +137,17 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
                                     const BSONObj& view) {
     dassert(opCtx->lockState()->isDbLockedForMode(_db->name(), MODE_X));
     NamespaceString systemViewsNs(_db->getSystemViewsName());
-    Collection* systemViews = _db->getOrCreateCollection(opCtx, systemViewsNs);
+    Collection* systemViews = _db->getCollection(opCtx, systemViewsNs);
+    invariant(systemViews);
 
     const bool requireIndex = false;
     RecordId id = Helpers::findOne(opCtx, systemViews, BSON("_id" << name.ns()), requireIndex);
 
-    const bool enforceQuota = true;
     Snapshotted<BSONObj> oldView;
     if (!id.isNormal() || !systemViews->findDoc(opCtx, id, &oldView)) {
         LOG(2) << "insert view " << view << " into " << _db->getSystemViewsName();
-        uassertStatusOK(systemViews->insertDocument(
-            opCtx, InsertStatement(view), &CurOp::get(opCtx)->debug(), enforceQuota));
+        uassertStatusOK(
+            systemViews->insertDocument(opCtx, InsertStatement(view), &CurOp::get(opCtx)->debug()));
     } else {
         OplogUpdateEntryArgs args;
         args.nss = systemViewsNs;
@@ -156,14 +156,8 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
         args.fromMigrate = false;
 
         const bool assumeIndexesAreAffected = true;
-        systemViews->updateDocument(opCtx,
-                                    id,
-                                    oldView,
-                                    view,
-                                    enforceQuota,
-                                    assumeIndexesAreAffected,
-                                    &CurOp::get(opCtx)->debug(),
-                                    &args);
+        systemViews->updateDocument(
+            opCtx, id, oldView, view, assumeIndexesAreAffected, &CurOp::get(opCtx)->debug(), &args);
     }
 }
 

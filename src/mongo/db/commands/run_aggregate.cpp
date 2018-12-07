@@ -45,6 +45,7 @@
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_exchange.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
@@ -58,12 +59,12 @@
 #include "mongo/db/read_concern.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_catalog.h"
-#include "mongo/db/views/view_sharding_check.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -88,14 +89,48 @@ namespace {
  */
 bool handleCursorCommand(OperationContext* opCtx,
                          const NamespaceString& nsForCursor,
-                         ClientCursor* cursor,
+                         std::vector<ClientCursor*> cursors,
                          const AggregationRequest& request,
                          BSONObjBuilder& result) {
-    invariant(cursor);
-
+    invariant(!cursors.empty());
     long long batchSize = request.getBatchSize();
 
+    if (cursors.size() > 1) {
+
+        uassert(
+            ErrorCodes::BadValue, "the exchange initial batch size must be zero", batchSize == 0);
+
+        BSONArrayBuilder cursorsBuilder;
+        for (size_t idx = 0; idx < cursors.size(); ++idx) {
+            invariant(cursors[idx]);
+
+            BSONObjBuilder cursorResult;
+            appendCursorResponseObject(
+                cursors[idx]->cursorid(), nsForCursor.ns(), BSONArray(), &cursorResult);
+            cursorResult.appendBool("ok", 1);
+
+            cursorsBuilder.append(cursorResult.obj());
+
+            // If a time limit was set on the pipeline, remaining time is "rolled over" to the
+            // cursor (for use by future getmore ops).
+            cursors[idx]->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
+
+            // Cursor needs to be in a saved state while we yield locks for getmore. State
+            // will be restored in getMore().
+            cursors[idx]->getExecutor()->saveState();
+            cursors[idx]->getExecutor()->detachFromOperationContext();
+        }
+
+        result.appendArray("cursors", cursorsBuilder.obj());
+
+        return true;
+    }
+
     CursorResponseBuilder responseBuilder(true, &result);
+
+    ClientCursor* cursor = cursors[0];
+    invariant(cursor);
+
     BSONObj next;
     for (int objCount = 0; objCount < batchSize; objCount++) {
         // The initial getNext() on a PipelineProxyStage may be very expensive so we don't
@@ -318,15 +353,29 @@ Status runAggregate(OperationContext* opCtx,
     // where the collation has not yet been resolved, and where it has been resolved to nullptr.
     boost::optional<std::unique_ptr<CollatorInterface>> collatorToUse;
 
-    unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
+    // The UUID of the collection for the execution namespace of this aggregation. For change
+    // streams, this will be the UUID of the original namespace instead of the oplog namespace.
+    boost::optional<UUID> uuid;
+
+    std::vector<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> execs;
     boost::intrusive_ptr<ExpressionContext> expCtx;
-    Pipeline* unownedPipeline;
     auto curOp = CurOp::get(opCtx);
     {
         const LiteParsedPipeline liteParsedPipeline(request);
 
-        // Check whether the parsed pipeline supports the given read concern.
-        liteParsedPipeline.assertSupportsReadConcern(opCtx, request.getExplain());
+        try {
+            // Check whether the parsed pipeline supports the given read concern.
+            liteParsedPipeline.assertSupportsReadConcern(opCtx, request.getExplain());
+        } catch (const DBException& ex) {
+            auto session = OperationContextSession::get(opCtx);
+            // If we are in a multi-document transaction, we intercept the 'readConcern'
+            // assertion in order to provide a more descriptive error message and code.
+            if (session && session->inMultiDocumentTransaction()) {
+                return {ErrorCodes::OperationNotSupportedInTransaction,
+                        ex.toStatus("Operation not permitted in transaction").reason()};
+            }
+            return ex.toStatus();
+        }
 
         if (liteParsedPipeline.hasChangeStream()) {
             nss = NamespaceString::kRsOplogNamespace;
@@ -350,6 +399,9 @@ Status runAggregate(OperationContext* opCtx,
                 invariant(!collatorToUse);
                 Collection* origColl = origNssCtx.getCollection();
                 collatorToUse.emplace(resolveCollator(opCtx, request, origColl));
+
+                // Get the collection UUID to be set on the expression context.
+                uuid = origColl ? origColl->uuid() : boost::none;
             }
         }
 
@@ -374,6 +426,11 @@ Status runAggregate(OperationContext* opCtx,
 
         Collection* collection = ctx ? ctx->getCollection() : nullptr;
 
+        // For change streams, the UUID will already have been set for the original namespace.
+        if (!liteParsedPipeline.hasChangeStream()) {
+            uuid = collection ? collection->uuid() : boost::none;
+        }
+
         // The collator may already have been set if this is a $changeStream pipeline. If not,
         // resolve the collator to either the user-specified collation or the collection default.
         if (!collatorToUse) {
@@ -388,6 +445,7 @@ Status runAggregate(OperationContext* opCtx,
         if (ctx && ctx->getView() && !liteParsedPipeline.startsWithCollStats()) {
             invariant(nss != NamespaceString::kRsOplogNamespace);
             invariant(!nss.isCollectionlessAggregateNS());
+
             // Check that the default collation of 'view' is compatible with the operation's
             // collation. The check is skipped if the request did not specify a collation.
             if (!request.getCollation().isEmpty()) {
@@ -399,27 +457,28 @@ Status runAggregate(OperationContext* opCtx,
                 }
             }
 
-            ViewShardingCheck::throwResolvedViewIfSharded(opCtx, ctx->getDb(), ctx->getView());
-
-            auto resolvedView = ctx->getDb()->getViewCatalog()->resolveView(opCtx, nss);
-            if (!resolvedView.isOK()) {
-                return resolvedView.getStatus();
-            }
+            auto resolvedView =
+                uassertStatusOK(ctx->getDb()->getViewCatalog()->resolveView(opCtx, nss));
+            uassert(std::move(resolvedView),
+                    "On sharded systems, resolved views must be executed by mongos",
+                    !ShardingState::get(opCtx)->enabled());
 
             // With the view & collation resolved, we can relinquish locks.
             ctx.reset();
 
             // Parse the resolved view into a new aggregation request.
-            auto newRequest = resolvedView.getValue().asExpandedViewAggregation(request);
+            auto newRequest = resolvedView.asExpandedViewAggregation(request);
             auto newCmd = newRequest.serializeToCommandObj().toBson();
 
             auto status = runAggregate(opCtx, origNss, newRequest, newCmd, result);
+
             {
                 // Set the namespace of the curop back to the view namespace so ctx records
                 // stats on this view namespace on destruction.
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
                 curOp->setNS_inlock(nss.ns());
             }
+
             return status;
         }
 
@@ -429,11 +488,11 @@ Status runAggregate(OperationContext* opCtx,
                                   request,
                                   std::move(*collatorToUse),
                                   std::make_shared<PipelineD::MongoDInterface>(opCtx),
-                                  uassertStatusOK(resolveInvolvedNamespaces(opCtx, request))));
+                                  uassertStatusOK(resolveInvolvedNamespaces(opCtx, request)),
+                                  uuid));
         expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
         auto session = OperationContextSession::get(opCtx);
-        expCtx->inSnapshotReadOrMultiDocumentTransaction =
-            session && session->inSnapshotReadOrMultiDocumentTransaction();
+        expCtx->inMultiDocumentTransaction = session && session->inMultiDocumentTransaction();
 
         auto pipeline = uassertStatusOK(Pipeline::parse(request.getPipeline(), expCtx));
 
@@ -473,22 +532,43 @@ Status runAggregate(OperationContext* opCtx,
         // this process uses the correct collation if it does any string comparisons.
         pipeline->optimizePipeline();
 
-        // Transfer ownership of the Pipeline to the PipelineProxyStage.
-        unownedPipeline = pipeline.get();
-        auto ws = make_unique<WorkingSet>();
-        auto proxy = make_unique<PipelineProxyStage>(opCtx, std::move(pipeline), ws.get());
+        std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> pipelines;
 
-        // This PlanExecutor will simply forward requests to the Pipeline, so does not need to
-        // yield or to be registered with any collection's CursorManager to receive invalidations.
-        // The Pipeline may contain PlanExecutors which *are* yielding PlanExecutors and which *are*
-        // registered with their respective collection's CursorManager
-        auto statusWithPlanExecutor =
-            PlanExecutor::make(opCtx, std::move(ws), std::move(proxy), nss, PlanExecutor::NO_YIELD);
-        invariant(statusWithPlanExecutor.isOK());
-        exec = std::move(statusWithPlanExecutor.getValue());
+        pipelines.emplace_back(std::move(pipeline));
+
+        auto exchange =
+            dynamic_cast<DocumentSourceExchange*>(pipelines[0]->getSources().back().get());
+        if (exchange) {
+            for (size_t idx = 1; idx < exchange->getConsumers(); ++idx) {
+                auto sources = pipelines[0]->getSources();
+                sources.back() = new DocumentSourceExchange(expCtx, exchange->getExchange(), idx);
+                pipelines.emplace_back(
+                    uassertStatusOK(Pipeline::create(std::move(sources), expCtx)));
+            }
+        }
+
+        // TODO we will revisit the current vector of pipelines design when we will implement
+        // plan summaries, explains, etc.
+        for (size_t idx = 0; idx < pipelines.size(); ++idx) {
+            // Transfer ownership of the Pipeline to the PipelineProxyStage.
+            auto ws = make_unique<WorkingSet>();
+            auto proxy =
+                make_unique<PipelineProxyStage>(opCtx, std::move(pipelines[idx]), ws.get());
+
+            // This PlanExecutor will simply forward requests to the Pipeline, so does not need to
+            // yield or to be registered with any collection's CursorManager to receive
+            // invalidations. The Pipeline may contain PlanExecutors which *are* yielding
+            // PlanExecutors and which *are* registered with their respective collection's
+            // CursorManager
+
+            auto statusWithPlanExecutor = PlanExecutor::make(
+                opCtx, std::move(ws), std::move(proxy), nss, PlanExecutor::NO_YIELD);
+            invariant(statusWithPlanExecutor.isOK());
+            execs.emplace_back(std::move(statusWithPlanExecutor.getValue()));
+        }
 
         {
-            auto planSummary = Explain::getPlanSummary(exec.get());
+            auto planSummary = Explain::getPlanSummary(execs[0].get());
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             curOp->setPlanSummary_inlock(std::move(planSummary));
         }
@@ -499,30 +579,44 @@ Status runAggregate(OperationContext* opCtx,
     // cursor manager. The global cursor manager does not deliver invalidations or kill
     // notifications; the underlying PlanExecutor(s) used by the pipeline will be receiving
     // invalidations and kill notifications themselves, not the cursor we create here.
-    ClientCursorParams cursorParams(
-        std::move(exec),
-        origNss,
-        AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
-        repl::ReadConcernArgs::get(opCtx).getLevel(),
-        cmdObj);
-    if (expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData) {
-        cursorParams.setTailable(true);
-        cursorParams.setAwaitData(true);
+
+    std::vector<ClientCursorPin> pins;
+    std::vector<ClientCursor*> cursors;
+
+    ScopeGuard cursorFreer = MakeGuard(
+        [](std::vector<ClientCursorPin>* pins) {
+            for (auto& p : *pins) {
+                p.deleteUnderlying();
+            }
+        },
+        &pins);
+
+    for (size_t idx = 0; idx < execs.size(); ++idx) {
+        ClientCursorParams cursorParams(
+            std::move(execs[idx]),
+            origNss,
+            AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+            repl::ReadConcernArgs::get(opCtx).getLevel(),
+            cmdObj);
+        if (expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData) {
+            cursorParams.setTailable(true);
+            cursorParams.setAwaitData(true);
+        }
+
+        auto pin =
+            CursorManager::getGlobalCursorManager()->registerCursor(opCtx, std::move(cursorParams));
+        cursors.emplace_back(pin.getCursor());
+        pins.emplace_back(std::move(pin));
     }
-
-    auto pin =
-        CursorManager::getGlobalCursorManager()->registerCursor(opCtx, std::move(cursorParams));
-
-    ScopeGuard cursorFreer = MakeGuard(&ClientCursorPin::deleteUnderlying, &pin);
 
     // If both explain and cursor are specified, explain wins.
     if (expCtx->explain) {
         Explain::explainPipelineExecutor(
-            pin.getCursor()->getExecutor(), *(expCtx->explain), &result);
+            pins[0].getCursor()->getExecutor(), *(expCtx->explain), &result);
     } else {
         // Cursor must be specified, if explain is not.
         const bool keepCursor =
-            handleCursorCommand(opCtx, origNss, pin.getCursor(), request, result);
+            handleCursorCommand(opCtx, origNss, std::move(cursors), request, result);
         if (keepCursor) {
             cursorFreer.Dismiss();
         }
@@ -530,7 +624,7 @@ Status runAggregate(OperationContext* opCtx,
 
     if (!expCtx->explain) {
         PlanSummaryStats stats;
-        Explain::getSummaryStats(*(pin.getCursor()->getExecutor()), &stats);
+        Explain::getSummaryStats(*(pins[0].getCursor()->getExecutor()), &stats);
         curOp->debug().setPlanSummaryMetrics(stats);
         curOp->debug().nreturned = stats.nReturned;
     }

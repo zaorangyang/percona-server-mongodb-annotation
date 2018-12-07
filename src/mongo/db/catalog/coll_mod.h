@@ -51,15 +51,6 @@ Status collMod(OperationContext* opCtx,
                const BSONObj& cmdObj,
                BSONObjBuilder* result);
 
-/*
- * Adds uuid to the collection "ns" if the collection does not already have a UUID.
- * This is called if a collection failed to be assigned a UUID during upgrade to 3.6.
- */
-Status collModForUUIDUpgrade(OperationContext* opCtx,
-                             const NamespaceString& ns,
-                             const BSONObj& cmdObj,
-                             CollectionUUID uuid);
-
 /**
  * Applies the collMod operation and optionally updates formatVersion of unique indexes belonging
  * to collection "nss".
@@ -78,4 +69,10 @@ void updateUniqueIndexesOnUpgrade(OperationContext* opCtx);
  * Updates non-replicated unique indexes to timestamp safe unique index format.
  */
 Status updateNonReplicatedUniqueIndexes(OperationContext* opCtx);
+
+/*
+ * Checks index namespaces that would exceed 4.0 constraints on setFCV=4.0.
+ */
+Status checkIndexNamespacesOnDowngrade(OperationContext* opCtx);
+
 }  // namespace mongo

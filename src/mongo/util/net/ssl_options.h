@@ -35,8 +35,8 @@
 
 namespace mongo {
 
-#if (MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_WINDOWS) || \
-    (MONGO_CONFIG_SSL_PROVIDER == SSL_PROVIDER_APPLE)
+#if (MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_WINDOWS) || \
+    (MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_APPLE)
 #define MONGO_CONFIG_SSL_CERTIFICATE_SELECTORS 1
 #endif
 
@@ -77,6 +77,9 @@ struct SSLParams {
     bool sslAllowInvalidHostnames = false;        // --sslAllowInvalidHostnames
     bool disableNonSSLConnectionLogging =
         false;  // --setParameter disableNonSSLConnectionLogging=true
+    bool disableNonSSLConnectionLoggingSet = false;
+    bool suppressNoTLSPeerCertificateWarning =
+        false;  // --setParameter suppressNoTLSPeerCertificateWarning
 
     SSLParams() {
         sslMode.store(SSLMode_disabled);
@@ -107,22 +110,30 @@ struct SSLParams {
 
 extern SSLParams sslGlobalParams;
 
-Status addSSLServerOptions(mongo::optionenvironment::OptionSection* options);
+/**
+ * Older versions of mongod/mongos accepted --sslDisabledProtocols values
+ * in the form 'noTLS1_0,noTLS1_1'.  kAcceptNegativePrefix allows us to
+ * continue accepting this format on mongod/mongos while only supporting
+ * the "standard" TLS1_X format in the shell.
+ */
+enum class SSLDisabledProtocolsMode {
+    kStandardFormat,
+    kAcceptNegativePrefix,
+};
 
-Status addSSLClientOptions(mongo::optionenvironment::OptionSection* options);
+Status storeSSLDisabledProtocols(
+    const std::string& disabledProtocols,
+    SSLDisabledProtocolsMode mode = SSLDisabledProtocolsMode::kStandardFormat);
 
-Status storeSSLServerOptions(const mongo::optionenvironment::Environment& params);
+/**
+* The global SSL configuration. This should be accessed only after global initialization has
+* completed. If it must be accessed in an initializer, the initializer should have
+* "EndStartupOptionStorage" as a prerequisite.
+*/
+const SSLParams& getSSLGlobalParams();
 
 Status parseCertificateSelector(SSLParams::CertificateSelector* selector,
                                 StringData name,
                                 StringData value);
-/**
- * Canonicalize SSL options for the given environment that have different representations with
- * the same logical meaning.
- */
-Status canonicalizeSSLServerOptions(mongo::optionenvironment::Environment* params);
 
-Status validateSSLServerOptions(const mongo::optionenvironment::Environment& params);
-
-Status storeSSLClientOptions(const mongo::optionenvironment::Environment& params);
 }  // namespace mongo

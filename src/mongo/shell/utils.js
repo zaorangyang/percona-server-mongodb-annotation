@@ -24,10 +24,16 @@ function reconnect(db) {
 function _getErrorWithCode(codeOrObj, message) {
     var e = new Error(message);
     if (codeOrObj != undefined) {
-        if (codeOrObj.writeError) {
-            e.code = codeOrObj.writeError.code;
-        } else if (codeOrObj.code) {
-            e.code = codeOrObj.code;
+        if (codeOrObj.writeError || codeOrObj.code) {
+            if (codeOrObj.writeError) {
+                e.code = codeOrObj.writeError.code;
+            } else if (codeOrObj.code) {
+                e.code = codeOrObj.code;
+            }
+
+            if (codeOrObj.hasOwnProperty("errorLabels")) {
+                e.errorLabels = codeOrObj.errorLabels;
+            }
         } else {
             // At this point assume codeOrObj is a number type
             e.code = codeOrObj;
@@ -253,7 +259,6 @@ jsTestOptions = function() {
             wiredTigerCollectionConfigString: TestData.wiredTigerCollectionConfigString,
             wiredTigerIndexConfigString: TestData.wiredTigerIndexConfigString,
             noJournal: TestData.noJournal,
-            noJournalPrealloc: TestData.noJournalPrealloc,
             auth: TestData.auth,
             // Note: keyFile is also used as a flag to indicate cluster auth is turned on, set it
             // to a truthy value if you'd like to do cluster auth, even if it's not keyFile auth.
@@ -305,6 +310,12 @@ jsTestOptions = function() {
             logRetryAttempts: TestData.logRetryAttempts || false,
             connectionString: TestData.connectionString || "",
             skipCheckDBHashes: TestData.skipCheckDBHashes || false,
+            traceExceptions: TestData.hasOwnProperty("traceExceptions") ? TestData.traceExceptions
+                                                                        : true,
+            transactionLifetimeLimitSeconds: TestData.transactionLifetimeLimitSeconds,
+            mqlTestFile: TestData.mqlTestFile,
+            mqlRootPath: TestData.mqlRootPath,
+            disableImplicitSessions: TestData.disableImplicitSessions || false,
         });
     }
     return _jsTestOptions;
@@ -546,6 +557,16 @@ if (typeof _shouldRetryWrites === 'undefined') {
     // We ensure the _shouldRetryWrites() function is always defined, in case the JavaScript engine
     // is being used from someplace other than the mongo shell (e.g. map-reduce).
     _shouldRetryWrites = function _shouldRetryWrites() {
+        return false;
+    };
+}
+
+if (typeof _shouldUseImplicitSessions === 'undefined') {
+    // We ensure the _shouldUseImplicitSessions() function is always defined, in case the JavaScript
+    // engine is being used from someplace other than the mongo shell (e.g. map-reduce). If the
+    // function was not defined, implicit sessions are disabled to prevent unnecessary sessions from
+    // being created.
+    _shouldUseImplicitSessions = function _shouldUseImplicitSessions() {
         return false;
     };
 }
@@ -990,8 +1011,73 @@ shellHelper.show = function(what) {
         }
     }
 
+    if (what == "freeMonitoring") {
+        var dbDeclared, ex;
+        try {
+            // !!db essentially casts db to a boolean
+            // Will throw a reference exception if db hasn't been declared.
+            dbDeclared = !!db;
+        } catch (ex) {
+            dbDeclared = false;
+        }
+
+        if (dbDeclared) {
+            const freemonStatus = db.adminCommand({getFreeMonitoringStatus: 1});
+
+            if (freemonStatus.ok) {
+                if (freemonStatus.state == 'enabled' &&
+                    freemonStatus.hasOwnProperty('userReminder')) {
+                    print("---");
+                    print(freemonStatus.userReminder);
+                    print("---");
+                } else if (freemonStatus.state === 'undecided') {
+                    print(
+                        "---\n" +
+                        "Enable MongoDB's free cloud-based monitoring service, which will then receive and display\n" +
+                        "metrics about your deployment (disk utilization, CPU, operation statistics, etc).\n" +
+                        "\n" +
+                        "The monitoring data will be available on a MongoDB website with a unique URL accessible to you\n" +
+                        "and anyone you share the URL with. MongoDB may use this information to make product\n" +
+                        "improvements and to suggest MongoDB products and deployment options to you.\n" +
+                        "\n" +
+                        "To enable free monitoring, run the following command: db.enableFreeMonitoring()\n" +
+                        "To permanently disable this reminder, run the following command: db.disableFreeMonitoring()\n" +
+                        "---\n");
+                }
+            }
+
+            return "";
+        } else {
+            print("Cannot show freeMonitoring, \"db\" is not set");
+            return "";
+        }
+    }
+
     throw Error("don't know how to show [" + what + "]");
 
+};
+
+__promptWrapper__ = function(promptFunction) {
+    // Call promptFunction directly if the global "db" is not defined, e.g. --nodb.
+    if (typeof db === 'undefined' || !(db instanceof DB)) {
+        __prompt__ = promptFunction();
+        return;
+    }
+
+    // Stash the global "db" for the prompt function to make sure the session
+    // of the global "db" isn't accessed by the prompt function.
+    let originalDB = db;
+    try {
+        db = originalDB.getMongo().getDB(originalDB.getName());
+        // Setting db._session to be a _DummyDriverSession instance makes it so that
+        // a logical session id isn't included in the isMaster and replSetGetStatus
+        // commands and therefore won't interfere with the session associated with the
+        // global "db" object.
+        db._session = new _DummyDriverSession(db.getMongo());
+        __prompt__ = promptFunction();
+    } finally {
+        db = originalDB;
+    }
 };
 
 Math.sigFig = function(x, N) {

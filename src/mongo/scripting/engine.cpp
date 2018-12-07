@@ -34,8 +34,8 @@
 #include <boost/filesystem/operations.hpp>
 #include <cctype>
 
-#include "mongo/client/dbclientcursor.h"
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_base.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
@@ -56,7 +56,7 @@ AtomicInt64 Scope::_lastVersion(1);
 
 namespace {
 
-MONGO_FP_DECLARE(mr_killop_test_fp);
+MONGO_FAIL_POINT_DEFINE(mr_killop_test_fp);
 // 2 GB is the largest support Javascript file size.
 const fileofs kMaxJsFileLength = fileofs(2) * 1024 * 1024 * 1024;
 
@@ -419,9 +419,6 @@ public:
     void init(const BSONObj* data) {
         _real->init(data);
     }
-    void localConnectForDbEval(OperationContext* opCtx, const char* dbName) {
-        invariant(!"localConnectForDbEval should only be called from dbEval");
-    }
     void setLocalDB(const string& dbName) {
         _real->setLocalDB(dbName);
     }
@@ -439,6 +436,9 @@ public:
     }
     void requireOwnedObjects() override {
         _real->requireOwnedObjects();
+    }
+    void kill() {
+        _real->kill();
     }
     bool isKillPending() const {
         return _real->isKillPending();

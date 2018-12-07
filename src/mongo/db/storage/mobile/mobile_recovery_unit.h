@@ -39,6 +39,7 @@
 #include "mongo/db/storage/mobile/mobile_session_pool.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/snapshot.h"
+#include "mongo/platform/atomic_word.h"
 
 namespace mongo {
 
@@ -61,17 +62,11 @@ public:
 
     void registerChange(Change* change) override;
 
-    void* writingPtr(void* data, size_t len) override {
-        MONGO_UNREACHABLE;
-    }
-
-    void setRollbackWritesDisabled() override {}
-
     SnapshotId getSnapshotId() const override {
         return SnapshotId();
     }
 
-    MobileSession* getSession(OperationContext* opCtx);
+    MobileSession* getSession(OperationContext* opCtx, bool readOnly = true);
 
     MobileSession* getSessionNoTxn(OperationContext* opCtx);
 
@@ -95,11 +90,16 @@ private:
 
     void _ensureSession(OperationContext* opCtx);
     void _txnClose(bool commit);
-    void _txnOpen(OperationContext* opCtx);
+    void _txnOpen(OperationContext* opCtx, bool readOnly);
+    void _upgradeToWriteSession(OperationContext* opCtx);
 
     bool _areWriteUnitOfWorksBanned = false;
     bool _inUnitOfWork;
     bool _active;
+
+    static AtomicInt64 _nextID;
+    uint64_t _id;
+    bool _isReadOnly;
 
     std::string _path;
     MobileSessionPool* _sessionPool;

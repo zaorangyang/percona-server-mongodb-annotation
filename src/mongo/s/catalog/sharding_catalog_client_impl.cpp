@@ -59,6 +59,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
+#include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -74,7 +75,7 @@
 
 namespace mongo {
 
-MONGO_FP_DECLARE(failApplyChunkOps);
+MONGO_FAIL_POINT_DEFINE(failApplyChunkOps);
 
 using repl::OpTime;
 using std::set;
@@ -93,10 +94,10 @@ const int kMaxReadRetry = 3;
 const int kMaxWriteRetry = 3;
 
 const std::string kActionLogCollectionName("actionlog");
-const int kActionLogCollectionSizeMB = 2 * 1024 * 1024;
+const int kActionLogCollectionSizeMB = 20 * 1024 * 1024;
 
 const std::string kChangeLogCollectionName("changelog");
-const int kChangeLogCollectionSizeMB = 10 * 1024 * 1024;
+const int kChangeLogCollectionSizeMB = 200 * 1024 * 1024;
 
 const NamespaceString kSettingsNamespace("config", "settings");
 
@@ -148,20 +149,6 @@ Status ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
                                         upsert,
                                         ShardingCatalogClient::kMajorityWriteConcern);
     return status.getStatus().withContext(str::stream() << "Collection metadata write failed");
-}
-
-Status ShardingCatalogClientImpl::updateDatabase(OperationContext* opCtx,
-                                                 const std::string& dbName,
-                                                 const DatabaseType& db) {
-    fassert(28616, db.validate());
-
-    auto status = updateConfigDocument(opCtx,
-                                       DatabaseType::ConfigNS,
-                                       BSON(DatabaseType::name(dbName)),
-                                       db.toBSON(),
-                                       true,
-                                       ShardingCatalogClient::kMajorityWriteConcern);
-    return status.getStatus().withContext(str::stream() << "Database metadata write failed");
 }
 
 Status ShardingCatalogClientImpl::logAction(OperationContext* opCtx,
@@ -217,12 +204,14 @@ Status ShardingCatalogClientImpl::_log(OperationContext* opCtx,
                                        const BSONObj& detail,
                                        const WriteConcernOptions& writeConcern) {
     Date_t now = Grid::get(opCtx)->getNetwork()->now();
-    const std::string hostName = Grid::get(opCtx)->getNetwork()->getHostName();
-    const string changeId = str::stream() << hostName << "-" << now.toString() << "-" << OID::gen();
+    const std::string serverName = str::stream() << Grid::get(opCtx)->getNetwork()->getHostName()
+                                                 << ":" << serverGlobalParams.port;
+    const std::string changeId = str::stream() << serverName << "-" << now.toString() << "-"
+                                               << OID::gen();
 
     ChangeLogType changeLog;
     changeLog.setChangeId(changeId);
-    changeLog.setServer(hostName);
+    changeLog.setServer(serverName);
     changeLog.setClientAddr(opCtx->getClient()->clientAddress(true));
     changeLog.setTime(now);
     changeLog.setNS(operationNS);
@@ -251,13 +240,15 @@ StatusWith<repl::OpTimeWith<DatabaseType>> ShardingCatalogClientImpl::getDatabas
 
     // The admin database is always hosted on the config server.
     if (dbName == "admin") {
-        DatabaseType dbt(dbName, ShardRegistry::kConfigServerShardId, false);
+        DatabaseType dbt(
+            dbName, ShardRegistry::kConfigServerShardId, false, databaseVersion::makeFixed());
         return repl::OpTimeWith<DatabaseType>(dbt);
     }
 
     // The config database's primary shard is always config, and it is always sharded.
     if (dbName == "config") {
-        DatabaseType dbt(dbName, ShardRegistry::kConfigServerShardId, true);
+        DatabaseType dbt(
+            dbName, ShardRegistry::kConfigServerShardId, true, databaseVersion::makeFixed());
         return repl::OpTimeWith<DatabaseType>(dbt);
     }
 
@@ -788,7 +779,7 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
         // Look for the chunk in this shard whose version got bumped. We assume that if that
         // mod made it to the config server, then transaction was successful.
         BSONObjBuilder query;
-        lastChunkVersion.addToBSON(query, ChunkType::lastmod());
+        lastChunkVersion.appendLegacyWithField(&query, ChunkType::lastmod());
         query.append(ChunkType::ns(), nss.ns());
         auto chunkWithStatus = getChunks(opCtx, query.obj(), BSONObj(), 1, nullptr, readConcern);
 

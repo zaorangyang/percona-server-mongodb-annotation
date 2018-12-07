@@ -5,9 +5,9 @@
  *
  * Repeatedly creates a capped collection. Also verifies that truncation
  * occurs once the collection reaches a certain size.
+ *
+ * @tags: [requires_capped]
  */
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js');    // for dropCollections
-load('jstests/concurrency/fsm_workload_helpers/server_types.js');  // for isMongod and isMMAPv1
 
 var $config = (function() {
 
@@ -64,42 +64,6 @@ var $config = (function() {
             var smallDocSize = Math.floor(options.size / 8) - 1;
             var largeDocSize = Math.floor(options.size / 2) - 1;
 
-            // Truncation in MMAPv1 has well defined behavior.
-            if (isMongod(db) && isMMAPv1(db)) {
-                ids.push(this.insert(db, myCollName, largeDocSize));
-
-                // Insert a large document and verify that a truncation has occurred.
-                // There should be 1 document in the collection and it should always be
-                // the most recently inserted document.
-
-                ids.push(this.insert(db, myCollName, largeDocSize));
-
-                count = db[myCollName].find().itcount();
-                assertWhenOwnDB.eq(count, 1, 'expected truncation to occur');
-                assertWhenOwnDB.eq(ids.slice(ids.length - count),
-                                   this.getObjectIds(db, myCollName),
-                                   'expected truncation to remove the oldest document');
-
-                // Insert multiple small documents and verify that truncation has occurred. There
-                // should be at most 4 documents in the collection (fewer based on the maximum
-                // number of documents allowed if specified during collection creation), and they
-                // should be the most recently inserted documents.
-
-                ids.push(this.insert(db, myCollName, smallDocSize));
-                ids.push(this.insert(db, myCollName, smallDocSize));
-                ids.push(this.insert(db, myCollName, smallDocSize));
-
-                var prevCount = count;
-                count = db[myCollName].find().itcount();
-
-                var expectedCount = options.max && options.max < 4 ? options.max : 4;
-
-                assertWhenOwnDB.eq(count, expectedCount, 'expected truncation to occur');
-                assertWhenOwnDB.eq(ids.slice(ids.length - count),
-                                   this.getObjectIds(db, myCollName),
-                                   'expected truncation to remove the oldest documents');
-            }
-
             // Truncation of capped collections is generally unreliable. Instead of relying on it
             // to occur after a certain size document is inserted we test its occurrence. We set a
             // reasonable threshold of documents to insert before a user might expect truncation to
@@ -149,18 +113,12 @@ var $config = (function() {
 
     var transitions = {init: {create: 1}, create: {create: 1}};
 
-    function teardown(db, collName, cluster) {
-        var pattern = new RegExp('^' + this.prefix + '\\d+_\\d+$');
-        dropCollections(db, pattern);
-    }
-
     return {
         threadCount: 5,
         iterations: 5,
         data: data,
         states: states,
         transitions: transitions,
-        teardown: teardown
     };
 
 })();

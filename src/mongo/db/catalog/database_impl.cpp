@@ -63,7 +63,6 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/sessions_collection.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -90,7 +89,7 @@ MONGO_REGISTER_SHIM(Database::makeImpl)
 }
 
 namespace {
-MONGO_FP_DECLARE(hangBeforeLoggingCreateCollection);
+MONGO_FAIL_POINT_DEFINE(hangBeforeLoggingCreateCollection);
 }  // namespace
 
 using std::endl;
@@ -335,6 +334,12 @@ Status DatabaseImpl::setProfilingLevel(OperationContext* opCtx, int newLevel) {
         return Status(ErrorCodes::BadValue, "profiling level has to be >=0 and <= 2");
     }
 
+    // Can't support profiling without supporting capped collections.
+    if (!opCtx->getServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "the storage engine doesn't support profiling.");
+    }
+
     Status status = createProfileCollection(opCtx, this->_this);
 
     if (!status.isOK()) {
@@ -455,7 +460,7 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
                     return Status(ErrorCodes::IllegalOperation,
                                   "turn off profiling before dropping system.profile collection");
             } else if (!(nss.isSystemDotViews() || nss.isHealthlog() ||
-                         nss == SessionsCollection::kSessionsNamespaceString ||
+                         nss == NamespaceString::kLogicalSessionsNamespace ||
                          nss == NamespaceString::kSystemKeysNamespace)) {
                 return Status(ErrorCodes::IllegalOperation,
                               str::stream() << "can't drop system collection " << fullns);
@@ -775,24 +780,36 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
             "request doesn't allow collection to be created implicitly",
             OperationShardingState::get(opCtx).allowImplicitCollectionCreation());
 
+    auto coordinator = repl::ReplicationCoordinator::get(opCtx);
+    bool canAcceptWrites =
+        (coordinator->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) ||
+        coordinator->canAcceptWritesForDatabase(opCtx, nss.db()) || nss.isSystemDotProfile();
+
+
     CollectionOptions optionsWithUUID = options;
     bool generatedUUID = false;
     if (!optionsWithUUID.uuid) {
-        auto coordinator = repl::ReplicationCoordinator::get(opCtx);
-        bool canGenerateUUID =
-            (coordinator->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) ||
-            coordinator->canAcceptWritesForDatabase(opCtx, nss.db()) || nss.isSystemDotProfile();
-
-        if (!canGenerateUUID) {
+        if (!canAcceptWrites) {
             std::string msg = str::stream() << "Attempted to create a new collection " << nss.ns()
                                             << " without a UUID";
             severe() << msg;
             uasserted(ErrorCodes::InvalidOptions, msg);
         }
-        if (canGenerateUUID) {
+        if (canAcceptWrites) {
             optionsWithUUID.uuid.emplace(CollectionUUID::gen());
             generatedUUID = true;
         }
+    }
+
+    // Because writing the oplog entry depends on having the full spec for the _id index, which is
+    // not available until the collection is actually created, we can't write the oplog entry until
+    // after we have created the collection.  In order to make the storage timestamp for the
+    // collection create always correct even when other operations are present in the same storage
+    // transaction, we reserve an opTime before the collection creation, then pass it to the
+    // opObserver.  Reserving the optime automatically sets the storage timestamp.
+    OplogSlot createOplogSlot;
+    if (canAcceptWrites && supportsDocLocking() && !coordinator->isOplogDisabledFor(opCtx, nss)) {
+        createOplogSlot = repl::getNextOpTime(opCtx);
     }
 
     _checkCanCreateCollection(opCtx, nss, optionsWithUUID);
@@ -834,16 +851,21 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
                         !nss.isReplicated());
             }
         }
-
-        if (nss.isSystem()) {
-            createSystemIndexes(opCtx, collection);
-        }
     }
 
     MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangBeforeLoggingCreateCollection);
 
     opCtx->getServiceContext()->getOpObserver()->onCreateCollection(
-        opCtx, collection, nss, optionsWithUUID, fullIdIndexSpec);
+        opCtx, collection, nss, optionsWithUUID, fullIdIndexSpec, createOplogSlot);
+
+    // It is necessary to create the system index *after* running the onCreateCollection so that
+    // the storage timestamp for the index creation is after the storage timestamp for the
+    // collection creation, and the opTimes for the corresponding oplog entries are the same as the
+    // storage timestamps.  This way both primary and any secondaries will see the index created
+    // after the collection is created.
+    if (canAcceptWrites && createIdIndex && nss.isSystem()) {
+        createSystemIndexes(opCtx, collection);
+    }
 
     return collection;
 }
@@ -950,14 +972,13 @@ MONGO_REGISTER_SHIM(Database::userCreateNS)
 (OperationContext* opCtx,
  Database* db,
  StringData ns,
- BSONObj options,
- CollectionOptions::ParseKind parseKind,
+ CollectionOptions collectionOptions,
  bool createDefaultIndexes,
  const BSONObj& idIndex)
     ->Status {
     invariant(db);
 
-    LOG(1) << "create collection " << ns << ' ' << options;
+    LOG(1) << "create collection " << ns << ' ' << collectionOptions.toBSON();
 
     if (!NamespaceString::validCollectionComponent(ns))
         return Status(ErrorCodes::InvalidNamespace, str::stream() << "invalid ns: " << ns);
@@ -971,12 +992,6 @@ MONGO_REGISTER_SHIM(Database::userCreateNS)
     if (db->getViewCatalog()->lookup(opCtx, ns))
         return Status(ErrorCodes::NamespaceExists,
                       str::stream() << "a view '" << ns.toString() << "' already exists");
-
-    CollectionOptions collectionOptions;
-    Status status = collectionOptions.parse(options, parseKind);
-
-    if (!status.isOK())
-        return status;
 
     // Validate the collation, if there is one.
     std::unique_ptr<CollatorInterface> collator;
@@ -1008,11 +1023,11 @@ MONGO_REGISTER_SHIM(Database::userCreateNS)
         // Save this to a variable to avoid reading the atomic variable multiple times.
         const auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
 
-        // If the feature compatibility version is not 4.0, and we are validating features as
-        // master, ban the use of new agg features introduced in 4.0 to prevent them from being
+        // If the feature compatibility version is not 4.2, and we are validating features as
+        // master, ban the use of new agg features introduced in 4.2 to prevent them from being
         // persisted in the catalog.
         if (serverGlobalParams.validateFeaturesAsMaster.load() &&
-            currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
+            currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
             expCtx->maxFeatureCompatibilityVersion = currentFCV;
         }
         auto statusWithMatcher =
@@ -1025,7 +1040,7 @@ MONGO_REGISTER_SHIM(Database::userCreateNS)
         }
     }
 
-    status = validateStorageOptions(
+    Status status = validateStorageOptions(
         opCtx->getServiceContext(),
         collectionOptions.storageEngine,
         [](const auto& x, const auto& y) { return x->validateCollectionStorageOptions(y); });
@@ -1045,7 +1060,6 @@ MONGO_REGISTER_SHIM(Database::userCreateNS)
     }
 
     if (collectionOptions.isView()) {
-        invariant(parseKind == CollectionOptions::parseForCommand);
         uassertStatusOK(db->createView(opCtx, ns, collectionOptions));
     } else {
         invariant(

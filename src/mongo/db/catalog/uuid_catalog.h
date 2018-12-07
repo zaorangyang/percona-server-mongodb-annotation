@@ -73,7 +73,8 @@ public:
                             Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
-                            const BSONObj& idIndex) override;
+                            const BSONObj& idIndex,
+                            const OplogSlot& createOpTime) override;
     void onCollMod(OperationContext* opCtx,
                    const NamespaceString& nss,
                    OptionalCollectionUUID uuid,
@@ -89,12 +90,24 @@ public:
                      OptionalCollectionUUID uuid,
                      const std::string& indexName,
                      const BSONObj& idxDescriptor) override {}
-    repl::OpTime onRenameCollection(OperationContext* opCtx,
-                                    const NamespaceString& fromCollection,
-                                    const NamespaceString& toCollection,
-                                    OptionalCollectionUUID uuid,
-                                    OptionalCollectionUUID dropTargetUUID,
-                                    bool stayTemp) override;
+    void onRenameCollection(OperationContext* opCtx,
+                            const NamespaceString& fromCollection,
+                            const NamespaceString& toCollection,
+                            OptionalCollectionUUID uuid,
+                            OptionalCollectionUUID dropTargetUUID,
+                            bool stayTemp) override;
+    repl::OpTime preRenameCollection(OperationContext* opCtx,
+                                     const NamespaceString& fromCollection,
+                                     const NamespaceString& toCollection,
+                                     OptionalCollectionUUID uuid,
+                                     OptionalCollectionUUID dropTargetUUID,
+                                     bool stayTemp) override;
+    void postRenameCollection(OperationContext* opCtx,
+                              const NamespaceString& fromCollection,
+                              const NamespaceString& toCollection,
+                              OptionalCollectionUUID uuid,
+                              OptionalCollectionUUID dropTargetUUID,
+                              bool stayTemp) override;
     void onApplyOps(OperationContext* opCtx,
                     const std::string& dbName,
                     const BSONObj& applyOpCmd) override {}
@@ -136,20 +149,18 @@ public:
     void onDropCollection(OperationContext* opCtx, CollectionUUID uuid);
 
     /**
-     * Combination of onDropCollection and onCreateCollection.
-     * 'getNewCollection' is a function that returns collection to be registered when the current
-     * write unit of work is committed.
+     * This function atomically removes any existing entry for uuid from the UUID catalog and adds
+     * a new entry for uuid associated with the Collection coll. It is called by the op observer
+     * when a collection is renamed.
      */
-    using GetNewCollectionFunction = stdx::function<Collection*()>;
-    void onRenameCollection(OperationContext* opCtx,
-                            GetNewCollectionFunction getNewCollection,
-                            CollectionUUID uuid);
+    void onRenameCollection(OperationContext* opCtx, Collection* coll, CollectionUUID uuid);
 
     /**
      * Implies onDropCollection for all collections in db, but is not transactional.
      */
     void onCloseDatabase(Database* db);
 
+    Collection* replaceUUIDCatalogEntry(CollectionUUID uuid, Collection* coll);
     void registerUUIDCatalogEntry(CollectionUUID uuid, Collection* coll);
     Collection* removeUUIDCatalogEntry(CollectionUUID uuid);
 
@@ -170,15 +181,20 @@ public:
 
     /**
      * Puts the catalog in closed state. In this state, the lookupNSSByUUID method will fall back
-     * to the pre-close state to resolve queries for currently unknown UUIDs. This allows
-     * authorization, which needs to do lookups outside of database locks, to proceed.
+     * to the pre-close state to resolve queries for currently unknown UUIDs. This allows processes,
+     * like authorization and replication, which need to do lookups outside of database locks, to
+     * proceed.
+     *
+     * Must be called with the global lock acquired in exclusive mode.
      */
-    void onCloseCatalog();
+    void onCloseCatalog(OperationContext* opCtx);
 
     /**
      * Puts the catatlog back in open state, removing the pre-close state. See onCloseCatalog.
+     *
+     * Must be called with the global lock acquired in exclusive mode.
      */
-    void onOpenCatalog();
+    void onOpenCatalog(OperationContext* opCtx);
 
     /**
      * Return the UUID lexicographically preceding `uuid` in the database named by `db`.
@@ -197,6 +213,8 @@ public:
 private:
     const std::vector<CollectionUUID>& _getOrdering_inlock(const StringData& db,
                                                            const stdx::lock_guard<stdx::mutex>&);
+    void _registerUUIDCatalogEntry_inlock(CollectionUUID uuid, Collection* coll);
+    Collection* _removeUUIDCatalogEntry_inlock(CollectionUUID uuid);
 
     mutable mongo::stdx::mutex _catalogLock;
     /**

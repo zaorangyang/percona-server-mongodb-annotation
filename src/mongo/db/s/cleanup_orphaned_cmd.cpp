@@ -80,7 +80,7 @@ CleanupResult cleanupOrphanedData(OperationContext* opCtx,
         AutoGetCollection autoColl(opCtx, ns, MODE_IX);
         const auto css = CollectionShardingState::get(opCtx, ns);
         auto metadata = css->getMetadata(opCtx);
-        if (!metadata) {
+        if (!metadata->isSharded()) {
             log() << "skipping orphaned data cleanup for " << ns.toString()
                   << ", collection is not sharded";
             return CleanupResult_Done;
@@ -227,7 +227,7 @@ public:
             return false;
         }
 
-        forceShardFilteringMetadataRefresh(opCtx, nss);
+        forceShardFilteringMetadataRefresh(opCtx, nss, true /* forceRefreshFromThisThread */);
 
         BSONObj stoppedAtKey;
         CleanupResult cleanupResult =

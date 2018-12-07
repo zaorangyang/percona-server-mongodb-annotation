@@ -6,10 +6,12 @@ doassert = function(msg, obj) {
     if (typeof(msg) == "object")
         msg = tojson(msg);
 
-    if (typeof(msg) == "string" && msg.indexOf("assert") == 0)
-        print(msg);
-    else
-        print("assert: " + msg);
+    if (jsTest.options().traceExceptions) {
+        if (typeof(msg) == "string" && msg.indexOf("assert") == 0)
+            print(msg);
+        else
+            print("assert: " + msg);
+    }
 
     var ex;
     if (obj) {
@@ -17,7 +19,9 @@ doassert = function(msg, obj) {
     } else {
         ex = Error(msg);
     }
-    print(ex.stack);
+    if (jsTest.options().traceExceptions) {
+        print(ex.stack);
+    }
     throw ex;
 };
 
@@ -191,6 +195,20 @@ assert = (function() {
 
         doassert(_buildAssertionMessage(
             msg, "[" + tojson(aSorted) + "] != [" + tojson(bSorted) + "] are not equal"));
+    };
+
+    assert.setEq = function(aSet, bSet, msg) {
+        const failAssertion = function() {
+            doassert(_buildAssertionMessage(msg, tojson(aSet) + " != " + tojson(bSet)));
+        };
+        if (aSet.size !== bSet.size) {
+            failAssertion();
+        }
+        for (let a of aSet) {
+            if (!bSet.has(a)) {
+                failAssertion();
+            }
+        }
     };
 
     assert.eq.automsg = function(a, b) {
@@ -484,12 +502,16 @@ assert = (function() {
             res instanceof BulkWriteResult || res instanceof BulkWriteError;
     }
 
+    function _validateCommandResponse(res, assertionName) {
+        if (typeof res !== "object") {
+            doassert("unknown response type '" + typeof res + "' given to " + assertionName +
+                     ", res='" + res + "'");
+        }
+    }
+
     function _assertCommandWorked(res, msg, {ignoreWriteErrors, ignoreWriteConcernErrors}) {
         _validateAssertionMessage(msg);
-
-        if (typeof res !== "object") {
-            doassert("unknown response given to commandWorked");
-        }
+        _validateCommandResponse(res, "commandWorked");
 
         // Keep this as a function so we don't call tojson if not necessary.
         const makeFailMsg = () => {
@@ -529,10 +551,7 @@ assert = (function() {
     const kAnyErrorCode = Object.create(null);
     function _assertCommandFailed(res, expectedCode, msg) {
         _validateAssertionMessage(msg);
-
-        if (typeof res !== "object") {
-            doassert("unknown response given to commandFailed");
-        }
+        _validateCommandResponse(res, "commandFailed");
 
         if (expectedCode !== kAnyErrorCode && !Array.isArray(expectedCode)) {
             expectedCode = [expectedCode];
@@ -813,11 +832,7 @@ assert = (function() {
         assert.between(a, b, c, msg, false);
     };
 
-    assert.close = function(a, b, msg, places) {
-        if (places === undefined) {
-            places = 4;
-        }
-
+    assert.close = function(a, b, msg, places = 4) {
         // This treats 'places' as digits past the decimal point.
         var absoluteError = Math.abs(a - b);
         if (Math.round(absoluteError * Math.pow(10, places)) === 0) {
@@ -830,8 +845,8 @@ assert = (function() {
             return;
         }
 
-        const msgPrefix = "" + a + " is not equal to " + b + " within " + places + " places, " +
-            "absolute error: " + absoluteError + ", relative error: " + relativeError;
+        const msgPrefix = `${a} is not equal to ${b} within ${places} places, absolute error: ` +
+            `${absoluteError}, relative error: ${relativeError}`;
         doassert(_buildAssertionMessage(msg, msgPrefix));
     };
 

@@ -46,6 +46,7 @@
 #include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/log.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace {
@@ -114,9 +115,9 @@ public:
 
         auto it = _collections.find(ns);
         if (it == _collections.end()) {
-            auto inserted = _collections.emplace(
+            auto inserted = _collections.try_emplace(
                 ns,
-                std::make_unique<CollectionShardingState>(get.owner(this), NamespaceString(ns)));
+                std::make_shared<CollectionShardingState>(get.owner(this), NamespaceString(ns)));
             invariant(inserted.second);
             it = std::move(inserted.first);
         }
@@ -142,10 +143,8 @@ public:
 
             for (auto& coll : _collections) {
                 ScopedCollectionMetadata metadata = coll.second->getMetadata(opCtx);
-                if (metadata) {
+                if (metadata->isSharded()) {
                     versionB.appendTimestamp(coll.first, metadata->getShardVersion().toLong());
-                } else {
-                    versionB.appendTimestamp(coll.first, ChunkVersion::UNSHARDED().toLong());
                 }
             }
         }
@@ -156,8 +155,7 @@ public:
 private:
     mutable stdx::mutex _mutex;
 
-    using CollectionsMap =
-        stdx::unordered_map<std::string, std::unique_ptr<CollectionShardingState>>;
+    using CollectionsMap = StringMap<std::shared_ptr<CollectionShardingState>>;
     CollectionsMap _collections;
 };
 
@@ -196,10 +194,8 @@ void CollectionShardingState::report(OperationContext* opCtx, BSONObjBuilder* bu
 }
 
 ScopedCollectionMetadata CollectionShardingState::getMetadata(OperationContext* opCtx) {
-    // TODO: SERVER-34276 - find an alternative to get the atClusterTime.
     auto atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
-    return atClusterTime ? _metadataManager->createMetadataAt(opCtx, atClusterTime.get())
-                         : _metadataManager->getActiveMetadata(_metadataManager);
+    return _metadataManager->getActiveMetadata(_metadataManager, atClusterTime);
 }
 
 void CollectionShardingState::refreshMetadata(OperationContext* opCtx,
@@ -228,11 +224,6 @@ auto CollectionShardingState::cleanUpRange(ChunkRange const& range, CleanWhen wh
     return _metadataManager->cleanUpRange(range, time);
 }
 
-std::vector<ScopedCollectionMetadata> CollectionShardingState::overlappingMetadata(
-    ChunkRange const& range) const {
-    return _metadataManager->overlappingMetadata(_metadataManager, range);
-}
-
 void CollectionShardingState::enterCriticalSectionCatchUpPhase(OperationContext* opCtx) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_nss.ns(), MODE_X));
     _critSec.enterCriticalSectionCatchUpPhase();
@@ -249,25 +240,89 @@ void CollectionShardingState::exitCriticalSection(OperationContext* opCtx) {
 }
 
 void CollectionShardingState::checkShardVersionOrThrow(OperationContext* opCtx) {
-    std::string errmsg;
-    ChunkVersion received;
-    ChunkVersion wanted;
-    if (!_checkShardVersionOk(opCtx, &errmsg, &received, &wanted)) {
-        uasserted(StaleConfigInfo(_nss.ns(), received, wanted),
-                  str::stream() << "shard version not ok: " << errmsg);
-    }
-}
+    auto& oss = OperationShardingState::get(opCtx);
 
-bool CollectionShardingState::collectionIsSharded(OperationContext* opCtx) {
-    auto metadata = getMetadata(opCtx).getMetadata();
-    if (metadata && (metadata->getCollVersion().isStrictlyEqualTo(ChunkVersion::UNSHARDED()))) {
-        return false;
+    const auto receivedShardVersion = [&] {
+        // If there is a version attached to the OperationContext, use it as the received version,
+        // otherwise get the received version from the ShardedConnectionInfo
+        if (oss.hasShardVersion()) {
+            return oss.getShardVersion(_nss);
+        } else if (auto const info = ShardedConnectionInfo::get(opCtx->getClient(), false)) {
+            auto connectionShardVersion = info->getVersion(_nss.ns());
+
+            // For backwards compatibility with map/reduce, which can access up to 2 sharded
+            // collections in a single call, the lack of version for a namespace on the collection
+            // must be treated as UNSHARDED
+            return connectionShardVersion.value_or(ChunkVersion::UNSHARDED());
+        } else {
+            // There is no shard version information on either 'opCtx' or 'client'. This means that
+            // the operation represented by 'opCtx' is unversioned, and the shard version is always
+            // OK for unversioned operations.
+            return ChunkVersion::IGNORED();
+        }
+    }();
+
+    if (ChunkVersion::isIgnoredVersion(receivedShardVersion)) {
+        return;
     }
 
-    // If 'metadata' is null, then the shard doesn't know if this collection is sharded or not. In
-    // this scenario we will assume this collection is sharded. We will know sharding state
-    // definitively once SERVER-24960 has been fixed.
-    return true;
+    // An operation with read concern 'available' should never have shardVersion set.
+    invariant(repl::ReadConcernArgs::get(opCtx).getLevel() !=
+              repl::ReadConcernLevel::kAvailableReadConcern);
+
+    // Set this for error messaging purposes before potentially returning false.
+    auto metadata = getMetadata(opCtx);
+    const auto wantedShardVersion =
+        metadata->isSharded() ? metadata->getShardVersion() : ChunkVersion::UNSHARDED();
+
+    auto criticalSectionSignal = _critSec.getSignal(opCtx->lockState()->isWriteLocked()
+                                                        ? ShardingMigrationCriticalSection::kWrite
+                                                        : ShardingMigrationCriticalSection::kRead);
+    if (criticalSectionSignal) {
+        // Set migration critical section on operation sharding state: operation will wait for the
+        // migration to finish before returning failure and retrying.
+        oss.setMigrationCriticalSectionSignal(criticalSectionSignal);
+
+        uasserted(StaleConfigInfo(_nss, receivedShardVersion, wantedShardVersion),
+                  str::stream() << "migration commit in progress for " << _nss.ns());
+    }
+
+    if (receivedShardVersion.isWriteCompatibleWith(wantedShardVersion)) {
+        return;
+    }
+
+    //
+    // Figure out exactly why not compatible, send appropriate error message
+    // The versions themselves are returned in the error, so not needed in messages here
+    //
+
+    StaleConfigInfo sci(_nss, receivedShardVersion, wantedShardVersion);
+
+    uassert(std::move(sci),
+            str::stream() << "epoch mismatch detected for " << _nss.ns() << ", "
+                          << "the collection may have been dropped and recreated",
+            wantedShardVersion.epoch() == receivedShardVersion.epoch());
+
+    if (!wantedShardVersion.isSet() && receivedShardVersion.isSet()) {
+        uasserted(std::move(sci),
+                  str::stream() << "this shard no longer contains chunks for " << _nss.ns() << ", "
+                                << "the collection may have been dropped");
+    }
+
+    if (wantedShardVersion.isSet() && !receivedShardVersion.isSet()) {
+        uasserted(std::move(sci),
+                  str::stream() << "this shard contains chunks for " << _nss.ns() << ", "
+                                << "but the client expects unsharded collection");
+    }
+
+    if (wantedShardVersion.majorVersion() != receivedShardVersion.majorVersion()) {
+        // Could be > or < - wanted is > if this is the source of a migration, wanted < if this is
+        // the target of a migration
+        uasserted(std::move(sci), str::stream() << "version mismatch detected for " << _nss.ns());
+    }
+
+    // Those are all the reasons the versions can mismatch
+    MONGO_UNREACHABLE;
 }
 
 // Call with collection unlocked.  Note that the CollectionShardingState object involved might not
@@ -288,9 +343,12 @@ Status CollectionShardingState::waitForClean(OperationContext* opCtx,
             {
                 // First, see if collection was dropped, but do it in a separate scope in order to
                 // not hold reference on it, which would make it appear in use
-                auto metadata = css->_metadataManager->getActiveMetadata(css->_metadataManager);
-                if (!metadata || metadata->getCollVersion().epoch() != epoch) {
-                    return {ErrorCodes::StaleShardVersion, "Collection being migrated was dropped"};
+                auto metadata =
+                    css->_metadataManager->getActiveMetadata(css->_metadataManager, boost::none);
+
+                if (!metadata->isSharded() || metadata->getCollVersion().epoch() != epoch) {
+                    return {ErrorCodes::ConflictingOperationInProgress,
+                            "Collection being migrated was dropped"};
                 }
             }
 
@@ -324,95 +382,21 @@ boost::optional<ChunkRange> CollectionShardingState::getNextOrphanRange(BSONObj 
     return _metadataManager->getNextOrphanRange(from);
 }
 
-bool CollectionShardingState::_checkShardVersionOk(OperationContext* opCtx,
-                                                   std::string* errmsg,
-                                                   ChunkVersion* expectedShardVersion,
-                                                   ChunkVersion* actualShardVersion) {
-    auto& oss = OperationShardingState::get(opCtx);
+CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, NamespaceString ns)
+    : _nss(std::move(ns)), _opCtx(opCtx) {
+    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX, MODE_X);
+    CollectionShardingState::get(opCtx, _nss)->enterCriticalSectionCatchUpPhase(_opCtx);
+}
 
-    // If there is a version attached to the OperationContext, use it as the received version.
-    // Otherwise, get the received version from the ShardedConnectionInfo.
-    if (oss.hasShardVersion()) {
-        *expectedShardVersion = oss.getShardVersion(_nss);
-    } else {
-        auto const info = ShardedConnectionInfo::get(opCtx->getClient(), false);
-        if (!info) {
-            // There is no shard version information on either 'opCtx' or 'client'. This means that
-            // the operation represented by 'opCtx' is unversioned, and the shard version is always
-            // OK for unversioned operations.
-            return true;
-        }
+CollectionCriticalSection::~CollectionCriticalSection() {
+    UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
+    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX, MODE_X);
+    CollectionShardingState::get(_opCtx, _nss)->exitCriticalSection(_opCtx);
+}
 
-        auto connectionExpectedShardVersion = info->getVersion(_nss.ns());
-        if (!connectionExpectedShardVersion) {
-            *expectedShardVersion = ChunkVersion::UNSHARDED();
-        } else {
-            *expectedShardVersion = std::move(*connectionExpectedShardVersion);
-        }
-    }
-
-    // An operation with read concern 'available' should never have shardVersion set.
-    invariant(repl::ReadConcernArgs::get(opCtx).getLevel() !=
-              repl::ReadConcernLevel::kAvailableReadConcern);
-
-    if (ChunkVersion::isIgnoredVersion(*expectedShardVersion)) {
-        return true;
-    }
-
-    // Set this for error messaging purposes before potentially returning false.
-    auto metadata = getMetadata(opCtx);
-    *actualShardVersion = metadata ? metadata->getShardVersion() : ChunkVersion::UNSHARDED();
-
-    auto criticalSectionSignal = _critSec.getSignal(opCtx->lockState()->isWriteLocked()
-                                                        ? ShardingMigrationCriticalSection::kWrite
-                                                        : ShardingMigrationCriticalSection::kRead);
-    if (criticalSectionSignal) {
-        *errmsg = str::stream() << "migration commit in progress for " << _nss.ns();
-
-        // Set migration critical section on operation sharding state: operation will wait for
-        // the migration to finish before returning failure and retrying.
-        oss.setMigrationCriticalSectionSignal(criticalSectionSignal);
-        return false;
-    }
-
-    if (expectedShardVersion->isWriteCompatibleWith(*actualShardVersion)) {
-        return true;
-    }
-
-    //
-    // Figure out exactly why not compatible, send appropriate error message
-    // The versions themselves are returned in the error, so not needed in messages here
-    //
-
-    // Check epoch first, to send more meaningful message, since other parameters probably won't
-    // match either.
-    if (actualShardVersion->epoch() != expectedShardVersion->epoch()) {
-        *errmsg = str::stream() << "version epoch mismatch detected for " << _nss.ns() << ", "
-                                << "the collection may have been dropped and recreated";
-        return false;
-    }
-
-    if (!actualShardVersion->isSet() && expectedShardVersion->isSet()) {
-        *errmsg = str::stream() << "this shard no longer contains chunks for " << _nss.ns() << ", "
-                                << "the collection may have been dropped";
-        return false;
-    }
-
-    if (actualShardVersion->isSet() && !expectedShardVersion->isSet()) {
-        *errmsg = str::stream() << "this shard contains versioned chunks for " << _nss.ns() << ", "
-                                << "but no version set in request";
-        return false;
-    }
-
-    if (actualShardVersion->majorVersion() != expectedShardVersion->majorVersion()) {
-        // Could be > or < - wanted is > if this is the source of a migration, wanted < if this is
-        // the target of a migration
-        *errmsg = str::stream() << "version mismatch detected for " << _nss.ns();
-        return false;
-    }
-
-    // Those are all the reasons the versions can mismatch
-    MONGO_UNREACHABLE;
+void CollectionCriticalSection::enterCommitPhase() {
+    AutoGetCollection autoColl(_opCtx, _nss, MODE_IX, MODE_X);
+    CollectionShardingState::get(_opCtx, _nss)->enterCriticalSectionCommitPhase(_opCtx);
 }
 
 }  // namespace mongo

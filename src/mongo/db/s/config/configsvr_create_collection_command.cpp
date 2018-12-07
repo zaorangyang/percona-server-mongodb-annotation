@@ -81,6 +81,11 @@ public:
 
             auto const catalogClient = Grid::get(opCtx)->catalogClient();
 
+            auto scopedDbLock =
+                ShardingCatalogManager::get(opCtx)->serializeCreateDatabase(opCtx, ns().db());
+            auto scopedCollLock =
+                ShardingCatalogManager::get(opCtx)->serializeCreateCollection(opCtx, ns());
+
             auto dbDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(
                 opCtx, ns().db(), "createCollection", DistLockManager::kDefaultLockTimeout));
             auto collDistLock = uassertStatusOK(catalogClient->getDistLockManager()->lock(

@@ -33,7 +33,6 @@
 #include "mongo/db/query/find.h"
 
 #include "mongo/base/error_codes.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
@@ -72,7 +71,7 @@ using std::unique_ptr;
 using stdx::make_unique;
 
 // Failpoint for checking whether we've received a getmore.
-MONGO_FP_DECLARE(failReceivedGetmore);
+MONGO_FAIL_POINT_DEFINE(failReceivedGetmore);
 
 bool shouldSaveCursor(OperationContext* opCtx,
                       const Collection* collection,

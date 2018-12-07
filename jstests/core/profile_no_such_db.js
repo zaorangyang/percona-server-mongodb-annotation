@@ -1,4 +1,4 @@
-// @tags: [does_not_support_stepdowns]
+// @tags: [does_not_support_stepdowns, requires_profiling]
 
 // Test that reading the profiling level doesn't create databases, but setting it does.
 (function(db) {
@@ -23,11 +23,9 @@
         jsTest.log('Testing profiling level ' + level);
 
         // Setting the profiling level creates the database.
-        // Note: in storage engines other than MMAPv1 setting the profiling level to 0 puts the
-        // database
-        // in a weird state where it exists internally, but doesn't show up in listDatabases, and
-        // won't
-        // exist if you restart the server.
+        // Note: setting the profiling level to 0 puts the database in a weird state where it
+        // exists internally, but doesn't show up in listDatabases, and won't exist if you
+        // restart the server.
         var res = db.setProfilingLevel(level);
         assert.eq(res.was, defaultProfilingLevel);
         assert(dbExists() || level == 0);

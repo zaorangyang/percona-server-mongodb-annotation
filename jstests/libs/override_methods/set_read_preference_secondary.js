@@ -14,17 +14,14 @@
         "dbStats",
         "distinct",
         "find",
-        "geoNear",
         "geoSearch",
-        "group",
         "mapReduce",
         "mapreduce",
-        "parallelCollectionScan",
     ]);
     const kDatabasesOnConfigServers = new Set(["config", "admin"]);
 
     // This list of cursor-generating commands is incomplete. For example, "listCollections",
-    // "listIndexes", "parallelCollectionScan", and "repairCursor" are all missing from this list.
+    // "listIndexes", and "repairCursor" are all missing from this list.
     // If we ever add tests that attempt to run getMore or killCursors on cursors generated from
     // those commands, then we should update the contents of this list and also handle any
     // differences in the server's response format.
@@ -123,6 +120,12 @@
         } else if (conn.isMongos() && kDatabasesOnConfigServers.has(dbName)) {
             // Avoid overriding the read preference for config server since there may only be one
             // of them.
+            shouldForceReadPreference = false;
+        }
+
+        if (TestData.doNotOverrideReadPreference) {
+            // Use this TestData flag to allow certain runCommands to be exempted from
+            // setting secondary read preference.
             shouldForceReadPreference = false;
         }
 

@@ -54,6 +54,15 @@
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/stdx/memory.h"
 
+#define ASSERT_DOES_NOT_THROW(EXPRESSION)                                          \
+    try {                                                                          \
+        EXPRESSION;                                                                \
+    } catch (const AssertionException& e) {                                        \
+        ::mongoutils::str::stream err;                                             \
+        err << "Threw an exception incorrectly: " << e.toString();                 \
+        ::mongo::unittest::TestAssertionFailure(__FILE__, __LINE__, err).stream(); \
+    }
+
 namespace QueryStageUpdate {
 
 using std::unique_ptr;
@@ -65,13 +74,13 @@ static const NamespaceString nss("unittests.QueryStageUpdate");
 class QueryStageUpdateBase {
 public:
     QueryStageUpdateBase() : _client(&_opCtx) {
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         _client.dropCollection(nss.ns());
         _client.createCollection(nss.ns());
     }
 
     virtual ~QueryStageUpdateBase() {
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         _client.dropCollection(nss.ns());
     }
 
@@ -186,7 +195,7 @@ public:
     void run() {
         // Run the update.
         {
-            OldClientWriteContext ctx(&_opCtx, nss.ns());
+            dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
             CurOp& curOp = *CurOp::get(_opCtx);
             OpDebug* opDebug = &curOp.debug();
             const CollatorInterface* collator = nullptr;
@@ -210,7 +219,8 @@ public:
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
 
-            ASSERT_OK(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
+            ASSERT_DOES_NOT_THROW(
+                driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
 
             // Setup update params.
             UpdateStageParams params(&request, &driver, opDebug);
@@ -250,7 +260,7 @@ public:
     void run() {
         // Run the update.
         {
-            OldClientWriteContext ctx(&_opCtx, nss.ns());
+            dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
 
             // Populate the collection.
             for (int i = 0; i < 10; ++i) {
@@ -284,7 +294,8 @@ public:
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
 
-            ASSERT_OK(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
+            ASSERT_DOES_NOT_THROW(
+                driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
 
             // Configure the scan.
             CollectionScanParams collScanParams;
@@ -374,7 +385,7 @@ public:
         ASSERT_EQUALS(10U, count(BSONObj()));
 
         // Various variables we'll need.
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         OpDebug* opDebug = &CurOp::get(_opCtx)->debug();
         Collection* coll = ctx.getCollection();
         UpdateLifecycleImpl updateLifecycle(nss);
@@ -400,7 +411,7 @@ public:
 
         const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
 
-        ASSERT_OK(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
+        ASSERT_DOES_NOT_THROW(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
 
         // Configure a QueuedDataStage to pass the first object in the collection back in a
         // RID_AND_OBJ state.
@@ -465,7 +476,7 @@ public:
         ASSERT_EQUALS(50U, count(BSONObj()));
 
         // Various variables we'll need.
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         OpDebug* opDebug = &CurOp::get(_opCtx)->debug();
         Collection* coll = ctx.getCollection();
         UpdateLifecycleImpl updateLifecycle(nss);
@@ -491,7 +502,7 @@ public:
 
         const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
 
-        ASSERT_OK(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
+        ASSERT_DOES_NOT_THROW(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
 
         // Configure a QueuedDataStage to pass the first object in the collection back in a
         // RID_AND_OBJ state.
@@ -552,7 +563,7 @@ class QueryStageUpdateSkipOwnedObjects : public QueryStageUpdateBase {
 public:
     void run() {
         // Various variables we'll need.
-        OldClientWriteContext ctx(&_opCtx, nss.ns());
+        dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         OpDebug* opDebug = &CurOp::get(_opCtx)->debug();
         Collection* coll = ctx.getCollection();
         UpdateLifecycleImpl updateLifecycle(nss);
@@ -572,7 +583,7 @@ public:
 
         const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
 
-        ASSERT_OK(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
+        ASSERT_DOES_NOT_THROW(driver.parse(request.getUpdates(), arrayFilters, request.isMulti()));
 
         // Configure a QueuedDataStage to pass an OWNED_OBJ to the update stage.
         auto qds = make_unique<QueuedDataStage>(&_opCtx, ws.get());

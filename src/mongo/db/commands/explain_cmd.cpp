@@ -92,18 +92,13 @@ public:
           _innerRequest{std::move(innerRequest)},
           _innerInvocation{std::move(innerInvocation)} {}
 
-    void run(OperationContext* opCtx, CommandReplyBuilder* result) override {
+    void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
         uassert(50746,
                 "Explain's child command cannot run on this node. "
                 "Are you explaining a write command on a secondary?",
                 commandCanRunHere(opCtx, _dbName, _innerInvocation->definition()));
-        try {
-            BSONObjBuilder bob = result->getBodyBuilder();
-            _innerInvocation->explain(opCtx, _verbosity, &bob);
-        } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
-            CommandHelpers::logAuthViolation(opCtx, this, *_outerRequest, ErrorCodes::Unauthorized);
-            throw;
-        }
+        BSONObjBuilder bob = result->getBodyBuilder();
+        _innerInvocation->explain(opCtx, _verbosity, &bob);
     }
 
     void explain(OperationContext* opCtx,

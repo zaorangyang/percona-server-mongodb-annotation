@@ -40,7 +40,6 @@
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/config.h"
 #include "mongo/crypto/mechanism_scram.h"
 #include "mongo/db/audit.h"
@@ -663,15 +662,6 @@ Status buildCredentials(BSONObjBuilder* builder, const auth::CreateOrUpdateUserA
         auto sha1Cred = scram::Secrets<SHA1Block>::generateCredentials(
             hashedPwd, saslGlobalParams.scramSHA1IterationCount.load());
         builder->append("SCRAM-SHA-1", sha1Cred);
-    }
-
-    if (buildSCRAMSHA256) {
-        // FCV check is deferred till this point so that the suitability checks can be performed
-        // regardless.
-        const auto fcv = serverGlobalParams.featureCompatibility.getVersion();
-        if (fcv < ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
-            buildSCRAMSHA256 = false;
-        }
     }
 
     if (buildSCRAMSHA256) {
@@ -1379,21 +1369,27 @@ public:
                 pipeline.push_back(BSON("$match" << *args.filter));
             }
 
+            DBDirectClient client(opCtx);
+
             BSONObjBuilder responseBuilder;
             AggregationRequest aggRequest(AuthorizationManager::usersCollectionNamespace,
                                           std::move(pipeline));
-            Status status = runAggregate(opCtx,
+            uassertStatusOK(runAggregate(opCtx,
                                          AuthorizationManager::usersCollectionNamespace,
                                          aggRequest,
                                          aggRequest.serializeToCommandObj().toBson(),
-                                         responseBuilder);
-            uassertStatusOK(status);
-
+                                         responseBuilder));
             CommandHelpers::appendSimpleCommandStatus(responseBuilder, true);
-            auto swResponse = CursorResponse::parseFromBSON(responseBuilder.obj());
-            uassertStatusOK(swResponse.getStatus());
-            for (const BSONObj& obj : swResponse.getValue().getBatch()) {
-                usersArrayBuilder.append(obj);
+            auto response = CursorResponse::parseFromBSONThrowing(responseBuilder.obj());
+            DBClientCursor cursor(&client,
+                                  response.getNSS().toString(),
+                                  response.getCursorId(),
+                                  0,
+                                  0,
+                                  response.releaseBatch());
+
+            while (cursor.more()) {
+                usersArrayBuilder.append(cursor.next());
             }
         }
         result.append("users", usersArrayBuilder.arr());

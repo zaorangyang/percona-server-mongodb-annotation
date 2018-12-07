@@ -48,7 +48,6 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
-#include "mongo/db/sessions_collection.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -150,7 +149,7 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
     // Ensure the namespace is valid.
     uassert(ErrorCodes::IllegalOperation,
             "can't shard system namespaces",
-            !nss.isSystem() || nss == SessionsCollection::kSessionsNamespaceString);
+            !nss.isSystem() || nss == NamespaceString::kLogicalSessionsNamespace);
 
     // Ensure the collation is valid. Currently we only allow the simple collation.
     bool simpleCollationSpecified = false;
@@ -178,7 +177,8 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
                           << maxNumInitialChunksForShards
                           << ", 8192 * number of shards; or "
                           << maxNumInitialChunksTotal,
-            numChunks <= maxNumInitialChunksForShards && numChunks <= maxNumInitialChunksTotal);
+            numChunks >= 0 && numChunks <= maxNumInitialChunksForShards &&
+                numChunks <= maxNumInitialChunksTotal);
 
     // Retrieve the collection metadata in order to verify that it is legal to shard this
     // collection.
@@ -636,7 +636,6 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
         }
     }
 }
-
 boost::optional<UUID> getUUIDFromPrimaryShard(const NamespaceString& nss,
                                               ScopedDbConnection& conn) {
     // Obtain the collection's UUID from the primary shard's listCollections response.
@@ -667,7 +666,7 @@ boost::optional<UUID> getUUIDFromPrimaryShard(const NamespaceString& nss,
             str::stream() << "expected primary shard to return 'info' field as part of "
                              "listCollections for "
                           << nss.ns()
-                          << " because the cluster is in featureCompatibilityVersion=3.6, but got "
+                          << ", but got "
                           << res,
             !collectionInfo.isEmpty());
 
@@ -681,7 +680,7 @@ boost::optional<UUID> getUUIDFromPrimaryShard(const NamespaceString& nss,
 }
 
 /**
- * Internal sharding command run on config servers to add a shard to the cluster.
+ * Internal sharding command run on config servers to shard a collection.
  */
 class ConfigSvrShardCollectionCommand : public BasicCommand {
 public:
@@ -785,8 +784,7 @@ public:
             // Only whitelisted collections in config may be sharded (unless we are in test mode)
             uassert(ErrorCodes::IllegalOperation,
                     "only special collections in the config db may be sharded",
-                    nss == SessionsCollection::kSessionsNamespaceString ||
-                        getTestCommandsEnabled());
+                    nss == NamespaceString::kLogicalSessionsNamespace || getTestCommandsEnabled());
 
             auto configShard = uassertStatusOK(shardRegistry->getShard(opCtx, dbType.getPrimary()));
             ScopedDbConnection configConn(configShard->getConnString());
@@ -829,15 +827,77 @@ public:
             return true;
         }
 
+        bool isEmpty = (conn->count(nss.ns()) == 0);
+        boost::optional<UUID> uuid;
+
+        if (serverGlobalParams.featureCompatibility.getVersion() ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+
+            // The primary shard will read the config.tags collection so we need to lock the zone
+            // mutex.
+            Lock::ExclusiveLock lk = catalogManager->lockZoneMutex(opCtx);
+
+            ShardsvrShardCollection shardsvrShardCollectionRequest;
+            shardsvrShardCollectionRequest.set_shardsvrShardCollection(nss);
+            shardsvrShardCollectionRequest.setKey(request.getKey());
+            shardsvrShardCollectionRequest.setUnique(request.getUnique());
+            shardsvrShardCollectionRequest.setNumInitialChunks(request.getNumInitialChunks());
+            shardsvrShardCollectionRequest.setInitialSplitPoints(request.getInitialSplitPoints());
+            shardsvrShardCollectionRequest.setCollation(request.getCollation());
+            shardsvrShardCollectionRequest.setGetUUIDfromPrimaryShard(
+                request.getGetUUIDfromPrimaryShard());
+
+            auto cmdResponse = uassertStatusOK(primaryShard->runCommandWithFixedRetryAttempts(
+                opCtx,
+                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                "admin",
+                CommandHelpers::appendMajorityWriteConcern(CommandHelpers::appendPassthroughFields(
+                    cmdObj, shardsvrShardCollectionRequest.toBSON())),
+                Shard::RetryPolicy::kIdempotent));
+
+            // SERVER-14394 Remove status check below and replace with
+            // filterCommandReplyForPassthrough
+            uassertStatusOK(cmdResponse.commandStatus);
+
+            auto shardCollResponse = ShardsvrShardCollectionResponse::parse(
+                IDLParserErrorContext("ShardsvrShardCollectionResponse"), cmdResponse.response);
+            auto uuid = std::move(shardCollResponse.getCollectionUUID());
+
+            result << "collectionsharded" << nss.ns();
+            if (uuid) {
+                result << "collectionUUID" << *uuid;
+            }
+
+            // Make sure the cached metadata for the collection knows that we are now sharded
+            catalogCache->invalidateShardedCollection(nss);
+
+            // Free the distlocks to allow the splits and migrations below to proceed.
+            collDistLock.reset();
+            dbDistLock.reset();
+            lk.unlock();
+
+            // Step 7. Migrate initial chunks to distribute them across shards.
+            migrateAndFurtherSplitInitialChunks(opCtx,
+                                                nss,
+                                                numShards,
+                                                shardIds,
+                                                isEmpty,
+                                                shardKeyPattern,
+                                                std::move(shardCollResponse.getAllSplits()));
+
+            return true;
+        }
+
         // Step 3.
         validateShardKeyAgainstExistingIndexes(
             opCtx, nss, proposedKey, shardKeyPattern, primaryShard, conn, request);
 
         // Step 4.
-        auto uuid = getUUIDFromPrimaryShard(nss, conn);
-
-        // isEmpty is used by multiple steps below.
-        bool isEmpty = (conn->count(nss.ns()) == 0);
+        if (request.getGetUUIDfromPrimaryShard()) {
+            uuid = getUUIDFromPrimaryShard(nss, conn);
+        } else {
+            uuid = UUID::gen();
+        }
 
         // Step 5.
         std::vector<BSONObj> initSplits;  // there will be at most numShards-1 of these
@@ -850,6 +910,7 @@ public:
                                     request,
                                     &initSplits,
                                     &allSplits);
+
 
         LOG(0) << "CMD: shardcollection: " << cmdObj;
 

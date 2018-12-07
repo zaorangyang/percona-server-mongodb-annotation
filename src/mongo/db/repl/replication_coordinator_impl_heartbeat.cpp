@@ -38,11 +38,8 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/elect_cmd_runner.h"
-#include "mongo/db/repl/freshness_checker.h"
 #include "mongo/db/repl/heartbeat_response_action.h"
 #include "mongo/db/repl/repl_set_config_checks.h"
-#include "mongo/db/repl/repl_set_heartbeat_args.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
@@ -65,8 +62,8 @@ namespace repl {
 
 namespace {
 
-MONGO_FP_DECLARE(blockHeartbeatStepdown);
-MONGO_FP_DECLARE(blockHeartbeatReconfigFinish);
+MONGO_FAIL_POINT_DEFINE(blockHeartbeatStepdown);
+MONGO_FAIL_POINT_DEFINE(blockHeartbeatReconfigFinish);
 
 }  // namespace
 
@@ -98,17 +95,11 @@ void ReplicationCoordinatorImpl::_doMemberHeartbeat(executor::TaskExecutor::Call
     const Date_t now = _replExecutor->now();
     BSONObj heartbeatObj;
     Milliseconds timeout(0);
-    if (isV1ElectionProtocol()) {
-        const std::pair<ReplSetHeartbeatArgsV1, Milliseconds> hbRequest =
-            _topCoord->prepareHeartbeatRequestV1(now, _settings.ourSetName(), target);
-        heartbeatObj = hbRequest.first.toBSON();
-        timeout = hbRequest.second;
-    } else {
-        const std::pair<ReplSetHeartbeatArgs, Milliseconds> hbRequest =
-            _topCoord->prepareHeartbeatRequest(now, _settings.ourSetName(), target);
-        heartbeatObj = hbRequest.first.toBSON();
-        timeout = hbRequest.second;
-    }
+    invariant(isV1ElectionProtocol());
+    const std::pair<ReplSetHeartbeatArgsV1, Milliseconds> hbRequest =
+        _topCoord->prepareHeartbeatRequestV1(now, _settings.ourSetName(), target);
+    heartbeatObj = hbRequest.first.toBSON();
+    timeout = hbRequest.second;
 
     const RemoteCommandRequest request(
         target, "admin", heartbeatObj, BSON(rpc::kReplSetMetadataFieldName << 1), nullptr, timeout);
@@ -221,9 +212,6 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         _updateLastCommittedOpTime_inlock();
     }
 
-    // Wake the stepdown waiter when our updated OpTime allows it to finish stepping down.
-    _signalStepDownWaiterIfReady_inlock();
-
     // Abort catchup if we have caught up to the latest known optime after heartbeat refreshing.
     if (_catchupState) {
         _catchupState->signalHeartbeatUpdate_inlock();
@@ -265,9 +253,6 @@ stdx::unique_lock<stdx::mutex> ReplicationCoordinatorImpl::_handleHeartbeatRespo
             invariant(responseStatus.isOK());
             _scheduleHeartbeatReconfig_inlock(responseStatus.getValue().getConfig());
             break;
-        case HeartbeatResponseAction::StartElection:
-            _startElectSelf_inlock();
-            break;
         case HeartbeatResponseAction::StepDownSelf:
             invariant(action.getPrimaryConfigIndex() == _selfIndex);
             if (_topCoord->prepareForUnconditionalStepDown()) {
@@ -278,12 +263,6 @@ stdx::unique_lock<stdx::mutex> ReplicationCoordinatorImpl::_handleHeartbeatRespo
                           "process of stepping down";
             }
             break;
-        case HeartbeatResponseAction::StepDownRemotePrimary: {
-            invariant(action.getPrimaryConfigIndex() != _selfIndex);
-            _requestRemotePrimaryStepdown(
-                _rsConfig.getMemberAt(action.getPrimaryConfigIndex()).getHostAndPort());
-            break;
-        }
         case HeartbeatResponseAction::PriorityTakeover: {
             // Don't schedule a priority takeover if any takeover is already scheduled.
             if (!_priorityTakeoverCbh.isValid() && !_catchupTakeoverCbh.isValid()) {
@@ -402,10 +381,6 @@ void ReplicationCoordinatorImpl::_stepDownFinish(
     _externalState->killAllUserOperations(opCtx.get());
     globalExclusiveLock.waitForLockUntil(Date_t::max());
     invariant(globalExclusiveLock.isLocked());
-
-    // TODO SERVER-34395: Remove this method and kill cursors as part of killAllUserOperations call
-    // when the CursorManager no longer requires collection locks to kill cursors.
-    _externalState->killAllTransactionCursors(opCtx.get());
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
@@ -832,6 +807,11 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
         return;
     }
     stdx::lock_guard<stdx::mutex> lock(_mutex);
+    // If it is not a single node replica set, no need to start an election after stepdown timeout.
+    if (reason == TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout &&
+        _rsConfig.getNumMembers() != 1) {
+        return;
+    }
 
     // We should always reschedule this callback even if we do not make it to the election
     // process.
@@ -864,6 +844,10 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
                 log() << "Not starting an election for a catchup takeover, "
                       << "since we are not electable due to: " << status.reason();
                 break;
+            case TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout:
+                log() << "Not starting an election for a single node replica set stepdown timeout, "
+                      << "since we are not electable due to: " << status.reason();
+                break;
         }
         return;
     }
@@ -881,6 +865,9 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
             break;
         case TopologyCoordinator::StartElectionReason::kCatchupTakeover:
             log() << "Starting an election for a catchup takeover";
+            break;
+        case TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout:
+            log() << "Starting an election due to single node replica set stepdown timeout";
             break;
     }
 

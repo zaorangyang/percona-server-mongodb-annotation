@@ -78,11 +78,20 @@ void SyncTailOpObserver::onCreateCollection(OperationContext* opCtx,
                                             Collection* coll,
                                             const NamespaceString& collectionName,
                                             const CollectionOptions& options,
-                                            const BSONObj& idIndex) {
+                                            const BSONObj& idIndex,
+                                            const OplogSlot& createOpTime) {
     if (!onCreateCollectionFn) {
         return;
     }
     onCreateCollectionFn(opCtx, coll, collectionName, options, idIndex);
+}
+
+// static
+OplogApplier::Options SyncTailTest::makeInitialSyncOptions() {
+    OplogApplier::Options options;
+    options.allowNamespaceNotFoundErrorsOnCrudOps = true;
+    options.missingDocumentSourceForInitialSync = HostAndPort("localhost", 123);
+    return options;
 }
 
 void SyncTailTest::setUp() {
@@ -113,7 +122,7 @@ void SyncTailTest::setUp() {
     // test fixture does not create a featureCompatibilityVersion document from which to initialize
     // the server parameter.
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
 }
 
 void SyncTailTest::tearDown() {
@@ -208,17 +217,25 @@ Status SyncTailTest::runOpInitialSync(const OplogEntry& op) {
 }
 
 Status SyncTailTest::runOpsInitialSync(std::vector<OplogEntry> ops) {
+    auto options = makeInitialSyncOptions();
     SyncTail syncTail(nullptr,
                       getConsistencyMarkers(),
                       getStorageInterface(),
                       SyncTail::MultiSyncApplyFunc(),
-                      nullptr);
-    MultiApplier::OperationPtrs opsPtrs;
+                      nullptr,
+                      options);
+    // Apply each operation in a batch of one because 'ops' may contain a mix of commands and CRUD
+    // operations provided by idempotency tests.
     for (auto& op : ops) {
+        MultiApplier::OperationPtrs opsPtrs;
         opsPtrs.push_back(&op);
+        WorkerMultikeyPathInfo pathInfo;
+        auto status = multiSyncApply(_opCtx.get(), &opsPtrs, &syncTail, &pathInfo);
+        if (!status.isOK()) {
+            return status;
+        }
     }
-    WorkerMultikeyPathInfo pathInfo;
-    return multiInitialSyncApply(_opCtx.get(), &opsPtrs, &syncTail, &pathInfo);
+    return Status::OK();
 }
 
 

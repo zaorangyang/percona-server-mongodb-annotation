@@ -15,12 +15,13 @@
  *  - The txnNumber for the first session id is the original value.
  *  - There is no record for the second session id.
  *  - A record for the third session id was created during oplog replay.
- *
- * TODO(SERVER-33879): Unblacklist this test from WiredTiger.
- * @tags: [requires_mmapv1]
  */
 (function() {
     "use strict";
+
+    // TODO(SERVER-35654): Re-enable once fixed.
+    if (true)
+        return;
 
     load("jstests/libs/retryable_writes_util.js");
 
@@ -225,8 +226,9 @@
     assert.eq(upstream.getDB("config").transactions.find().itcount(), 2);
 
     // Confirm the nodes are consistent.
-    replTest.checkReplicatedDataHashes(testName);
     replTest.checkOplogs();
+    replTest.checkReplicatedDataHashes(testName);
+    replTest.checkCollectionCounts();
 
     replTest.stopSet();
 }());

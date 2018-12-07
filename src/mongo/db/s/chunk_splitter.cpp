@@ -32,11 +32,12 @@
 
 #include "mongo/db/s/chunk_splitter.h"
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/query.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/s/chunk_split_state_driver.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/split_chunk.h"
 #include "mongo/db/s/split_vector.h"
@@ -259,19 +260,22 @@ void ChunkSplitter::onStepDown() {
     // TODO: Re-enable this log when auto split is actively running on shards.
 }
 
-void ChunkSplitter::trySplitting(const NamespaceString& nss,
+void ChunkSplitter::trySplitting(ChunkSplitStateDriver chunkSplitStateDriver,
+                                 const NamespaceString& nss,
                                  const BSONObj& min,
                                  const BSONObj& max,
                                  long dataWritten) {
     if (!_isPrimary) {
         return;
     }
-    uassertStatusOK(_threadPool.schedule([ this, nss, min, max, dataWritten ]() noexcept {
-        _runAutosplit(nss, min, max, dataWritten);
-    }));
+    uassertStatusOK(_threadPool.schedule(
+        [ this, &chunkSplitStateDriver, nss, min, max, dataWritten ]() noexcept {
+            _runAutosplit(std::move(chunkSplitStateDriver), nss, min, max, dataWritten);
+        }));
 }
 
-void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
+void ChunkSplitter::_runAutosplit(ChunkSplitStateDriver chunkSplitStateDriver,
+                                  const NamespaceString& nss,
                                   const BSONObj& min,
                                   const BSONObj& max,
                                   long dataWritten) {
@@ -284,25 +288,13 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
         const auto routingInfo = uassertStatusOK(
             Grid::get(opCtx.get())->catalogCache()->getCollectionRoutingInfo(opCtx.get(), nss));
 
+        const auto cm = routingInfo.cm();
         uassert(ErrorCodes::NamespaceNotSharded,
                 "Could not split chunk. Collection is no longer sharded",
-                routingInfo.cm());
+                cm);
 
-        const auto cm = routingInfo.cm();
         const auto chunk = cm->findIntersectingChunkWithSimpleCollation(min);
-
-        // Stop if chunk's range differs from the range we were expecting to split.
-        if ((0 != chunk.getMin().woCompare(min)) || (0 != chunk.getMax().woCompare(max)) ||
-            (chunk.getShardId() != ShardingState::get(opCtx.get())->getShardName())) {
-            LOG(1) << "Cannot auto-split chunk with range '"
-                   << redact(ChunkRange(min, max).toString()) << "' for nss '" << nss
-                   << "' on shard '" << ShardingState::get(opCtx.get())->getShardName()
-                   << "' because since scheduling auto-split the chunk has been changed to '"
-                   << redact(chunk.toString()) << "'";
-            return;
-        }
-
-        const ChunkRange chunkRange(chunk.getMin(), chunk.getMax());
+        const auto& shardKeyPattern = cm->getShardKeyPattern();
 
         const auto balancerConfig = Grid::get(opCtx.get())->getBalancerConfiguration();
         // Ensure we have the most up-to-date balancer configuration
@@ -318,9 +310,10 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
                << " dataWritten since last check: " << dataWritten
                << " maxChunkSizeBytes: " << maxChunkSizeBytes;
 
+        chunkSplitStateDriver.prepareSplit();
         auto splitPoints = uassertStatusOK(splitVector(opCtx.get(),
                                                        nss,
-                                                       cm->getShardKeyPattern().toBSON(),
+                                                       shardKeyPattern.toBSON(),
                                                        chunk.getMin(),
                                                        chunk.getMax(),
                                                        false,
@@ -344,23 +337,19 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
 
         // Keeps track of the minKey of the top chunk after the split so we can migrate the chunk.
         BSONObj topChunkMinKey;
-
-        if (KeyPattern::isOrderedKeyPattern(cm->getShardKeyPattern().toBSON())) {
-            if (0 ==
-                cm->getShardKeyPattern().getKeyPattern().globalMin().woCompare(chunk.getMin())) {
+        const auto skpGlobalMin = shardKeyPattern.getKeyPattern().globalMin();
+        const auto skpGlobalMax = shardKeyPattern.getKeyPattern().globalMax();
+        if (KeyPattern::isOrderedKeyPattern(shardKeyPattern.toBSON())) {
+            if (skpGlobalMin.woCompare(min) == 0) {
                 // MinKey is infinity (This is the first chunk on the collection)
-                BSONObj key =
-                    findExtremeKeyForShard(opCtx.get(), nss, cm->getShardKeyPattern(), true);
+                BSONObj key = findExtremeKeyForShard(opCtx.get(), nss, shardKeyPattern, true);
                 if (!key.isEmpty()) {
                     splitPoints.front() = key.getOwned();
-                    topChunkMinKey = cm->getShardKeyPattern().getKeyPattern().globalMin();
+                    topChunkMinKey = skpGlobalMin;
                 }
-            } else if (0 ==
-                       cm->getShardKeyPattern().getKeyPattern().globalMax().woCompare(
-                           chunk.getMax())) {
+            } else if (skpGlobalMax.woCompare(max) == 0) {
                 // MaxKey is infinity (This is the last chunk on the collection)
-                BSONObj key =
-                    findExtremeKeyForShard(opCtx.get(), nss, cm->getShardKeyPattern(), false);
+                BSONObj key = findExtremeKeyForShard(opCtx.get(), nss, shardKeyPattern, false);
                 if (!key.isEmpty()) {
                     splitPoints.back() = key.getOwned();
                     topChunkMinKey = key.getOwned();
@@ -371,10 +360,11 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
         uassertStatusOK(splitChunkAtMultiplePoints(opCtx.get(),
                                                    chunk.getShardId(),
                                                    nss,
-                                                   cm->getShardKeyPattern(),
+                                                   shardKeyPattern,
                                                    cm->getVersion(),
-                                                   chunkRange,
+                                                   ChunkRange(min, max),
                                                    splitPoints));
+        chunkSplitStateDriver.commitSplit();
 
         const bool shouldBalance = isAutoBalanceEnabled(opCtx.get(), nss, balancerConfig);
 
@@ -386,7 +376,6 @@ void ChunkSplitter::_runAutosplit(const NamespaceString& nss,
 
         // Balance the resulting chunks if the autobalance option is enabled and if we split at the
         // first or last chunk on the collection as part of top chunk optimization.
-
         if (!shouldBalance || topChunkMinKey.isEmpty()) {
             return;
         }

@@ -48,7 +48,6 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/socket_utils.h"
-#include "mongo/util/net/ssl_options.h"
 #include "mongo/util/options_parser/startup_options.h"
 #include "mongo/util/version.h"
 
@@ -163,14 +162,6 @@ Status addMongoShellOptions(moe::OptionSection* options) {
                             "allow automatic JavaScript function marshalling")
         .incompatibleWith("enableJavaScriptProtection");
 
-    Status ret = Status::OK();
-#ifdef MONGO_CONFIG_SSL
-    ret = addSSLClientOptions(options);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
-
     options
         ->addOptionChaining("enableJavaScriptProtection",
                             "enableJavaScriptProtection",
@@ -228,9 +219,10 @@ Status addMongoShellOptions(moe::OptionSection* options) {
             "rpcProtocols", "rpcProtocols", moe::String, " none, opQueryOnly, opCommandOnly, all")
         .hidden();
 
-    ret = addMessageCompressionOptions(options, true);
-    if (!ret.isOK())
+    auto ret = addMessageCompressionOptions(options, true);
+    if (!ret.isOK()) {
         return ret;
+    }
 
     options->addOptionChaining(
         "jsHeapLimitMB", "jsHeapLimitMB", moe::Int, "set the js scope's heap size limit");
@@ -245,6 +237,7 @@ std::string getMongoShellHelp(StringData name, const moe::OptionSection& options
        << "  foo                   foo database on local machine\n"
        << "  192.168.0.5/foo       foo database on 192.168.0.5 machine\n"
        << "  192.168.0.5:9999/foo  foo database on 192.168.0.5 machine on port 9999\n"
+       << "  mongodb://192.168.0.5:9999/foo  connection string URI can also be used\n"
        << options.helpString() << "\n"
        << "file names: a list of files to run. files have to end in .js and will exit after "
        << "unless --shell is specified";
@@ -269,20 +262,15 @@ bool handlePreValidationMongoShellOptions(const moe::Environment& params,
 
 Status storeMongoShellOptions(const moe::Environment& params,
                               const std::vector<std::string>& args) {
-    Status ret = Status::OK();
     if (params.count("quiet")) {
         mongo::serverGlobalParams.quiet.store(true);
     }
-#ifdef MONGO_CONFIG_SSL
-    ret = storeSSLClientOptions(params);
-    if (!ret.isOK()) {
-        return ret;
-    }
-#endif
+
     if (params.count("ipv6")) {
         mongo::enableIPv6();
         shellGlobalParams.enableIPv6 = true;
     }
+
     if (params.count("verbose")) {
         logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
     }
@@ -475,7 +463,7 @@ Status storeMongoShellOptions(const moe::Environment& params,
         return Status(ErrorCodes::InvalidOptions, sb.str());
     }
 
-    ret = storeMessageCompressionOptions(params);
+    auto ret = storeMessageCompressionOptions(params);
     if (!ret.isOK())
         return ret;
 

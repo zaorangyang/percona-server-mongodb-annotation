@@ -93,16 +93,14 @@ public:
 
     void setPrepareTimestamp(Timestamp timestamp) override;
 
+    Timestamp getPrepareTimestamp() const override;
+
     void setIgnorePrepared(bool ignore) override;
 
     void setTimestampReadSource(ReadSource source,
                                 boost::optional<Timestamp> provided = boost::none) override;
 
     ReadSource getTimestampReadSource() const override;
-
-    void* writingPtr(void* data, size_t len) override;
-
-    void setRollbackWritesDisabled() override {}
 
     virtual void setOrderedCommit(bool orderedCommit) override {
         _orderedCommit = orderedCommit;
@@ -159,7 +157,7 @@ private:
     bool _isTimestamped = false;
 
     // Specifies which external source to use when setting read timestamps on transactions.
-    ReadSource _timestampReadSource = ReadSource::kNone;
+    ReadSource _timestampReadSource = ReadSource::kUnset;
 
     // Commits are assumed ordered.  Unordered commits are assumed to always need to reserve a
     // new optime, and thus always call oplogDiskLocRegister() on the record store.

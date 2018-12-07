@@ -110,6 +110,19 @@ TEST_F(UUIDCatalogTest, OnDropCollection) {
     ASSERT(catalog.lookupCollectionByUUID(colUUID) == nullptr);
 }
 
+TEST_F(UUIDCatalogTest, OnRenameCollection) {
+    auto oldUUID = CollectionUUID::gen();
+    NamespaceString oldNss(nss.db(), "oldcol");
+    Collection oldCol(stdx::make_unique<CollectionMock>(oldNss));
+    catalog.onCreateCollection(&opCtx, &oldCol, oldUUID);
+    ASSERT_EQUALS(catalog.lookupCollectionByUUID(oldUUID), &oldCol);
+
+    NamespaceString newNss(nss.db(), "newcol");
+    Collection newCol(stdx::make_unique<CollectionMock>(newNss));
+    catalog.onRenameCollection(&opCtx, &newCol, oldUUID);
+    ASSERT_EQUALS(catalog.lookupCollectionByUUID(oldUUID), &newCol);
+}
+
 TEST_F(UUIDCatalogTest, NonExistingNextCol) {
     ASSERT_FALSE(catalog.next(nss.db(), colUUID));
     ASSERT_FALSE(catalog.next(nss.db(), nextUUID));
@@ -187,11 +200,11 @@ TEST_F(UUIDCatalogTest, InvalidateOrdering) {
 }
 
 TEST_F(UUIDCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsOldNSSIfDropped) {
-    catalog.onCloseCatalog();
+    catalog.onCloseCatalog(&opCtx);
     catalog.onDropCollection(&opCtx, colUUID);
     ASSERT(catalog.lookupCollectionByUUID(colUUID) == nullptr);
     ASSERT_EQUALS(catalog.lookupNSSByUUID(colUUID), nss);
-    catalog.onOpenCatalog();
+    catalog.onOpenCatalog(&opCtx);
     ASSERT_EQUALS(catalog.lookupNSSByUUID(colUUID), NamespaceString());
 }
 
@@ -201,7 +214,7 @@ TEST_F(UUIDCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsNewlyCreatedNSS) {
     Collection newCol(stdx::make_unique<CollectionMock>(newNss));
 
     // Ensure that looking up non-existing UUIDs doesn't affect later registration of those UUIDs.
-    catalog.onCloseCatalog();
+    catalog.onCloseCatalog(&opCtx);
     ASSERT(catalog.lookupCollectionByUUID(newUUID) == nullptr);
     ASSERT(catalog.lookupNSSByUUID(newUUID) == NamespaceString());
     catalog.onCreateCollection(&opCtx, &newCol, newUUID);
@@ -209,7 +222,7 @@ TEST_F(UUIDCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsNewlyCreatedNSS) {
     ASSERT_EQUALS(catalog.lookupNSSByUUID(colUUID), nss);
 
     // Ensure that collection still exists after opening the catalog again.
-    catalog.onOpenCatalog();
+    catalog.onOpenCatalog(&opCtx);
     ASSERT_EQUALS(catalog.lookupCollectionByUUID(newUUID), &newCol);
     ASSERT_EQUALS(catalog.lookupNSSByUUID(colUUID), nss);
 }
@@ -217,7 +230,7 @@ TEST_F(UUIDCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsNewlyCreatedNSS) {
 TEST_F(UUIDCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsFreshestNSS) {
     NamespaceString newNss(nss.db(), "newcol");
     Collection newCol(stdx::make_unique<CollectionMock>(newNss));
-    catalog.onCloseCatalog();
+    catalog.onCloseCatalog(&opCtx);
     catalog.onDropCollection(&opCtx, colUUID);
     ASSERT(catalog.lookupCollectionByUUID(colUUID) == nullptr);
     ASSERT_EQUALS(catalog.lookupNSSByUUID(colUUID), nss);
@@ -226,7 +239,7 @@ TEST_F(UUIDCatalogTest, LookupNSSByUUIDForClosedCatalogReturnsFreshestNSS) {
     ASSERT_EQUALS(catalog.lookupNSSByUUID(colUUID), newNss);
 
     // Ensure that collection still exists after opening the catalog again.
-    catalog.onOpenCatalog();
+    catalog.onOpenCatalog(&opCtx);
     ASSERT_EQUALS(catalog.lookupCollectionByUUID(colUUID), &newCol);
     ASSERT_EQUALS(catalog.lookupNSSByUUID(colUUID), newNss);
 }

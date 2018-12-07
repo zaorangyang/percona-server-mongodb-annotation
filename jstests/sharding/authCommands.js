@@ -4,6 +4,9 @@
 (function() {
     'use strict';
 
+    // TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+    TestData.disableImplicitSessions = true;
+
     load("jstests/replsets/rslib.js");
 
     // Replica set nodes started with --shardsvr do not enable key generation until they are added
@@ -170,7 +173,6 @@
             assert.eq(1, testDB.foo.findOne({a: 1}).b);
             testDB.foo.remove({a: 1});
             assert.eq(null, testDB.runCommand({getlasterror: 1}).err);
-            checkCommandSucceeded(testDB, {reIndex: 'foo'});
             checkCommandSucceeded(testDB,
                                   {mapreduce: 'foo', map: map, reduce: reduce, out: 'mrOutput'});
             assert.eq(100, testDB.mrOutput.count());
@@ -189,7 +191,6 @@
             assert.eq(0, authenticatedConn.getDB('test').foo.count({a: 1, i: 1, j: 1}));
             checkCommandFailed(
                 testDB, {findAndModify: "foo", query: {a: 1, i: 1, j: 1}, update: {$set: {b: 1}}});
-            checkCommandFailed(testDB, {reIndex: 'foo'});
             checkCommandFailed(testDB,
                                {mapreduce: 'foo', map: map, reduce: reduce, out: 'mrOutput'});
             checkCommandFailed(testDB, {drop: 'foo'});

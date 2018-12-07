@@ -105,15 +105,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual void lockMMAPV1Flush() {
-        MONGO_UNREACHABLE;
-    }
-
     virtual bool unlockGlobal() {
-        MONGO_UNREACHABLE;
-    }
-
-    virtual void downgradeGlobalXtoSForMMAPV1() {
         MONGO_UNREACHABLE;
     }
 
@@ -197,7 +189,7 @@ public:
     }
 
     virtual bool isW() const {
-        MONGO_UNREACHABLE;
+        return true;
     }
 
     virtual bool isR() const {
@@ -205,15 +197,17 @@ public:
     }
 
     virtual bool isLocked() const {
+        // This is necessary because replication makes decisions based on the answer to this, and
+        // we wrote unit tests to test the behavior specifically when this returns "false".
         return false;
     }
 
     virtual bool isWriteLocked() const {
-        return false;
+        return true;
     }
 
     virtual bool isReadLocked() const {
-        MONGO_UNREACHABLE;
+        return true;
     }
 
     virtual bool hasLockPending() const {

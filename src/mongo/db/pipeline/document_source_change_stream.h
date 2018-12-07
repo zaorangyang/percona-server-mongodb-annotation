@@ -29,9 +29,9 @@
 #pragma once
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_change_stream_gen.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
-#include "mongo/db/pipeline/document_sources_gen.h"
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/resume_token.h"
 
@@ -86,9 +86,10 @@ public:
         void assertSupportsReadConcern(const repl::ReadConcernArgs& readConcern) const {
             // Only "majority" is allowed for change streams.
             uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "Read concern " << readConcern.toString()
-                                  << " is not supported for change streams. "
-                                     "Only read concern level \"majority\" is supported.",
+                    str::stream() << "$changeStream cannot run with a readConcern other than "
+                                  << "'majority', or in a multi-document transaction. Current "
+                                     "readConcern: "
+                                  << readConcern.toString(),
                     !readConcern.hasLevel() ||
                         readConcern.getLevel() == repl::ReadConcernLevel::kMajorityReadConcern);
         }
@@ -135,11 +136,17 @@ public:
     static constexpr StringData kTxnNumberField = "txnNumber"_sd;
     static constexpr StringData kLsidField = "lsid"_sd;
 
+    // The target namespace of a rename operation.
+    static constexpr StringData kRenameTargetNssField = "to"_sd;
+
     // The different types of operations we can use for the operation type.
     static constexpr StringData kUpdateOpType = "update"_sd;
     static constexpr StringData kDeleteOpType = "delete"_sd;
     static constexpr StringData kReplaceOpType = "replace"_sd;
     static constexpr StringData kInsertOpType = "insert"_sd;
+    static constexpr StringData kDropCollectionOpType = "drop"_sd;
+    static constexpr StringData kRenameCollectionOpType = "rename"_sd;
+    static constexpr StringData kDropDatabaseOpType = "dropDatabase"_sd;
     static constexpr StringData kInvalidateOpType = "invalidate"_sd;
     // Internal op type to signal mongos to open cursors on new shards.
     static constexpr StringData kNewShardDetectedOpType = "kNewShardDetected"_sd;
@@ -169,11 +176,6 @@ public:
     static std::list<boost::intrusive_ptr<DocumentSource>> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
-    static boost::intrusive_ptr<DocumentSource> createTransformationStage(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx,
-        BSONObj changeStreamSpec,
-        ServerGlobalParams::FeatureCompatibility::Version fcv);
-
     /**
      * Given a BSON object containing an aggregation command with a $changeStream stage, and a
      * resume token, returns a new BSON object with the same command except with the addition of a
@@ -190,16 +192,15 @@ public:
     static void checkValueType(const Value v, const StringData fieldName, BSONType expectedType);
 
 private:
-    static constexpr StringData kRegexAllCollections = R"(\.(?!(\$|system\.)))"_sd;
-    static constexpr StringData kRegexAllDBs = "(?!(admin|config|local)).+"_sd;
-    static constexpr StringData kRegexCmdColl = R"(\.\$cmd$)"_sd;
+    static constexpr StringData kRegexAllCollections = R"((?!(\$|system\.)))"_sd;
+    static constexpr StringData kRegexAllDBs = R"(^(?!(admin|config|local)\.)[^.]+)"_sd;
+    static constexpr StringData kRegexCmdColl = R"(\$cmd$)"_sd;
 
     // Helper function which throws if the $changeStream fails any of a series of semantic checks.
     // For instance, whether it is permitted to run given the current FCV, whether the namespace is
     // valid for the options specified in the spec, etc.
     static void assertIsLegalSpecification(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                           const DocumentSourceChangeStreamSpec& spec,
-                                           ServerGlobalParams::FeatureCompatibility::Version fcv);
+                                           const DocumentSourceChangeStreamSpec& spec);
 
     // It is illegal to construct a DocumentSourceChangeStream directly, use createFromBson()
     // instead.

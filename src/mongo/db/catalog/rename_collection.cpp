@@ -47,9 +47,11 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builder.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -134,6 +136,10 @@ Status renameCollectionCommon(OperationContext* opCtx,
     else if (!lockState->isW())
         globalWriteLock.emplace(opCtx);
 
+    // Allow the MODE_X lock above to be interrupted, but rename is not resilient to interruption
+    // when the onRenameCollection OpObserver takes an oplog collection lock.
+    UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
     // We stay in source context the whole time. This is mostly to set the CurOp namespace.
     boost::optional<OldClientContext> ctx;
     ctx.emplace(opCtx, source.ns());
@@ -161,14 +167,22 @@ Status renameCollectionCommon(OperationContext* opCtx,
     }
 
     // Make sure the source collection is not sharded.
-    if (CollectionShardingState::get(opCtx, source)->getMetadata(opCtx)) {
-        return {ErrorCodes::IllegalOperation, "source namespace cannot be sharded"};
+    {
+        auto const css = CollectionShardingState::get(opCtx, source);
+        if (css->getMetadata(opCtx)->isSharded()) {
+            return {ErrorCodes::IllegalOperation, "source namespace cannot be sharded"};
+        }
     }
 
     // Ensure that collection name does not exceed maximum length.
-    // Ensure that index names do not push the length over the max.
+    // Index names do not limit the maximum allowable length of the target namespace under
+    // FCV 4.2 and above.
+    const auto checkIndexNamespace =
+        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.getVersion() !=
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42;
     std::string::size_type longestIndexNameLength =
-        sourceColl->getIndexCatalog()->getLongestIndexNameLength(opCtx);
+        checkIndexNamespace ? sourceColl->getIndexCatalog()->getLongestIndexNameLength(opCtx) : 0;
     auto status = target.checkLengthForRename(longestIndexNameLength);
     if (!status.isOK()) {
         return status;
@@ -189,8 +203,12 @@ Status renameCollectionCommon(OperationContext* opCtx,
             invariant(source == target);
             return Status::OK();
         }
-        if (CollectionShardingState::get(opCtx, target)->getMetadata(opCtx)) {
-            return {ErrorCodes::IllegalOperation, "cannot rename to a sharded collection"};
+
+        {
+            auto const css = CollectionShardingState::get(opCtx, target);
+            if (css->getMetadata(opCtx)->isSharded()) {
+                return {ErrorCodes::IllegalOperation, "cannot rename to a sharded collection"};
+            }
         }
 
         if (!options.dropTarget) {
@@ -254,7 +272,7 @@ Status renameCollectionCommon(OperationContext* opCtx,
             invariant(options.dropTarget);
             auto dropTargetUUID = targetColl->uuid();
             invariant(dropTargetUUID);
-            auto renameOpTime = opObserver->onRenameCollection(
+            auto renameOpTime = opObserver->preRenameCollection(
                 opCtx, source, target, sourceUUID, dropTargetUUID, options.stayTemp);
 
             if (!renameOpTimeFromApplyOps.isNull()) {
@@ -282,6 +300,8 @@ Status renameCollectionCommon(OperationContext* opCtx,
                 return status;
             }
 
+            opObserver->postRenameCollection(
+                opCtx, source, target, sourceUUID, dropTargetUUID, options.stayTemp);
             wunit.commit();
             return Status::OK();
         });
@@ -412,12 +432,16 @@ Status renameCollectionCommon(OperationContext* opCtx,
         AutoGetCollectionForRead autoSourceColl(opCtx, source);
         AutoGetCollection autoTmpColl(opCtx, tmpName, MODE_IX);
         ctx.reset();
-        if (globalWriteLock) {
-            const ResourceId globalLockResourceId(RESOURCE_GLOBAL, ResourceId::SINGLETON_GLOBAL);
-            lockState->downgrade(globalLockResourceId, MODE_IX);
-            invariant(!lockState->isW());
-        } else {
-            invariant(lockState->isW());
+
+        if (opCtx->getServiceContext()->getStorageEngine()->supportsDBLocking()) {
+            if (globalWriteLock) {
+                const ResourceId globalLockResourceId(RESOURCE_GLOBAL,
+                                                      ResourceId::SINGLETON_GLOBAL);
+                lockState->downgrade(globalLockResourceId, MODE_IX);
+                invariant(!lockState->isW());
+            } else {
+                invariant(lockState->isW());
+            }
         }
 
         auto cursor = sourceColl->getCursor(opCtx);
@@ -502,6 +526,13 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
     NamespaceString sourceNss(sourceNsElt.valueStringData());
     NamespaceString targetNss(targetNsElt.valueStringData());
     NamespaceString uiNss(getNamespaceFromUUIDElement(opCtx, ui));
+
+    if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() ==
+         repl::ReplicationCoordinator::modeNone) &&
+        targetNss.isOplog()) {
+        return Status(ErrorCodes::IllegalOperation,
+                      str::stream() << "Cannot rename collection to the oplog");
+    }
 
     // If the UUID we're targeting already exists, rename from there no matter what.
     if (!uiNss.isEmpty()) {

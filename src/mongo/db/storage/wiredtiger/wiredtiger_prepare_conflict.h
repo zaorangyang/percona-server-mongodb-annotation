@@ -38,7 +38,7 @@
 namespace mongo {
 
 // When set, returns simulates returning WT_PREPARE_CONFLICT on WT cursor read operations.
-MONGO_FP_FORWARD_DECLARE(WTPrepareConflictForReads);
+MONGO_FAIL_POINT_DECLARE(WTPrepareConflictForReads);
 
 /**
  * Logs a message with the number of prepare conflict retry attempts.
@@ -67,7 +67,7 @@ int wiredTigerPrepareConflictRetry(OperationContext* opCtx, F&& f) {
         if (ret != WT_PREPARE_CONFLICT)
             return ret;
 
-        ++CurOp::get(opCtx)->debug().prepareReadConflicts;
+        CurOp::get(opCtx)->debug().additiveMetrics.incrementPrepareReadConflicts(1);
         wiredTigerPrepareConflictLog(attempts);
         // Wait on the session cache to signal that a unit of work has been committed or aborted.
         recoveryUnit->getSessionCache()->waitUntilPreparedUnitOfWorkCommitsOrAborts(opCtx);

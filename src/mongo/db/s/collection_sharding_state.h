@@ -54,11 +54,6 @@ class CollectionShardingState : public Decorable<CollectionShardingState> {
     MONGO_DISALLOW_COPYING(CollectionShardingState);
 
 public:
-    using CleanupNotification = CollectionRangeDeleter::DeleteNotification;
-
-    /**
-     * Instantiates a new per-collection sharding state as unsharded.
-     */
     CollectionShardingState(ServiceContext* sc, NamespaceString nss);
 
     /**
@@ -72,16 +67,28 @@ public:
     static CollectionShardingState* get(OperationContext* opCtx, const std::string& ns);
 
     static void resetAll(OperationContext* opCtx);
+
+    /**
+     * Reports all collections which have filtering information associated.
+     */
     static void report(OperationContext* opCtx, BSONObjBuilder* builder);
 
     /**
-     * Returns the chunk metadata for the collection. The metadata it represents lives as long as
-     * the object itself, and the collection, exist. After dropping the collection lock, the
-     * collection may no longer exist, but it is still safe to destroy the object.
-     * The metadata is tied to a specific point in time (atClusterTime) and the time is retrieved
-     * from the operation context (opCtx).
+     * Returns the chunk filtering metadata for the collection. The returned object is safe to
+     * access outside of collection lock.
+     *
+     * If the operation context contains an 'atClusterTime' property, the returned filtering
+     * metadata will be tied to a specific point in time. Otherwise it will reference the latest
+     * time available.
      */
     ScopedCollectionMetadata getMetadata(OperationContext* opCtx);
+
+    /**
+     * Checks whether the shard version in the operation context is compatible with the shard
+     * version of the collection and if not, throws StaleConfigException populated with the received
+     * and wanted versions.
+     */
+    void checkShardVersionOrThrow(OperationContext* opCtx);
 
     /**
      * BSON output of the pending metadata into a BSONArray
@@ -89,6 +96,10 @@ public:
     void toBSONPending(BSONArrayBuilder& bb) const {
         _metadataManager->toBSONPending(bb);
     }
+
+    //
+    // Methods used by the sharding runtime only (all runtime)
+    //
 
     /**
      * Updates the metadata based on changes received from the config server and also resolves the
@@ -105,6 +116,30 @@ public:
      */
     void markNotShardedAtStepdown();
 
+    //
+    // Methods used by the sharding runtime only (donor shard)
+    //
+
+    /**
+     * Methods to control the collection's critical section. Must be called with the collection X
+     * lock held.
+     */
+    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx);
+    void enterCriticalSectionCommitPhase(OperationContext* opCtx);
+    void exitCriticalSection(OperationContext* opCtx);
+
+    /**
+     * If the collection is currently in a critical section, returns the critical section signal to
+     * be waited on. Otherwise, returns nullptr.
+     */
+    auto getCriticalSectionSignal(ShardingMigrationCriticalSection::Operation op) const {
+        return _critSec.getSignal(op);
+    }
+
+    //
+    // Methods used by the sharding runtime only (recipient shard)
+    //
+
     /**
      * Schedules any documents in `range` for immediate cleanup iff no running queries can depend
      * on them, and adds the range to the list of pending ranges. Otherwise, returns a notification
@@ -112,11 +147,12 @@ public:
      * to wait for the deletion to complete or fail.  After that, call waitForClean to ensure no
      * other deletions are pending for the range.
      */
-    auto beginReceive(ChunkRange const& range) -> CleanupNotification;
+    using CleanupNotification = CollectionRangeDeleter::DeleteNotification;
+    CleanupNotification beginReceive(ChunkRange const& range);
 
     /*
      * Removes `range` from the list of pending ranges, and schedules any documents in the range for
-     * immediate cleanup.  Does not block.
+     * immediate cleanup. Does not block.
      */
     void forgetReceive(const ChunkRange& range);
 
@@ -131,43 +167,7 @@ public:
      * result.abandon(), instead of waitStatus, to ignore the outcome.
      */
     enum CleanWhen { kNow, kDelayed };
-    auto cleanUpRange(ChunkRange const& range, CleanWhen) -> CleanupNotification;
-
-    /**
-     * Returns a vector of ScopedCollectionMetadata objects representing metadata instances in use
-     * by running queries that overlap the argument range, suitable for identifying and invalidating
-     * those queries.
-     */
-    std::vector<ScopedCollectionMetadata> overlappingMetadata(ChunkRange const& range) const;
-
-    /**
-     * Methods to control the collection's critical section. Must be called with the collection X
-     * lock held.
-     */
-    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx);
-    void enterCriticalSectionCommitPhase(OperationContext* opCtx);
-    void exitCriticalSection(OperationContext* opCtx);
-
-    auto getCriticalSectionSignal(ShardingMigrationCriticalSection::Operation op) const {
-        return _critSec.getSignal(op);
-    }
-
-    /**
-     * Checks whether the shard version in the context is compatible with the shard version of the
-     * collection locally and if not throws StaleConfigException populated with the expected and
-     * actual versions.
-     *
-     * Because StaleConfigException has special semantics in terms of how a sharded command's
-     * response is constructed, this function should be the only means of checking for shard version
-     * match.
-     */
-    void checkShardVersionOrThrow(OperationContext* opCtx);
-
-    /**
-     * Returns whether this collection is sharded. Valid only if mongoD is primary.
-     * TODO SERVER-24960: This method may return a false positive until SERVER-24960 is fixed.
-     */
-    bool collectionIsSharded(OperationContext* opCtx);
+    CleanupNotification cleanUpRange(ChunkRange const& range, CleanWhen when);
 
     /**
      * Tracks deletion of any documents within the range, returning when deletion is complete.
@@ -194,30 +194,13 @@ public:
     boost::optional<ChunkRange> getNextOrphanRange(BSONObj const& startingFrom);
 
 private:
-    /**
-     * Checks whether the shard version of the operation matches that of the collection.
-     *
-     * opCtx - Operation context from which to retrieve the operation's expected version.
-     * errmsg (out) - On false return contains an explanatory error message.
-     * expectedShardVersion (out) - On false return contains the expected collection version on this
-     *  shard. Obtained from the operation sharding state.
-     * actualShardVersion (out) - On false return contains the actual collection version on this
-     *  shard. Obtained from the collection sharding state.
-     *
-     * Returns true if the expected collection version on the shard matches its actual version on
-     * the shard and false otherwise. Upon false return, the output parameters will be set.
-     */
-    bool _checkShardVersionOk(OperationContext* opCtx,
-                              std::string* errmsg,
-                              ChunkVersion* expectedShardVersion,
-                              ChunkVersion* actualShardVersion);
-
     // Namespace this state belongs to.
     const NamespaceString _nss;
 
     // Contains all the metadata associated with this collection.
     std::shared_ptr<MetadataManager> _metadataManager;
 
+    // Tracks the migration critical section state for this collection.
     ShardingMigrationCriticalSection _critSec;
 
     // for access to _metadataManager
@@ -227,6 +210,28 @@ private:
                                                          int maxToDelete,
                                                          CollectionRangeDeleter*)
         -> boost::optional<Date_t>;
+};
+
+/**
+ * RAII-style class, which obtains a reference to the critical section for the
+ * specified collection.
+ */
+class CollectionCriticalSection {
+    MONGO_DISALLOW_COPYING(CollectionCriticalSection);
+
+public:
+    CollectionCriticalSection(OperationContext* opCtx, NamespaceString ns);
+    ~CollectionCriticalSection();
+
+    /**
+     * Enters the commit phase of the critical section and blocks reads.
+     */
+    void enterCommitPhase();
+
+private:
+    NamespaceString _nss;
+
+    OperationContext* _opCtx;
 };
 
 }  // namespace mongo

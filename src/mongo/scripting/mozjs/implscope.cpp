@@ -193,8 +193,18 @@ void MozJSImplScope::unregisterOperation() {
 
 void MozJSImplScope::kill() {
     {
-        std::unique_lock<std::mutex> lk(_sleepMutex);
-        _pendingKill.store(true);
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+
+        // If we are on the right thread, in the middle of an operation, and we have a registered
+        // opCtx, then we should check the opCtx for interrupts.
+        if (_mr._thread.get() == PR_GetCurrentThread() && _inOp > 0 && _opCtx) {
+            _killStatus = _opCtx->checkForInterruptNoAssert();
+        }
+
+        // If we didn't have a kill status, someone is killing us by hand here.
+        if (_killStatus.isOK()) {
+            _killStatus = Status(ErrorCodes::Interrupted, "JavaScript execution interrupted");
+        }
     }
     _sleepCondition.notify_all();
     JS_RequestInterruptCallback(_runtime);
@@ -205,7 +215,8 @@ void MozJSImplScope::interrupt() {
 }
 
 bool MozJSImplScope::isKillPending() const {
-    return _pendingKill.load();
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return !_killStatus.isOK();
 }
 
 OperationContext* MozJSImplScope::getOpContext() const {
@@ -229,20 +240,18 @@ bool MozJSImplScope::_interruptCallback(JSContext* cx) {
         JS_MaybeGC(cx);
     }
 
+    // Check our initial kill status (which might be fine).
+    auto status = [&scope]() -> Status {
+        stdx::lock_guard<stdx::mutex> lk(scope->_mutex);
+        return scope->_killStatus;
+    }();
+
     if (scope->_hasOutOfMemoryException) {
-        scope->_status = Status(ErrorCodes::JSInterpreterFailure, "Out of memory");
-    } else if (scope->isKillPending()) {
-        scope->_status = Status(ErrorCodes::Interrupted, "JavaScript execution interrupted");
+        status = Status(ErrorCodes::JSInterpreterFailure, "Out of memory");
     }
-    // If we are on the right thread, in the middle of an operation, and we have a registered opCtx,
-    // then we should check the opCtx for interrupts.
-    if ((scope->_mr._thread.get() == PR_GetCurrentThread()) && (scope->_inOp > 0) &&
-        scope->_opCtx) {
-        auto status = scope->_opCtx->checkForInterruptNoAssert();
-        if (!status.isOK()) {
-            scope->_status = status;
-        }
-    }
+
+    if (!status.isOK())
+        scope->setStatus(std::move(status));
 
     if (!scope->_status.isOK()) {
         scope->_engine->getDeadlineMonitor().stopDeadline(scope);
@@ -413,7 +422,7 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _global(_globalProto.getProto()),
       _funcs(),
       _internedStrings(_context),
-      _pendingKill(false),
+      _killStatus(Status::OK()),
       _opId(0),
       _opCtx(nullptr),
       _inOp(0),
@@ -440,7 +449,6 @@ MozJSImplScope::MozJSImplScope(MozJSScriptEngine* engine)
       _minKeyProto(_context),
       _mongoExternalProto(_context),
       _mongoHelpersProto(_context),
-      _mongoLocalProto(_context),
       _nativeFunctionProto(_context),
       _numberDecimalProto(_context),
       _numberIntProto(_context),
@@ -799,44 +807,12 @@ void MozJSImplScope::gc() {
 }
 
 void MozJSImplScope::sleep(Milliseconds ms) {
-    std::unique_lock<std::mutex> lk(_sleepMutex);
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
 
-    _sleepCondition.wait_for(lk, ms.toSystemDuration(), [this] { return _pendingKill.load(); });
-}
-
-void MozJSImplScope::localConnectForDbEval(OperationContext* opCtx, const char* dbName) {
-
-    _runSafely([this, &opCtx, &dbName] {
-        if (_connectState == ConnectState::External)
-            uasserted(12510, "externalSetup already called, can't call localConnect");
-        if (_connectState == ConnectState::Local) {
-            if (_localDBName == dbName)
-                return;
-            uasserted(12511,
-                      str::stream() << "localConnect previously called with name " << _localDBName);
-        }
-
-        // NOTE: order is important here.  the following methods must be called after
-        //       the above conditional statements.
-
-        _connectState = ConnectState::Local;
-        _localDBName = dbName;
-
-        loadStored(opCtx);
-
-        // install db access functions in the global object
-        installDBAccess();
-
-        // install the Mongo function object and instantiate the 'db' global
-        _mongoLocalProto.install(_global);
-        execCoreFiles();
-
-        const char* const makeMongo = "const _mongo = new Mongo()";
-        exec(makeMongo, "local connect 2", false, true, true, 0);
-
-        std::string makeDB = str::stream() << "const db = _mongo.getDB(\"" << dbName << "\");";
-        exec(makeDB, "local connect 3", false, true, true, 0);
-    });
+    uassert(ErrorCodes::JSUncatchableError,
+            "sleep was interrupted by kill",
+            !_sleepCondition.wait_for(
+                lk, ms.toSystemDuration(), [this] { return !_killStatus.isOK(); }));
 }
 
 void MozJSImplScope::externalSetup() {
@@ -844,8 +820,6 @@ void MozJSImplScope::externalSetup() {
     _runSafely([&] {
         if (_connectState == ConnectState::External)
             return;
-        if (_connectState == ConnectState::Local)
-            uasserted(12512, "localConnect already called, can't call externalSetup");
 
         // install db access functions in the global object
         installDBAccess();
@@ -862,7 +836,7 @@ void MozJSImplScope::externalSetup() {
 
 void MozJSImplScope::reset() {
     unregisterOperation();
-    _pendingKill.store(false);
+    _killStatus = Status::OK();
     _pendingGC.store(false);
     _requireOwnedObjects = false;
     advanceGeneration();
@@ -907,9 +881,22 @@ void MozJSImplScope::installFork() {
     _jsThreadProto.install(_global);
 }
 
+void MozJSImplScope::setStatus(Status status) {
+    _status = std::move(status);
+}
+
 bool MozJSImplScope::_checkErrorState(bool success, bool reportError, bool assertOnError) {
-    if (success)
+    {
+        stdx::lock_guard<stdx::mutex> lk(_mutex);
+        if (!_killStatus.isOK()) {
+            success = false;
+            setStatus(_killStatus);
+        }
+    }
+
+    if (success) {
         return false;
+    }
 
     if (_status.isOK()) {
         JS::RootedValue excn(_context);

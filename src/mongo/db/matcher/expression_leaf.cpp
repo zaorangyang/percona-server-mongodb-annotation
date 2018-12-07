@@ -115,14 +115,34 @@ ComparisonMatchExpression::ComparisonMatchExpression(MatchType type,
 bool ComparisonMatchExpression::matchesSingleElement(const BSONElement& e,
                                                      MatchDetails* details) const {
     if (e.canonicalType() != _rhs.canonicalType()) {
-        // some special cases
-        //  jstNULL and undefined are treated the same
+        // We can't call 'compareElements' on elements of different canonical types.  Usually
+        // elements with different canonical types should never match any comparison, but there are
+        // a few exceptions, handled here.
+
+        // jstNULL and undefined are treated the same
         if (e.canonicalType() + _rhs.canonicalType() == 5) {
             return matchType() == EQ || matchType() == LTE || matchType() == GTE;
         }
-
         if (_rhs.type() == MaxKey || _rhs.type() == MinKey) {
-            return matchType() != EQ;
+            switch (matchType()) {
+                // LT and LTE need no distinction here because the two elements that we are
+                // comparing do not even have the same canonical type and are thus not equal
+                // (i.e.the case where we compare MinKey against MinKey would not reach this switch
+                // statement at all).  The same reasoning follows for the lack of distinction
+                // between GTE and GT.
+                case LT:
+                case LTE:
+                    return _rhs.type() == MaxKey;
+                case EQ:
+                    return false;
+                case GT:
+                case GTE:
+                    return _rhs.type() == MinKey;
+                default:
+                    // This is a comparison match expression, so it must be either
+                    // a $lt, $lte, $gt, $gte, or equality expression.
+                    MONGO_UNREACHABLE;
+            }
         }
         return false;
     }
@@ -151,7 +171,6 @@ bool ComparisonMatchExpression::matchesSingleElement(const BSONElement& e,
 
     int x = BSONElement::compareElements(
         e, _rhs, BSONElement::ComparisonRules::kConsiderFieldName, _collator);
-
     switch (matchType()) {
         case LT:
             return x < 0;
@@ -196,6 +215,8 @@ inline pcrecpp::RE_Options flags2options(const char* flags) {
     return options;
 }
 
+constexpr size_t RegexMatchExpression::kMaxPatternSize;
+
 RegexMatchExpression::RegexMatchExpression(StringData path, const BSONElement& e)
     : LeafMatchExpression(REGEX, path),
       _regex(e.regex()),
@@ -214,6 +235,9 @@ RegexMatchExpression::RegexMatchExpression(StringData path, StringData regex, St
 }
 
 void RegexMatchExpression::_init() {
+    uassert(
+        ErrorCodes::BadValue, "Regular expression is too long", _regex.size() <= kMaxPatternSize);
+
     uassert(ErrorCodes::BadValue,
             "Regular expression cannot contain an embedded null byte",
             _regex.find('\0') == std::string::npos);
@@ -221,10 +245,6 @@ void RegexMatchExpression::_init() {
     uassert(ErrorCodes::BadValue,
             "Regular expression options string cannot contain an embedded null byte",
             _flags.find('\0') == std::string::npos);
-
-    uassert(ErrorCodes::BadValue,
-            str::stream() << "Regular expression is invalid: " << _re->error(),
-            _re->error().empty());
 }
 
 RegexMatchExpression::~RegexMatchExpression() {}
@@ -476,6 +496,15 @@ void InMatchExpression::_doSetCollator(const CollatorInterface* collator) {
     _collator = collator;
     _eltCmp = BSONElementComparator(BSONElementComparator::FieldNamesMode::kIgnore, _collator);
 
+    if (!std::is_sorted(_originalEqualityVector.begin(),
+                        _originalEqualityVector.end(),
+                        _eltCmp.makeLessThan())) {
+        // Re-sort the list of equalities according to our current comparator. This is necessary to
+        // work around https://svn.boost.org/trac10/ticket/13140.
+        std::sort(
+            _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeLessThan());
+    }
+
     // We need to re-compute '_equalitySet', since our set comparator has changed.
     _equalitySet = _eltCmp.makeBSONEltFlatSet(_originalEqualityVector);
 }
@@ -495,7 +524,16 @@ Status InMatchExpression::setEqualities(std::vector<BSONElement> equalities) {
             _hasEmptyArray = true;
         }
     }
+
     _originalEqualityVector = std::move(equalities);
+
+    if (!std::is_sorted(_originalEqualityVector.begin(),
+                        _originalEqualityVector.end(),
+                        _eltCmp.makeLessThan())) {
+        // Sort the list of equalities to work around https://svn.boost.org/trac10/ticket/13140.
+        std::sort(
+            _originalEqualityVector.begin(), _originalEqualityVector.end(), _eltCmp.makeLessThan());
+    }
 
     _equalitySet = _eltCmp.makeBSONEltFlatSet(_originalEqualityVector);
 

@@ -70,8 +70,6 @@ class ReplSetMetadata;
 
 namespace repl {
 
-class ElectCmdRunner;
-class FreshnessChecker;
 class HeartbeatResponseAction;
 class LastVote;
 class OplogReader;
@@ -211,9 +209,6 @@ public:
 
     virtual Status processReplSetFreeze(int secs, BSONObjBuilder* resultObj) override;
 
-    virtual Status processHeartbeat(const ReplSetHeartbeatArgs& args,
-                                    ReplSetHeartbeatResponse* response) override;
-
     virtual Status processReplSetReconfig(OperationContext* opCtx,
                                           const ReplSetReconfigArgs& args,
                                           BSONObjBuilder* resultObj) override;
@@ -221,12 +216,6 @@ public:
     virtual Status processReplSetInitiate(OperationContext* opCtx,
                                           const BSONObj& configObj,
                                           BSONObjBuilder* resultObj) override;
-
-    virtual Status processReplSetFresh(const ReplSetFreshArgs& args,
-                                       BSONObjBuilder* resultObj) override;
-
-    virtual Status processReplSetElect(const ReplSetElectArgs& args,
-                                       BSONObjBuilder* response) override;
 
     virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
                                                 long long* configVersion) override;
@@ -391,7 +380,7 @@ public:
     void waitForElectionDryRunFinish_forTest();
 
     /**
-     * Waits until a stepdown command has begun. Callers should ensure that the stepdown attempt
+     * Waits until a stepdown attempt has begun. Callers should ensure that the stepdown attempt
      * won't fully complete before this method is called, or this method may never return.
      */
     void waitForStepDownAttempt_forTest();
@@ -459,6 +448,9 @@ private:
 
         BSONObj toBSON() const;
         std::string toString() const;
+        // Controls whether or not this Waiter should stay on the WaiterList upon notification.
+        virtual bool runs_once() const = 0;
+
         // It is invalid to call notify_inlock() unless holding ReplicationCoordinatorImpl::_mutex.
         virtual void notify_inlock() = 0;
 
@@ -475,6 +467,9 @@ private:
                      const WriteConcernOptions* _writeConcern,
                      stdx::condition_variable* _condVar);
         void notify_inlock() override;
+        bool runs_once() const override {
+            return false;
+        }
 
         stdx::condition_variable* condVar = nullptr;
     };
@@ -488,6 +483,9 @@ private:
 
         CallbackWaiter(OpTime _opTime, FinishFunc _finishCallback);
         void notify_inlock() override;
+        bool runs_once() const override {
+            return true;
+        }
 
         // The callback that will be called when this waiter is notified.
         FinishFunc finishCallback = nullptr;
@@ -503,10 +501,10 @@ private:
         void add_inlock(WaiterType waiter);
         // Returns whether waiter is found and removed.
         bool remove_inlock(WaiterType waiter);
-        // Signals and removes all waiters that satisfy the condition.
-        void signalAndRemoveIf_inlock(stdx::function<bool(WaiterType)> fun);
-        // Signals and removes all waiters from the list.
-        void signalAndRemoveAll_inlock();
+        // Signals all waiters that satisfy the condition.
+        void signalIf_inlock(stdx::function<bool(WaiterType)> fun);
+        // Signals all waiters from the list.
+        void signalAll_inlock();
 
     private:
         std::vector<WaiterType> _list;
@@ -598,6 +596,11 @@ private:
     void _handleTimePassing(const executor::TaskExecutor::CallbackArgs& cbData);
 
     /**
+     * Chooses a candidate for election handoff and sends a ReplSetStepUp command to it.
+     */
+    void _performElectionHandoff();
+
+    /**
      * Helper method for _awaitReplication that takes an already locked unique_lock, but leaves
      * operation timing to the caller.
      */
@@ -616,13 +619,6 @@ private:
                                            const WriteConcernOptions& writeConcern);
 
     Status _checkIfWriteConcernCanBeSatisfied_inlock(const WriteConcernOptions& writeConcern) const;
-
-    /**
-     * Wakes up threads in the process of handling a stepdown request based on whether the
-     * TopologyCoordinator now believes enough secondaries are caught up for the stepdown request to
-     * complete.
-     */
-    void _signalStepDownWaiterIfReady_inlock();
 
     bool _canAcceptWritesFor_inlock(const NamespaceString& ns);
 
@@ -791,10 +787,6 @@ private:
      * believes it can be elected PRIMARY.
      * For proper concurrency, start methods must be called while holding _mutex.
      *
-     * For old style elections the election path is:
-     *      _startElectSelf_inlock()
-     *      _onFreshnessCheckComplete()
-     *      _onElectCmdRunnerComplete()
      * For V1 (raft) style elections the election path is:
      *      _startElectSelfV1() or _startElectSelfV1_inlock()
      *      _onDryRunComplete()
@@ -802,21 +794,8 @@ private:
      *      _startVoteRequester_inlock()
      *      _onVoteRequestComplete()
      */
-    void _startElectSelf_inlock();
     void _startElectSelfV1_inlock(TopologyCoordinator::StartElectionReason reason);
     void _startElectSelfV1(TopologyCoordinator::StartElectionReason reason);
-
-    /**
-     * Callback called when the FreshnessChecker has completed; checks the results and
-     * decides whether to continue election proceedings.
-     **/
-    void _onFreshnessCheckComplete();
-
-    /**
-     * Callback called when the ElectCmdRunner has completed; checks the results and
-     * decides whether to complete the election and change state to primary.
-     **/
-    void _onElectCmdRunnerComplete();
 
     /**
      * Callback called when the dryRun VoteRequester has completed; checks the results and
@@ -845,11 +824,6 @@ private:
      * changed, do not step up as primary.
      */
     void _onVoteRequestComplete(long long originalTerm);
-
-    /**
-     * Callback called after a random delay, to prevent repeated election ties.
-     */
-    void _recoverFromElectionTie(const executor::TaskExecutor::CallbackArgs& cbData);
 
     /**
      * Removes 'host' from the sync source blacklist. If 'host' isn't found, it's simply
@@ -1194,22 +1168,9 @@ private:
     // This member's index position in the current config.
     int _selfIndex;  // (M)
 
-    // Condition to signal when new heartbeat data comes in.
-    stdx::condition_variable _stepDownWaiters;  // (M)
-
-    // State for conducting an election of this node.
-    // the presence of a non-null _freshnessChecker pointer indicates that an election is
-    // currently in progress. When using the V1 protocol, a non-null _voteRequester pointer
-    // indicates this instead.
-    // Only one election is allowed at a time.
-    std::unique_ptr<FreshnessChecker> _freshnessChecker;  // (M)
-
-    std::unique_ptr<ElectCmdRunner> _electCmdRunner;  // (M)
-
     std::unique_ptr<VoteRequester> _voteRequester;  // (M)
 
     // Event that the election code will signal when the in-progress election completes.
-    // Unspecified value when _freshnessChecker is NULL.
     executor::TaskExecutor::EventHandle _electionFinishedEvent;  // (M)
 
     // Event that the election code will signal when the in-progress election dry run completes,

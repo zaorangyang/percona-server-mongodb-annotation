@@ -48,7 +48,6 @@ namespace repl {
 class HeartbeatResponseAction;
 class MemberData;
 class OpTime;
-class ReplSetHeartbeatArgs;
 class ReplSetConfig;
 class TagSubgroup;
 struct MemberState;
@@ -164,12 +163,6 @@ public:
     HostAndPort getSyncSourceAddress() const;
 
     /**
-     * Retrieves a vector of HostAndPorts containing all nodes that are neither DOWN nor
-     * ourself.
-     */
-    std::vector<HostAndPort> getMaybeUpHostAndPorts() const;
-
-    /**
      * Gets the earliest time the current node will stand for election.
      */
     Date_t getStepDownTime() const;
@@ -248,21 +241,6 @@ public:
                                 Date_t now) const;
 
     /**
-     * Checks whether we are a single node set and we are not in a stepdown period.  If so,
-     * puts us into candidate mode, otherwise does nothing.  This is used to ensure that
-     * nodes in a single node replset become primary again when their stepdown period ends.
-     */
-    bool becomeCandidateIfStepdownPeriodOverAndSingleNodeSet(Date_t now);
-
-    /**
-     * Sets the earliest time the current node will stand for election to "newTime".
-     *
-     * Until this time, while the node may report itself as electable, it will not stand
-     * for election.
-     */
-    void setElectionSleepUntil(Date_t newTime);
-
-    /**
      * Sets the reported mode of this node to one of RS_SECONDARY, RS_STARTUP2, RS_ROLLBACK or
      * RS_RECOVERING, when getRole() == Role::follower.  This is the interface by which the
      * applier changes the reported member state of the current node, and enables or suppresses
@@ -325,24 +303,6 @@ public:
     void prepareSyncFromResponse(const HostAndPort& target,
                                  BSONObjBuilder* response,
                                  Status* result);
-
-    // produce a reply to a replSetFresh command
-    void prepareFreshResponse(const ReplicationCoordinator::ReplSetFreshArgs& args,
-                              Date_t now,
-                              BSONObjBuilder* response,
-                              Status* result);
-
-    // produce a reply to a received electCmd
-    void prepareElectResponse(const ReplicationCoordinator::ReplSetElectArgs& args,
-                              Date_t now,
-                              BSONObjBuilder* response,
-                              Status* result);
-
-    // produce a reply to a heartbeat
-    Status prepareHeartbeatResponse(Date_t now,
-                                    const ReplSetHeartbeatArgs& args,
-                                    const std::string& ourSetName,
-                                    ReplSetHeartbeatResponse* response);
 
     // produce a reply to a V1 heartbeat
     Status prepareHeartbeatResponseV1(Date_t now,
@@ -418,8 +378,6 @@ public:
      * This call should be paired (with intervening network communication) with a call to
      * processHeartbeatResponse for the same "target".
      */
-    std::pair<ReplSetHeartbeatArgs, Milliseconds> prepareHeartbeatRequest(
-        Date_t now, const std::string& ourSetName, const HostAndPort& target);
     std::pair<ReplSetHeartbeatArgsV1, Milliseconds> prepareHeartbeatRequestV1(
         Date_t now, const std::string& ourSetName, const HostAndPort& target);
 
@@ -430,16 +388,9 @@ public:
      * Updates internal topology coordinator state, and returns instructions about what action
      * to take next.
      *
-     * If the next action indicates StartElection, the topology coordinator has transitioned to
-     * the "candidate" role, and will remain there until processWinElection or
-     * processLoseElection are called.
-     *
      * If the next action indicates "StepDownSelf", the topology coordinator has transitioned
      * to the "follower" role from "leader", and the caller should take any necessary actions
      * to become a follower.
-     *
-     * If the next action indicates "StepDownRemotePrimary", the caller should take steps to
-     * cause the specified remote host to step down from primary to secondary.
      *
      * If the next action indicates "Reconfig", the caller should verify the configuration in
      * hbResponse is acceptable, perform any other reconfiguration actions it must, and call
@@ -448,7 +399,7 @@ public:
      * processWinElection) before calling updateConfig.
      *
      * This call should be paired (with intervening network communication) with a call to
-     * prepareHeartbeatRequest for the same "target".
+     * prepareHeartbeatRequestV1 for the same "target".
      */
     HeartbeatResponseAction processHeartbeatResponse(
         Date_t now,
@@ -545,12 +496,6 @@ public:
     StatusWith<bool> setLastOptime(const UpdatePositionArgs::UpdateInfo& args,
                                    Date_t now,
                                    long long* configVersion);
-
-    /**
-     * If getRole() == Role::candidate and this node has not voted too recently, updates the
-     * lastVote tracker and returns true.  Otherwise, returns false.
-     */
-    bool voteForMyself(Date_t now);
 
     /**
      * Sets lastVote to be for ourself in this term.
@@ -651,10 +596,11 @@ public:
     void finishUnconditionalStepDown();
 
     /**
-     * Considers whether or not this node should stand for election, and returns true
-     * if the node has transitioned to candidate role as a result of the call.
+     * Returns the index of the most suitable candidate for an election handoff. The node must be
+     * caught up and electable. Ties are resolved first by highest priority, then by lowest member
+     * id.
      */
-    Status checkShouldStandForElection(Date_t now) const;
+    int chooseElectionHandoffCandidate();
 
     /**
      * Set the outgoing heartbeat message from self
@@ -706,7 +652,8 @@ public:
         kElectionTimeout,
         kPriorityTakeover,
         kStepUpRequest,
-        kCatchupTakeover
+        kCatchupTakeover,
+        kSingleNodeStepDownTimeout
     };
 
     /**
@@ -770,17 +717,14 @@ private:
     enum UnelectableReason {
         None = 0,
         CannotSeeMajority = 1 << 0,
-        NotCloseEnoughToLatestOptime = 1 << 1,
-        ArbiterIAm = 1 << 2,
-        NotSecondary = 1 << 3,
-        NoPriority = 1 << 4,
-        StepDownPeriodActive = 1 << 5,
-        NoData = 1 << 6,
-        NotInitialized = 1 << 7,
-        VotedTooRecently = 1 << 8,
-        RefusesToStand = 1 << 9,
-        NotCloseEnoughToLatestForPriorityTakeover = 1 << 10,
-        NotFreshEnoughForCatchupTakeover = 1 << 11,
+        ArbiterIAm = 1 << 1,
+        NotSecondary = 1 << 2,
+        NoPriority = 1 << 3,
+        StepDownPeriodActive = 1 << 4,
+        NoData = 1 << 5,
+        NotInitialized = 1 << 6,
+        NotCloseEnoughToLatestForPriorityTakeover = 1 << 7,
+        NotFreshEnoughForCatchupTakeover = 1 << 8,
     };
 
     // Set what type of PRIMARY this node currently is.
@@ -792,12 +736,6 @@ private:
     // Returns the current "ping" value for the given member by their address
     Milliseconds _getPing(const HostAndPort& host);
 
-    // Determines if we will veto the member specified by "args.id".
-    // If we veto, the errmsg will be filled in with a reason
-    bool _shouldVetoMember(const ReplicationCoordinator::ReplSetFreshArgs& args,
-                           const Date_t& now,
-                           std::string* errmsg) const;
-
     // Returns the index of the member with the matching id, or -1 if none match.
     int _getMemberIndex(int id) const;
 
@@ -807,10 +745,6 @@ private:
     // Checks if the node can see a healthy primary of equal or greater priority to the
     // candidate. If so, returns the index of that node. Otherwise returns -1.
     int _findHealthyPrimaryOfEqualOrGreaterPriority(const int candidateIndex) const;
-
-    // Is otherOpTime close enough (within 10 seconds) to the latest known optime to qualify
-    // for an election
-    bool _isOpTimeCloseEnoughToLatestToElect(const OpTime& otherOpTime) const;
 
     // Is our optime close enough to the latest known optime to call for a priority takeover.
     bool _amIFreshEnoughForPriorityTakeover() const;
@@ -834,12 +768,6 @@ private:
 
     // Scans through all members that are 'up' and return the latest known optime.
     OpTime _latestKnownOpTime() const;
-
-    // Scans the electable set and returns the highest priority member index
-    int _getHighestPriorityElectableIndex(Date_t now) const;
-
-    // Returns true if "one" member is higher priority than "two" member
-    bool _isMemberHigherPriority(int memberOneIndex, int memberTwoIndex) const;
 
     // Helper shortcut to self config
     const MemberConfig& _selfConfig() const;
@@ -865,12 +793,7 @@ private:
     /**
      * Performs updating "_currentPrimaryIndex" for processHeartbeatResponse(), and determines if an
      * election or stepdown should commence.
-     * _updatePrimaryFromHBDataV1() is a simplified version of _updatePrimaryFromHBData() to be used
-     * when in ProtocolVersion1.
      */
-    HeartbeatResponseAction _updatePrimaryFromHBData(int updatedConfigIndex,
-                                                     const MemberState& originalState,
-                                                     Date_t now);
     HeartbeatResponseAction _updatePrimaryFromHBDataV1(int updatedConfigIndex,
                                                        const MemberState& originalState,
                                                        Date_t now);
@@ -888,6 +811,11 @@ private:
      * attemptStepDown() for more details on the rules of when stepdown attempts succeed or fail.
      */
     bool _canCompleteStepDownAttempt(Date_t now, Date_t waitUntil, bool force);
+
+    /**
+     * Returns true if a node is both caught up to our last applied opTime and electable.
+     */
+    bool _isCaughtUpAndElectable(int memberIndex, OpTime lastApplied);
 
     void _stepDownSelfAndReplaceWith(int newPrimary);
 
@@ -987,15 +915,6 @@ private:
     typedef std::map<HostAndPort, PingStats> PingMap;
     // Ping stats for each member by HostAndPort;
     PingMap _pings;
-
-    // Last vote info from the election
-    struct VoteLease {
-        static const Seconds leaseTime;
-
-        Date_t when;
-        int whoId = -1;
-        HostAndPort whoHostAndPort;
-    } _voteLease;
 
     // V1 last vote info for elections
     LastVote _lastVote{OpTime::kInitialTerm, -1};

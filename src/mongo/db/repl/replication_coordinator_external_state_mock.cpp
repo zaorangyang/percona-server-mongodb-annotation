@@ -72,10 +72,6 @@ void ReplicationCoordinatorExternalStateMock::startSteadyStateReplication(Operat
 
 void ReplicationCoordinatorExternalStateMock::stopDataReplication(OperationContext*) {}
 
-Status ReplicationCoordinatorExternalStateMock::runRepairOnLocalDB(OperationContext* opCtx) {
-    return Status::OK();
-}
-
 Status ReplicationCoordinatorExternalStateMock::initializeReplSetStorage(OperationContext* opCtx,
                                                                          const BSONObj& config) {
     return storeLocalConfigDocument(opCtx, config);
@@ -201,8 +197,6 @@ void ReplicationCoordinatorExternalStateMock::closeConnections() {
 
 void ReplicationCoordinatorExternalStateMock::killAllUserOperations(OperationContext* opCtx) {}
 
-void ReplicationCoordinatorExternalStateMock::killAllTransactionCursors(OperationContext* opCtx) {}
-
 void ReplicationCoordinatorExternalStateMock::shardingOnStepDownHook() {}
 
 void ReplicationCoordinatorExternalStateMock::signalApplierToChooseNewSyncSource() {}
@@ -226,6 +220,10 @@ void ReplicationCoordinatorExternalStateMock::setAreSnapshotsEnabled(bool val) {
     _areSnapshotsEnabled = val;
 }
 
+void ReplicationCoordinatorExternalStateMock::setElectionTimeoutOffsetLimitFraction(double val) {
+    _electionTimeoutOffsetLimitFraction = val;
+}
+
 void ReplicationCoordinatorExternalStateMock::notifyOplogMetadataWaiters(
     const OpTime& committedOpTime) {}
 
@@ -235,7 +233,7 @@ boost::optional<OpTime> ReplicationCoordinatorExternalStateMock::getEarliestDrop
 }
 
 double ReplicationCoordinatorExternalStateMock::getElectionTimeoutOffsetLimitFraction() const {
-    return 0.15;
+    return _electionTimeoutOffsetLimitFraction;
 }
 
 bool ReplicationCoordinatorExternalStateMock::isReadCommittedSupportedByStorageEngine(
@@ -248,7 +246,13 @@ bool ReplicationCoordinatorExternalStateMock::isReadConcernSnapshotSupportedBySt
     return true;
 }
 
-std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherMaxFetcherRestarts() const {
+std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherSteadyStateMaxFetcherRestarts()
+    const {
+    return 0;
+}
+
+std::size_t ReplicationCoordinatorExternalStateMock::getOplogFetcherInitialSyncMaxFetcherRestarts()
+    const {
     return 0;
 }
 

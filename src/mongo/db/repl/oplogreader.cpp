@@ -34,7 +34,6 @@
 
 #include <string>
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -79,7 +78,7 @@ bool OplogReader::connect(const HostAndPort& host) {
             error() << errmsg << endl;
             return false;
         }
-        _conn->setTags(executor::NetworkInterface::kMessagingPortKeepOpen);
+        _conn->setTags(transport::Session::kKeepOpen);
         _host = host;
     }
     return true;

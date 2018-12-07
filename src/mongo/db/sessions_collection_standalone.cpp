@@ -30,7 +30,6 @@
 
 #include "mongo/db/sessions_collection_standalone.h"
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/query.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
@@ -49,7 +48,7 @@ Status SessionsCollectionStandalone::setupSessionsCollection(OperationContext* o
     DBDirectClient client(opCtx);
     auto cmd = generateCreateIndexesCmd();
     BSONObj info;
-    if (!client.runCommand(kSessionsNamespaceString.db().toString(), cmd, info)) {
+    if (!client.runCommand(NamespaceString::kLogicalSessionsNamespace.db().toString(), cmd, info)) {
         return getStatusFromCommandResult(info);
     }
 
@@ -59,25 +58,25 @@ Status SessionsCollectionStandalone::setupSessionsCollection(OperationContext* o
 Status SessionsCollectionStandalone::refreshSessions(OperationContext* opCtx,
                                                      const LogicalSessionRecordSet& sessions) {
     DBDirectClient client(opCtx);
-    return doRefresh(kSessionsNamespaceString,
+    return doRefresh(NamespaceString::kLogicalSessionsNamespace,
                      sessions,
-                     makeSendFnForBatchWrite(kSessionsNamespaceString, &client));
+                     makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
 }
 
 Status SessionsCollectionStandalone::removeRecords(OperationContext* opCtx,
                                                    const LogicalSessionIdSet& sessions) {
     DBDirectClient client(opCtx);
-    return doRemove(kSessionsNamespaceString,
+    return doRemove(NamespaceString::kLogicalSessionsNamespace,
                     sessions,
-                    makeSendFnForBatchWrite(kSessionsNamespaceString, &client));
+                    makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
 }
 
 StatusWith<LogicalSessionIdSet> SessionsCollectionStandalone::findRemovedSessions(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
     DBDirectClient client(opCtx);
-    return doFetch(kSessionsNamespaceString,
+    return doFetch(NamespaceString::kLogicalSessionsNamespace,
                    sessions,
-                   makeFindFnForCommand(kSessionsNamespaceString, &client));
+                   makeFindFnForCommand(NamespaceString::kLogicalSessionsNamespace, &client));
 }
 
 Status SessionsCollectionStandalone::removeTransactionRecords(OperationContext* opCtx,

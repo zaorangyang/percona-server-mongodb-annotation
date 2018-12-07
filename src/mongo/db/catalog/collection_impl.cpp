@@ -64,7 +64,6 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/record_fetcher.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/update/update_driver.h"
@@ -101,7 +100,7 @@ MONGO_REGISTER_SHIM(Collection::parseValidationAction)
 
 namespace {
 // Used below to fail during inserts.
-MONGO_FP_DECLARE(failCollectionInserts);
+MONGO_FAIL_POINT_DEFINE(failCollectionInserts);
 
 // Uses the collator factory to convert the BSON representation of a collator to a
 // CollatorInterface. Returns null if the BSONObj is empty. We expect the stored collation to be
@@ -193,15 +192,6 @@ CollectionImpl::~CollectionImpl() {
         LOG(2) << "destructed collection " << ns() << " with UUID " << uuid()->toString();
     }
     _magic = 0;
-}
-
-void CollectionImpl::refreshUUID(OperationContext* opCtx) {
-    auto options = getCatalogEntry()->getCollectionOptions(opCtx);
-    // refreshUUID may be called from outside a WriteUnitOfWork. In such cases, there is no
-    // change to any on disk data, so no rollback handler is needed.
-    if (opCtx->lockState()->inAWriteUnitOfWork())
-        opCtx->recoveryUnit()->onRollback([ this, oldUUID = _uuid ] { this->_uuid = oldUUID; });
-    _uuid = options.uuid;
 }
 
 bool CollectionImpl::requiresIdIndex() const {
@@ -339,7 +329,6 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
                                        const vector<InsertStatement>::const_iterator begin,
                                        const vector<InsertStatement>::const_iterator end,
                                        OpDebug* opDebug,
-                                       bool enforceQuota,
                                        bool fromMigrate) {
 
     MONGO_FAIL_POINT_BLOCK(failCollectionInserts, extraData) {
@@ -373,7 +362,7 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
 
     const SnapshotId sid = opCtx->recoveryUnit()->getSnapshotId();
 
-    Status status = _insertDocuments(opCtx, begin, end, enforceQuota, opDebug);
+    Status status = _insertDocuments(opCtx, begin, end, opDebug);
     if (!status.isOK())
         return status;
     invariant(sid == opCtx->recoveryUnit()->getSnapshotId());
@@ -390,17 +379,15 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
 Status CollectionImpl::insertDocument(OperationContext* opCtx,
                                       const InsertStatement& docToInsert,
                                       OpDebug* opDebug,
-                                      bool enforceQuota,
                                       bool fromMigrate) {
     vector<InsertStatement> docs;
     docs.push_back(docToInsert);
-    return insertDocuments(opCtx, docs.begin(), docs.end(), opDebug, enforceQuota, fromMigrate);
+    return insertDocuments(opCtx, docs.begin(), docs.end(), opDebug, fromMigrate);
 }
 
 Status CollectionImpl::insertDocument(OperationContext* opCtx,
                                       const BSONObj& doc,
-                                      const std::vector<MultiIndexBlock*>& indexBlocks,
-                                      bool enforceQuota) {
+                                      const std::vector<MultiIndexBlock*>& indexBlocks) {
 
     MONGO_FAIL_POINT_BLOCK(failCollectionInserts, extraData) {
         const BSONObj& data = extraData.getData();
@@ -425,8 +412,8 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
 
     // TODO SERVER-30638: using timestamp 0 for these inserts, which are non-oplog so we don't yet
     // care about their correct timestamps.
-    StatusWith<RecordId> loc = _recordStore->insertRecord(
-        opCtx, doc.objdata(), doc.objsize(), Timestamp(), _enforceQuota(enforceQuota));
+    StatusWith<RecordId> loc =
+        _recordStore->insertRecord(opCtx, doc.objdata(), doc.objsize(), Timestamp());
 
     if (!loc.isOK())
         return loc.getStatus();
@@ -460,7 +447,6 @@ Status CollectionImpl::insertDocument(OperationContext* opCtx,
 Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
                                         const vector<InsertStatement>::const_iterator begin,
                                         const vector<InsertStatement>::const_iterator end,
-                                        bool enforceQuota,
                                         OpDebug* opDebug) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
 
@@ -493,8 +479,7 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
         Timestamp timestamp = Timestamp(it->oplogSlot.opTime.getTimestamp());
         timestamps.push_back(timestamp);
     }
-    Status status =
-        _recordStore->insertRecords(opCtx, &records, &timestamps, _enforceQuota(enforceQuota));
+    Status status = _recordStore->insertRecords(opCtx, &records, &timestamps);
     if (!status.isOK())
         return status;
 
@@ -506,14 +491,14 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
         invariant(RecordId::min() < loc);
         invariant(loc < RecordId::max());
 
-        BsonRecord bsonRecord = {loc, &(it->doc)};
+        BsonRecord bsonRecord = {loc, Timestamp(it->oplogSlot.opTime.getTimestamp()), &(it->doc)};
         bsonRecords.push_back(bsonRecord);
     }
 
     int64_t keysInserted;
     status = _indexCatalog.indexRecords(opCtx, bsonRecords, &keysInserted);
     if (opDebug) {
-        opDebug->keysInserted += keysInserted;
+        opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
     }
 
     return status;
@@ -578,7 +563,7 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
     int64_t keysDeleted;
     _indexCatalog.unindexRecord(opCtx, doc.value(), loc, noWarn, &keysDeleted);
     if (opDebug) {
-        opDebug->keysDeleted += keysDeleted;
+        opDebug->additiveMetrics.incrementKeysDeleted(keysDeleted);
     }
 
     _recordStore->deleteRecord(opCtx, loc);
@@ -594,7 +579,6 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
                                         const RecordId& oldLocation,
                                         const Snapshotted<BSONObj>& oldDoc,
                                         const BSONObj& newDoc,
-                                        bool enforceQuota,
                                         bool indexesAffected,
                                         OpDebug* opDebug,
                                         OplogUpdateEntryArgs* args) {
@@ -674,16 +658,10 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
 
     args->preImageDoc = oldDoc.value().getOwned();
 
-    Status updateStatus = _recordStore->updateRecord(
-        opCtx, oldLocation, newDoc.objdata(), newDoc.objsize(), _enforceQuota(enforceQuota), this);
+    Status updateStatus =
+        _recordStore->updateRecord(opCtx, oldLocation, newDoc.objdata(), newDoc.objsize(), this);
 
-    if (updateStatus == ErrorCodes::NeedsDocumentMove) {
-        return uassertStatusOK(_updateDocumentWithMove(
-            opCtx, oldLocation, oldDoc, newDoc, enforceQuota, opDebug, args, sid));
-    }
-    uassertStatusOK(updateStatus);
-
-    // Object did not move.  We update each index with each respective UpdateTicket.
+    // Update each index with each respective UpdateTicket.
     if (indexesAffected) {
         IndexCatalog::IndexIterator ii = _indexCatalog.getIndexIterator(opCtx, true);
         while (ii.more()) {
@@ -695,8 +673,8 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
             uassertStatusOK(iam->update(
                 opCtx, *updateTickets.mutableMap()[descriptor], &keysInserted, &keysDeleted));
             if (opDebug) {
-                opDebug->keysInserted += keysInserted;
-                opDebug->keysDeleted += keysDeleted;
+                opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
+                opDebug->additiveMetrics.incrementKeysDeleted(keysDeleted);
             }
         }
     }
@@ -707,61 +685,6 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
     getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, *args);
 
     return {oldLocation};
-}
-
-StatusWith<RecordId> CollectionImpl::_updateDocumentWithMove(OperationContext* opCtx,
-                                                             const RecordId& oldLocation,
-                                                             const Snapshotted<BSONObj>& oldDoc,
-                                                             const BSONObj& newDoc,
-                                                             bool enforceQuota,
-                                                             OpDebug* opDebug,
-                                                             OplogUpdateEntryArgs* args,
-                                                             const SnapshotId& sid) {
-    // Insert new record.
-    // TODO SERVER-30638, thread through actual timestamps.
-    StatusWith<RecordId> newLocation = _recordStore->insertRecord(
-        opCtx, newDoc.objdata(), newDoc.objsize(), Timestamp(), _enforceQuota(enforceQuota));
-    if (!newLocation.isOK()) {
-        return newLocation;
-    }
-
-    invariant(newLocation.getValue() != oldLocation);
-
-    _cursorManager.invalidateDocument(opCtx, oldLocation, INVALIDATION_DELETION);
-
-    args->preImageDoc = oldDoc.value().getOwned();
-
-    // Remove indexes for old record.
-    int64_t keysDeleted;
-    _indexCatalog.unindexRecord(opCtx, oldDoc.value(), oldLocation, true, &keysDeleted);
-
-    // Remove old record.
-    _recordStore->deleteRecord(opCtx, oldLocation);
-
-    std::vector<BsonRecord> bsonRecords;
-    BsonRecord bsonRecord = {newLocation.getValue(), &newDoc};
-    bsonRecords.push_back(bsonRecord);
-
-    // Add indexes for new record.
-    int64_t keysInserted;
-    Status status = _indexCatalog.indexRecords(opCtx, bsonRecords, &keysInserted);
-    if (!status.isOK()) {
-        return StatusWith<RecordId>(status);
-    }
-
-    invariant(sid == opCtx->recoveryUnit()->getSnapshotId());
-    args->updatedDoc = newDoc;
-
-    getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, *args);
-
-    moveCounter.increment();
-    if (opDebug) {
-        opDebug->nmoved++;
-        opDebug->keysInserted += keysInserted;
-        opDebug->keysDeleted += keysDeleted;
-    }
-
-    return newLocation;
 }
 
 Status CollectionImpl::recordStoreGoingToUpdateInPlace(OperationContext* opCtx,
@@ -802,22 +725,6 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
         getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, *args);
     }
     return newRecStatus;
-}
-
-bool CollectionImpl::_enforceQuota(bool userEnforeQuota) const {
-    if (!userEnforeQuota)
-        return false;
-
-    if (!mmapv1GlobalOptions.quota)
-        return false;
-
-    if (_ns.db() == "local")
-        return false;
-
-    if (_ns.isSpecial())
-        return false;
-
-    return true;
 }
 
 bool CollectionImpl::isCapped() const {

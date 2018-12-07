@@ -13,7 +13,7 @@
  * applicable.
  *
  * This test requires replica set configuration and user credentials to persist across a restart.
- * @tags: [requires_persistence]
+ * @tags: [requires_persistence, uses_transactions]
  */
 
 // Restarts cause issues with authentication for awaiting replication.
@@ -89,15 +89,6 @@ TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
     // Create necessary users at both cluster and shard-local level.
     createUsers(shardConn);
     createUsers(mongosConn);
-
-    // Gate this test to transaction supporting engines only as it uses txnNumber.
-    assert(shardAdminDB.auth("admin", "pwd"));
-    if (!shardAdminDB.serverStatus().storageEngine.supportsSnapshotReadConcern) {
-        jsTestLog("Do not run on storage engine that does not support transactions");
-        st.stop();
-        return;
-    }
-    shardAdminDB.logout();
 
     // Create a test database and some dummy data on rs0.
     assert(clusterAdminDB.auth("admin", "pwd"));
@@ -634,7 +625,7 @@ TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
             opid: {$exists: false},
             desc: "inactive transaction",
             "lsid.id": {$in: sessions.map((session) => session.getSessionId().id)},
-            "transaction.parameters.txnNumber": {$gte: 0, $lt: sessions.length}
+            "transaction.parameters.txnNumber": {$gte: 0, $lt: sessions.length},
         };
     }
 
@@ -729,6 +720,8 @@ TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
     // disabled, even with 'allUsers:false'.
     const session = shardAdminDB.getMongo().startSession();
 
+    const timeBeforeTransactionStarts = new ISODate();
+
     // Start but do not complete a transaction.
     const sessionDB = session.getDatabase(shardTestDB.getName());
     assert.commandWorked(sessionDB.runCommand({
@@ -742,6 +735,8 @@ TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
     sessionDBs = [sessionDB];
     sessions = [session];
 
+    const timeAfterTransactionStarts = new ISODate();
+
     // Use $currentOp to confirm that the incomplete transaction has stashed its locks.
     assert.eq(shardAdminDB.aggregate([{$currentOp: {allUsers: false}}, {$match: sessionFilter()}])
                   .itcount(),
@@ -754,6 +749,20 @@ TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
                 [{$currentOp: {allUsers: false, idleSessions: false}}, {$match: sessionFilter()}])
             .itcount(),
         0);
+
+    const timeBeforeCurrentOp = new ISODate();
+
+    // Check that the currentOp's transaction subdocument's fields align with our expectations.
+    let currentOp =
+        shardAdminDB.aggregate([{$currentOp: {allUsers: false}}, {$match: sessionFilter()}])
+            .toArray();
+    let transactionDocument = currentOp[0].transaction;
+    assert.eq(transactionDocument.parameters.autocommit, false);
+    assert.gte(ISODate(transactionDocument.startWallClockTime), timeBeforeTransactionStarts);
+    assert.gt(transactionDocument.timeOpenMicros,
+              (timeBeforeCurrentOp - timeAfterTransactionStarts) * 1000);
+    assert.gte(transactionDocument.timeActiveMicros, 0);
+    assert.gte(transactionDocument.timeInactiveMicros, 0);
 
     // Allow the transactions to complete and close the session.
     assert.commandWorked(sessionDB.adminCommand({

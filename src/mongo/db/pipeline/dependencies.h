@@ -43,9 +43,68 @@ class ParsedDeps;
  */
 struct DepsTracker {
     /**
+     * Used by aggregation stages to report whether or not dependency resolution is complete, or
+     * must continue to the next stage.
+     */
+    enum State {
+        // The full object and all metadata may be required.
+        NOT_SUPPORTED = 0x0,
+
+        // Later stages could need either fields or metadata. For example, a $limit stage will pass
+        // through all fields, and they may or may not be needed by future stages.
+        SEE_NEXT = 0x1,
+
+        // Later stages won't need more fields from input. For example, an inclusion projection like
+        // {_id: 1, a: 1} will only output two fields, so future stages cannot possibly depend on
+        // any other fields.
+        EXHAUSTIVE_FIELDS = 0x2,
+
+        // Later stages won't need more metadata from input. For example, a $group stage will group
+        // documents together, discarding their text score and sort keys.
+        EXHAUSTIVE_META = 0x4,
+
+        // Later stages won't need either fields or metadata.
+        EXHAUSTIVE_ALL = EXHAUSTIVE_FIELDS | EXHAUSTIVE_META,
+    };
+
+    /**
+     * Represents the type of metadata a pipeline might request.
+     */
+    enum class MetadataType {
+        // The score associated with a text match.
+        TEXT_SCORE,
+
+        // The key to use for sorting.
+        SORT_KEY,
+
+        // The computed distance for a near query.
+        GEO_NEAR_DISTANCE,
+
+        // The point used in the computation of the GEO_NEAR_DISTANCE.
+        GEO_NEAR_POINT,
+    };
+
+    /**
      * Represents what metadata is available on documents that are input to the pipeline.
      */
-    enum MetadataAvailable { kNoMetadata = 0, kTextScore = 1 };
+    enum MetadataAvailable {
+        kNoMetadata = 0,
+        kTextScore = 1 << 1,
+        kGeoNearDistance = 1 << 2,
+        kGeoNearPoint = 1 << 3,
+    };
+
+    /**
+     * Represents a state where all geo metadata is available.
+     */
+    static constexpr auto kAllGeoNearDataAvailable =
+        MetadataAvailable(MetadataAvailable::kGeoNearDistance | MetadataAvailable::kGeoNearPoint);
+
+    /**
+     * Represents a state where all metadata is available.
+     */
+    static constexpr auto kAllMetadataAvailable =
+        MetadataAvailable(kTextScore | kGeoNearDistance | kGeoNearPoint);
 
     DepsTracker(MetadataAvailable metadataAvailable = kNoMetadata)
         : _metadataAvailable(metadataAvailable) {}
@@ -71,36 +130,44 @@ struct DepsTracker {
         return !match.empty();
     }
 
+    /**
+     * Returns a value with bits set indicating the types of metadata available.
+     */
     MetadataAvailable getMetadataAvailable() const {
         return _metadataAvailable;
     }
 
-    bool isTextScoreAvailable() const {
-        return _metadataAvailable & MetadataAvailable::kTextScore;
+    /**
+     * Returns true if the DepsTracker the metadata 'type' is available to the pipeline. It is
+     * illegal to call this with MetadataType::SORT_KEY, since the sort key will always be available
+     * if needed.
+     */
+    bool isMetadataAvailable(MetadataType type) const;
+
+    /**
+     * Sets whether or not metadata 'type' is required. Throws if 'required' is true but that
+     * metadata is not available to the pipeline.
+     *
+     * Except for MetadataType::SORT_KEY, once 'type' is required, it cannot be unset.
+     */
+    void setNeedsMetadata(MetadataType type, bool required);
+
+    /**
+     * Returns true if the DepsTracker requires that metadata of type 'type' is present.
+     */
+    bool getNeedsMetadata(MetadataType type) const;
+
+    /**
+     * Returns true if there exists a type of metadata required by the DepsTracker.
+     */
+    bool getNeedsAnyMetadata() const {
+        return _needTextScore || _needSortKey || _needGeoNearDistance || _needGeoNearPoint;
     }
 
-    bool getNeedTextScore() const {
-        return _needTextScore;
-    }
-
-    void setNeedTextScore(bool needTextScore) {
-        if (needTextScore && !isTextScoreAvailable()) {
-            uasserted(
-                40218,
-                "pipeline requires text score metadata, but there is no text score available");
-        }
-        _needTextScore = needTextScore;
-    }
-
-    bool getNeedSortKey() const {
-        return _needSortKey;
-    }
-
-    void setNeedSortKey(bool needSortKey) {
-        // We don't expect to ever unset '_needSortKey'.
-        invariant(!_needSortKey || needSortKey);
-        _needSortKey = needSortKey;
-    }
+    /**
+     * Returns a vector containing all the types of metadata required by this DepsTracker.
+     */
+    std::vector<MetadataType> getAllRequiredMetadataTypes() const;
 
     std::set<std::string> fields;    // Names of needed fields in dotted notation.
     std::set<Variables::Id> vars;    // IDs of referenced variables.
@@ -114,8 +181,12 @@ private:
     bool _appendMetaProjections(BSONObjBuilder* bb) const;
 
     MetadataAvailable _metadataAvailable;
-    bool _needTextScore = false;  // if true, add a {$meta: "textScore"} to the projection.
-    bool _needSortKey = false;    // if true, add a {$meta: "sortKey"} to the projection.
+
+    // Each member variable influences a different $meta projection.
+    bool _needTextScore = false;        // {$meta: "textScore"}
+    bool _needSortKey = false;          // {$meta: "sortKey"}
+    bool _needGeoNearDistance = false;  // {$meta: "geoNearDistance"}
+    bool _needGeoNearPoint = false;     // {$meta: "geoNearPoint"}
 };
 
 /**

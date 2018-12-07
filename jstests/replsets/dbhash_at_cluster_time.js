@@ -1,5 +1,6 @@
 /**
  * Tests that "atClusterTime" is supported by the "dbHash" command.
+ * @tags: [uses_transactions]
  */
 (function() {
     "use strict";
@@ -17,11 +18,6 @@
     const session = primary.startSession({causalConsistency: false});
     const db = session.getDatabase("test");
     let txnNumber = 0;
-
-    if (!db.serverStatus().storageEngine.supportsSnapshotReadConcern) {
-        rst.stopSet();
-        return;
-    }
 
     // We force 'secondary' to sync from 'primary' using the "forceSyncSourceCandidate" failpoint to
     // ensure that an intermittent connectivity issue doesn't lead to the secondary not advancing
@@ -53,7 +49,11 @@
     const hash1 = {collections: res.collections, md5: res.md5};
 
     // We insert another document to ensure the collection's contents have a different md5sum now.
-    assert.commandWorked(db.mycoll.insert({_id: 2}));
+    // We use a w=majority write concern to ensure that the insert has also been applied on the
+    // secondary by the time we go to run the dbHash command later. This avoids a race where the
+    // replication subsystem could be applying the insert operation when the dbHash command is run
+    // on the secondary.
+    assert.commandWorked(db.mycoll.insert({_id: 2}, {writeConcern: {w: "majority"}}));
 
     // However, using atClusterTime to read at the opTime of the first insert should return the same
     // md5sum as it did originally.

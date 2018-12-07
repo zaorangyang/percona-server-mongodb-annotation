@@ -34,7 +34,6 @@
 #include <utility>
 
 #include "mongo/client/connection_string.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
@@ -93,7 +92,7 @@ auto runIfStandaloneOrPrimary(const NamespaceString& ns,
     {
         Lock::DBLock lk(opCtx, ns.db(), mode);
         Lock::CollectionLock lock(
-            opCtx->lockState(), SessionsCollection::kSessionsNamespaceString.ns(), mode);
+            opCtx->lockState(), NamespaceString::kLogicalSessionsNamespace.ns(), mode);
 
         auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
 
@@ -145,7 +144,7 @@ auto dispatch(const NamespaceString& ns,
 
 Status SessionsCollectionRS::setupSessionsCollection(OperationContext* opCtx) {
     return dispatch(
-        kSessionsNamespaceString,
+        NamespaceString::kLogicalSessionsNamespace,
         MODE_IX,
         opCtx,
         [&] {
@@ -153,7 +152,8 @@ Status SessionsCollectionRS::setupSessionsCollection(OperationContext* opCtx) {
             DBDirectClient client(opCtx);
             BSONObj info;
             auto cmd = generateCreateIndexesCmd();
-            if (!client.runCommand(kSessionsNamespaceString.db().toString(), cmd, info)) {
+            if (!client.runCommand(
+                    NamespaceString::kLogicalSessionsNamespace.db().toString(), cmd, info)) {
                 return getStatusFromCommandResult(info);
             }
 
@@ -168,56 +168,62 @@ Status SessionsCollectionRS::setupSessionsCollection(OperationContext* opCtx) {
 Status SessionsCollectionRS::refreshSessions(OperationContext* opCtx,
                                              const LogicalSessionRecordSet& sessions) {
     return dispatch(
-        kSessionsNamespaceString,
+        NamespaceString::kLogicalSessionsNamespace,
         MODE_IX,
         opCtx,
         [&] {
             DBDirectClient client(opCtx);
-            return doRefresh(kSessionsNamespaceString,
-                             sessions,
-                             makeSendFnForBatchWrite(kSessionsNamespaceString, &client));
+            return doRefresh(
+                NamespaceString::kLogicalSessionsNamespace,
+                sessions,
+                makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
         },
         [&](DBClientBase* client) {
-            return doRefreshExternal(kSessionsNamespaceString,
-                                     sessions,
-                                     makeSendFnForCommand(kSessionsNamespaceString, client));
+            return doRefreshExternal(
+                NamespaceString::kLogicalSessionsNamespace,
+                sessions,
+                makeSendFnForCommand(NamespaceString::kLogicalSessionsNamespace, client));
         });
 }
 
 Status SessionsCollectionRS::removeRecords(OperationContext* opCtx,
                                            const LogicalSessionIdSet& sessions) {
-    return dispatch(kSessionsNamespaceString,
-                    MODE_IX,
-                    opCtx,
-                    [&] {
-                        DBDirectClient client(opCtx);
-                        return doRemove(kSessionsNamespaceString,
-                                        sessions,
-                                        makeSendFnForBatchWrite(kSessionsNamespaceString, &client));
-                    },
-                    [&](DBClientBase* client) {
-                        return doRemoveExternal(
-                            kSessionsNamespaceString,
-                            sessions,
-                            makeSendFnForCommand(kSessionsNamespaceString, client));
-                    });
+    return dispatch(
+        NamespaceString::kLogicalSessionsNamespace,
+        MODE_IX,
+        opCtx,
+        [&] {
+            DBDirectClient client(opCtx);
+            return doRemove(
+                NamespaceString::kLogicalSessionsNamespace,
+                sessions,
+                makeSendFnForBatchWrite(NamespaceString::kLogicalSessionsNamespace, &client));
+        },
+        [&](DBClientBase* client) {
+            return doRemoveExternal(
+                NamespaceString::kLogicalSessionsNamespace,
+                sessions,
+                makeSendFnForCommand(NamespaceString::kLogicalSessionsNamespace, client));
+        });
 }
 
 StatusWith<LogicalSessionIdSet> SessionsCollectionRS::findRemovedSessions(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
-    return dispatch(kSessionsNamespaceString,
+    return dispatch(NamespaceString::kLogicalSessionsNamespace,
                     MODE_IS,
                     opCtx,
                     [&] {
                         DBDirectClient client(opCtx);
-                        return doFetch(kSessionsNamespaceString,
+                        return doFetch(NamespaceString::kLogicalSessionsNamespace,
                                        sessions,
-                                       makeFindFnForCommand(kSessionsNamespaceString, &client));
+                                       makeFindFnForCommand(
+                                           NamespaceString::kLogicalSessionsNamespace, &client));
                     },
                     [&](DBClientBase* client) {
-                        return doFetch(kSessionsNamespaceString,
+                        return doFetch(NamespaceString::kLogicalSessionsNamespace,
                                        sessions,
-                                       makeFindFnForCommand(kSessionsNamespaceString, client));
+                                       makeFindFnForCommand(
+                                           NamespaceString::kLogicalSessionsNamespace, client));
                     });
 }
 

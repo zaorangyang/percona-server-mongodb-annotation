@@ -77,52 +77,6 @@
     assert(s.admin.runCommand({shardcollection: "test.foo7", key: {num: 1}}).ok,
            "shard with ok unique index");
 
-    // ----- eval -----
-
-    db.foo2.save({num: 5, a: 7});
-    db.foo3.save({num: 5, a: 8});
-
-    assert.eq(1, db.foo3.count(), "eval pre1");
-    assert.eq(1, db.foo2.count(), "eval pre2");
-
-    assert.eq(8,
-              db.eval(function() {
-                  return db.foo3.findOne().a;
-              }),
-              "eval 1 ");
-    assert.throws(function() {
-        db.eval(function() {
-            return db.foo2.findOne().a;
-        });
-    }, [], "eval 2");
-
-    assert.eq(1,
-              db.eval(function() {
-                  return db.foo3.count();
-              }),
-              "eval 3 ");
-    assert.throws(function() {
-        db.eval(function() {
-            return db.foo2.count();
-        });
-    }, [], "eval 4");
-
-    // ----- "eval" new command name SERVER-5588 -----
-    var result;
-    result = db.runCommand({
-        eval: function() {
-            return db.foo3.count();
-        }
-    });  // non-sharded collection
-    assert.eq(1, result.ok, "eval should work for non-sharded collection in cluster");
-
-    result = db.runCommand({
-        eval: function() {
-            return db.foo2.count();
-        }
-    });  // sharded collection
-    assert.eq(0, result.ok, "eval should not work for sharded collection in cluster");
-
     // ---- unique shard key ----
 
     assert(s.admin.runCommand({shardcollection: "test.foo4", key: {num: 1}, unique: true}).ok,
@@ -171,53 +125,6 @@
     assert(db.foo5.isCapped(), "cb1");
     var res = s.admin.runCommand({shardcollection: "test.foo5", key: {num: 1}});
     assert(!res.ok, "shard capped: " + tojson(res));
-
-    // ----- group ----
-
-    db.foo6.save({a: 1});
-    db.foo6.save({a: 3});
-    db.foo6.save({a: 3});
-    db.foo6.ensureIndex({a: 1});
-    s.sync();
-    printjson(db.foo6.getIndexes());
-
-    assert.eq(2,
-              db.foo6
-                  .group({
-                      key: {a: 1},
-                      initial: {count: 0},
-                      reduce: function(z, prev) {
-                          prev.count++;
-                      }
-                  })
-                  .length);
-
-    assert.eq(3, db.foo6.find().count());
-    assert(s.admin.runCommand({shardcollection: "test.foo6", key: {a: 1}}).ok);
-    assert.eq(3, db.foo6.find().count());
-
-    s.adminCommand({split: "test.foo6", middle: {a: 2}});
-
-    // movechunk commands are wrapped in assert.soon
-    // Sometimes the TO-side shard isn't immediately ready, this
-    // causes problems on slow hosts.
-    // Remove when SERVER-10232 is fixed
-
-    assert.soon(function() {
-        var cmdRes = s.admin.runCommand(
-            {movechunk: "test.foo6", find: {a: 3}, to: s.getOther(s.getPrimaryShard("test")).name});
-        return cmdRes.ok;
-    }, 'move chunk test.foo6', 60000, 1000);
-
-    assert.throws(function() {
-        db.foo6.group({
-            key: {a: 1},
-            initial: {count: 0},
-            reduce: function(z, prev) {
-                prev.count++;
-            }
-        });
-    });
 
     // ---- can't shard non-empty collection without index -----
 

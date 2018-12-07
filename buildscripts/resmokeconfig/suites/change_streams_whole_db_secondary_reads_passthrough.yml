@@ -9,6 +9,9 @@ selector:
   - jstests/change_streams/only_wake_getmore_for_relevant_changes.js
   # This test is not expected to work when run against a mongos.
   - jstests/change_streams/report_latest_observed_oplog_timestamp.js
+  # Only relevant for single-collection change streams.
+  - jstests/change_streams/metadata_notifications.js
+
   exclude_with_any_tags:
   ##
   # The next three tags correspond to the special errors thrown by the
@@ -20,9 +23,6 @@ selector:
   - assumes_read_concern_unchanged
   # "Cowardly refusing to override write concern of command: ..."
   - assumes_write_concern_unchanged
-  # "Cowardly refusing to run test with overridden write concern when it uses a command that can
-  #  only perform w=1 writes: ..."
-  - requires_eval_command
   ##
   # The next tag corresponds to the special error thrown by the set_read_preference_secondary.js
   # override when it refuses to replace the readPreference of a particular command. Above each tag
@@ -68,7 +68,6 @@ executor:
             asio: 2
           tracking: 0
     mongod_options:
-      nopreallocj: ''
       set_parameters:
         enableTestCommands: 1
         logComponentVerbosity:

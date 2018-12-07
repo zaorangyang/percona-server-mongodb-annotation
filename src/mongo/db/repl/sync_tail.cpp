@@ -39,7 +39,6 @@
 #include "mongo/base/counter.h"
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/timestamp.h"
-#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -56,7 +55,6 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/prefetch.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/repl/applier_helpers.h"
 #include "mongo/db/repl/apply_ops.h"
@@ -68,7 +66,6 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/session_update_tracker.h"
-#include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session.h"
 #include "mongo/db/session_txn_record_gen.h"
@@ -87,53 +84,9 @@ using std::endl;
 
 namespace repl {
 
-AtomicInt32 SyncTail::replBatchLimitOperations{50 * 1000};
-
 namespace {
 
-MONGO_FP_DECLARE(pauseBatchApplicationBeforeCompletion);
-
-/**
- * This variable determines the number of writer threads SyncTail will have. It can be overridden
- * using the "replWriterThreadCount" server parameter.
- */
-int replWriterThreadCount = 16;
-
-class ExportedWriterThreadCountParameter
-    : public ExportedServerParameter<int, ServerParameterType::kStartupOnly> {
-public:
-    ExportedWriterThreadCountParameter()
-        : ExportedServerParameter<int, ServerParameterType::kStartupOnly>(
-              ServerParameterSet::getGlobal(), "replWriterThreadCount", &replWriterThreadCount) {}
-
-    virtual Status validate(const int& potentialNewValue) {
-        if (potentialNewValue < 1 || potentialNewValue > 256) {
-            return Status(ErrorCodes::BadValue, "replWriterThreadCount must be between 1 and 256");
-        }
-
-        return Status::OK();
-    }
-
-} exportedWriterThreadCountParam;
-
-class ExportedBatchLimitOperationsParameter
-    : public ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime> {
-public:
-    ExportedBatchLimitOperationsParameter()
-        : ExportedServerParameter<int, ServerParameterType::kStartupAndRuntime>(
-              ServerParameterSet::getGlobal(),
-              "replBatchLimitOperations",
-              &SyncTail::replBatchLimitOperations) {}
-
-    virtual Status validate(const int& potentialNewValue) {
-        if (potentialNewValue < 1 || potentialNewValue > (1000 * 1000)) {
-            return Status(ErrorCodes::BadValue,
-                          "replBatchLimitOperations must be between 1 and 1 million, inclusive");
-        }
-
-        return Status::OK();
-    }
-} exportedBatchLimitOperationsParam;
+MONGO_FAIL_POINT_DEFINE(pauseBatchApplicationBeforeCompletion);
 
 // The oplog entries applied
 Counter64 opsAppliedStats;
@@ -275,35 +228,6 @@ NamespaceStringOrUUID getNsOrUUID(const NamespaceString& nss, const BSONObj& op)
 
 }  // namespace
 
-std::size_t SyncTail::calculateBatchLimitBytes(OperationContext* opCtx,
-                                               StorageInterface* storageInterface) {
-    auto oplogMaxSizeResult =
-        storageInterface->getOplogMaxSize(opCtx, NamespaceString::kRsOplogNamespace);
-    auto oplogMaxSize = fassert(40301, oplogMaxSizeResult);
-    return std::min(oplogMaxSize / 10, std::size_t(replBatchLimitBytes));
-}
-
-std::unique_ptr<ThreadPool> SyncTail::makeWriterPool() {
-    return makeWriterPool(replWriterThreadCount);
-}
-
-std::unique_ptr<ThreadPool> SyncTail::makeWriterPool(int threadCount) {
-    ThreadPool::Options options;
-    options.threadNamePrefix = "repl writer worker ";
-    options.poolName = "repl writer worker Pool";
-    options.maxThreads = options.minThreads = static_cast<size_t>(threadCount);
-    options.onCreateThread = [](const std::string&) {
-        // Only do this once per thread
-        if (!Client::getCurrent()) {
-            Client::initThreadIfNotAlready();
-            AuthorizationSession::get(cc())->grantInternalAuthorization();
-        }
-    };
-    auto pool = stdx::make_unique<ThreadPool>(options);
-    pool->startup();
-    return pool;
-}
-
 // static
 Status SyncTail::syncApply(OperationContext* opCtx,
                            const BSONObj& op,
@@ -423,38 +347,6 @@ const OplogApplier::Options& SyncTail::getOptions() const {
 }
 
 namespace {
-
-// The pool threads call this to prefetch each op
-void prefetchOp(const OplogEntry& oplogEntry) {
-    const auto& nss = oplogEntry.getNamespace();
-    if (!nss.isEmpty()) {
-        try {
-            // one possible tweak here would be to stay in the read lock for this database
-            // for multiple prefetches if they are for the same database.
-            const ServiceContext::UniqueOperationContext opCtxPtr = cc().makeOperationContext();
-            OperationContext& opCtx = *opCtxPtr;
-            AutoGetCollectionForReadCommand ctx(&opCtx, nss);
-            Database* db = ctx.getDb();
-            if (db) {
-                prefetchPagesForReplicatedOp(&opCtx, db, oplogEntry);
-            }
-        } catch (const DBException& e) {
-            LOG(2) << "ignoring exception in prefetchOp(): " << redact(e) << endl;
-        } catch (const std::exception& e) {
-            log() << "Unhandled std::exception in prefetchOp(): " << redact(e.what()) << endl;
-            fassertFailed(16397);
-        }
-    }
-}
-
-// Doles out all the work to the reader pool threads and waits for them to complete
-void prefetchOps(const MultiApplier::Operations& ops, ThreadPool* prefetcherPool) {
-    invariant(prefetcherPool);
-    for (auto&& op : ops) {
-        invariant(prefetcherPool->schedule([&] { prefetchOp(op); }));
-    }
-    prefetcherPool->waitForIdle();
-}
 
 // Doles out all the work to the writer pool threads.
 // Does not modify writerVectors, but passes non-const pointers to inner vectors into func.
@@ -647,6 +539,10 @@ void fillWriterVectors(OperationContext* opCtx,
         // Extract applyOps operations and fill writers with extracted operations using this
         // function.
         if (op.isCommand() && op.getCommandType() == OplogEntry::CommandType::kApplyOps) {
+            if (op.shouldPrepare()) {
+                // TODO (SERVER-35307) mark operations as needing prepare.
+                continue;
+            }
             try {
                 derivedOps->emplace_back(ApplyOps::extractOperations(op));
                 fillWriterVectors(
@@ -784,14 +680,14 @@ private:
         Client::initThread("ReplBatcher");
 
         BatchLimits batchLimits;
-        batchLimits.bytes =
-            calculateBatchLimitBytes(cc().makeOperationContext().get(), _storageInterface);
+        batchLimits.bytes = OplogApplier::calculateBatchLimitBytes(
+            cc().makeOperationContext().get(), _storageInterface);
 
         while (true) {
             batchLimits.slaveDelayLatestTimestamp = _calculateSlaveDelayLatestTimestamp();
 
             // Check this once per batch since users can change it at runtime.
-            batchLimits.ops = replBatchLimitOperations.load();
+            batchLimits.ops = OplogApplier::getBatchLimitOperations();
 
             OpQueue ops(batchLimits.ops);
             // tryPopAndWaitForMore adds to ops and returns true when we need to end a batch early.
@@ -834,20 +730,18 @@ private:
 };
 
 void SyncTail::oplogApplication(OplogBuffer* oplogBuffer, ReplicationCoordinator* replCoord) {
-    if (isMMAPV1()) {
-        // Overwrite prefetch index mode if ReplSettings has a mode set.
-        auto&& replSettings = replCoord->getSettings();
-        if (replSettings.isPrefetchIndexModeSet()) {
-            replCoord->setIndexPrefetchConfig(replSettings.getPrefetchIndexMode());
-        }
-    }
-
     // We don't start data replication for arbiters at all and it's not allowed to reconfig
     // arbiterOnly field for any member.
     invariant(!replCoord->getMemberState().arbiter());
 
     OpQueueBatcher batcher(this, _storageInterface, oplogBuffer);
 
+    _oplogApplication(oplogBuffer, replCoord, &batcher);
+}
+
+void SyncTail::_oplogApplication(OplogBuffer* oplogBuffer,
+                                 ReplicationCoordinator* replCoord,
+                                 OpQueueBatcher* batcher) noexcept {
     std::unique_ptr<ApplyBatchFinalizer> finalizer{
         getGlobalServiceContext()->getStorageEngine()->isDurable()
             ? new ApplyBatchFinalizerForJournal(replCoord)
@@ -886,7 +780,7 @@ void SyncTail::oplogApplication(OplogBuffer* oplogBuffer, ReplicationCoordinator
         long long termWhenBufferIsEmpty = replCoord->getTerm();
         // Blocks up to a second waiting for a batch to be ready to apply. If one doesn't become
         // ready in time, we'll loop again so we can do the above checks periodically.
-        OpQueue ops = batcher.getNextBatch(Seconds(1));
+        OpQueue ops = batcher->getNextBatch(Seconds(1));
         if (ops.empty()) {
             if (ops.mustShutdown()) {
                 // Shut down and exit oplog application loop.
@@ -1036,7 +930,11 @@ bool SyncTail::tryPopAndWaitForMore(OperationContext* opCtx,
     // Commands must be processed one at a time. The only exception to this is applyOps because
     // applyOps oplog entries are effectively containers for CRUD operations. Therefore, it is safe
     // to batch applyOps commands with CRUD operations when reading from the oplog buffer.
-    if (entry.isCommand() && entry.getCommandType() != OplogEntry::CommandType::kApplyOps) {
+    // Oplog entries on 'system.views' should also be processed one at a time. View catalog
+    // immediately reflects changes for each oplog entry so we can see inconsistent view catalog if
+    // multiple oplog entries on 'system.views' are being applied out of the original order.
+    if ((entry.isCommand() && entry.getCommandType() != OplogEntry::CommandType::kApplyOps) ||
+        entry.getNamespace().isSystemDotViews()) {
         if (ops->getCount() == 1) {
             // apply commands one-at-a-time
             _consume(opCtx, oplogBuffer);
@@ -1061,15 +959,12 @@ bool SyncTail::tryPopAndWaitForMore(OperationContext* opCtx,
 void SyncTail::_consume(OperationContext* opCtx, OplogBuffer* oplogBuffer) {
     // This is just to get the op off the queue; it's been peeked at and queued for application
     // already.
+    // If we failed to get an op off the queue, this means that shutdown() was called between the
+    // consumer's calls to peek() and consume(). shutdown() cleared the buffer so there is nothing
+    // for us to consume here. Since our postcondition is already met, it is safe to return
+    // successfully.
     BSONObj op;
-    if (oplogBuffer->tryPop(opCtx, &op)) {
-        _observer->onOperationConsumed(op);
-    } else {
-        invariant(inShutdown());
-        // This means that shutdown() was called between the consumer's calls to peek() and
-        // consume(). shutdown() cleared the buffer so there is nothing for us to consume here.
-        // Since our postcondition is already met, it is safe to return successfully.
-    }
+    invariant(oplogBuffer->tryPop(opCtx, &op) || inShutdown());
 }
 
 void SyncTail::shutdown() {
@@ -1080,10 +975,6 @@ void SyncTail::shutdown() {
 bool SyncTail::inShutdown() const {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     return _inShutdown;
-}
-
-void SyncTail::setHostname(const std::string& hostname) {
-    _hostname = hostname;
 }
 
 BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, const OplogEntry& oplogEntry) {
@@ -1097,6 +988,9 @@ BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, const OplogEntry& oplog
         }
     }
 
+    auto source = _options.missingDocumentSourceForInitialSync;
+    invariant(source);
+
     const int retryMax = 3;
     for (int retryCount = 1; retryCount <= retryMax; ++retryCount) {
         if (retryCount != 1) {
@@ -1104,7 +998,7 @@ BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, const OplogEntry& oplog
             sleepsecs(retryCount * retryCount);
         }
         try {
-            bool ok = missingObjReader.connect(HostAndPort(_hostname));
+            bool ok = missingObjReader.connect(*source);
             if (!ok) {
                 warning() << "network problem detected while connecting to the "
                           << "sync source, attempt " << retryCount << " of " << retryMax << endl;
@@ -1151,10 +1045,11 @@ BSONObj SyncTail::getMissingDoc(OperationContext* opCtx, const OplogEntry& oplog
     }
     // retry count exceeded
     msgasserted(15916,
-                str::stream() << "Can no longer connect to initial sync source: " << _hostname);
+                str::stream() << "Can no longer connect to initial sync source: "
+                              << source->toString());
 }
 
-bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx,
+void SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx,
                                              const OplogEntry& oplogEntry) {
     // Note that using the local UUID/NamespaceString mapping is sufficient for checking
     // whether the collection is capped on the remote because convertToCapped creates a
@@ -1167,7 +1062,7 @@ bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx,
         Collection* const collection = autoColl.getCollection();
         if (collection && collection->isCapped()) {
             log() << "Not fetching missing document in capped collection (" << nss << ")";
-            return false;
+            return;
         }
     }
 
@@ -1183,7 +1078,7 @@ bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx,
                  "field: "
               << redact(oplogEntry.getObject()) << ", o2: " << redact(object2);
 
-        return false;
+        return;
     }
 
     return writeConflictRetry(opCtx, "fetchAndInsertMissingDocument", nss.ns(), [&] {
@@ -1197,7 +1092,7 @@ bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx,
         auto uuid = oplogEntry.getUuid();
         if (!uuid) {
             if (!db) {
-                return false;
+                return;
             }
             coll = db->getOrCreateCollection(opCtx, nss);
         } else {
@@ -1207,7 +1102,7 @@ bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx,
             coll = catalog.lookupCollectionByUUID(*uuid);
             if (!coll) {
                 // TODO(SERVER-30819) insert this UUID into the missing UUIDs set.
-                return false;
+                return;
             }
         }
 
@@ -1227,8 +1122,6 @@ bool SyncTail::fetchAndInsertMissingDocument(OperationContext* opCtx,
             const OplogApplier::Observer::FetchInfo fetchInfo(oplogEntry, missingObj);
             _observer->onMissingDocumentsFetchedAndInserted({fetchInfo});
         }
-
-        return true;
     });
 }
 
@@ -1243,13 +1136,18 @@ Status multiSyncApply(OperationContext* opCtx,
     DisableDocumentValidation validationDisabler(opCtx);
     ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(opCtx->lockState());
 
+    // Explicitly start future read transactions without a timestamp.
+    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+
     ApplierHelpers::stableSortByNamespace(ops);
 
-    // This function is only called in steady state replication and recovering.
     // Assume we are recovering if oplog writes are disabled in the options.
+    // Assume we are in initial sync if we have a host for fetching missing documents.
     const auto oplogApplicationMode = st->getOptions().skipWritesToOplog
         ? OplogApplication::Mode::kRecovering
-        : OplogApplication::Mode::kSecondary;
+        : (st->getOptions().missingDocumentSourceForInitialSync
+               ? OplogApplication::Mode::kInitialSync
+               : OplogApplication::Mode::kSecondary);
 
     ApplierHelpers::InsertGroup insertGroup(ops, opCtx, oplogApplicationMode);
 
@@ -1273,6 +1171,17 @@ Status multiSyncApply(OperationContext* opCtx,
                 const Status status = SyncTail::syncApply(opCtx, entry.raw, oplogApplicationMode);
 
                 if (!status.isOK()) {
+                    // In initial sync, update operations can cause documents to be missed during
+                    // collection cloning. As a result, it is possible that a document that we
+                    // need to update is not present locally. In that case we fetch the document
+                    // from the sync source.
+                    if (status == ErrorCodes::UpdateOperationFailed &&
+                        st->getOptions().missingDocumentSourceForInitialSync) {
+                        // We might need to fetch the missing docs from the sync source.
+                        st->fetchAndInsertMissingDocument(opCtx, entry);
+                        continue;
+                    }
+
                     severe() << "Error applying operation (" << redact(entry.toBSON())
                              << "): " << causedBy(redact(status));
                     return status;
@@ -1302,70 +1211,8 @@ Status multiSyncApply(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status multiInitialSyncApply(OperationContext* opCtx,
-                             MultiApplier::OperationPtrs* ops,
-                             SyncTail* st,
-                             WorkerMultikeyPathInfo* workerMultikeyPathInfo) {
-    invariant(st);
-
-    UnreplicatedWritesBlock uwb(opCtx);
-    DisableDocumentValidation validationDisabler(opCtx);
-    ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(opCtx->lockState());
-
-    {  // Ensure that the MultikeyPathTracker stops tracking paths.
-        ON_BLOCK_EXIT([opCtx] { MultikeyPathTracker::get(opCtx).stopTrackingMultikeyPathInfo(); });
-        MultikeyPathTracker::get(opCtx).startTrackingMultikeyPathInfo();
-
-        for (auto it = ops->begin(); it != ops->end(); ++it) {
-            auto& entry = **it;
-            try {
-                const Status s =
-                    SyncTail::syncApply(opCtx, entry.raw, OplogApplication::Mode::kInitialSync);
-                if (!s.isOK()) {
-                    // In initial sync, update operations can cause documents to be missed during
-                    // collection cloning. As a result, it is possible that a document that we
-                    // need to update is not present locally. In that case we fetch the document
-                    // from the sync source.
-                    if (s != ErrorCodes::UpdateOperationFailed) {
-                        error() << "Error applying operation: " << redact(s) << " ("
-                                << redact(entry.toBSON()) << ")";
-                        return s;
-                    }
-
-                    // We might need to fetch the missing docs from the sync source.
-                    st->fetchAndInsertMissingDocument(opCtx, entry);
-                }
-            } catch (const DBException& e) {
-                // SERVER-24927 If we have a NamespaceNotFound exception, then this document will be
-                // dropped before initial sync ends anyways and we should ignore it.
-                if (e.code() == ErrorCodes::NamespaceNotFound && entry.isCrudOpType()) {
-                    continue;
-                }
-
-                severe() << "writer worker caught exception: " << causedBy(redact(e))
-                         << " on: " << redact(entry.toBSON());
-                return e.toStatus();
-            }
-        }
-    }
-
-    invariant(!MultikeyPathTracker::get(opCtx).isTrackingMultikeyPathInfo());
-    invariant(workerMultikeyPathInfo->empty());
-    auto newPaths = MultikeyPathTracker::get(opCtx).getMultikeyPathInfo();
-    if (!newPaths.empty()) {
-        workerMultikeyPathInfo->swap(newPaths);
-    }
-
-    return Status::OK();
-}
-
 StatusWith<OpTime> SyncTail::multiApply(OperationContext* opCtx, MultiApplier::Operations ops) {
     invariant(!ops.empty());
-
-    if (isMMAPV1()) {
-        // Use a ThreadPool to prefetch all the operations in a batch.
-        prefetchOps(ops, _writerPool);
-    }
 
     LOG(2) << "replication batch size is " << ops.size();
     // Stop all readers until we're done. This also prevents doc-locking engines from deleting old

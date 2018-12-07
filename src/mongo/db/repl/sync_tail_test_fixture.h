@@ -74,7 +74,8 @@ public:
                             Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
-                            const BSONObj& idIndex) override;
+                            const BSONObj& idIndex,
+                            const OplogSlot& createOpTime) override;
 
     // Hooks for OpObserver functions. Defaults to a no-op function but may be overridden to check
     // actual documents mutated.
@@ -98,6 +99,12 @@ public:
 };
 
 class SyncTailTest : public ServiceContextMongoDTest {
+public:
+    /**
+     * Creates OplogApplier::Options for initial sync.
+     */
+    static OplogApplier::Options makeInitialSyncOptions();
+
 protected:
     void _testSyncApplyCrudOperation(ErrorCodes::Error expectedError,
                                      const BSONObj& op,

@@ -116,10 +116,11 @@ public:
                             Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
-                            const BSONObj& idIndex) override {
+                            const BSONObj& idIndex,
+                            const OplogSlot& createOpTime) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onCreateCollection(opCtx, coll, collectionName, options, idIndex);
+            o->onCreateCollection(opCtx, coll, collectionName, options, idIndex, createOpTime);
     }
 
     void onCollMod(OperationContext* const opCtx,
@@ -160,22 +161,45 @@ public:
             o->onDropIndex(opCtx, nss, uuid, indexName, idxDescriptor);
     }
 
-    repl::OpTime onRenameCollection(OperationContext* const opCtx,
-                                    const NamespaceString& fromCollection,
-                                    const NamespaceString& toCollection,
-                                    OptionalCollectionUUID uuid,
-                                    OptionalCollectionUUID dropTargetUUID,
-                                    bool stayTemp) override {
+
+    void onRenameCollection(OperationContext* const opCtx,
+                            const NamespaceString& fromCollection,
+                            const NamespaceString& toCollection,
+                            OptionalCollectionUUID uuid,
+                            OptionalCollectionUUID dropTargetUUID,
+                            bool stayTemp) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->onRenameCollection(
+                opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
+    }
+
+    repl::OpTime preRenameCollection(OperationContext* const opCtx,
+                                     const NamespaceString& fromCollection,
+                                     const NamespaceString& toCollection,
+                                     OptionalCollectionUUID uuid,
+                                     OptionalCollectionUUID dropTargetUUID,
+                                     bool stayTemp) override {
         ReservedTimes times{opCtx};
         for (auto& observer : this->_observers) {
-            const auto time = observer->onRenameCollection(
+            const auto time = observer->preRenameCollection(
                 opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
             invariant(time.isNull());
         }
-
         return _getOpTimeToReturn(times.get().reservedOpTimes);
     }
 
+    void postRenameCollection(OperationContext* const opCtx,
+                              const NamespaceString& fromCollection,
+                              const NamespaceString& toCollection,
+                              OptionalCollectionUUID uuid,
+                              OptionalCollectionUUID dropTargetUUID,
+                              bool stayTemp) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->postRenameCollection(
+                opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
+    }
     void onApplyOps(OperationContext* const opCtx,
                     const std::string& dbName,
                     const BSONObj& applyOpCmd) override {

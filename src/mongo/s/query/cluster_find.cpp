@@ -198,14 +198,11 @@ std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
         qrToForward->asFindCommand(&cmdBuilder);
 
         if (routingInfo.cm()) {
-            ChunkVersion version(routingInfo.cm()->getVersion(shardId));
-            version.appendForCommands(&cmdBuilder);
+            routingInfo.cm()->getVersion(shardId).appendToCommand(&cmdBuilder);
         } else if (!query.nss().isOnInternalDb()) {
-            ChunkVersion version(ChunkVersion::UNSHARDED());
-            version.appendForCommands(&cmdBuilder);
+            ChunkVersion::UNSHARDED().appendToCommand(&cmdBuilder);
         }
 
-        // TODO SERVER-33702: standardize method for attaching txnNumber through mongos.
         if (opCtx->getTxnNumber()) {
             cmdBuilder.append(OperationSessionInfo::kTxnNumberFieldName, *opCtx->getTxnNumber());
         }

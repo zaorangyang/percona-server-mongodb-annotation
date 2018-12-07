@@ -34,7 +34,7 @@
 #include <vector>
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/client/dbclientinterface.h"
+#include "mongo/client/dbclient_base.h"
 #include "mongo/db/create_indexes_gen.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/ops/write_ops.h"
@@ -156,9 +156,6 @@ Status runBulkCmd(StringData label,
 }
 
 }  // namespace
-
-const NamespaceString SessionsCollection::kSessionsNamespaceString =
-    NamespaceString(NamespaceString::kConfigDb, "system.sessions");
 
 SessionsCollection::~SessionsCollection() = default;
 
@@ -333,7 +330,7 @@ BSONObj SessionsCollection::generateCreateIndexesCmd() {
     indexes.push_back(std::move(index));
 
     CreateIndexesCmd createIndexes;
-    createIndexes.setCreateIndexes(kSessionsNamespaceString.coll());
+    createIndexes.setCreateIndexes(NamespaceString::kLogicalSessionsNamespace.coll());
     createIndexes.setIndexes(std::move(indexes));
 
     return createIndexes.toBSON();

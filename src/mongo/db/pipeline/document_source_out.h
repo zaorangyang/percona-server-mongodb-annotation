@@ -29,6 +29,7 @@
 #pragma once
 
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_out_gen.h"
 
 namespace mongo {
 
@@ -42,7 +43,7 @@ public:
     GetNextResult getNext() final;
     const char* getSourceName() const final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
-    GetDepsReturn getDependencies(DepsTracker* deps) const final;
+    DepsTracker::State getDependencies(DepsTracker* deps) const final;
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kStreaming,
@@ -80,7 +81,10 @@ public:
 
 private:
     DocumentSourceOut(const NamespaceString& outputNs,
-                      const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+                      const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                      WriteModeEnum mode,
+                      bool dropTarget,
+                      boost::optional<Document> uniqueKey);
 
     /**
      * Sets '_tempNs' to a unique temporary namespace, makes sure the output collection isn't
@@ -107,6 +111,10 @@ private:
 
     NamespaceString _tempNs;          // output goes here as it is being processed.
     const NamespaceString _outputNs;  // output will go here after all data is processed.
+
+    WriteModeEnum _mode;
+    bool _dropTarget;
+    boost::optional<Document> _uniqueKey;
 };
 
 }  // namespace mongo

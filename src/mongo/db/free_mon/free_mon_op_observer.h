@@ -61,7 +61,7 @@ public:
 
     void aboutToDelete(OperationContext* opCtx,
                        const NamespaceString& nss,
-                       const BSONObj& doc) final {}
+                       const BSONObj& doc) final;
 
     void onDelete(OperationContext* opCtx,
                   const NamespaceString& nss,
@@ -80,7 +80,8 @@ public:
                             Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
-                            const BSONObj& idIndex) final {}
+                            const BSONObj& idIndex,
+                            const OplogSlot& createOpTime) final {}
 
     void onCollMod(OperationContext* opCtx,
                    const NamespaceString& nss,
@@ -101,15 +102,27 @@ public:
                      const std::string& indexName,
                      const BSONObj& indexInfo) final {}
 
-    repl::OpTime onRenameCollection(OperationContext* opCtx,
-                                    const NamespaceString& fromCollection,
-                                    const NamespaceString& toCollection,
-                                    OptionalCollectionUUID uuid,
-                                    OptionalCollectionUUID dropTargetUUID,
-                                    bool stayTemp) final {
+    void onRenameCollection(OperationContext* opCtx,
+                            const NamespaceString& fromCollection,
+                            const NamespaceString& toCollection,
+                            OptionalCollectionUUID uuid,
+                            OptionalCollectionUUID dropTargetUUID,
+                            bool stayTemp) final {}
+
+    repl::OpTime preRenameCollection(OperationContext* opCtx,
+                                     const NamespaceString& fromCollection,
+                                     const NamespaceString& toCollection,
+                                     OptionalCollectionUUID uuid,
+                                     OptionalCollectionUUID dropTargetUUID,
+                                     bool stayTemp) final {
         return repl::OpTime();
     }
-
+    void postRenameCollection(OperationContext* opCtx,
+                              const NamespaceString& fromCollection,
+                              const NamespaceString& toCollection,
+                              OptionalCollectionUUID uuid,
+                              OptionalCollectionUUID dropTargetUUID,
+                              bool stayTemp) final {}
     void onApplyOps(OperationContext* opCtx,
                     const std::string& dbName,
                     const BSONObj& applyOpCmd) final {}

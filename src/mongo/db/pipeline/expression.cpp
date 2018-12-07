@@ -1343,34 +1343,6 @@ intrusive_ptr<Expression> ExpressionDateFromString::parse(
         }
     }
 
-    // The 'format', 'onNull' and 'onError' options were introduced in 4.0, and should not be
-    // allowed in contexts where the maximum feature version is <= 4.0.
-    if (expCtx->maxFeatureCompatibilityVersion &&
-        *expCtx->maxFeatureCompatibilityVersion <
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
-        uassert(
-            ErrorCodes::QueryFeatureNotAllowed,
-            str::stream() << "\"format\" option to $dateFromString is not allowed with the current "
-                             "feature compatibility version. See "
-                          << feature_compatibility_version_documentation::kCompatibilityLink
-                          << " for more information.",
-            !formatElem);
-        uassert(
-            ErrorCodes::QueryFeatureNotAllowed,
-            str::stream() << "\"onNull\" option to $dateFromString is not allowed with the current "
-                             "feature compatibility version. See "
-                          << feature_compatibility_version_documentation::kCompatibilityLink
-                          << " for more information.",
-            !onNullElem);
-        uassert(ErrorCodes::QueryFeatureNotAllowed,
-                str::stream()
-                    << "\"onError\" option to $dateFromString is not allowed with the current "
-                       "feature compatibility version. See "
-                    << feature_compatibility_version_documentation::kCompatibilityLink
-                    << " for more information.",
-                !onErrorElem);
-    }
-
     uassert(40542, "Missing 'dateString' parameter to $dateFromString", dateStringElem);
 
     return new ExpressionDateFromString(
@@ -1689,28 +1661,6 @@ intrusive_ptr<Expression> ExpressionDateToString::parse(
                       str::stream() << "Unrecognized argument to $dateToString: "
                                     << arg.fieldName());
         }
-    }
-
-    // The 'onNull' option was introduced in 4.0, and should not be allowed in contexts where the
-    // maximum feature version is <= 4.0. Similarly, the 'format' option was made optional in 4.0,
-    // so should be required in such scenarios.
-    if (expCtx->maxFeatureCompatibilityVersion &&
-        *expCtx->maxFeatureCompatibilityVersion <
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
-        uassert(
-            ErrorCodes::QueryFeatureNotAllowed,
-            str::stream() << "\"onNull\" option to $dateToString is not allowed with the current "
-                             "feature compatibility version. See "
-                          << feature_compatibility_version_documentation::kCompatibilityLink
-                          << " for more information.",
-            !onNullElem);
-
-        uassert(ErrorCodes::QueryFeatureNotAllowed,
-                str::stream() << "\"format\" option to $dateToString is required with the current "
-                                 "feature compatibility version. See "
-                              << feature_compatibility_version_documentation::kCompatibilityLink
-                              << " for more information.",
-                formatElem);
     }
 
     uassert(18628, "Missing 'date' parameter to $dateToString", !dateElem.eoo());
@@ -2534,7 +2484,7 @@ Value ExpressionMeta::evaluate(const Document& root) const {
 
 void ExpressionMeta::_doAddDependencies(DepsTracker* deps) const {
     if (_metaType == MetaType::TEXT_SCORE) {
-        deps->setNeedTextScore(true);
+        deps->setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, true);
     }
 }
 
@@ -4518,20 +4468,9 @@ const char* ExpressionToUpper::getOpName() const {
 
 /* -------------------------- ExpressionTrim ------------------------------ */
 
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    trim,
-    ExpressionTrim::parse,
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    ltrim,
-    ExpressionTrim::parse,
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    rtrim,
-    ExpressionTrim::parse,
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+REGISTER_EXPRESSION(trim, ExpressionTrim::parse);
+REGISTER_EXPRESSION(ltrim, ExpressionTrim::parse);
+REGISTER_EXPRESSION(rtrim, ExpressionTrim::parse);
 
 intrusive_ptr<Expression> ExpressionTrim::parse(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -5401,45 +5340,18 @@ Expression::Parser makeConversionAlias(const StringData shortcutName, BSONType t
 const double ExpressionConvert::kLongLongMaxPlusOneAsDouble =
     scalbn(1, std::numeric_limits<long long>::digits);
 
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    convert,
-    ExpressionConvert::parse,
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+REGISTER_EXPRESSION(convert, ExpressionConvert::parse);
 
 // Also register shortcut expressions like $toInt, $toString, etc. which can be used as a shortcut
 // for $convert without an 'onNull' or 'onError'.
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    toString,
-    makeConversionAlias("$toString"_sd, BSONType::String),
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    toObjectId,
-    makeConversionAlias("$toObjectId"_sd, BSONType::jstOID),
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    toDate,
-    makeConversionAlias("$toDate"_sd, BSONType::Date),
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    toDouble,
-    makeConversionAlias("$toDouble"_sd, BSONType::NumberDouble),
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    toInt,
-    makeConversionAlias("$toInt"_sd, BSONType::NumberInt),
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    toLong,
-    makeConversionAlias("$toLong"_sd, BSONType::NumberLong),
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    toDecimal,
-    makeConversionAlias("$toDecimal"_sd, BSONType::NumberDecimal),
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
-REGISTER_EXPRESSION_WITH_MIN_VERSION(
-    toBool,
-    makeConversionAlias("$toBool"_sd, BSONType::Bool),
-    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+REGISTER_EXPRESSION(toString, makeConversionAlias("$toString"_sd, BSONType::String));
+REGISTER_EXPRESSION(toObjectId, makeConversionAlias("$toObjectId"_sd, BSONType::jstOID));
+REGISTER_EXPRESSION(toDate, makeConversionAlias("$toDate"_sd, BSONType::Date));
+REGISTER_EXPRESSION(toDouble, makeConversionAlias("$toDouble"_sd, BSONType::NumberDouble));
+REGISTER_EXPRESSION(toInt, makeConversionAlias("$toInt"_sd, BSONType::NumberInt));
+REGISTER_EXPRESSION(toLong, makeConversionAlias("$toLong"_sd, BSONType::NumberLong));
+REGISTER_EXPRESSION(toDecimal, makeConversionAlias("$toDecimal"_sd, BSONType::NumberDecimal));
+REGISTER_EXPRESSION(toBool, makeConversionAlias("$toBool"_sd, BSONType::Bool));
 
 boost::intrusive_ptr<Expression> ExpressionConvert::create(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,

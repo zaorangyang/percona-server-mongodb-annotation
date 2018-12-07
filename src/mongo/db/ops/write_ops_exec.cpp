@@ -41,6 +41,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/curop_metrics.h"
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/update.h"
@@ -82,10 +83,13 @@ namespace mongo {
 // single type of operation are static functions defined above their caller.
 namespace {
 
-MONGO_FP_DECLARE(failAllInserts);
-MONGO_FP_DECLARE(failAllUpdates);
-MONGO_FP_DECLARE(failAllRemoves);
-MONGO_FP_DECLARE(hangDuringBatchInsert);
+MONGO_FAIL_POINT_DEFINE(failAllInserts);
+MONGO_FAIL_POINT_DEFINE(failAllUpdates);
+MONGO_FAIL_POINT_DEFINE(failAllRemoves);
+MONGO_FAIL_POINT_DEFINE(hangBeforeChildRemoveOpFinishes);
+MONGO_FAIL_POINT_DEFINE(hangBeforeChildRemoveOpIsPopped);
+MONGO_FAIL_POINT_DEFINE(hangAfterAllChildRemoveOpsArePopped);
+MONGO_FAIL_POINT_DEFINE(hangDuringBatchInsert);
 
 void updateRetryStats(OperationContext* opCtx, bool containsRetry) {
     if (containsRetry) {
@@ -120,24 +124,10 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
         const bool shouldSample =
             curOp->completeAndLogOperation(opCtx, MONGO_LOG_DEFAULT_COMPONENT);
 
-        auto session = OperationContextSession::get(opCtx);
         if (curOp->shouldDBProfile(shouldSample)) {
-            boost::optional<Session::TxnResources> txnResources;
-            if (session && session->inSnapshotReadOrMultiDocumentTransaction()) {
-                // Stash the current transaction so that writes to the profile collection are not
-                // done as part of the transaction. This must be done under the client lock, since
-                // we are modifying 'opCtx'.
-                stdx::lock_guard<Client> clientLock(*opCtx->getClient());
-                txnResources = Session::TxnResources(opCtx);
-            }
-            ON_BLOCK_EXIT([&] {
-                if (txnResources) {
-                    // Restore the transaction state onto 'opCtx'. This must be done under the
-                    // client lock, since we are modifying 'opCtx'.
-                    stdx::lock_guard<Client> clientLock(*opCtx->getClient());
-                    txnResources->release(opCtx);
-                }
-            });
+            // Stash the current transaction so that writes to the profile collection are not
+            // done as part of the transaction.
+            Session::SideTransactionBlock sideTxn(opCtx);
             profile(opCtx, CurOp::get(opCtx)->getNetworkOp());
         }
     } catch (const DBException& ex) {
@@ -200,8 +190,8 @@ void assertCanWrite_inlock(OperationContext* opCtx, const NamespaceString& ns) {
 
 void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
     auto session = OperationContextSession::get(opCtx);
-    auto inTransaction = session && session->inSnapshotReadOrMultiDocumentTransaction();
-    uassert(ErrorCodes::NamespaceNotFound,
+    auto inTransaction = session && session->inMultiDocumentTransaction();
+    uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot create namespace " << ns.ns()
                           << " in multi-document transaction.",
             !inTransaction);
@@ -212,7 +202,10 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
         if (!db.getDb()->getCollection(opCtx, ns)) {  // someone else may have beat us to it.
             uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
             WriteUnitOfWork wuow(opCtx);
-            uassertStatusOK(Database::userCreateNS(opCtx, db.getDb(), ns.ns(), BSONObj()));
+            CollectionOptions collectionOptions;
+            uassertStatusOK(
+                collectionOptions.parse(BSONObj(), CollectionOptions::ParseKind::parseForCommand));
+            uassertStatusOK(Database::userCreateNS(opCtx, db.getDb(), ns.ns(), collectionOptions));
             wuow.commit();
         }
     });
@@ -235,7 +228,7 @@ bool handleError(OperationContext* opCtx,
     }
 
     auto session = OperationContextSession::get(opCtx);
-    if (session && session->inSnapshotReadOrMultiDocumentTransaction()) {
+    if (session && session->inMultiDocumentTransaction()) {
         // If we are in a transaction, we must fail the whole batch.
         throw;
     }
@@ -252,10 +245,6 @@ bool handleError(OperationContext* opCtx,
         return false;
     } else if (auto cannotImplicitCreateCollInfo =
                    ex.extraInfo<CannotImplicitlyCreateCollectionInfo>()) {
-        // Don't try doing more ops since they will fail with the same error.
-        // Command reply serializer will handle repeating this error if needed.
-        out->results.emplace_back(ex.toStatus());
-
         if (ShardingState::get(opCtx)->enabled()) {
             // Ignore status since we already put the cannot implicitly create error as the
             // result of the write.
@@ -263,6 +252,9 @@ bool handleError(OperationContext* opCtx,
                 .ignore();
         }
 
+        // Don't try doing more ops since they will fail with the same error.
+        // Command reply serializer will handle repeating this error if needed.
+        out->results.emplace_back(ex.toStatus());
         return false;
     }
 
@@ -298,7 +290,7 @@ SingleWriteResult createIndex(OperationContext* opCtx,
     // Unlike normal inserts, it is not an error to "insert" a duplicate index.
     long long n =
         cmdResult["numIndexesAfter"].numberInt() - cmdResult["numIndexesBefore"].numberInt();
-    CurOp::get(opCtx)->debug().ninserted += n;
+    CurOp::get(opCtx)->debug().additiveMetrics.incrementNinserted(n);
 
     SingleWriteResult result;
     result.setN(n);
@@ -362,8 +354,7 @@ void insertDocuments(OperationContext* opCtx,
         }
     }
 
-    uassertStatusOK(collection->insertDocuments(
-        opCtx, begin, end, &CurOp::get(opCtx)->debug(), /*enforceQuota*/ true));
+    uassertStatusOK(collection->insertDocuments(opCtx, begin, end, &CurOp::get(opCtx)->debug()));
     wuow.commit();
 }
 
@@ -418,14 +409,20 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
             result.setN(1);
 
             std::fill_n(std::back_inserter(out->results), batch.size(), std::move(result));
-            curOp.debug().ninserted += batch.size();
+            curOp.debug().additiveMetrics.incrementNinserted(batch.size());
             return true;
         }
     } catch (const DBException&) {
-        collection.reset();
 
-        // Ignore this failure and behave as-if we never tried to do the combined batch insert.
-        // The loop below will handle reporting any non-transient errors.
+        // If we cannot abandon the current snapshot, we give up and rethrow the exception.
+        // No WCE retrying is attempted.  This code path is intended for snapshot read concern.
+        if (opCtx->lockState()->inAWriteUnitOfWork()) {
+            throw;
+        }
+
+        // Otherwise, ignore this failure and behave as-if we never tried to do the combined batch
+        // insert.  The loop below will handle reporting any non-transient errors.
+        collection.reset();
     }
 
     // Try to insert the batch one-at-a-time. This path is executed both for singular batches, and
@@ -443,7 +440,7 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
                     SingleWriteResult result;
                     result.setN(1);
                     out->results.emplace_back(std::move(result));
-                    curOp.debug().ninserted++;
+                    curOp.debug().additiveMetrics.incrementNinserted(1);
                 } catch (...) {
                     // Release the lock following any error if we are not in multi-statement
                     // transaction. Among other things, this ensures that we don't sleep in the WCE
@@ -481,11 +478,11 @@ SingleWriteResult makeWriteResultForInsertOrDeleteRetry() {
 }  // namespace
 
 WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& wholeOp) {
-    // Insert performs its own retries, so we should only be within a WriteUnitOfWork when run under
-    // snapshot read concern or in a transaction.
+    // Insert performs its own retries, so we should only be within a WriteUnitOfWork when run in a
+    // transaction.
     auto session = OperationContextSession::get(opCtx);
     invariant(!opCtx->lockState()->inAWriteUnitOfWork() ||
-              (session && session->inSnapshotReadOrMultiDocumentTransaction()));
+              (session && session->inMultiDocumentTransaction()));
     auto& curOp = *CurOp::get(opCtx);
     ON_BLOCK_EXIT([&] {
         // This is the only part of finishCurOp we need to do for inserts because they reuse the
@@ -507,7 +504,7 @@ WriteResult performInserts(OperationContext* opCtx, const write_ops::Insert& who
         curOp.setNS_inlock(wholeOp.getNamespace().ns());
         curOp.setLogicalOp_inlock(LogicalOp::opInsert);
         curOp.ensureStarted();
-        curOp.debug().ninserted = 0;
+        curOp.debug().additiveMetrics.ninserted = 0;
     }
 
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
@@ -686,11 +683,11 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
 }
 
 WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& wholeOp) {
-    // Update performs its own retries, so we should not be in a WriteUnitOfWork unless run under
-    // snapshot read concern or in a transaction.
+    // Update performs its own retries, so we should not be in a WriteUnitOfWork unless run in a
+    // transaction.
     auto session = OperationContextSession::get(opCtx);
     invariant(!opCtx->lockState()->inAWriteUnitOfWork() ||
-              (session && session->inSnapshotReadOrMultiDocumentTransaction()));
+              (session && session->inMultiDocumentTransaction()));
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
     DisableDocumentValidationIfTrue docValidationDisabler(
@@ -764,7 +761,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         curOp.ensureStarted();
     }
 
-    curOp.debug().ndeleted = 0;
+    curOp.debug().additiveMetrics.ndeleted = 0;
 
     DeleteRequest request(ns);
     request.setQuery(op.getQ());
@@ -804,7 +801,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
 
     uassertStatusOK(exec->executePlan());
     long long n = DeleteStage::getNumDeleted(*exec);
-    curOp.debug().ndeleted = n;
+    curOp.debug().additiveMetrics.ndeleted = n;
 
     PlanSummaryStats summary;
     Explain::getSummaryStats(*exec, &summary);
@@ -831,7 +828,7 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
     // transaction.
     auto session = OperationContextSession::get(opCtx);
     invariant(!opCtx->lockState()->inAWriteUnitOfWork() ||
-              (session && session->inSnapshotReadOrMultiDocumentTransaction()));
+              (session && session->inMultiDocumentTransaction()));
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
     DisableDocumentValidationIfTrue docValidationDisabler(
@@ -866,7 +863,17 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             curOp.setCommand_inlock(cmd);
         }
-        ON_BLOCK_EXIT([&] { finishCurOp(opCtx, &curOp); });
+        ON_BLOCK_EXIT([&] {
+            if (MONGO_FAIL_POINT(hangBeforeChildRemoveOpFinishes)) {
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &hangBeforeChildRemoveOpFinishes, opCtx, "hangBeforeChildRemoveOpFinishes");
+            }
+            finishCurOp(opCtx, &curOp);
+            if (MONGO_FAIL_POINT(hangBeforeChildRemoveOpIsPopped)) {
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &hangBeforeChildRemoveOpIsPopped, opCtx, "hangBeforeChildRemoveOpIsPopped");
+            }
+        });
         try {
             lastOpFixer.startingOp();
             out.results.emplace_back(
@@ -878,6 +885,11 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
             if (!canContinue)
                 break;
         }
+    }
+
+    if (MONGO_FAIL_POINT(hangAfterAllChildRemoveOpsArePopped)) {
+        CurOpFailpointHelpers::waitWhileFailPointEnabled(
+            &hangAfterAllChildRemoveOpsArePopped, opCtx, "hangAfterAllChildRemoveOpsArePopped");
     }
 
     return out;

@@ -32,6 +32,7 @@
 
 #include "mongo/s/client/version_manager.h"
 
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog_cache.h"
@@ -309,7 +310,7 @@ bool checkShardVersion(OperationContext* opCtx,
                                      << shard->getConnString().toString()
                                      << ")");
 
-            uasserted(StaleConfigInfo(ns, refVersion, currentVersion), msg);
+            uasserted(StaleConfigInfo(nss, refVersion, currentVersion), msg);
         }
     } else if (refManager) {
         string msg(str::stream() << "not sharded (" << (!manager ? string("<none>") : str::stream()
@@ -324,7 +325,7 @@ bool checkShardVersion(OperationContext* opCtx,
                                  << ")");
 
         uasserted(
-            StaleConfigInfo(ns, refManager->getVersion(shard->getId()), ChunkVersion::UNSHARDED()),
+            StaleConfigInfo(nss, refManager->getVersion(shard->getId()), ChunkVersion::UNSHARDED()),
             msg);
     }
 

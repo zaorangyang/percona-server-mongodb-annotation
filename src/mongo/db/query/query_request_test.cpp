@@ -39,7 +39,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_request.h"
 #include "mongo/db/query/query_request.h"
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -133,24 +133,6 @@ TEST(QueryRequestTest, ZeroNToReturn) {
 TEST(QueryRequestTest, PositiveNToReturn) {
     QueryRequest qr(testns);
     qr.setNToReturn(1);
-    ASSERT_OK(qr.validate());
-}
-
-TEST(QueryRequestTest, NegativeMaxScan) {
-    QueryRequest qr(testns);
-    qr.setMaxScan(-1);
-    ASSERT_NOT_OK(qr.validate());
-}
-
-TEST(QueryRequestTest, ZeroMaxScan) {
-    QueryRequest qr(testns);
-    qr.setMaxScan(0);
-    ASSERT_OK(qr.validate());
-}
-
-TEST(QueryRequestTest, PositiveMaxScan) {
-    QueryRequest qr(testns);
-    qr.setMaxScan(1);
     ASSERT_OK(qr.validate());
 }
 
@@ -365,8 +347,7 @@ TEST(QueryRequestTest, ParseFromCommandWithOptions) {
         "filter: {a: 3},"
         "sort: {a: 1},"
         "projection: {_id: 0, a: 1},"
-        "showRecordId: true,"
-        "maxScan: 1000}}");
+        "showRecordId: true}}");
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     unique_ptr<QueryRequest> qr(
@@ -374,7 +355,6 @@ TEST(QueryRequestTest, ParseFromCommandWithOptions) {
 
     // Make sure the values from the command BSON are reflected in the QR.
     ASSERT(qr->showRecordId());
-    ASSERT_EQUALS(1000, qr->getMaxScan());
 }
 
 TEST(QueryRequestTest, ParseFromCommandHintAsString) {
@@ -622,18 +602,6 @@ TEST(QueryRequestTest, ParseFromCommandUnwrappedReadPrefWrongType) {
         "{find: 'testns',"
         "filter:  {a: 1},"
         "$queryOptions: 1}");
-    const NamespaceString nss("test.testns");
-    bool isExplain = false;
-    auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
-    ASSERT_NOT_OK(result.getStatus());
-}
-
-TEST(QueryRequestTest, ParseFromCommandMaxScanWrongType) {
-    BSONObj cmdObj = fromjson(
-        "{find: 'testns',"
-        "filter:  {a: 1},"
-        "maxScan: true,"
-        "comment: 'foo'}");
     const NamespaceString nss("test.testns");
     bool isExplain = false;
     auto result = QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain);
@@ -991,7 +959,6 @@ TEST(QueryRequestTest, DefaultQueryParametersCorrect) {
     ASSERT_EQUALS(true, qr->wantMore());
     ASSERT_FALSE(qr->getNToReturn());
     ASSERT_EQUALS(false, qr->isExplain());
-    ASSERT_EQUALS(0, qr->getMaxScan());
     ASSERT_EQUALS(0, qr->getMaxTimeMS());
     ASSERT_EQUALS(false, qr->returnKey());
     ASSERT_EQUALS(false, qr->showRecordId());
@@ -1132,12 +1099,6 @@ TEST(QueryRequestTest, ConvertToAggregationWithNoWantMoreLimitOneSucceeds) {
     qr.setWantMore(false);
     qr.setLimit(1);
     ASSERT_OK(qr.asAggregationCommand());
-}
-
-TEST(QueryRequestTest, ConvertToAggregationWithMaxScanFails) {
-    QueryRequest qr(testns);
-    qr.setMaxScan(7);
-    ASSERT_NOT_OK(qr.asAggregationCommand());
 }
 
 TEST(QueryRequestTest, ConvertToAggregationWithReturnKeyFails) {
@@ -1311,8 +1272,7 @@ TEST(QueryRequestTest, ParseFromLegacyQuery) {
             $hint: {hint: 1},
             $explain: false,
             $min: {x: 'min'},
-            $max: {x: 'max'},
-            $maxScan: 7
+            $max: {x: 'max'}
          })");
     const NamespaceString nss("test.testns");
     unique_ptr<QueryRequest> qr(assertGet(QueryRequest::fromLegacyQuery(
@@ -1329,7 +1289,6 @@ TEST(QueryRequestTest, ParseFromLegacyQuery) {
     ASSERT_EQ(qr->getNToReturn(), boost::optional<long long>(kNToReturn));
     ASSERT_EQ(qr->wantMore(), true);
     ASSERT_EQ(qr->isExplain(), false);
-    ASSERT_EQ(qr->getMaxScan(), 7);
     ASSERT_EQ(qr->isSlaveOk(), false);
     ASSERT_EQ(qr->isOplogReplay(), false);
     ASSERT_EQ(qr->isNoCursorTimeout(), false);
@@ -1363,20 +1322,19 @@ TEST(QueryRequestTest, ParseFromLegacyQueryTooNegativeNToReturn) {
             .getStatus());
 }
 
-TEST(QueryRequestTest, ParseFromUUID) {
-    ServiceContextNoop service;
-    auto client = service.makeClient("test");
-    auto opCtxNoop = client->makeOperationContext();
-    auto opCtx = opCtxNoop.get();
+class QueryRequestTest : public ServiceContextTest {};
+
+TEST_F(QueryRequestTest, ParseFromUUID) {
+    auto opCtx = makeOperationContext();
     // Register a UUID/Collection pair in the UUIDCatalog.
     const CollectionUUID uuid = UUID::gen();
     const NamespaceString nss("test.testns");
     Collection coll(stdx::make_unique<CollectionMock>(nss));
-    UUIDCatalog& catalog = UUIDCatalog::get(opCtx);
-    catalog.onCreateCollection(opCtx, &coll, uuid);
+    UUIDCatalog& catalog = UUIDCatalog::get(opCtx.get());
+    catalog.onCreateCollection(opCtx.get(), &coll, uuid);
     QueryRequest qr(uuid);
     // Ensure a call to refreshNSS succeeds.
-    qr.refreshNSS(opCtx);
+    qr.refreshNSS(opCtx.get());
     ASSERT_EQ(nss, qr.nss());
 }
 

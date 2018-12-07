@@ -56,14 +56,20 @@ public:
 
     virtual const char* name() const;
 
+    const std::string& getIdent() const override {
+        return ns();
+    }
+
     virtual RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const;
 
     virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const;
 
     virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl);
 
-    virtual StatusWith<RecordId> insertRecord(
-        OperationContext* opCtx, const char* data, int len, Timestamp, bool enforceQuota);
+    virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
+                                              const char* data,
+                                              int len,
+                                              Timestamp);
 
     virtual Status insertRecordsWithDocWriter(OperationContext* opCtx,
                                               const DocWriter* const* docs,
@@ -75,7 +81,6 @@ public:
                                 const RecordId& oldLocation,
                                 const char* data,
                                 int len,
-                                bool enforceQuota,
                                 UpdateNotifier* notifier);
 
     virtual bool updateWithDamagesSupported() const;
@@ -105,7 +110,7 @@ public:
 
     virtual Status touch(OperationContext* opCtx, BSONObjBuilder* output) const;
 
-    virtual void increaseStorageSize(OperationContext* opCtx, int size, bool enforceQuota);
+    virtual void increaseStorageSize(OperationContext* opCtx, int size);
 
     virtual int64_t storageSize(OperationContext* opCtx,
                                 BSONObjBuilder* extraInfo = NULL,

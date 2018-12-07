@@ -37,7 +37,6 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/simple_bsonelement_comparator.h"
-#include "mongo/client/dbclientinterface.h"  // For QueryOption_foobar
 #include "mongo/db/bson/dotted_path_support.h"
 #include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/matcher/expression_geo.h"
@@ -502,7 +501,7 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
 
     // Use the cached index assignments to build solnRoot.
     std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::buildIndexedDataAccess(
-        query, clone.release(), false, params.indices, params));
+        query, std::move(clone), params.indices, params));
 
     if (!solnRoot) {
         return Status(ErrorCodes::BadValue,
@@ -824,15 +823,15 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
         PlanEnumerator isp(enumParams);
         isp.init().transitional_ignore();
 
-        unique_ptr<MatchExpression> rawTree;
-        while ((rawTree = isp.getNext()) && (out.size() < params.maxIndexedSolutions)) {
+        unique_ptr<MatchExpression> nextTaggedTree;
+        while ((nextTaggedTree = isp.getNext()) && (out.size() < params.maxIndexedSolutions)) {
             LOG(5) << "About to build solntree from tagged tree:" << endl
-                   << redact(rawTree.get()->toString());
+                   << redact(nextTaggedTree->toString());
 
             // Store the plan cache index tree before calling prepareForAccessingPlanning(), so that
             // the PlanCacheIndexTree has the same sort as the MatchExpression used to generate the
             // plan cache key.
-            std::unique_ptr<MatchExpression> clone(rawTree.get()->shallowClone());
+            std::unique_ptr<MatchExpression> clone(nextTaggedTree->shallowClone());
             std::unique_ptr<PlanCacheIndexTree> cacheData;
             auto statusWithCacheData = cacheDataFromTaggedTree(clone.get(), relevantIndices);
             if (!statusWithCacheData.isOK()) {
@@ -844,11 +843,11 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
 
             // We have already cached the tree in canonical order, so now we can order the nodes for
             // access planning.
-            prepareForAccessPlanning(rawTree.get());
+            prepareForAccessPlanning(nextTaggedTree.get());
 
             // This can fail if enumeration makes a mistake.
             std::unique_ptr<QuerySolutionNode> solnRoot(QueryPlannerAccess::buildIndexedDataAccess(
-                query, rawTree.release(), false, relevantIndices, params));
+                query, std::move(nextTaggedTree), relevantIndices, params));
 
             if (!solnRoot) {
                 continue;

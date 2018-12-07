@@ -69,6 +69,9 @@ using DiskUseRequirement = DocumentSource::StageConstraints::DiskUseRequirement;
 using FacetRequirement = DocumentSource::StageConstraints::FacetRequirement;
 using StreamType = DocumentSource::StageConstraints::StreamType;
 
+constexpr MatchExpressionParser::AllowedFeatureSet Pipeline::kAllowedMatcherFeatures;
+constexpr MatchExpressionParser::AllowedFeatureSet Pipeline::kGeoNearMatcherFeatures;
+
 Pipeline::Pipeline(const intrusive_ptr<ExpressionContext>& pTheCtx) : pCtx(pTheCtx) {}
 
 Pipeline::Pipeline(SourceContainer stages, const intrusive_ptr<ExpressionContext>& expCtx)
@@ -228,10 +231,9 @@ void Pipeline::validateCommon() const {
                 str::stream() << stage->getSourceName() << " can only be run on mongoS",
                 !(constraints.hostRequirement == HostTypeRequirement::kMongoS && !pCtx->inMongos));
 
-        if (pCtx->inSnapshotReadOrMultiDocumentTransaction) {
-            uassert(50742,
-                    str::stream() << "Stage not supported with readConcern level \"snapshot\" "
-                                     "or inside of a multi-document transaction: "
+        if (pCtx->inMultiDocumentTransaction) {
+            uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                    str::stream() << "Stage not supported inside of a multi-document transaction: "
                                   << stage->getSourceName(),
                     constraints.isAllowedInTransaction());
         }
@@ -485,11 +487,11 @@ DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAva
     bool knowAllMeta = false;
     for (auto&& source : _sources) {
         DepsTracker localDeps(deps.getMetadataAvailable());
-        DocumentSource::GetDepsReturn status = source->getDependencies(&localDeps);
+        DepsTracker::State status = source->getDependencies(&localDeps);
 
         deps.vars.insert(localDeps.vars.begin(), localDeps.vars.end());
 
-        if ((skipFieldsAndMetadataDeps |= (status == DocumentSource::NOT_SUPPORTED))) {
+        if ((skipFieldsAndMetadataDeps |= (status == DepsTracker::State::NOT_SUPPORTED))) {
             // Assume this stage needs everything. We may still know something about our
             // dependencies if an earlier stage returned EXHAUSTIVE_FIELDS or EXHAUSTIVE_META. If
             // this scope has variables, we need to keep enumerating the remaining stages but will
@@ -505,17 +507,14 @@ DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAva
             deps.fields.insert(localDeps.fields.begin(), localDeps.fields.end());
             if (localDeps.needWholeDocument)
                 deps.needWholeDocument = true;
-            knowAllFields = status & DocumentSource::EXHAUSTIVE_FIELDS;
+            knowAllFields = status & DepsTracker::State::EXHAUSTIVE_FIELDS;
         }
 
         if (!knowAllMeta) {
-            if (localDeps.getNeedTextScore())
-                deps.setNeedTextScore(true);
-
-            if (localDeps.getNeedSortKey())
-                deps.setNeedSortKey(true);
-
-            knowAllMeta = status & DocumentSource::EXHAUSTIVE_META;
+            for (auto&& req : localDeps.getAllRequiredMetadataTypes()) {
+                deps.setNeedsMetadata(req, true);
+            }
+            knowAllMeta = status & DepsTracker::State::EXHAUSTIVE_META;
         }
 
         // If there are variables defined at this pipeline's scope, there may be dependencies upon
@@ -531,11 +530,12 @@ DepsTracker Pipeline::getDependencies(DepsTracker::MetadataAvailable metadataAva
     if (metadataAvailable & DepsTracker::MetadataAvailable::kTextScore) {
         // If there is a text score, assume we need to keep it if we can't prove we don't. If we are
         // the first half of a pipeline which has been split, future stages might need it.
-        if (!knowAllMeta)
-            deps.setNeedTextScore(true);
+        if (!knowAllMeta) {
+            deps.setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, true);
+        }
     } else {
         // If there is no text score available, then we don't need to ask for it.
-        deps.setNeedTextScore(false);
+        deps.setNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE, false);
     }
 
     return deps;

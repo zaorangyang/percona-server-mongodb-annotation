@@ -124,7 +124,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
         new MongoRunner.VersionSub(extractMajorVersionFromVersionString(shellVersion()),
                                    shellVersion()),
         // To-be-updated when we branch for the next release.
-        new MongoRunner.VersionSub("last-stable", "3.6")
+        new MongoRunner.VersionSub("last-stable", "4.0")
     ];
 
     MongoRunner.getBinVersionFor = function(version) {
@@ -238,7 +238,6 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
         noReplSet: true,
         forgetPort: true,
         arbiter: true,
-        noJournalPrealloc: true,
         noJournal: true,
         binVersion: true,
         waitForConnect: true,
@@ -361,11 +360,6 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
 
                 if (!o.binVersion)
                     return true;
-
-                // Version 1.x options
-                if (o.binVersion.startsWith("1.")) {
-                    return ["nopreallocj"].indexOf(option) < 0;
-                }
 
                 return true;
             };
@@ -580,7 +574,6 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
      *     useLogFiles {boolean}: use with logFile option.
      *     logFile {string}: path to the log file. If not specified and useLogFiles
      *       is true, automatically creates a log file inside dbpath.
-     *     noJournalPrealloc {boolean}
      *     noJournal {boolean}
      *     keyFile
      *     replSet
@@ -608,9 +601,6 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
         if (opts.logFile !== undefined) {
             opts.logpath = opts.logFile;
         }
-
-        if (jsTestOptions().noJournalPrealloc || opts.noJournalPrealloc)
-            opts.nopreallocj = "";
 
         if ((jsTestOptions().noJournal || opts.noJournal) && !('journal' in opts) &&
             !('configsvr' in opts)) {
@@ -1071,12 +1061,17 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                         .length > 0);
         }
 
+        function argArrayContainsSetParameterValue(value) {
+            assert(value.endsWith("="),
+                   "Expected value argument to be of the form <parameterName>=");
+            return argArray.some(function(el) {
+                return typeof el === "string" && el.startsWith(value);
+            });
+        }
+
         // programName includes the version, e.g., mongod-3.2.
         // baseProgramName is the program name without any version information, e.g., mongod.
         let programName = argArray[0];
-
-        // Object containing log component levels for the "logComponentVerbosity" parameter
-        let logComponentVerbosity = {};
 
         let [baseProgramName, programVersion] = programName.split("-");
         let programMajorMinorVersion = 0;
@@ -1088,22 +1083,9 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
         if (baseProgramName === 'mongod' || baseProgramName === 'mongos') {
             if (jsTest.options().enableTestCommands) {
                 argArray.push(...['--setParameter', "enableTestCommands=1"]);
-                if (!programVersion || programMajorMinorVersion >= 303) {
-                    if (!argArrayContains("logComponentVerbosity")) {
-                        logComponentVerbosity["tracking"] = 0;
-                    }
-                }
             }
             if (jsTest.options().authMechanism && jsTest.options().authMechanism != "SCRAM-SHA-1") {
-                var hasAuthMechs = false;
-                for (var i in argArray) {
-                    if (typeof argArray[i] === 'string' &&
-                        argArray[i].indexOf('authenticationMechanisms') != -1) {
-                        hasAuthMechs = true;
-                        break;
-                    }
-                }
-                if (!hasAuthMechs) {
+                if (!argArrayContainsSetParameterValue('authenticationMechanisms=')) {
                     argArray.push(
                         ...['--setParameter',
                             "authenticationMechanisms=" + jsTest.options().authMechanism]);
@@ -1114,8 +1096,7 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
             }
 
             // New options in 3.5.x
-            if (!programVersion || (parseInt(programVersion.split(".")[0]) >= 3 &&
-                                    parseInt(programVersion.split(".")[1]) >= 5)) {
+            if (!programMajorMinorVersion || programMajorMinorVersion >= 305) {
                 if (jsTest.options().serviceExecutor) {
                     if (!argArrayContains("--serviceExecutor")) {
                         argArray.push(...["--serviceExecutor", jsTest.options().serviceExecutor]);
@@ -1154,15 +1135,22 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                     }
                 }
 
-                // TODO: Make this unconditional in 3.8.
-                if (!programMajorMinorVersion || programMajorMinorVersion > 304) {
-                    let hasParam = false;
-                    for (let arg of argArray) {
-                        if (typeof arg === 'string' && arg.startsWith('orphanCleanupDelaySecs=')) {
-                            hasParam = true;
+                // New mongod-specific options in 4.0.x
+                if (!programMajorMinorVersion || programMajorMinorVersion >= 400) {
+                    if (jsTest.options().transactionLifetimeLimitSeconds !== undefined) {
+                        if (!argArrayContainsSetParameterValue(
+                                "transactionLifetimeLimitSeconds=")) {
+                            argArray.push(
+                                ...["--setParameter",
+                                    "transactionLifetimeLimitSeconds=" +
+                                        jsTest.options().transactionLifetimeLimitSeconds]);
                         }
                     }
-                    if (!hasParam) {
+                }
+
+                // TODO: Make this unconditional in 3.8.
+                if (!programMajorMinorVersion || programMajorMinorVersion > 304) {
+                    if (!argArrayContainsSetParameterValue('orphanCleanupDelaySecs=')) {
                         argArray.push(...['--setParameter', 'orphanCleanupDelaySecs=1']);
                     }
                 }
@@ -1170,26 +1158,25 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                 // Since options may not be backward compatible, mongod options are not
                 // set on older versions, e.g., mongod-3.0.
                 if (programName.endsWith('mongod')) {
-                    // Enable heartbeat logging for replica set nodes.
-                    if (!argArrayContains("logComponentVerbosity")) {
-                        logComponentVerbosity["replication"] = {"heartbeats": 2, "rollback": 2};
-                    }
-
                     if (jsTest.options().storageEngine === "wiredTiger" ||
                         !jsTest.options().storageEngine) {
-                        if (jsTest.options().storageEngineCacheSizeGB) {
+                        if (jsTest.options().storageEngineCacheSizeGB &&
+                            !argArrayContains('--wiredTigerCacheSizeGB')) {
                             argArray.push(...['--wiredTigerCacheSizeGB',
                                               jsTest.options().storageEngineCacheSizeGB]);
                         }
-                        if (jsTest.options().wiredTigerEngineConfigString) {
+                        if (jsTest.options().wiredTigerEngineConfigString &&
+                            !argArrayContains('--wiredTigerEngineConfigString')) {
                             argArray.push(...['--wiredTigerEngineConfigString',
                                               jsTest.options().wiredTigerEngineConfigString]);
                         }
-                        if (jsTest.options().wiredTigerCollectionConfigString) {
+                        if (jsTest.options().wiredTigerCollectionConfigString &&
+                            !argArrayContains('--wiredTigerCollectionConfigString')) {
                             argArray.push(...['--wiredTigerCollectionConfigString',
                                               jsTest.options().wiredTigerCollectionConfigString]);
                         }
-                        if (jsTest.options().wiredTigerIndexConfigString) {
+                        if (jsTest.options().wiredTigerIndexConfigString &&
+                            !argArrayContains('--wiredTigerIndexConfigString')) {
                             argArray.push(...['--wiredTigerIndexConfigString',
                                               jsTest.options().wiredTigerIndexConfigString]);
                         }
@@ -1199,24 +1186,27 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
                                               jsTest.options().storageEngineCacheSizeGB]);
                         }
                     }
-                    // apply setParameters for mongod
+                    // apply setParameters for mongod. The 'setParameters' field should be given as
+                    // a plain JavaScript object, where each key is a parameter name and the value
+                    // is the value to set for that parameter.
                     if (jsTest.options().setParameters) {
-                        var params = jsTest.options().setParameters.split(",");
-                        if (params && params.length > 0) {
-                            params.forEach(function(p) {
-                                if (p)
-                                    argArray.push(...['--setParameter', p]);
-                            });
+                        let params = jsTest.options().setParameters;
+                        for (let paramName of Object.keys(params)) {
+                            // Only set the 'logComponentVerbosity' parameter if it has not already
+                            // been specified in the given argument array. This means that any
+                            // 'logComponentVerbosity' settings passed through via TestData will
+                            // always be overridden by settings passed directly to MongoRunner from
+                            // within the shell.
+                            if (paramName === "logComponentVerbosity" &&
+                                argArrayContains("logComponentVerbosity")) {
+                                continue;
+                            }
+                            const paramVal = params[paramName];
+                            const setParamStr = paramName + "=" + JSON.stringify(paramVal);
+                            argArray.push(...['--setParameter', setParamStr]);
                         }
                     }
                 }
-            }
-
-            // Add any enabled log components.
-            if (Object.keys(logComponentVerbosity).length > 0) {
-                argArray.push(
-                    ...['--setParameter',
-                        "logComponentVerbosity=" + JSON.stringify(logComponentVerbosity)]);
             }
         }
 

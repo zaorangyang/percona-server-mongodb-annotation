@@ -38,7 +38,7 @@
 namespace mongo {
 namespace {
 
-MONGO_FP_DECLARE(setAutoGetCollectionWait);
+MONGO_FAIL_POINT_DEFINE(setAutoGetCollectionWait);
 
 void uassertLockTimeout(std::string resourceName,
                         LockMode lockMode,
@@ -182,6 +182,16 @@ AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx,
     }
 
     DatabaseShardingState::get(_db).checkDbVersion(opCtx);
+}
+
+ConcealUUIDCatalogChangesBlock::ConcealUUIDCatalogChangesBlock(OperationContext* opCtx)
+    : _opCtx(opCtx) {
+    UUIDCatalog::get(_opCtx).onCloseCatalog(_opCtx);
+}
+
+ConcealUUIDCatalogChangesBlock::~ConcealUUIDCatalogChangesBlock() {
+    invariant(_opCtx);
+    UUIDCatalog::get(_opCtx).onOpenCatalog(_opCtx);
 }
 
 }  // namespace mongo

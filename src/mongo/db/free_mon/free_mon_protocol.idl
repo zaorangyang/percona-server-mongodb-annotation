@@ -41,6 +41,9 @@ structs:
             description: "Existing Registration Id"
             type: string
             optional: true
+          localTime:
+            description: "Local time at registration send"
+            type: date
           tags:
             description: "Tags"
             type: array<string>
@@ -82,6 +85,9 @@ structs:
           id:
             description: "Registration Id"
             type: string
+          localTime:
+            description: "Local time at metrics send"
+            type: date
           encoding:
             description: "Compression Encoding"
             type: MetricsEncoding
@@ -89,7 +95,10 @@ structs:
             description: "Metrics Blob"
             type: bindata_generic
 
-            
+    # History
+    # -------
+    # Version 2 - added resendRegistration bool
+    #
     FreeMonMetricsResponse:
         description: "Metrics Response from Cloud Server"
         fields: 
@@ -120,4 +129,8 @@ structs:
           userReminder:
             description: "Message to display to user to remind them about service"
             type: string
+            optional: true
+          resendRegistration:
+            description: "If true, resend registration to server"
+            type: bool
             optional: true

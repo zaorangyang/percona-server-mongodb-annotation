@@ -17,6 +17,15 @@ load("jstests/free_mon/libs/free_mon.js");
     const conn = MongoRunner.runMongod(options);
     assert.neq(null, conn, 'mongod was unable to start up');
 
+    // Wait an arbitrary amount of time to allow the processor loop to start.
+    sleep(10 * 1000);
+
+    // Then verify that no registrations happened since we haven't runtime enabled yed.
+    assert.eq('undecided',
+              conn.getDB('admin').getFreeMonitoringStatus().state,
+              "Initial state should be 'undecided'");
+    assert.eq(0, mock_web.queryStats().registers, "mongod registered without enabling free_mod");
+
     assert.commandWorked(conn.adminCommand({setFreeMonitoring: 1, action: "enable"}));
 
     // The command should either timeout or suceed after registration is complete
@@ -32,7 +41,7 @@ load("jstests/free_mon/libs/free_mon.js");
     const last_register = mock_web.query("last_register");
     print(tojson(last_register));
 
-    assert.eq(last_register.version, 1);
+    assert.eq(last_register.version, 2);
     assert.eq(last_register.payload.buildInfo.bits, 64);
     assert.eq(last_register.payload.buildInfo.ok, 1);
     assert.eq(last_register.payload.storageEngine.readOnly, false);
@@ -43,7 +52,7 @@ load("jstests/free_mon/libs/free_mon.js");
     const last_metrics = mock_web.query("last_metrics");
     print(tojson(last_metrics));
 
-    assert.eq(last_metrics.version, 1);
+    assert.eq(last_metrics.version, 2);
 
     assert.commandWorked(conn.adminCommand({setFreeMonitoring: 1, action: "disable"}));
 

@@ -145,7 +145,7 @@ void serializeReply(OperationContext* opCtx,
             error.append("code", int(ErrorCodes::StaleShardVersion));  // Different from exception!
             {
                 BSONObjBuilder errInfo(error.subobjStart("errInfo"));
-                staleInfo->getVersionWanted().addToBSON(errInfo, "vWanted");
+                staleInfo->serialize(&errInfo);
             }
         } else {
             error.append("code", int(status.code()));
@@ -225,19 +225,14 @@ private:
     // Customization point for 'run'.
     virtual void runImpl(OperationContext* opCtx, BSONObjBuilder& result) const = 0;
 
-    void run(OperationContext* opCtx, CommandReplyBuilder* result) final {
+    void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) final {
         try {
-            try {
-                _transactionChecks(opCtx);
-                BSONObjBuilder bob = result->getBodyBuilder();
-                runImpl(opCtx, bob);
-                CommandHelpers::extractOrAppendOk(bob);
-            } catch (const DBException& ex) {
-                LastError::get(opCtx->getClient()).setLastError(ex.code(), ex.reason());
-                throw;
-            }
-        } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
-            CommandHelpers::logAuthViolation(opCtx, this, *_request, ErrorCodes::Unauthorized);
+            _transactionChecks(opCtx);
+            BSONObjBuilder bob = result->getBodyBuilder();
+            runImpl(opCtx, bob);
+            CommandHelpers::extractOrAppendOk(bob);
+        } catch (const DBException& ex) {
+            LastError::get(opCtx->getClient()).setLastError(ex.code(), ex.reason());
             throw;
         }
     }
@@ -262,7 +257,7 @@ private:
 
     void _transactionChecks(OperationContext* opCtx) const {
         auto session = OperationContextSession::get(opCtx);
-        if (!session || !session->inSnapshotReadOrMultiDocumentTransaction())
+        if (!session || !session->inMultiDocumentTransaction())
             return;
         uassert(50791,
                 str::stream() << "Cannot write to system collection " << ns().toString()

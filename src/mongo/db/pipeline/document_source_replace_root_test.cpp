@@ -258,7 +258,8 @@ TEST_F(ReplaceRootBasics, OnlyDependentFieldIsNewRoot) {
     auto replaceRoot = createReplaceRoot(BSON("newRoot"
                                               << "$a.b"));
     DepsTracker dependencies;
-    ASSERT_EQUALS(DocumentSource::EXHAUSTIVE_FIELDS, replaceRoot->getDependencies(&dependencies));
+    ASSERT_EQUALS(DepsTracker::State::EXHAUSTIVE_FIELDS,
+                  replaceRoot->getDependencies(&dependencies));
 
     // Should only depend on field a.b
     ASSERT_EQUALS(1U, dependencies.fields.size());
@@ -268,7 +269,7 @@ TEST_F(ReplaceRootBasics, OnlyDependentFieldIsNewRoot) {
 
     // Should not need any other fields.
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(false, dependencies.getNeedTextScore());
+    ASSERT_EQUALS(false, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 TEST_F(ReplaceRootBasics, ReplaceRootModifiesAllFields) {

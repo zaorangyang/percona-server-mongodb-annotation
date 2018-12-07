@@ -32,6 +32,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/repl/optime_with.h"
+#include "mongo/db/s/config/namespace_serializer.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_database.h"
@@ -68,6 +69,7 @@ enum ShardDrainingStatus {
  */
 class ShardingCatalogManager {
     MONGO_DISALLOW_COPYING(ShardingCatalogManager);
+    friend class ConfigSvrShardCollectionCommand;
 
 public:
     ShardingCatalogManager(ServiceContext* serviceContext,
@@ -189,7 +191,6 @@ public:
     StatusWith<BSONObj> commitChunkMigration(OperationContext* opCtx,
                                              const NamespaceString& nss,
                                              const ChunkType& migratedChunk,
-                                             const boost::optional<ChunkType>& controlChunk,
                                              const OID& collectionEpoch,
                                              const ShardId& fromShard,
                                              const ShardId& toShard,
@@ -208,6 +209,14 @@ public:
      * Throws DatabaseDifferCase if the database already exists with a different case.
      */
     DatabaseType createDatabase(OperationContext* opCtx, const std::string& dbName);
+
+    /**
+     * Creates a ScopedLock on the database name in _namespaceSerializer. This is to prevent
+     * timeouts waiting on the dist lock if multiple threads attempt to create the same db.
+     */
+    auto serializeCreateDatabase(OperationContext* opCtx, StringData dbName) {
+        return _namespaceSerializer.lock(opCtx, dbName);
+    }
 
     /**
      * Creates the database if it does not exist, then marks its entry in config.databases as
@@ -288,6 +297,14 @@ public:
                           const NamespaceString& ns,
                           const CollectionOptions& options);
 
+    /**
+     * Creates a ScopedLock on the collection name in _namespaceSerializer. This is to prevent
+     * timeouts waiting on the dist lock if multiple threads attempt to create the same collection.
+     */
+    auto serializeCreateCollection(OperationContext* opCtx, const NamespaceString& ns) {
+        return _namespaceSerializer.lock(opCtx, ns.ns());
+    }
+
     //
     // Shard Operations
     //
@@ -326,14 +343,6 @@ public:
     //
 
     /**
-     * Returns a BSON representation of an update request that can be used to insert a shardIdentity
-     * doc into the shard for the given shardType (or update the shard's existing shardIdentity
-     * doc's configsvrConnString if the _id, shardName, and clusterId do not conflict).
-     */
-    BSONObj createShardIdentityUpsertForAddShard(OperationContext* opCtx,
-                                                 const std::string& shardName);
-
-    /**
      * Runs the setFeatureCompatibilityVersion command on all shards.
      */
     Status setFeatureCompatibilityVersionOnShards(OperationContext* opCtx, const BSONObj& cmdObj);
@@ -353,24 +362,7 @@ public:
      */
     static void clearForTests(ServiceContext* serviceContext);
 
-    //
-    // Upgrade/downgrade
-    //
-
-    /**
-     * Upgrade the chunk metadata to include the history field.
-     */
-    Status upgradeChunksHistory(OperationContext* opCtx,
-                                const NamespaceString& nss,
-                                const OID& collectionEpoch,
-                                const Timestamp validAfter);
-
-    /**
-     * Remove the history field from the chunk metadata.
-     */
-    Status downgradeChunksHistory(OperationContext* opCtx,
-                                  const NamespaceString& nss,
-                                  const OID& collectionEpoch);
+    Lock::ExclusiveLock lockZoneMutex(OperationContext* opCtx);
 
 private:
     /**
@@ -465,16 +457,6 @@ private:
     void _appendReadConcern(BSONObjBuilder* builder);
 
     /**
-     * Creates the first chunks of a new sharded collection.
-     */
-    ChunkVersion _createFirstChunks(OperationContext* opCtx,
-                                    const NamespaceString& nss,
-                                    const ShardKeyPattern& shardKeyPattern,
-                                    const ShardId& primaryShardId,
-                                    const std::vector<BSONObj>& initPoints,
-                                    const bool distributeInitialChunks);
-
-    /**
      * Retrieve the full chunk description from the config.
      */
     StatusWith<ChunkType> _findChunkOnConfig(OperationContext* opCtx,
@@ -543,6 +525,8 @@ private:
      * be removed while they are running (such as removeShardFromZone) to take this in shared mode.
      */
     Lock::ResourceMutex _kShardMembershipLock;
+
+    NamespaceSerializer _namespaceSerializer;
 };
 
 }  // namespace mongo

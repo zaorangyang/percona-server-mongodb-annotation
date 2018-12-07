@@ -66,6 +66,7 @@
     const isUnrelated = "is unrelated";
 
     let viewsCommandTests = {
+        _addShard: {skip: isAnInternalCommand},
         _cloneCatalogData: {skip: isAnInternalCommand},
         _configsvrAddShard: {skip: isAnInternalCommand},
         _configsvrAddShardToZone: {skip: isAnInternalCommand},
@@ -87,6 +88,8 @@
         _configsvrRemoveShardFromZone: {skip: isAnInternalCommand},
         _configsvrShardCollection: {skip: isAnInternalCommand},
         _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
+        _cpuProfilerStart: {skip: isAnInternalCommand},
+        _cpuProfilerStop: {skip: isAnInternalCommand},
         _flushDatabaseCacheUpdates: {skip: isUnrelated},
         _flushRoutingTableCacheUpdates: {skip: isUnrelated},
         _getNextSessionMods: {skip: isAnInternalCommand},
@@ -100,6 +103,7 @@
         _recvChunkCommit: {skip: isAnInternalCommand},
         _recvChunkStart: {skip: isAnInternalCommand},
         _recvChunkStatus: {skip: isAnInternalCommand},
+        _shardsvrShardCollection: {skip: isAnInternalCommand},
         _transferMods: {skip: isAnInternalCommand},
         abortTransaction: {skip: isUnrelated},
         addShard: {skip: isUnrelated},
@@ -141,6 +145,7 @@
         connPoolSync: {skip: isUnrelated},
         connectionStatus: {skip: isUnrelated},
         convertToCapped: {command: {convertToCapped: "view", size: 12345}, expectFailure: true},
+        coordinateCommitTransaction: {skip: isUnrelated},
         copydb: {skip: "Tested in replsets/copydb.js"},
         copydbsaslstart: {skip: isUnrelated},
         count: {command: {count: "view"}},
@@ -234,7 +239,6 @@
         },
         enableSharding: {skip: "Tested as part of shardCollection"},
         endSessions: {skip: isUnrelated},
-        eval: {skip: isUnrelated},
         explain: {command: {explain: {count: "view"}}},
         features: {skip: isUnrelated},
         filemd5: {skip: isUnrelated},
@@ -247,11 +251,6 @@
         fsync: {skip: isUnrelated},
         fsyncUnlock: {skip: isUnrelated},
         getDatabaseVersion: {skip: isUnrelated},
-        geoNear: {
-            command:
-                {geoNear: "view", near: {type: "Point", coordinates: [-50, 37]}, spherical: true},
-            expectFailure: true
-        },
         geoSearch: {
             command: {
                 geoSearch: "view",
@@ -315,16 +314,13 @@
         grantPrivilegesToRole: {skip: "tested in auth/commands_user_defined_roles.js"},
         grantRolesToRole: {skip: isUnrelated},
         grantRolesToUser: {skip: isUnrelated},
-        group: {
-            command: {group: {ns: "test.view", key: "x", $reduce: function() {}, initial: {}}},
-        },
         handshake: {skip: isUnrelated},
         hostInfo: {skip: isUnrelated},
         insert: {command: {insert: "view", documents: [{x: 1}]}, expectFailure: true},
         invalidateUserCache: {skip: isUnrelated},
+        invalidateViewCatalog: {command: {invalidateViewCatalog: 1}},
         isdbgrid: {skip: isUnrelated},
         isMaster: {skip: isUnrelated},
-        journalLatencyTest: {skip: isUnrelated},
         killCursors: {
             setup: function(conn) {
                 assert.writeOK(conn.collection.remove({}));
@@ -399,7 +395,6 @@
         movePrimary: {skip: "Tested in sharding/movePrimary1.js"},
         multicast: {skip: isUnrelated},
         netstat: {skip: isAnInternalCommand},
-        parallelCollectionScan: {command: {parallelCollectionScan: "view"}, expectFailure: true},
         ping: {command: {ping: 1}},
         planCacheClear: {command: {planCacheClear: "view"}, expectFailure: true},
         planCacheClearFilters: {command: {planCacheClearFilters: "view"}, expectFailure: true},
@@ -436,9 +431,7 @@
         repairCursor: {command: {repairCursor: "view"}, expectFailure: true},
         repairDatabase: {command: {repairDatabase: 1}},
         replSetAbortPrimaryCatchUp: {skip: isUnrelated},
-        replSetElect: {skip: isUnrelated},
         replSetFreeze: {skip: isUnrelated},
-        replSetFresh: {skip: isUnrelated},
         replSetGetConfig: {skip: isUnrelated},
         replSetGetRBID: {skip: isUnrelated},
         replSetGetStatus: {skip: isUnrelated},
@@ -506,7 +499,7 @@
                 max: {x: 0},
                 keyPattern: {x: 1},
                 splitKeys: [{x: -2}, {x: -1}],
-                shardVersion: [ObjectId(), 2]
+                shardVersion: [Timestamp(1, 2), ObjectId()]
             },
             skipSharded: true,
             expectFailure: true,

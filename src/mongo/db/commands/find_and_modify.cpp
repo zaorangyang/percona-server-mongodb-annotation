@@ -334,7 +334,7 @@ public:
             maybeDisableValidation.emplace(opCtx);
 
         const auto session = OperationContextSession::get(opCtx);
-        const auto inTransaction = session && session->inSnapshotReadOrMultiDocumentTransaction();
+        const auto inTransaction = session && session->inMultiDocumentTransaction();
         uassert(50781,
                 str::stream() << "Cannot write to system collection " << nsString.ns()
                               << " within a transaction.",
@@ -417,7 +417,7 @@ public:
                 opDebug->setPlanSummaryMetrics(summaryStats);
 
                 // Fill out OpDebug with the number of deleted docs.
-                opDebug->ndeleted = getDeleteStats(exec.get())->docsDeleted;
+                opDebug->additiveMetrics.ndeleted = getDeleteStats(exec.get())->docsDeleted;
 
                 if (curOp->shouldDBProfile()) {
                     BSONObjBuilder execStatsBob;
@@ -463,7 +463,7 @@ public:
                 // Create the collection if it does not exist when performing an upsert because the
                 // update stage does not create its own collection
                 if (!collection && args.isUpsert()) {
-                    uassert(ErrorCodes::NamespaceNotFound,
+                    uassert(ErrorCodes::OperationNotSupportedInTransaction,
                             str::stream() << "Cannot create namespace " << nsString.ns()
                                           << " in multi-document transaction.",
                             !inTransaction);
@@ -481,8 +481,11 @@ public:
                     if (!collection) {
                         uassertStatusOK(userAllowedCreateNS(nsString.db(), nsString.coll()));
                         WriteUnitOfWork wuow(opCtx);
+                        CollectionOptions collectionOptions;
+                        uassertStatusOK(collectionOptions.parse(
+                            BSONObj(), CollectionOptions::ParseKind::parseForCommand));
                         uassertStatusOK(Database::userCreateNS(
-                            opCtx, autoDb->getDb(), nsString.ns(), BSONObj()));
+                            opCtx, autoDb->getDb(), nsString.ns(), collectionOptions));
                         wuow.commit();
 
                         collection = autoDb->getDb()->getCollection(opCtx, nsString);

@@ -41,10 +41,10 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/stdx/utility.h"
+#include "mongo/util/dns_name.h"
 #include "mongo/util/dns_query.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/mongoutils/str.h"
@@ -234,28 +234,12 @@ MongoURI::OptionsMap addTXTOptions(std::map<std::string, std::string> options,
 
     return {std::make_move_iterator(begin(options)), std::make_move_iterator(end(options))};
 }
-
-std::string stripHost(const std::string& hostname) {
-    return hostname.substr(hostname.find('.') + 1);
-}
-
-bool isWithinDomain(std::string hostname, std::string domain) {
-    auto removeFQDNRoot = [](std::string name) -> std::string {
-        if (name.back() == '.') {
-            name.pop_back();
-        }
-        return name;
-    };
-    hostname = stripHost(removeFQDNRoot(std::move(hostname)));
-    domain = removeFQDNRoot(std::move(domain));
-    return hostname == domain;
-}
 }  // namespace
 
 MongoURI MongoURI::parseImpl(const std::string& url) {
     const StringData urlSD(url);
 
-    // 1. Validate and remove the scheme prefix mongodb://
+    // 1. Validate and remove the scheme prefix `mongodb://` or `mongodb+srv://`
     const bool isSeedlist = urlSD.startsWith(kURISRVPrefix);
     if (!(urlSD.startsWith(kURIPrefix) || isSeedlist)) {
         return MongoURI(uassertStatusOK(ConnectionString::parse(url)));
@@ -365,27 +349,40 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
             uasserted(ErrorCodes::FailedToParse,
                       "Only a single server may be specified with a mongo+srv:// url.");
         }
-        const int dots = std::count(begin(canonicalHost), end(canonicalHost), '.');
-        const int requiredDots = (canonicalHost.back() == '.') + 2;
-        if (dots < requiredDots) {
+
+        const mongo::dns::HostName host(canonicalHost);
+
+        if (host.nameComponents().size() < 3) {
             uasserted(ErrorCodes::FailedToParse,
                       "A server specified with a mongo+srv:// url must have at least 3 hostname "
                       "components separated by dots ('.')");
         }
-        const auto domain = stripHost(canonicalHost);
-        auto srvEntries = dns::lookupSRVRecords("_mongodb._tcp." + canonicalHost);
+
+        const mongo::dns::HostName srvSubdomain("_mongodb._tcp");
+
+        const auto srvEntries =
+            dns::lookupSRVRecords(srvSubdomain.resolvedIn(host).canonicalName());
+
+        auto makeFQDN = [](dns::HostName hostName) {
+            hostName.forceQualification();
+            return hostName;
+        };
+
+        const mongo::dns::HostName domain = makeFQDN(host.parentDomain());
         servers.clear();
-        std::transform(std::make_move_iterator(begin(srvEntries)),
-                       std::make_move_iterator(end(srvEntries)),
-                       back_inserter(servers),
-                       [&domain](auto&& srv) {
-                           if (!isWithinDomain(srv.host, domain)) {
-                               uasserted(ErrorCodes::FailedToParse,
-                                         "Hostname "s + srv.host + " is not within the domain "s +
-                                             domain);
-                           }
-                           return HostAndPort(std::move(srv.host), srv.port);
-                       });
+        using std::begin;
+        using std::end;
+        std::transform(
+            begin(srvEntries), end(srvEntries), back_inserter(servers), [&domain](auto&& srv) {
+                const dns::HostName target(srv.host);  // FQDN
+
+                if (!domain.contains(target)) {
+                    uasserted(ErrorCodes::FailedToParse,
+                              str::stream() << "Hostname " << target << " is not within the domain "
+                                            << domain);
+                }
+                return HostAndPort(srv.host, srv.port);
+            });
     }
 
     // 6. Split the auth database and connection options string by the first, unescaped ?,
@@ -429,11 +426,11 @@ MongoURI MongoURI::parseImpl(const std::string& url) {
         invariant(!setName.empty());
     }
 
-    // If an appname option was specified, validate that is 128 bytes or less.
-    optIter = options.find("appname");
+    // If an appName option was specified, validate that is 128 bytes or less.
+    optIter = options.find("appName");
     if (optIter != end(options) && optIter->second.length() > 128) {
         uasserted(ErrorCodes::FailedToParse,
-                  str::stream() << "appname cannot exceed 128 characters: " << optIter->second);
+                  str::stream() << "appName cannot exceed 128 characters: " << optIter->second);
     }
 
     boost::optional<bool> retryWrites = boost::none;
@@ -462,7 +459,7 @@ StatusWith<MongoURI> MongoURI::parse(const std::string& url) try {
 }
 
 const boost::optional<std::string> MongoURI::getAppName() const {
-    const auto optIter = _options.find("appname");
+    const auto optIter = _options.find("appName");
     if (optIter != end(_options)) {
         return optIter->second;
     } else {

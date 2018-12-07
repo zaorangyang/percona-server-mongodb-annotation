@@ -269,12 +269,18 @@ KVCatalog::FeatureTracker::FeatureBits KVCatalog::FeatureTracker::getInfo(
     BSONElement nonRepairableFeaturesElem;
     auto nonRepairableFeaturesStatus = bsonExtractTypedField(
         obj, kNonRepairableFeaturesFieldName, BSONType::NumberLong, &nonRepairableFeaturesElem);
-    fassert(40111, nonRepairableFeaturesStatus);
+    if (!nonRepairableFeaturesStatus.isOK()) {
+        error() << "error: exception extracting typed field with obj:" << redact(obj);
+        fassert(40111, nonRepairableFeaturesStatus);
+    }
 
     BSONElement repairableFeaturesElem;
     auto repairableFeaturesStatus = bsonExtractTypedField(
         obj, kRepairableFeaturesFieldName, BSONType::NumberLong, &repairableFeaturesElem);
-    fassert(40112, repairableFeaturesStatus);
+    if (!repairableFeaturesStatus.isOK()) {
+        error() << "error: exception extracting typed field with obj:" << redact(obj);
+        fassert(40112, repairableFeaturesStatus);
+    }
 
     FeatureBits versionInfo;
     versionInfo.nonRepairableFeatures =
@@ -300,17 +306,14 @@ void KVCatalog::FeatureTracker::putInfo(OperationContext* opCtx, const FeatureBi
     if (_rid.isNull()) {
         // This is the first time a feature is being marked as in-use or not in-use, so we must
         // insert the feature document rather than update it.
-        const bool enforceQuota = false;
         // TODO SERVER-30638: using timestamp 0 for these inserts
-        auto rid = _catalog->_rs->insertRecord(
-            opCtx, obj.objdata(), obj.objsize(), Timestamp(), enforceQuota);
+        auto rid = _catalog->_rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), Timestamp());
         fassert(40113, rid.getStatus());
         _rid = rid.getValue();
     } else {
-        const bool enforceQuota = false;
         UpdateNotifier* notifier = nullptr;
-        auto status = _catalog->_rs->updateRecord(
-            opCtx, _rid, obj.objdata(), obj.objsize(), enforceQuota, notifier);
+        auto status =
+            _catalog->_rs->updateRecord(opCtx, _rid, obj.objdata(), obj.objsize(), notifier);
         fassert(40114, status);
     }
 }
@@ -419,10 +422,8 @@ Status KVCatalog::newCollection(OperationContext* opCtx,
         b.append("md", md.toBSON());
         obj = b.obj();
     }
-    const bool enforceQuota = false;
     // TODO SERVER-30638: using timestamp 0 for these inserts.
-    StatusWith<RecordId> res =
-        _rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), Timestamp(), enforceQuota);
+    StatusWith<RecordId> res = _rs->insertRecord(opCtx, obj.objdata(), obj.objsize(), Timestamp());
     if (!res.isOK())
         return res.getStatus();
 
@@ -451,7 +452,7 @@ BSONObj KVCatalog::_findEntry(OperationContext* opCtx, StringData ns, RecordId* 
     {
         stdx::lock_guard<stdx::mutex> lk(_identsLock);
         NSToIdentMap::const_iterator it = _idents.find(ns.toString());
-        invariant(it != _idents.end());
+        invariant(it != _idents.end(), str::stream() << "Did not find collection. Ns: " << ns);
         dl = it->second.storedLoc;
     }
 
@@ -518,7 +519,7 @@ void KVCatalog::putMetaData(OperationContext* opCtx,
     }
 
     LOG(3) << "recording new metadata: " << obj;
-    Status status = _rs->updateRecord(opCtx, loc, obj.objdata(), obj.objsize(), false, NULL);
+    Status status = _rs->updateRecord(opCtx, loc, obj.objdata(), obj.objsize(), NULL);
     fassert(28521, status.isOK());
 }
 
@@ -543,7 +544,7 @@ Status KVCatalog::renameCollection(OperationContext* opCtx,
         b.appendElementsUnique(old);
 
         BSONObj obj = b.obj();
-        Status status = _rs->updateRecord(opCtx, loc, obj.objdata(), obj.objsize(), false, NULL);
+        Status status = _rs->updateRecord(opCtx, loc, obj.objdata(), obj.objsize(), NULL);
         fassert(28522, status.isOK());
     }
 

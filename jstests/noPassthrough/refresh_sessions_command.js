@@ -1,13 +1,17 @@
 (function() {
     "use strict";
 
+    // This test makes assertions about the number of sessions, which are not compatible with
+    // implicit sessions.
+    TestData.disableImplicitSessions = true;
+
     var conn;
     var admin;
     var result;
     var startSession = {startSession: 1};
 
     // Run initial tests without auth.
-    conn = MongoRunner.runMongod({nojournal: ""});
+    conn = MongoRunner.runMongod();
     admin = conn.getDB("admin");
 
     result = admin.runCommand(startSession);
@@ -29,7 +33,7 @@
 
     // Turn on auth for further testing.
     MongoRunner.stopMongod(conn);
-    conn = MongoRunner.runMongod({auth: "", nojournal: ""});
+    conn = MongoRunner.runMongod({auth: "", nojournal: "", setParameter: {maxSessions: 3}});
     admin = conn.getDB("admin");
 
     admin.createUser(
@@ -73,6 +77,11 @@
     // Test that we can run refreshSessions with an empty set of sessions.
     result = admin.runCommand({refreshSessions: []});
     assert.commandWorked(result, "unable to refresh empty set of lsids");
+
+    // Test that we cannot run refreshSessions when the cache is full.
+    var lsid4 = {"id": UUID()};
+    result = admin.runCommand({refreshSessions: [lsid4]});
+    assert.commandFailed(result, "able to run refreshSessions when the cache is full");
 
     // Test that once we force a refresh, all of these sessions are in the sessions collection.
     admin.logout();

@@ -262,7 +262,7 @@ def create_task_list(evergreen_conf, buildvariant, suites, exclude_tasks):
 
     Returns a dict keyed by task_name, with executor, resmoke_args & tests, i.e.,
     {'jsCore_small_oplog':
-        {'resmoke_args': '--suites=core_small_oplog --storageEngine=mmapv1',
+        {'resmoke_args': '--suites=core_small_oplog --storageEngine=inMemory',
          'tests': ['jstests/core/all2.js', 'jstests/core/all3.js']}
     }
     """
@@ -351,7 +351,7 @@ def main():
     # Run the executor finder.
     else:
         # Parse the Evergreen project configuration file.
-        evergreen_conf = evergreen.EvergreenProjectConfig(values.evergreen_file)
+        evergreen_conf = evergreen.parse_evergreen_file(values.evergreen_file)
 
         if values.buildvariant is None:
             print "Option buildVariant must be specified to find changed tests.\n", \

@@ -48,7 +48,7 @@ namespace repl {
 
 Seconds OplogFetcher::kDefaultProtocolZeroAwaitDataTimeout(2);
 
-MONGO_FP_DECLARE(stopReplProducer);
+MONGO_FAIL_POINT_DEFINE(stopReplProducer);
 
 namespace {
 
@@ -350,7 +350,8 @@ OplogFetcher::~OplogFetcher() {
 }
 
 BSONObj OplogFetcher::_makeFindCommandObject(const NamespaceString& nss,
-                                             OpTime lastOpTimeFetched) const {
+                                             OpTime lastOpTimeFetched,
+                                             Milliseconds findMaxTime) const {
     auto lastCommittedWithCurrentTerm =
         _dataReplicatorExternalState->getCurrentTermAndLastCommittedOpTime();
     auto term = lastCommittedWithCurrentTerm.value;
@@ -360,7 +361,7 @@ BSONObj OplogFetcher::_makeFindCommandObject(const NamespaceString& nss,
     cmdBob.append("tailable", true);
     cmdBob.append("oplogReplay", true);
     cmdBob.append("awaitData", true);
-    cmdBob.append("maxTimeMS", durationCount<Milliseconds>(_getFindMaxTime()));
+    cmdBob.append("maxTimeMS", durationCount<Milliseconds>(findMaxTime));
     cmdBob.append("batchSize", _batchSize);
 
     if (term != OpTime::kUninitializedTerm) {

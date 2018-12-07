@@ -208,9 +208,7 @@ Status handleOplogUpdate(OperationContext* opCtx,
 
     // Oplog updates do not have array filters.
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
-    status = driver.parse(updatePattern, arrayFilters);
-    if (!status.isOK())
-        return status;
+    driver.parse(updatePattern, arrayFilters);
 
     mutablebson::Document roleDocument;
     status = RoleGraph::getBSONForRole(roleGraph, roleToUpdate, roleDocument.root());
@@ -295,10 +293,11 @@ Status handleOplogCommand(RoleGraph* roleGraph, const BSONObj& cmdObj) {
         }
         return Status::OK();
     }
+
     if (cmdName == "dropIndexes" || cmdName == "deleteIndexes") {
         return Status::OK();
     }
-    if ((cmdName == "collMod" || cmdName == "emptycapped") &&
+    if ((cmdName == "collMod" || cmdName == "emptycapped" || cmdName == "createIndexes") &&
         cmdObj.firstElement().str() != rolesCollectionNamespace.coll()) {
         // We don't care about these if they're not on the roles collection.
         return Status::OK();

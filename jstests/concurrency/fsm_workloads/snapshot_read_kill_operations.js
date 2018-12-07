@@ -3,33 +3,42 @@
 /**
  * Test a snapshot read spanning a find and getmore that runs concurrently with killSessions,
  * killOp, killCursors, and txnNumber change.
+ *
  * @tags: [uses_transactions]
  */
 load('jstests/concurrency/fsm_workload_helpers/snapshot_read_utils.js');
 var $config = (function() {
     const data = {numIds: 100, batchSize: 50};
-    const threadCount = 5;
 
     const states = {
         init: function init(db, collName) {
             let session = db.getMongo().startSession({causalConsistency: false});
             // Store the session ID in the database so any unterminated transactions can be aborted
             // at teardown.
-            insertSessionDoc(db, collName, this, session);
+            insertSessionDoc(db, collName, this.tid, session.getSessionId().id);
             this.sessionDb = session.getDatabase(db.getName());
             this.txnNumber = 0;
             this.stmtId = 0;
+            this.iteration = 1;
         },
 
         snapshotFind: function snapshotFind(db, collName) {
             const sortByAscending = false;
-            doSnapshotFind(sortByAscending, collName, this, [ErrorCodes.NoSuchTransaction]);
+            doSnapshotFind(sortByAscending,
+                           collName,
+                           this,
+                           [ErrorCodes.NoSuchTransaction, ErrorCodes.LockTimeout]);
         },
 
         snapshotGetMore: function snapshotGetMore(db, collName) {
             doSnapshotGetMore(collName,
                               this,
-                              [ErrorCodes.NoSuchTransaction, ErrorCodes.CursorNotFound],
+                              [
+                                ErrorCodes.NoSuchTransaction,
+                                ErrorCodes.CursorNotFound,
+                                ErrorCodes.Interrupted,
+                                ErrorCodes.LockTimeout
+                              ],
                               [ErrorCodes.NoSuchTransaction]);
         },
 
@@ -39,7 +48,7 @@ var $config = (function() {
 
         killSessions: function killSessions(db, collName) {
             // Kill a random active session.
-            const idToKill = "sessionDoc" + Math.floor(Math.random() * threadCount);
+            const idToKill = "sessionDoc" + Math.floor(Math.random() * this.threadCount);
             const sessionDocToKill = db[collName].find({"_id": idToKill});
             assert.commandWorked(
                 this.sessionDb.runCommand({killSessions: [{id: sessionDocToKill.id}]}));
@@ -61,8 +70,17 @@ var $config = (function() {
             const killCursorCmd = {killCursors: collName, cursors: [this.cursorId]};
             const res = this.sessionDb.runCommand(killCursorCmd);
             assertWorkedOrFailed(killCursorCmd, res, [ErrorCodes.CursorNotFound]);
-        }
+        },
+
     };
+
+    // Wrap each state in a cleanupOnLastIteration() invocation.
+    for (let stateName of Object.keys(states)) {
+        const stateFn = states[stateName];
+        states[stateName] = function(db, collName) {
+            cleanupOnLastIteration(this, () => stateFn.apply(this, arguments));
+        };
+    }
 
     const transitions = {
         init: {snapshotFind: 1.0},
@@ -83,7 +101,7 @@ var $config = (function() {
     function setup(db, collName, cluster) {
         assertWhenOwnColl.commandWorked(db.runCommand({create: collName}));
         for (let i = 0; i < this.numIds; ++i) {
-            const res = db[collName].insert({_id: i, value: this.valueToBeIncremented});
+            const res = db[collName].insert({_id: i, value: i});
             assert.writeOK(res);
             assert.eq(1, res.nInserted);
         }
@@ -94,17 +112,8 @@ var $config = (function() {
         killSessionsFromDocs(db, collName);
     }
 
-    const skip = function skip(cluster) {
-        // TODO(SERVER-34570) remove isSharded() check once transactions are supported in sharded
-        // environments.
-        if (cluster.isSharded() || cluster.isStandalone()) {
-            return {skip: true, msg: 'only runs in a replica set.'};
-        }
-        return {skip: false};
-    };
-
     return {
-        threadCount: threadCount,
+        threadCount: 5,
         iterations: 10,
         startState: 'init',
         states: states,
@@ -112,7 +121,6 @@ var $config = (function() {
         setup: setup,
         teardown: teardown,
         data: data,
-        skip: skip
     };
 
 })();

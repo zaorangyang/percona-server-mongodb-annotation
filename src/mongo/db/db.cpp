@@ -95,6 +95,7 @@
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/periodic_runner_job_abort_expired_transactions.h"
+#include "mongo/db/periodic_runner_job_decrease_snapshot_cache_pressure.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
@@ -119,15 +120,12 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/service_context_registrar.h"
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/session_killer.h"
 #include "mongo/db/startup_warnings_mongod.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/encryption_hooks.h"
-#include "mongo/db/storage/mmap_v1/mmap_v1_options.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
@@ -228,7 +226,11 @@ void logStartup(OperationContext* opCtx) {
     if (!collection) {
         BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
         repl::UnreplicatedWritesBlock uwb(opCtx);
-        uassertStatusOK(Database::userCreateNS(opCtx, db, startupLogCollectionName.ns(), options));
+        CollectionOptions collectionOptions;
+        uassertStatusOK(
+            collectionOptions.parse(options, CollectionOptions::ParseKind::parseForCommand));
+        uassertStatusOK(
+            Database::userCreateNS(opCtx, db, startupLogCollectionName.ns(), collectionOptions));
         collection = db->getCollection(opCtx, startupLogCollectionName);
     }
     invariant(collection);
@@ -270,7 +272,7 @@ void initWireSpec() {
     spec.isInternalClient = true;
 }
 
-MONGO_FP_DECLARE(shutdownAtStartup);
+MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
 
 ExitCode _initAndListen(int listenPort) {
     Client::initThread("initandlisten");
@@ -318,8 +320,6 @@ ExitCode _initAndListen(int listenPort) {
 
     logProcessDetails();
 
-    createLockFile(serviceContext);
-
     serviceContext->setServiceEntryPoint(
         stdx::make_unique<ServiceEntryPointMongod>(serviceContext));
 
@@ -334,7 +334,7 @@ ExitCode _initAndListen(int listenPort) {
         serviceContext->setTransportLayer(std::move(tl));
     }
 
-    initializeStorageEngine(serviceContext);
+    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
     if (EncryptionHooks::get(serviceContext)->restartRequired()) {
@@ -360,6 +360,14 @@ ExitCode _initAndListen(int listenPort) {
                           << storageGlobalParams.engine;
             }
         }
+    }
+
+    // Disallow running a storage engine that doesn't support capped collections with --profile
+    if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections() &&
+        serverGlobalParams.defaultProfile != 0) {
+        log() << "Running " << storageGlobalParams.engine << " with profiling is not supported. "
+              << "Make sure you are not using --profile.";
+        exitCleanly(EXIT_BADOPTIONS);
     }
 
     // Disallow running WiredTiger with --nojournal in a replica set
@@ -396,20 +404,11 @@ ExitCode _initAndListen(int listenPort) {
         uassert(10296, ss.str().c_str(), boost::filesystem::exists(storageGlobalParams.dbpath));
     }
 
-    {
-        std::stringstream ss;
-        ss << "repairpath (" << storageGlobalParams.repairpath << ") does not exist";
-        uassert(12590, ss.str().c_str(), boost::filesystem::exists(storageGlobalParams.repairpath));
-    }
-
     initializeSNMP();
 
     if (!storageGlobalParams.readOnly) {
         boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/");
     }
-
-    if (mmapv1GlobalOptions.journalOptions & MMAPV1Options::JournalRecoverOnly)
-        return EXIT_NET_ERROR;
 
     if (mongodGlobalParams.scriptingEnabled) {
         ScriptEngine::setup();
@@ -474,6 +473,9 @@ ExitCode _initAndListen(int listenPort) {
             log() << redact(status);
             if (status == ErrorCodes::AuthSchemaIncompatible) {
                 exitCleanly(EXIT_NEED_UPGRADE);
+            } else if (status == ErrorCodes::NotMaster) {
+                // Try creating the indexes if we become master.  If we do not become master,
+                // the master will create the indexes and we will replicate them.
             } else {
                 quickExit(EXIT_FAILURE);
             }
@@ -522,8 +524,14 @@ ExitCode _initAndListen(int listenPort) {
         waitForShardRegistryReload(startupOpCtx.get()).transitional_ignore();
     }
 
+    auto storageEngine = serviceContext->getStorageEngine();
+    invariant(storageEngine);
+
     if (!storageGlobalParams.readOnly) {
-        logStartup(startupOpCtx.get());
+
+        if (storageEngine->supportsCappedCollections()) {
+            logStartup(startupOpCtx.get());
+        }
 
         startMongoDFTDC();
 
@@ -601,13 +609,15 @@ ExitCode _initAndListen(int listenPort) {
     SessionKiller::set(serviceContext,
                        std::make_shared<SessionKiller>(serviceContext, killSessionsLocal));
 
-    // Start up a background task to periodically check for and kill expired transactions.
+    // Start up a background task to periodically check for and kill expired transactions; and a
+    // background task to periodically check for and decrease cache pressure by decreasing the
+    // target size setting for the storage engine's window of available snapshots.
+    //
     // Only do this on storage engines supporting snapshot reads, which hold resources we wish to
     // release periodically in order to avoid storage cache pressure build up.
-    auto storageEngine = serviceContext->getStorageEngine();
-    invariant(storageEngine);
     if (storageEngine->supportsReadConcernSnapshot()) {
         startPeriodicThreadToAbortExpiredTransactions(serviceContext);
+        startPeriodicThreadToDecreaseSnapshotHistoryCachePressure(serviceContext);
     }
 
     // Set up the logical session cache
@@ -939,7 +949,7 @@ void shutdownTask() {
     // For a Windows service, dbexit does not call exit(), so we must leak the lock outside
     // of this function to prevent any operations from running that need a lock.
     //
-    DefaultLockerImpl* globalLocker = new DefaultLockerImpl();
+    LockerImpl* globalLocker = new LockerImpl();
     LockResult result = globalLocker->lockGlobalBegin(MODE_X, Date_t::max());
     if (result == LOCK_WAITING) {
         result = globalLocker->lockGlobalComplete(Date_t::max());
@@ -977,6 +987,8 @@ int mongoDbMain(int argc, char* argv[], char** envp) {
         severe(LogComponent::kControl) << "Failed global initialization: " << status;
         quickExit(EXIT_FAILURE);
     }
+    auto service = getGlobalServiceContext();
+    service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
 
     ErrorExtraInfo::invariantHaveAllParsers();
 

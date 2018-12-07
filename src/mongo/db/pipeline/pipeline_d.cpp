@@ -33,7 +33,6 @@
 #include "mongo/db/pipeline/pipeline_d.h"
 
 #include "mongo/bson/simple_bsonobj_comparator.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
@@ -58,6 +57,8 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/pipeline/document_source_geo_near.h"
+#include "mongo/db/pipeline/document_source_geo_near_cursor.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_merge_cursors.h"
 #include "mongo/db/pipeline/document_source_sample.h"
@@ -181,7 +182,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     BSONObj projectionObj,
     BSONObj sortObj,
     const AggregationRequest* aggRequest,
-    const size_t plannerOpts) {
+    const size_t plannerOpts,
+    const MatchExpressionParser::AllowedFeatureSet& matcherFeatures) {
     auto qr = stdx::make_unique<QueryRequest>(nss);
     qr->setTailableMode(pExpCtx->tailableMode);
     qr->setOplogReplay(oplogReplay);
@@ -206,7 +208,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     const ExtensionsCallbackReal extensionsCallback(pExpCtx->opCtx, &nss);
 
     auto cq = CanonicalQuery::canonicalize(
-        opCtx, std::move(qr), pExpCtx, extensionsCallback, Pipeline::kAllowedMatcherFeatures);
+        opCtx, std::move(qr), pExpCtx, extensionsCallback, matcherFeatures);
 
     if (!cq.isOK()) {
         // Return an error instead of uasserting, since there are cases where the combination of
@@ -225,6 +227,50 @@ BSONObj removeSortKeyMetaProjection(BSONObj projectionObj) {
         return projectionObj;
     }
     return projectionObj.removeField(Document::metaFieldSortKey);
+}
+
+/**
+ * Examines the indexes in 'collection' and returns the field name of a geo-indexed field suitable
+ * for use in $geoNear. 2d indexes are given priority over 2dsphere indexes.
+ *
+ * The 'collection' is required to exist. Throws if no usable 2d or 2dsphere index could be found.
+ */
+StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx, Collection* collection) {
+    invariant(collection);
+
+    std::vector<IndexDescriptor*> idxs;
+    collection->getIndexCatalog()->findIndexByType(opCtx, IndexNames::GEO_2D, idxs);
+    uassert(ErrorCodes::IndexNotFound,
+            str::stream() << "There is more than one 2d index on " << collection->ns().ns()
+                          << "; unsure which to use for $geoNear",
+            idxs.size() <= 1U);
+    if (idxs.size() == 1U) {
+        for (auto&& elem : idxs.front()->keyPattern()) {
+            if (elem.type() == BSONType::String && elem.valueStringData() == IndexNames::GEO_2D) {
+                return elem.fieldNameStringData();
+            }
+        }
+        MONGO_UNREACHABLE;
+    }
+
+    // If there are no 2d indexes, look for a 2dsphere index.
+    idxs.clear();
+    collection->getIndexCatalog()->findIndexByType(opCtx, IndexNames::GEO_2DSPHERE, idxs);
+    uassert(ErrorCodes::IndexNotFound,
+            "$geoNear requires a 2d or 2dsphere index, but none were found",
+            !idxs.empty());
+    uassert(ErrorCodes::IndexNotFound,
+            str::stream() << "There is more than one 2dsphere index on " << collection->ns().ns()
+                          << "; unsure which to use for $geoNear",
+            idxs.size() <= 1U);
+
+    invariant(idxs.size() == 1U);
+    for (auto&& elem : idxs.front()->keyPattern()) {
+        if (elem.type() == BSONType::String && elem.valueStringData() == IndexNames::GEO_2DSPHERE) {
+            return elem.fieldNameStringData();
+        }
+    }
+    MONGO_UNREACHABLE;
 }
 }  // namespace
 
@@ -260,15 +306,31 @@ void PipelineD::prepareCursorSource(Collection* collection,
                     expCtx, sampleSize, idString, numRecords));
 
                 addCursorSource(
-                    collection,
                     pipeline,
-                    expCtx,
-                    std::move(exec),
+                    DocumentSourceCursor::create(collection, std::move(exec), expCtx),
                     pipeline->getDependencies(DepsTracker::MetadataAvailable::kNoMetadata));
                 return;
             }
         }
     }
+
+    // If the first stage is $geoNear, prepare a special DocumentSourceGeoNearCursor stage;
+    // otherwise, create a generic DocumentSourceCursor.
+    const auto geoNearStage =
+        sources.empty() ? nullptr : dynamic_cast<DocumentSourceGeoNear*>(sources.front().get());
+    if (geoNearStage) {
+        prepareGeoNearCursorSource(collection, nss, aggRequest, pipeline);
+    } else {
+        prepareGenericCursorSource(collection, nss, aggRequest, pipeline);
+    }
+}
+
+void PipelineD::prepareGenericCursorSource(Collection* collection,
+                                           const NamespaceString& nss,
+                                           const AggregationRequest* aggRequest,
+                                           Pipeline* pipeline) {
+    Pipeline::SourceContainer& sources = pipeline->_sources;
+    auto expCtx = pipeline->getContext();
 
     // Look for an initial match. This works whether we got an initial query or not. If not, it
     // results in a "{}" query, which will be what we want in that case.
@@ -283,7 +345,7 @@ void PipelineD::prepareCursorSource(Collection* collection,
             sources.pop_front();
         } else {
             // A $geoNear stage, the only other stage that can produce an initial query, is also
-            // a valid initial stage and will be handled above.
+            // a valid initial stage. However, we should be in prepareGeoNearCursorSource() instead.
             MONGO_UNREACHABLE;
         }
     }
@@ -321,6 +383,7 @@ void PipelineD::prepareCursorSource(Collection* collection,
                                                 deps,
                                                 queryObj,
                                                 aggRequest,
+                                                Pipeline::kAllowedMatcherFeatures,
                                                 &sortObj,
                                                 &projForQuery));
 
@@ -335,8 +398,71 @@ void PipelineD::prepareCursorSource(Collection* collection,
         }
     }
 
-    addCursorSource(
-        collection, pipeline, expCtx, std::move(exec), deps, queryObj, sortObj, projForQuery);
+    addCursorSource(pipeline,
+                    DocumentSourceCursor::create(collection, std::move(exec), expCtx),
+                    deps,
+                    queryObj,
+                    sortObj,
+                    projForQuery);
+}
+
+void PipelineD::prepareGeoNearCursorSource(Collection* collection,
+                                           const NamespaceString& nss,
+                                           const AggregationRequest* aggRequest,
+                                           Pipeline* pipeline) {
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "$geoNear requires a geo index to run, but " << nss.ns()
+                          << " does not exist",
+            collection);
+
+    Pipeline::SourceContainer& sources = pipeline->_sources;
+    auto expCtx = pipeline->getContext();
+    const auto geoNearStage = dynamic_cast<DocumentSourceGeoNear*>(sources.front().get());
+    invariant(geoNearStage);
+
+    auto deps = pipeline->getDependencies(DepsTracker::kAllGeoNearDataAvailable);
+
+    // If the user specified a "key" field, use that field to satisfy the "near" query. Otherwise,
+    // look for a geo-indexed field in 'collection' that can.
+    auto nearFieldName =
+        (geoNearStage->getKeyField() ? geoNearStage->getKeyField()->fullPath()
+                                     : extractGeoNearFieldFromIndexes(expCtx->opCtx, collection))
+            .toString();
+
+    // Create a PlanExecutor whose query is the "near" predicate on 'nearFieldName' combined with
+    // the optional "query" argument in the $geoNear stage.
+    BSONObj fullQuery = geoNearStage->asNearQuery(nearFieldName);
+    BSONObj proj = deps.toProjection();
+    BSONObj sortFromQuerySystem;
+    auto exec = uassertStatusOK(prepareExecutor(expCtx->opCtx,
+                                                collection,
+                                                nss,
+                                                pipeline,
+                                                expCtx,
+                                                false,   /* oplogReplay */
+                                                nullptr, /* sortStage */
+                                                deps,
+                                                std::move(fullQuery),
+                                                aggRequest,
+                                                Pipeline::kGeoNearMatcherFeatures,
+                                                &sortFromQuerySystem,
+                                                &proj));
+
+    invariant(sortFromQuerySystem.isEmpty(),
+              str::stream() << "Unexpectedly got the following sort from the query system: "
+                            << sortFromQuerySystem.jsonString());
+
+    auto geoNearCursor =
+        DocumentSourceGeoNearCursor::create(collection,
+                                            std::move(exec),
+                                            expCtx,
+                                            geoNearStage->getDistanceField(),
+                                            geoNearStage->getLocationField(),
+                                            geoNearStage->getDistanceMultiplier().value_or(1.0));
+
+    // Remove the initial $geoNear; it will be replaced by $geoNearCursor.
+    sources.pop_front();
+    addCursorSource(pipeline, std::move(geoNearCursor), std::move(deps));
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prepareExecutor(
@@ -350,6 +476,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     const DepsTracker& deps,
     const BSONObj& queryObj,
     const AggregationRequest* aggRequest,
+    const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
     BSONObj* sortObj,
     BSONObj* projectionObj) {
     // The query system has the potential to use an index to provide a non-blocking sort and/or to
@@ -378,11 +505,11 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
         plannerOpts |= QueryPlannerParams::IS_COUNT;
     }
 
-    // The only way to get a text score or the sort key is to let the query system handle the
-    // projection. In all other cases, unless the query system can do an index-covered projection
-    // and avoid going to the raw record at all, it is faster to have ParsedDeps filter the fields
-    // we need.
-    if (!deps.getNeedTextScore() && !deps.getNeedSortKey()) {
+    // The only way to get meta information (e.g. the text score) is to let the query system handle
+    // the projection. In all other cases, unless the query system can do an index-covered
+    // projection and avoid going to the raw record at all, it is faster to have ParsedDeps filter
+    // the fields we need.
+    if (!deps.getNeedsAnyMetadata()) {
         plannerOpts |= QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
     }
 
@@ -405,7 +532,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                  expCtx->needsMerge ? metaSortProjection : emptyProjection,
                                  *sortObj,
                                  aggRequest,
-                                 plannerOpts);
+                                 plannerOpts,
+                                 matcherFeatures);
 
         if (swExecutorSort.isOK()) {
             // Success! Now see if the query system can also cover the projection.
@@ -418,7 +546,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                                               *projectionObj,
                                                               *sortObj,
                                                               aggRequest,
-                                                              plannerOpts);
+                                                              plannerOpts,
+                                                              matcherFeatures);
 
             std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
             if (swExecutorSortAndProj.isOK()) {
@@ -458,7 +587,9 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     // sort.
     dassert(sortObj->isEmpty());
     *projectionObj = removeSortKeyMetaProjection(*projectionObj);
-    if (deps.getNeedSortKey() && !deps.getNeedTextScore()) {
+    const auto metadataRequired = deps.getAllRequiredMetadataTypes();
+    if (metadataRequired.size() == 1 &&
+        metadataRequired.front() == DepsTracker::MetadataType::SORT_KEY) {
         // A sort key requirement would have prevented us from being able to add this parameter
         // before, but now we know the query system won't cover the sort, so we will be able to
         // compute the sort key ourselves during the $sort stage, and thus don't need a query
@@ -476,7 +607,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                                *projectionObj,
                                                *sortObj,
                                                aggRequest,
-                                               plannerOpts);
+                                               plannerOpts,
+                                               matcherFeatures);
     if (swExecutorProj.isOK()) {
         // Success! We have a covered projection.
         return std::move(swExecutorProj.getValue());
@@ -499,34 +631,24 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
                                 *projectionObj,
                                 *sortObj,
                                 aggRequest,
-                                plannerOpts);
+                                plannerOpts,
+                                matcherFeatures);
 }
 
-void PipelineD::addCursorSource(Collection* collection,
-                                Pipeline* pipeline,
-                                const intrusive_ptr<ExpressionContext>& expCtx,
-                                unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+void PipelineD::addCursorSource(Pipeline* pipeline,
+                                boost::intrusive_ptr<DocumentSourceCursor> cursor,
                                 DepsTracker deps,
                                 const BSONObj& queryObj,
                                 const BSONObj& sortObj,
                                 const BSONObj& projectionObj) {
-    // DocumentSourceCursor expects a yielding PlanExecutor that has had its state saved.
-    exec->saveState();
-
-    // Put the PlanExecutor into a DocumentSourceCursor and add it to the front of the pipeline.
-    intrusive_ptr<DocumentSourceCursor> pSource =
-        DocumentSourceCursor::create(collection, std::move(exec), expCtx);
-
-    // Note the query, sort, and projection for explain.
-    pSource->setQuery(queryObj);
-    pSource->setSort(sortObj);
-
+    cursor->setQuery(queryObj);
+    cursor->setSort(sortObj);
     if (deps.hasNoRequirements()) {
-        pSource->shouldProduceEmptyDocs();
+        cursor->shouldProduceEmptyDocs();
     }
 
     if (!projectionObj.isEmpty()) {
-        pSource->setProjection(projectionObj, boost::none);
+        cursor->setProjection(projectionObj, boost::none);
     } else {
         // There may be fewer dependencies now if the sort was covered.
         if (!sortObj.isEmpty()) {
@@ -535,9 +657,9 @@ void PipelineD::addCursorSource(Collection* collection,
                                                  : DepsTracker::MetadataAvailable::kNoMetadata);
         }
 
-        pSource->setProjection(deps.toProjection(), deps.toParsedDeps());
+        cursor->setProjection(deps.toProjection(), deps.toParsedDeps());
     }
-    pipeline->addInitialSource(pSource);
+    pipeline->addInitialSource(std::move(cursor));
 }
 
 Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {
@@ -588,10 +710,8 @@ DBClientBase* PipelineD::MongoDInterface::directClient() {
 
 bool PipelineD::MongoDInterface::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
     AutoGetCollectionForReadCommand autoColl(opCtx, nss);
-    // TODO SERVER-24960: Use CollectionShardingState::collectionIsSharded() to confirm sharding
-    // state.
-    auto css = CollectionShardingState::get(opCtx, nss);
-    return bool(css->getMetadata(opCtx));
+    auto const css = CollectionShardingState::get(opCtx, nss);
+    return css->getMetadata(opCtx)->isSharded();
 }
 
 BSONObj PipelineD::MongoDInterface::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -722,13 +842,11 @@ Status PipelineD::MongoDInterface::attachCursorSourceToPipeline(
     // collection representing the document source to be not-sharded. We confirm sharding state
     // here to avoid taking a collection lock elsewhere for this purpose alone.
     // TODO SERVER-27616: This check is incorrect in that we don't acquire a collection cursor
-    // until after we release the lock, leaving room for a collection to be sharded inbetween.
-    // TODO SERVER-24960: Use CollectionShardingState::collectionIsSharded() to confirm sharding
-    // state.
+    // until after we release the lock, leaving room for a collection to be sharded in-between.
     auto css = CollectionShardingState::get(expCtx->opCtx, expCtx->ns);
     uassert(4567,
             str::stream() << "from collection (" << expCtx->ns.ns() << ") cannot be sharded",
-            !bool(css->getMetadata(expCtx->opCtx)));
+            !css->getMetadata(expCtx->opCtx)->isSharded());
 
     PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline);
 
@@ -777,7 +895,7 @@ std::pair<std::vector<FieldPath>, bool> PipelineD::MongoDInterface::collectDocum
 
     // Collection is not sharded or UUID mismatch implies collection has been dropped and recreated
     // as sharded.
-    if (!scm || !scm->uuidMatches(uuid)) {
+    if (!scm->isSharded() || !scm->uuidMatches(uuid)) {
         return {{"_id"}, false};
     }
 
@@ -842,8 +960,14 @@ BSONObj PipelineD::MongoDInterface::_reportCurrentOpForClient(
     CurOp::reportCurrentOpForClient(
         opCtx, client, (truncateOps == CurrentOpTruncateMode::kTruncateOps), &builder);
 
-    // Append lock stats before returning.
-    if (auto clientOpCtx = client->getOperationContext()) {
+    OperationContext* clientOpCtx = client->getOperationContext();
+
+    if (clientOpCtx) {
+        if (auto opCtxSession = OperationContextSession::get(clientOpCtx)) {
+            opCtxSession->reportUnstashedState(&builder);
+        }
+
+        // Append lock stats before returning.
         if (auto lockerInfo = clientOpCtx->lockState()->getLockerInfo()) {
             fillLockerInfo(*lockerInfo, builder);
         }

@@ -40,7 +40,6 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_impl.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/authorization_session_for_test.h"
 #include "mongo/db/auth/authz_manager_external_state_mock.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
 #include "mongo/db/auth/sasl_options.h"
@@ -50,9 +49,10 @@
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_cache_impl.h"
 #include "mongo/db/logical_session_id_helpers.h"
-#include "mongo/db/operation_context_noop.h"
-#include "mongo/db/service_context_noop.h"
-#include "mongo/db/service_liason_mock.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/db/service_liaison_mock.h"
 #include "mongo/db/sessions_collection_mock.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
@@ -61,52 +61,39 @@
 namespace mongo {
 namespace {
 
-class LogicalSessionIdTest : public ::mongo::unittest::Test {
+class LogicalSessionIdTest : public ServiceContextTest {
 public:
     AuthzManagerExternalStateMock* managerState;
     transport::TransportLayerMock transportLayer;
-    transport::SessionHandle session;
-    ServiceContextNoop serviceContext;
-    ServiceContext::UniqueClient client;
+    transport::SessionHandle session = transportLayer.createSession();
     ServiceContext::UniqueOperationContext _opCtx;
-    AuthzSessionExternalStateMock* sessionState;
-    AuthorizationManager* authzManager;
-    AuthorizationSessionForTest* authzSession;
+    AuthorizationSession* authzSession;
 
-    void setUp() {
-        session = transportLayer.createSession();
-        client = serviceContext.makeClient("testClient", session);
+    LogicalSessionIdTest() {
         RestrictionEnvironment::set(
             session, std::make_unique<RestrictionEnvironment>(SockAddr(), SockAddr()));
-        _opCtx = client->makeOperationContext();
         auto localManagerState = std::make_unique<AuthzManagerExternalStateMock>();
         managerState = localManagerState.get();
         managerState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
-        auto uniqueAuthzManager = std::make_unique<AuthorizationManagerImpl>(
+        auto authzManager = std::make_unique<AuthorizationManagerImpl>(
             std::move(localManagerState),
             AuthorizationManagerImpl::InstallMockForTestingOrAuthImpl{});
-        authzManager = uniqueAuthzManager.get();
-        AuthorizationManager::set(&serviceContext, std::move(uniqueAuthzManager));
-        auto localSessionState = std::make_unique<AuthzSessionExternalStateMock>(authzManager);
-        sessionState = localSessionState.get();
-
-        auto localauthzSession = std::make_unique<AuthorizationSessionForTest>(
-            std::move(localSessionState),
-            AuthorizationSessionImpl::InstallMockForTestingOrAuthImpl{});
-        authzSession = localauthzSession.get();
-
-        AuthorizationSession::set(client.get(), std::move(localauthzSession));
         authzManager->setAuthEnabled(true);
+        AuthorizationManager::set(getServiceContext(), std::move(authzManager));
+        Client::releaseCurrent();
+        Client::initThread(getThreadName(), session);
+        authzSession = AuthorizationSession::get(getClient());
+        _opCtx = makeOperationContext();
 
-        auto localServiceLiason =
-            std::make_unique<MockServiceLiason>(std::make_shared<MockServiceLiasonImpl>());
+        auto localServiceLiaison =
+            std::make_unique<MockServiceLiaison>(std::make_shared<MockServiceLiaisonImpl>());
         auto localSessionsCollection = stdx::make_unique<MockSessionsCollection>(
             std::make_shared<MockSessionsCollectionImpl>());
 
         auto localLogicalSessionCache = std::make_unique<LogicalSessionCacheImpl>(
-            std::move(localServiceLiason), std::move(localSessionsCollection), nullptr);
+            std::move(localServiceLiaison), std::move(localSessionsCollection), nullptr);
 
-        LogicalSessionCache::set(&serviceContext, std::move(localLogicalSessionCache));
+        LogicalSessionCache::set(getServiceContext(), std::move(localLogicalSessionCache));
     }
 
     User* addSimpleUser(UserName un) {
@@ -248,7 +235,7 @@ TEST_F(LogicalSessionIdTest, GenWithoutAuthedUser) {
 
 TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_NoSessionIdNoTransactionNumber) {
     addSimpleUser(UserName("simple", "test"));
-    initializeOperationSessionInfo(_opCtx.get(), BSON("TestCmd" << 1), true, true, true);
+    initializeOperationSessionInfo(_opCtx.get(), BSON("TestCmd" << 1), true, true, true, true);
 
     ASSERT(!_opCtx->getLogicalSessionId());
     ASSERT(!_opCtx->getTxnNumber());
@@ -262,6 +249,7 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SessionIdNoTransacti
     initializeOperationSessionInfo(_opCtx.get(),
                                    BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "OtherField"
                                                   << "TestField"),
+                                   true,
                                    true,
                                    true,
                                    true);
@@ -280,6 +268,7 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_MissingSessionIdWith
                                                       << "TestField"),
                                        true,
                                        true,
+                                       true,
                                        true),
         AssertionException,
         ErrorCodes::InvalidOptions);
@@ -294,6 +283,7 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SessionIdAndTransact
         _opCtx.get(),
         BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber" << 100LL << "OtherField"
                        << "TestField"),
+        true,
         true,
         true,
         true);
@@ -317,6 +307,7 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_IsReplSetMemberOrMon
                            << "TestField"),
             true,
             false,
+            true,
             true),
         AssertionException,
         ErrorCodes::IllegalOperation);
@@ -334,9 +325,47 @@ TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SupportsDocLockingFa
                            << "TestField"),
             true,
             true,
+            false,
+            true),
+        AssertionException,
+        ErrorCodes::IllegalOperation);
+}
+
+TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_SupportsRecoverToStableTimestampFalse) {
+    addSimpleUser(UserName("simple", "test"));
+    LogicalSessionFromClient lsid;
+    lsid.setId(UUID::gen());
+
+    ASSERT_THROWS_CODE(
+        initializeOperationSessionInfo(
+            _opCtx.get(),
+            BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber" << 100LL << "OtherField"
+                           << "TestField"
+                           << "autocommit"
+                           << false),
+            true,
+            true,
+            true,
             false),
         AssertionException,
         ErrorCodes::IllegalOperation);
+}
+
+TEST_F(LogicalSessionIdTest, InitializeOperationSessionInfo_IgnoresInfoIfNoCache) {
+    addSimpleUser(UserName("simple", "test"));
+    LogicalSessionFromClient lsid;
+    lsid.setId(UUID::gen());
+
+    LogicalSessionCache::set(_opCtx->getServiceContext(), nullptr);
+
+    ASSERT_FALSE(initializeOperationSessionInfo(
+        _opCtx.get(),
+        BSON("TestCmd" << 1 << "lsid" << lsid.toBSON() << "txnNumber" << 100LL << "OtherField"
+                       << "TestField"),
+        true,
+        true,
+        true,
+        true));
 }
 
 TEST_F(LogicalSessionIdTest, ConstructorFromClientWithTooLongName) {

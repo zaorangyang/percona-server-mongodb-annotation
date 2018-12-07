@@ -35,7 +35,6 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/index_create.h"
@@ -49,8 +48,7 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/service_context_d.h"
-#include "mongo/db/service_context_registrar.h"
+#include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/dbtests/framework.h"
 #include "mongo/scripting/engine.h"
@@ -123,6 +121,39 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
     return Status::OK();
 }
 
+WriteContextForTests::WriteContextForTests(OperationContext* opCtx, StringData ns)
+    : _opCtx(opCtx), _nss(ns) {
+    // Lock the database and collection
+    _autoCreateDb.emplace(opCtx, _nss.db(), MODE_IX);
+    _collLock.emplace(opCtx->lockState(), _nss.ns(), MODE_IX);
+
+    const bool doShardVersionCheck = false;
+
+    _clientContext.emplace(opCtx, _nss.ns(), doShardVersionCheck);
+    invariant(_autoCreateDb->getDb() == _clientContext->db());
+
+    // If the collection exists, there is no need to lock into stronger mode
+    if (getCollection())
+        return;
+
+    // If the database was just created, it is already locked in MODE_X so we can skip the relocking
+    // code below
+    if (_autoCreateDb->justCreated()) {
+        dassert(opCtx->lockState()->isDbLockedForMode(_nss.db(), MODE_X));
+        return;
+    }
+
+    // If the collection doesn't exists, put the context in a state where the database is locked in
+    // MODE_X so that the collection can be created
+    _clientContext.reset();
+    _collLock.reset();
+    _autoCreateDb.reset();
+    _autoCreateDb.emplace(opCtx, _nss.db(), MODE_X);
+
+    _clientContext.emplace(opCtx, _nss.ns(), _autoCreateDb->getDb());
+    invariant(_autoCreateDb->getDb() == _clientContext->db());
+}
+
 }  // namespace dbtests
 }  // namespace mongo
 
@@ -134,10 +165,11 @@ int dbtestsMain(int argc, char** argv, char** envp) {
 
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40);
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     repl::ReplSettings replSettings;
     replSettings.setOplogSizeBytes(10 * 1024 * 1024);
     ServiceContext* service = getGlobalServiceContext();
+    service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
 
     auto logicalClock = stdx::make_unique<LogicalClock>(service);
     LogicalClock::set(service, std::move(logicalClock));

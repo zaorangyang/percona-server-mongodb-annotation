@@ -5,13 +5,13 @@ env = env.Clone()
 
 env.SConscript(
     dirs=[
+        'biggie',
         'devnull',
         'ephemeral_for_test',
         'inmemory',
         'kv',
-        'mmap_v1',
-        'wiredtiger',
         'mobile',
+        'wiredtiger',
     ],
     exports=[
         'env'
@@ -200,6 +200,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         'storage_engine_lock_file',
         'storage_engine_metadata',
         'storage_options',
@@ -245,9 +246,6 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/storage/mmap_v1/paths',
     ],
 )
 

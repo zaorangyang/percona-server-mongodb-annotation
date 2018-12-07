@@ -39,7 +39,9 @@
 #include <limits>
 #include <string>
 
+#include "mongo/base/init.h"
 #include "mongo/client/connection_string.h"
+#include "mongo/client/dbclient_connection.h"
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/executor/connection_pool_stats.h"
@@ -670,5 +672,15 @@ void ScopedDbConnection::clearPool() {
 }
 
 AtomicInt32 AScopedConnection::_numConnections;
+
+MONGO_INITIALIZER(SetupDBClientBaseWithConnection)(InitializerContext*) {
+    DBClientBase::withConnection_do_not_use = [](std::string host,
+                                                 std::function<void(DBClientBase*)> cb) {
+        ScopedDbConnection conn(host);
+        cb(conn.get());
+        conn.done();
+    };
+    return Status::OK();
+}
 
 }  // namespace mongo

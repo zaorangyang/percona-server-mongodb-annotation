@@ -8,9 +8,12 @@ selector:
   exclude_files:
   # In MongoDB 4.0, transactions are not supported in sharded clusters.
   - jstests/core/txns/**/*.js
+  # Not expected to pass with replica-sets.
+  - jstests/core/opcounters_write_cmd.js
   # The following tests fail because a certain command or functionality is not supported by
   # mongos. This command or functionality is placed in a comment next to the failing test.
-  - jstests/core/apitest_db.js  # profiling.
+  - jstests/core/apitest_db.js  # serverStatus output doesn't have storageEngine.
+  - jstests/core/apitest_db_profile_level.js  # profiling.
   - jstests/core/apply_ops*.js  # applyOps, SERVER-1439.
   - jstests/core/bypass_doc_validation.js  # copyDatabase
   - jstests/core/capped*.js  # capped collections.
@@ -27,7 +30,6 @@ selector:
   - jstests/core/diagdata.js # Command not supported in mongos
   - jstests/core/do_txn*.js # doTxn
   - jstests/core/dropdb_race.js  # syncdelay.
-  - jstests/core/evalb.js  # profiling.
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_haystack*.js  # geoSearch.
   - jstests/core/geo_update_btree2.js  # notablescan.
@@ -80,43 +82,6 @@ selector:
   - jstests/core/queryoptimizer3.js
   # TODO: SERVER-27269: mongos can't establish cursor if view has $collStats and views another view.
   - jstests/core/views/views_coll_stats.js
-  # Tests that won't work with an injected 'majority' readConcern
-  # and/or an injected 'majority' writeConcern. Where a function is
-  # listed the reason is we don't have a reliable solution to override
-  # the write concern for that function.
-  - jstests/core/batch_write_command*.js # these tests use various write concerns
-  - jstests/core/bench_test*.js # benchRun() used for writes
-  - jstests/core/crud_api.js # has specific w:0 tests
-  - jstests/core/error2.js # db.eval() used
-  - jstests/core/eval0.js # db.eval() used
-  - jstests/core/eval1.js # db.eval() used
-  - jstests/core/eval3.js # db.eval() used
-  - jstests/core/eval4.js # db.eval() used
-  - jstests/core/eval5.js # db.eval() used
-  - jstests/core/eval6.js # db.eval() used
-  - jstests/core/eval7.js # db.eval() used
-  - jstests/core/eval9.js # db.eval() used
-  - jstests/core/evala.js # db.eval() used
-  - jstests/core/evald.js # db.eval() used
-  - jstests/core/evale.js # db.eval() used
-  - jstests/core/evalg.js # db.eval() used
-  - jstests/core/eval_mr.js # db.eval() used
-  - jstests/core/eval_nolock.js # db.eval() used
-  - jstests/core/js3.js # db.dbEval() used
-  - jstests/core/js7.js # db.eval() used
-  - jstests/core/js9.js # db.eval() used
-  - jstests/core/mr_merge.js # mr temp tables aren't replicated
-  - jstests/core/mr_merge2.js # mr temp tables aren't replicated
-  - jstests/core/mr_outreduce.js # mr temp tables aren't replicated
-  - jstests/core/mr_outreduce2.js # mr temp tables aren't replicated
-  - jstests/core/opcounters_active.js  # off by n problem with opcounters
-  - jstests/core/opcounters_write_cmd.js # off by n problem with opcounters
-  - jstests/core/remove8.js # db.eval() used
-  - jstests/core/shell1.js # tests setSlaveOk() variations on standalone mongod
-  - jstests/core/shellkillop.js # db.eval() used
-  - jstests/core/shell_writeconcern.js # checks write concern shell helpers
-  - jstests/core/storefunc.js # db.eval() used
-  - jstests/core/write_result.js # Tests invalid writeConcern, we shouldn't override.
   # Tests that need triaging & remediation | blacklist decision
   # Comments list possible problem point under review.
   - jstests/core/stages_delete.js # Uses stageDebug command for deletes.
@@ -149,11 +114,7 @@ selector:
   - jstests/core/fts_spanish.js
   - jstests/core/geo_distinct.js
   - jstests/core/geo_s2ordering.js
-  - jstests/core/group1.js
-  - jstests/core/group2.js
-  - jstests/core/maxscan.js
   - jstests/core/nan.js
-  - jstests/core/null2.js
   - jstests/core/not2.js
   - jstests/core/sorta.js
   - jstests/core/sortc.js
@@ -175,8 +136,6 @@ selector:
   - jstests/core/orf.js #explain.executionStats is not CC
   # The `dbstats` command builds in-memory structures that are not causally consistent.
   - jstests/core/dbstats.js
-  # TODO SERVER-34248
-  - jstests/core/function_string_representations.js
   # TODO SERVER-33248: Remove this test from the blacklist. The secondary can get stuck without a
   # sync source if the RestartCatalog command kills its oplog fetching cursor, which blocks
   # secondary majority reads.
@@ -224,7 +183,6 @@ executor:
             verbosity: 1
             asio: 2
     mongod_options:
-      nopreallocj: ''
       enableMajorityReadConcern: ''
       set_parameters:
         enableTestCommands: 1

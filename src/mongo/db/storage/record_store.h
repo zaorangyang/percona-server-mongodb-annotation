@@ -90,11 +90,6 @@ struct Record {
     RecordData data;
 };
 
-struct BsonRecord {
-    RecordId id;
-    const BSONObj* docPtr;
-};
-
 enum ValidateCmdLevel : int {
     kValidateIndex = 0x01,
     kValidateRecordStore = 0x02,
@@ -271,9 +266,10 @@ public:
 };
 
 /**
- * A RecordStore provides an abstraction used for storing documents in a collection,
- * or entries in an index. In storage engines implementing the KVEngine, record stores
- * are also used for implementing catalogs.
+ * An abstraction used for storing documents in a collection or entries in an index.
+ *
+ * In storage engines implementing the KVEngine, record stores are also used for implementing
+ * catalogs.
  *
  * Many methods take an OperationContext parameter. This contains the RecoveryUnit, with
  * all RecordStore specific transaction information, as well as the LockState. Methods that take
@@ -299,6 +295,8 @@ public:
     virtual const std::string& ns() const {
         return _ns;
     }
+
+    virtual const std::string& getIdent() const = 0;
 
     /**
      * The dataSize is an approximation of the sum of the sizes (in bytes) of the
@@ -374,20 +372,15 @@ public:
     virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
                                               const char* data,
                                               int len,
-                                              Timestamp timestamp,
-                                              bool enforceQuota) = 0;
+                                              Timestamp timestamp) = 0;
 
     virtual Status insertRecords(OperationContext* opCtx,
                                  std::vector<Record>* records,
-                                 std::vector<Timestamp>* timestamps,
-                                 bool enforceQuota) {
+                                 std::vector<Timestamp>* timestamps) {
         int index = 0;
         for (auto& record : *records) {
-            StatusWith<RecordId> res = insertRecord(opCtx,
-                                                    record.data.data(),
-                                                    record.data.size(),
-                                                    (*timestamps)[index++],
-                                                    enforceQuota);
+            StatusWith<RecordId> res =
+                insertRecord(opCtx, record.data.data(), record.data.size(), (*timestamps)[index++]);
             if (!res.isOK())
                 return res.getStatus();
 
@@ -428,19 +421,11 @@ public:
      * @param notifier - Only used by record stores which do not support doc-locking. Called only
      *                   in the case of an in-place update. Called just before the in-place write
      *                   occurs.
-     * @return Status  - If a document move is required (MMAPv1 only) then a status of
-     *                   ErrorCodes::NeedsDocumentMove will be returned. On receipt of this status
-     *                   no update will be performed. It is the caller's responsibility to:
-     *                     1. Remove the existing document and associated index keys.
-     *                     2. Insert a new document and index keys.
-     *
-     * For capped record stores, the record size will never change.
      */
     virtual Status updateRecord(OperationContext* opCtx,
                                 const RecordId& oldLocation,
                                 const char* data,
                                 int len,
-                                bool enforceQuota,
                                 UpdateNotifier* notifier) = 0;
 
     /**

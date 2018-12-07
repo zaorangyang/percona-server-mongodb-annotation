@@ -52,7 +52,7 @@ namespace mongo {
 namespace repl {
 
 // Failpoint which causes the initial sync function to hang before running listCollections.
-MONGO_FP_DECLARE(initialSyncHangBeforeListCollections);
+MONGO_FAIL_POINT_DEFINE(initialSyncHangBeforeListCollections);
 
 namespace {
 
@@ -72,12 +72,9 @@ MONGO_EXPORT_STARTUP_SERVER_PARAMETER(collectionClonerBatchSize, int, kUseARMDef
 // The number of attempts for the listCollections commands.
 MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncListCollectionsAttempts, int, 3);
 
-// The number of cursors to use in the collection cloning process.
-MONGO_EXPORT_SERVER_PARAMETER(maxNumInitialSyncCollectionClonerCursors, int, 1);
-
 // Failpoint which causes initial sync to hang right after listCollections, but before cloning
 // any colelctions in the 'database' database.
-MONGO_FP_DECLARE(initialSyncHangAfterListCollections);
+MONGO_FAIL_POINT_DEFINE(initialSyncHangAfterListCollections);
 
 /**
  * Default listCollections predicate.
@@ -402,8 +399,7 @@ void DatabaseCloner::_listCollectionsCallback(const StatusWith<Fetcher::QueryRes
                 options,
                 [=](const Status& status) { return _collectionClonerCallback(status, nss); },
                 _storageInterface,
-                collectionClonerBatchSize,
-                maxNumInitialSyncCollectionClonerCursors.load());
+                collectionClonerBatchSize);
         } catch (const AssertionException& ex) {
             _finishCallback_inlock(lk, ex.toStatus());
             return;

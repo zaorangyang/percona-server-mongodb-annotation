@@ -44,7 +44,7 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/server_options.h"
-#include "mongo/db/service_context_noop.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/views/durable_view_catalog.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_catalog.h"
@@ -231,6 +231,21 @@ TEST_F(ReplViewCatalogFixture, CreateViewWithPipelineFailsOnIneligibleStage) {
 
     // $changeStream cannot be used in a view definition pipeline.
     auto invalidPipeline = BSON_ARRAY(BSON("$changeStream" << BSONObj()));
+
+    ASSERT_THROWS_CODE(
+        viewCatalog.createView(opCtx.get(), viewName, viewOn, invalidPipeline, emptyCollation)
+            .ignore(),
+        AssertionException,
+        ErrorCodes::OptionNotSupportedOnView);
+}
+
+TEST_F(ReplViewCatalogFixture, CreateViewWithPipelineFailsOnIneligibleStagePersistentWrite) {
+    const NamespaceString viewName("db.view");
+    const NamespaceString viewOn("db.coll");
+
+    // $out cannot be used in a view definition pipeline.
+    auto invalidPipeline = BSON_ARRAY(BSON("$out"
+                                           << "someOtherCollection"));
 
     ASSERT_THROWS_CODE(
         viewCatalog.createView(opCtx.get(), viewName, viewOn, invalidPipeline, emptyCollation)

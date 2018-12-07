@@ -117,7 +117,7 @@ TEST_F(AddFieldsTest, ShouldAddReferencedFieldsToDependencies) {
         fromjson("{a: true, x: '$b', y: {$and: ['$c','$d']}, z: {$meta: 'textScore'}}"),
         getExpCtx());
     DepsTracker dependencies(DepsTracker::MetadataAvailable::kTextScore);
-    ASSERT_EQUALS(DocumentSource::SEE_NEXT, addFields->getDependencies(&dependencies));
+    ASSERT_EQUALS(DepsTracker::State::SEE_NEXT, addFields->getDependencies(&dependencies));
     ASSERT_EQUALS(3U, dependencies.fields.size());
 
     // No implicit _id dependency.
@@ -133,7 +133,7 @@ TEST_F(AddFieldsTest, ShouldAddReferencedFieldsToDependencies) {
     ASSERT_EQUALS(1U, dependencies.fields.count("c"));
     ASSERT_EQUALS(1U, dependencies.fields.count("d"));
     ASSERT_EQUALS(false, dependencies.needWholeDocument);
-    ASSERT_EQUALS(true, dependencies.getNeedTextScore());
+    ASSERT_EQUALS(true, dependencies.getNeedsMetadata(DepsTracker::MetadataType::TEXT_SCORE));
 }
 
 TEST_F(AddFieldsTest, ShouldPropagatePauses) {

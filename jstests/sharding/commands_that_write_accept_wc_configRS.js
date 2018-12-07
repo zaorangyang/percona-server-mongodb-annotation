@@ -8,8 +8,7 @@
  * commands fail, they should return an actual error, not just a writeConcernError.
  *
  * This test is labeled resource intensive because its total io_write is 70MB compared to a median
- * of 5MB across all sharding tests in wiredTiger. Its total io_write is 1900MB compared to a median
- * of 135MB in mmapv1.
+ * of 5MB across all sharding tests in wiredTiger.
  * @tags: [resource_intensive]
  */
 load('jstests/libs/write_concern_util.js');
@@ -17,6 +16,10 @@ load('jstests/multiVersion/libs/auth_helpers.js');
 
 (function() {
     "use strict";
+
+    // TODO SERVER-35447: Multiple users cannot be authenticated on one connection within a session.
+    TestData.disableImplicitSessions = true;
+
     var st = new ShardingTest({
         shards: {
             rs0: {nodes: 3, settings: {chainingAllowed: false}},

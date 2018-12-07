@@ -209,6 +209,13 @@ public:
     }
 
     /**
+     * This must not change over the lifetime of the engine.
+     */
+    virtual bool supportsCappedCollections() const {
+        return true;
+    }
+
+    /**
      * Returns true if storage engine supports --directoryperdb.
      * See:
      *     http://docs.mongodb.org/manual/reference/program/mongod/#cmdoption--directoryperdb
@@ -262,9 +269,26 @@ public:
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) {}
 
     /**
+     * See `StorageEngine::setOldestTimestampFromStable`
+     */
+    virtual void setOldestTimestampFromStable() {}
+
+    /**
      * See `StorageEngine::setOldestTimestamp`
      */
-    virtual void setOldestTimestamp(Timestamp oldestTimestamp) {}
+    virtual void setOldestTimestamp(Timestamp newOldestTimestamp) {}
+
+    /**
+     * See `StorageEngine::isCacheUnderPressure()`
+     */
+    virtual bool isCacheUnderPressure(OperationContext* opCtx) const {
+        return false;
+    }
+
+    /**
+     * See 'StorageEngine::setCachePressureForTest()'
+     */
+    virtual void setCachePressureForTest(int pressure) {}
 
     /**
      * See `StorageEngine::supportsRecoverToStableTimestamp`

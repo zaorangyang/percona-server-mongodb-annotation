@@ -125,10 +125,11 @@ env.Library(
         'legacy_reply_builder.cpp'
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/s/common_s',
+        '$BUILD_DIR/mongo/util/net/network',
         'command_reply',
         'metadata',
         'object_check',
-        '$BUILD_DIR/mongo/util/net/network',
     ],
 )
 
@@ -207,7 +208,7 @@ env.CppUnitTest(
         'reply_builder_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/client/clientdriver_minimal',
         'rpc',
     ],
 )
@@ -245,7 +246,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/s/is_mongos',
-        '$BUILD_DIR/mongo/transport/transport_layer',
+        '$BUILD_DIR/mongo/transport/transport_layer_common',
         "$BUILD_DIR/mongo/util/concurrency/spin_lock",
         '$BUILD_DIR/mongo/util/net/network',
         "$BUILD_DIR/mongo/util/processinfo",
@@ -269,7 +270,8 @@ env.CppIntegrationTest(
     ],
     LIBDEPS=[
         'protocol',
-        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/client/clientdriver_network',
+        '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
         '$BUILD_DIR/mongo/util/version_impl',
     ],
 )

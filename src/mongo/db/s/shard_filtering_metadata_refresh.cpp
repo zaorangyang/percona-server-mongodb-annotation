@@ -49,7 +49,8 @@ namespace mongo {
 
 Status onShardVersionMismatch(OperationContext* opCtx,
                               const NamespaceString& nss,
-                              ChunkVersion shardVersionReceived) noexcept {
+                              ChunkVersion shardVersionReceived,
+                              bool forceRefreshFromThisThread) noexcept {
     invariant(!opCtx->lockState()->isLocked());
     invariant(!opCtx->getClient()->isInDirectClient());
 
@@ -74,7 +75,7 @@ Status onShardVersionMismatch(OperationContext* opCtx,
     const auto currentShardVersion = [&] {
         AutoGetCollection autoColl(opCtx, nss, MODE_IS);
         const auto currentMetadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
-        if (currentMetadata) {
+        if (currentMetadata->isSharded()) {
             return currentMetadata->getShardVersion();
         }
 
@@ -89,7 +90,7 @@ Status onShardVersionMismatch(OperationContext* opCtx,
     }
 
     try {
-        forceShardFilteringMetadataRefresh(opCtx, nss);
+        forceShardFilteringMetadataRefresh(opCtx, nss, forceRefreshFromThisThread);
         return Status::OK();
     } catch (const DBException& ex) {
         log() << "Failed to refresh metadata for collection" << nss << causedBy(redact(ex));
@@ -98,15 +99,17 @@ Status onShardVersionMismatch(OperationContext* opCtx,
 }
 
 ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
-                                                const NamespaceString& nss) {
+                                                const NamespaceString& nss,
+                                                bool forceRefreshFromThisThread) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(!opCtx->getClient()->isInDirectClient());
 
     auto const shardingState = ShardingState::get(opCtx);
     invariant(shardingState->canAcceptShardedCommands());
 
-    const auto routingInfo = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx, nss));
+    const auto routingInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(
+            opCtx, nss, forceRefreshFromThisThread));
     const auto cm = routingInfo.cm();
 
     if (!cm) {
@@ -126,7 +129,8 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
         auto metadata = CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
 
         // We already have newer version
-        if (metadata && metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
+        if (metadata->isSharded() &&
+            metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
             metadata->getCollVersion() >= cm->getVersion()) {
             LOG(1) << "Skipping refresh of metadata for " << nss << " "
                    << metadata->getCollVersion() << " with an older " << cm->getVersion();
@@ -141,7 +145,7 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     auto metadata = css->getMetadata(opCtx);
 
     // We already have newer version
-    if (metadata && metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
+    if (metadata->isSharded() && metadata->getCollVersion().epoch() == cm->getVersion().epoch() &&
         metadata->getCollVersion() >= cm->getVersion()) {
         LOG(1) << "Skipping refresh of metadata for " << nss << " " << metadata->getCollVersion()
                << " with an older " << cm->getVersion();
@@ -201,39 +205,13 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
         uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, dbName))
             .databaseVersion();
 
-    // Only set the in-memory version in FCV 4.0, and hold the lock across checking the FCV and
-    // setting the version.
-    Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
-    if (serverGlobalParams.featureCompatibility.getVersion() ==
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40) {
-        // First, check under a shared lock if another thread already updated the cached version.
-        // This is a best-effort optimization to make as few threads as possible to convoy on the
-        // exclusive lock below.
-        {
-            // Take the DBLock directly rather than using AutoGetDb, to prevent a recursive call
-            // into checkDbVersion().
-            Lock::DBLock dbLock(opCtx, dbName, MODE_IS);
-            const auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, dbName);
-            if (!db) {
-                log() << "Database " << dbName
-                      << " has been dropped; not caching the refreshed databaseVersion";
-                return;
-            }
-
-            const auto cachedDbVersion = DatabaseShardingState::get(db).getDbVersion(opCtx);
-            if (cachedDbVersion && refreshedDbVersion &&
-                cachedDbVersion->getUuid() == refreshedDbVersion->getUuid() &&
-                cachedDbVersion->getLastMod() >= refreshedDbVersion->getLastMod()) {
-                LOG(2) << "Skipping setting cached databaseVersion for " << dbName
-                       << " to refreshed version " << refreshedDbVersion->toBSON()
-                       << " because current cached databaseVersion is already "
-                       << cachedDbVersion->toBSON();
-                return;
-            }
-        }
-
-        // The cached version is older than the refreshed version; update the cached version.
-        Lock::DBLock dbLock(opCtx, dbName, MODE_X);
+    // First, check under a shared lock if another thread already updated the cached version.
+    // This is a best-effort optimization to make as few threads as possible to convoy on the
+    // exclusive lock below.
+    {
+        // Take the DBLock directly rather than using AutoGetDb, to prevent a recursive call
+        // into checkDbVersion().
+        Lock::DBLock dbLock(opCtx, dbName, MODE_IS);
         const auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, dbName);
         if (!db) {
             log() << "Database " << dbName
@@ -241,8 +219,27 @@ void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName) {
             return;
         }
 
-        DatabaseShardingState::get(db).setDbVersion(opCtx, std::move(refreshedDbVersion));
+        const auto cachedDbVersion = DatabaseShardingState::get(db).getDbVersion(opCtx);
+        if (cachedDbVersion && cachedDbVersion->getUuid() == refreshedDbVersion.getUuid() &&
+            cachedDbVersion->getLastMod() >= refreshedDbVersion.getLastMod()) {
+            LOG(2) << "Skipping setting cached databaseVersion for " << dbName
+                   << " to refreshed version " << refreshedDbVersion.toBSON()
+                   << " because current cached databaseVersion is already "
+                   << cachedDbVersion->toBSON();
+            return;
+        }
     }
+
+    // The cached version is older than the refreshed version; update the cached version.
+    Lock::DBLock dbLock(opCtx, dbName, MODE_X);
+    const auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, dbName);
+    if (!db) {
+        log() << "Database " << dbName
+              << " has been dropped; not caching the refreshed databaseVersion";
+        return;
+    }
+
+    DatabaseShardingState::get(db).setDbVersion(opCtx, std::move(refreshedDbVersion));
 }
 
 }  // namespace mongo
