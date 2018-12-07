@@ -1,7 +1,7 @@
 #
 %define         mongo_home /var/lib/mongo
 #
-Name:           Percona-Server-MongoDB
+Name:           percona-server-mongodb
 Version:        @@VERSION@@
 Release:        @@RELEASE@@%{?dist}
 Summary:        High-performance MongoDB replacement from Percona (metapackage)
