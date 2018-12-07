@@ -58,19 +58,19 @@ namespace mongo {
 
         auditOptions.addOptionChaining("auditLog.destination", "auditDestination", optionenvironment::String,
                 "Output type: enables auditing functionality",
-                "audit.destination");
+                {"audit.destination"});
 
         auditOptions.addOptionChaining("auditLog.format", "auditFormat", optionenvironment::String,
                 "Output format (supported formats are JSON and BSON; defaults to JSON)",
-                "audit.format");
+                {"audit.format"});
 
         auditOptions.addOptionChaining("auditLog.filter", "auditFilter", optionenvironment::String,
                 "JSON query filter on events, users, etc.",
-                "audit.filter");
+                {"audit.filter"});
 
         auditOptions.addOptionChaining("auditLog.path", "auditPath", optionenvironment::String,
                 "Event destination file path and name",
-                "audit.path");
+                {"audit.path"});
 
         Status ret = options->addSection(auditOptions);
         if (!ret.isOK()) {
