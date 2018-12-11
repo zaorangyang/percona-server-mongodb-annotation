@@ -38,9 +38,10 @@ load("jstests/libs/analyze_plan.js");
             }
         });
         replTest.startSet();
-        // Cannot wait for a stable checkpoint with 'testingSnapshotBehaviorInIsolation' set.
+        // Cannot wait for a stable recovery timestamp with 'testingSnapshotBehaviorInIsolation'
+        // set.
         replTest.initiateWithAnyNodeAsPrimary(
-            null, "replSetInitiate", {doNotWaitForStableCheckpoint: true});
+            null, "replSetInitiate", {doNotWaitForStableRecoveryTimestamp: true});
 
         const session =
             replTest.getPrimary().getDB("test").getMongo().startSession({causalConsistency: false});
@@ -51,7 +52,7 @@ load("jstests/libs/analyze_plan.js");
             var res =
                 t.runCommand('find', {batchSize: 2, readConcern: {level: level}, maxTimeMS: 1000});
             assert.commandFailed(res);
-            assert.eq(res.code, ErrorCodes.ExceededTimeLimit);
+            assert.eq(res.code, ErrorCodes.MaxTimeMSExpired);
         }
 
         function getCursorForReadConcernLevel() {
@@ -179,16 +180,6 @@ load("jstests/libs/analyze_plan.js");
         assertNoSnapshotAvailableForReadConcernLevel();
         assert.commandWorked(db.adminCommand({"setCommittedSnapshot": newSnapshot}));
         assert.eq(getCursorForReadConcernLevel().itcount(), 10);
-
-        // Repair bumps the min snapshot.
-        assert.writeOK(t.bump.insert({a: 1}));  // Bump timestamp.
-        db.repairDatabase();
-        assertNoSnapshotAvailableForReadConcernLevel();
-        newSnapshot = assert.commandWorked(db.adminCommand("makeSnapshot")).name;
-        assertNoSnapshotAvailableForReadConcernLevel();
-        assert.commandWorked(db.adminCommand({"setCommittedSnapshot": newSnapshot}));
-        assert.eq(getCursorForReadConcernLevel().itcount(), 10);
-        assert.eq(getAggCursorForReadConcernLevel().itcount(), 10);
 
         // Dropping the collection is visible in the committed snapshot, even though it hasn't been
         // marked committed yet. This is allowed by the current specification even though it

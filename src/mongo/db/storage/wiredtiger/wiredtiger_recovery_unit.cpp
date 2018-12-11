@@ -241,7 +241,9 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     WT_SESSION* s = _session->getSession();
     if (_timer) {
         const int transactionTime = _timer->millis();
-        if (transactionTime >= serverGlobalParams.slowMS) {
+        // `serverGlobalParams.slowMs` can be set to values <= 0. In those cases, give logging a
+        // break.
+        if (transactionTime >= std::max(1, serverGlobalParams.slowMS)) {
             LOG(kSlowTransactionSeverity) << "Slow WT transaction. Lifetime of SnapshotId "
                                           << _mySnapshotId << " was " << transactionTime << "ms";
         }
@@ -423,7 +425,11 @@ Status WiredTigerRecoveryUnit::setTimestamp(Timestamp timestamp) {
 }
 
 void WiredTigerRecoveryUnit::setCommitTimestamp(Timestamp timestamp) {
-    invariant(!_inUnitOfWork);
+    // This can be called either outside of a WriteUnitOfWork or in a prepared transaction after
+    // setPrepareTimestamp() is called. Prepared transactions ensure the correct timestamping
+    // semantics and the set-once commitTimestamp behavior is exactly what prepared transactions
+    // want.
+    invariant(!_inUnitOfWork || !_prepareTimestamp.isNull());
     invariant(_commitTimestamp.isNull(),
               str::stream() << "Commit timestamp set to " << _commitTimestamp.toString()
                             << " and trying to set it to "
@@ -437,7 +443,7 @@ void WiredTigerRecoveryUnit::setCommitTimestamp(Timestamp timestamp) {
     _commitTimestamp = timestamp;
 }
 
-Timestamp WiredTigerRecoveryUnit::getCommitTimestamp() {
+Timestamp WiredTigerRecoveryUnit::getCommitTimestamp() const {
     return _commitTimestamp;
 }
 
@@ -526,7 +532,10 @@ WiredTigerCursor::WiredTigerCursor(const std::string& uri,
     _session = _ru->getSession();
     _cursor = _session->getCursor(uri, tableId, forRecordStore);
     if (!_cursor) {
-        error() << "no cursor for uri: " << uri;
+        // It could be an index file or a data file here.
+        error() << "Failed to get the cursor for uri: " << uri;
+        error() << "This may be due to missing data files. " << kWTRepairMsg;
+        fassertFailedNoTrace(50883);
     }
 }
 

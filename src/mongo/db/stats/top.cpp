@@ -85,8 +85,9 @@ void Top::record(OperationContext* opCtx,
     auto hashedNs = UsageMap::HashedKey(ns);
     stdx::lock_guard<SimpleMutex> lk(_lock);
 
-    if ((command || logicalOp == LogicalOp::opQuery) && ns == _lastDropped) {
-        _lastDropped = "";
+    if ((command || logicalOp == LogicalOp::opQuery) &&
+        _collDropNs.find(ns.toString()) != _collDropNs.end()) {
+        _collDropNs.erase(ns.toString());
         return;
     }
 
@@ -142,10 +143,11 @@ void Top::_record(OperationContext* opCtx,
 void Top::collectionDropped(StringData ns, bool databaseDropped) {
     stdx::lock_guard<SimpleMutex> lk(_lock);
     _usage.erase(ns);
+
     if (!databaseDropped) {
         // If a collection drop occurred, there will be a subsequent call to record for this
         // collection namespace which must be ignored. This does not apply to a database drop.
-        _lastDropped = ns.toString();
+        _collDropNs.insert(ns.toString());
     }
 }
 
@@ -216,6 +218,11 @@ void Top::incrementGlobalLatencyStats(OperationContext* opCtx,
 void Top::appendGlobalLatencyStats(bool includeHistograms, BSONObjBuilder* builder) {
     stdx::lock_guard<SimpleMutex> guard(_lock);
     _globalHistogramStats.append(includeHistograms, builder);
+}
+
+void Top::incrementGlobalTransactionLatencyStats(uint64_t latency) {
+    stdx::lock_guard<SimpleMutex> guard(_lock);
+    _globalHistogramStats.increment(latency, Command::ReadWriteType::kTransaction);
 }
 
 void Top::_incrementHistogram(OperationContext* opCtx,

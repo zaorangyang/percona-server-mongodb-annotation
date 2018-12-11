@@ -49,8 +49,8 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/stale_exception.h"
 
@@ -256,8 +256,8 @@ private:
     }
 
     void _transactionChecks(OperationContext* opCtx) const {
-        auto session = OperationContextSession::get(opCtx);
-        if (!session || !session->inMultiDocumentTransaction())
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        if (!txnParticipant || !txnParticipant->inMultiDocumentTransaction())
             return;
         uassert(50791,
                 str::stream() << "Cannot write to system collection " << ns().toString()
@@ -350,7 +350,7 @@ private:
 
         void explain(OperationContext* opCtx,
                      ExplainOptions::Verbosity verbosity,
-                     BSONObjBuilder* out) override {
+                     rpc::ReplyBuilderInterface* result) override {
             uassert(ErrorCodes::InvalidLength,
                     "explained write batches must be of size 1",
                     _batch.getUpdates().size() == 1);
@@ -376,7 +376,8 @@ private:
 
             auto exec = uassertStatusOK(getExecutorUpdate(
                 opCtx, &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedUpdate));
-            Explain::explainStages(exec.get(), collection.getCollection(), verbosity, out);
+            auto bodyBuilder = result->getBodyBuilder();
+            Explain::explainStages(exec.get(), collection.getCollection(), verbosity, &bodyBuilder);
         }
 
         write_ops::Update _batch;
@@ -426,7 +427,7 @@ private:
 
         void explain(OperationContext* opCtx,
                      ExplainOptions::Verbosity verbosity,
-                     BSONObjBuilder* out) override {
+                     rpc::ReplyBuilderInterface* result) override {
             uassert(ErrorCodes::InvalidLength,
                     "explained write batches must be of size 1",
                     _batch.getDeletes().size() == 1);
@@ -448,7 +449,8 @@ private:
             // Explain the plan tree.
             auto exec = uassertStatusOK(getExecutorDelete(
                 opCtx, &CurOp::get(opCtx)->debug(), collection.getCollection(), &parsedDelete));
-            Explain::explainStages(exec.get(), collection.getCollection(), verbosity, out);
+            auto bodyBuilder = result->getBodyBuilder();
+            Explain::explainStages(exec.get(), collection.getCollection(), verbosity, &bodyBuilder);
         }
 
         write_ops::Delete _batch;

@@ -258,8 +258,6 @@ public:
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response) override;
 
-    virtual bool isV1ElectionProtocol() const override;
-
     virtual bool getWriteConcernMajorityShouldJournal() override;
 
     virtual void summarizeAsHtml(ReplSetHtmlSummary* s) override;
@@ -1009,13 +1007,6 @@ private:
      * Callback which starts an election if this node is electable and using protocolVersion 1.
      */
     void _startElectSelfIfEligibleV1(TopologyCoordinator::StartElectionReason reason);
-
-    /**
-     * Resets the term of last vote to 0 to prevent any node from voting for term 0.
-     */
-    void _resetElectionInfoOnProtocolVersionUpgrade(OperationContext* opCtx,
-                                                    const ReplSetConfig& oldConfig,
-                                                    const ReplSetConfig& newConfig);
 
     /**
      * Schedules work to be run no sooner than 'when' and returns handle to callback.

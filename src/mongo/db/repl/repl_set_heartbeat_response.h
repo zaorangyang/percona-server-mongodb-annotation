@@ -57,18 +57,18 @@ public:
     /**
      * Appends all non-default values to "builder".
      */
-    void addToBSON(BSONObjBuilder* builder, bool isProtocolVersionV1) const;
+    void addToBSON(BSONObjBuilder* builder) const;
 
     /**
      * Returns a BSONObj consisting of all non-default values to "builder".
      */
-    BSONObj toBSON(bool isProtocolVersionV1) const;
+    BSONObj toBSON() const;
 
     /**
      * Returns toBSON().toString()
      */
     const std::string toString() const {
-        return toBSON(true).toString();
+        return toBSON().toString();
     }
 
     const std::string& getReplicaSetName() const {
@@ -82,9 +82,6 @@ public:
         return _electionTimeSet;
     }
     Timestamp getElectionTime() const;
-    const std::string& getHbMsg() const {
-        return _hbmsg;
-    }
     const HostAndPort& getSyncingTo() const {
         return _syncingTo;
     }
@@ -132,13 +129,6 @@ public:
     void setElectionTime(Timestamp time) {
         _electionTimeSet = true;
         _electionTime = time;
-    }
-
-    /**
-     * Sets _hbmsg to "hbmsg".
-     */
-    void setHbMsg(std::string hbmsg) {
-        _hbmsg = hbmsg;
     }
 
     /**
@@ -194,7 +184,6 @@ private:
 
     int _configVersion = -1;
     std::string _setName;
-    std::string _hbmsg;
     HostAndPort _syncingTo;
 
     bool _configSet = false;

@@ -80,7 +80,7 @@ Status MobileIndex::insert(OperationContext* opCtx,
                            const BSONObj& key,
                            const RecordId& recId,
                            bool dupsAllowed) {
-    invariant(recId.isNormal());
+    invariant(recId.isValid());
     invariant(!hasFieldNames(key));
 
     Status status = _checkKeySize(key);
@@ -133,7 +133,7 @@ void MobileIndex::unindex(OperationContext* opCtx,
                           const BSONObj& key,
                           const RecordId& recId,
                           bool dupsAllowed) {
-    invariant(recId.isNormal());
+    invariant(recId.isValid());
     invariant(!hasFieldNames(key));
 
     return _unindex(opCtx, key, recId, dupsAllowed);
@@ -299,7 +299,7 @@ public:
     virtual ~BulkBuilderBase() {}
 
     Status addKey(const BSONObj& key, const RecordId& recId) override {
-        invariant(recId.isNormal());
+        invariant(recId.isValid());
         invariant(!hasFieldNames(key));
 
         Status status = _checkKeySize(key);
@@ -466,7 +466,9 @@ public:
 
     // All work is done in restore().
     void save() override {
-        _resetStatement();
+        // SQLite acquires implicit locks over the snapshot this cursor is using. It is important
+        // to finalize the corresponding statement to release these locks.
+        _stmt->finalize();
     }
 
     void saveUnpositioned() override {
@@ -477,6 +479,12 @@ public:
         if (_isEOF) {
             return;
         }
+
+        // Obtaining a session starts a read transaction if not done already.
+        MobileSession* session = MobileRecoveryUnit::get(_opCtx)->getSession(_opCtx);
+        // save() finalized this cursor's SQLite statement. We need to prepare a new statement,
+        // before re-positioning it at the saved state.
+        _stmt->prepare(*session);
 
         _startPosition.resetFromBuffer(_savedKey.getBuffer(), _savedKey.getSize());
         bool isExactMatch = _doSeek();

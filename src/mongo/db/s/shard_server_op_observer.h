@@ -30,7 +30,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/op_observer.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 
 namespace mongo {
 
@@ -132,9 +132,9 @@ public:
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid) override {}
 
-    void onTransactionCommit(OperationContext* opCtx) override {}
+    void onTransactionCommit(OperationContext* opCtx, bool wasPrepared) override {}
 
-    void onTransactionPrepare(OperationContext* opCtx) override {}
+    void onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) override {}
 
     void onTransactionAbort(OperationContext* opCtx) override {}
 
@@ -152,7 +152,7 @@ public:
  */
 struct ShardObserverDeleteState {
     static ShardObserverDeleteState make(OperationContext* opCtx,
-                                         CollectionShardingState* css,
+                                         CollectionShardingRuntime* css,
                                          const BSONObj& docToDelete);
     // Contains the fields of the document that are in the collection's shard key, and "_id".
     BSONObj documentKey;
@@ -164,16 +164,16 @@ struct ShardObserverDeleteState {
 };
 
 void shardObserveInsertOp(OperationContext* opCtx,
-                          CollectionShardingState* css,
+                          CollectionShardingRuntime* css,
                           const BSONObj& insertedDoc,
                           const repl::OpTime& opTime);
 void shardObserveUpdateOp(OperationContext* opCtx,
-                          CollectionShardingState* css,
+                          CollectionShardingRuntime* css,
                           const BSONObj& updatedDoc,
                           const repl::OpTime& opTime,
                           const repl::OpTime& prePostImageOpTime);
 void shardObserveDeleteOp(OperationContext* opCtx,
-                          CollectionShardingState* css,
+                          CollectionShardingRuntime* css,
                           const ShardObserverDeleteState& deleteState,
                           const repl::OpTime& opTime,
                           const repl::OpTime& preImageOpTime);

@@ -32,7 +32,9 @@
 
 #include <algorithm>
 #include <iterator>
+#include <set>
 
+#include "mongo/db/hasher.h"
 #include "mongo/db/pipeline/document_source_exchange.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/util/log.h"
@@ -79,20 +81,24 @@ DocumentSource::GetNextResult DocumentSourceExchange::getNext() {
 Exchange::Exchange(const ExchangeSpec& spec)
     : _spec(spec),
       _keyPattern(spec.getKey().getOwned()),
+      _ordering(extractOrdering(_keyPattern)),
       _boundaries(extractBoundaries(spec.getBoundaries())),
+      _consumerIds(extractConsumerIds(spec.getConsumerids(), spec.getConsumers())),
       _policy(spec.getPolicy()),
       _orderPreserving(spec.getOrderPreserving()),
       _maxBufferSize(spec.getBufferSize()) {
+    uassert(50901, "$exchange must have at least one consumer", spec.getConsumers() > 0);
+
     for (int idx = 0; idx < spec.getConsumers(); ++idx) {
         _consumers.emplace_back(std::make_unique<ExchangeBuffer>());
     }
 
-    if (_policy == ExchangePolicyEnum::kRange) {
-        uassert(ErrorCodes::BadValue,
-                "$exchange boundaries do not much number of consumers.",
-                getConsumers() + 1 == _boundaries.size());
-    } else if (_policy == ExchangePolicyEnum::kHash) {
-        uasserted(ErrorCodes::BadValue, "$exchange hash is not yet implemented.");
+    if (_policy == ExchangePolicyEnum::kRange || _policy == ExchangePolicyEnum::kHash) {
+        uassert(50900,
+                "$exchange boundaries do not match number of consumers.",
+                _boundaries.size() == _consumerIds.size() + 1);
+    } else {
+        uassert(50899, "$exchange boundaries must not be specified.", _boundaries.empty());
     }
 }
 
@@ -118,11 +124,67 @@ std::vector<std::string> Exchange::extractBoundaries(
     }
 
     for (size_t idx = 1; idx < ret.size(); ++idx) {
-        uassert(ErrorCodes::BadValue,
+        uassert(50893,
                 str::stream() << "$exchange range boundaries are not in ascending order.",
                 ret[idx - 1] < ret[idx]);
     }
     return ret;
+}
+
+std::vector<size_t> Exchange::extractConsumerIds(
+    const boost::optional<std::vector<std::int32_t>>& consumerIds, size_t nConsumers) {
+
+    std::vector<size_t> ret;
+
+    if (!consumerIds) {
+        // If the ids are not specified than we generate a simple sequence 0,1,2,3,...
+        for (size_t idx = 0; idx < nConsumers; ++idx) {
+            ret.push_back(idx);
+        }
+    } else {
+        // Validate that the ids are dense (no hole) and in the range [0,nConsumers)
+        std::set<size_t> validation;
+
+        for (auto cid : *consumerIds) {
+            validation.insert(cid);
+            ret.push_back(cid);
+        }
+
+        uassert(50894,
+                str::stream() << "$exchange consumers ids are invalid.",
+                nConsumers > 0 && validation.size() == nConsumers && *validation.begin() == 0 &&
+                    *validation.rbegin() == nConsumers - 1);
+    }
+    return ret;
+}
+
+Ordering Exchange::extractOrdering(const BSONObj& obj) {
+    bool hasHashKey = false;
+    bool hasOrderKey = false;
+
+    for (const auto& element : obj) {
+        if (element.type() == BSONType::String) {
+            uassert(50895,
+                    str::stream() << "$exchange key description is invalid: " << element,
+                    element.valueStringData() == "hashed"_sd);
+            hasHashKey = true;
+        } else if (element.isNumber()) {
+            auto num = element.number();
+            if (!(num == 1 || num == -1)) {
+                uasserted(50896,
+                          str::stream() << "$exchange key description is invalid: " << element);
+            }
+            hasOrderKey = true;
+        } else {
+            uasserted(50897, str::stream() << "$exchange key description is invalid: " << element);
+        }
+    }
+
+    uassert(50898,
+            str::stream() << "$exchange hash and order keys cannot be mixed together: " << obj,
+            !(hasHashKey && hasOrderKey));
+
+    return hasHashKey ? Ordering::make(BSONObj()) : Ordering::make(obj);
 }
 
 DocumentSource::GetNextResult Exchange::getNext(size_t consumerId) {
@@ -202,8 +264,7 @@ size_t Exchange::loadNextBatch() {
                     return target;
             } break;
             case ExchangePolicyEnum::kHash: {
-                // TODO implement the hash policy. Note that returning 0 is technically correct.
-                size_t target = 0;
+                size_t target = getTargetConsumer(input.getDocument());
                 bool full = _consumers[target]->appendDocument(std::move(input), _maxBufferSize);
                 if (full && _orderPreserving) {
                     // TODO send the high watermark here.
@@ -231,11 +292,16 @@ size_t Exchange::getTargetConsumer(const Document& input) {
     BSONObjBuilder kb;
     for (auto elem : _keyPattern) {
         auto value = input[elem.fieldName()];
-        kb << "" << value;
+        if (elem.type() == BSONType::String && elem.str() == "hashed") {
+            kb << "" << BSONElementHasher::hash64(BSON("" << value).firstElement(),
+                                                  BSONElementHasher::DEFAULT_HASH_SEED);
+        } else {
+            kb << "" << value;
+        }
     }
 
     // TODO implement hash keys for the hash policy.
-    KeyString key{KeyString::Version::V1, kb.obj(), Ordering::make(BSONObj())};
+    KeyString key{KeyString::Version::V1, kb.obj(), _ordering};
     std::string keyStr{key.getBuffer(), key.getSize()};
 
     // Binary search for the consumer id.
@@ -243,9 +309,12 @@ size_t Exchange::getTargetConsumer(const Document& input) {
     invariant(it != _boundaries.end());
 
     size_t distance = std::distance(_boundaries.begin(), it) - 1;
-    invariant(distance < _consumers.size());
+    invariant(distance < _consumerIds.size());
 
-    return distance;
+    size_t cid = _consumerIds[distance];
+    invariant(cid < _consumers.size());
+
+    return cid;
 }
 
 DocumentSource::GetNextResult Exchange::ExchangeBuffer::getNext() {

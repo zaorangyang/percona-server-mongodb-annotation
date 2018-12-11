@@ -27,6 +27,8 @@
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define LOG_FOR_ELECTION(level) \
+    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kReplicationElection)
 
 #include "mongo/platform/basic.h"
 
@@ -66,7 +68,7 @@
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/connection_pool_stats.h"
@@ -105,7 +107,7 @@ const OperationContext::Decoration<bool> alwaysAllowNonLocalWrites =
 
 MONGO_EXPORT_SERVER_PARAMETER(numInitialSyncAttempts, int, 10);
 
-MONGO_EXPORT_SERVER_PARAMETER(handOffElectionOnStepdown, bool, false);
+MONGO_EXPORT_SERVER_PARAMETER(enableElectionHandoff, bool, true);
 
 // Number of seconds between noop writer writes.
 MONGO_EXPORT_STARTUP_SERVER_PARAMETER(periodicNoopIntervalSecs, int, 10);
@@ -575,20 +577,29 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         }
     }
 
-    long long term = OpTime::kUninitializedTerm;
-    if (localConfig.getProtocolVersion() == 1) {
-        // Restore the current term according to the terms of last oplog entry and last vote.
-        // The initial term of OpTime() is 0.
-        term = lastOpTime.getTerm();
-        if (lastVoteStatus.isOK()) {
-            long long lastVoteTerm = lastVoteStatus.getValue().getTerm();
-            if (term < lastVoteTerm) {
-                term = lastVoteTerm;
-            }
+    // Restore the current term according to the terms of last oplog entry and last vote.
+    // The initial term of OpTime() is 0.
+    long long term = lastOpTime.getTerm();
+    if (lastVoteStatus.isOK()) {
+        long long lastVoteTerm = lastVoteStatus.getValue().getTerm();
+        if (term < lastVoteTerm) {
+            term = lastVoteTerm;
         }
     }
 
     auto opCtx = cc().makeOperationContext();
+    auto consistency = DataConsistency::Inconsistent;
+    if (!lastOpTime.isNull()) {
+
+        // If we have an oplog, it is still possible that our data is not in a consistent state. For
+        // example, if we are starting up after a crash following a post-rollback RECOVERING state.
+        // To detect this, we see if our last optime is >= the 'minValid' optime, which
+        // should be persistent across node crashes.
+        OpTime minValid = _replicationProcess->getConsistencyMarkers()->getMinValid(opCtx.get());
+        consistency =
+            (lastOpTime >= minValid) ? DataConsistency::Consistent : DataConsistency::Inconsistent;
+    }
+
     stdx::unique_lock<stdx::mutex> lock(_mutex);
     invariant(_rsConfigState == kConfigStartingUp);
     const PostMemberStateUpdateAction action =
@@ -597,15 +608,6 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     // Set our last applied and durable optimes to the top of the oplog, if we have one.
     if (!lastOpTime.isNull()) {
         bool isRollbackAllowed = false;
-
-        // If we have an oplog, it is still possible that our data is not in a consistent state. For
-        // example, if we are starting up after a crash following a post-rollback RECOVERING state.
-        // To detect this, we see if our last optime is >= the 'minValid' optime, which
-        // should be persistent across node crashes.
-        OpTime minValid = _replicationProcess->getConsistencyMarkers()->getMinValid(opCtx.get());
-        auto consistency =
-            (lastOpTime >= minValid) ? DataConsistency::Consistent : DataConsistency::Inconsistent;
-
         _setMyLastAppliedOpTime_inlock(lastOpTime, isRollbackAllowed, consistency);
         _setMyLastDurableOpTime_inlock(lastOpTime, isRollbackAllowed);
         _reportUpstream_inlock(std::move(lock));  // unlocks _mutex.
@@ -996,7 +998,7 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     {
         lk.unlock();
         AllowNonLocalWritesBlock writesAllowed(opCtx);
-        OpTime firstOpTime = _externalState->onTransitionToPrimary(opCtx, isV1ElectionProtocol());
+        OpTime firstOpTime = _externalState->onTransitionToPrimary(opCtx);
         lk.lock();
 
         auto status = _topCoord->completeTransitionToPrimary(firstOpTime);
@@ -1347,9 +1349,9 @@ Status ReplicationCoordinatorImpl::_waitUntilClusterTimeForRead(OperationContext
     invariant(!readConcern.getArgsOpTime());
 
     // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
-    auto session = OperationContextSession::get(opCtx);
-    const bool speculative =
-        session && session->inMultiDocumentTransaction() && !readConcern.getArgsAtClusterTime();
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    const bool speculative = txnParticipant && txnParticipant->inMultiDocumentTransaction() &&
+        !readConcern.getArgsAtClusterTime();
 
     const bool isMajorityCommittedRead =
         (readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern ||
@@ -1587,6 +1589,15 @@ Status ReplicationCoordinatorImpl::_awaitReplication_inlock(
             if (getTestCommandsEnabled()) {
                 // log state of replica set on timeout to help with diagnosis.
                 BSONObjBuilder progress;
+
+                const auto lastCommittedOpTime = _topCoord->getLastCommittedOpTime();
+                progress.append("lastCommittedOpTime", lastCommittedOpTime.toBSON());
+
+                const auto currentCommittedSnapshotOpTime =
+                    _getCurrentCommittedSnapshotOpTime_inlock();
+                progress.append("currentCommittedSnapshotOpTime",
+                                currentCommittedSnapshotOpTime.toBSON());
+
                 _topCoord->fillMemberData(&progress);
                 log() << "Replication for failed WC: " << writeConcern.toBSON()
                       << ", waitInfo: " << waiter << ", opID: " << opCtx->getOpID()
@@ -1632,9 +1643,14 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
         return {ErrorCodes::NotMaster, "not primary so can't step down"};
     }
 
+    // Using 'force' sets the default for the wait time to zero, which means the stepdown will
+    // fail if it does not acquire the lock immediately. In such a scenario, we use the
+    // stepDownUntil deadline instead.
+    auto lockDeadline = force ? stepDownUntil : waitUntil;
+
     auto globalLock = stdx::make_unique<Lock::GlobalLock>(opCtx,
                                                           MODE_X,
-                                                          stepDownUntil,
+                                                          lockDeadline,
                                                           Lock::InterruptBehavior::kThrow,
                                                           Lock::GlobalLock::EnqueueOnly());
 
@@ -1643,11 +1659,10 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     // to help us get the global lock faster.
     _externalState->killAllUserOperations(opCtx);
 
-    globalLock->waitForLockUntil(stepDownUntil);
+    globalLock->waitForLockUntil(lockDeadline);
     if (!globalLock->isLocked()) {
         return {ErrorCodes::ExceededTimeLimit,
-                "Could not acquire the global shared lock within the amount of time "
-                "specified that we should step down for"};
+                "Could not acquire the global shared lock before the deadline for stepdown"};
     }
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
@@ -1769,7 +1784,7 @@ Status ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
 
     // If election handoff is enabled, schedule a step-up immediately instead of waiting for the
     // election timeout to expire.
-    if (!force && handOffElectionOnStepdown.load()) {
+    if (!force && enableElectionHandoff.load()) {
         _performElectionHandoff();
     }
     return Status::OK();
@@ -1815,9 +1830,8 @@ void ReplicationCoordinatorImpl::_handleTimePassing(
 
     // For election protocol v1, call _startElectSelfIfEligibleV1 to avoid race
     // against other elections caused by events like election timeout, replSetStepUp etc.
-    invariant(isV1ElectionProtocol());
     _startElectSelfIfEligibleV1(
-        TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout);
+        TopologyCoordinator::StartElectionReason::kSingleNodePromptElection);
 }
 
 bool ReplicationCoordinatorImpl::isMasterForReportingPurposes() {
@@ -1922,8 +1936,8 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
         return Status::OK();
     }
 
-    auto session = OperationContextSession::get(opCtx);
-    if (session && session->inMultiDocumentTransaction()) {
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    if (txnParticipant && txnParticipant->inMultiDocumentTransaction()) {
         if (!_canAcceptNonLocalWrites && !getTestCommandsEnabled()) {
             return Status(ErrorCodes::NotMaster,
                           "Multi-document transactions are only allowed on replica set primaries.");
@@ -2016,7 +2030,8 @@ Status ReplicationCoordinatorImpl::processReplSetGetStatus(
             static_cast<unsigned>(time(0) - serverGlobalParams.started),
             _getCurrentCommittedSnapshotOpTime_inlock(),
             initialSyncProgress,
-            _storage->getLastStableCheckpointTimestamp(_service)},
+            _storage->getLastStableCheckpointTimestampDeprecated(_service),
+            _storage->getLastStableRecoveryTimestamp(_service)},
         response,
         &result);
     return result;
@@ -2039,6 +2054,11 @@ void ReplicationCoordinatorImpl::fillIsMasterForReplSet(IsMasterResponse* respon
         // Report that we are secondary to ismaster callers until drain completes.
         response->setIsMaster(false);
         response->setIsSecondary(true);
+    }
+
+    if (_inShutdown) {
+        response->setIsMaster(false);
+        response->setIsSecondary(false);
     }
 }
 
@@ -2155,11 +2175,12 @@ Status ReplicationCoordinatorImpl::processReplSetFreeze(int secs, BSONObjBuilder
         return result.getStatus();
     }
 
-    if (TopologyCoordinator::PrepareFreezeResponseResult::kElectSelf == result.getValue()) {
-        // If we just unfroze and ended our stepdown period and we are a one node replica set,
-        // the topology coordinator will have gone into the candidate role to signal that we
-        // need to elect ourself.
-        _performPostMemberStateUpdateAction(kActionWinElection);
+    if (TopologyCoordinator::PrepareFreezeResponseResult::kSingleNodeSelfElect ==
+        result.getValue()) {
+        // For election protocol v1, call _startElectSelfIfEligibleV1 to avoid race
+        // against other elections caused by events like election timeout, replSetStepUp etc.
+        _startElectSelfIfEligibleV1(
+            TopologyCoordinator::StartElectionReason::kSingleNodePromptElection);
     }
 
     return Status::OK();
@@ -2316,7 +2337,6 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(
     _dropAllSnapshots_inlock();
 
     lk.unlock();
-    _resetElectionInfoOnProtocolVersionUpgrade(opCtx.get(), oldConfig, newConfig);
     _performPostMemberStateUpdateAction(action);
     _replExecutor->signalEvent(finishedEvent);
 }
@@ -2374,10 +2394,7 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
     // In pv1, the TopologyCoordinator has not set the term yet. It will be set to kInitialTerm if
     // the initiate succeeds so we pass that here.
     status = checkQuorumForInitiate(
-        _replExecutor.get(),
-        newConfig,
-        myIndex.getValue(),
-        newConfig.getProtocolVersion() == 1 ? OpTime::kInitialTerm : OpTime::kUninitializedTerm);
+        _replExecutor.get(), newConfig, myIndex.getValue(), OpTime::kInitialTerm);
 
     if (!status.isOK()) {
         error() << "replSetInitiate failed; " << status;
@@ -2455,11 +2472,8 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator_inlock(
         if (_topCoord->getRole() == TopologyCoordinator::Role::kCandidate) {
             invariant(_rsConfig.getNumMembers() == 1 && _selfIndex == 0 &&
                       _rsConfig.getMemberAt(0).isElectable());
-            if (isV1ElectionProtocol()) {
-                // Start election in protocol version 1
-                return kActionStartSingleNodeElection;
-            }
-            return kActionWinElection;
+            // Start election in protocol version 1
+            return kActionStartSingleNodeElection;
         }
         return kActionNone;
     }
@@ -2503,12 +2517,8 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator_inlock(
         // overriding requirement is to elect this singleton node primary.
         invariant(_rsConfig.getNumMembers() == 1 && _selfIndex == 0 &&
                   _rsConfig.getMemberAt(0).isElectable());
-        if (isV1ElectionProtocol()) {
-            // Start election in protocol version 1
-            result = kActionStartSingleNodeElection;
-        } else {
-            result = kActionWinElection;
-        }
+        // Start election in protocol version 1
+        result = kActionStartSingleNodeElection;
     }
 
     if (newState.rollback()) {
@@ -2588,12 +2598,8 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
             break;
         case kActionWinElection: {
             stdx::unique_lock<stdx::mutex> lk(_mutex);
-            if (isV1ElectionProtocol()) {
-                invariant(_topCoord->getTerm() != OpTime::kUninitializedTerm);
-                _electionId = OID::fromTerm(_topCoord->getTerm());
-            } else {
-                _electionId = OID::gen();
-            }
+            invariant(_topCoord->getTerm() != OpTime::kUninitializedTerm);
+            _electionId = OID::fromTerm(_topCoord->getTerm());
 
             auto ts = LogicalClock::get(getServiceContext())->reserveTicks(1).asTimestamp();
             _topCoord->processWinElection(_electionId, ts);
@@ -2608,13 +2614,9 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
             }
             // Notify all secondaries of the election win.
             _restartHeartbeats_inlock();
-            if (isV1ElectionProtocol()) {
-                invariant(!_catchupState);
-                _catchupState = stdx::make_unique<CatchupState>(this);
-                _catchupState->start_inlock();
-            } else {
-                _enterDrainMode_inlock();
-            }
+            invariant(!_catchupState);
+            _catchupState = stdx::make_unique<CatchupState>(this);
+            _catchupState->start_inlock();
             break;
         }
         case kActionStartSingleNodeElection:
@@ -2714,6 +2716,13 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
     }
 
     log() << "Heartbeats updated catchup target optime to " << *targetOpTime;
+    log() << "Latest known optime per replica set member:";
+    auto opTimesPerMember = _repl->_topCoord->latestKnownOpTimeSinceHeartbeatRestartPerMember();
+    for (auto&& pair : opTimesPerMember) {
+        log() << "Member ID: " << pair.first
+              << ", latest known optime: " << (pair.second ? (*pair.second).toString() : "unknown");
+    }
+
     if (_waiter) {
         _repl->_opTimeWaiterList.remove_inlock(_waiter.get());
     }
@@ -2729,11 +2738,6 @@ void ReplicationCoordinatorImpl::CatchupState::signalHeartbeatUpdate_inlock() {
 }
 
 Status ReplicationCoordinatorImpl::abortCatchupIfNeeded() {
-    if (!isV1ElectionProtocol()) {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "Primary catch-up is only supported by Protocol Version 1");
-    }
-
     stdx::lock_guard<stdx::mutex> lk(_mutex);
     if (_catchupState) {
         _catchupState->abort_inlock();
@@ -2756,6 +2760,7 @@ ReplicationCoordinatorImpl::PostMemberStateUpdateAction
 ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
                                                        const ReplSetConfig& newConfig,
                                                        int myIndex) {
+    invariant(newConfig.getProtocolVersion() == 1);
     invariant(_settings.usingReplSets());
     _cancelHeartbeats_inlock();
     _setConfigState_inlock(kConfigSteady);
@@ -2768,17 +2773,6 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
     const ReplSetConfig oldConfig = _rsConfig;
     _rsConfig = newConfig;
     _protVersion.store(_rsConfig.getProtocolVersion());
-
-    // Warn if this config has protocol version 0
-    if (newConfig.getProtocolVersion() == 0 &&
-        (!oldConfig.isInitialized() || oldConfig.getProtocolVersion() == 1)) {
-        log() << startupWarningsLog;
-        log() << "** WARNING: This replica set was configured with protocol version 0."
-              << startupWarningsLog;
-        log() << "**          This protocol version is deprecated and subject to be removed "
-              << startupWarningsLog;
-        log() << "**          in a future version." << startupWarningsLog;
-    }
 
     // Warn if running --nojournal and writeConcernMajorityJournalDefault = false
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
@@ -2820,24 +2814,6 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
         _startHeartbeats_inlock();
     }
     _updateLastCommittedOpTime_inlock();
-
-    // Set election id if we're primary.
-    if (oldConfig.isInitialized() && _memberState.primary()) {
-        if (oldConfig.getProtocolVersion() > newConfig.getProtocolVersion()) {
-            // Downgrade
-            invariant(newConfig.getProtocolVersion() == 0);
-            _electionId = OID::gen();
-            auto ts = LogicalClock::get(getServiceContext())->reserveTicks(1).asTimestamp();
-            _topCoord->setElectionInfo(_electionId, ts);
-        } else if (oldConfig.getProtocolVersion() < newConfig.getProtocolVersion()) {
-            // Upgrade
-            invariant(newConfig.getProtocolVersion() == 1);
-            invariant(_topCoord->getTerm() != OpTime::kUninitializedTerm);
-            _electionId = OID::fromTerm(_topCoord->getTerm());
-            auto ts = LogicalClock::get(getServiceContext())->reserveTicks(1).asTimestamp();
-            _topCoord->setElectionInfo(_electionId, ts);
-        }
-    }
 
     return action;
 }
@@ -3174,9 +3150,6 @@ Status ReplicationCoordinatorImpl::processReplSetRequestVotes(
     OperationContext* opCtx,
     const ReplSetRequestVotesArgs& args,
     ReplSetRequestVotesResponse* response) {
-    if (!isV1ElectionProtocol()) {
-        return {ErrorCodes::BadValue, "not using election protocol v1"};
-    }
 
     auto termStatus = updateTerm(opCtx, args.getTerm());
     if (!termStatus.isOK() && termStatus.code() != ErrorCodes::StaleTerm)
@@ -3239,10 +3212,6 @@ void ReplicationCoordinatorImpl::_prepareReplSetMetadata_inlock(const OpTime& la
 void ReplicationCoordinatorImpl::_prepareOplogQueryMetadata_inlock(int rbid,
                                                                    BSONObjBuilder* builder) const {
     _topCoord->prepareOplogQueryMetadata(rbid).writeToMetadata(builder).transitional_ignore();
-}
-
-bool ReplicationCoordinatorImpl::isV1ElectionProtocol() const {
-    return _protVersion.load() == 1;
 }
 
 bool ReplicationCoordinatorImpl::getWriteConcernMajorityShouldJournal() {
@@ -3319,11 +3288,6 @@ Status ReplicationCoordinatorImpl::updateTerm(OperationContext* opCtx, long long
         return {ErrorCodes::BadValue, "cannot supply 'term' without active replication"};
     }
 
-    if (!isV1ElectionProtocol()) {
-        // Do not update if not in V1 protocol.
-        return Status::OK();
-    }
-
     // Check we haven't acquired any lock, because potential stepdown needs global lock.
     dassert(!opCtx->lockState()->isLocked() || opCtx->lockState()->isNoop());
     TopologyCoordinator::UpdateTermResult updateTermResult;
@@ -3348,10 +3312,6 @@ Status ReplicationCoordinatorImpl::updateTerm(OperationContext* opCtx, long long
 
 EventHandle ReplicationCoordinatorImpl::_updateTerm_inlock(
     long long term, TopologyCoordinator::UpdateTermResult* updateTermResult) {
-    if (!isV1ElectionProtocol()) {
-        LOG(3) << "Cannot update term in election protocol version 0";
-        return EventHandle();
-    }
 
     auto now = _replExecutor->now();
     TopologyCoordinator::UpdateTermResult localUpdateTermResult = _topCoord->updateTerm(term, now);
@@ -3459,21 +3419,6 @@ void ReplicationCoordinatorImpl::waitForElectionDryRunFinish_forTest() {
     }
 }
 
-void ReplicationCoordinatorImpl::_resetElectionInfoOnProtocolVersionUpgrade(
-    OperationContext* opCtx, const ReplSetConfig& oldConfig, const ReplSetConfig& newConfig) {
-
-    // On protocol version upgrade, reset last vote as if I just learned the term 0 from other
-    // nodes.
-    if (!oldConfig.isInitialized() ||
-        oldConfig.getProtocolVersion() >= newConfig.getProtocolVersion()) {
-        return;
-    }
-    invariant(newConfig.getProtocolVersion() == 1);
-
-    const LastVote lastVote{OpTime::kInitialTerm, -1};
-    fassert(40445, _externalState->storeLocalLastVoteDocument(opCtx, lastVote));
-}
-
 CallbackHandle ReplicationCoordinatorImpl::_scheduleWorkAt(Date_t when, const CallbackFn& work) {
     auto cbh = _replExecutor->scheduleWorkAt(when, [work](const CallbackArgs& args) {
         if (args.status == ErrorCodes::CallbackCanceled) {
@@ -3522,11 +3467,6 @@ CallbackFn ReplicationCoordinatorImpl::_wrapAsCallbackFn(const stdx::function<vo
 }
 
 Status ReplicationCoordinatorImpl::stepUpIfEligible() {
-    if (!isV1ElectionProtocol()) {
-        return Status(ErrorCodes::CommandNotSupported,
-                      "Step-up command is only supported by Protocol Version 1");
-    }
-
     _startElectSelfIfEligibleV1(TopologyCoordinator::StartElectionReason::kStepUpRequest);
     EventHandle finishEvent;
     {
@@ -3558,7 +3498,6 @@ executor::TaskExecutor::EventHandle ReplicationCoordinatorImpl::_cancelElectionI
     if (_topCoord->getRole() != TopologyCoordinator::Role::kCandidate) {
         return {};
     }
-    invariant(isV1ElectionProtocol());
     invariant(_voteRequester);
     _voteRequester->cancel();
     return _electionFinishedEvent;

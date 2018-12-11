@@ -15,9 +15,19 @@ selector:
   - jstests/core/txns/abort_transactions_on_FCV_downgrade.js
 
   # Prepare is not a command on mongos.
+  - jstests/core/txns/abort_prepared_transaction.js
+  - jstests/core/txns/commit_prepared_transaction.js
+  - jstests/core/txns/commit_prepared_transaction_errors.js
   - jstests/core/txns/empty_prepare.js
+  - jstests/core/txns/no_new_transactions_when_prepared_transaction_in_progress.js
+  - jstests/core/txns/prepare_committed_transaction.js
   - jstests/core/txns/prepare_conflict.js
-  - jstests/core/txns/prepare_transaction.js
+  - jstests/core/txns/prepare_nonexistent_transaction.js
+  - jstests/core/txns/timestamped_reads_wait_for_prepare_oplog_visibility.js
+  - jstests/core/txns/prepare_requires_fcv42.js
+
+  # Mongos doesn't upconvert from local or majority level readConcern to snapshot.
+  - jstests/core/txns/upconvert_read_concern.js
 
   # Implicitly creates a database through a collection rename, which does not work in a sharded
   # cluster.
@@ -34,23 +44,19 @@ selector:
   - jstests/core/txns/abort_expired_transaction.js
   - jstests/core/txns/abort_transaction_thread_does_not_block_on_locks.js
 
-  # TODO SERVER-35829: Mongos loses txnNumber when forwarding to shards.
+  # Writes to the local database are not allowed through mongos.
+  # TODO SERVER-28756: Mongos CSRS write retry logic drops txnNumbers.
   - jstests/core/txns/banned_txn_dbs.js
-  - jstests/core/txns/kill_cursors_in_transaction.js
 
-  # TODO SERVER-35829: Mongos loses txnNumber when forwarding to shards.
+  # TODO SERVER-36260: Mongos should reject commands with txnNumbers that aren't allowed in a
+  # transaction.
   # TODO SERVER-33709: Support readConcern snapshot in cluster count command.
   - jstests/core/txns/commands_not_allowed_in_txn.js
 
   # TODO SERVER-35708 Mongos does not attach errorLabels on command response.
   - jstests/core/txns/multi_statement_transaction_abort.js
 
-  # TODO SERVER-36057: Mongos doesn't validate autocommit / startTransaction fields.
-  - jstests/core/txns/multi_statement_transaction_command_args.js
-  - jstests/core/txns/upconvert_read_concern.js
-
   # TODO SERVER-35825: Mongos should only allow readConcern on writes that start transactions.
-  - jstests/core/txns/no_read_or_write_concern_inside_txn.js
   - jstests/core/txns/no_read_concern_snapshot_outside_txn.js
 
   # TODO SERVER-35707: Figure out transaction abort state on re-targeting exceptions.

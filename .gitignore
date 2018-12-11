@@ -155,4 +155,8 @@ CMakeLists.txt
 *.wixpdb
 DriverInclude.wxs
 
+# Gradle
+.gradle
+src/mongo/embedded/java/mongodb-embedded-capi/build/
+
 compile_commands.json

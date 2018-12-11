@@ -155,6 +155,8 @@ variables:
        value: ${remote_dir}/afterrecovery
      - key: backup_path_before
        value: ${remote_dir}/beforerecovery
+     - key: backup_artifacts
+       value: ${remote_dir}/afterrecovery* ${remote_dir}/beforerecovery*
      - key: db_path
        value: /data/db
      - key: log_path
@@ -163,7 +165,7 @@ variables:
        value: powercycle_exit.yml
 
 - &powercycle_test
-  ec2_artifacts: ${log_path} ${db_path} ${backup_path_after} ${backup_path_before}
+  ec2_artifacts: ${log_path} ${db_path} ${backup_artifacts}
   program_options:  --exitYamlFile=${exit_file} --logLevel=info --backupPathBefore=${backup_path_before} --backupPathAfter=${backup_path_after}
   connection_options: --sshUserHost=${private_ip_address} --sshConnection=\"${ssh_identity} ${ssh_connection_options}\"
   test_options: --testLoops=15 --seedDocNum=10000 --rsync --rsyncExcludeFiles=diagnostic.data/metrics.interim* --validate=local --canary=local
@@ -172,6 +174,18 @@ variables:
   mongodb_options: --rootDir=${remote_dir}-${task_id} --mongodbBinDir=${remote_dir}
   mongod_options: --mongodUsablePorts ${standard_port} ${secret_port} --dbPath=${db_path} --logPath=${log_path}
   mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1 --setParameter logComponentVerbosity='{storage:{recovery:2}}'\"
+
+- &benchrun_embedded
+  name: benchrun_embedded
+  execution_tasks:
+  - benchrun_embedded_aggregation
+  - benchrun_embedded_commands
+  - benchrun_embedded_insert
+  - benchrun_embedded_misc
+  - benchrun_embedded_mixed_and_multi
+  - benchrun_embedded_queries
+  - benchrun_embedded_remove
+  - benchrun_embedded_update
 
 - &replica_sets_auth
   name: replica_sets_auth
@@ -332,6 +346,12 @@ variables:
   - compile_unittests
   - unittests
 
+- &dbtest
+  name: dbtest!
+  execution_tasks:
+  - compile_dbtest
+  - dbtest
+
 - &compile_task_group_template
   name: compile_task_group_template
   max_hosts: 1
@@ -347,12 +367,14 @@ variables:
   - func: "save code coverage data"
   - func: "save mongo coredumps"
   - func: "save failed unittests"
+  - func: "save unstripped dbtest"
   - func: "save hang analyzer debugger files"
   - func: "save disk statistics"
   - func: "save system resource information"
   - func: "remove files"
     vars:
       files: >-
+        src/resmoke_error_code
         src/build/scons/config.log
         src/*.gcda.gcov
         src/gcov-intermediate-files.tgz
@@ -403,6 +425,7 @@ variables:
   modules:
   - enterprise
   display_tasks:
+  - *dbtest
   - *replica_sets_auth
   - *replica_sets_ese
   - *sharding_auth
@@ -424,7 +447,7 @@ variables:
     use_scons_cache: true
     multiversion_platform: windows
     multiversion_edition: enterprise
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    gorootvars: 'PATH="/cygdrive/c/golang/go1.10/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/golang/go1.10" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: false
     jstestfuzz_num_generated_files: 35
@@ -443,7 +466,6 @@ variables:
   - name: benchmarks_orphaned
   - name: benchmarks_sharding
   - name: buildscripts_test
-  - name: dbtest
   - name: ese
   - name: external_auth
   - name: jsCore
@@ -763,6 +785,15 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/benchmarks/${build_id}.tgz
       bucket: mciuploads
       extract_to: src
+
+  "fetch benchmark embedded files" : &fetch_benchrun_embedded_files
+    command: s3.get
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      remote_file: ${project}/benchrun_embedded/benchrun_json_files.tgz
+      bucket: mciuploads
+      extract_to: src/benchrun_embedded
 
   "get buildnumber" : &get_buildnumber
     command: keyval.inc
@@ -1210,6 +1241,13 @@ functions:
   - *set_up_credentials
   - *fetch_benchmarks
 
+  "do benchmark embedded setup" :
+  - *git_get_project
+  - *fetch_artifacts
+  - *get_buildnumber
+  - *set_up_credentials
+  - *fetch_benchrun_embedded_files
+
   "set up virtualenv" :
     command: shell.exec
     type: test
@@ -1391,6 +1429,9 @@ functions:
           if [[ $resmoke_exit_code = 74 || $resmoke_exit_code = 75 ]]; then
             echo $resmoke_exit_code > run_tests_infrastructure_failure
             exit 0
+          elif [ $resmoke_exit_code != 0 ]; then
+            # On failure save the resmoke exit code.
+            echo $resmoke_exit_code > resmoke_error_code
           fi
           exit $resmoke_exit_code
           fi # end if [[ ${disable_unit_tests} && ! -f ${skip_tests|/dev/null} ]]
@@ -1670,7 +1711,7 @@ functions:
           set -o errexit
           echo "jstestfuzz self-tests finished"
 
-          npm run ${npm_command|jstestfuzz} -- --jsTestsDir ../jstests ${jstestfuzz_vars}
+          npm run ${npm_command|jstestfuzz} -- ${jstestfuzz_vars}
 
     - command: archive.targz_pack
       params:
@@ -2934,6 +2975,33 @@ functions:
   - *tar_failed_unittests
   - *archive_failed_unittests
 
+  "detect failed dbtest": &detect_failed_dbtest
+    command: shell.exec
+    params:
+      working_dir: "src"
+      script: |
+        if [ -f resmoke_error_code ] && [ -f ../dbtest_unstripped.tgz ]; then
+          echo "Task dbtest failed with error $(cat resmoke_error_code), archiving the unstripped binary"
+          mv ../dbtest_unstripped.tgz ../dbtest.tgz
+        fi
+
+  "archive unstripped dbtest": &archive_unstripped_dbtest
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: dbtest.tgz
+      remote_file: ${project}/${build_variant}/${revision}/dbtest/dbtest-${build_id}-${task_name}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: application/tar
+      display_name: Unstripped dbtest binary - Execution ${execution}
+      optional: true
+
+  "save unstripped dbtest":
+  - *detect_failed_dbtest
+  - *archive_unstripped_dbtest
+
   ### Process & archive artifacts from hung processes ###
   "run hang analyzer":
     command: shell.exec
@@ -3161,6 +3229,7 @@ test_lifecycle_excluded_tasks:
 - aggregation_fuzzer*
 - burn_in_tests
 - compile*
+- benchmarks*
 - dbtest*
 - idl_tests
 - integration*
@@ -3204,6 +3273,26 @@ tasks:
           mv mongodb-*-debugsymbols.${ext|tgz} mongo-debugsymbols.tgz || true
           mv mongodb-*.${ext|tgz} mongodb-binaries.tgz
 
+    # Tar unstripped dbtest, to be archived in case of failure
+    - command: archive.targz_pack
+      params:
+        target: "dbtest_unstripped.tgz"
+        source_dir: "src"
+        include:
+          - "./dbtest*"
+
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+
+          if [ "${is_patch}" = "true" ] && [ "${bypass_compile|false}" = "true" ]; then
+            exit 0
+          fi
+
           # If strip is on the path (everywhere except windows) then we should strip the test binaries
           # before tarring them up
           if [ -x ${strip_path|/usr/bin/strip} ]; then
@@ -3211,6 +3300,7 @@ tasks:
             ${strip_command|/usr/bin/strip} dbtest
             ${strip_command|/usr/bin/strip} mongobridge
           fi
+
 
     - command: shell.exec
       params:
@@ -3378,6 +3468,34 @@ tasks:
         resmoke_args: --suites=unittests
         run_multiple_jobs: true
 
+## compile_dbtest ##
+- name: compile_dbtest
+  commands:
+    - func: "scons compile"
+      vars:
+        targets: dbtest
+        task_compile_flags: >-
+          --detect-odr-violations
+
+    # Tar unstripped dbtest, to be archived in case of failure
+    - command: archive.targz_pack
+      params:
+        target: "dbtest_unstripped.tgz"
+        source_dir: "src"
+        include:
+          - "./dbtest*"
+
+## dbtest ##
+- name: dbtest
+  commands:
+    - func: "run diskstats"
+    - func: "monitor process threads"
+    - func: "collect system resource info"
+    - func: "run tests"
+      vars:
+        resmoke_args: --suites=dbtest --storageEngine=wiredTiger
+        run_multiple_jobs: true
+
 ## embedded_sdk_build_and_test_* - build the mobile-dev and mobile-test targets only ##
 
 - name: embedded_sdk_build_cdriver
@@ -3419,6 +3537,7 @@ tasks:
           --dbg=off
           --opt=size
           --enable-free-mon=off
+          --enable-http-client=off
           --use-system-mongo-c=on
           --wiredtiger=off
           CPPPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libbson-1.0 $BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libmongoc-1.0'
@@ -3432,7 +3551,8 @@ tasks:
         script: |
           set -o errexit
           set -o verbose
-          tar cfvz ./embedded-sdk.tgz ./mongo-embedded-sdk-${version}
+
+          tar cfvz embedded-sdk.tgz mongo-embedded-sdk-${version}
 
     # Upload it so we can download from EVG.
     - command: s3.put
@@ -3454,6 +3574,31 @@ tasks:
         targets: install-mobile-test
         task_compile_flags: *embedded_sdk_compile_flags
 
+- name: embedded_sdk_tests_s3_put
+  commands:
+    # Not using archive.targz_pack here because I can't get it to work.
+    - command: shell.exec
+      params:
+        working_dir: "src/build"
+        script: |
+          set -o errexit
+          set -o verbose
+
+          tar cfvz embedded-sdk-tests.tgz mongo-embedded-sdk-${version}
+
+    # Upload it so we can download from EVG.
+    - command: s3.put
+      params:
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "src/build/embedded-sdk-tests.tgz"
+        remote_file: ${project}/embedded-sdk-test/${build_variant}/${revision}/${version}.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+        display_name: "Embedded SDK Tests Tar Archive"
+
 - name: embedded_sdk_run_tests
   commands:
     - command: shell.exec
@@ -3462,6 +3607,7 @@ tasks:
         script: |
           set -o errexit
           set -o verbose
+
           if [ ${enable_embedded_tests|false} = "ios_tvos_simulator" -a $(command -v xcrun) ]; then
             find ./lib -type f -name "*.dylib" -print0 | xargs -0 -L 1 xcrun codesign -s -
           fi
@@ -3495,6 +3641,9 @@ tasks:
       params:
         working_dir: "src/build"
         script: |
+          set -o errexit
+          set -o verbose
+
           if [ "${is_patch}" = "true" ]; then
             rm -f src/build/embedded-sdk.tgz
           fi
@@ -3515,6 +3664,105 @@ tasks:
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
 
+- name: embedded_sdk_tests_s3_put_latest
+  commands:
+    # A second put, this time to -latest, to give devs a reasonable
+    # way to get the most recent build.
+    - command: s3.put
+      params:
+        visibility: none
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "src/build/embedded-sdk-tests.tgz"
+        remote_file: ${project}/embedded-sdk-test/${build_variant}-latest.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/x-gzip}
+
+- name: embedded_sdk_multiarch_android_package
+  depends_on:
+    - name: embedded_sdk_s3_put
+      variant: embedded-sdk-android-arm32
+    - name: embedded_sdk_s3_put
+      variant: embedded-sdk-android-arm64
+    - name: embedded_sdk_s3_put
+      variant: embedded-sdk-android-x86_64
+  commands:
+    - command: manifest.load
+    - func: "git get project"
+    - func: "get buildnumber"
+    - func: "set up credentials"
+    - func: "setup android toolchain" # noop if ${setup_android_toolchain} is not "true"
+    - func: "generate compile expansions"
+    - func: "apply compile expansions"
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${project}/embedded-sdk/embedded-sdk-android-arm32/${revision}/${version}.tgz
+        bucket: mciuploads
+        local_file: "embedded-sdk-android-armeabi-v7a.tgz"
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${project}/embedded-sdk/embedded-sdk-android-arm64/${revision}/${version}.tgz
+        bucket: mciuploads
+        local_file: "embedded-sdk-android-arm64-v8a.tgz"
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${project}/embedded-sdk/embedded-sdk-android-x86_64/${revision}/${version}.tgz
+        bucket: mciuploads
+        local_file: "embedded-sdk-android-x86_64.tgz"
+    - command: shell.exec
+      params:
+        script: |
+          set -o errexit
+          set -o verbose
+
+          if [ "${setup_android_toolchain|}" = "true" ]; then
+            export ANDROID_HOME=$(pwd)/android_sdk
+
+            cd src/src/mongo/embedded/android
+
+            chmod +x gradlew
+
+            for arch in arm64-v8a armeabi-v7a x86_64 ; do
+                tar zxvf ../../../../../embedded-sdk-android-$arch.tgz
+                mkdir -p mongodb-embedded-capi/src/main/jniLibs/$arch
+                cp ./mongo-embedded-sdk-${version}/lib/*.so mongodb-embedded-capi/src/main/jniLibs/$arch
+                rm -rf ./mongo-embedded-sdk-${version}
+            done
+
+            ./gradlew build
+
+            mkdir -p ../../../../build/mongo-embedded-sdk-${version}/aar
+            cp mongodb-embedded-capi/build/outputs/aar/*.aar ../../../../build/mongo-embedded-sdk-${version}/aar
+          fi
+    - command: shell.exec
+      params:
+        script: |
+          set -o errexit
+          set -o verbose
+
+          if [ "${setup_android_toolchain|}" = "true" ]; then
+            cd src/build
+            tar zcvf mongo-embedded-sdk-${version}.tgz mongo-embedded-sdk-${version}
+          fi
+    - command: s3.put
+      params:
+        #optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "src/build/mongo-embedded-sdk-${version}.tgz"
+        remote_file: "${project}/embedded-sdk/embedded-sdk-android-multiarch/${revision}/${version}.tgz"
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+        display_name: "Embedded SDK Tar Archive"
 
 - name: compile_benchmarks
   depends_on: []
@@ -3645,6 +3893,86 @@ tasks:
       run_multiple_jobs: false
   - func: "send benchmark results"
 
+- <<: *task_template
+  name: benchrun_embedded_aggregation
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_aggregation
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *task_template
+  name: benchrun_embedded_commands
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_commands
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *task_template
+  name: benchrun_embedded_insert
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_insert
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *task_template
+  name: benchrun_embedded_misc
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_misc
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *task_template
+  name: benchrun_embedded_mixed_and_multi
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_mixed_and_multi
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *task_template
+  name: benchrun_embedded_queries
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_queries
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *task_template
+  name: benchrun_embedded_remove
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_remove
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
+- <<: *task_template
+  name: benchrun_embedded_update
+  commands:
+  - func: "do benchmark embedded setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchrun_embedded_update
+      run_multiple_jobs: false
+  - func: "send benchmark results"
+
 - <<: *run_jepsen_template
   name: jepsen_register_findAndModify
   commands:
@@ -3703,6 +4031,22 @@ tasks:
       jepsen_storage_engine: --storage-engine wiredTiger
       jepsen_test_name: read-concern-majority
       jepsen_write_concern: --write-concern w1
+
+## Standalone generational fuzzer for aggregation expressions ##
+- <<: *jstestfuzz_template
+  name: aggregation_expression_multiversion_fuzzer
+  commands:
+  - func: "do setup"
+  - func: "do multiversion setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 50
+      npm_command: agg-expr-fuzzer
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
+      task_path_suffix: /data/multiversion
+      resmoke_args: --suites=generational_fuzzer
 
 ## jstestfuzz standalone aggregation generational fuzzer ##
 - <<: *jstestfuzz_template
@@ -3798,6 +4142,8 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --jsTestsDir ../jstests
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3810,7 +4156,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
+      jstestfuzz_vars: --jsTestsDir ../jstests --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3823,7 +4169,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
+      jstestfuzz_vars: --jsTestsDir ../jstests --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3836,7 +4182,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
+      jstestfuzz_vars: --jsTestsDir ../jstests --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3849,7 +4195,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
+      jstestfuzz_vars: --jsTestsDir ../jstests --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3862,7 +4208,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
+      jstestfuzz_vars: --jsTestsDir ../jstests --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3875,7 +4221,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles 25
+      jstestfuzz_vars: --jsTestsDir ../jstests --numGeneratedFiles 25
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3888,7 +4234,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
+      jstestfuzz_vars: --jsTestsDir ../jstests --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3900,6 +4246,8 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --jsTestsDir ../jstests
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3911,6 +4259,8 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --jsTestsDir ../jstests
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3922,6 +4272,8 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --jsTestsDir ../jstests
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3934,7 +4286,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles 75
+      jstestfuzz_vars: --jsTestsDir ../jstests --numGeneratedFiles 75
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3946,6 +4298,8 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --jsTestsDir ../jstests
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3957,6 +4311,8 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --jsTestsDir ../jstests
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3968,6 +4324,8 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --jsTestsDir ../jstests
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3980,7 +4338,7 @@ tasks:
   - func: "do setup"
   - func: "run jstestfuzz"
     vars:
-      jstestfuzz_vars: --numGeneratedFiles 50
+      jstestfuzz_vars: --jsTestsDir ../jstests --numGeneratedFiles 50
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -3992,6 +4350,8 @@ tasks:
   commands:
   - func: "do setup"
   - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --jsTestsDir ../jstests
   - <<: *run_jstestfuzz_tests
     vars:
       <<: *jstestfuzz_config_vars
@@ -4254,15 +4614,6 @@ tasks:
       run_multiple_jobs: true
 
 - <<: *task_template
-  name: dbtest
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=dbtest --storageEngine=wiredTiger
-      run_multiple_jobs: true
-
-- <<: *task_template
   name: disk_mobile
   commands:
   - func: "do setup"
@@ -4426,7 +4777,7 @@ tasks:
   - func: "do setup"
   - func: "run tests"
     vars:
-      resmoke_args: --suites=core --mongod=./mongoed --excludeWithAnyTags=requires_scripting,requires_auth,requires_sharding,does_not_support_stepdowns,requires_background_index,incompatible_with_embedded,incompatible_with_embedded_todo_investigate,requires_replication,requires_capped,requires_profiling,requires_javascript,requires_fsync
+      resmoke_args: --suites=core --mongod=./mongoed --excludeWithAnyTags=requires_scripting,requires_auth,requires_sharding,does_not_support_stepdowns,requires_background_index,requires_ttl_index,incompatible_with_embedded,incompatible_with_embedded_todo_investigate,requires_replication,requires_capped,requires_profiling,requires_javascript,requires_fsync,requires_compact
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -4753,6 +5104,14 @@ tasks:
       resmoke_args: --suites=concurrency_replication_causal_consistency --storageEngine=wiredTiger
 
 - <<: *task_template
+  name: concurrency_replication_multi_stmt_txn
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_replication_multi_stmt_txn --storageEngine=wiredTiger
+
+- <<: *task_template
   name: concurrency_replication_ubsan
   commands:
   - func: "do setup"
@@ -4767,6 +5126,14 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=concurrency_replication_causal_consistency_ubsan --storageEngine=wiredTiger
+
+- <<: *task_template
+  name: concurrency_replication_multi_stmt_txn_ubsan
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_replication_multi_stmt_txn_ubsan --storageEngine=wiredTiger
 
 - <<: *task_template
   name: concurrency_sharded_replication
@@ -6459,6 +6826,29 @@ tasks:
       client_options: "--numCrudClients=20 --numFsmClients=20 --writeConcern='{\"w\": \"majority\"}'"
       mongod_extra_options: --mongodOptions \"--setParameter enableTestCommands=1 --setParameter logComponentVerbosity='{storage:{recovery:2}}' --storageEngine wiredTiger\"
 
+- name: powercycle_mobile
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  depends_on:
+  - name: compile
+  commands:
+  - func: "do setup"
+  - func: "set up remote credentials"
+    vars:
+      <<: *powercycle_remote_credentials
+  - func: "set up EC2 instance"
+    vars:
+      <<: *powercycle_ec2_instance
+  - command: expansions.update
+    <<: *powercycle_expansions
+  - func: "run powercycle test"
+    timeout_secs: 1800 # 30 minute timeout for no output
+    vars:
+      <<: *powercycle_test
+      # We do 5 rather than 15 loops when running against the mobile storage engine because
+      # collection validation otherwise starts to take several minutes after each loop.
+      client_options: --testLoops=5 --numCrudClients=20 --numFsmClients=20
+      mongod_extra_options: --mongodOptions=\"--setParameter enableTestCommands=1 --storageEngine mobile\"
+
 - name: idl_tests
   depends_on:
   - name: compile
@@ -7020,11 +7410,18 @@ task_groups:
   tasks:
   - compile
 - <<: *compile_task_group_template
+  name: dbtest_TG
+  tasks:
+  - compile_dbtest
+  - dbtest
+- <<: *compile_task_group_template
   name: compile_all_run_unittests_TG
   tasks:
   - compile
   - compile_unittests
   - unittests
+  - compile_dbtest
+  - dbtest
   - compile_all
 - name: embedded_sdk_build_and_test
   setup_group:
@@ -7047,8 +7444,10 @@ task_groups:
   - "embedded_sdk_install_dev"
   - "embedded_sdk_s3_put"
   - "embedded_sdk_install_tests"
+  - "embedded_sdk_tests_s3_put"
   - "embedded_sdk_run_tests"
   - "embedded_sdk_s3_put_latest"
+  - "embedded_sdk_tests_s3_put_latest"
 
 #######################################
 #               Modules               #
@@ -7086,13 +7485,14 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: x86_64
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off --release
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off --enable-http-client=off --release
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -7118,7 +7518,6 @@ buildvariants:
   - name: change_streams_whole_cluster_mongos_passthrough
   - name: change_streams_whole_cluster_secondary_reads_passthrough
   - name: change_streams_whole_cluster_sharded_collections_passthrough
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -7158,6 +7557,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - rhel62-large
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7190,20 +7590,20 @@ buildvariants:
   - rhel62-small
   batchtime: 1440 # 1 day
   expansions:
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off --enable-http-client=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --repeat=10 --shuffle
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - rhel62-large
-  - name: dbtest
   - name: integration_tests_standalone
   - name: integration_tests_replset
   - name: integration_tests_sharded
@@ -7215,6 +7615,9 @@ buildvariants:
     distros:
     - rhel62-large
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel62-large
+  - name: concurrency_replication_multi_stmt_txn
     distros:
     - rhel62-large
   - name: concurrency_sharded_replication
@@ -7239,13 +7642,14 @@ buildvariants:
     push_name: linux-debug
     push_arch: x86_64
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 2)) # Avoid starting too many mongod's
-    compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off
+    compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off --enable-http-client=off
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *replica_sets_auth
   - *sharding
   - *sharding_auth
@@ -7276,6 +7680,7 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -7284,7 +7689,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -7383,7 +7787,7 @@ buildvariants:
   expansions:
     use_wt_develop: true
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 2)) # Avoid starting too many mongod's
-    compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off
+    compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off --enable-http-client=off
     use_scons_cache: true
     build_mongoreplay: true
 
@@ -7397,17 +7801,18 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux-duroff
     push_arch: x86_64
-    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off
+    compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off --enable-http-client=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     # Running WiredTiger with --nojournal in a replica set is no longer supported, so this variant
     # does not include replica set tests. Since transactions are only supported on replica sets, we
     # exclude those tests as well.
     test_flags: --nojournal --excludeWithAnyTags=requires_journaling,requires_replication,requires_sharding,uses_transactions
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -7419,7 +7824,6 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -7454,16 +7858,16 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --wiredTigerEngineConfig=mmap=false --wiredTigerCollectionConfig=type=lsm --wiredTigerIndexConfig=type=lsm --excludeWithAnyTags=uses_transactions,does_not_support_wiredtiger_lsm
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - rhel62-large
-  - name: dbtest
   - name: jsCore
 
 - name: ubuntu1404
@@ -7487,10 +7891,11 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -7499,7 +7904,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -7535,6 +7939,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - ubuntu1404-build
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7583,10 +7988,11 @@ buildvariants:
     packager_distro: ubuntu1804
     repo_edition: org
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -7595,7 +8001,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -7630,6 +8035,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - ubuntu1804-build
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7673,17 +8079,17 @@ buildvariants:
     packager_distro: ubuntu1804
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1804-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
@@ -7730,32 +8136,23 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1804-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  # - name: aggregation_fuzzer
-  # - name: jstestfuzz
-  # - name: jstestfuzz_concurrent
-  # - name: jstestfuzz_concurrent_replication
-  # - name: jstestfuzz_concurrent_sharded
-  # - name: jstestfuzz_replication
-  # - name: jstestfuzz_sharded
-  # - name: replica_sets_auth
   - name: sasl
-  # - name: sharding_auth
   - name: snmp
   - name: ssl
   - name: sslSpecial
@@ -7785,29 +8182,22 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1804-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  # - name: aggregation_fuzzer
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  # - name: jstestfuzz_sharded
   - name: replica_sets_auth
   - name: sasl
   - name: sharding_auth
@@ -7837,10 +8227,11 @@ buildvariants:
     packager_distro: ubuntu1604
     repo_edition: org
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -7849,7 +8240,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -7900,6 +8290,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - ubuntu1604-build
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -7942,20 +8333,19 @@ buildvariants:
     packager_arch: arm64
     packager_distro: ubuntu1604
     repo_edition: enterprise
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto libsasl2)" -tags 'sasl ssl'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/aarch64-mongodb-linux-gcc'
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: arm64
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -7985,6 +8375,7 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8023,17 +8414,16 @@ buildvariants:
     packager_arch: arm64
     packager_distro: ubuntu1604
     repo_edition: org
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto)" -tags 'ssl'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/aarch64-mongodb-linux-gcc'
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: arm64
     multiversion_edition: targeted
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
-  - name: dbtest
   - name: free_monitoring
   - name: jsCore
   - name: replica_sets_jscore_passthrough
@@ -8060,13 +8450,14 @@ buildvariants:
     packager_arch: ppc64le
     packager_distro: ubuntu1604
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
     tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: ppc64le
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8075,7 +8466,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -8105,6 +8495,7 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8145,13 +8536,14 @@ buildvariants:
     packager_arch: s390x
     packager_distro: ubuntu1604
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
     tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: s390x
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8169,11 +8561,11 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: ese
   - name: failpoints
   - name: failpoints_auth
@@ -8254,11 +8646,12 @@ buildvariants:
     packager_distro: amazon
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
     virtualenv: /opt/mongodbtoolchain/v2/bin/virtualenv
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8269,7 +8662,6 @@ buildvariants:
   - name: audit
   - name: auth
   - name: auth_audit
-  - name: dbtest
   - name: ese
   - name: failpoints_auth
   - name: jsCore
@@ -8332,11 +8724,12 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl'"
     build_mongoreplay: true
     virtualenv: /opt/mongodbtoolchain/v2/bin/virtualenv
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8345,7 +8738,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -8381,6 +8773,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - linux-64-amzn-build
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8431,10 +8824,11 @@ buildvariants:
     packager_distro: amazon2
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8445,7 +8839,6 @@ buildvariants:
   - name: audit
   - name: auth
   - name: auth_audit
-  - name: dbtest
   - name: ese
   - name: failpoints_auth
   - name: jsCore
@@ -8512,10 +8905,11 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8524,7 +8918,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -8560,6 +8953,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - amazon2-build
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -8605,10 +8999,13 @@ buildvariants:
     python: python
     ext: zip
     use_scons_cache: true
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go"'
+    multiversion_platform: windows
+    multiversion_edition: enterprise
+    gorootvars: 'PATH="/cygdrive/c/golang/go1.10/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/golang/go1.10"'
     tooltags: ""
     build_mongoreplay: false
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8620,6 +9017,7 @@ buildvariants:
   - name: aggregation_one_shard_sharded_collections
   - name: aggregation_read_concern_majority_passthrough
   - name: aggregation_sharded_collections_passthrough
+  - name: aggregation_expression_multiversion_fuzzer
   - name: auth
   - name: causally_consistent_jscore_passthrough
   - name: causally_consistent_jscore_passthrough_auth
@@ -8634,7 +9032,6 @@ buildvariants:
   - name: change_streams_whole_cluster_passthrough
   - name: change_streams_whole_cluster_mongos_passthrough
   - name: change_streams_whole_cluster_sharded_collections_passthrough
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: free_monitoring
@@ -8665,6 +9062,9 @@ buildvariants:
     distros:
     - windows-64-vs2015-large
   - name: concurrency_replication_causal_consistency
+    distros:
+    - windows-64-vs2015-large
+  - name: concurrency_replication_multi_stmt_txn
     distros:
     - windows-64-vs2015-large
   - name: concurrency_sharded_replication
@@ -8763,11 +9163,12 @@ buildvariants:
     use_scons_cache: true
     multiversion_platform: windows
     multiversion_edition: enterprise
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    gorootvars: 'PATH="/cygdrive/c/golang/go1.10/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/golang/go1.10" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: false
     jstestfuzz_num_generated_files: 35
   display_tasks:
+  - *dbtest
   - *replica_sets_auth
   - *replica_sets_ese
   - *sharding_auth
@@ -8788,7 +9189,7 @@ buildvariants:
   - name: benchmarks_orphaned
   - name: benchmarks_sharding
   - name: buildscripts_test
-  - name: dbtest
+  - name: dbtest_TG
   - name: ese
   - name: external_auth
   - name: jsCore
@@ -8797,6 +9198,7 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
+  - name: aggregation_expression_multiversion_fuzzer
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -9037,6 +9439,7 @@ buildvariants:
   run_on:
   - windows-64-vs2015-small
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9074,7 +9477,7 @@ buildvariants:
     ext: zip
     use_scons_cache: true
     test_flags: --serviceExecutor=adaptive
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    gorootvars: 'PATH="/cygdrive/c/golang/go1.10/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/golang/go1.10" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: false
   tasks:
@@ -9108,10 +9511,11 @@ buildvariants:
     use_scons_cache: true
     multiversion_platform: windows
     multiversion_edition: enterprise
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    gorootvars: 'PATH="/cygdrive/c/golang/go1.10/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/golang/go1.10" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: false
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9119,12 +9523,12 @@ buildvariants:
     - windows-64-vs2015-large
   - name: audit
   - name: auth_audit
-  - name: dbtest
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
     distros:
     - windows-64-vs2015-large
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -9178,10 +9582,11 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    gorootvars: 'PATH="/cygdrive/c/golang/go1.10/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/golang/go1.10" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     tooltags: "-tags ssl"
     build_mongoreplay: false
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9203,7 +9608,6 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: free_monitoring
@@ -9294,7 +9698,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
+    gorootvars: 'PATH="/cygdrive/c/golang/go1.10/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/golang/go1.10" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: false
   tasks:
@@ -9325,10 +9729,11 @@ buildvariants:
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
     num_jobs_available: 1
-    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     tooltags: "-tags 'ssl openssl_pre_1.0'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9355,6 +9760,7 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -9363,7 +9769,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: free_monitoring
@@ -9429,16 +9834,16 @@ buildvariants:
     num_jobs_available: 1
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --dbg=on --opt=on -j$(sysctl -n hw.logicalcpu) --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
-    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
   - name: aggregation
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: jsCore
@@ -9466,16 +9871,16 @@ buildvariants:
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
     num_jobs_available: 1
-    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
   - name: audit
   - name: auth_audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
@@ -9519,12 +9924,12 @@ buildvariants:
     openssl_config_flags: "-mmacosx-version-min=10.10"
     openssl_make_flags: "-j$(sysctl -n hw.logicalcpu)"
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
   - name: audit
   - name: auth_audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
@@ -9713,6 +10118,7 @@ buildvariants:
       --dbg=off
       --opt=size
       --enable-free-mon=off
+      --enable-http-client=off
       --variables-files=etc/scons/xcode_watchos.vars
       --use-system-mongo-c=on
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
@@ -9746,6 +10152,7 @@ buildvariants:
       --dbg=off
       --opt=size
       --enable-free-mon=off
+      --enable-http-client=off
       --variables-files=etc/scons/xcode_watchos_sim.vars
       --use-system-mongo-c=on
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
@@ -9898,6 +10305,21 @@ buildvariants:
   tasks:
   - name: embedded_sdk_build_and_test
 
+- name: embedded-sdk-android-multiarch
+  display_name: "Embedded SDK - Android Multiarch Package"
+  run_on:
+  - ubuntu1604-build
+  batchtime: 1440 # 1 day
+  expansions:
+    compile_env: JAVA_HOME=/opt/java/jdk8/
+    setup_android_toolchain: true
+    android_toolchain_system_image_arch: "x86_64"
+    android_system_image_version: 21
+    android_toolchain_target_arch: "x86_64"
+    android_toolchain_api_version: "21"
+  tasks:
+  - name: embedded_sdk_multiarch_android_package
+
 ###########################################
 #          Redhat buildvariants           #
 ###########################################
@@ -9924,12 +10346,12 @@ buildvariants:
     packager_distro: rhel62
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
     jstestfuzz_num_generated_files: 40
   display_tasks:
-  - *unittests
+  - *dbtest
   - *replica_sets_auth
   - *replica_sets_ese
   - *sharding
@@ -9938,6 +10360,7 @@ buildvariants:
   - *sharding_ese
   - *sharding_last_stable_mongos_and_mixed_shards
   - *sharding_op_query
+  - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     requires:
@@ -9995,6 +10418,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - rhel62-large
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -10003,7 +10427,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -10026,6 +10449,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
+  - name: aggregation_expression_multiversion_fuzzer
   - name: aggregation_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
@@ -10505,10 +10929,11 @@ buildvariants:
     # Mixing --cache and --gcov doesn't work correctly yet. See SERVER-11084
     timeout_secs: 10800 # 3 hour timeout
     use_scons_cache: false
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -10542,6 +10967,7 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -10550,7 +10976,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -10639,10 +11064,11 @@ buildvariants:
     packager_distro: rhel70
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -10656,13 +11082,13 @@ buildvariants:
   - name: auth_audit
   - name: benchmarks_orphaned
   - name: benchmarks_sharding
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_fuzzer
+  - name: aggregation_expression_multiversion_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -10710,7 +11136,7 @@ buildvariants:
     compile_flags: MONGO_DISTMOD=ubuntu1604 --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: ""
     build_mongoreplay: true
   tasks:
@@ -10745,10 +11171,11 @@ buildvariants:
     packager_distro: rhel62
     repo_edition: org
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -10757,7 +11184,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -10793,6 +11219,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - rhel62-large
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -10836,10 +11263,11 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -10848,7 +11276,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -10886,6 +11313,9 @@ buildvariants:
     distros:
     - rhel70
   - name: concurrency_replication_causal_consistency
+    distros:
+    - rhel70
+  - name: concurrency_replication_multi_stmt_txn
     distros:
     - rhel70
   - name: concurrency_sharded_replication
@@ -10939,13 +11369,14 @@ buildvariants:
     push_name: linux
     push_arch: ppc64le-enterprise-rhel71
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
     tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: rhel71
     multiversion_architecture: ppc64le
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -10963,13 +11394,13 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
     distros:
     - rhel72-zseries-build
-  - name: dbtest
   - name: ese
   - name: failpoints
   - name: failpoints_auth
@@ -11051,13 +11482,14 @@ buildvariants:
     push_name: linux
     push_arch: s390x-enterprise-rhel72
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
     tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: rhel72
     multiversion_architecture: s390x
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -11075,11 +11507,11 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: ese
   - name: failpoints
   - name: failpoints_auth
@@ -11162,10 +11594,11 @@ buildvariants:
     push_name: linux
     push_arch: s390x-enterprise-rhel67
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
     tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -11183,11 +11616,11 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: ese
   - name: failpoints
   - name: failpoints_auth
@@ -11261,16 +11694,16 @@ buildvariants:
     push_name: linux
     push_arch: s390x-rhel67
     repo_edition: org
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
     build_mongoreplay: true
     tooltags: "-tags ssl"
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - rhel67-zseries-build
-  - name: dbtest
   - name: jsCore
   - name: replica_sets_jscore_passthrough
   - name: ssl
@@ -11302,17 +11735,17 @@ buildvariants:
     packager_distro: ubuntu1404
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1404-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
@@ -11359,17 +11792,17 @@ buildvariants:
     packager_distro: ubuntu1604
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1604-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jepsen_register_findAndModify
     distros:
@@ -11421,10 +11854,11 @@ buildvariants:
     lang_environment: LANG=C
     compile_flags: --link-model=dynamic --ssl CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -11440,10 +11874,11 @@ buildvariants:
     lang_environment: LANG=C
     compile_flags: --link-model=dynamic --ssl CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -11475,17 +11910,17 @@ buildvariants:
     packager_distro: suse12
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - suse12-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
@@ -11531,13 +11966,14 @@ buildvariants:
     packager_arch: s390x
     packager_distro: suse12
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
     tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: suse12
     multiversion_architecture: s390x
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -11555,11 +11991,11 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: ese
   - name: failpoints
   - name: failpoints_auth
@@ -11643,10 +12079,11 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -11655,7 +12092,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -11690,6 +12126,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - suse12-build
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11736,17 +12173,17 @@ buildvariants:
     packager_distro: debian81
     repo_edition: enterprise
     scons_cache: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - debian81-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
@@ -11792,10 +12229,11 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -11804,7 +12242,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -11839,6 +12276,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - debian81-build
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -11885,18 +12323,18 @@ buildvariants:
     packager_arch: x86_64
     packager_distro: debian92
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     scons_cache_scope: shared
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - debian92-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
@@ -11943,12 +12381,13 @@ buildvariants:
     packager_arch: x86_64
     packager_distro: debian92
     repo_edition: org
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl'"
     scons_cache_scope: shared
     shared_scons_pruning: true
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -11957,7 +12396,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -11992,6 +12430,7 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - debian92-build
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
@@ -12036,10 +12475,11 @@ buildvariants:
     multiversion_edition: enterprise
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12085,7 +12525,6 @@ buildvariants:
   - name: concurrency_simultaneous_replication
     distros:
     - rhel62-large
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -12190,8 +12629,8 @@ buildvariants:
     # mobile storage engine.
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling
-      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993
+      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact
+      --excludeWithAnyTags=SERVER-32709,SERVER-32869
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --mobile-se=on
@@ -12200,10 +12639,12 @@ buildvariants:
       MONGO_DISTMOD=rhel62
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     build_mongoreplay: true
     additional_targets: mongoebench mongoed
   display_tasks:
+  - *benchrun_embedded
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12213,11 +12654,32 @@ buildvariants:
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough
   - name: auth
+  - name: concurrency
+  - name: benchrun_embedded_aggregation
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_commands
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_insert
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_misc
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_mixed_and_multi
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_queries
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_remove
+    distros:
+    - centos6-perf
+  - name: benchrun_embedded_update
+    distros:
+    - centos6-perf
   - name: dbtest
-  # TODO SERVER-32993: Re-enable the concurrency and concurrency_simultaneous suite on the
-  # mobile storage engine builders.
-  # - name: concurrency
-  # - name: concurrency_simultaneous
   - name: disk_mobile
   - name: failpoints
   - name: failpoints_auth
@@ -12234,8 +12696,7 @@ buildvariants:
   - name: jstestfuzz_concurrent
   - name: noPassthrough
   - name: noPassthroughWithMongod
-  - name: parallel
-  - name: parallel_compatibility
+  - name: powercycle_mobile
   - name: serial_run
   - name: session_jscore_passthrough
 
@@ -12247,8 +12708,8 @@ buildvariants:
   expansions:
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling
-      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993
+      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact
+      --excludeWithAnyTags=SERVER-32709,SERVER-32869
     compile_flags: >-
         -j$(grep -c ^processor /proc/cpuinfo)
         --mobile-se=on
@@ -12258,11 +12719,11 @@ buildvariants:
         MONGO_DISTMOD=ubuntu1604
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     max_jobs: 8 # Avoid starting too many mongod's on ARM test servers
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: -gccgoflags "$(pkg-config --libs)"
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/aarch64-mongodb-linux-gcc'
     build_mongoreplay: true
     additional_targets: mongoebench mongoed
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12270,11 +12731,7 @@ buildvariants:
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough
   - name: auth
-  - name: dbtest
-  # TODO SERVER-32993: Re-enable the concurrency and concurrency_simultaneous suite on the
-  # mobile storage engine builders.
-  # - name: concurrency
-  # - name: concurrency_simultaneous
+  - name: concurrency
   - name: disk_mobile
   - name: failpoints
   - name: failpoints_auth
@@ -12291,8 +12748,6 @@ buildvariants:
   - name: jstestfuzz_concurrent
   - name: noPassthrough
   - name: noPassthroughWithMongod
-  - name: parallel
-  - name: parallel_compatibility
   - name: serial_run
   - name: session_jscore_passthrough
 
@@ -12331,8 +12786,8 @@ buildvariants:
     # mobile storage engine.
     test_flags: >-
       --storageEngine=mobile
-      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling
-      --excludeWithAnyTags=SERVER-32709,SERVER-32869,SERVER-32993
+      --excludeWithAnyTags=requires_wiredtiger,requires_replication,requires_sharding,uses_transactions,requires_capped,requires_profiling,requires_compact
+      --excludeWithAnyTags=SERVER-32709,SERVER-32869
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: >-
       -j$(sysctl -n hw.logicalcpu)
@@ -12343,10 +12798,11 @@ buildvariants:
       CPPPATH=/opt/mongodbtoolchain/v2/include
       LINKFLAGS="-mmacosx-version-min=10.10"
     num_jobs_available: 1
-    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     build_mongoreplay: true
     additional_targets: mongoebench mongoed
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12354,11 +12810,7 @@ buildvariants:
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough
   - name: auth
-  - name: dbtest
-  # TODO SERVER-32993: Re-enable the concurrency and concurrency_simultaneous suite on the
-  # mobile storage engine builders.
-  # - name: concurrency
-  # - name: concurrency_simultaneous
+  - name: concurrency
   - name: disk_mobile
   - name: failpoints
   - name: failpoints_auth
@@ -12375,8 +12827,6 @@ buildvariants:
   - name: jstestfuzz_concurrent
   - name: noPassthrough
   - name: noPassthroughWithMongod
-  - name: parallel
-  - name: parallel_compatibility
   - name: serial_run
   - name: session_jscore_passthrough
 
@@ -12391,10 +12841,11 @@ buildvariants:
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12416,7 +12867,6 @@ buildvariants:
   - name: concurrency_simultaneous_replication
     distros:
     - rhel62-large
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -12479,10 +12929,11 @@ buildvariants:
     compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel71 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(echo "$(grep -c processor /proc/cpuinfo)/4" | bc)
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling,uses_transactions
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
     tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12503,7 +12954,6 @@ buildvariants:
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -12562,10 +13012,11 @@ buildvariants:
     compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: 2
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling,uses_transactions
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
     tooltags: -tags 'sasl ssl'
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12588,6 +13039,8 @@ buildvariants:
   - name: concurrency_replication_causal_consistency
     distros:
     - rhel72-zseries-build
+    distros:
+    - rhel72-zseries-build
   - name: concurrency_sharded_replication
     distros:
     - rhel72-zseries-build
@@ -12600,7 +13053,6 @@ buildvariants:
   - name: concurrency_simultaneous_replication
     distros:
     - rhel72-zseries-build
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -12669,12 +13121,13 @@ buildvariants:
     multiversion_platform: ubuntu1604
     multiversion_edition: enterprise
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl'"
     build_mongoreplay: true
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12712,6 +13165,7 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -12720,7 +13174,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -12804,12 +13257,13 @@ buildvariants:
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl'"
     build_mongoreplay: true
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12849,11 +13303,12 @@ buildvariants:
     multiversion_platform: ubuntu1604
     multiversion_edition: enterprise
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under UBSAN build.
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
     scons_cache_scope: shared
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12892,6 +13347,7 @@ buildvariants:
   # TODO: SERVER-35964 revert the addition of UBSAN concurrency_replication suites.
   - name: concurrency_replication_ubsan
   - name: concurrency_replication_causal_consistency_ubsan
+  - name: concurrency_replication_multi_stmt_txn_ubsan
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency
@@ -12900,7 +13356,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -12986,16 +13441,16 @@ buildvariants:
     san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl'"
     build_mongoreplay: true
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
-  - name: dbtest
   - name: jsCore
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
@@ -13016,13 +13471,14 @@ buildvariants:
     san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl'"
     build_mongoreplay: false
     hang_analyzer_dump_core: false
     test_flags: --serviceExecutor=adaptive
     scons_cache_scope: shared
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -13042,11 +13498,11 @@ buildvariants:
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
+  - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
   - name: concurrency_simultaneous_replication
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -13118,11 +13574,12 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
     scons_cache_mode: all
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10'
     tooltags: "-tags 'ssl sasl'"
     build_mongoreplay: true
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG

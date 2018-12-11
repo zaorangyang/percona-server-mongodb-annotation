@@ -35,6 +35,7 @@
 #include <memory>
 #include <string>
 
+#include <boost/filesystem/path.hpp>
 #include <wiredtiger.h>
 
 #include "mongo/bson/ordering.h"
@@ -81,43 +82,43 @@ public:
     void setRecordStoreExtraOptions(const std::string& options);
     void setSortedDataInterfaceExtraOptions(const std::string& options);
 
-    virtual bool supportsDocLocking() const;
+    virtual bool supportsDocLocking() const override;
 
-    virtual bool supportsDirectoryPerDB() const;
+    virtual bool supportsDirectoryPerDB() const override;
 
-    virtual bool isDurable() const {
+    virtual bool isDurable() const override {
         return _durable;
     }
 
-    virtual bool isEphemeral() const {
+    virtual bool isEphemeral() const override {
         return _ephemeral;
     }
 
-    virtual RecoveryUnit* newRecoveryUnit();
+    virtual RecoveryUnit* newRecoveryUnit() override;
 
     virtual Status createRecordStore(OperationContext* opCtx,
                                      StringData ns,
                                      StringData ident,
-                                     const CollectionOptions& options) {
+                                     const CollectionOptions& options) override {
         return createGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
     }
 
     virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
                                                         StringData ns,
                                                         StringData ident,
-                                                        const CollectionOptions& options) {
+                                                        const CollectionOptions& options) override {
         return getGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
     }
 
     virtual Status createSortedDataInterface(OperationContext* opCtx,
                                              StringData ident,
-                                             const IndexDescriptor* desc) {
+                                             const IndexDescriptor* desc) override {
         return createGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
     }
 
     virtual SortedDataInterface* getSortedDataInterface(OperationContext* opCtx,
                                                         StringData ident,
-                                                        const IndexDescriptor* desc) {
+                                                        const IndexDescriptor* desc) override {
         return getGroupedSortedDataInterface(opCtx, ident, desc, KVPrefix::kNotPrefixed);
     }
 
@@ -125,53 +126,63 @@ public:
                                             StringData ns,
                                             StringData ident,
                                             const CollectionOptions& options,
-                                            KVPrefix prefix);
+                                            KVPrefix prefix) override;
 
     virtual std::unique_ptr<RecordStore> getGroupedRecordStore(OperationContext* opCtx,
                                                                StringData ns,
                                                                StringData ident,
                                                                const CollectionOptions& options,
-                                                               KVPrefix prefix);
+                                                               KVPrefix prefix) override;
 
     virtual Status createGroupedSortedDataInterface(OperationContext* opCtx,
                                                     StringData ident,
                                                     const IndexDescriptor* desc,
-                                                    KVPrefix prefix);
+                                                    KVPrefix prefix) override;
 
     virtual SortedDataInterface* getGroupedSortedDataInterface(OperationContext* opCtx,
                                                                StringData ident,
                                                                const IndexDescriptor* desc,
-                                                               KVPrefix prefix);
+                                                               KVPrefix prefix) override;
 
-    virtual Status dropIdent(OperationContext* opCtx, StringData ident);
+    virtual Status dropIdent(OperationContext* opCtx, StringData ident) override;
 
     virtual void alterIdentMetadata(OperationContext* opCtx,
                                     StringData ident,
-                                    const IndexDescriptor* desc);
+                                    const IndexDescriptor* desc) override;
 
     virtual Status okToRename(OperationContext* opCtx,
                               StringData fromNS,
                               StringData toNS,
                               StringData ident,
-                              const RecordStore* originalRecordStore) const;
+                              const RecordStore* originalRecordStore) const override;
 
-    virtual int flushAllFiles(OperationContext* opCtx, bool sync);
+    virtual int flushAllFiles(OperationContext* opCtx, bool sync) override;
 
-    virtual Status beginBackup(OperationContext* opCtx);
+    virtual Status beginBackup(OperationContext* opCtx) override;
 
-    virtual void endBackup(OperationContext* opCtx);
+    virtual void endBackup(OperationContext* opCtx) override;
 
-    virtual Status hotBackup(const std::string& path);
+    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(
+        OperationContext* opCtx) override;
 
-    virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident);
+    virtual void endNonBlockingBackup(OperationContext* opCtx) override;
 
-    virtual Status repairIdent(OperationContext* opCtx, StringData ident);
+    virtual Status hotBackup(const std::string& path) override;
 
-    virtual bool hasIdent(OperationContext* opCtx, StringData ident) const;
+    virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) override;
 
-    std::vector<std::string> getAllIdents(OperationContext* opCtx) const;
+    virtual Status repairIdent(OperationContext* opCtx, StringData ident) override;
 
-    virtual void cleanShutdown();
+    virtual Status recoverOrphanedIdent(OperationContext* opCtx,
+                                        StringData ns,
+                                        StringData ident,
+                                        const CollectionOptions& options) override;
+
+    virtual bool hasIdent(OperationContext* opCtx, StringData ident) const override;
+
+    std::vector<std::string> getAllIdents(OperationContext* opCtx) const override;
+
+    virtual void cleanShutdown() override;
 
     SnapshotManager* getSnapshotManager() const final {
         return &_sessionCache->snapshotManager();
@@ -194,11 +205,18 @@ public:
     virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
 
     /**
-     * Returns a timestamp value that is at or before the last checkpoint. Everything before this
-     * value is guaranteed to be persisted on disk and replication recovery will not need to
-     * replay documents with an earlier time.
+     * Returns a stable timestamp value that is guaranteed to exist on recoverToStableTimestamp.
+     * Replication recovery will not need to replay documents with an earlier time.
+     *
+     * Only returns a stable timestamp when it has advanced to >= the initial data timestamp.
+     * Replication recoverable rollback is unsafe when stable < initial during repl initial sync due
+     * to initial sync's cloning phase without timestamps.
+     *
+     * For the persisted mode of this engine, further guarantees a stable timestamp value that is at
+     * or before the last checkpoint. Everything before this value is guaranteed to be persisted on
+     * disk. This supports replication recovery on restart.
      */
-    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const override;
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
     virtual Timestamp getAllCommittedTimestamp() const override;
 
@@ -283,6 +301,15 @@ public:
     Timestamp getStableTimestamp() const;
     Timestamp getOldestTimestamp() const;
 
+    Timestamp getInitialDataTimestamp() const;
+
+    /**
+     * Returns the data file path associated with an ident on disk. Returns boost::none if the data
+     * file can not be found. This will attempt to locate a file even if the storage engine's own
+     * metadata is not aware of the ident. This is intented for database repair purposes only.
+     */
+    boost::optional<boost::filesystem::path> getDataFilePathForIdent(StringData ident) const;
+
 private:
     class WiredTigerJournalFlusher;
     class WiredTigerCheckpointThread;
@@ -303,6 +330,19 @@ private:
      * If the returned Timestamp isNull(), oldest_timestamp should not be moved forward.
      */
     Timestamp _calculateHistoryLagFromStableTimestamp(Timestamp stableTimestamp);
+
+    /**
+     * Checks whether rollback to a timestamp can occur, enforcing a contract of use between the
+     * storage engine and replication.
+     *
+     * It is required that setInitialDataTimestamp has been called with a valid value other than
+     * kAllowUnstableCheckpointsSentinel by the time a node is fully set up -- initial sync
+     * complete, replica set initialized, etc. Else, this fasserts.
+     * Furthermore, rollback cannot go back farther in the past than the initial data timestamp, so
+     * the stable timestamp must be greater than initial data timestamp for a valid rollback. This
+     * function will return false if that is not true.
+     */
+    bool _canRecoverToStableTimestamp() const;
 
     /**
      * Sets the oldest timestamp for which the storage engine must maintain snapshot history
@@ -330,7 +370,7 @@ private:
     mutable ElapsedTracker _sizeStorerSyncTracker;
 
     bool _durable;
-    bool _ephemeral;
+    bool _ephemeral;  // whether we are using the in-memory mode of the WT engine
     const bool _inRepairMode;
     bool _readOnly;
     std::unique_ptr<WiredTigerJournalFlusher> _journalFlusher;  // Depends on _sizeStorer
@@ -349,12 +389,12 @@ private:
     Timestamp _recoveryTimestamp;
     WiredTigerFileVersion _fileVersion;
 
-    // Ensures accesses to _oldestTimestamp and _stableTimestamp, respectively, are multi-core safe.
-    mutable stdx::mutex _oldestTimestampMutex;
-    mutable stdx::mutex _stableTimestampMutex;
-
     // Tracks the stable and oldest timestamps we've set on the storage engine.
-    Timestamp _oldestTimestamp;
-    Timestamp _stableTimestamp;
+    AtomicWord<std::uint64_t> _oldestTimestamp;
+    AtomicWord<std::uint64_t> _stableTimestamp;
+
+    // Timestamp of data at startup. Used internally to advise checkpointing and recovery to a
+    // timestamp. Provided by replication layer because WT does not persist timestamps.
+    AtomicWord<std::uint64_t> _initialDataTimestamp;
 };
 }

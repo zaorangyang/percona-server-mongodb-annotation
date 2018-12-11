@@ -34,6 +34,8 @@
 
 #include "mongo/db/curop.h"
 
+#include <iomanip>
+
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/client.h"
@@ -46,6 +48,7 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/stringutils.h"
@@ -286,7 +289,7 @@ void CurOp::setGenericOpRequestDetails(OperationContext* opCtx,
     // Set the _isCommand flags based on network op only. For legacy writes on mongoS, we resolve
     // them to OpMsgRequests and then pass them into the Commands path, so having a valid Command*
     // here does not guarantee that the op was issued from the client using a command protocol.
-    const bool isCommand = (op == dbMsg || op == dbCommand || (op == dbQuery && nss.isCommand()));
+    const bool isCommand = (op == dbMsg || (op == dbQuery && nss.isCommand()));
     auto logicalOp = (command ? command->getLogicalOp() : networkOpToLogicalOp(op));
 
     stdx::lock_guard<Client> clientLock(*opCtx->getClient());
@@ -503,8 +506,6 @@ StringData getProtoString(int op) {
         return "op_msg";
     } else if (op == dbQuery) {
         return "op_query";
-    } else if (op == dbCommand) {
-        return "op_command";
     }
     MONGO_UNREACHABLE;
 }
@@ -579,6 +580,7 @@ string OpDebug::report(Client* client,
     OPDEBUG_TOSTRING_HELP_OPTIONAL("keysExamined", additiveMetrics.keysExamined);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("docsExamined", additiveMetrics.docsExamined);
     OPDEBUG_TOSTRING_HELP_BOOL(hasSortStage);
+    OPDEBUG_TOSTRING_HELP_BOOL(usedDisk);
     OPDEBUG_TOSTRING_HELP_BOOL(fromMultiPlanner);
     OPDEBUG_TOSTRING_HELP_BOOL(replanned);
     OPDEBUG_TOSTRING_HELP_OPTIONAL("nMatched", additiveMetrics.nMatched);
@@ -598,6 +600,9 @@ string OpDebug::report(Client* client,
     s << " numYields:" << curop.numYields();
     OPDEBUG_TOSTRING_HELP(nreturned);
 
+    if (queryHash) {
+        s << " queryHash:" << unsignedIntToFixedLengthHex(*queryHash);
+    }
     if (!errInfo.isOK()) {
         s << " ok:" << 0;
         if (!errInfo.reason().empty()) {
@@ -660,6 +665,7 @@ void OpDebug::append(const CurOp& curop,
     OPDEBUG_APPEND_OPTIONAL("keysExamined", additiveMetrics.keysExamined);
     OPDEBUG_APPEND_OPTIONAL("docsExamined", additiveMetrics.docsExamined);
     OPDEBUG_APPEND_BOOL(hasSortStage);
+    OPDEBUG_APPEND_BOOL(usedDisk);
     OPDEBUG_APPEND_BOOL(fromMultiPlanner);
     OPDEBUG_APPEND_BOOL(replanned);
     OPDEBUG_APPEND_OPTIONAL("nMatched", additiveMetrics.nMatched);
@@ -678,6 +684,10 @@ void OpDebug::append(const CurOp& curop,
 
     b.appendNumber("numYield", curop.numYields());
     OPDEBUG_APPEND_NUMBER(nreturned);
+
+    if (queryHash) {
+        b.append("queryHash", unsignedIntToFixedLengthHex(*queryHash));
+    }
 
     {
         BSONObjBuilder locks(b.subobjStart("locks"));
@@ -714,6 +724,7 @@ void OpDebug::setPlanSummaryMetrics(const PlanSummaryStats& planSummaryStats) {
     additiveMetrics.keysExamined = planSummaryStats.totalKeysExamined;
     additiveMetrics.docsExamined = planSummaryStats.totalDocsExamined;
     hasSortStage = planSummaryStats.hasSortStage;
+    usedDisk = planSummaryStats.usedDisk;
     fromMultiPlanner = planSummaryStats.fromMultiPlanner;
     replanned = planSummaryStats.replanned;
 }
@@ -799,6 +810,24 @@ void OpDebug::AdditiveMetrics::incrementPrepareReadConflicts(long long n) {
         prepareReadConflicts = 0;
     }
     *prepareReadConflicts += n;
+}
+
+string OpDebug::AdditiveMetrics::report() {
+    StringBuilder s;
+
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("keysExamined", keysExamined);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("docsExamined", docsExamined);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("nMatched", nMatched);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("nModified", nModified);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("ninserted", ninserted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("ndeleted", ndeleted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("nmoved", nmoved);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("keysInserted", keysInserted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("keysDeleted", keysDeleted);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("prepareReadConflicts", prepareReadConflicts);
+    OPDEBUG_TOSTRING_HELP_OPTIONAL("writeConflicts", writeConflicts);
+
+    return s.str();
 }
 
 }  // namespace mongo

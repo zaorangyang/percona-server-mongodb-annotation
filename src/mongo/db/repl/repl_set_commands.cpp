@@ -134,12 +134,12 @@ public:
 
             uassertStatusOK(status);
             return true;
-        } else if (cmdObj.hasElement("getLastStableCheckpointTimestamp")) {
+        } else if (cmdObj.hasElement("getLastStableRecoveryTimestamp")) {
             boost::optional<Timestamp> ts =
                 StorageInterface::get(getGlobalServiceContext())
-                    ->getLastStableCheckpointTimestamp(getGlobalServiceContext());
+                    ->getLastStableRecoveryTimestamp(getGlobalServiceContext());
             if (ts) {
-                result.append("lastStableCheckpointTimestamp", ts.get());
+                result.append("lastStableRecoveryTimestamp", ts.get());
             }
             return true;
         }
@@ -670,7 +670,7 @@ public:
         ReplSetHeartbeatResponse response;
         status = ReplicationCoordinator::get(opCtx)->processHeartbeatV1(args, &response);
         if (status.isOK())
-            response.addToBSON(&result, true);
+            response.addToBSON(&result);
 
         LOG_FOR_HEARTBEATS(2) << "Processed heartbeat from " << cmdObj.getStringField("from")
                               << " and generated response, " << response;

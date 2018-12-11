@@ -78,9 +78,6 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/logical_session_cache_factory_mongos',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
-        '$BUILD_DIR/mongo/executor/network_interface_factory',
-        '$BUILD_DIR/mongo/executor/network_interface_thread_pool',
-        '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_catalog_impl',
         '$BUILD_DIR/mongo/s/catalog/replset_dist_lock_manager',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
@@ -89,6 +86,9 @@ env.Library(
         'coreshard',
         'sharding_task_executor',
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
+    ]
 )
 
 env.Library(
@@ -147,6 +147,7 @@ env.Library(
         env.Idlc('request_types/get_database_version.idl')[0],
         env.Idlc('request_types/move_primary.idl')[0],
         env.Idlc('request_types/shard_collection.idl')[0],
+        env.Idlc('request_types/clone_collection_options_from_primary_shard.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/connection_string',
@@ -352,11 +353,11 @@ env.CppUnitTest(
         'catalog_cache_refresh_test.cpp',
         'chunk_manager_index_bounds_test.cpp',
         'chunk_manager_query_test.cpp',
+        'routing_table_history_test.cpp',
         'shard_key_pattern_test.cpp',
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/auth/authmocks",
-        '$BUILD_DIR/mongo/db/s/sharding',
         '$BUILD_DIR/mongo/db/serveronly',
         'catalog_cache_test_fixture',
     ]
@@ -464,6 +465,7 @@ env.CppUnitTest(
         'client/shard_connection_test.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/dbtests/mocklib',
         '$BUILD_DIR/mongo/util/net/network',
         'client/sharding_connection_hook',

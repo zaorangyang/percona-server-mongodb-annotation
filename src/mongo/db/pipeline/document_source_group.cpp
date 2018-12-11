@@ -245,9 +245,10 @@ intrusive_ptr<DocumentSourceGroup> DocumentSourceGroup::create(
     const intrusive_ptr<ExpressionContext>& pExpCtx,
     const boost::intrusive_ptr<Expression>& groupByExpression,
     std::vector<AccumulationStatement> accumulationStatements,
-    size_t maxMemoryUsageBytes) {
-    intrusive_ptr<DocumentSourceGroup> groupStage(
-        new DocumentSourceGroup(pExpCtx, maxMemoryUsageBytes));
+    boost::optional<size_t> maxMemoryUsageBytes) {
+    size_t memoryBytes = maxMemoryUsageBytes ? *maxMemoryUsageBytes
+                                             : internalDocumentSourceGroupMaxMemoryBytes.load();
+    intrusive_ptr<DocumentSourceGroup> groupStage(new DocumentSourceGroup(pExpCtx, memoryBytes));
     groupStage->setIdExpression(groupByExpression);
     for (auto&& statement : accumulationStatements) {
         groupStage->addAccumulator(statement);
@@ -257,10 +258,12 @@ intrusive_ptr<DocumentSourceGroup> DocumentSourceGroup::create(
 }
 
 DocumentSourceGroup::DocumentSourceGroup(const intrusive_ptr<ExpressionContext>& pExpCtx,
-                                         size_t maxMemoryUsageBytes)
+                                         boost::optional<size_t> maxMemoryUsageBytes)
     : DocumentSource(pExpCtx),
+      _usedDisk(false),
       _doingMerge(false),
-      _maxMemoryUsageBytes(maxMemoryUsageBytes),
+      _maxMemoryUsageBytes(maxMemoryUsageBytes ? *maxMemoryUsageBytes
+                                               : internalDocumentSourceGroupMaxMemoryBytes.load()),
       _inputSort(BSONObj()),
       _streaming(false),
       _initialized(false),
@@ -582,7 +585,12 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
     MONGO_UNREACHABLE;
 }
 
+bool DocumentSourceGroup::usedDisk() {
+    return _usedDisk;
+}
+
 shared_ptr<Sorter<Value, Value>::Iterator> DocumentSourceGroup::spill() {
+    _usedDisk = true;
     vector<const GroupsMap::value_type*> ptrs;  // using pointers to speed sorting
     ptrs.reserve(_groups->size());
     for (GroupsMap::const_iterator it = _groups->begin(), end = _groups->end(); it != end; ++it) {
@@ -678,8 +686,7 @@ boost::optional<BSONObj> DocumentSourceGroup::findRelevantInputSort() const {
         // for every permutation of group by (a, b, c), since we are guaranteed that documents with
         // the same value of (a, b, c) will be consecutive in the input stream, no matter what our
         // _id is.
-        std::set<std::string> fieldNames;
-        obj.getFieldNames(fieldNames);
+        auto fieldNames = obj.getFieldNames<std::set<std::string>>();
         if (fieldNames == deps.fields) {
             return obj;
         }

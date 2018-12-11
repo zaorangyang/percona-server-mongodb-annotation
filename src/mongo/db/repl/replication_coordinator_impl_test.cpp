@@ -382,10 +382,10 @@ TEST_F(ReplCoordTest, InitiateSucceedsWhenQuorumCheckPasses) {
     ASSERT_BSONOBJ_EQ(hbArgs.toBSON(), noi->getRequest().cmdObj);
     ReplSetHeartbeatResponse hbResp;
     hbResp.setConfigVersion(0);
+    hbResp.setAppliedOpTime(OpTime(Timestamp(100, 1), 0));
+    hbResp.setDurableOpTime(OpTime(Timestamp(100, 1), 0));
     getNet()->scheduleResponse(
-        noi,
-        startDate + Milliseconds(10),
-        RemoteCommandResponse(hbResp.toBSON(false), BSONObj(), Milliseconds(8)));
+        noi, startDate + Milliseconds(10), RemoteCommandResponse(hbResp.toBSON(), Milliseconds(8)));
     getNet()->runUntil(startDate + Milliseconds(10));
     getNet()->exitNetwork();
     ASSERT_EQUALS(startDate + Milliseconds(10), getNet()->now());
@@ -1354,7 +1354,7 @@ protected:
             hbResp.setDurableOpTime(desiredOpTime);
             BSONObjBuilder respObj;
             respObj << "ok" << 1;
-            hbResp.addToBSON(&respObj, false);
+            hbResp.addToBSON(&respObj);
             getNet()->scheduleResponse(noi, getNet()->now(), makeResponseStatus(respObj.obj()));
         }
         while (getNet()->hasReadyRequests()) {
@@ -1863,7 +1863,7 @@ protected:
             hbResp.setAppliedOpTime(optimeResponse);
             BSONObjBuilder respObj;
             respObj << "ok" << 1;
-            hbResp.addToBSON(&respObj, false);
+            hbResp.addToBSON(&respObj);
             getNet()->scheduleResponse(noi, getNet()->now(), makeResponseStatus(respObj.obj()));
             hbNum += 1;
         }
@@ -1999,6 +1999,55 @@ TEST_F(ReplCoordTest, SingleNodeReplSetStepDownTimeoutAndElectionTimeoutExpiresA
     Date_t stepdownUntil = getNet()->now() + Seconds(1);
     getNet()->runUntil(stepdownUntil);
     ASSERT_EQUALS(stepdownUntil, getNet()->now());
+    ASSERT_TRUE(getTopoCoord().getMemberState().primary());
+    getNet()->exitNetwork();
+    ASSERT_TRUE(getReplCoord()->getMemberState().primary());
+}
+
+TEST_F(ReplCoordTest, SingleNodeReplSetUnfreeze) {
+    init();
+
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version"
+                            << 1
+                            << "members"
+                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                     << "test1:1234"))
+                            << "protocolVersion"
+                            << 1
+                            << "settings"
+                            << BSON("electionTimeoutMillis" << 10000)),
+                       HostAndPort("test1", 1234));
+    auto opCtx = makeOperationContext();
+    getExternalState()->setElectionTimeoutOffsetLimitFraction(0);
+
+    // Become Secondary.
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+    getReplCoord()->setMyLastAppliedOpTime(OpTimeWithTermOne(100, 1));
+    getReplCoord()->setMyLastDurableOpTime(OpTimeWithTermOne(100, 1));
+    ASSERT_TRUE(getTopoCoord().getMemberState().secondary());
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+
+    // Freeze the node for 20 seconds.
+    BSONObjBuilder resultObj;
+    Date_t freezeUntil = getNet()->now() + Seconds(15);
+    ASSERT_OK(getReplCoord()->processReplSetFreeze(20, &resultObj));
+    getNet()->enterNetwork();
+
+    // Now run time forward and unfreeze the node after 15 seconds.
+    getNet()->runUntil(freezeUntil);
+    ASSERT_EQUALS(freezeUntil, getNet()->now());
+    ASSERT_TRUE(getTopoCoord().getMemberState().secondary());
+    getNet()->exitNetwork();
+    ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
+    ASSERT_OK(getReplCoord()->processReplSetFreeze(0, &resultObj));
+    getNet()->enterNetwork();
+
+    // Wait for single node election to happen.
+    Date_t waitUntil = freezeUntil + Seconds(1);
+    getNet()->runUntil(waitUntil);
+    ASSERT_EQUALS(waitUntil, getNet()->now());
     ASSERT_TRUE(getTopoCoord().getMemberState().primary());
     getNet()->exitNetwork();
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
@@ -2166,7 +2215,7 @@ TEST_F(StepDownTest,
         hbResp.setConfigVersion(hbArgs.getConfigVersion());
         BSONObjBuilder respObj;
         respObj << "ok" << 1;
-        hbResp.addToBSON(&respObj, false);
+        hbResp.addToBSON(&respObj);
         getNet()->scheduleResponse(noi, getNet()->now(), makeResponseStatus(respObj.obj()));
     }
     while (getNet()->hasReadyRequests()) {
@@ -2935,6 +2984,35 @@ TEST_F(ReplCoordTest, IsMasterWithCommittedSnapshot) {
     ASSERT_EQUALS(majorityOpTime, response.getLastMajorityWriteOpTime());
     ASSERT_EQUALS(majorityWriteDate, response.getLastMajorityWriteDate());
 }
+
+TEST_F(ReplCoordTest, IsMasterInShutdown) {
+    init("mySet");
+
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version"
+                            << 1
+                            << "members"
+                            << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                     << "test1:1234"))),
+                       HostAndPort("test1", 1234));
+    auto opCtx = makeOperationContext();
+    runSingleNodeElection(opCtx.get());
+
+    IsMasterResponse responseBeforeShutdown;
+    getReplCoord()->fillIsMasterForReplSet(&responseBeforeShutdown);
+    ASSERT_TRUE(responseBeforeShutdown.isMaster());
+    ASSERT_FALSE(responseBeforeShutdown.isSecondary());
+
+    shutdown(opCtx.get());
+
+    // Must not report ourselves as master while we're in shutdown.
+    IsMasterResponse responseAfterShutdown;
+    getReplCoord()->fillIsMasterForReplSet(&responseAfterShutdown);
+    ASSERT_FALSE(responseAfterShutdown.isMaster());
+    ASSERT_FALSE(responseBeforeShutdown.isSecondary());
+}
+
 
 TEST_F(ReplCoordTest, LogAMessageWhenShutDownBeforeReplicationStartUpFinished) {
     init();
@@ -4471,9 +4549,8 @@ TEST_F(ReplCoordTest,
                                   << 3
                                   << "syncSourceIndex"
                                   << 1)));
-    BSONObjBuilder metadataBuilder;
-    ASSERT_OK(metadata.getValue().writeToMetadata(&metadataBuilder));
-    auto metadataObj = metadataBuilder.obj();
+    BSONObjBuilder responseBuilder;
+    ASSERT_OK(metadata.getValue().writeToMetadata(&responseBuilder));
 
     auto net = getNet();
     net->enterNetwork();
@@ -4488,7 +4565,8 @@ TEST_F(ReplCoordTest,
     hbResp.setConfigVersion(config.getConfigVersion());
     hbResp.setSetName(config.getReplSetName());
     hbResp.setState(MemberState::RS_SECONDARY);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true), metadataObj));
+    responseBuilder.appendElements(hbResp.toBSON());
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(responseBuilder.obj()));
     net->runReadyNetworkOperations();
     net->exitNetwork();
 
@@ -4597,9 +4675,8 @@ TEST_F(ReplCoordTest, TermAndLastCommittedOpTimeUpdatedFromHeartbeatWhenArbiter)
                                   << 3
                                   << "syncSourceIndex"
                                   << 1)));
-    BSONObjBuilder metadataBuilder;
-    ASSERT_OK(metadata.getValue().writeToMetadata(&metadataBuilder));
-    auto metadataObj = metadataBuilder.obj();
+    BSONObjBuilder responseBuilder;
+    ASSERT_OK(metadata.getValue().writeToMetadata(&responseBuilder));
 
     auto net = getNet();
     net->enterNetwork();
@@ -4614,7 +4691,8 @@ TEST_F(ReplCoordTest, TermAndLastCommittedOpTimeUpdatedFromHeartbeatWhenArbiter)
     hbResp.setConfigVersion(config.getConfigVersion());
     hbResp.setSetName(config.getReplSetName());
     hbResp.setState(MemberState::RS_SECONDARY);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true), metadataObj));
+    responseBuilder.appendElements(hbResp.toBSON());
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(responseBuilder.obj()));
     net->runReadyNetworkOperations();
     net->exitNetwork();
 
@@ -4788,7 +4866,9 @@ TEST_F(ReplCoordTest,
     hbResp.setConfigVersion(3);
     hbResp.setSetName("mySet");
     hbResp.setState(MemberState::RS_SECONDARY);
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+    hbResp.setAppliedOpTime(OpTime(Timestamp(100, 1), 0));
+    hbResp.setDurableOpTime(OpTime(Timestamp(100, 1), 0));
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     net->runReadyNetworkOperations();
     net->exitNetwork();
 
@@ -4840,11 +4920,14 @@ TEST_F(ReplCoordTest,
     hbResp.setSetName("mySet");
     hbResp.setState(MemberState::RS_PRIMARY);
     hbResp.setTerm(replCoord->getTerm());
+    hbResp.setAppliedOpTime(OpTime(Timestamp(100, 1), 0));
+    hbResp.setDurableOpTime(OpTime(Timestamp(100, 1), 0));
+    hbResp.setConfigVersion(1);
 
     // Heartbeat response is scheduled with a delay so that we can be sure that
     // the election was rescheduled due to the heartbeat response.
     auto heartbeatWhen = net->now() + Seconds(1);
-    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON(true)));
+    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON()));
     net->runUntil(heartbeatWhen);
     ASSERT_EQUALS(heartbeatWhen, net->now());
     net->runReadyNetworkOperations();
@@ -4898,7 +4981,7 @@ TEST_F(ReplCoordTest,
     // Heartbeat response is scheduled with a delay so that we can be sure that
     // the election was rescheduled due to the heartbeat response.
     auto heartbeatWhen = net->now() + Seconds(1);
-    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON(true)));
+    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON()));
     net->runUntil(heartbeatWhen);
     ASSERT_EQUALS(heartbeatWhen, net->now());
     net->runReadyNetworkOperations();
@@ -4949,7 +5032,7 @@ TEST_F(ReplCoordTest,
     // Heartbeat response is scheduled with a delay so that we can be sure that
     // the election was rescheduled due to the heartbeat response.
     auto heartbeatWhen = net->now() + Seconds(1);
-    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON(true)));
+    net->scheduleResponse(noi, heartbeatWhen, makeResponseStatus(hbResp.toBSON()));
     net->runUntil(heartbeatWhen);
     ASSERT_EQUALS(heartbeatWhen, net->now());
     net->runReadyNetworkOperations();

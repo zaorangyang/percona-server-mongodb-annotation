@@ -44,6 +44,7 @@
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/explain_options.h"
+#include "mongo/db/storage/backup_cursor_service.h"
 
 namespace mongo {
 
@@ -95,11 +96,22 @@ public:
     virtual bool isSharded(OperationContext* opCtx, const NamespaceString& ns) = 0;
 
     /**
-     * Inserts 'objs' into 'ns' and returns the "detailed" last error object.
+     * Inserts 'objs' into 'ns' and throws a UserException if the insert fails.
      */
-    virtual BSONObj insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                           const NamespaceString& ns,
-                           const std::vector<BSONObj>& objs) = 0;
+    virtual void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                        const NamespaceString& ns,
+                        const std::vector<BSONObj>& objs) = 0;
+
+    /**
+     * Updates the documents matching 'queries' with the objects 'updates'. Throws a UserException
+     * if any of the updates fail.
+     */
+    virtual void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                        const NamespaceString& ns,
+                        const std::vector<BSONObj>& queries,
+                        const std::vector<BSONObj>& updates,
+                        bool upsert,
+                        bool multi) = 0;
 
     virtual CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
                                                   const NamespaceString& ns) = 0;
@@ -135,8 +147,10 @@ public:
     /**
      * Performs the given rename command if the collection given by 'targetNs' has the same options
      * as specified in 'originalCollectionOptions', and has the same indexes as 'originalIndexes'.
+     *
+     * Throws an exception if the collection options and/or indexes are different.
      */
-    virtual Status renameIfOptionsAndIndexesHaveNotChanged(
+    virtual void renameIfOptionsAndIndexesHaveNotChanged(
         OperationContext* opCtx,
         const BSONObj& renameCommandObj,
         const NamespaceString& targetNs,
@@ -210,6 +224,17 @@ public:
      */
     virtual std::vector<GenericCursor> getCursors(
         const boost::intrusive_ptr<ExpressionContext>& expCtx) const = 0;
+
+    /**
+     * The following methods forward to the BackupCursorService decorating the ServiceContext.
+     */
+    virtual void fsyncLock(OperationContext* opCtx) = 0;
+
+    virtual void fsyncUnlock(OperationContext* opCtx) = 0;
+
+    virtual BackupCursorState openBackupCursor(OperationContext* opCtx) = 0;
+
+    virtual void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) = 0;
 };
 
 }  // namespace mongo

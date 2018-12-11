@@ -114,16 +114,25 @@ BSONObj BSONObj::getOwned() const {
 }
 
 string BSONObj::jsonString(JsonStringFormat format, int pretty, bool isArray) const {
-    if (isEmpty())
-        return isArray ? "[]" : "{}";
+    std::stringstream s;
+    BSONObj::jsonStringStream(format, pretty, isArray, s);
+    return s.str();
+}
 
-    StringBuilder s;
+void BSONObj::jsonStringStream(JsonStringFormat format,
+                               int pretty,
+                               bool isArray,
+                               std::stringstream& s) const {
+    if (isEmpty()) {
+        s << (isArray ? "[]" : "{}");
+        return;
+    }
     s << (isArray ? "[ " : "{ ");
     BSONObjIterator i(*this);
     BSONElement e = i.next();
     if (!e.eoo())
         while (1) {
-            s << e.jsonString(format, !isArray, pretty ? pretty + 1 : 0);
+            e.jsonStringStream(format, !isArray, pretty ? pretty + 1 : 0, s);
             e = i.next();
             if (e.eoo())
                 break;
@@ -137,7 +146,6 @@ string BSONObj::jsonString(JsonStringFormat format, int pretty, bool isArray) co
             }
         }
     s << (isArray ? " ]" : " }");
-    return s.str();
 }
 
 bool BSONObj::valid(BSONVersion version) const {
@@ -269,20 +277,6 @@ BSONElement BSONObj::getFieldUsingIndexNames(StringData fieldName, const BSONObj
         --j;
     }
     return BSONElement();
-}
-
-/* grab names of all the fields in this object */
-int BSONObj::getFieldNames(set<string>& fields) const {
-    int n = 0;
-    BSONObjIterator i(*this);
-    while (i.moreWithEOO()) {
-        BSONElement e = i.next();
-        if (e.eoo())
-            break;
-        fields.insert(e.fieldName());
-        n++;
-    }
-    return n;
 }
 
 /* note: addFields always adds _id even if not specified

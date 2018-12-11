@@ -33,12 +33,12 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/transaction_participant.h"
 
 namespace mongo {
 namespace {
@@ -73,12 +73,16 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        auto session = OperationContextSession::get(opCtx);
-        uassert(
-            ErrorCodes::CommandFailed, "commitTransaction must be run within a session", session);
+        IDLParserErrorContext ctx("commitTransaction");
+        auto cmd = CommitTransaction::parse(ctx, cmdObj);
+
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        uassert(ErrorCodes::CommandFailed,
+                "commitTransaction must be run within a transaction",
+                txnParticipant);
 
         // commitTransaction is retryable.
-        if (session->transactionIsCommitted()) {
+        if (txnParticipant->transactionIsCommitted()) {
             // We set the client last op to the last optime observed by the system to ensure that
             // we wait for the specified write concern on an optime greater than or equal to the
             // commit oplog entry.
@@ -89,59 +93,21 @@ public:
 
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",
-                session->inMultiDocumentTransaction());
+                txnParticipant->inMultiDocumentTransaction());
 
-        session->commitTransaction(opCtx);
+        auto optionalCommitTimestamp = cmd.getCommitTimestamp();
+        if (optionalCommitTimestamp) {
+            // commitPreparedTransaction will throw if the transaction is not prepared.
+            txnParticipant->commitPreparedTransaction(opCtx, optionalCommitTimestamp.get());
+        } else {
+            // commitUnpreparedTransaction will throw if the transaction is prepared.
+            txnParticipant->commitUnpreparedTransaction(opCtx);
+        }
 
         return true;
     }
 
 } commitTxn;
-
-class CmdPrepareTxn : public BasicCommand {
-public:
-    CmdPrepareTxn() : BasicCommand("prepareTransaction") {}
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
-        return AllowedOnSecondary::kNever;
-    }
-
-    virtual bool adminOnly() const {
-        return true;
-    }
-
-    bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return true;
-    }
-
-    std::string help() const override {
-        return "Prepares a transaction. This is only expected to be called by mongos.";
-    }
-
-    Status checkAuthForOperation(OperationContext* opCtx,
-                                 const std::string& dbname,
-                                 const BSONObj& cmdObj) const override {
-        return Status::OK();
-    }
-
-    bool run(OperationContext* opCtx,
-             const std::string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) override {
-        auto session = OperationContextSession::get(opCtx);
-        uassert(
-            ErrorCodes::CommandFailed, "prepareTransaction must be run within a session", session);
-
-        uassert(ErrorCodes::NoSuchTransaction,
-                "Transaction isn't in progress",
-                session->inMultiDocumentTransaction());
-
-        session->prepareTransaction(opCtx);
-        return true;
-    }
-};
-
-MONGO_REGISTER_TEST_COMMAND(CmdPrepareTxn);
 
 class CmdAbortTxn : public BasicCommand {
 public:
@@ -173,16 +139,16 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
-        auto session = OperationContextSession::get(opCtx);
-        uassert(
-            ErrorCodes::CommandFailed, "abortTransaction must be run within a session", session);
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        uassert(ErrorCodes::CommandFailed,
+                "abortTransaction must be run within a transaction",
+                txnParticipant);
 
-        // TODO SERVER-33501 Change this when abortTransaction is retryable.
         uassert(ErrorCodes::NoSuchTransaction,
                 "Transaction isn't in progress",
-                session->inMultiDocumentTransaction());
+                txnParticipant->inMultiDocumentTransaction());
 
-        session->abortActiveTransaction(opCtx);
+        txnParticipant->abortActiveTransaction(opCtx);
         return true;
     }
 

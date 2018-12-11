@@ -27,8 +27,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/dbdirectclient',
         '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/service_context_d',
-        '$BUILD_DIR/mongo/db/s/sharding',
-        '$BUILD_DIR/mongo/s/coreshard',
+        '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
         '$BUILD_DIR/mongo/scripting/scripting_common',
         '$BUILD_DIR/mongo/unittest/unittest',
         'framework_options',
@@ -53,6 +52,7 @@ env.Library(
 dbtest = env.Program(
     target="dbtest",
     source=[
+        'all_paths_multikey_persistence_test.cpp',
         'basictests.cpp',
         'clienttests.cpp',
         'commandtests.cpp',
@@ -77,7 +77,6 @@ dbtest = env.Program(
         'mock_dbclient_conn_test.cpp',
         'mock_replica_set_test.cpp',
         'multikey_paths_test.cpp',
-        'oplogstarttests.cpp',
         'pdfiletests.cpp',
         'plan_ranking.cpp',
         'query_stage_multiplan.cpp',
@@ -93,7 +92,6 @@ dbtest = env.Program(
         'query_stage_ensure_sorted.cpp',
         'query_stage_fetch.cpp',
         'query_stage_ixscan.cpp',
-        'query_stage_keep.cpp',
         'query_stage_limit_skip.cpp',
         'query_stage_merge_sort.cpp',
         'query_stage_near.cpp',

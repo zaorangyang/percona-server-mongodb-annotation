@@ -247,7 +247,7 @@ void DBClientCursor::exhaustReceiveMore() {
 
 BSONObj DBClientCursor::commandDataReceived(const Message& reply) {
     int op = reply.operation();
-    invariant(op == opReply || op == dbCommandReply || op == dbMsg);
+    invariant(op == opReply || op == dbMsg);
 
     auto commandReply = _client->parseCommandReplyMessage(_client->getServerAddress(), reply);
     auto commandStatus = getStatusFromCommandResult(commandReply->getCommandReply());
@@ -262,7 +262,7 @@ BSONObj DBClientCursor::commandDataReceived(const Message& reply) {
     auto opCtx = haveClient() ? cc().getOperationContext() : nullptr;
     if (_client->getReplyMetadataReader()) {
         uassertStatusOK(_client->getReplyMetadataReader()(
-            opCtx, commandReply->getMetadata(), _client->getServerAddress()));
+            opCtx, commandReply->getCommandReply(), _client->getServerAddress()));
     }
 
     return commandReply->getCommandReply().getOwned();

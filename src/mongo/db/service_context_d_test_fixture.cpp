@@ -41,8 +41,8 @@
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
-#include "mongo/unittest/temp_dir.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/mock_periodic_runner_impl.h"
 
 #include "mongo/db/catalog/database_holder.h"
 
@@ -51,19 +51,29 @@ namespace mongo {
 ServiceContextMongoDTest::ServiceContextMongoDTest()
     : ServiceContextMongoDTest("ephemeralForTest") {}
 
-ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine) {
+ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine)
+    : ServiceContextMongoDTest(engine, RepairAction::kNoRepair) {}
+
+ServiceContextMongoDTest::ServiceContextMongoDTest(std::string engine, RepairAction repair)
+    : _tempDir("service_context_d_test_fixture") {
 
     _stashedStorageParams.engine = std::exchange(storageGlobalParams.engine, std::move(engine));
     _stashedStorageParams.engineSetByUser =
         std::exchange(storageGlobalParams.engineSetByUser, true);
+    _stashedStorageParams.repair =
+        std::exchange(storageGlobalParams.repair, (repair == RepairAction::kRepair));
 
     auto const serviceContext = getServiceContext();
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
     auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
     LogicalClock::set(serviceContext, std::move(logicalClock));
 
-    unittest::TempDir tempDir("service_context_d_test_fixture");
-    storageGlobalParams.dbpath = tempDir.path();
+    // Set up a fake no-op PeriodicRunner. No jobs will ever get run, which is
+    // desired behavior for unit tests unrelated to background jobs.
+    auto runner = std::make_unique<MockPeriodicRunnerImpl>();
+    serviceContext->setPeriodicRunner(std::move(runner));
+
+    storageGlobalParams.dbpath = _tempDir.path();
 
     initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
 
@@ -86,6 +96,7 @@ ServiceContextMongoDTest::~ServiceContextMongoDTest() {
     shutdownGlobalStorageEngineCleanly(getGlobalServiceContext());
     std::swap(storageGlobalParams.engine, _stashedStorageParams.engine);
     std::swap(storageGlobalParams.engineSetByUser, _stashedStorageParams.engineSetByUser);
+    std::swap(storageGlobalParams.repair, _stashedStorageParams.repair);
 }
 
 }  // namespace mongo

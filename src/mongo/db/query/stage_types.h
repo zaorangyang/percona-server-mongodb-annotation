@@ -54,16 +54,9 @@ enum StageType {
     // scan stage is an ixscan with some key-skipping behvaior that only distinct uses.
     STAGE_DISTINCT_SCAN,
 
-    // Dummy stage used for receiving notifications of deletions during chunk migration.
-    STAGE_NOTIFY_DELETE,
-
     STAGE_ENSURE_SORTED,
 
     STAGE_EOF,
-
-    // This is more of an "internal-only" stage where we try to keep docs that were mutated
-    // during query execution.
-    STAGE_KEEP_MUTATIONS,
 
     STAGE_FETCH,
 
@@ -75,9 +68,6 @@ enum StageType {
 
     STAGE_IDHACK,
 
-    // Simple wrapper to iterate a SortedDataInterface::Cursor.
-    STAGE_INDEX_ITERATOR,
-
     STAGE_IXSCAN,
     STAGE_LIMIT,
 
@@ -85,7 +75,6 @@ enum StageType {
     STAGE_MULTI_ITERATOR,
 
     STAGE_MULTI_PLAN,
-    STAGE_OPLOG_START,
     STAGE_OR,
     STAGE_PROJECTION,
 

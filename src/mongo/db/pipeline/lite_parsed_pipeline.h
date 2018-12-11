@@ -110,11 +110,21 @@ public:
     }
 
     /**
-     * Returns false if the pipeline has any Documet Source which requires rewriting via serialize.
+     * Returns false if the pipeline has any Document Source which requires rewriting via serialize.
      */
     bool allowedToPassthroughFromMongos() const {
         return std::all_of(_stageSpecs.cbegin(), _stageSpecs.cend(), [](const auto& spec) {
             return spec->allowedToPassthroughFromMongos();
+        });
+    }
+
+    /**
+     * Returns false if at least one of the stages does not allow an involved namespace to be
+     * sharded.
+     */
+    bool allowShardedForeignCollections() const {
+        return std::all_of(_stageSpecs.begin(), _stageSpecs.end(), [](auto&& spec) {
+            return spec->allowShardedForeignCollections();
         });
     }
 

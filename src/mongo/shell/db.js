@@ -465,7 +465,8 @@ var DB;
     };
 
     /**
-      Clone database on another server to here.
+      Clone database on another server to here. This functionality was removed as of MongoDB 4.2.
+      The shell helper is kept to maintain compatibility with previous versions of MongoDB.
       <p>
       Generally, you should dropDatabase() first as otherwise the cloned information will MERGE
       into whatever data is already present in this database.  (That is however a valid way to use
@@ -481,7 +482,7 @@ var DB;
      */
     DB.prototype.cloneDatabase = function(from) {
         print(
-            "WARNING: db.cloneDatabase is deprecated. See http://dochub.mongodb.org/core/copydb-clone-deprecation");
+            "WARNING: db.cloneDatabase will only function with MongoDB 4.0 and below. See http://dochub.mongodb.org/core/4.2-copydb-clone");
         assert(isString(from) && from.length);
         return this._dbCommand({clone: from});
     };
@@ -512,7 +513,9 @@ var DB;
     };
 
     /**
-      Copy database from one server or name to another server or name.
+      Copy database from one server or name to another server or name. This functionality was
+      removed as of MongoDB 4.2. The shell helper is kept to maintain compatibility with previous
+      versions of MongoDB.
 
       Generally, you should dropDatabase() first as otherwise the copied information will MERGE
       into whatever data is already present in this database (and you will get duplicate objects
@@ -534,7 +537,7 @@ var DB;
     DB.prototype.copyDatabase = function(
         fromdb, todb, fromhost, username, password, mechanism, slaveOk) {
         print(
-            "WARNING: db.copyDatabase is deprecated. See http://dochub.mongodb.org/core/copydb-clone-deprecation");
+            "WARNING: db.copyDatabase will only function with MongoDB 4.0 and below. See http://dochub.mongodb.org/core/4.2-copydb-clone");
         assert(isString(fromdb) && fromdb.length);
         assert(isString(todb) && todb.length);
         fromhost = fromhost || "";
@@ -580,15 +583,6 @@ var DB;
         });
     };
 
-    /**
-      Repair database.
-
-     * @return Object returned has member ok set to true if operation succeeds, false otherwise.
-    */
-    DB.prototype.repairDatabase = function() {
-        return this._dbCommand({repairDatabase: 1});
-    };
-
     DB.prototype.help = function() {
         print("DB methods:");
         print(
@@ -596,9 +590,10 @@ var DB;
         print(
             "\tdb.aggregate([pipeline], {options}) - performs a collectionless aggregation on this database; returns a cursor");
         print("\tdb.auth(username, password)");
-        print("\tdb.cloneDatabase(fromhost) - deprecated");
+        print("\tdb.cloneDatabase(fromhost) - will only function with MongoDB 4.0 and below");
         print("\tdb.commandHelp(name) returns the help for the command");
-        print("\tdb.copyDatabase(fromdb, todb, fromhost) - deprecated");
+        print(
+            "\tdb.copyDatabase(fromdb, todb, fromhost) - will only function with MongoDB 4.0 and below");
         print("\tdb.createCollection(name, {size: ..., capped: ..., max: ...})");
         print("\tdb.createView(name, viewOn, [{$operator: {...}}, ...], {viewOptions})");
         print("\tdb.createUser(userDocument)");
@@ -636,7 +631,6 @@ var DB;
         print("\tdb.printShardingStatus()");
         print("\tdb.printSlaveReplicationInfo()");
         print("\tdb.dropUser(username)");
-        print("\tdb.repairDatabase()");
         print("\tdb.resetError()");
         print(
             "\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into {cmdObj: 1}");
@@ -1919,6 +1913,12 @@ var DB;
 
     DB.prototype.enableFreeMonitoring = function() {
         'use strict';
+        const isMaster = this.isMaster();
+        if (isMaster.ismaster == false) {
+            print("ERROR: db.enableFreeMonitoring() may only be run on a primary");
+            return;
+        }
+
         assert.commandWorked(this.adminCommand({setFreeMonitoring: 1, action: 'enable'}));
 
         const cmd = this.adminCommand({getFreeMonitoringStatus: 1});
@@ -1932,9 +1932,12 @@ var DB;
         assert.commandWorked(cmd);
 
         if (cmd.state !== 'enabled') {
-            print("Successfully initiated free monitoring. The registration is " +
-                  "proceeding in the background. ");
-            print("Run db.getFreeMonitoringStatus() at any time to check on the progress.");
+            const url = this.adminCommand({'getParameter': 1, 'cloudFreeMonitoringEndpointURL': 1})
+                            .cloudFreeMonitoringEndpointURL;
+
+            print("Unable to get immediate response from the Cloud Monitoring service. We will" +
+                  "continue to retry in the background. Please check your firewall " +
+                  "settings to ensure that mongod can communicate with \"" + url + "\"");
             return;
         }
 

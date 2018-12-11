@@ -79,6 +79,9 @@ extern AtomicDouble internalQueryCacheWorksGrowthCoefficient;
 // Whether or not cache entries can be marked as "inactive."
 extern AtomicBool internalQueryCacheDisableInactiveEntries;
 
+// Whether or not planCacheListPlans uses the new output format.
+extern AtomicBool internalQueryCacheListPlansNewOutput;
+
 //
 // Planning and enumeration.
 //
@@ -123,6 +126,10 @@ const int64_t insertVectorMaxBytes = 256 * 1024;
 // The number of bytes to buffer at once during a $facet stage.
 extern AtomicInt32 internalQueryFacetBufferSizeBytes;
 
+extern AtomicInt64 internalDocumentSourceSortMaxBlockingSortBytes;
+
+extern AtomicInt64 internalDocumentSourceGroupMaxMemoryBytes;
+
 extern AtomicInt32 internalInsertMaxBatchSize;
 
 extern AtomicInt32 internalDocumentSourceCursorBatchSizeBytes;
@@ -130,4 +137,10 @@ extern AtomicInt32 internalDocumentSourceCursorBatchSizeBytes;
 extern AtomicInt32 internalDocumentSourceLookupCacheSizeBytes;
 
 extern AtomicBool internalQueryProhibitBlockingMergeOnMongoS;
+
+//
+// In-progress features.
+//
+// TODO: Remove in SERVER-36198.
+extern AtomicBool internalQueryAllowAllPathsIndexes;
 }  // namespace mongo

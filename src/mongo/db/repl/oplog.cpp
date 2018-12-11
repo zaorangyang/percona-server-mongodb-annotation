@@ -152,8 +152,7 @@ void _getNextOpTimes(OperationContext* opCtx,
     long long term = OpTime::kUninitializedTerm;
 
     // Fetch term out of the newOpMutex.
-    if (replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet &&
-        replCoord->isV1ElectionProtocol()) {
+    if (replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet) {
         // Current term. If we're not a replset of pv=1, it remains kOldProtocolVersionTerm.
         term = replCoord->getTerm();
     }
@@ -679,7 +678,7 @@ void createOplog(OperationContext* opCtx) {
     createOplog(opCtx, localOplogInfo(opCtx->getServiceContext()).oplogName, isReplSet);
 }
 
-OplogSlot getNextOpTime(OperationContext* opCtx) {
+MONGO_REGISTER_SHIM(GetNextOpTimeClass::getNextOpTime)(OperationContext* opCtx)->OplogSlot {
     // The local oplog collection pointer must already be established by this point.
     // We can't establish it here because that would require locking the local database, which would
     // be a lock order violation.
@@ -951,8 +950,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-         return convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
-     }}},
+          return convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
+      },
+      {ErrorCodes::NamespaceNotFound}}},
     {"emptycapped",
      {[](OperationContext* opCtx,
          const char* ns,
@@ -960,8 +960,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-         return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
-     }}},
+          return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
+      },
+      {ErrorCodes::NamespaceNotFound}}},
 };
 
 }  // namespace

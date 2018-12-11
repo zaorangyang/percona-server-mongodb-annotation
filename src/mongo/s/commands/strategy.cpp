@@ -74,7 +74,7 @@
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/cluster_find.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/s/transaction/router_session_runtime_state.h"
+#include "mongo/s/transaction/transaction_router.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -319,7 +319,7 @@ void runCommand(OperationContext* opCtx,
     const int maxTimeMS = uassertStatusOK(
         QueryRequest::parseMaxTimeMS(request.body[QueryRequest::cmdOptionMaxTimeMS]));
     if (maxTimeMS > 0 && command->getLogicalOp() != LogicalOp::opGetMore) {
-        opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
+        opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
@@ -334,6 +334,14 @@ void runCommand(OperationContext* opCtx,
     // Fill out all currentOp details.
     CurOp::get(opCtx)->setGenericOpRequestDetails(opCtx, nss, command, request.body, opType);
 
+    auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    auto readConcernParseStatus = readConcernArgs.initialize(request.body);
+    if (!readConcernParseStatus.isOK()) {
+        auto builder = replyBuilder->getBodyBuilder();
+        CommandHelpers::appendCommandStatusNoThrow(builder, readConcernParseStatus);
+        return;
+    }
+
     boost::optional<ScopedRouterSession> scopedSession;
     if (auto osi = initializeOperationSessionInfo(
             opCtx, request.body, command->requiresAuth(), true, true, true)) {
@@ -341,8 +349,8 @@ void runCommand(OperationContext* opCtx,
         if (osi->getAutocommit()) {
             scopedSession.emplace(opCtx);
 
-            auto routerSession = RouterSessionRuntimeState::get(opCtx);
-            invariant(routerSession);
+            auto txnRouter = TransactionRouter::get(opCtx);
+            invariant(txnRouter);
 
             auto txnNumber = opCtx->getTxnNumber();
             invariant(txnNumber);
@@ -350,16 +358,8 @@ void runCommand(OperationContext* opCtx,
             auto startTxnSetting = osi->getStartTransaction();
             bool startTransaction = startTxnSetting ? *startTxnSetting : false;
 
-            routerSession->beginOrContinueTxn(*txnNumber, startTransaction);
+            txnRouter->beginOrContinueTxn(opCtx, *txnNumber, startTransaction);
         }
-    }
-
-    auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    auto readConcernParseStatus = readConcernArgs.initialize(request.body);
-    if (!readConcernParseStatus.isOK()) {
-        auto builder = replyBuilder->getBodyBuilder();
-        CommandHelpers::appendCommandStatusNoThrow(builder, readConcernParseStatus);
-        return;
     }
 
     try {
@@ -479,7 +479,8 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
         uassert(50749,
                 "Illegal attempt to set operation deadline within DBDirectClient",
                 !opCtx->getClient()->isInDirectClient());
-        opCtx->setDeadlineAfterNowBy(Milliseconds{queryRequest.getMaxTimeMS()});
+        opCtx->setDeadlineAfterNowBy(Milliseconds{queryRequest.getMaxTimeMS()},
+                                     ErrorCodes::MaxTimeMSExpired);
     }
     opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
 
@@ -579,7 +580,6 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
         return {};  // Don't reply.
     }
 
-    reply->setMetadata(BSONObj());  // mongos doesn't use metadata but the API requires this call.
     return DbResponse{reply->done()};
 }
 

@@ -408,10 +408,6 @@ Status ReplicationCoordinatorMock::processHeartbeatV1(const ReplSetHeartbeatArgs
     return Status::OK();
 }
 
-bool ReplicationCoordinatorMock::isV1ElectionProtocol() const {
-    return true;
-}
-
 bool ReplicationCoordinatorMock::getWriteConcernMajorityShouldJournal() {
     return true;
 }
@@ -419,10 +415,11 @@ bool ReplicationCoordinatorMock::getWriteConcernMajorityShouldJournal() {
 void ReplicationCoordinatorMock::summarizeAsHtml(ReplSetHtmlSummary* output) {}
 
 long long ReplicationCoordinatorMock::getTerm() {
-    return OpTime::kInitialTerm;
+    return _term;
 }
 
 Status ReplicationCoordinatorMock::updateTerm(OperationContext* opCtx, long long term) {
+    _term = term;
     return Status::OK();
 }
 

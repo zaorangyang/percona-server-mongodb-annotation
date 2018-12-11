@@ -27,6 +27,8 @@
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define LOG_FOR_ELECTION(level) \
+    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kReplicationElection)
 
 #include "mongo/platform/basic.h"
 
@@ -98,8 +100,8 @@ std::ostream& operator<<(std::ostream& os,
     switch (result) {
         case TopologyCoordinator::PrepareFreezeResponseResult::kNoAction:
             return os << "no action";
-        case TopologyCoordinator::PrepareFreezeResponseResult::kElectSelf:
-            return os << "elect self";
+        case TopologyCoordinator::PrepareFreezeResponseResult::kSingleNodeSelfElect:
+            return os << "single node self elect";
     }
     MONGO_UNREACHABLE;
 }
@@ -132,15 +134,8 @@ bool _hasOnlyAuthErrorUpHeartbeats(const std::vector<MemberData>& hbdata, const 
     return foundAuthError;
 }
 
-void appendOpTime(BSONObjBuilder* bob,
-                  const char* elemName,
-                  const OpTime& opTime,
-                  const long long pv) {
-    if (pv == 1) {
-        opTime.append(bob, elemName);
-    } else {
-        bob->append(elemName, opTime.getTimestamp());
-    }
+void appendOpTime(BSONObjBuilder* bob, const char* elemName, const OpTime& opTime) {
+    opTime.append(bob, elemName);
 }
 }  // namespace
 
@@ -707,14 +702,12 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     //
     // Arbiters also decrease their heartbeat interval to at most half the election timeout period.
     Milliseconds heartbeatInterval = _rsConfig.getHeartbeatInterval();
-    if (_rsConfig.getProtocolVersion() == 1) {
-        if (getMemberState().arbiter()) {
-            heartbeatInterval = std::min(_rsConfig.getElectionTimeoutPeriod() / 2,
-                                         _rsConfig.getHeartbeatInterval());
-        } else if (getSyncSourceAddress().empty() && !_iAmPrimary()) {
-            heartbeatInterval = std::min(_rsConfig.getElectionTimeoutPeriod() / 2,
-                                         _rsConfig.getHeartbeatInterval() / 4);
-        }
+    if (getMemberState().arbiter()) {
+        heartbeatInterval =
+            std::min(_rsConfig.getElectionTimeoutPeriod() / 2, _rsConfig.getHeartbeatInterval());
+    } else if (getSyncSourceAddress().empty() && !_iAmPrimary()) {
+        heartbeatInterval = std::min(_rsConfig.getElectionTimeoutPeriod() / 2,
+                                     _rsConfig.getHeartbeatInterval() / 4);
     }
 
     const Milliseconds alreadyElapsed = now - hbStats.getLastHeartbeatStartDate();
@@ -800,13 +793,11 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
         }
     } else {
         ReplSetHeartbeatResponse hbr = std::move(hbResponse.getValue());
-        LOG(3) << "setUpValues: heartbeat response good for member _id:" << member.getId()
-               << ", msg:  " << hbr.getHbMsg();
+        LOG(3) << "setUpValues: heartbeat response good for member _id:" << member.getId();
         advancedOpTime = hbData.setUpValues(now, std::move(hbr));
     }
 
     HeartbeatResponseAction nextAction;
-    invariant(_rsConfig.getProtocolVersion() == 1);
     nextAction = _updatePrimaryFromHBDataV1(memberIndex, originalState, now);
 
     nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
@@ -1096,21 +1087,24 @@ HeartbeatResponseAction TopologyCoordinator::_updatePrimaryFromHBDataV1(
 
         if (!catchupTakeoverDisabled && (_memberData.at(primaryIndex).getLastAppliedOpTime() <
                                          _memberData.at(_selfIndex).getLastAppliedOpTime())) {
-            LOG(2) << "I can take over the primary due to fresher data."
-                   << " Current primary index: " << primaryIndex << " in term "
-                   << _memberData.at(primaryIndex).getTerm() << "."
-                   << " Current primary optime: "
-                   << _memberData.at(primaryIndex).getLastAppliedOpTime()
-                   << " My optime: " << _memberData.at(_selfIndex).getLastAppliedOpTime();
+            LOG_FOR_ELECTION(2) << "I can take over the primary due to fresher data."
+                                << " Current primary index: " << primaryIndex << " in term "
+                                << _memberData.at(primaryIndex).getTerm() << "."
+                                << " Current primary optime: "
+                                << _memberData.at(primaryIndex).getLastAppliedOpTime()
+                                << " My optime: "
+                                << _memberData.at(_selfIndex).getLastAppliedOpTime();
+            LOG_FOR_ELECTION(4) << _getReplSetStatusString();
 
             scheduleCatchupTakeover = true;
         }
 
         if (_rsConfig.getMemberAt(primaryIndex).getPriority() <
             _rsConfig.getMemberAt(_selfIndex).getPriority()) {
-            LOG(2) << "I can take over the primary due to higher priority."
-                   << " Current primary index: " << primaryIndex << " in term "
-                   << _memberData.at(primaryIndex).getTerm();
+            LOG_FOR_ELECTION(2) << "I can take over the primary due to higher priority."
+                                << " Current primary index: " << primaryIndex << " in term "
+                                << _memberData.at(primaryIndex).getTerm();
+            LOG_FOR_ELECTION(4) << _getReplSetStatusString();
 
             schedulePriorityTakeover = true;
         }
@@ -1124,10 +1118,11 @@ HeartbeatResponseAction TopologyCoordinator::_updatePrimaryFromHBDataV1(
         // Otherwise, prefer to schedule a catchup takeover over a priority takeover
         if (scheduleCatchupTakeover && schedulePriorityTakeover &&
             _rsConfig.calculatePriorityRank(currentNodePriority) == 0) {
-            LOG(2) << "I can take over the primary because I have a higher priority, the highest "
-                   << "priority in the replica set, and fresher data."
-                   << " Current primary index: " << primaryIndex << " in term "
-                   << _memberData.at(primaryIndex).getTerm();
+            LOG_FOR_ELECTION(2)
+                << "I can take over the primary because I have a higher priority, the highest "
+                << "priority in the replica set, and fresher data."
+                << " Current primary index: " << primaryIndex << " in term "
+                << _memberData.at(primaryIndex).getTerm();
             return HeartbeatResponseAction::makePriorityTakeoverAction();
         }
         if (scheduleCatchupTakeover) {
@@ -1352,7 +1347,6 @@ void TopologyCoordinator::setCurrentPrimary_forTest(int primaryIndex,
             hbResponse.setElectionTime(electionTime);
             hbResponse.setAppliedOpTime(_memberData.at(primaryIndex).getHeartbeatAppliedOpTime());
             hbResponse.setSyncingTo(HostAndPort());
-            hbResponse.setHbMsg("");
             _memberData.at(primaryIndex)
                 .setUpValues(_memberData.at(primaryIndex).getLastHeartbeat(),
                              std::move(hbResponse));
@@ -1368,6 +1362,19 @@ const MemberConfig* TopologyCoordinator::_currentPrimaryMember() const {
     return &(_rsConfig.getMemberAt(_currentPrimaryIndex));
 }
 
+std::string TopologyCoordinator::_getReplSetStatusString() {
+    // Construct a ReplSetStatusArgs using default parameters. Missing parameters will not be
+    // included in the status string.
+    ReplSetStatusArgs rsStatusArgs{Date_t::now(), 0U, OpTime(), BSONObj(), boost::none};
+    BSONObjBuilder builder;
+    Status result(ErrorCodes::InternalError, "didn't set status in prepareStatusResponse");
+    prepareStatusResponse(rsStatusArgs, &builder, &result);
+    if (!result.isOK()) {
+        return str::stream() << "Could not get replSetGetStatus output: " << result.toString();
+    }
+    return str::stream() << "Current replSetGetStatus output: " << builder.done().toString();
+}
+
 void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatusArgs,
                                                 BSONObjBuilder* response,
                                                 Status* result) {
@@ -1378,8 +1385,10 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
     const OpTime lastOpApplied = getMyLastAppliedOpTime();
     const OpTime lastOpDurable = getMyLastDurableOpTime();
     const BSONObj& initialSyncStatus = rsStatusArgs.initialSyncStatus;
-    const boost::optional<Timestamp>& lastStableCheckpointTimestamp =
-        rsStatusArgs.lastStableCheckpointTimestamp;
+    const boost::optional<Timestamp>& lastStableRecoveryTimestamp =
+        rsStatusArgs.lastStableRecoveryTimestamp;
+    const boost::optional<Timestamp>& lastStableCheckpointTimestampDeprecated =
+        rsStatusArgs.lastStableCheckpointTimestampDeprecated;
 
     if (_selfIndex == -1) {
         // We're REMOVED or have an invalid config
@@ -1387,7 +1396,7 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
         response->append("stateStr", myState.toString());
         response->append("uptime", rsStatusArgs.selfUptime);
 
-        appendOpTime(response, "optime", lastOpApplied, _rsConfig.getProtocolVersion());
+        appendOpTime(response, "optime", lastOpApplied);
 
         response->appendDate("optimeDate",
                              Date_t::fromDurationSinceEpoch(Seconds(lastOpApplied.getSecs())));
@@ -1418,7 +1427,7 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
             bb.append("stateStr", myState.toString());
             bb.append("uptime", rsStatusArgs.selfUptime);
             if (!_selfConfig().isArbiter()) {
-                appendOpTime(&bb, "optime", lastOpApplied, _rsConfig.getProtocolVersion());
+                appendOpTime(&bb, "optime", lastOpApplied);
                 bb.appendDate("optimeDate",
                               Date_t::fromDurationSinceEpoch(Seconds(lastOpApplied.getSecs())));
             }
@@ -1471,12 +1480,8 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                 it->getUpSince() != Date_t() ? durationCount<Seconds>(now - it->getUpSince()) : 0));
             bb.append("uptime", uptime);
             if (!itConfig.isArbiter()) {
-                appendOpTime(
-                    &bb, "optime", it->getHeartbeatAppliedOpTime(), _rsConfig.getProtocolVersion());
-                appendOpTime(&bb,
-                             "optimeDurable",
-                             it->getHeartbeatDurableOpTime(),
-                             _rsConfig.getProtocolVersion());
+                appendOpTime(&bb, "optime", it->getHeartbeatAppliedOpTime());
+                appendOpTime(&bb, "optimeDurable", it->getHeartbeatDurableOpTime());
 
                 bb.appendDate("optimeDate",
                               Date_t::fromDurationSinceEpoch(
@@ -1552,12 +1557,16 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
         rsStatusArgs.readConcernMajorityOpTime.append(&optimes, "readConcernMajorityOpTime");
     }
 
-    appendOpTime(&optimes, "appliedOpTime", lastOpApplied, _rsConfig.getProtocolVersion());
-    appendOpTime(&optimes, "durableOpTime", lastOpDurable, _rsConfig.getProtocolVersion());
+    appendOpTime(&optimes, "appliedOpTime", lastOpApplied);
+    appendOpTime(&optimes, "durableOpTime", lastOpDurable);
     response->append("optimes", optimes.obj());
-    if (lastStableCheckpointTimestamp) {
-        // Make sure to omit if the storage engine does not support recovering to a timestamp.
-        response->append("lastStableCheckpointTimestamp", *lastStableCheckpointTimestamp);
+    if (lastStableRecoveryTimestamp) {
+        // Only include this field if the storage engine supports RTT.
+        response->append("lastStableRecoveryTimestamp", *lastStableRecoveryTimestamp);
+    }
+    if (lastStableCheckpointTimestampDeprecated) {
+        // Only include this field if the storage engine supports RTT and persists data.
+        response->append("lastStableCheckpointTimestamp", *lastStableCheckpointTimestampDeprecated);
     }
 
     if (!initialSyncStatus.isEmpty()) {
@@ -1612,16 +1621,20 @@ void TopologyCoordinator::fillMemberData(BSONObjBuilder* result) {
     {
         for (const auto& memberData : _memberData) {
             BSONObjBuilder entry(replicationProgress.subobjStart());
-            const auto lastDurableOpTime = memberData.getLastDurableOpTime();
-            if (_rsConfig.getProtocolVersion() == 1) {
-                BSONObjBuilder opTime(entry.subobjStart("optime"));
-                opTime.append("ts", lastDurableOpTime.getTimestamp());
-                opTime.append("term", lastDurableOpTime.getTerm());
-                opTime.done();
-            } else {
-                entry.append("optime", lastDurableOpTime.getTimestamp());
-            }
             entry.append("host", memberData.getHostAndPort().toString());
+
+            const auto lastDurableOpTime = memberData.getLastDurableOpTime();
+            entry.append("optime", lastDurableOpTime.toBSON());
+
+            const auto lastAppliedOpTime = memberData.getLastAppliedOpTime();
+            entry.append("lastAppliedOpTime", lastAppliedOpTime.toBSON());
+
+            const auto heartbeatAppliedOpTime = memberData.getHeartbeatAppliedOpTime();
+            entry.append("heartbeatAppliedOpTime", heartbeatAppliedOpTime.toBSON());
+
+            const auto heartbeatDurableOpTime = memberData.getHeartbeatDurableOpTime();
+            entry.append("heartbeatDurableOpTime", heartbeatDurableOpTime.toBSON());
+
             if (_selfIndex >= 0) {
                 const int memberId = memberData.getMemberId();
                 invariant(memberId >= 0);
@@ -1715,15 +1728,7 @@ TopologyCoordinator::prepareFreezeResponse(Date_t now, int secs, BSONObjBuilder*
         _stepDownUntil = now;
         log() << "'unfreezing'";
         response->append("info", "unfreezing");
-
-        if (_isElectableNodeInSingleNodeReplicaSet()) {
-            // If we are a one-node replica set, we're the one member,
-            // we're electable, we're not in maintenance mode, and we are currently in followerMode
-            // SECONDARY, we must transition to candidate now that our stepdown period
-            // is no longer active, in leiu of heartbeats.
-            _role = Role::kCandidate;
-            return PrepareFreezeResponseResult::kElectSelf;
-        }
+        return PrepareFreezeResponseResult::kSingleNodeSelfElect;
     } else {
         if (secs == 1)
             response->append("warning", "you really want to freeze for only 1 second?");
@@ -1803,15 +1808,9 @@ void TopologyCoordinator::updateConfig(const ReplSetConfig& newConfig, int selfI
     invariant(_role != Role::kCandidate);
     invariant(selfIndex < newConfig.getNumMembers());
 
-    // Reset term on startup and upgrade/downgrade of protocol version.
-    if (!_rsConfig.isInitialized() ||
-        _rsConfig.getProtocolVersion() != newConfig.getProtocolVersion()) {
-        if (newConfig.getProtocolVersion() == 1) {
-            _term = OpTime::kInitialTerm;
-        } else {
-            invariant(newConfig.getProtocolVersion() == 0);
-            _term = OpTime::kUninitializedTerm;
-        }
+    // Reset term on startup.
+    if (!_rsConfig.isInitialized()) {
+        _term = OpTime::kInitialTerm;
         LOG(1) << "Updated term in topology coordinator to " << _term << " due to new config";
     }
 
@@ -1926,8 +1925,6 @@ TopologyCoordinator::UnelectableReasonMask TopologyCoordinator::_getMyUnelectabl
         result |= NotSecondary;
     }
 
-    // Election rules only for protocol version 1.
-    invariant(_rsConfig.getProtocolVersion() == 1);
     if (reason == StartElectionReason::kPriorityTakeover && !_amIFreshEnoughForPriorityTakeover()) {
         result |= NotCloseEnoughToLatestForPriorityTakeover;
     }
@@ -2473,8 +2470,7 @@ bool TopologyCoordinator::shouldChangeSyncSource(
         return true;
     }
 
-    if (_rsConfig.getProtocolVersion() == 1 &&
-        replMetadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
+    if (replMetadata.getConfigVersion() != _rsConfig.getConfigVersion()) {
         log() << "Choosing new sync source because the config version supplied by " << currentSource
               << ", " << replMetadata.getConfigVersion() << ", does not match ours, "
               << _rsConfig.getConfigVersion();
@@ -2482,7 +2478,6 @@ bool TopologyCoordinator::shouldChangeSyncSource(
     }
 
     const int currentSourceIndex = _rsConfig.findMemberIndexByHostAndPort(currentSource);
-    // PV0 doesn't use metadata, we have to consult _rsConfig.
     if (currentSourceIndex == -1) {
         log() << "Choosing new sync source because " << currentSource.toString()
               << " is not in our config";
@@ -2519,8 +2514,8 @@ bool TopologyCoordinator::shouldChangeSyncSource(
     // Change sync source if they are not ahead of us, and don't have a sync source,
     // unless they are primary.
     const OpTime myLastOpTime = getMyLastAppliedOpTime();
-    if (_rsConfig.getProtocolVersion() == 1 && syncSourceIndex == -1 &&
-        currentSourceOpTime <= myLastOpTime && primaryIndex != currentSourceIndex) {
+    if (syncSourceIndex == -1 && currentSourceOpTime <= myLastOpTime &&
+        primaryIndex != currentSourceIndex) {
         std::stringstream logMessage;
         logMessage << "Choosing new sync source because our current sync source, "
                    << currentSource.toString() << ", has an OpTime (" << currentSourceOpTime
@@ -2654,6 +2649,10 @@ void TopologyCoordinator::processReplSetRequestVotes(const ReplSetRequestVotesAr
             response->setVoteGranted(true);
         }
     }
+
+    LOG_FOR_ELECTION(0) << "Received vote request: " << args.toString();
+    LOG_FOR_ELECTION(0) << "Sending vote response: " << response->toString();
+    LOG_FOR_ELECTION(4) << _getReplSetStatusString();
 }
 
 void TopologyCoordinator::loadLastVote(const LastVote& lastVote) {
@@ -2725,6 +2724,28 @@ boost::optional<OpTime> TopologyCoordinator::latestKnownOpTimeSinceHeartbeatRest
         }
     }
     return latest;
+}
+
+std::map<int, boost::optional<OpTime>>
+TopologyCoordinator::latestKnownOpTimeSinceHeartbeatRestartPerMember() const {
+    std::map<int, boost::optional<OpTime>> opTimesPerMember;
+    for (size_t i = 0; i < _memberData.size(); i++) {
+        auto& member = _memberData[i];
+        int memberId = _rsConfig.getMemberAt(i).getId();
+
+        if (!member.isUpdatedSinceRestart()) {
+            opTimesPerMember[memberId] = boost::none;
+            continue;
+        }
+
+        if (!member.up()) {
+            opTimesPerMember[memberId] = boost::none;
+            continue;
+        }
+
+        opTimesPerMember[memberId] = member.getHeartbeatAppliedOpTime();
+    }
+    return opTimesPerMember;
 }
 
 }  // namespace repl

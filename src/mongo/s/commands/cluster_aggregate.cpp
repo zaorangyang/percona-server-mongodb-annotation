@@ -33,6 +33,7 @@
 #include "mongo/s/commands/cluster_aggregate.h"
 
 #include <boost/intrusive_ptr.hpp>
+#include <mongo/rpc/op_msg_rpc_impls.h>
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -47,6 +48,7 @@
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/mongos_process_interface.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
@@ -58,7 +60,6 @@
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_commands_helpers.h"
-#include "mongo/s/commands/pipeline_s.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
@@ -543,9 +544,12 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
         opCtx, Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(), std::move(params));
 
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
-    BSONObjBuilder cursorResponse;
 
-    CursorResponseBuilder responseBuilder(true, &cursorResponse);
+    rpc::OpMsgReplyBuilder replyBuilder;
+    CursorResponseBuilder::Options options;
+    options.isInitialResponse = true;
+
+    CursorResponseBuilder responseBuilder(&replyBuilder, options);
 
     for (long long objCount = 0; objCount < request.getBatchSize(); ++objCount) {
         ClusterQueryResult next;
@@ -609,9 +613,11 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
 
     responseBuilder.done(clusterCursorId, requestedNss.ns());
 
-    CommandHelpers::appendSimpleCommandStatus(cursorResponse, true);
+    auto bodyBuilder = replyBuilder.getBodyBuilder();
+    CommandHelpers::appendSimpleCommandStatus(bodyBuilder, true);
+    bodyBuilder.doneFast();
 
-    return cursorResponse.obj();
+    return replyBuilder.releaseBody();
 }
 
 /**
@@ -733,12 +739,12 @@ ShardId pickMergingShard(OperationContext* opCtx,
               .toString();
 }
 
-// "Resolve" involved namespaces and verify that none of them are sharded. We won't try to execute
-// anything on a mongos, but we still have to populate this map so that any $lookups, etc. will be
-// able to have a resolved view definition. It's okay that this is incorrect, we will repopulate the
-// real namespace map on the mongod. Note that this function must be called before forwarding an
-// aggregation command on an unsharded collection, in order to validate that none of the involved
-// collections are sharded.
+// "Resolve" involved namespaces and verify that none of them are sharded unless allowed by the
+// pipeline. We won't try to execute anything on a mongos, but we still have to populate this map so
+// that any $lookups, etc. will be able to have a resolved view definition. It's okay that this is
+// incorrect, we will repopulate the real namespace map on the mongod. Note that this function must
+// be called before forwarding an aggregation command on an unsharded collection, in order to verify
+// that the involved namespaces are allowed to be sharded.
 StringMap<ExpressionContext::ResolvedNamespace> resolveInvolvedNamespaces(
     OperationContext* opCtx, const LiteParsedPipeline& litePipe) {
 
@@ -746,8 +752,9 @@ StringMap<ExpressionContext::ResolvedNamespace> resolveInvolvedNamespaces(
     for (auto&& nss : litePipe.getInvolvedNamespaces()) {
         const auto resolvedNsRoutingInfo =
             uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
-        uassert(
-            28769, str::stream() << nss.ns() << " cannot be sharded", !resolvedNsRoutingInfo.cm());
+        uassert(28769,
+                str::stream() << nss.ns() << " cannot be sharded",
+                !resolvedNsRoutingInfo.cm() || litePipe.allowShardedForeignCollections());
         resolvedNamespaces.try_emplace(nss.coll(), nss, std::vector<BSONObj>{});
     }
     return resolvedNamespaces;
@@ -775,7 +782,7 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(OperationContext* 
     auto mergeCtx = new ExpressionContext(opCtx,
                                           request,
                                           std::move(collation),
-                                          std::make_shared<PipelineS::MongoSInterface>(),
+                                          std::make_shared<MongoSInterface>(),
                                           resolveInvolvedNamespaces(opCtx, litePipe),
                                           uuid);
 

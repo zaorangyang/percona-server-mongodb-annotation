@@ -109,7 +109,7 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
                                                 StringData applicationName) {
     try {
         // We need to force the usage of OP_QUERY on this command, even if we have previously
-        // detected support for OP_COMMAND on a connection. This is necessary to handle the case
+        // detected support for OP_MSG on a connection. This is necessary to handle the case
         // where we reconnect to an older version of MongoDB running at the same host/port.
         ScopedForceOpQuery forceOpQuery{conn};
 
@@ -153,8 +153,7 @@ executor::RemoteCommandResponse initWireVersion(DBClientConnection* conn,
 
         conn->getCompressorManager().clientFinish(isMasterObj);
 
-        return executor::RemoteCommandResponse{
-            std::move(isMasterObj), result->getMetadata().getOwned(), finish - start};
+        return executor::RemoteCommandResponse{std::move(isMasterObj), finish - start};
 
     } catch (...) {
         return exceptionToStatus();
@@ -503,10 +502,8 @@ unsigned long long DBClientConnection::query(stdx::function<void(DBClientCursorB
                 n += i.n();
             }
 
-            if (c->getCursorId() == 0)
+            if (!c->more())
                 break;
-
-            c->exhaustReceiveMore();
         }
     } catch (std::exception&) {
         /* connection CANNOT be used anymore as more data may be on the way from the server.

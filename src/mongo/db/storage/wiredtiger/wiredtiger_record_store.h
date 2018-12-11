@@ -178,8 +178,6 @@ public:
     virtual std::unique_ptr<RecordCursor> getRandomCursorWithOptions(
         OperationContext* opCtx, StringData extraConfig) const = 0;
 
-    std::vector<std::unique_ptr<RecordCursor>> getManyCursors(OperationContext* opCtx) const final;
-
     virtual Status truncate(OperationContext* opCtx);
 
     virtual bool compactSupported() const {
@@ -189,7 +187,7 @@ public:
         return true;
     }
 
-    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const final;
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const final;
 
     virtual bool supportsRecoverToStableTimestamp() const final;
 
@@ -263,10 +261,11 @@ public:
     void reclaimOplog(OperationContext* opCtx);
 
     /**
-     * The `persistedTimestamp` is when replication recovery would need to replay from on a
-     * restart. `reclaimOplog` will not truncate oplog entries in front of this time.
+     * The `recoveryTimestamp` is when replication recovery would need to replay from for
+     * recoverable rollback, or restart for durable engines. `reclaimOplog` will not
+     * truncate oplog entries in front of this time.
      */
-    void reclaimOplog(OperationContext* opCtx, Timestamp persistedTimestamp);
+    void reclaimOplog(OperationContext* opCtx, Timestamp recoveryTimestamp);
 
     // Returns false if the oplog was dropped while waiting for a deletion request.
     bool yieldAndAwaitOplogDeletionRequest(OperationContext* opCtx);

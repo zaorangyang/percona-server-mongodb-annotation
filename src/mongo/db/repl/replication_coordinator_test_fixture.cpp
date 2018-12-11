@@ -212,15 +212,8 @@ void ReplCoordTest::assertStartSuccess(const BSONObj& configDoc, const HostAndPo
 
 executor::RemoteCommandResponse ReplCoordTest::makeResponseStatus(const BSONObj& doc,
                                                                   Milliseconds millis) {
-    return makeResponseStatus(doc, BSONObj(), millis);
-}
-
-executor::RemoteCommandResponse ReplCoordTest::makeResponseStatus(const BSONObj& doc,
-                                                                  const BSONObj& metadata,
-                                                                  Milliseconds millis) {
-    log() << "Responding with " << doc << " (metadata: " << metadata << "; elapsed: " << millis
-          << ")";
-    return RemoteCommandResponse(doc, metadata, millis);
+    log() << "Responding with " << doc << " (elapsed: " << millis << ")";
+    return RemoteCommandResponse(doc, millis);
 }
 
 void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
@@ -239,8 +232,9 @@ void ReplCoordTest::simulateEnoughHeartbeatsForAllNodesUp() {
             hbResp.setState(MemberState::RS_SECONDARY);
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
             hbResp.setAppliedOpTime(OpTime(Timestamp(100, 2), 0));
+            hbResp.setDurableOpTime(OpTime(Timestamp(100, 2), 0));
             BSONObjBuilder respObj;
-            net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+            net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
         } else {
             error() << "Black holing unexpected request to " << request.target << ": "
                     << request.cmdObj;
@@ -343,7 +337,7 @@ void ReplCoordTest::simulateSuccessfulV1ElectionWithoutExitingDrainMode(Date_t e
             hbResp.setAppliedOpTime(opTime);
             hbResp.setDurableOpTime(opTime);
             hbResp.setConfigVersion(rsConfig.getConfigVersion());
-            net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+            net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
         } else if (request.cmdObj.firstElement().fieldNameStringData() == "replSetRequestVotes") {
             net->scheduleResponse(noi,
                                   net->now(),
@@ -435,8 +429,9 @@ bool ReplCoordTest::consumeHeartbeatV1(const NetworkInterfaceMock::NetworkOperat
     hbResp.setState(MemberState::RS_SECONDARY);
     hbResp.setConfigVersion(rsConfig.getConfigVersion());
     hbResp.setAppliedOpTime(lastApplied);
+    hbResp.setDurableOpTime(lastApplied);
     BSONObjBuilder respObj;
-    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON(true)));
+    net->scheduleResponse(noi, net->now(), makeResponseStatus(hbResp.toBSON()));
     return true;
 }
 

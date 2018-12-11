@@ -1357,13 +1357,12 @@ __wt_page_evict_retry(WT_SESSION_IMPL *session, WT_PAGE *page)
 		return (true);
 
 #ifdef HAVE_TIMESTAMPS
-	if (!__wt_timestamp_iszero(&mod->last_eviction_timestamp)) {
-		__wt_txn_pinned_timestamp(session, &pinned_ts);
-		if (__wt_timestamp_cmp(
-		    &mod->last_eviction_timestamp,
-		    &txn_global->pinned_timestamp) != 0)
-			return (true);
-	}
+	if (__wt_timestamp_iszero(&mod->last_eviction_timestamp))
+		return (true);
+
+	__wt_txn_pinned_timestamp(session, &pinned_ts);
+	if (__wt_timestamp_cmp(&pinned_ts, &mod->last_eviction_timestamp) > 0)
+		return (true);
 #endif
 
 	return (false);
@@ -1669,7 +1668,7 @@ static inline int
 __wt_page_swap_func(
     WT_SESSION_IMPL *session, WT_REF *held, WT_REF *want, uint32_t flags
 #ifdef HAVE_DIAGNOSTIC
-    , const char *file, int line
+    , const char *func, int line
 #endif
     )
 {
@@ -1692,7 +1691,7 @@ __wt_page_swap_func(
 	/* Get the wanted page. */
 	ret = __wt_page_in_func(session, want, flags
 #ifdef HAVE_DIAGNOSTIC
-	    , file, line
+	    , func, line
 #endif
 	    );
 

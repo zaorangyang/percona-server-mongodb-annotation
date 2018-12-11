@@ -66,6 +66,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/top.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
@@ -256,7 +257,7 @@ public:
     Status explain(OperationContext* opCtx,
                    const OpMsgRequest& request,
                    ExplainOptions::Verbosity verbosity,
-                   BSONObjBuilder* out) const override {
+                   rpc::ReplyBuilderInterface* result) const override {
         std::string dbName = request.getDatabase().toString();
         const BSONObj& cmdObj = request.body;
         const auto args(uassertStatusOK(FindAndModifyRequest::parseFromBSON(
@@ -288,7 +289,8 @@ public:
             const auto exec =
                 uassertStatusOK(getExecutorDelete(opCtx, opDebug, collection, &parsedDelete));
 
-            Explain::explainStages(exec.get(), collection, verbosity, out);
+            auto bodyBuilder = result->getBodyBuilder();
+            Explain::explainStages(exec.get(), collection, verbosity, &bodyBuilder);
         } else {
             UpdateRequest request(nsString);
             UpdateLifecycleImpl updateLifecycle(nsString);
@@ -312,7 +314,8 @@ public:
             const auto exec =
                 uassertStatusOK(getExecutorUpdate(opCtx, opDebug, collection, &parsedUpdate));
 
-            Explain::explainStages(exec.get(), collection, verbosity, out);
+            auto bodyBuilder = result->getBodyBuilder();
+            Explain::explainStages(exec.get(), collection, verbosity, &bodyBuilder);
         }
 
         return Status::OK();
@@ -333,8 +336,8 @@ public:
         if (shouldBypassDocumentValidationForCommand(cmdObj))
             maybeDisableValidation.emplace(opCtx);
 
-        const auto session = OperationContextSession::get(opCtx);
-        const auto inTransaction = session && session->inMultiDocumentTransaction();
+        const auto txnParticipant = TransactionParticipant::get(opCtx);
+        const auto inTransaction = txnParticipant && txnParticipant->inMultiDocumentTransaction();
         uassert(50781,
                 str::stream() << "Cannot write to system collection " << nsString.ns()
                               << " within a transaction.",
@@ -348,7 +351,7 @@ public:
 
 
         const auto stmtId = 0;
-        if (opCtx->getTxnNumber()) {
+        if (opCtx->getTxnNumber() && !inTransaction) {
             auto session = OperationContextSession::get(opCtx);
             if (auto entry =
                     session->checkStatementExecuted(opCtx, *opCtx->getTxnNumber(), stmtId)) {

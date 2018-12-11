@@ -131,9 +131,9 @@ public:
                        const NamespaceString& collectionName,
                        OptionalCollectionUUID uuid) final {}
 
-    void onTransactionCommit(OperationContext* opCtx) final {}
+    void onTransactionCommit(OperationContext* opCtx, bool wasPrepared) final {}
 
-    void onTransactionPrepare(OperationContext* opCtx) final {}
+    void onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) final {}
 
     void onTransactionAbort(OperationContext* opCtx) final {}
 

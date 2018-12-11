@@ -94,10 +94,24 @@ const auto kAllowImplicitCollectionCreation = "allowImplicitCollectionCreation"_
  * same cmdObj combined with the default sharding parameters.
  */
 std::vector<AsyncRequestsSender::Request> buildUnversionedRequestsForShards(
-    std::vector<ShardId> shardIds, const BSONObj& cmdObj) {
+    OperationContext* opCtx, std::vector<ShardId> shardIds, const BSONObj& cmdObj) {
     auto cmdToSend = cmdObj;
     if (!cmdToSend.hasField(kAllowImplicitCollectionCreation)) {
         cmdToSend = appendAllowImplicitCreate(cmdToSend, false);
+    }
+
+    if (shardIds.size() == 1u) {
+        // The commands that support snapshot read concern only send unversioned
+        // requests to unsharded collections, so they should only be targeting
+        // the primary shard.
+        auto atClusterTime = computeAtClusterTimeForOneShard(opCtx, shardIds[0]);
+        invariant(!atClusterTime || *atClusterTime != LogicalTime::kUninitialized);
+        if (atClusterTime) {
+            cmdToSend = appendAtClusterTime(cmdToSend, *atClusterTime);
+        }
+    } else {
+        invariant(repl::ReadConcernArgs::get(opCtx).getLevel() !=
+                  repl::ReadConcernLevel::kSnapshotReadConcern);
     }
 
     std::vector<AsyncRequestsSender::Request> requests;
@@ -111,11 +125,12 @@ std::vector<AsyncRequestsSender::Request> buildUnversionedRequestsForAllShards(
     OperationContext* opCtx, const BSONObj& cmdObj) {
     std::vector<ShardId> shardIds;
     Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload(&shardIds);
-    return buildUnversionedRequestsForShards(std::move(shardIds), cmdObj);
+    return buildUnversionedRequestsForShards(opCtx, std::move(shardIds), cmdObj);
 }
 
 std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShards(
     OperationContext* opCtx,
+    const NamespaceString& nss,
     const CachedCollectionRoutingInfo& routingInfo,
     const BSONObj& cmdObj,
     const BSONObj& query,
@@ -129,6 +144,7 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
             : cmdObj;
 
         return buildUnversionedRequestsForShards(
+            opCtx,
             {routingInfo.db().primaryId()},
             appendDbVersionIfPresent(cmdObjWithShardVersion, routingInfo.db()));
     }
@@ -143,6 +159,13 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
     // The collection is sharded. Target all shards that own chunks that match the query.
     std::set<ShardId> shardIds;
     routingInfo.cm()->getShardIdsForQuery(opCtx, query, collation, &shardIds);
+
+    auto atClusterTime = computeAtClusterTime(opCtx, false, shardIds, nss, query, collation);
+    invariant(!atClusterTime || *atClusterTime != LogicalTime::kUninitialized);
+    if (atClusterTime) {
+        cmdToSend = appendAtClusterTime(cmdToSend, *atClusterTime);
+    }
+
     for (const ShardId& shardId : shardIds) {
         requests.emplace_back(shardId,
                               appendShardVersion(cmdToSend, routingInfo.cm()->getVersion(shardId)));
@@ -151,9 +174,8 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
     return requests;
 }
 
-/**
- * Throws StaleConfigException if any remote returns a stale shardVersion error.
- */
+}  // namespace
+
 std::vector<AsyncRequestsSender::Response> gatherResponses(
     OperationContext* opCtx,
     StringData dbName,
@@ -232,8 +254,6 @@ std::vector<AsyncRequestsSender::Response> gatherResponses(
     return responses;
 }
 
-}  // namespace
-
 BSONObj appendShardVersion(BSONObj cmdObj, ChunkVersion version) {
     BSONObjBuilder cmdWithVersionBob(std::move(cmdObj));
     version.appendToCommand(&cmdWithVersionBob);
@@ -267,7 +287,7 @@ std::vector<AsyncRequestsSender::Response> scatterGatherVersionedTargetByRouting
     const BSONObj& query,
     const BSONObj& collation) {
     const auto requests =
-        buildVersionedRequestsForTargetedShards(opCtx, routingInfo, cmdObj, query, collation);
+        buildVersionedRequestsForTargetedShards(opCtx, nss, routingInfo, cmdObj, query, collation);
 
     return gatherResponses(opCtx, dbName, readPref, retryPolicy, requests);
 }
@@ -289,7 +309,7 @@ std::vector<AsyncRequestsSender::Response> scatterGatherOnlyVersionIfUnsharded(
         requests = buildUnversionedRequestsForAllShards(opCtx, cmdObj);
     } else {
         requests = buildVersionedRequestsForTargetedShards(
-            opCtx, routingInfo, cmdObj, BSONObj(), BSONObj());
+            opCtx, nss, routingInfo, cmdObj, BSONObj(), BSONObj());
     }
 
     return gatherResponses(opCtx, nss.db(), readPref, retryPolicy, requests);
@@ -308,7 +328,7 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
                         readPref,
                         retryPolicy,
                         buildUnversionedRequestsForShards(
-                            {dbInfo.primaryId()}, appendDbVersionIfPresent(cmdObj, dbInfo)));
+                            opCtx, {dbInfo.primaryId()}, appendDbVersionIfPresent(cmdObj, dbInfo)));
     return std::move(responses.front());
 }
 
@@ -542,6 +562,15 @@ BSONObj appendAtClusterTime(BSONObj cmdObj, LogicalTime atClusterTime) {
                     readConcernBob.append(elem);
                 }
             }
+
+            // TODO SERVER-36237: When running a transaction with upconverted readConcern, this
+            // method may be called without a real readConcern object. Once atClusterTime selection
+            // and usage have been integrated with the RouterSession, the readConcern object should
+            // always have the correct level here and this can be removed.
+            if (!readConcernBob.hasField(repl::ReadConcernArgs::kLevelFieldName)) {
+                readConcernBob.append(repl::ReadConcernArgs::kLevelFieldName, "snapshot");
+            }
+
             readConcernBob.append(repl::ReadConcernArgs::kAtClusterTimeFieldName,
                                   atClusterTime.asTimestamp());
         } else {
@@ -563,6 +592,14 @@ BSONObj appendAtClusterTimeToReadConcern(BSONObj readConcernObj, LogicalTime atC
         }
     }
 
+    // TODO SERVER-36237: When running a transaction with upconverted readConcern, this method may
+    // be called without a real readConcern object. Once atClusterTime selection and usage have been
+    // integrated with the RouterSession, the readConcern object should always have the correct
+    // level here and this can be removed.
+    if (!readConcernBob.hasField(repl::ReadConcernArgs::kLevelFieldName)) {
+        readConcernBob.append(repl::ReadConcernArgs::kLevelFieldName, "snapshot");
+    }
+
     readConcernBob.append(repl::ReadConcernArgs::kAtClusterTimeFieldName,
                           atClusterTime.asTimestamp());
 
@@ -579,7 +616,16 @@ boost::optional<LogicalTime> computeAtClusterTimeForOneShard(OperationContext* o
 
     auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     invariant(shardRegistry);
-    return shardRegistry->getShardNoReload(shardId)->getLastCommittedOpTime();
+
+    auto shard = shardRegistry->getShardNoReload(shardId);
+    uassert(ErrorCodes::ShardNotFound, str::stream() << "Could not find shard " << shardId, shard);
+
+    // Return the cached last committed opTime for the shard if there is one, otherwise return the
+    // lastest cluster time from the logical clock.
+    auto lastCommittedOpTime = shard->getLastCommittedOpTime();
+    return lastCommittedOpTime != LogicalTime::kUninitialized
+        ? lastCommittedOpTime
+        : LogicalClock::get(opCtx)->getClusterTime();
 }
 
 namespace {

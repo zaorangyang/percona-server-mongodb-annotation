@@ -147,17 +147,17 @@ Status getCurrentUserRoles(OperationContext* opCtx,
                            AuthorizationManager* authzManager,
                            const UserName& userName,
                            stdx::unordered_set<RoleName>* roles) {
-    User* user;
     authzManager->invalidateUserByName(userName);  // Need to make sure cache entry is up to date
-    Status status = authzManager->acquireUser(opCtx, userName, &user);
-    if (!status.isOK()) {
-        return status;
+    auto swUser = authzManager->acquireUser(opCtx, userName);
+    if (!swUser.isOK()) {
+        return swUser.getStatus();
     }
+    auto user = std::move(swUser.getValue());
+
     RoleNameIterator rolesIt = user->getRoles();
     while (rolesIt.more()) {
         roles->insert(rolesIt.next());
     }
-    authzManager->releaseUser(user);
     return Status::OK();
 }
 
@@ -1371,16 +1371,18 @@ public:
 
             DBDirectClient client(opCtx);
 
-            BSONObjBuilder responseBuilder;
+            rpc::OpMsgReplyBuilder replyBuilder;
             AggregationRequest aggRequest(AuthorizationManager::usersCollectionNamespace,
                                           std::move(pipeline));
             uassertStatusOK(runAggregate(opCtx,
                                          AuthorizationManager::usersCollectionNamespace,
                                          aggRequest,
                                          aggRequest.serializeToCommandObj().toBson(),
-                                         responseBuilder));
-            CommandHelpers::appendSimpleCommandStatus(responseBuilder, true);
-            auto response = CursorResponse::parseFromBSONThrowing(responseBuilder.obj());
+                                         &replyBuilder));
+            auto bodyBuilder = replyBuilder.getBodyBuilder();
+            CommandHelpers::appendSimpleCommandStatus(bodyBuilder, true);
+            bodyBuilder.doneFast();
+            auto response = CursorResponse::parseFromBSONThrowing(replyBuilder.releaseBody());
             DBClientCursor cursor(&client,
                                   response.getNSS().toString(),
                                   response.getCursorId(),

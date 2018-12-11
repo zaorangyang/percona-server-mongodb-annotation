@@ -36,11 +36,10 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/s/chunk_split_state_driver.h"
 #include "mongo/db/s/chunk_splitter.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
-#include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/s/balancer_configuration.h"
 #include "mongo/s/catalog/type_shard_collection.h"
@@ -79,7 +78,7 @@ public:
         // This is a hack to get around CollectionShardingState::refreshMetadata() requiring the X
         // lock: markNotShardedAtStepdown() doesn't have a lock check. Temporary measure until
         // SERVER-31595 removes the X lock requirement.
-        CollectionShardingState::get(_opCtx, _nss)->markNotShardedAtStepdown();
+        CollectionShardingRuntime::get(_opCtx, _nss)->markNotShardedAtStepdown();
     }
 
     void rollback() override {}
@@ -98,8 +97,12 @@ public:
         : _opCtx(opCtx), _shardIdentity(std::move(shardIdentity)) {}
 
     void commit(boost::optional<Timestamp>) override {
-        fassertNoTrace(
-            40071, ShardingState::get(_opCtx)->initializeFromShardIdentity(_opCtx, _shardIdentity));
+        try {
+            ShardingInitializationMongoD::get(_opCtx)->initializeFromShardIdentity(_opCtx,
+                                                                                   _shardIdentity);
+        } catch (const AssertionException& ex) {
+            fassertFailedWithStatus(40071, ex.toStatus());
+        }
     }
 
     void rollback() override {}
@@ -171,15 +174,12 @@ void incrementChunkOnInsertOrUpdate(OperationContext* opCtx,
 
     const auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
 
-    if (chunkWritesTracker->shouldSplit(balancerConfig->getMaxChunkSizeBytes())) {
+    if (balancerConfig->getShouldAutoSplit() &&
+        chunkWritesTracker->shouldSplit(balancerConfig->getMaxChunkSizeBytes())) {
         auto chunkSplitStateDriver = ChunkSplitStateDriver::tryInitiateSplit(chunkWritesTracker);
         if (chunkSplitStateDriver) {
-            // TODO (SERVER-9287): Enable the following to trigger chunk splitting
-            // ChunkSplitter::get(opCtx).trySplitting(std::move(chunkSplitStateDriver.get()),
-            //                                       nss,
-            //                                       chunk.getMin(),
-            //                                       chunk.getMax(),
-            //                                       dataWritten);
+            ChunkSplitter::get(opCtx).trySplitting(
+                std::move(chunkSplitStateDriver), nss, chunk.getMin(), chunk.getMax(), dataWritten);
         }
     }
 }
@@ -273,7 +273,7 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
                 // This is a hack to get around CollectionShardingState::refreshMetadata() requiring
                 // the X lock: markNotShardedAtStepdown() doesn't have a lock check. Temporary
                 // measure until SERVER-31595 removes the X lock requirement.
-                CollectionShardingState::get(opCtx, updatedNss)->markNotShardedAtStepdown();
+                CollectionShardingRuntime::get(opCtx, updatedNss)->markNotShardedAtStepdown();
             }
         }
     }
@@ -323,7 +323,7 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
 void ShardServerOpObserver::aboutToDelete(OperationContext* opCtx,
                                           NamespaceString const& nss,
                                           BSONObj const& doc) {
-    auto css = CollectionShardingState::get(opCtx, nss.ns());
+    auto* const css = CollectionShardingRuntime::get(opCtx, nss);
     getDeleteState(opCtx) = ShardObserverDeleteState::make(opCtx, css, doc);
 }
 
@@ -392,7 +392,7 @@ repl::OpTime ShardServerOpObserver::onDropCollection(OperationContext* opCtx,
 }
 
 void shardObserveInsertOp(OperationContext* opCtx,
-                          CollectionShardingState* css,
+                          CollectionShardingRuntime* css,
                           const BSONObj& insertedDoc,
                           const repl::OpTime& opTime) {
     css->checkShardVersionOrThrow(opCtx);
@@ -403,7 +403,7 @@ void shardObserveInsertOp(OperationContext* opCtx,
 }
 
 void shardObserveUpdateOp(OperationContext* opCtx,
-                          CollectionShardingState* css,
+                          CollectionShardingRuntime* css,
                           const BSONObj& updatedDoc,
                           const repl::OpTime& opTime,
                           const repl::OpTime& prePostImageOpTime) {
@@ -415,7 +415,7 @@ void shardObserveUpdateOp(OperationContext* opCtx,
 }
 
 void shardObserveDeleteOp(OperationContext* opCtx,
-                          CollectionShardingState* css,
+                          CollectionShardingRuntime* css,
                           const ShardObserverDeleteState& deleteState,
                           const repl::OpTime& opTime,
                           const repl::OpTime& preImageOpTime) {
@@ -427,7 +427,7 @@ void shardObserveDeleteOp(OperationContext* opCtx,
 }
 
 ShardObserverDeleteState ShardObserverDeleteState::make(OperationContext* opCtx,
-                                                        CollectionShardingState* css,
+                                                        CollectionShardingRuntime* css,
                                                         const BSONObj& docToDelete) {
     auto msm = MigrationSourceManager::get(css);
     auto metadata = css->getMetadata(opCtx);

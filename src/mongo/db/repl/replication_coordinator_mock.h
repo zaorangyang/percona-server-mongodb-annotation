@@ -224,8 +224,6 @@ public:
     virtual Status processHeartbeatV1(const ReplSetHeartbeatArgsV1& args,
                                       ReplSetHeartbeatResponse* response);
 
-    virtual bool isV1ElectionProtocol() const override;
-
     virtual bool getWriteConcernMajorityShouldJournal();
 
     virtual void summarizeAsHtml(ReplSetHtmlSummary* output);
@@ -292,6 +290,7 @@ private:
     };
     bool _alwaysAllowWrites = false;
     bool _resetLastOpTimesCalled = false;
+    long long _term = OpTime::kInitialTerm;
 };
 
 }  // namespace repl

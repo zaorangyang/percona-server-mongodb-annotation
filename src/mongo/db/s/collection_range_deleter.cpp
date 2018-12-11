@@ -48,8 +48,9 @@
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern.h"
@@ -116,7 +117,7 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         AutoGetCollection autoColl(opCtx, nss, MODE_IX);
 
         auto* const collection = autoColl.getCollection();
-        auto* const css = CollectionShardingState::get(opCtx, nss);
+        auto* const css = CollectionShardingRuntime::get(opCtx, nss);
         auto& metadataManager = css->_metadataManager;
         auto* const self = forTestOnly ? forTestOnly : &metadataManager->_rangesToClean;
 
@@ -247,8 +248,10 @@ boost::optional<Date_t> CollectionRangeDeleter::cleanUpNextRange(
         // Don't allow lock interrupts while cleaning up.
         UninterruptibleLockGuard noInterrupt(opCtx->lockState());
         AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-        auto* const css = CollectionShardingState::get(opCtx, nss);
-        auto* const self = forTestOnly ? forTestOnly : &css->_metadataManager->_rangesToClean;
+        auto* const css = CollectionShardingRuntime::get(opCtx, nss);
+        auto& metadataManager = css->_metadataManager;
+        auto* const self = forTestOnly ? forTestOnly : &metadataManager->_rangesToClean;
+
         stdx::lock_guard<stdx::mutex> scopedLock(css->_metadataManager->_managerLock);
 
         if (!status.isOK()) {
@@ -375,6 +378,7 @@ StatusWith<int> CollectionRangeDeleter::_doDeletion(OperationContext* opCtx,
                       << redact(restoreStateStatus);
             break;
         }
+        ShardingStatistics::get(opCtx).countDocsDeletedOnDonor.addAndFetch(1);
 
     } while (++numDeleted < maxToDelete);
 

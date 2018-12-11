@@ -498,30 +498,38 @@ using future_details::Future;
  *
  * If the result is ready when producing the Future, it is more efficient to use
  * makeReadyFutureWith() or Future<T>::makeReady() than to use a Promise<T>.
+ *
+ * A default constructed `Promise` is in a null state.  Null `Promises` can only be assigned over
+ * and destroyed. It is a programmer error to call any methods on a null `Promise`.  Any methods
+ * that complete a `Promise` leave it in the null state.
  */
 template <typename T>
 class future_details::Promise {
 public:
     using value_type = T;
 
+    /**
+     * Creates a null `Promise`.
+     */
     Promise() = default;
 
     ~Promise() {
-        if (MONGO_unlikely(sharedState)) {
-            if (haveExtractedFuture) {
-                sharedState->setError({ErrorCodes::BrokenPromise, "broken promise"});
-            }
-        }
+        breakPromiseIfNeeded();
     }
 
     Promise(const Promise&) = delete;
     Promise& operator=(const Promise&) = delete;
 
-    // If we want to enable move-assignability, we need to handle breaking the promise on the old
-    // value of this.
-    Promise& operator=(Promise&&) = delete;
 
-    // The default move construction is fine.
+    /**
+     * Breaks this `Promise`, if not fulfilled and not in a moved-from state.
+     */
+    Promise& operator=(Promise&& p) noexcept {
+        breakPromiseIfNeeded();
+        _sharedState = std::move(p._sharedState);
+        return *this;
+    }
+
     Promise(Promise&&) = default;
 
     /**
@@ -551,17 +559,23 @@ public:
 
     template <typename... Args>
     void emplaceValue(Args&&... args) noexcept {
-        setImpl([&] { sharedState->emplaceValue(std::forward<Args>(args)...); });
+        setImpl([&](boost::intrusive_ptr<SharedState<T>>&& sharedState) {
+            sharedState->emplaceValue(std::forward<Args>(args)...);
+        });
     }
 
     void setError(Status status) noexcept {
         invariant(!status.isOK());
-        setImpl([&] { sharedState->setError(std::move(status)); });
+        setImpl([&](boost::intrusive_ptr<SharedState<T>>&& sharedState) {
+            sharedState->setError(std::move(status));
+        });
     }
 
     // TODO rename to not XXXWith and handle void
     void setFromStatusWith(StatusWith<T> sw) noexcept {
-        setImpl([&] { sharedState->setFromStatusWith(std::move(sw)); });
+        setImpl([&](boost::intrusive_ptr<SharedState<T>>&& sharedState) {
+            sharedState->setFromStatusWith(std::move(sw));
+        });
     }
 
     /**
@@ -576,26 +590,43 @@ public:
      */
     SharedPromise<T> share() noexcept;
 
-    /**
-     * Prefer using makePromiseFuture<T>() over constructing a promise and calling this method.
-     */
-    Future<T> getFuture() noexcept;
+    static auto makePromiseFutureImpl() {
+        struct PromiseAndFuture {
+            Promise<T> promise{make_intrusive<SharedState<T>>()};
+            Future<T> future = promise.getFuture();
+        };
+        return PromiseAndFuture();
+    }
 
 private:
+    explicit Promise(boost::intrusive_ptr<SharedState<T>>&& sharedState)
+        : _sharedState(std::move(sharedState)) {}
+
+    // This is not public because we found it frequently was involved in races.  The
+    // `makePromiseFuture<T>` API avoids those races entirely.
+    Future<T> getFuture() noexcept;
+
     friend class Future<void>;
 
     template <typename Func>
     void setImpl(Func&& doSet) noexcept {
-        invariant(!haveSetValue);
-        haveSetValue = true;
-        doSet();
-        if (haveExtractedFuture)
-            sharedState.reset();
+        invariant(_sharedState);
+        // We keep `sharedState` as a stack local, to preserve ownership of the resource,
+        // in case the code in `doSet` unblocks a thread which winds up causing
+        // `~Promise` to be invoked.
+        auto sharedState = std::move(_sharedState);
+        doSet(std::move(sharedState));
+        // Note: `this` is potentially dead, at this point.
     }
 
-    bool haveSetValue = false;
-    bool haveExtractedFuture = false;
-    boost::intrusive_ptr<SharedState<T>> sharedState = make_intrusive<SharedState<T>>();
+    // The current promise will be broken, if not already fulfilled.
+    void breakPromiseIfNeeded() {
+        if (MONGO_unlikely(_sharedState)) {
+            _sharedState->setError({ErrorCodes::BrokenPromise, "broken promise"});
+        }
+    }
+
+    boost::intrusive_ptr<SharedState<T>> _sharedState;
 };
 
 /**
@@ -699,14 +730,14 @@ public:
      */
     static Future<T> makeReady(T val) {  // TODO emplace?
         Future out;
-        out.immediate = std::move(val);
+        out._immediate = std::move(val);
         return out;
     }
 
     static Future<T> makeReady(Status status) {
         invariant(!status.isOK());
         auto out = Future<T>(make_intrusive<SharedState<T>>());
-        out.shared->setError(std::move(status));
+        out._shared->setError(std::move(status));
         return out;
     }
 
@@ -730,7 +761,7 @@ public:
      * timeouts, that is unnecessary if the Future is ready already.
      */
     bool isReady() const {
-        return immediate || shared->state.load(std::memory_order_acquire) == SSBState::kFinished;
+        return _immediate || _shared->state.load(std::memory_order_acquire) == SSBState::kFinished;
     }
 
     /**
@@ -750,24 +781,24 @@ public:
         return const_cast<Future*>(this)->getImpl();
     }
     StatusWith<T> getNoThrow() && noexcept {
-        if (immediate) {
-            return std::move(*immediate);
+        if (_immediate) {
+            return std::move(*_immediate);
         }
 
-        shared->wait();
-        if (!shared->status.isOK())
-            return std::move(shared->status);
-        return std::move(*shared->data);
+        _shared->wait();
+        if (!_shared->status.isOK())
+            return std::move(_shared->status);
+        return std::move(*_shared->data);
     }
     StatusWith<T> getNoThrow() const& noexcept {
-        if (immediate) {
-            return *immediate;
+        if (_immediate) {
+            return *_immediate;
         }
 
-        shared->wait();
-        if (!shared->status.isOK())
-            return shared->status;
-        return *shared->data;
+        _shared->wait();
+        if (!_shared->status.isOK())
+            return _shared->status;
+        return *_shared->data;
     }
 
     /**
@@ -789,8 +820,8 @@ public:
             [&](Status&& status) { call(func, std::move(status)); },
             // on not ready yet:
             [&] {
-                shared->callback = [func = std::forward<Func>(func)](SharedStateBase *
-                                                                     ssb) mutable noexcept {
+                _shared->callback = [func = std::forward<Func>(func)](SharedStateBase *
+                                                                      ssb) mutable noexcept {
                     const auto input = checked_cast<SharedState<T>*>(ssb);
                     if (input->status.isOK()) {
                         call(func, std::move(*input->data));
@@ -974,7 +1005,7 @@ public:
                 (std::is_same<T, FakeVoid>::value && std::is_same<Result, Future<void>>::value),
             "func passed to Future<T>::onError must return T, StatusWith<T>, or Future<T>");
 
-        if (immediate || (isReady() && shared->status.isOK()))
+        if (_immediate || (isReady() && _shared->status.isOK()))
             return std::move(*this);  // Avoid copy/moving func if we know we won't call it.
 
         // TODO in C++17 with constexpr if this can be done cleaner and more efficiently by not
@@ -1074,28 +1105,28 @@ private:
     friend class Promise<T>;
 
     T& getImpl() {
-        if (immediate) {
-            return *immediate;
+        if (_immediate) {
+            return *_immediate;
         }
 
-        shared->wait();
-        uassertStatusOK(shared->status);
-        return *(shared->data);
+        _shared->wait();
+        uassertStatusOK(_shared->status);
+        return *(_shared->data);
     }
 
     // All callbacks are called immediately so they are allowed to capture everything by reference.
     // All callbacks should return the same return type.
     template <typename SuccessFunc, typename FailFunc, typename NotReady>
     auto generalImpl(SuccessFunc&& success, FailFunc&& fail, NotReady&& notReady) noexcept {
-        if (immediate) {
-            return success(std::move(*immediate));
+        if (_immediate) {
+            return success(std::move(*_immediate));
         }
 
-        if (shared->state.load(std::memory_order_acquire) == SSBState::kFinished) {
-            if (shared->status.isOK()) {
-                return success(std::move(*shared->data));
+        if (_shared->state.load(std::memory_order_acquire) == SSBState::kFinished) {
+            if (_shared->status.isOK()) {
+                return success(std::move(*_shared->data));
             } else {
-                return fail(std::move(shared->status));
+                return fail(std::move(_shared->status));
             }
         }
 
@@ -1104,10 +1135,10 @@ private:
         // void to a variable.
         ON_BLOCK_EXIT([&] {
             auto oldState = SSBState::kInit;
-            if (MONGO_unlikely(!shared->state.compare_exchange_strong(
+            if (MONGO_unlikely(!_shared->state.compare_exchange_strong(
                     oldState, SSBState::kWaiting, std::memory_order_acq_rel))) {
                 dassert(oldState == SSBState::kFinished);
-                shared->callback(shared.get());
+                _shared->callback(_shared.get());
             }
         });
 
@@ -1159,13 +1190,13 @@ private:
                 // examining p->continuation, and p->continuation must be written before doing the
                 // release-store of true to p->isJustForContinuation.
                 if (output->isJustForContinuation.load(std::memory_order_acquire)) {
-                    shared->continuation = std::move(output->continuation);
+                    _shared->continuation = std::move(output->continuation);
                 } else {
-                    shared->continuation = output;
+                    _shared->continuation = output;
                 }
-                shared->isJustForContinuation.store(true, std::memory_order_release);
+                _shared->isJustForContinuation.store(true, std::memory_order_release);
 
-                shared->callback = [](SharedStateBase * ssb) noexcept {
+                _shared->callback = [](SharedStateBase * ssb) noexcept {
                     const auto input = checked_cast<SharedState<T>*>(ssb);
                     const auto output = checked_cast<SharedState<T>*>(ssb->continuation.get());
                     output->fillFrom(std::move(*input));
@@ -1175,13 +1206,13 @@ private:
 
     template <typename Result, typename OnReady>
     inline Future<Result> makeContinuation(OnReady&& onReady) {
-        invariant(!shared->callback && !shared->continuation);
+        invariant(!_shared->callback && !_shared->continuation);
 
         auto continuation = make_intrusive<SharedState<Result>>();
         continuation->threadUnsafeIncRefCountTo(2);
-        shared->continuation.reset(continuation.get(), /*add ref*/ false);
-        shared->callback = [onReady = std::forward<OnReady>(onReady)](SharedStateBase *
-                                                                      ssb) mutable noexcept {
+        _shared->continuation.reset(continuation.get(), /*add ref*/ false);
+        _shared->callback = [onReady = std::forward<OnReady>(onReady)](SharedStateBase *
+                                                                       ssb) mutable noexcept {
             const auto input = checked_cast<SharedState<T>*>(ssb);
             const auto output = checked_cast<SharedState<Result>*>(ssb->continuation.get());
             onReady(input, output);
@@ -1189,11 +1220,11 @@ private:
         return Future<VoidToFakeVoid<Result>>(std::move(continuation));
     }
 
-    explicit Future(boost::intrusive_ptr<SharedState<T>> ptr) : shared(std::move(ptr)) {}
+    explicit Future(boost::intrusive_ptr<SharedState<T>> ptr) : _shared(std::move(ptr)) {}
 
     // At most one of these will be active.
-    boost::optional<T> immediate;
-    boost::intrusive_ptr<SharedState<T>> shared;
+    boost::optional<T> _immediate;
+    boost::intrusive_ptr<SharedState<T>> _shared;
 };
 
 /**
@@ -1222,50 +1253,50 @@ public:
     }
 
     bool isReady() const {
-        return inner.isReady();
+        return _inner.isReady();
     }
 
     void get() const {
-        inner.get();
+        _inner.get();
     }
 
     Status getNoThrow() const noexcept {
-        return inner.getNoThrow().getStatus();
+        return _inner.getNoThrow().getStatus();
     }
 
     template <typename Func>  // Status -> void
         void getAsync(Func&& func) && noexcept {
-        return std::move(inner).getAsync(std::forward<Func>(func));
+        return std::move(_inner).getAsync(std::forward<Func>(func));
     }
 
     template <typename Func>  // () -> T or StatusWith<T> or Future<T>
         auto then(Func&& func) && noexcept {
-        return std::move(inner).then(std::forward<Func>(func));
+        return std::move(_inner).then(std::forward<Func>(func));
     }
 
     template <typename Func>  // Status -> T or StatusWith<T> or Future<T>
         Future<void> onError(Func&& func) && noexcept {
-        return std::move(inner).onError(std::forward<Func>(func));
+        return std::move(_inner).onError(std::forward<Func>(func));
     }
 
     template <ErrorCodes::Error code, typename Func>  // Status -> T or StatusWith<T> or Future<T>
         Future<void> onError(Func&& func) && noexcept {
-        return std::move(inner).onError<code>(std::forward<Func>(func));
+        return std::move(_inner).onError<code>(std::forward<Func>(func));
     }
 
     template <typename Func>  // () -> void
         Future<void> tap(Func&& func) && noexcept {
-        return std::move(inner).tap(std::forward<Func>(func));
+        return std::move(_inner).tap(std::forward<Func>(func));
     }
 
     template <typename Func>  // Status -> void
         Future<void> tapError(Func&& func) && noexcept {
-        return std::move(inner).tapError(std::forward<Func>(func));
+        return std::move(_inner).tapError(std::forward<Func>(func));
     }
 
     template <typename Func>  // Status -> void
         Future<void> tapAll(Func&& func) && noexcept {
-        return std::move(inner).tapAll(std::forward<Func>(func));
+        return std::move(_inner).tapAll(std::forward<Func>(func));
     }
 
     Future<void> ignoreValue() && noexcept {
@@ -1277,21 +1308,21 @@ private:
     friend class Future;
     friend class Promise<void>;
 
-    explicit Future(boost::intrusive_ptr<SharedState<FakeVoid>> ptr) : inner(std::move(ptr)) {}
-    /*implicit*/ Future(Future<FakeVoid>&& inner) : inner(std::move(inner)) {}
+    explicit Future(boost::intrusive_ptr<SharedState<FakeVoid>> ptr) : _inner(std::move(ptr)) {}
+    /*implicit*/ Future(Future<FakeVoid>&& inner) : _inner(std::move(inner)) {}
     /*implicit*/ operator Future<FakeVoid>() && {
-        return std::move(inner);
+        return std::move(_inner);
     }
 
     void propagateResultTo(SharedState<void>* output) noexcept {
-        inner.propagateResultTo(output);
+        _inner.propagateResultTo(output);
     }
 
     static Future<void> makeReady(StatusWith<FakeVoid> status) {
         return Future<FakeVoid>::makeReady(std::move(status));
     }
 
-    Future<FakeVoid> inner;
+    Future<FakeVoid> _inner;
 };
 
 /**
@@ -1310,11 +1341,7 @@ auto makeReadyFutureWith(Func&& func) {
  */
 template <typename T>
 inline auto makePromiseFuture() {
-    struct PromiseAndFuture {
-        Promise<T> promise;
-        Future<T> future = promise.getFuture();
-    };
-    return PromiseAndFuture();
+    return Promise<T>::makePromiseFutureImpl();
 }
 
 /**
@@ -1349,29 +1376,21 @@ using FutureContinuationResult =
 
 template <typename T>
 inline Future<T> Promise<T>::getFuture() noexcept {
-    invariant(!haveExtractedFuture);
-    haveExtractedFuture = true;
-
-    if (!haveSetValue) {
-        sharedState->threadUnsafeIncRefCountTo(2);
-        return Future<T>(
-            boost::intrusive_ptr<SharedState<T>>(sharedState.get(), /*add ref*/ false));
-    }
-
-    // Let the Future steal our ref-count since we don't need it anymore.
-    return Future<T>(std::move(sharedState));
+    _sharedState->threadUnsafeIncRefCountTo(2);
+    return Future<T>(boost::intrusive_ptr<SharedState<T>>(_sharedState.get(), /*add ref*/ false));
 }
 
 template <typename T>
 inline SharedPromise<T> Promise<T>::share() noexcept {
-    invariant(haveExtractedFuture);
-    invariant(!haveSetValue);
+    invariant(_sharedState);
     return SharedPromise<T>(std::make_shared<Promise<T>>(std::move(*this)));
 }
 
 template <typename T>
 inline void Promise<T>::setFrom(Future<T>&& future) noexcept {
-    setImpl([&] { future.propagateResultTo(sharedState.get()); });
+    setImpl([&](boost::intrusive_ptr<SharedState<T>>&& sharedState) {
+        future.propagateResultTo(sharedState.get());
+    });
 }
 
 template <typename T>

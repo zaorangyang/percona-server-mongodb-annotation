@@ -720,10 +720,20 @@ TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
     // disabled, even with 'allUsers:false'.
     const session = shardAdminDB.getMongo().startSession();
 
+    // Run an operation prior to starting the transaction and save its operation time.
+    const sessionDB = session.getDatabase(shardTestDB.getName());
+    const res = assert.commandWorked(sessionDB.runCommand({insert: "test", documents: [{x: 1}]}));
+    const operationTime = res.operationTime;
+
+    // Set and save the transaction's lifetime. We will use this later to assert that our
+    // transaction's expiry time is equal to its start time + lifetime.
+    const transactionLifeTime = 10;
+    assert.commandWorked(sessionDB.adminCommand(
+        {setParameter: 1, transactionLifetimeLimitSeconds: transactionLifeTime}));
+
     const timeBeforeTransactionStarts = new ISODate();
 
     // Start but do not complete a transaction.
-    const sessionDB = session.getDatabase(shardTestDB.getName());
     assert.commandWorked(sessionDB.runCommand({
         insert: "test",
         documents: [{_id: `txn-insert-no-auth`}],
@@ -758,11 +768,19 @@ TestData.skipAwaitingReplicationOnShardsBeforeCheckingUUIDs = true;
             .toArray();
     let transactionDocument = currentOp[0].transaction;
     assert.eq(transactionDocument.parameters.autocommit, false);
+    assert.eq(transactionDocument.parameters.readConcern, {level: "snapshot"});
+    assert.gte(transactionDocument.readTimestamp, operationTime);
     assert.gte(ISODate(transactionDocument.startWallClockTime), timeBeforeTransactionStarts);
-    assert.gt(transactionDocument.timeOpenMicros,
-              (timeBeforeCurrentOp - timeAfterTransactionStarts) * 1000);
+    // We round timeOpenMicros up to the nearest multiple of 1000 to avoid occasional assertion
+    // failures caused by timeOpenMicros having microsecond precision while
+    // timeBeforeCurrentOp/timeAfterTransactionStarts only have millisecond precision.
+    assert.gte(Math.ceil(transactionDocument.timeOpenMicros / 1000) * 1000,
+               (timeBeforeCurrentOp - timeAfterTransactionStarts) * 1000);
     assert.gte(transactionDocument.timeActiveMicros, 0);
     assert.gte(transactionDocument.timeInactiveMicros, 0);
+    assert.eq(
+        ISODate(transactionDocument.expiryTime).getTime(),
+        ISODate(transactionDocument.startWallClockTime).getTime() + transactionLifeTime * 1000);
 
     // Allow the transactions to complete and close the session.
     assert.commandWorked(sessionDB.adminCommand({

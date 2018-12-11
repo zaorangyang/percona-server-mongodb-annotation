@@ -55,6 +55,8 @@ MONGO_EXPORT_SERVER_PARAMETER(internalQueryCacheWorksGrowthCoefficient, double, 
 
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryCacheDisableInactiveEntries, bool, false);
 
+MONGO_EXPORT_SERVER_PARAMETER(internalQueryCacheListPlansNewOutput, bool, false);
+
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryPlannerMaxIndexedSolutions, int, 64);
 
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryEnumerationMaxOrSolutions, int, 10);
@@ -79,6 +81,28 @@ MONGO_EXPORT_SERVER_PARAMETER(internalQueryExecYieldPeriodMS, int, 10);
 
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryFacetBufferSizeBytes, int, 100 * 1024 * 1024);
 
+MONGO_EXPORT_SERVER_PARAMETER(internalDocumentSourceSortMaxBlockingSortBytes,
+                              long long,
+                              100 * 1024 * 1024)
+    ->withValidator([](const long long& newVal) {
+        if (newVal <= 0) {
+            return Status(ErrorCodes::BadValue,
+                          "internalDocumentSourceSortMaxBlockingSortBytes must be >= 0");
+        }
+        return Status::OK();
+    });
+
+MONGO_EXPORT_SERVER_PARAMETER(internalDocumentSourceGroupMaxMemoryBytes,
+                              long long,
+                              100 * 1024 * 1024)
+    ->withValidator([](const long long& newVal) {
+        if (newVal <= 0) {
+            return Status(ErrorCodes::BadValue,
+                          "internalDocumentSourceGroupMaxMemoryBytes must be >= 0");
+        }
+        return Status::OK();
+    });
+
 MONGO_EXPORT_SERVER_PARAMETER(internalInsertMaxBatchSize,
                               int,
                               internalQueryExecYieldIterations.load() / 2);
@@ -92,4 +116,6 @@ MONGO_EXPORT_SERVER_PARAMETER(internalQueryPlannerGenerateCoveredWholeIndexScans
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryIgnoreUnknownJSONSchemaKeywords, bool, false);
 
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryProhibitBlockingMergeOnMongoS, bool, false);
+
+MONGO_EXPORT_SERVER_PARAMETER(internalQueryAllowAllPathsIndexes, bool, false);
 }  // namespace mongo

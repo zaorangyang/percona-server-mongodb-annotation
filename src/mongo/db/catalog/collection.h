@@ -213,9 +213,6 @@ public:
         virtual std::unique_ptr<SeekableRecordCursor> getCursor(OperationContext* opCtx,
                                                                 bool forward) const = 0;
 
-        virtual std::vector<std::unique_ptr<RecordCursor>> getManyCursors(
-            OperationContext* opCtx) const = 0;
-
         virtual void deleteDocument(OperationContext* opCtx,
                                     StmtId stmtId,
                                     const RecordId& loc,
@@ -422,15 +419,6 @@ public:
     }
 
     /**
-     * Returns many cursors that partition the Collection into many disjoint sets. Iterating
-     * all returned cursors is equivalent to iterating the full collection.
-     */
-    inline std::vector<std::unique_ptr<RecordCursor>> getManyCursors(
-        OperationContext* const opCtx) const {
-        return this->_impl().getManyCursors(opCtx);
-    }
-
-    /**
      * Deletes the document with the given RecordId from the collection.
      *
      * 'fromMigrate' indicates whether the delete was induced by a chunk migration, and
@@ -438,7 +426,6 @@ public:
      * real delete.
      * 'loc' key to uniquely identify a record in a collection.
      * 'opDebug' Optional argument. When not null, will be used to record operation statistics.
-     * 'cappedOK' if true, allows deletes on capped collections (Cloner::copyDB uses this).
      * 'noWarn' if unindexing the record causes an error, if noWarn is true the error
      * will not be logged.
      */

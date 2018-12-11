@@ -168,7 +168,7 @@ rpc::UniqueReply DBClientBase::parseCommandReplyMessage(const std::string& host,
 
     if (_metadataReader) {
         auto opCtx = haveClient() ? cc().getOperationContext() : nullptr;
-        uassertStatusOK(_metadataReader(opCtx, commandReply->getMetadata(), host));
+        uassertStatusOK(_metadataReader(opCtx, commandReply->getCommandReply(), host));
     }
 
     auto status = getStatusFromCommandResult(commandReply->getCommandReply());
@@ -470,11 +470,10 @@ void DBClientBase::_auth(const BSONObj& params) {
                     OpMsgRequest::fromDBAndBody(request.dbname, request.cmdObj, request.metadata));
 
                 BSONObj data = reply->getCommandReply().getOwned();
-                BSONObj metadata = reply->getMetadata().getOwned();
                 Milliseconds millis(Date_t::now() - start);
 
                 // Hand control back to authenticateClient()
-                handler({data, metadata, millis});
+                handler({data, millis});
 
             } catch (...) {
                 handler(exceptionToStatus());
@@ -559,21 +558,6 @@ bool DBClientBase::createCollection(
     if (max)
         b.append("max", max);
     return runCommand(db.c_str(), b.done(), *info);
-}
-
-bool DBClientBase::copyDatabase(const string& fromdb,
-                                const string& todb,
-                                const string& fromhost,
-                                BSONObj* info) {
-    BSONObj o;
-    if (info == 0)
-        info = &o;
-    BSONObjBuilder b;
-    b.append("copydb", 1);
-    b.append("fromhost", fromhost);
-    b.append("fromdb", fromdb);
-    b.append("todb", todb);
-    return runCommand("admin", b.done(), *info);
 }
 
 list<BSONObj> DBClientBase::getCollectionInfos(const string& db, const BSONObj& filter) {

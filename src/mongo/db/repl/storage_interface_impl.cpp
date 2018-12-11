@@ -66,6 +66,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/parsed_update.h"
+#include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/update_request.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
@@ -879,8 +880,10 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
         // We can create an UpdateRequest now that the collection's namespace has been resolved, in
         // the event it was specified as a UUID.
         UpdateRequest request(collection->ns());
+        UpdateLifecycleImpl lifeCycle(collection->ns());
         request.setQuery(query);
         request.setUpdates(update);
+        request.setLifecycle(&lifeCycle);
         request.setUpsert(true);
         invariant(!request.isMulti());  // This follows from using an exact _id query.
         invariant(!request.shouldReturnAnyDocs());
@@ -919,8 +922,10 @@ Status StorageInterfaceImpl::putSingleton(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const TimestampedBSONObj& update) {
     UpdateRequest request(nss);
+    UpdateLifecycleImpl lifeCycle(nss);
     request.setQuery({});
     request.setUpdates(update.obj);
+    request.setLifecycle(&lifeCycle);
     request.setUpsert(true);
     return _updateWithQuery(opCtx, request, update.timestamp);
 }
@@ -930,8 +935,10 @@ Status StorageInterfaceImpl::updateSingleton(OperationContext* opCtx,
                                              const BSONObj& query,
                                              const TimestampedBSONObj& update) {
     UpdateRequest request(nss);
+    UpdateLifecycleImpl lifeCycle(nss);
     request.setQuery(query);
     request.setUpdates(update.obj);
+    request.setLifecycle(&lifeCycle);
     invariant(!request.isUpsert());
     return _updateWithQuery(opCtx, request, update.timestamp);
 }
@@ -1125,8 +1132,17 @@ Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
 }
 
 void StorageInterfaceImpl::waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) {
-    AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
-    oplog.getCollection()->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
+    Collection* oplog;
+    {
+        // We don't want to be holding the collection lock while blocking, to avoid deadlocks.
+        // It is safe to store and access the oplog's Collection object after dropping the lock
+        // because the oplog is special and cannot be deleted on a running process.
+        // TODO(spencer): It should be possible to get the pointer to the oplog Collection object
+        // without ever having to take the collection lock.
+        AutoGetCollection oplogLock(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
+        oplog = oplogLock.getCollection();
+    }
+    oplog->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(opCtx);
 }
 
 void StorageInterfaceImpl::oplogDiskLocRegister(OperationContext* opCtx,
@@ -1138,18 +1154,30 @@ void StorageInterfaceImpl::oplogDiskLocRegister(OperationContext* opCtx,
         oplog.getCollection()->getRecordStore()->oplogDiskLocRegister(opCtx, ts, orderedCommit));
 }
 
-boost::optional<Timestamp> StorageInterfaceImpl::getLastStableCheckpointTimestamp(
+boost::optional<Timestamp> StorageInterfaceImpl::getLastStableRecoveryTimestamp(
     ServiceContext* serviceCtx) const {
     if (!supportsRecoverToStableTimestamp(serviceCtx)) {
         return boost::none;
     }
 
-    const auto ret = serviceCtx->getStorageEngine()->getLastStableCheckpointTimestamp();
+    const auto ret = serviceCtx->getStorageEngine()->getLastStableRecoveryTimestamp();
     if (ret == boost::none) {
         return Timestamp::min();
     }
 
     return ret;
+}
+
+boost::optional<Timestamp> StorageInterfaceImpl::getLastStableCheckpointTimestampDeprecated(
+    ServiceContext* serviceCtx) const {
+    if (serviceCtx->getStorageEngine()->isEphemeral()) {
+        return boost::none;
+    }
+
+    // A persisted storage engine will set its recovery timestamp to its last stable checkpoint.
+    // (Reporting last stable checkpoint in replication will be removed in v4.4 (SERVER-36194). The
+    // storage layer has already removed the direct API support.)
+    return getLastStableRecoveryTimestamp(serviceCtx);
 }
 
 bool StorageInterfaceImpl::supportsDocLocking(ServiceContext* serviceCtx) const {

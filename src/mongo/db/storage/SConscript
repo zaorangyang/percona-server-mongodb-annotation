@@ -122,7 +122,6 @@ env.Library(
         'sorted_data_interface_test_harness.cpp',
         'sorted_data_interface_test_insert.cpp',
         'sorted_data_interface_test_isempty.cpp',
-        'sorted_data_interface_test_rand_cursor.cpp',
         'sorted_data_interface_test_rollback.cpp',
         'sorted_data_interface_test_spaceused.cpp',
         'sorted_data_interface_test_touch.cpp',
@@ -147,7 +146,6 @@ env.Library(
         'record_store_test_deleterecord.cpp',
         'record_store_test_harness.cpp',
         'record_store_test_insertrecord.cpp',
-        'record_store_test_manyiter.cpp',
         'record_store_test_randomiter.cpp',
         'record_store_test_recorditer.cpp',
         'record_store_test_recordstore.cpp',
@@ -245,7 +243,18 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
+    ],
+)
+
+env.Library(
+    target='backup_cursor_service',
+    source=[
+        'backup_cursor_service.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -263,5 +272,24 @@ env.CppUnitTest(
     LIBDEPS=[
         'key_string',
         '$BUILD_DIR/mongo/base',
-        ]
+    ],
+)
+
+env.Benchmark(
+    target='storage_key_string_bm',
+    source='key_string_bm.cpp',
+    LIBDEPS=[
+        'key_string',
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.CppUnitTest(
+    target='backup_cursor_service_test',
+    source='backup_cursor_service_test.cpp',
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
+        'backup_cursor_service',
+    ],
 )

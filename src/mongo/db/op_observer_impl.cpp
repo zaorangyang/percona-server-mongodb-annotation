@@ -47,10 +47,10 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/db/views/durable_view_catalog.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/assert_util.h"
@@ -108,7 +108,8 @@ void onWriteOpCompleted(OperationContext* opCtx,
                         Session* session,
                         std::vector<StmtId> stmtIdsWritten,
                         const repl::OpTime& lastStmtIdWriteOpTime,
-                        Date_t lastStmtIdWriteDate) {
+                        Date_t lastStmtIdWriteDate,
+                        boost::optional<DurableTxnStateEnum> txnState) {
     if (lastStmtIdWriteOpTime.isNull())
         return;
 
@@ -117,7 +118,8 @@ void onWriteOpCompleted(OperationContext* opCtx,
                                              *opCtx->getTxnNumber(),
                                              std::move(stmtIdsWritten),
                                              lastStmtIdWriteOpTime,
-                                             lastStmtIdWriteDate);
+                                             lastStmtIdWriteDate,
+                                             txnState);
     }
 }
 
@@ -295,7 +297,8 @@ OpTimeBundle replLogApplyOps(OperationContext* opCtx,
                              const OperationSessionInfo& sessionInfo,
                              StmtId stmtId,
                              const repl::OplogLink& oplogLink,
-                             bool prepare) {
+                             bool prepare,
+                             const OplogSlot& oplogSlot) {
     OpTimeBundle times;
     times.wallClockTime = getWallClockTimeForOpLog(opCtx);
     times.writeOpTime = logOperation(opCtx,
@@ -310,7 +313,7 @@ OpTimeBundle replLogApplyOps(OperationContext* opCtx,
                                      stmtId,
                                      oplogLink,
                                      prepare,
-                                     OplogSlot());
+                                     oplogSlot);
     return times;
 }
 
@@ -371,9 +374,9 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
                                std::vector<InsertStatement>::const_iterator first,
                                std::vector<InsertStatement>::const_iterator last,
                                bool fromMigrate) {
-    Session* const session = OperationContextSession::get(opCtx);
-    const bool inMultiDocumentTransaction =
-        session && opCtx->writesAreReplicated() && session->inMultiDocumentTransaction();
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    const bool inMultiDocumentTransaction = txnParticipant && opCtx->writesAreReplicated() &&
+        txnParticipant->inMultiDocumentTransaction();
 
     Date_t lastWriteDate;
 
@@ -389,11 +392,12 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
         }
         for (auto iter = first; iter != last; iter++) {
             auto operation = OplogEntry::makeInsertOperation(nss, uuid, iter->doc);
-            session->addTransactionOperation(opCtx, operation);
+            txnParticipant->addTransactionOperation(opCtx, operation);
         }
     } else {
         lastWriteDate = getWallClockTimeForOpLog(opCtx);
 
+        Session* const session = OperationContextSession::get(opCtx);
         opTimeList =
             repl::logInsertOps(opCtx, nss, uuid, session, first, last, fromMigrate, lastWriteDate);
         if (!opTimeList.empty())
@@ -410,12 +414,13 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
                        std::back_inserter(stmtIdsWritten),
                        [](const InsertStatement& stmt) { return stmt.stmtId; });
 
-        onWriteOpCompleted(opCtx, nss, session, stmtIdsWritten, lastOpTime, lastWriteDate);
+        onWriteOpCompleted(
+            opCtx, nss, session, stmtIdsWritten, lastOpTime, lastWriteDate, boost::none);
     }
 
-    auto css = (nss == NamespaceString::kSessionTransactionsTableNamespace || fromMigrate)
+    auto* const css = (nss == NamespaceString::kSessionTransactionsTableNamespace || fromMigrate)
         ? nullptr
-        : CollectionShardingState::get(opCtx, nss);
+        : CollectionShardingRuntime::get(opCtx, nss);
 
     size_t index = 0;
     for (auto it = first; it != last; it++, index++) {
@@ -464,22 +469,24 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
         return;
     }
 
-    Session* const session = OperationContextSession::get(opCtx);
-    const bool inMultiDocumentTransaction =
-        session && opCtx->writesAreReplicated() && session->inMultiDocumentTransaction();
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    const bool inMultiDocumentTransaction = txnParticipant && opCtx->writesAreReplicated() &&
+        txnParticipant->inMultiDocumentTransaction();
     OpTimeBundle opTime;
     if (inMultiDocumentTransaction) {
         auto operation =
             OplogEntry::makeUpdateOperation(args.nss, args.uuid, args.update, args.criteria);
-        session->addTransactionOperation(opCtx, operation);
+        txnParticipant->addTransactionOperation(opCtx, operation);
     } else {
+        Session* const session = OperationContextSession::get(opCtx);
         opTime = replLogUpdate(opCtx, session, args);
         onWriteOpCompleted(opCtx,
                            args.nss,
                            session,
                            std::vector<StmtId>{args.stmtId},
                            opTime.writeOpTime,
-                           opTime.wallClockTime);
+                           opTime.wallClockTime,
+                           boost::none);
     }
 
     AuthorizationManager::get(opCtx->getServiceContext())
@@ -487,7 +494,7 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
 
     if (args.nss != NamespaceString::kSessionTransactionsTableNamespace) {
         if (!args.fromMigrate) {
-            auto css = CollectionShardingState::get(opCtx, args.nss);
+            auto* const css = CollectionShardingRuntime::get(opCtx, args.nss);
             shardObserveUpdateOp(
                 opCtx, css, args.updatedDoc, opTime.writeOpTime, opTime.prePostImageOpTime);
         }
@@ -511,7 +518,7 @@ void OpObserverImpl::aboutToDelete(OperationContext* opCtx,
                                    NamespaceString const& nss,
                                    BSONObj const& doc) {
     getDeleteState(opCtx) =
-        ShardObserverDeleteState::make(opCtx, CollectionShardingState::get(opCtx, nss), doc);
+        ShardObserverDeleteState::make(opCtx, CollectionShardingRuntime::get(opCtx, nss), doc);
 }
 
 void OpObserverImpl::onDelete(OperationContext* opCtx,
@@ -520,24 +527,26 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
                               StmtId stmtId,
                               bool fromMigrate,
                               const boost::optional<BSONObj>& deletedDoc) {
-    Session* const session = OperationContextSession::get(opCtx);
     auto& deleteState = getDeleteState(opCtx);
     invariant(!deleteState.documentKey.isEmpty());
-    const bool inMultiDocumentTransaction =
-        session && opCtx->writesAreReplicated() && session->inMultiDocumentTransaction();
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    const bool inMultiDocumentTransaction = txnParticipant && opCtx->writesAreReplicated() &&
+        txnParticipant->inMultiDocumentTransaction();
     OpTimeBundle opTime;
     if (inMultiDocumentTransaction) {
         auto operation = OplogEntry::makeDeleteOperation(
             nss, uuid, deletedDoc ? deletedDoc.get() : deleteState.documentKey);
-        session->addTransactionOperation(opCtx, operation);
+        txnParticipant->addTransactionOperation(opCtx, operation);
     } else {
+        Session* const session = OperationContextSession::get(opCtx);
         opTime = replLogDelete(opCtx, nss, uuid, session, stmtId, fromMigrate, deletedDoc);
         onWriteOpCompleted(opCtx,
                            nss,
                            session,
                            std::vector<StmtId>{stmtId},
                            opTime.writeOpTime,
-                           opTime.wallClockTime);
+                           opTime.wallClockTime,
+                           boost::none);
     }
 
     AuthorizationManager::get(opCtx->getServiceContext())
@@ -545,7 +554,7 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
 
     if (nss != NamespaceString::kSessionTransactionsTableNamespace) {
         if (!fromMigrate) {
-            auto css = CollectionShardingState::get(opCtx, nss);
+            auto* const css = CollectionShardingRuntime::get(opCtx, nss);
             shardObserveDeleteOp(
                 opCtx, css, deleteState, opTime.writeOpTime, opTime.prePostImageOpTime);
         }
@@ -886,7 +895,7 @@ void OpObserverImpl::onApplyOps(OperationContext* opCtx,
 
     // Only transactional 'applyOps' commands can be prepared.
     constexpr bool prepare = false;
-    replLogApplyOps(opCtx, cmdNss, applyOpCmd, {}, kUninitializedStmtId, {}, prepare);
+    replLogApplyOps(opCtx, cmdNss, applyOpCmd, {}, kUninitializedStmtId, {}, prepare, OplogSlot());
 
     AuthorizationManager::get(opCtx->getServiceContext())
         ->logOp(opCtx, "c", cmdNss, applyOpCmd, nullptr);
@@ -924,7 +933,7 @@ namespace {
 OpTimeBundle logApplyOpsForTransaction(OperationContext* opCtx,
                                        Session* const session,
                                        std::vector<repl::ReplOperation> stmts,
-                                       bool prepare) {
+                                       const OplogSlot& prepareOplogSlot) {
     BSONObjBuilder applyOpsBuilder;
     BSONArrayBuilder opsArray(applyOpsBuilder.subarrayStart("applyOps"_sd));
     for (auto& stmt : stmts) {
@@ -944,12 +953,15 @@ OpTimeBundle logApplyOpsForTransaction(OperationContext* opCtx,
     invariant(oplogLink.prevOpTime.isNull());
 
     try {
+        // We are only given an oplog slot for prepared transactions.
+        auto prepare = !prepareOplogSlot.opTime.isNull();
         auto applyOpCmd = applyOpsBuilder.done();
-        auto times =
-            replLogApplyOps(opCtx, cmdNss, applyOpCmd, sessionInfo, stmtId, oplogLink, prepare);
+        auto times = replLogApplyOps(
+            opCtx, cmdNss, applyOpCmd, sessionInfo, stmtId, oplogLink, prepare, prepareOplogSlot);
 
+        auto txnState = prepare ? DurableTxnStateEnum::kPrepared : DurableTxnStateEnum::kCommitted;
         onWriteOpCompleted(
-            opCtx, cmdNss, session, {stmtId}, times.writeOpTime, times.wallClockTime);
+            opCtx, cmdNss, session, {stmtId}, times.writeOpTime, times.wallClockTime, txnState);
         return times;
     } catch (const AssertionException& e) {
         // Change the error code to TransactionTooLarge if it is BSONObjectTooLarge.
@@ -963,43 +975,70 @@ OpTimeBundle logApplyOpsForTransaction(OperationContext* opCtx,
 
 }  //  namespace
 
-void OpObserverImpl::onTransactionCommit(OperationContext* opCtx) {
+void OpObserverImpl::onTransactionCommit(OperationContext* opCtx, bool wasPrepared) {
     invariant(opCtx->getTxnNumber());
-    Session* const session = OperationContextSession::get(opCtx);
-    invariant(session);
-    auto stmts = session->endTransactionAndRetrieveOperations(opCtx);
+    if (wasPrepared) {
+        // TODO (SERVER-35865): log commitTransaction oplog entry correctly. We log a dummy entry to
+        // test the timestamping behavior.
+        const NamespaceString cmdNss{"admin", "$cmd"};
+        const auto cmdObj = BSON("commitTransaction" << 1);
+        TransactionParticipant::SideTransactionBlock sideTxn(opCtx);
+        WriteUnitOfWork wuow(opCtx);
+        logOperation(opCtx,
+                     "c",
+                     cmdNss,
+                     boost::none,
+                     cmdObj,
+                     nullptr,
+                     false,
+                     getWallClockTimeForOpLog(opCtx),
+                     {},
+                     kUninitializedStmtId,
+                     {},
+                     false /* prepare */,
+                     OplogSlot());
+        wuow.commit();
+    } else {
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        invariant(txnParticipant);
+        const auto stmts = txnParticipant->endTransactionAndRetrieveOperations(opCtx);
 
-    // It is possible that the transaction resulted in no changes.  In that case, we should
-    // not write an empty applyOps entry.
-    if (stmts.empty())
-        return;
+        // It is possible that the transaction resulted in no changes.  In that case, we should
+        // not write an empty applyOps entry.
+        if (stmts.empty())
+            return;
 
-    const auto commitOpTime =
-        logApplyOpsForTransaction(opCtx, session, stmts, false /* prepare */).writeOpTime;
-    invariant(!commitOpTime.isNull());
+        Session* const session = OperationContextSession::get(opCtx);
+        invariant(session);
+
+        const auto commitOpTime =
+            logApplyOpsForTransaction(opCtx, session, stmts, OplogSlot()).writeOpTime;
+        invariant(!commitOpTime.isNull());
+    }
 }
 
-void OpObserverImpl::onTransactionPrepare(OperationContext* opCtx) {
+void OpObserverImpl::onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) {
     invariant(opCtx->getTxnNumber());
-    Session* const session = OperationContextSession::get(opCtx);
-    invariant(session);
-    invariant(session->inMultiDocumentTransaction());
-    auto stmts = session->endTransactionAndRetrieveOperations(opCtx);
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    invariant(txnParticipant);
+    invariant(txnParticipant->inMultiDocumentTransaction());
+    invariant(!prepareOpTime.opTime.isNull());
+    auto stmts = txnParticipant->endTransactionAndRetrieveOperations(opCtx);
 
     // We write the oplog entry in a side transaction so that we do not commit the now-prepared
-    // transaction. We then return to the main transaction and set its 'prepareTimestamp'.
+    // transaction.
     // We write an empty 'applyOps' entry if there were no writes to choose a prepare timestamp
     // and allow this transaction to be continued on failover.
-    repl::OpTime prepareOpTime;
     {
-        Session::SideTransactionBlock sideTxn(opCtx);
+        TransactionParticipant::SideTransactionBlock sideTxn(opCtx);
         WriteUnitOfWork wuow(opCtx);
-        prepareOpTime =
-            logApplyOpsForTransaction(opCtx, session, stmts, true /* prepare */).writeOpTime;
+
+        Session* const session = OperationContextSession::get(opCtx);
+        invariant(session);
+
+        logApplyOpsForTransaction(opCtx, session, stmts, prepareOpTime);
         wuow.commit();
     }
-    invariant(!prepareOpTime.isNull());
-    opCtx->recoveryUnit()->setPrepareTimestamp(prepareOpTime.getTimestamp());
 }
 
 void OpObserverImpl::onTransactionAbort(OperationContext* opCtx) {

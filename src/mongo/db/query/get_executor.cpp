@@ -40,12 +40,12 @@
 #include "mongo/base/parse_number.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/exec/cached_plan.h"
+#include "mongo/db/exec/collection_scan.h"
 #include "mongo/db/exec/count.h"
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/eof.h"
 #include "mongo/db/exec/idhack.h"
 #include "mongo/db/exec/multi_plan.h"
-#include "mongo/db/exec/oplogstart.h"
 #include "mongo/db/exec/projection.h"
 #include "mongo/db/exec/shard_filter.h"
 #include "mongo/db/exec/sort_key_generator.h"
@@ -193,17 +193,6 @@ void fillOutPlannerParams(OperationContext* opCtx,
     }
 
     plannerParams->options |= QueryPlannerParams::SPLIT_LIMITED_SORT;
-
-    // Doc-level locking storage engines cannot answer predicates implicitly via exact index
-    // bounds for index intersection plans, as this can lead to spurious matches.
-    //
-    // Such storage engines do not use the invalidation framework, and therefore
-    // have no need for KEEP_MUTATIONS.
-    if (supportsDocLocking()) {
-        plannerParams->options |= QueryPlannerParams::CANNOT_TRIM_IXISECT;
-    } else {
-        plannerParams->options |= QueryPlannerParams::KEEP_MUTATIONS;
-    }
 
     if (shouldWaitForOplogVisibility(
             opCtx, collection, canonicalQuery->getQueryRequest().isTailable())) {
@@ -357,36 +346,44 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
         }
     }
 
-    // Try to look up a cached solution for the query.
-    if (auto cs =
-            collection->infoCache()->getPlanCache()->getCacheEntryIfCacheable(*canonicalQuery)) {
-        // We have a CachedSolution.  Have the planner turn it into a QuerySolution.
-        auto statusWithQs = QueryPlanner::planFromCache(*canonicalQuery, plannerParams, *cs);
+    // Check that the query should be cached.
+    if (collection->infoCache()->getPlanCache()->shouldCacheQuery(*canonicalQuery)) {
+        auto planCacheKey = collection->infoCache()->getPlanCache()->computeKey(*canonicalQuery);
 
-        if (statusWithQs.isOK()) {
-            auto querySolution = std::move(statusWithQs.getValue());
-            if ((plannerParams.options & QueryPlannerParams::IS_COUNT) &&
-                turnIxscanIntoCount(querySolution.get())) {
-                LOG(2) << "Using fast count: " << redact(canonicalQuery->toStringShort());
+        // Fill in opDebug information.
+        CurOp::get(opCtx)->debug().queryHash = PlanCache::computeQueryHash(planCacheKey);
+
+        // Try to look up a cached solution for the query.
+        if (auto cs =
+                collection->infoCache()->getPlanCache()->getCacheEntryIfActive(planCacheKey)) {
+            // We have a CachedSolution.  Have the planner turn it into a QuerySolution.
+            auto statusWithQs = QueryPlanner::planFromCache(*canonicalQuery, plannerParams, *cs);
+
+            if (statusWithQs.isOK()) {
+                auto querySolution = std::move(statusWithQs.getValue());
+                if ((plannerParams.options & QueryPlannerParams::IS_COUNT) &&
+                    turnIxscanIntoCount(querySolution.get())) {
+                    LOG(2) << "Using fast count: " << redact(canonicalQuery->toStringShort());
+                }
+
+                PlanStage* rawRoot;
+                verify(StageBuilder::build(
+                    opCtx, collection, *canonicalQuery, *querySolution, ws, &rawRoot));
+
+                // Add a CachedPlanStage on top of the previous root.
+                //
+                // 'decisionWorks' is used to determine whether the existing cache entry should
+                // be evicted, and the query replanned.
+                root = make_unique<CachedPlanStage>(opCtx,
+                                                    collection,
+                                                    ws,
+                                                    canonicalQuery.get(),
+                                                    plannerParams,
+                                                    cs->decisionWorks,
+                                                    rawRoot);
+                return PrepareExecutionResult(
+                    std::move(canonicalQuery), std::move(querySolution), std::move(root));
             }
-
-            PlanStage* rawRoot;
-            verify(StageBuilder::build(
-                opCtx, collection, *canonicalQuery, *querySolution, ws, &rawRoot));
-
-            // Add a CachedPlanStage on top of the previous root.
-            //
-            // 'decisionWorks' is used to determine whether the existing cache entry should
-            // be evicted, and the query replanned.
-            root = make_unique<CachedPlanStage>(opCtx,
-                                                collection,
-                                                ws,
-                                                canonicalQuery.get(),
-                                                plannerParams,
-                                                cs->decisionWorks,
-                                                rawRoot);
-            return PrepareExecutionResult(
-                std::move(canonicalQuery), std::move(querySolution), std::move(root));
         }
     }
 
@@ -597,47 +594,17 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
 
     boost::optional<RecordId> startLoc = boost::none;
 
-    // See if the RecordStore supports the oplogStartHack
+    // See if the RecordStore supports the oplogStartHack.
     StatusWith<RecordId> goal = oploghack::keyForOptime(*minTs);
     if (goal.isOK()) {
         startLoc = collection->getRecordStore()->oplogStartHack(opCtx, goal.getValue());
     }
 
-    if (startLoc) {
-        LOG(3) << "Using direct oplog seek";
-    } else {
-        LOG(3) << "Using OplogStart stage";
-
-        // Fallback to trying the OplogStart stage.
-        unique_ptr<WorkingSet> oplogws = make_unique<WorkingSet>();
-        unique_ptr<OplogStart> stage =
-            make_unique<OplogStart>(opCtx, collection, *minTs, oplogws.get());
-        // Takes ownership of oplogws and stage.
-        auto statusWithPlanExecutor = PlanExecutor::make(
-            opCtx, std::move(oplogws), std::move(stage), collection, PlanExecutor::YIELD_AUTO);
-        invariant(statusWithPlanExecutor.isOK());
-        unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec =
-            std::move(statusWithPlanExecutor.getValue());
-
-        // The stage returns a RecordId of where to start.
-        startLoc = RecordId();
-        PlanExecutor::ExecState state = exec->getNext(NULL, startLoc.get_ptr());
-
-        if (PlanExecutor::IS_EOF == state) {
-            // EOF from the OplogStart stage means that the starting point is prior to the very
-            // first document in the oplog. In this case, we should start from the beginning of the
-            // collection.
-            startLoc = boost::none;
-        } else if (PlanExecutor::ADVANCED != state) {
-            // This is not normal.  An error was encountered.
-            return Status(ErrorCodes::InternalError, "quick oplog start location had error...?");
-        }
-    }
-
-    // Build our collection scan...
+    // Build our collection scan.
     CollectionScanParams params;
     params.collection = collection;
     if (startLoc) {
+        LOG(3) << "Using direct oplog seek";
         params.start = *startLoc;
     }
     params.maxTs = maxTs;
@@ -656,10 +623,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
         params.stopApplyingFilterAfterFirstMatch = true;
     }
 
-    unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
-    unique_ptr<CollectionScan> cs =
-        make_unique<CollectionScan>(opCtx, params, ws.get(), cq->root());
-    // Takes ownership of 'ws', 'cs', and 'cq'.
+    auto ws = make_unique<WorkingSet>();
+    auto cs = make_unique<CollectionScan>(opCtx, params, ws.get(), cq->root());
     return PlanExecutor::make(
         opCtx, std::move(ws), std::move(cs), std::move(cq), collection, PlanExecutor::YIELD_AUTO);
 }

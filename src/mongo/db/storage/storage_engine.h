@@ -267,14 +267,21 @@ public:
         return;
     }
 
+    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine does not support a concurrent mode.");
+    }
+
+    virtual void endNonBlockingBackup(OperationContext* opCtx) {
+        return;
+    }
+
     /**
      * Recover as much data as possible from a potentially corrupt RecordStore.
      * This only recovers the record data, not indexes or anything else.
      *
      * Generally, this method should not be called directly except by the repairDatabase()
      * free function.
-     *
-     * NOTE: MMAPv1 does not support this method and has its own repairDatabase() method.
      */
     virtual Status repairRecordStore(OperationContext* opCtx, const std::string& ns) = 0;
 
@@ -350,12 +357,16 @@ public:
     }
 
     /**
-     * Returns a timestamp that is guaranteed to be persisted to disk in a checkpoint. Returns
-     * boost::none if there is no stable checkpoint. This method should return at least the value of
-     * `getRecoveryTimestamp` if the node started from a stable checkpoint. fasserts if
-     * StorageEngine::supportsRecoverToStableTimestamp() would return false.
+     * Returns a timestamp that is guaranteed to exist on storage engine recovery to a stable
+     * timestamp. This indicates when the storage engine can safely rollback to stable; and for
+     * durable engines, it is also the guaranteed minimum stable recovery point on server restart
+     * after crash or shutdown.
+     *
+     * fasserts if StorageEngine::supportsRecoverToStableTimestamp() would return false. Returns
+     * boost::none if the recovery time has not yet been established. Replication recoverable
+     * rollback may not succeed before establishment, and restart will require resync.
      */
-    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const {
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const {
         MONGO_UNREACHABLE;
     }
 

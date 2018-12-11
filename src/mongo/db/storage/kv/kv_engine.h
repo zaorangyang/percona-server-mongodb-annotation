@@ -58,8 +58,13 @@ public:
     // ---------
 
     /**
-     * Having multiple out for the same ns is a rules violation; Calling on a non-created ident is
-     * invalid and may crash.
+     * Requesting multiple copies for the same ns/ident is a rules violation; Calling on a
+     * non-created ident is invalid and may crash.
+     *
+     * Trying to access this record store in the future will retreive the pointer from the
+     * collection object, and therefore this function can only be called once per namespace.
+     *
+     * @param ident Will be created if it does not already exist.
      */
     virtual std::unique_ptr<RecordStore> getRecordStore(OperationContext* opCtx,
                                                         StringData ns,
@@ -164,6 +169,24 @@ public:
 
     virtual Status dropIdent(OperationContext* opCtx, StringData ident) = 0;
 
+    /**
+     * Attempts to locate and recover a file that is "orphaned" from the storage engine's metadata,
+     * but may still exist on disk if this is a durable storage engine. Returns Status::OK if a new
+     * record store was successfully created.
+     *
+     * This may return an error if the storage engine attempted to recover the file and failed.
+     *
+     * This recovery process makes no guarantees about the integrity of data recovered or even that
+     * it still exists when recovered.
+     */
+    virtual Status recoverOrphanedIdent(OperationContext* opCtx,
+                                        StringData ns,
+                                        StringData ident,
+                                        const CollectionOptions& options) {
+        return createRecordStore(opCtx, ns, ident, options);
+    }
+
+
     virtual void alterIdentMetadata(OperationContext* opCtx,
                                     StringData ident,
                                     const IndexDescriptor* desc){};
@@ -185,6 +208,15 @@ public:
      * See StorageEngine::endBackup for details
      */
     virtual void endBackup(OperationContext* opCtx) {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx) {
+        return Status(ErrorCodes::CommandNotSupported,
+                      "The current storage engine doesn't support backup mode");
+    }
+
+    virtual void endNonBlockingBackup(OperationContext* opCtx) {
         MONGO_UNREACHABLE;
     }
 
@@ -312,9 +344,9 @@ public:
     }
 
     /**
-     * See `StorageEngine::getLastStableCheckpointTimestamp`
+     * See `StorageEngine::getLastStableRecoveryTimestamp`
      */
-    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const {
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const {
         MONGO_UNREACHABLE;
     }
 

@@ -111,17 +111,11 @@ string optionString(size_t options) {
             case QueryPlannerParams::INDEX_INTERSECTION:
                 ss << "INDEX_INTERSECTION ";
                 break;
-            case QueryPlannerParams::KEEP_MUTATIONS:
-                ss << "KEEP_MUTATIONS ";
-                break;
             case QueryPlannerParams::IS_COUNT:
                 ss << "IS_COUNT ";
                 break;
             case QueryPlannerParams::SPLIT_LIMITED_SORT:
                 ss << "SPLIT_LIMITED_SORT ";
-                break;
-            case QueryPlannerParams::CANNOT_TRIM_IXISECT:
-                ss << "CANNOT_TRIM_IXISECT ";
                 break;
             case QueryPlannerParams::NO_UNCOVERED_PROJECTIONS:
                 ss << "NO_UNCOVERED_PROJECTIONS ";
@@ -320,6 +314,11 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
             return Status(ErrorCodes::BadValue, "can't cache '2d' index");
         }
 
+        // TODO SERVER-35333: AllPaths indexes cannot currently be cached.
+        if (relevantIndices[itag->index].type == IndexType::INDEX_ALLPATHS) {
+            return Status(ErrorCodes::BadValue, "can't cache 'allPaths' index");
+        }
+
         IndexEntry* ientry = new IndexEntry(relevantIndices[itag->index]);
         indexTree->entry.reset(ientry);
         indexTree->index_pos = itag->pos;
@@ -333,6 +332,11 @@ StatusWith<std::unique_ptr<PlanCacheIndexTree>> QueryPlanner::cacheDataFromTagge
 
             if (is2DIndex(relevantIndices[itag->index].keyPattern)) {
                 return Status(ErrorCodes::BadValue, "can't cache '2d' index");
+            }
+
+            // TODO SERVER-35333: AllPaths indexes cannot currently be cached.
+            if (relevantIndices[itag->index].type == IndexType::INDEX_ALLPATHS) {
+                return Status(ErrorCodes::BadValue, "can't cache 'allPaths' index");
             }
 
             std::unique_ptr<IndexEntry> indexEntry =

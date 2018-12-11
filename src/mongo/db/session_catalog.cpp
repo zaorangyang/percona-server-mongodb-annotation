@@ -40,6 +40,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/log.h"
@@ -150,19 +151,20 @@ ScopedSession SessionCatalog::getOrCreateSession(OperationContext* opCtx,
         return ScopedSession(_getOrCreateSessionRuntimeInfo(ul, opCtx, lsid));
     }();
 
-    // Perform the refresh outside of the mutex
-    ss->refreshFromStorageIfNeeded(opCtx);
-
     return ss;
 }
 
 void SessionCatalog::invalidateSessions(OperationContext* opCtx,
                                         boost::optional<BSONObj> singleSessionDoc) {
-    uassert(40528,
-            str::stream() << "Direct writes against "
-                          << NamespaceString::kSessionTransactionsTableNamespace.ns()
-                          << " cannot be performed using a transaction or on a session.",
-            !opCtx->getLogicalSessionId());
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+    if (isReplSet) {
+        uassert(40528,
+                str::stream() << "Direct writes against "
+                              << NamespaceString::kSessionTransactionsTableNamespace.ns()
+                              << " cannot be performed using a transaction or on a session.",
+                !opCtx->getLogicalSessionId());
+    }
 
     const auto invalidateSessionFn = [&](WithLock, SessionRuntimeInfoMap::iterator it) {
         auto& sri = it->second;
@@ -235,14 +237,8 @@ void SessionCatalog::_releaseSession(const LogicalSessionId& lsid) {
     sri->availableCondVar.notify_one();
 }
 
-OperationContextSession::OperationContextSession(OperationContext* opCtx,
-                                                 bool checkOutSession,
-                                                 boost::optional<bool> autocommit,
-                                                 boost::optional<bool> startTransaction,
-                                                 StringData dbName,
-                                                 StringData cmdName)
+OperationContextSession::OperationContextSession(OperationContext* opCtx, bool checkOutSession)
     : _opCtx(opCtx) {
-
     if (!opCtx->getLogicalSessionId()) {
         return;
     }
@@ -254,10 +250,11 @@ OperationContextSession::OperationContextSession(OperationContext* opCtx,
     auto& checkedOutSession = operationSessionDecoration(opCtx);
     if (!checkedOutSession) {
         auto sessionTransactionTable = SessionCatalog::get(opCtx);
+        auto scopedCheckedOutSession = sessionTransactionTable->checkOutSession(opCtx);
         // We acquire a Client lock here to guard the construction of this session so that
         // references to this session are safe to use while the lock is held.
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        checkedOutSession.emplace(sessionTransactionTable->checkOutSession(opCtx));
+        checkedOutSession.emplace(std::move(scopedCheckedOutSession));
     } else {
         // The only reason to be trying to check out a session when you already have a session
         // checked out is if you're in DBDirectClient.
@@ -267,13 +264,6 @@ OperationContextSession::OperationContextSession(OperationContext* opCtx,
 
     const auto session = checkedOutSession->get();
     invariant(opCtx->getLogicalSessionId() == session->getSessionId());
-
-    checkedOutSession->get()->refreshFromStorageIfNeeded(opCtx);
-
-    if (opCtx->getTxnNumber()) {
-        checkedOutSession->get()->beginOrContinueTxn(
-            opCtx, *opCtx->getTxnNumber(), autocommit, startTransaction, dbName, cmdName);
-    }
 }
 
 OperationContextSession::~OperationContextSession() {

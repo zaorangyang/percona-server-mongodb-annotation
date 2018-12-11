@@ -254,6 +254,11 @@ public:
                            int pretty = 0,
                            bool isArray = false) const;
 
+    void jsonStringStream(JsonStringFormat format,
+                          int pretty,
+                          bool isArray,
+                          std::stringstream& s) const;
+
     /** note: addFields always adds _id even if not specified */
     int addFields(BSONObj& from, std::set<std::string>& fields); /* returns n added */
 
@@ -274,8 +279,11 @@ public:
     */
     int nFields() const;
 
-    /** adds the field names to the fields set.  does NOT clear it (appends). */
-    int getFieldNames(std::set<std::string>& fields) const;
+    /**
+     * Returns a 'Container' populated with the field names of the object.
+     */
+    template <class Container>
+    Container getFieldNames() const;
 
     /** Get the field of the specified name. eoo() is true on the returned
         element if not found.
@@ -838,4 +846,16 @@ inline void BSONObj::getFields(const std::array<StringData, N>& fieldNames,
             break;
     }
 }
+
+template <class Container>
+Container BSONObj::getFieldNames() const {
+    Container fields;
+    for (auto&& elem : *this) {
+        if (elem.eoo())
+            break;
+        fields.insert(elem.fieldName());
+    }
+    return fields;
+}
+
 }  // namespace mongo

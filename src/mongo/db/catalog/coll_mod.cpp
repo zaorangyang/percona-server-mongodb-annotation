@@ -66,19 +66,6 @@ namespace {
 // databases if none are provided).
 MONGO_FAIL_POINT_DEFINE(hangBeforeDatabaseUpgrade);
 
-/**
- * Returns list of database names.
- */
-std::vector<std::string> getDatabaseNames(OperationContext* opCtx) {
-    std::vector<std::string> dbNames;
-    auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    {
-        Lock::GlobalLock lk(opCtx, MODE_IS);
-        storageEngine->listDatabases(&dbNames);
-    }
-    return dbNames;
-}
-
 struct CollModRequest {
     const IndexDescriptor* idx = nullptr;
     BSONElement indexExpireAfterSeconds = {};
@@ -489,7 +476,7 @@ Status collModWithUpgrade(OperationContext* opCtx,
                           const BSONObj& cmdObj) {
     // A cmdObj with an empty collMod, i.e. nFields = 1, implies that it is a Unique Index
     // upgrade collMod.
-    bool upgradeUniqueIndex = createTimestampSafeUniqueIndex && (cmdObj.nFields() == 1);
+    bool upgradeUniqueIndex = (cmdObj.nFields() == 1);
 
     // Update all non-replicated unique indexes on upgrade i.e. setFCV=4.2.
     if (upgradeUniqueIndex && nss == NamespaceString::kServerConfigurationNamespace) {
@@ -575,9 +562,6 @@ void _updateUniqueIndexesForDatabase(OperationContext* opCtx, const std::string&
 }
 
 void updateUniqueIndexesOnUpgrade(OperationContext* opCtx) {
-    if (!createTimestampSafeUniqueIndex)
-        return;
-
     // Update all unique indexes except the _id index.
     std::vector<std::string> dbNames;
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
@@ -608,56 +592,19 @@ void updateUniqueIndexesOnUpgrade(OperationContext* opCtx) {
 }
 
 Status updateNonReplicatedUniqueIndexes(OperationContext* opCtx) {
-    if (!createTimestampSafeUniqueIndex)
-        return Status::OK();
-
     // Update all unique indexes belonging to all non-replicated collections.
     // (_id indexes are not updated).
-    auto dbNames = getDatabaseNames(opCtx);
+    std::vector<std::string> dbNames;
+    StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
+    {
+        Lock::GlobalLock lk(opCtx, MODE_IS);
+        storageEngine->listDatabases(&dbNames);
+    }
     for (auto it = dbNames.begin(); it != dbNames.end(); ++it) {
         auto dbName = *it;
         auto schemaStatus = _updateNonReplicatedUniqueIndexesPerDatabase(opCtx, dbName);
         if (!schemaStatus.isOK()) {
             return schemaStatus;
-        }
-    }
-    return Status::OK();
-}
-
-Status checkIndexNamespacesOnDowngrade(OperationContext* opCtx) {
-    auto dbNames = getDatabaseNames(opCtx);
-    for (const auto& dbName : dbNames) {
-        AutoGetDb autoDb(opCtx, dbName, MODE_IS);
-        auto db = autoDb.getDb();
-        // If the database no longer exists, there's nothing to do.
-        if (!db) {
-            continue;
-        }
-
-        for (auto collIter : *db) {
-            const auto nss = collIter->ns();
-            if (nss.isDropPendingNamespace()) {
-                continue;
-            }
-
-            AutoGetCollectionForRead autoColl(opCtx, nss);
-            auto coll = autoColl.getCollection();
-            if (!coll) {
-                continue;
-            }
-
-            const bool includeUnfinishedIndexes = true;
-            auto it = coll->getIndexCatalog()->getIndexIterator(opCtx, includeUnfinishedIndexes);
-            while (it.more()) {
-                auto desc = it.next();
-                if (desc->indexNamespace().length() > NamespaceString::MaxNsLen) {
-                    return Status(ErrorCodes::IndexNamespaceTooLong,
-                                  str::stream() << "index namespace \"" << desc->indexNamespace()
-                                                << "\" is too long for downgrade to 4.0 ("
-                                                << NamespaceString::MaxNsLen
-                                                << " byte max)");
-                }
-            }
         }
     }
     return Status::OK();

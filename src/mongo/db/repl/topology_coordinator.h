@@ -311,14 +311,23 @@ public:
                                       ReplSetHeartbeatResponse* response);
 
     struct ReplSetStatusArgs {
-        Date_t now;
-        unsigned selfUptime;
-        const OpTime& readConcernMajorityOpTime;
-        const BSONObj& initialSyncStatus;
+        const Date_t now;
+        const unsigned selfUptime;
+        const OpTime readConcernMajorityOpTime;
+        const BSONObj initialSyncStatus;
 
-        // boost::none if the storage engine does not support recovering to a
-        // timestamp. Timestamp::min() if a stable checkpoint is yet to be taken.
-        const boost::optional<Timestamp> lastStableCheckpointTimestamp;
+        // boost::none if the storage engine does not support RTT, or if it does but does not
+        // persist data to necessitate taking checkpoints. Timestamp::min() if a checkpoint is yet
+        // to be taken.
+        const boost::optional<Timestamp> lastStableCheckpointTimestampDeprecated;
+
+        // boost::none if the storage engine does not support recovery to a timestamp.
+        // Timestamp::min() if a stable recovery timestamp is yet to be taken.
+        //
+        // On the replication layer, a non-min() timestamp ensures recoverable rollback is possible,
+        // as well as startup recovery without re-initial syncing in the case of durable storage
+        // engines.
+        const boost::optional<Timestamp> lastStableRecoveryTimestamp;
     };
 
     // produce a reply to a status request
@@ -337,7 +346,7 @@ public:
     // Produce member data for the serverStatus command and diagnostic logging.
     void fillMemberData(BSONObjBuilder* result);
 
-    enum class PrepareFreezeResponseResult { kNoAction, kElectSelf };
+    enum class PrepareFreezeResponseResult { kNoAction, kSingleNodeSelfElect };
 
     /**
      * Produce a reply to a freeze request. Returns a PostMemberStateUpdateAction on success that
@@ -653,7 +662,7 @@ public:
         kPriorityTakeover,
         kStepUpRequest,
         kCatchupTakeover,
-        kSingleNodeStepDownTimeout
+        kSingleNodePromptElection
     };
 
     /**
@@ -681,6 +690,13 @@ public:
      * Returns OpTime(Timestamp(0, 0), 0), the smallest OpTime in PV1, if other nodes are all down.
      */
     boost::optional<OpTime> latestKnownOpTimeSinceHeartbeatRestart() const;
+
+    /**
+     * Similar to latestKnownOpTimeSinceHeartbeatRestart(), but returns the latest known optime for
+     * each member in the config. If the member is not up or hasn't responded to a heartbeat since
+     * we last restarted, then its value will be boost::none.
+     */
+    std::map<int, boost::optional<OpTime>> latestKnownOpTimeSinceHeartbeatRestartPerMember() const;
 
     ////////////////////////////////////////////////////////////
     //
@@ -835,6 +851,9 @@ private:
      * This is used to decide if we should transition to Role::candidate in a one-node replica set.
      */
     bool _isElectableNodeInSingleNodeReplicaSet() const;
+
+    // Returns a string representation of the current replica set status for logging purposes.
+    std::string _getReplSetStatusString();
 
     // This node's role in the replication protocol.
     Role _role;

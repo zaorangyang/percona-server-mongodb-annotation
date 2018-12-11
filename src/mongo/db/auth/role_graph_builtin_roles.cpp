@@ -171,7 +171,6 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::reIndex
         << ActionType::renameCollectionSameDB  // read_write gets this also
         << ActionType::startBackup
-        << ActionType::repairDatabase
         << ActionType::storageDetails
         << ActionType::validate;
 
@@ -226,8 +225,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
 
     // hostManager role actions that target the database resource
     hostManagerRoleDatabaseActions
-        << ActionType::killCursors
-        << ActionType::repairDatabase;
+        << ActionType::killCursors;
 
 
     // clusterManager role actions that target the cluster resource
@@ -363,7 +361,9 @@ void addUserAdminAnyDbPrivileges(PrivilegeVector* privileges) {
         Privilege(ResourcePattern::forClusterResource(), ActionType::invalidateUserCache));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::viewUser));
-
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges,
+        Privilege(ResourcePattern::forAnyNormalResource(), ActionType::listCachedAndActiveUsers));
 
     ActionSet readRoleAndIndexActions;
     readRoleAndIndexActions += readRoleActions;

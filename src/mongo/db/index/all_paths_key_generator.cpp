@@ -61,16 +61,14 @@ void popPathComponent(BSONElement elem, bool enclosingObjIsArray, FieldRef* path
 
 constexpr StringData AllPathsKeyGenerator::kSubtreeSuffix;
 
-AllPathsKeyGenerator::AllPathsKeyGenerator(BSONObj keyPattern,
-                                           BSONObj pathProjection,
-                                           const CollatorInterface* collator)
-    : _collator(collator), _keyPattern(keyPattern) {
+std::unique_ptr<ProjectionExecAgg> AllPathsKeyGenerator::createProjectionExec(
+    BSONObj keyPattern, BSONObj pathProjection) {
     // We should never have a key pattern that contains more than a single element.
-    invariant(_keyPattern.nFields() == 1);
+    invariant(keyPattern.nFields() == 1);
 
     // The _keyPattern is either { "$**": ±1 } for all paths or { "path.$**": ±1 } for a single
     // subtree. If we are indexing a single subtree, then we will project just that path.
-    auto indexRoot = _keyPattern.firstElement().fieldNameStringData();
+    auto indexRoot = keyPattern.firstElement().fieldNameStringData();
     auto suffixPos = indexRoot.find(kSubtreeSuffix);
 
     // If we're indexing a single subtree, we can't also specify a path projection.
@@ -86,26 +84,36 @@ AllPathsKeyGenerator::AllPathsKeyGenerator(BSONObj keyPattern,
     // If the projection spec does not explicitly specify _id, we exclude it by default. We also
     // prevent the projection from recursing through nested arrays, in order to ensure that the
     // output document aligns with the match system's expectations.
-    _projExec = ProjectionExecAgg::create(
+    return ProjectionExecAgg::create(
         projSpec,
         ProjectionExecAgg::DefaultIdPolicy::kExcludeId,
         ProjectionExecAgg::ArrayRecursionPolicy::kDoNotRecurseNestedArrays);
 }
 
+AllPathsKeyGenerator::AllPathsKeyGenerator(BSONObj keyPattern,
+                                           BSONObj pathProjection,
+                                           const CollatorInterface* collator)
+    : _collator(collator), _keyPattern(keyPattern) {
+    _projExec = createProjectionExec(keyPattern, pathProjection);
+}
+
 void AllPathsKeyGenerator::generateKeys(BSONObj inputDoc,
                                         BSONObjSet* keys,
-                                        MultikeyPathsMock* multikeyPaths) const {
-    FieldRef workingPath;
-    _traverseAllPaths(
-        _projExec->applyProjection(inputDoc), false, &workingPath, keys, multikeyPaths);
+                                        BSONObjSet* multikeyPaths) const {
+    FieldRef rootPath;
+    _traverseAllPaths(_projExec->applyProjection(inputDoc), false, &rootPath, keys, multikeyPaths);
 }
 
 void AllPathsKeyGenerator::_traverseAllPaths(BSONObj obj,
                                              bool objIsArray,
                                              FieldRef* path,
                                              BSONObjSet* keys,
-                                             MultikeyPathsMock* multikeyPaths) const {
+                                             BSONObjSet* multikeyPaths) const {
     for (const auto elem : obj) {
+        // If the element's fieldName contains a ".", fast-path skip it because it's not queryable.
+        if (elem.fieldNameStringData().find('.', 0) != std::string::npos)
+            continue;
+
         // If this element is an empty object, fast-path skip it.
         if (elem.type() == BSONType::Object && elem.Obj().isEmpty())
             continue;
@@ -158,10 +166,13 @@ void AllPathsKeyGenerator::_addKey(BSONElement elem,
     keys->insert(bob.obj());
 }
 
-void AllPathsKeyGenerator::_addMultiKey(const FieldRef& fullPath,
-                                        MultikeyPathsMock* multikeyPaths) const {
-    // Multikey paths are denoted by an entry of the form { "": 1, "": "path.to.array" }.
-    multikeyPaths->insert(BSON("" << 1 << "" << fullPath.dottedField()));
+void AllPathsKeyGenerator::_addMultiKey(const FieldRef& fullPath, BSONObjSet* multikeyPaths) const {
+    // Multikey paths are denoted by a key of the form { "": 1, "": "path.to.array" }. The argument
+    // 'multikeyPaths' may be nullptr if the access method is being used in an operation which does
+    // not require multikey path generation.
+    if (multikeyPaths) {
+        multikeyPaths->insert(BSON("" << 1 << "" << fullPath.dottedField()));
+    }
 }
 
 }  // namespace mongo

@@ -1832,6 +1832,7 @@ __wt_verbose_config(WT_SESSION_IMPL *session, const char *cfg[])
 		{ "checkpoint",		WT_VERB_CHECKPOINT },
 		{ "checkpoint_progress",WT_VERB_CHECKPOINT_PROGRESS },
 		{ "compact",		WT_VERB_COMPACT },
+		{ "error_returns",      WT_VERB_ERROR_RETURNS },
 		{ "evict",		WT_VERB_EVICT },
 		{ "evict_stuck",	WT_VERB_EVICT_STUCK },
 		{ "evictserver",	WT_VERB_EVICTSERVER },
@@ -2025,7 +2026,6 @@ __wt_timing_stress_config(WT_SESSION_IMPL *session, const char *cfg[])
 		{ "split_6",		WT_TIMING_STRESS_SPLIT_6 },
 		{ "split_7",		WT_TIMING_STRESS_SPLIT_7 },
 		{ "split_8",		WT_TIMING_STRESS_SPLIT_8 },
-		{ "split_9",		WT_TIMING_STRESS_SPLIT_9 },
 		{ NULL, 0 }
 	};
 	WT_CONFIG_ITEM cval, sval;
@@ -2626,6 +2626,12 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 #endif
 
 	WT_ERR(__wt_config_gets(session, cfg, "file_extend", &cval));
+	/*
+	 * If the log extend length is not set use the default of the configured
+	 * maximum log file size. That size is not known until it is initialized
+	 * as part of the log server initialization.
+	 */
+	conn->log_extend_len = WT_CONFIG_UNSET;
 	for (ft = file_types; ft->name != NULL; ft++) {
 		ret = __wt_config_subgets(session, &cval, ft->name, &sval);
 		if (ret == 0) {
@@ -2634,7 +2640,21 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler,
 				conn->data_extend_len = sval.val;
 				break;
 			case WT_DIRECT_IO_LOG:
-				conn->log_extend_len = sval.val;
+				/*
+				 * When using "file_extend=(log=)", the val
+				 * returned is 1. Unset the log extend length
+				 * in that case to use the default.
+				 */
+				if (sval.val == 1)
+					conn->log_extend_len = WT_CONFIG_UNSET;
+				else if (sval.val == 0 ||
+				    (sval.val >= WT_LOG_FILE_MIN &&
+				    sval.val <= WT_LOG_FILE_MAX))
+					conn->log_extend_len = sval.val;
+				else
+					WT_ERR_MSG(session, EINVAL,
+					    "invalid log extend length: %"
+					    PRId64, sval.val);
 				break;
 			}
 		} else
@@ -2749,16 +2769,4 @@ err:	/* Discard the scratch buffers. */
 	}
 
 	return (ret);
-}
-
-/*
- * wiredtiger_checksum_crc32c --
- *	CRC32C checksum function entry point.
- */
-uint32_t
-wiredtiger_checksum_crc32c(const void *buffer, size_t len)
-{
-	if (__wt_process.checksum == NULL)
-		__wt_checksum_init();
-	return (__wt_process.checksum(buffer, len));
 }

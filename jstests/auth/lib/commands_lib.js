@@ -2291,26 +2291,6 @@ var authCommandsLib = {
           ]
         },
         {
-          testname: "copydb",
-          command: {copydb: 1, fromdb: firstDbName, todb: secondDbName},
-          skipSharded: true,  // Does not work sharded due to SERVER-13080
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles: {readWriteAnyDatabase: 1, root: 1, __system: 1},
-                privileges: [
-                    {resource: {db: firstDbName, collection: ""}, actions: ["find"]},
-                    {resource: {db: firstDbName, collection: "system.js"}, actions: ["find"]},
-                    {
-                      resource: {db: secondDbName, collection: ""},
-                      actions: ["insert", "createIndex"]
-                    },
-                    {resource: {db: secondDbName, collection: "system.js"}, actions: ["insert"]},
-                ]
-              },
-          ]
-        },
-        {
           testname: "createRole_authenticationRestrictions",
           command: {
               createRole: "testRole",
@@ -5131,42 +5111,6 @@ var authCommandsLib = {
               },
               {runOnDb: firstDbName, roles: {}},
               {runOnDb: secondDbName, roles: {}}
-          ]
-        },
-        {
-          testname: "repairDatabase",
-          command: {repairDatabase: 1},
-          skipSharded: true,
-          testcases: [
-              {
-                runOnDb: adminDbName,
-                roles:
-                    {dbAdminAnyDatabase: 1, hostManager: 1, clusterAdmin: 1, root: 1, __system: 1},
-                privileges:
-                    [{resource: {db: adminDbName, collection: ""}, actions: ["repairDatabase"]}]
-              },
-              {
-                runOnDb: firstDbName,
-                roles: {
-                    dbAdmin: 1,
-                    dbAdminAnyDatabase: 1,
-                    hostManager: 1,
-                    clusterAdmin: 1,
-                    dbOwner: 1,
-                    root: 1,
-                    __system: 1
-                },
-                privileges:
-                    [{resource: {db: firstDbName, collection: ""}, actions: ["repairDatabase"]}]
-              },
-              {
-                runOnDb: secondDbName,
-                roles:
-                    {dbAdminAnyDatabase: 1, hostManager: 1, clusterAdmin: 1, root: 1, __system: 1},
-                privileges: [
-                    {resource: {db: secondDbName, collection: ""}, actions: ["repairDatabase"]}
-                ]
-              }
           ]
         },
         {

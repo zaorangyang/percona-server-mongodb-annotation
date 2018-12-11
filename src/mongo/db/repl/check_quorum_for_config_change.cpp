@@ -226,7 +226,7 @@ void QuorumChecker::_tabulateHeartbeatResponse(const RemoteCommandRequest& reque
 
     if (_rsConfig->hasReplicaSetId()) {
         StatusWith<rpc::ReplSetMetadata> replMetadata =
-            rpc::ReplSetMetadata::readFromMetadata(response.metadata);
+            rpc::ReplSetMetadata::readFromMetadata(response.data);
         if (replMetadata.isOK() && replMetadata.getValue().getReplicaSetId().isSet() &&
             _rsConfig->getReplicaSetId() != replMetadata.getValue().getReplicaSetId()) {
             std::string message = str::stream()
@@ -280,9 +280,10 @@ bool QuorumChecker::hasReceivedSufficientResponses() const {
 Status checkQuorumGeneral(executor::TaskExecutor* executor,
                           const ReplSetConfig& rsConfig,
                           const int myIndex,
-                          long long term) {
+                          long long term,
+                          std::string logMessage) {
     auto checker = std::make_shared<QuorumChecker>(&rsConfig, myIndex, term);
-    ScatterGatherRunner runner(checker, executor);
+    ScatterGatherRunner runner(checker, executor, std::move(logMessage));
     Status status = runner.run();
     if (!status.isOK()) {
         return status;
@@ -296,7 +297,7 @@ Status checkQuorumForInitiate(executor::TaskExecutor* executor,
                               const int myIndex,
                               long long term) {
     invariant(rsConfig.getConfigVersion() == 1);
-    return checkQuorumGeneral(executor, rsConfig, myIndex, term);
+    return checkQuorumGeneral(executor, rsConfig, myIndex, term, "initiate quorum check");
 }
 
 Status checkQuorumForReconfig(executor::TaskExecutor* executor,
@@ -304,7 +305,7 @@ Status checkQuorumForReconfig(executor::TaskExecutor* executor,
                               const int myIndex,
                               long long term) {
     invariant(rsConfig.getConfigVersion() > 1);
-    return checkQuorumGeneral(executor, rsConfig, myIndex, term);
+    return checkQuorumGeneral(executor, rsConfig, myIndex, term, "reconfig quorum check");
 }
 
 }  // namespace repl

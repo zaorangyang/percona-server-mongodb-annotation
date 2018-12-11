@@ -27,6 +27,8 @@
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define LOG_FOR_ELECTION(level) \
+    MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kReplicationElection)
 #define LOG_FOR_HEARTBEATS(level) \
     MONGO_LOG_COMPONENT(level, ::mongo::logger::LogComponent::kReplicationHeartbeats)
 
@@ -95,7 +97,6 @@ void ReplicationCoordinatorImpl::_doMemberHeartbeat(executor::TaskExecutor::Call
     const Date_t now = _replExecutor->now();
     BSONObj heartbeatObj;
     Milliseconds timeout(0);
-    invariant(isV1ElectionProtocol());
     const std::pair<ReplSetHeartbeatArgsV1, Milliseconds> hbRequest =
         _topCoord->prepareHeartbeatRequestV1(now, _settings.ourSetName(), target);
     heartbeatObj = hbRequest.first.toBSON();
@@ -148,7 +149,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         resp = cbData.response.data;
         responseStatus = hbResponse.initialize(resp, _topCoord->getTerm());
         StatusWith<rpc::ReplSetMetadata> replMetadata =
-            rpc::ReplSetMetadata::readFromMetadata(cbData.response.metadata);
+            rpc::ReplSetMetadata::readFromMetadata(cbData.response.data);
 
         LOG_FOR_HEARTBEATS(2) << "Received response to heartbeat (requestId: " << cbData.request.id
                               << ") from " << target << ", " << resp;
@@ -193,6 +194,7 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
         // Postpone election timeout if we have a successful heartbeat response from the primary.
         if (hbResponse.hasState() && hbResponse.getState().primary() &&
             hbResponse.getTerm() == _topCoord->getTerm()) {
+            LOG_FOR_ELECTION(4) << "Postponing election timeout due to heartbeat from primary";
             _cancelAndRescheduleElectionTimeout_inlock();
         }
     } else {
@@ -271,7 +273,7 @@ stdx::unique_lock<stdx::mutex> ReplicationCoordinatorImpl::_handleHeartbeatRespo
                 Milliseconds priorityTakeoverDelay = _rsConfig.getPriorityTakeoverDelay(_selfIndex);
                 Milliseconds randomOffset = _getRandomizedElectionOffset_inlock();
                 _priorityTakeoverWhen = _replExecutor->now() + priorityTakeoverDelay + randomOffset;
-                log() << "Scheduling priority takeover at " << _priorityTakeoverWhen;
+                LOG_FOR_ELECTION(0) << "Scheduling priority takeover at " << _priorityTakeoverWhen;
                 _priorityTakeoverCbh = _scheduleWorkAt(
                     _priorityTakeoverWhen, [=](const mongo::executor::TaskExecutor::CallbackArgs&) {
                         _startElectSelfIfEligibleV1(
@@ -285,7 +287,7 @@ stdx::unique_lock<stdx::mutex> ReplicationCoordinatorImpl::_handleHeartbeatRespo
             if (!_catchupTakeoverCbh.isValid() && !_priorityTakeoverCbh.isValid()) {
                 Milliseconds catchupTakeoverDelay = _rsConfig.getCatchUpTakeoverDelay();
                 _catchupTakeoverWhen = _replExecutor->now() + catchupTakeoverDelay;
-                log() << "Scheduling catchup takeover at " << _catchupTakeoverWhen;
+                LOG_FOR_ELECTION(0) << "Scheduling catchup takeover at " << _catchupTakeoverWhen;
                 _catchupTakeoverCbh = _scheduleWorkAt(
                     _catchupTakeoverWhen, [=](const mongo::executor::TaskExecutor::CallbackArgs&) {
                         _startElectSelfIfEligibleV1(
@@ -609,7 +611,6 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
     const PostMemberStateUpdateAction action =
         _setCurrentRSConfig_inlock(opCtx.get(), newConfig, myIndexValue);
     lk.unlock();
-    _resetElectionInfoOnProtocolVersionUpgrade(opCtx.get(), oldConfig, newConfig);
     _performPostMemberStateUpdateAction(action);
 }
 
@@ -661,10 +662,8 @@ void ReplicationCoordinatorImpl::_startHeartbeats_inlock() {
 
     _topCoord->restartHeartbeats();
 
-    if (isV1ElectionProtocol()) {
-        _topCoord->resetAllMemberTimeouts(_replExecutor->now());
-        _scheduleNextLivenessUpdate_inlock();
-    }
+    _topCoord->resetAllMemberTimeouts(_replExecutor->now());
+    _scheduleNextLivenessUpdate_inlock();
 }
 
 void ReplicationCoordinatorImpl::_handleLivenessTimeout(
@@ -675,9 +674,6 @@ void ReplicationCoordinatorImpl::_handleLivenessTimeout(
         _handleLivenessTimeoutCbh = CallbackHandle();
     }
     if (!cbData.status.isOK()) {
-        return;
-    }
-    if (!isV1ElectionProtocol()) {
         return;
     }
 
@@ -692,9 +688,6 @@ void ReplicationCoordinatorImpl::_handleLivenessTimeout(
 }
 
 void ReplicationCoordinatorImpl::_scheduleNextLivenessUpdate_inlock() {
-    if (!isV1ElectionProtocol()) {
-        return;
-    }
     // Scan liveness table for earliest date; schedule a run at (that date plus election
     // timeout).
     Date_t earliestDate;
@@ -773,10 +766,6 @@ void ReplicationCoordinatorImpl::_cancelAndRescheduleElectionTimeout_inlock() {
         return;
     }
 
-    if (!isV1ElectionProtocol()) {
-        return;
-    }
-
     if (!_memberState.secondary()) {
         return;
     }
@@ -793,7 +782,7 @@ void ReplicationCoordinatorImpl::_cancelAndRescheduleElectionTimeout_inlock() {
     auto now = _replExecutor->now();
     auto when = now + _rsConfig.getElectionTimeoutPeriod() + randomOffset;
     invariant(when > now);
-    LOG(4) << "Scheduling election timeout callback at " << when;
+    LOG_FOR_ELECTION(4) << "Scheduling election timeout callback at " << when;
     _handleElectionTimeoutWhen = when;
     _handleElectionTimeoutCbh =
         _scheduleWorkAt(when, [=](const mongo::executor::TaskExecutor::CallbackArgs&) {
@@ -803,12 +792,9 @@ void ReplicationCoordinatorImpl::_cancelAndRescheduleElectionTimeout_inlock() {
 
 void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
     TopologyCoordinator::StartElectionReason reason) {
-    if (!isV1ElectionProtocol()) {
-        return;
-    }
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     // If it is not a single node replica set, no need to start an election after stepdown timeout.
-    if (reason == TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout &&
+    if (reason == TopologyCoordinator::StartElectionReason::kSingleNodePromptElection &&
         _rsConfig.getNumMembers() != 1) {
         return;
     }
@@ -820,7 +806,7 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
         _cancelPriorityTakeover_inlock();
         _cancelAndRescheduleElectionTimeout_inlock();
         if (_inShutdown) {
-            log() << "Not starting an election, since we are shutting down";
+            LOG_FOR_ELECTION(0) << "Not starting an election, since we are shutting down";
             return;
         }
     }
@@ -829,24 +815,26 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
     if (!status.isOK()) {
         switch (reason) {
             case TopologyCoordinator::StartElectionReason::kElectionTimeout:
-                log() << "Not starting an election, since we are not electable due to: "
-                      << status.reason();
+                LOG_FOR_ELECTION(0)
+                    << "Not starting an election, since we are not electable due to: "
+                    << status.reason();
                 break;
             case TopologyCoordinator::StartElectionReason::kPriorityTakeover:
-                log() << "Not starting an election for a priority takeover, "
-                      << "since we are not electable due to: " << status.reason();
+                LOG_FOR_ELECTION(0) << "Not starting an election for a priority takeover, "
+                                    << "since we are not electable due to: " << status.reason();
                 break;
             case TopologyCoordinator::StartElectionReason::kStepUpRequest:
-                log() << "Not starting an election for a replSetStepUp request, "
-                      << "since we are not electable due to: " << status.reason();
+                LOG_FOR_ELECTION(0) << "Not starting an election for a replSetStepUp request, "
+                                    << "since we are not electable due to: " << status.reason();
                 break;
             case TopologyCoordinator::StartElectionReason::kCatchupTakeover:
-                log() << "Not starting an election for a catchup takeover, "
-                      << "since we are not electable due to: " << status.reason();
+                LOG_FOR_ELECTION(0) << "Not starting an election for a catchup takeover, "
+                                    << "since we are not electable due to: " << status.reason();
                 break;
-            case TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout:
-                log() << "Not starting an election for a single node replica set stepdown timeout, "
-                      << "since we are not electable due to: " << status.reason();
+            case TopologyCoordinator::StartElectionReason::kSingleNodePromptElection:
+                LOG_FOR_ELECTION(0)
+                    << "Not starting an election for a single node replica set prompt election, "
+                    << "since we are not electable due to: " << status.reason();
                 break;
         }
         return;
@@ -854,20 +842,21 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(
 
     switch (reason) {
         case TopologyCoordinator::StartElectionReason::kElectionTimeout:
-            log() << "Starting an election, since we've seen no PRIMARY in the past "
-                  << _rsConfig.getElectionTimeoutPeriod();
+            LOG_FOR_ELECTION(0) << "Starting an election, since we've seen no PRIMARY in the past "
+                                << _rsConfig.getElectionTimeoutPeriod();
             break;
         case TopologyCoordinator::StartElectionReason::kPriorityTakeover:
-            log() << "Starting an election for a priority takeover";
+            LOG_FOR_ELECTION(0) << "Starting an election for a priority takeover";
             break;
         case TopologyCoordinator::StartElectionReason::kStepUpRequest:
-            log() << "Starting an election due to step up request";
+            LOG_FOR_ELECTION(0) << "Starting an election due to step up request";
             break;
         case TopologyCoordinator::StartElectionReason::kCatchupTakeover:
-            log() << "Starting an election for a catchup takeover";
+            LOG_FOR_ELECTION(0) << "Starting an election for a catchup takeover";
             break;
-        case TopologyCoordinator::StartElectionReason::kSingleNodeStepDownTimeout:
-            log() << "Starting an election due to single node replica set stepdown timeout";
+        case TopologyCoordinator::StartElectionReason::kSingleNodePromptElection:
+            LOG_FOR_ELECTION(0)
+                << "Starting an election due to single node replica set prompt election";
             break;
     }
 

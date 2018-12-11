@@ -54,12 +54,21 @@ public:
     }
 
     bool isSharded(OperationContext* opCtx, const NamespaceString& ns) override {
+        return false;
+    }
+
+    void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                const NamespaceString& ns,
+                const std::vector<BSONObj>& objs) override {
         MONGO_UNREACHABLE;
     }
 
-    BSONObj insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                   const NamespaceString& ns,
-                   const std::vector<BSONObj>& objs) override {
+    void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                const NamespaceString& ns,
+                const std::vector<BSONObj>& queries,
+                const std::vector<BSONObj>& updates,
+                bool upsert,
+                bool multi) final {
         MONGO_UNREACHABLE;
     }
 
@@ -92,7 +101,7 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    Status renameIfOptionsAndIndexesHaveNotChanged(
+    void renameIfOptionsAndIndexesHaveNotChanged(
         OperationContext* opCtx,
         const BSONObj& renameCommandObj,
         const NamespaceString& targetNs,
@@ -141,6 +150,22 @@ public:
 
     std::vector<GenericCursor> getCursors(
         const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
+        MONGO_UNREACHABLE;
+    }
+
+    void fsyncLock(OperationContext* opCtx) final {
+        MONGO_UNREACHABLE;
+    }
+
+    void fsyncUnlock(OperationContext* opCtx) final {
+        MONGO_UNREACHABLE;
+    }
+
+    BackupCursorState openBackupCursor(OperationContext* opCtx) final {
+        MONGO_UNREACHABLE;
+    }
+
+    void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) final {
         MONGO_UNREACHABLE;
     }
 };

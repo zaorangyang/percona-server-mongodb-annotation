@@ -29,6 +29,7 @@
 #pragma once
 
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/periodic_runner.h"
 
 namespace mongo {
 
@@ -57,7 +58,7 @@ public:
      * Sets the mode of the ChunkSplitter to either primary or secondary.
      * The ChunkSplitter is only active when primary.
      */
-    void setReplicaSetMode(bool isPrimary);
+    void onShardingInitialization(bool isPrimary);
 
     /**
      * Invoked when the shard server primary enters the 'PRIMARY' state to set up the ChunkSplitter
@@ -74,9 +75,15 @@ public:
     void onStepDown();
 
     /**
+     * Blocks until all chunk split tasks in the underlying thread pool have
+     * completed (that is, until the thread pool is idle)
+     */
+    void waitForIdle();
+
+    /**
      * Schedules an autosplit task. This function throws on scheduling failure.
      */
-    void trySplitting(ChunkSplitStateDriver chunkSplitStateDriver,
+    void trySplitting(std::shared_ptr<ChunkSplitStateDriver> chunkSplitStateDriver,
                       const NamespaceString& nss,
                       const BSONObj& min,
                       const BSONObj& max,
@@ -91,7 +98,7 @@ private:
      * original owner. This optimization presumes that the user is doing writes with increasing or
      * decreasing shard key values.
      */
-    void _runAutosplit(ChunkSplitStateDriver chunkSplitStateDriver,
+    void _runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSplitStateDriver,
                        const NamespaceString& nss,
                        const BSONObj& min,
                        const BSONObj& max,

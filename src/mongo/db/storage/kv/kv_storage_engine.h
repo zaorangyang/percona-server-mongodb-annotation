@@ -34,6 +34,7 @@
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/kv/kv_catalog.h"
 #include "mongo/db/storage/kv/kv_database_catalog_entry_base.h"
@@ -112,6 +113,10 @@ public:
 
     virtual void endBackup(OperationContext* opCtx);
 
+    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup(OperationContext* opCtx);
+
+    virtual void endNonBlockingBackup(OperationContext* opCtx);
+
     virtual bool isDurable() const;
 
     virtual bool isEphemeral() const;
@@ -138,7 +143,7 @@ public:
 
     virtual boost::optional<Timestamp> getRecoveryTimestamp() const override;
 
-    virtual boost::optional<Timestamp> getLastStableCheckpointTimestamp() const override;
+    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
     virtual Timestamp getAllCommittedTimestamp() const override;
 
@@ -193,6 +198,21 @@ private:
                                          std::list<std::string>& toDrop,
                                          CollIter begin,
                                          CollIter end);
+
+    /**
+     * When called in a repair context (_options.forRepair=true), attempts to recover a collection
+     * whose entry is present in the KVCatalog, but missing from the KVEngine. Returns 'false' and
+     * removes collection metadata from the KVCatalog if called outside of a repair context, the
+     * collection is unrecoverable, or the implementation of KVEngine::recoverOrphanedIdent returns
+     * an error.
+     *
+     * Returns 'true' if the collection was recovered in the KVEngine and a new record store was
+     * created. Recovery does not make any guarantees about the integrity of the data in the
+     * collection.
+     */
+    bool _recoverOrDropOrphanedCollection(OperationContext* opCtx,
+                                          const NamespaceString& collectionName,
+                                          StringData collectionIdent);
 
     void _dumpCatalog(OperationContext* opCtx);
 

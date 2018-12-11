@@ -743,7 +743,7 @@ int _main(int argc, char* argv[], char** envp) {
     mongo::shell_utils::RecordMyLocation(argv[0]);
 
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
-
+    setGlobalServiceContext(ServiceContext::make());
     // TODO This should use a TransportLayerManager or TransportLayerFactory
     auto serviceContext = getGlobalServiceContext();
     transport::TransportLayerASIO::Options opts;
@@ -758,11 +758,16 @@ int _main(int argc, char* argv[], char** envp) {
 
     // hide password from ps output
     for (int i = 0; i < (argc - 1); ++i) {
-        if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--password")) {
+        StringData arg(argv[i]);
+        if (arg == "-p"_sd || arg == "--password"_sd) {
             char* arg = argv[i + 1];
             while (*arg) {
                 *arg++ = 'x';
             }
+        } else if (MongoURI::isMongoURI(arg)) {
+            auto reformedURI = MongoURI::redact(arg);
+            auto length = arg.size();
+            ::strncpy(argv[i], reformedURI.data(), length);
         }
     }
 

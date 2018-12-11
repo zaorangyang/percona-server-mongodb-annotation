@@ -131,10 +131,13 @@ void KVStorageEngine::loadCatalog(OperationContext* opCtx) {
         _catalogRecordStore.get(), _options.directoryPerDB, _options.directoryForIndexes));
     _catalog->init(opCtx);
 
-    // We populate 'identsKnownToStorageEngine' only if we are loading after an unclean shutdown.
+    // We populate 'identsKnownToStorageEngine' only if we are loading after an unclean shutdown or
+    // doing repair.
+    const bool loadingFromUncleanShutdownOrRepair =
+        startingAfterUncleanShutdown(getGlobalServiceContext()) || _options.forRepair;
+
     std::vector<std::string> identsKnownToStorageEngine;
-    const bool loadingFromUncleanShutdown = startingAfterUncleanShutdown(getGlobalServiceContext());
-    if (loadingFromUncleanShutdown) {
+    if (loadingFromUncleanShutdownOrRepair) {
         identsKnownToStorageEngine = _engine->getAllIdents(opCtx);
         std::sort(identsKnownToStorageEngine.begin(), identsKnownToStorageEngine.end());
     }
@@ -142,26 +145,56 @@ void KVStorageEngine::loadCatalog(OperationContext* opCtx) {
     std::vector<std::string> collectionsKnownToCatalog;
     _catalog->getAllCollections(&collectionsKnownToCatalog);
 
+    if (loadingFromUncleanShutdownOrRepair) {
+        // If we are loading the catalog after an unclean shutdown or during repair, it's possible
+        // that there are collection files on disk that are unknown to the catalog. If we can't find
+        // an ident in the catalog, we generate a catalog entry for it.
+        for (const auto& ident : identsKnownToStorageEngine) {
+            if (_catalog->isCollectionIdent(ident)) {
+                bool isOrphan = !std::any_of(collectionsKnownToCatalog.begin(),
+                                             collectionsKnownToCatalog.end(),
+                                             [this, &ident](const auto& coll) {
+                                                 return _catalog->getCollectionIdent(coll) == ident;
+                                             });
+                if (isOrphan) {
+                    // If the catalog does not have information about this
+                    // collection, we create an new entry for it.
+                    WriteUnitOfWork wuow(opCtx);
+                    StatusWith<std::string> statusWithNs = _catalog->newOrphanedIdent(opCtx, ident);
+                    if (statusWithNs.isOK()) {
+                        wuow.commit();
+                        log() << "Successfully created an entry in the catalog for the orphaned "
+                                 "collection: "
+                              << statusWithNs.getValue();
+                    } else {
+                        // Log an error message if we cannot create the entry.
+                        // reconcileCatalogAndIdents() will later drop this ident.
+                        error()
+                            << "Cannot create an entry in the catalog for the orphaned collection: "
+                            << ident << " due to " << statusWithNs.getStatus().reason();
+                    }
+                }
+            }
+        }
+    }
+
     KVPrefix maxSeenPrefix = KVPrefix::kNotPrefixed;
     for (const auto& coll : collectionsKnownToCatalog) {
         NamespaceString nss(coll);
         std::string dbName = nss.db().toString();
 
-        if (loadingFromUncleanShutdown) {
-            // If we are loading the catalog after an unclean shutdown, it's possible that there are
-            // collections in the catalog that are unknown to the storage engine. If we can't find
-            // it in the list of storage engine idents, remove the collection and move on to the
-            // next one.
+        if (loadingFromUncleanShutdownOrRepair) {
+            // If we are loading the catalog after an unclean shutdown or during repair, it's
+            // possible that there are collections in the catalog that are unknown to the storage
+            // engine. If we can't find a table in the list of storage engine idents, either
+            // attempt to recover the ident or drop it.
             const auto collectionIdent = _catalog->getCollectionIdent(coll);
-            if (!std::binary_search(identsKnownToStorageEngine.begin(),
-                                    identsKnownToStorageEngine.end(),
-                                    collectionIdent)) {
-                log() << "Dropping collection " << coll
-                      << " unknown to storage engine after unclean shutdown";
-
-                WriteUnitOfWork wuow(opCtx);
-                fassert(50716, _catalog->dropCollection(opCtx, coll));
-                wuow.commit();
+            bool orphan = !std::binary_search(identsKnownToStorageEngine.begin(),
+                                              identsKnownToStorageEngine.end(),
+                                              collectionIdent);
+            // If the storage engine is missing a collection and is unable to create a new record
+            // store, continue past the following logic.
+            if (orphan && !_recoverOrDropOrphanedCollection(opCtx, nss, collectionIdent)) {
                 continue;
             }
         }
@@ -175,6 +208,10 @@ void KVStorageEngine::loadCatalog(OperationContext* opCtx) {
         db->initCollection(opCtx, coll, _options.forRepair);
         auto maxPrefixForCollection = _catalog->getMetaData(opCtx, coll).getMaxPrefix();
         maxSeenPrefix = std::max(maxSeenPrefix, maxPrefixForCollection);
+
+        if (nss.isOrphanCollection()) {
+            log() << "Orphaned collection found: " << nss;
+        }
     }
 
     KVPrefix::setLargestPrefix(maxSeenPrefix);
@@ -200,6 +237,37 @@ void KVStorageEngine::closeCatalog(OperationContext* opCtx) {
 
     _catalog.reset(nullptr);
     _catalogRecordStore.reset(nullptr);
+}
+
+bool KVStorageEngine::_recoverOrDropOrphanedCollection(OperationContext* opCtx,
+                                                       const NamespaceString& collectionName,
+                                                       StringData collectionIdent) {
+
+    if (_options.forRepair) {
+        log() << "Storage engine is missing collection '" << collectionName
+              << "' from its metadata. Attempting to locate and recover the data for "
+              << collectionIdent;
+
+        WriteUnitOfWork wuow(opCtx);
+        const auto metadata = _catalog->getMetaData(opCtx, collectionName.toString());
+        auto status = _engine->recoverOrphanedIdent(
+            opCtx, collectionName.toString(), collectionIdent, metadata.options);
+        if (status.isOK()) {
+            wuow.commit();
+            return true;
+        }
+
+        warning() << "Failed to recover orphaned data file for collection '" << collectionName
+                  << "': " << status;
+    }
+
+    log() << "Dropping collection " << collectionName
+          << " from the catalog unknown to the storage engine";
+
+    WriteUnitOfWork wuow(opCtx);
+    fassert(50716, _catalog->dropCollection(opCtx, collectionName.toString()));
+    wuow.commit();
+    return false;
 }
 
 /**
@@ -254,6 +322,10 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
             continue;
         }
 
+        // In repair context, any orphaned collection idents from the engine should already be
+        // recovered in the catalog in loadCatalog().
+        invariant(!(_catalog->isCollectionIdent(it) && _options.forRepair));
+
         const auto& toRemove = it;
         log() << "Dropping unknown ident: " << toRemove;
         WriteUnitOfWork wuow(opCtx);
@@ -267,13 +339,15 @@ KVStorageEngine::reconcileCatalogAndIdents(OperationContext* opCtx) {
     // other contexts such as `recoverToStableTimestamp`.
     std::vector<std::string> collections;
     _catalog->getAllCollections(&collections);
-    for (const auto& coll : collections) {
-        const auto& identForColl = _catalog->getCollectionIdent(coll);
-        if (engineIdents.find(identForColl) == engineIdents.end()) {
-            return {ErrorCodes::UnrecoverableRollbackError,
-                    str::stream() << "Expected collection does not exist. Collection: " << coll
-                                  << " Ident: "
-                                  << identForColl};
+    if (!_options.forRepair) {
+        for (const auto& coll : collections) {
+            const auto& identForColl = _catalog->getCollectionIdent(coll);
+            if (engineIdents.find(identForColl) == engineIdents.end()) {
+                return {ErrorCodes::UnrecoverableRollbackError,
+                        str::stream() << "Expected collection does not exist. Collection: " << coll
+                                      << " Ident: "
+                                      << identForColl};
+            }
         }
     }
 
@@ -480,6 +554,15 @@ void KVStorageEngine::endBackup(OperationContext* opCtx) {
     _inBackupMode = false;
 }
 
+StatusWith<std::vector<std::string>> KVStorageEngine::beginNonBlockingBackup(
+    OperationContext* opCtx) {
+    return _engine->beginNonBlockingBackup(opCtx);
+}
+
+void KVStorageEngine::endNonBlockingBackup(OperationContext* opCtx) {
+    return _engine->endNonBlockingBackup(opCtx);
+}
+
 bool KVStorageEngine::isDurable() const {
     return _engine->isDurable();
 }
@@ -564,8 +647,8 @@ boost::optional<Timestamp> KVStorageEngine::getRecoveryTimestamp() const {
     return _engine->getRecoveryTimestamp();
 }
 
-boost::optional<Timestamp> KVStorageEngine::getLastStableCheckpointTimestamp() const {
-    return _engine->getLastStableCheckpointTimestamp();
+boost::optional<Timestamp> KVStorageEngine::getLastStableRecoveryTimestamp() const {
+    return _engine->getLastStableRecoveryTimestamp();
 }
 
 bool KVStorageEngine::supportsReadConcernSnapshot() const {

@@ -55,6 +55,7 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/operation_context_session_mongod.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/query/find.h"
@@ -65,14 +66,16 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/implicit_create_collection.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/scoped_operation_completion_sharding_actions.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharded_connection_info.h"
+#include "mongo/db/s/sharding_config_optime_gossip.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_entry_point_common.h"
-#include "mongo/db/session_catalog.h"
 #include "mongo/db/snapshot_window_util.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/top.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/message.h"
@@ -212,7 +215,7 @@ void generateErrorResponse(OperationContext* opCtx,
     // so we need to reset it to a clean state just to be sure.
     replyBuilder->reset();
     replyBuilder->setCommandReply(exception.toStatus(), extraFields);
-    replyBuilder->setMetadata(replyMetadata);
+    replyBuilder->getBodyBuilder().appendElements(replyMetadata);
 }
 
 BSONObj getErrorLabels(const boost::optional<OperationSessionInfoFromClient>& sessionOptions,
@@ -228,6 +231,7 @@ BSONObj getErrorLabels(const boost::optional<OperationSessionInfoFromClient>& se
         || code == ErrorCodes::SnapshotUnavailable                        //
         || code == ErrorCodes::NoSuchTransaction                          //
         || code == ErrorCodes::LockTimeout                                //
+        || code == ErrorCodes::PreparedTransactionInProgress              //
         // Clients can retry a single commitTransaction command, but cannot retry the whole
         // transaction if commitTransaction fails due to NotMaster.
         || (isRetryable && (commandName != "commitTransaction"));
@@ -461,15 +465,17 @@ void appendClusterAndOperationTime(OperationContext* opCtx,
 void invokeInTransaction(OperationContext* opCtx,
                          CommandInvocation* invocation,
                          rpc::ReplyBuilderInterface* replyBuilder) {
-    auto session = OperationContextSession::get(opCtx);
-    if (!session) {
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    if (!txnParticipant) {
         // Run the command directly if we're not in a transaction.
         invocation->run(opCtx, replyBuilder);
         return;
     }
 
-    session->unstashTransactionResources(opCtx, invocation->definition()->getName());
-    ScopeGuard guard = MakeGuard([session, opCtx]() { session->abortActiveTransaction(opCtx); });
+    txnParticipant->unstashTransactionResources(opCtx, invocation->definition()->getName());
+    ScopeGuard guard = MakeGuard([&txnParticipant, opCtx]() {
+        txnParticipant->abortActiveUnpreparedOrStashPreparedTransaction(opCtx);
+    });
 
     invocation->run(opCtx, replyBuilder);
 
@@ -481,7 +487,7 @@ void invokeInTransaction(OperationContext* opCtx,
     }
 
     // Stash or commit the transaction when the command succeeds.
-    session->stashTransactionResources(opCtx);
+    txnParticipant->stashTransactionResources(opCtx);
     guard.Dismiss();
 }
 
@@ -509,10 +515,11 @@ bool runCommandImpl(OperationContext* opCtx,
         invokeInTransaction(opCtx, invocation, replyBuilder);
     } else {
         auto wcResult = uassertStatusOK(extractWriteConcern(opCtx, request.body));
-        auto session = OperationContextSession::get(opCtx);
+        auto txnParticipant = TransactionParticipant::get(opCtx);
         uassert(ErrorCodes::InvalidOptions,
                 "writeConcern is not allowed within a multi-statement transaction",
-                wcResult.usedDefault || !session || !session->inMultiDocumentTransaction() ||
+                wcResult.usedDefault || !txnParticipant ||
+                    !txnParticipant->inMultiDocumentTransaction() ||
                     invocation->definition()->getName() == "commitTransaction" ||
                     invocation->definition()->getName() == "abortTransaction" ||
                     invocation->definition()->getName() == "doTxn");
@@ -570,15 +577,10 @@ bool runCommandImpl(OperationContext* opCtx,
         }
     }
 
-    BSONObjBuilder metadataBob;
-    appendReplyMetadata(opCtx, request, &metadataBob);
+    auto commandBodyBob = replyBuilder->getBodyBuilder();
+    appendReplyMetadata(opCtx, request, &commandBodyBob);
+    appendClusterAndOperationTime(opCtx, &commandBodyBob, &commandBodyBob, startOperationTime);
 
-    {
-        auto commandBodyBob = replyBuilder->getBodyBuilder();
-        appendClusterAndOperationTime(opCtx, &commandBodyBob, &metadataBob, startOperationTime);
-    }
-
-    replyBuilder->setMetadata(metadataBob.obj());
     return ok;
 }
 
@@ -627,6 +629,7 @@ void execCommandDatabase(OperationContext* opCtx,
     auto startOperationTime = getClientOperationTime(opCtx);
     auto invocation = command->parse(opCtx, request);
     boost::optional<OperationSessionInfoFromClient> sessionOptions = boost::none;
+
     try {
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
@@ -635,7 +638,7 @@ void execCommandDatabase(OperationContext* opCtx,
 
         // TODO: move this back to runCommands when mongos supports OperationContext
         // see SERVER-18515 for details.
-        rpc::readRequestMetadata(opCtx, request.body);
+        rpc::readRequestMetadata(opCtx, request.body, command->requiresAuth());
         rpc::TrackingMetadata::get(opCtx).initWithOperName(command->getName());
 
         auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
@@ -692,15 +695,15 @@ void execCommandDatabase(OperationContext* opCtx,
                     shouldCheckoutSession || !opCtx->getTxnNumber());
         }
 
+        if (autocommitVal) {
+            uassertStatusOK(TransactionParticipant::isValid(dbname, command->getName()));
+        }
+
         // This constructor will check out the session and start a transaction, if necessary. It
         // handles the appropriate state management for both multi-statement transactions and
         // retryable writes.
-        OperationContextSession sessionTxnState(opCtx,
-                                                shouldCheckoutSession,
-                                                autocommitVal,
-                                                startMultiDocTxn,
-                                                dbname,
-                                                command->getName());
+        OperationContextSessionMongod sessionTxnState(
+            opCtx, shouldCheckoutSession, autocommitVal, startMultiDocTxn);
 
         std::unique_ptr<MaintenanceModeSetter> mmSetter;
 
@@ -805,15 +808,15 @@ void execCommandDatabase(OperationContext* opCtx,
             uassert(40119,
                     "Illegal attempt to set operation deadline within DBDirectClient",
                     !opCtx->getClient()->isInDirectClient());
-            opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS});
+            opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
         }
 
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-        auto session = OperationContextSession::get(opCtx);
-        if (!opCtx->getClient()->isInDirectClient() || !session ||
-            !session->inMultiDocumentTransaction()) {
-            const bool upconvertToSnapshot = session && session->inMultiDocumentTransaction() &&
-                sessionOptions &&
+        auto txnParticipant = TransactionParticipant::get(opCtx);
+        if (!opCtx->getClient()->isInDirectClient() || !txnParticipant ||
+            !txnParticipant->inMultiDocumentTransaction()) {
+            const bool upconvertToSnapshot = txnParticipant &&
+                txnParticipant->inMultiDocumentTransaction() && sessionOptions &&
                 (sessionOptions->getStartTransaction() == boost::optional<bool>(true));
             readConcernArgs = uassertStatusOK(
                 _extractReadConcern(invocation.get(), request.body, upconvertToSnapshot));
@@ -826,10 +829,9 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
-            auto session = OperationContextSession::get(opCtx);
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot is only valid in multi-statement transactions",
-                    session && session->inMultiDocumentTransaction());
+                    txnParticipant && txnParticipant->inActiveOrKilledMultiDocumentTransaction());
             uassert(ErrorCodes::InvalidOptions,
                     "readConcern level snapshot requires a session ID",
                     opCtx->getLogicalSessionId());
@@ -854,13 +856,23 @@ void execCommandDatabase(OperationContext* opCtx,
             }
 
             // Handle config optime information that may have been sent along with the command.
-            uassertStatusOK(shardingState->updateConfigServerOpTimeFromMetadata(opCtx));
+            rpc::advanceConfigOptimeFromRequestMetadata(opCtx);
         }
 
         oss.setAllowImplicitCollectionCreation(allowImplicitCollectionCreationField);
+        ScopedOperationCompletionShardingActions operationCompletionShardingActions(opCtx);
 
-        // Can throw
-        opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
+        // This may trigger the maxTimeAlwaysTimeOut failpoint.
+        auto status = opCtx->checkForInterruptNoAssert();
+
+        // We still proceed if the primary stepped down, but accept other kinds of interruptions.
+        // We defer to individual commands to allow themselves to be interruptible by stepdowns,
+        // since commands like 'voteRequest' should conversely continue executing.
+        if (status != ErrorCodes::PrimarySteppedDown &&
+            status != ErrorCodes::InterruptedDueToStepDown) {
+            uassertStatusOK(status);
+        }
+
 
         CurOp::get(opCtx)->ensureStarted();
 
@@ -1294,7 +1306,7 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
         if (nsString.isCommand()) {
             isCommand = true;
         }
-    } else if (op == dbCommand || op == dbMsg) {
+    } else if (op == dbMsg) {
         isCommand = true;
     }
 
@@ -1313,7 +1325,7 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     bool forceLog = false;
 
     DbResponse dbresponse;
-    if (op == dbMsg || op == dbCommand || (op == dbQuery && isCommand)) {
+    if (op == dbMsg || (op == dbQuery && isCommand)) {
         dbresponse = receivedCommands(opCtx, m, behaviors);
     } else if (op == dbQuery) {
         invariant(!isCommand);

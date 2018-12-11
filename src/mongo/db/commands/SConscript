@@ -95,7 +95,6 @@ env.Library(
 env.Library(
     target="core",
     source=[
-        "copydb_common.cpp",
         "fail_point_cmd.cpp",
         "find_and_modify_common.cpp",
         "generic.cpp",
@@ -117,7 +116,7 @@ env.Library(
     ],
 )
 
-# Commands available in all mongodb server processes (mongod, mongos, etc.) 
+# Commands available in all mongodb server processes (mongod, mongos, etc.)
 env.Library(
     target="servers",
     source=[
@@ -175,6 +174,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/curop',
+        '$BUILD_DIR/mongo/db/storage/backup_cursor_service',
         'fsync_locked',
     ]
 )
@@ -243,8 +243,8 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
+        '$BUILD_DIR/mongo/db/pipeline/mongod_process_interface',
         '$BUILD_DIR/mongo/db/query_exec',
-        '$BUILD_DIR/mongo/db/repair_database',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
@@ -279,12 +279,9 @@ env.Library(
     target="mongod",
     source=[
         "apply_ops_cmd.cpp",
-        "clone.cpp",
         "clone_collection.cpp",
         "collection_to_capped.cpp",
         "compact.cpp",
-        "copydb.cpp",
-        "copydb_start_commands.cpp",
         "cpuload.cpp",
         "dbcheck.cpp",
         "dbcommands_d.cpp",
@@ -305,6 +302,7 @@ env.Library(
         "touch.cpp",
         "txn_cmds.cpp",
         "user_management_commands.cpp",
+        env.Idlc("txn_cmds.idl")[0],
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
@@ -329,6 +327,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/s/sharding_catalog_manager',
+        '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/s/sharding_legacy_api',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
         'core',

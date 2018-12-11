@@ -47,7 +47,7 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/log.h"
@@ -141,8 +141,7 @@ Status makeNoopWriteIfNeeded(OperationContext* opCtx, LogicalTime clusterTime) {
             return Status::OK();
         }
 
-        auto myShard =
-            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardingState->getShardName());
+        auto myShard = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardingState->shardId());
         if (!myShard.isOK()) {
             return myShard.getStatus();
         }
@@ -208,9 +207,9 @@ Status waitForReadConcern(OperationContext* opCtx,
     // If we are in a direct client within a transaction, then we may be holding locks, so it is
     // illegal to wait for read concern. This is fine, since the outer operation should have handled
     // waiting for read concern.
-    auto session = OperationContextSession::get(opCtx);
-    if (opCtx->getClient()->isInDirectClient() && session &&
-        session->inMultiDocumentTransaction()) {
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    if (opCtx->getClient()->isInDirectClient() && txnParticipant &&
+        txnParticipant->inMultiDocumentTransaction()) {
         return Status::OK();
     }
 
@@ -221,22 +220,14 @@ Status waitForReadConcern(OperationContext* opCtx,
     // concern is not yet supported with atClusterTime.
     //
     // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
-    const bool speculative =
-        session && session->inMultiDocumentTransaction() && !readConcernArgs.getArgsAtClusterTime();
+    const bool speculative = txnParticipant && txnParticipant->inMultiDocumentTransaction() &&
+        !readConcernArgs.getArgsAtClusterTime();
 
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kLinearizableReadConcern) {
         if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet) {
             // For standalone nodes, Linearizable Read is not supported.
             return {ErrorCodes::NotAReplicaSet,
                     "node needs to be a replica set member to use read concern"};
-        }
-
-        // Replica sets running pv0 do not support linearizable read concern until further testing
-        // is completed (SERVER-27025).
-        if (!replCoord->isV1ElectionProtocol()) {
-            return {
-                ErrorCodes::IncompatibleElectionProtocol,
-                "Replica sets running protocol version 0 do not support readConcern: linearizable"};
         }
 
         if (readConcernArgs.getArgsOpTime()) {
@@ -303,13 +294,8 @@ Status waitForReadConcern(OperationContext* opCtx,
             return {ErrorCodes::NotAReplicaSet,
                     "node needs to be a replica set member to use readConcern: snapshot"};
         }
-
-        if (!replCoord->isV1ElectionProtocol()) {
-            return {ErrorCodes::IncompatibleElectionProtocol,
-                    "Replica sets running protocol version 0 do not support readConcern: snapshot"};
-        }
         if (speculative) {
-            session->setSpeculativeTransactionOpTimeToLastApplied(opCtx);
+            txnParticipant->setSpeculativeTransactionOpTimeToLastApplied(opCtx);
         }
     }
 
@@ -325,11 +311,6 @@ Status waitForReadConcern(OperationContext* opCtx,
          readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) &&
         !speculative &&
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::Mode::modeReplSet) {
-        if (!replCoord->isV1ElectionProtocol()) {
-            return {ErrorCodes::IncompatibleElectionProtocol,
-                    str::stream() << "Replica sets running protocol version 0 do not support "
-                                     "majority committed reads"};
-        }
 
         const int debugLevel = serverGlobalParams.clusterRole == ClusterRole::ConfigServer ? 1 : 2;
 

@@ -235,7 +235,7 @@ ServiceContext::UniqueOperationContext ServiceContext::makeOperationContext(Clie
         opCtx->setLockState(std::make_unique<LockerNoop>());
     }
     if (!opCtx->recoveryUnit()) {
-        opCtx->setRecoveryUnit(new RecoveryUnitNoop(),
+        opCtx->setRecoveryUnit(std::make_unique<RecoveryUnitNoop>(),
                                WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
     }
     {
@@ -349,22 +349,6 @@ void ServiceContext::notifyStartupComplete() {
 
 namespace {
 
-// clang-format off
-GlobalInitializerRegisterer registerCreateServiceContext{
-    "ServiceContext",
-    {"default"},
-    [](InitializerContext* context) {
-        setGlobalServiceContext(ServiceContext::make());
-        return Status::OK();
-    },
-    [](DeinitializerContext* context) {
-        // For now, deregistration is done manually after all deinitializers run, in case any
-        // erroneously access the globalServiceContext without expressing a dependency.
-        return Status::OK();
-    }
-};
-// clang-format on
-
 /**
  * Accessor function to get the global list of ServiceContext constructor and destructor
  * functions.
@@ -390,7 +374,6 @@ ServiceContext::ConstructorActionRegisterer::ConstructorActionRegisterer(
         destructor = [](ServiceContext*) {};
     _registerer.emplace(std::move(name),
                         std::move(prereqs),
-                        std::vector<std::string>{"ServiceContext"},
                         [this, constructor, destructor](InitializerContext* context) {
                             _iter = registeredConstructorActions().emplace(
                                 registeredConstructorActions().end(),

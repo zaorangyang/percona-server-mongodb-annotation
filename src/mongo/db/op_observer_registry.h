@@ -216,16 +216,16 @@ public:
             o->onEmptyCapped(opCtx, collectionName, uuid);
     }
 
-    void onTransactionCommit(OperationContext* opCtx) override {
+    void onTransactionCommit(OperationContext* opCtx, bool wasPrepared) override {
         ReservedTimes times{opCtx};
         for (auto& o : _observers)
-            o->onTransactionCommit(opCtx);
+            o->onTransactionCommit(opCtx, wasPrepared);
     }
 
-    void onTransactionPrepare(OperationContext* opCtx) override {
+    void onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) override {
         ReservedTimes times{opCtx};
         for (auto& observer : _observers) {
-            observer->onTransactionPrepare(opCtx);
+            observer->onTransactionPrepare(opCtx, prepareOpTime);
         }
     }
 
