@@ -239,15 +239,19 @@ install_gcc_54_deb(){
 set_compiler(){
     if [ x"${DEBIAN}" = xjessie -o x"${DEBIAN}" = xwheezy -o x"${DEBIAN}" = xtrusty -o x"${DEBIAN}" = xxenial ]; then
         export CC=/usr/local/gcc-5.4.0/bin/gcc-5.4
-	    export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
+        export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
     fi
     if [ x"${DEBIAN}" = xstretch ]; then
         export CC=/usr/bin/gcc-6
-	    export CXX=/usr/bin/g++-6
+        export CXX=/usr/bin/g++-6
     fi
     if [ x"${DEBIAN}" = xartful -o x"${DEBIAN}" = xbionic ]; then
         export CC=/usr/bin/gcc-7
-	    export CXX=/usr/bin/g++-7
+        export CXX=/usr/bin/g++-7
+    fi
+    if [ x"${DEBIAN}" = xcosmic ]; then
+        export CC=/usr/bin/gcc-8
+        export CXX=/usr/bin/g++-8
     fi
 }
 
@@ -268,6 +272,13 @@ fix_rules(){
         sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-7|' debian/rules
         sed -i 's|CC = /usr/local/gcc-5.4.0/bin/gcc-5.4|CC = /usr/bin/gcc-7|' debian/rules
         sed -i 's|CXX = /usr/local/gcc-5.4.0/bin/g++-5.4|CXX = /usr/bin/g++-7|' debian/rules
+        sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules 
+    fi
+    if [ x"${DEBIAN}" = xcosmic ]; then
+        sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-8|' debian/rules
+        sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-8|' debian/rules
+        sed -i 's|CC = /usr/local/gcc-5.4.0/bin/gcc-5.4|CC = /usr/bin/gcc-8|' debian/rules
+        sed -i 's|CXX = /usr/local/gcc-5.4.0/bin/g++-5.4|CXX = /usr/bin/g++-8|' debian/rules
         sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules 
     fi
 }
@@ -309,7 +320,7 @@ install_deps() {
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
       INSTALL_LIST="python python-dev valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake "
-      if [ x"${DEBIAN}" = xstretch -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xartful ]; then
+      if [ x"${DEBIAN}" = xstretch -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xcosmic ]; then
         INSTALL_LIST="${INSTALL_LIST} libssl1.0-dev"
       else
         INSTALL_LIST="${INSTALL_LIST} libssl-dev"
@@ -690,7 +701,7 @@ build_tarball(){
     cd ${PSMDIR_ABS}
     pip install --user -r buildscripts/requirements.txt
     if [ ${DEBUG} = 0 ]; then
-        buildscripts/scons.py CC=${CC} CXX=${CXX} --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --rocksdb --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
+        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --rocksdb --inmemory --hotbackup CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib ${PSM_TARGETS}
     else
         buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --ssl --dbg=on -j$NJOBS --use-sasl-client \
         CPPPATH=${INSTALLDIR}/include LIBPATH=${INSTALLDIR}/lib --rocksdb --wiredtiger --inmemory --hotbackup ${PSM_TARGETS}
