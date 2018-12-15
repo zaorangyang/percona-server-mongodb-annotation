@@ -94,10 +94,10 @@ if [ -e /usr/bin/deb-systemd-helper ]; then
     if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ]; then
         if [ -x "/etc/init.d/mongod" ]; then
             update-rc.d mongod defaults >/dev/null
-            if [[ $RESTART == 1 ]]; then
+            if [ -n $2 ]; then
                 invoke-rc.d mongod restart || exit $?
             else
-                invoke-rc.d mongod stop || exit $?
+                invoke-rc.d mongod start|| exit $?
             fi
         fi
     fi
@@ -106,10 +106,10 @@ else
         if [ ! -e "/etc/init/mongod.conf" ]; then
                 update-rc.d mongod defaults >/dev/null
         fi
-        if [ $RESTART == 1 ]; then
+        if [ -n $2 ]; then
             invoke-rc.d mongod restart || exit $?
         else
-            invoke-rc.d mongod stop || exit $?
+            invoke-rc.d mongod start || exit $?
         fi
     fi
 fi
