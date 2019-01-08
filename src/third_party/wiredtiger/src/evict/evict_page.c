@@ -231,8 +231,7 @@ __wt_evict(WT_SESSION_IMPL *session,
 
 	if (0) {
 err:		if (!closing)
-			__evict_exclusive_clear(
-			    session, ref, previous_state);
+			__evict_exclusive_clear(session, ref, previous_state);
 
 		WT_STAT_CONN_INCR(session, cache_eviction_fail);
 		WT_STAT_DATA_INCR(session, cache_eviction_fail);
@@ -317,7 +316,7 @@ __evict_page_clean_update(WT_SESSION_IMPL *session, WT_REF *ref, bool closing)
 	    F_ISSET(session->dhandle, WT_DHANDLE_DEAD) ||
 	    (ref->page_las != NULL && ref->page_las->eviction_to_lookaside) ||
 	    __wt_txn_visible_all(session, ref->page->modify->rec_max_txn,
-	    WT_TIMESTAMP_NULL(&ref->page->modify->rec_max_timestamp)));
+	    ref->page->modify->rec_max_timestamp));
 
 	/*
 	 * Discard the page and update the reference structure. If evicting a
@@ -670,7 +669,7 @@ __evict_review(
 	 */
 	if (WT_SESSION_BTREE_SYNC(session) && !__wt_page_is_modified(page) &&
 	    !__wt_txn_visible_all(session, page->modify->rec_max_txn,
-	    WT_TIMESTAMP_NULL(&page->modify->rec_max_timestamp)))
+	    page->modify->rec_max_timestamp))
 		return (__wt_set_return(session, EBUSY));
 
 	/*

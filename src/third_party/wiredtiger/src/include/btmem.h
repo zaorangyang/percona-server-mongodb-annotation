@@ -223,7 +223,7 @@ struct __wt_ovfl_reuse {
 #endif
 #define	WT_LAS_CONFIG							\
     "key_format=" WT_UNCHECKED_STRING(QIQu)				\
-    ",value_format=" WT_UNCHECKED_STRING(QuBBu)				\
+    ",value_format=" WT_UNCHECKED_STRING(QQBBu)				\
     ",block_compressor=" WT_LOOKASIDE_COMPRESSOR			\
     ",leaf_value_max=64MB"						\
     ",prefix_compression=true"
@@ -236,8 +236,8 @@ struct __wt_page_lookaside {
 	uint64_t las_pageid;		/* Page ID in lookaside */
 	uint64_t max_txn;		/* Maximum transaction ID */
 	uint64_t unstable_txn;		/* First transaction ID not on page */
-	WT_DECL_TIMESTAMP(max_timestamp)/* Maximum timestamp */
-	WT_DECL_TIMESTAMP(unstable_timestamp)/* First timestamp not on page */
+	wt_timestamp_t max_timestamp;	/* Maximum timestamp */
+	wt_timestamp_t unstable_timestamp;/* First timestamp not on page */
 	bool eviction_to_lookaside;	/* Revert to lookaside on eviction */
 	bool has_prepares;		/* One or more updates are prepared */
 	bool skew_newest;		/* Page image has newest versions */
@@ -254,7 +254,7 @@ struct __wt_page_modify {
 	/* The transaction state last time eviction was attempted. */
 	uint64_t last_evict_pass_gen;
 	uint64_t last_eviction_id;
-	WT_DECL_TIMESTAMP(last_eviction_timestamp)
+	wt_timestamp_t last_eviction_timestamp;
 
 #ifdef HAVE_DIAGNOSTIC
 	/* Check that transaction time moves forward. */
@@ -263,14 +263,14 @@ struct __wt_page_modify {
 
 	/* Avoid checking for obsolete updates during checkpoints. */
 	uint64_t obsolete_check_txn;
-	WT_DECL_TIMESTAMP(obsolete_check_timestamp)
+	wt_timestamp_t obsolete_check_timestamp;
 
 	/* The largest transaction seen on the page by reconciliation. */
 	uint64_t rec_max_txn;
-	WT_DECL_TIMESTAMP(rec_max_timestamp)
+	wt_timestamp_t rec_max_timestamp;
 
 	/* Stable timestamp at last reconciliation. */
-	WT_DECL_TIMESTAMP(last_stable_timestamp)
+	wt_timestamp_t last_stable_timestamp;
 
 	/* The largest update transaction ID (approximate). */
 	uint64_t update_txn;
@@ -818,7 +818,7 @@ struct __wt_page {
  */
 struct __wt_page_deleted {
 	volatile uint64_t txnid;		/* Transaction ID */
-	WT_DECL_TIMESTAMP(timestamp)
+	wt_timestamp_t timestamp;
 
 	/*
 	 * The state is used for transaction prepare to manage visibility
@@ -857,29 +857,6 @@ struct __wt_ref {
 #define	WT_REF_SPLIT	 7		/* Parent page split (WT_REF dead) */
 	volatile uint32_t state;	/* Page state */
 
-#ifdef HAVE_DIAGNOSTIC
-	/* Capture history of ref state changes. */
-	struct {
-		WT_SESSION_IMPL *session;
-		const char *name;
-		const char *file;
-		int line;
-		uint32_t state;
-	} hist[3];
-	int histoff;
-#define	WT_REF_SET_STATE(ref, s) do {					\
-	ref->hist[ref->histoff].session = session;			\
-	ref->hist[ref->histoff].name = session->name;			\
-	ref->hist[ref->histoff].file = __FILE__;			\
-	ref->hist[ref->histoff].line = __LINE__;			\
-	ref->hist[ref->histoff].state = s;				\
-	ref->histoff = (ref->histoff + 1) % (int)WT_ELEMENTS(ref->hist);\
-	WT_PUBLISH(ref->state, s);					\
-} while (0)
-#else
-#define	WT_REF_SET_STATE(ref, s) WT_PUBLISH(ref->state, s)
-#endif
-
 	/*
 	 * Address: on-page cell if read from backing block, off-page WT_ADDR
 	 * if instantiated in-memory, or NULL if page created in-memory.
@@ -901,13 +878,37 @@ struct __wt_ref {
 
 	WT_PAGE_DELETED	  *page_del;	/* Deleted page information */
 	WT_PAGE_LOOKASIDE *page_las;	/* Lookaside information */
+
+#ifdef HAVE_DIAGNOSTIC
+	/* Capture history of ref state changes. */
+	struct __wt_ref_hist {
+		WT_SESSION_IMPL *session;
+		const char *name;
+		const char *file;
+		int line;
+		uint32_t state;
+	} hist[3];
+	uint64_t histoff;
+#define	WT_REF_SET_STATE(ref, s) do {					\
+	(ref)->hist[(ref)->histoff].session = session;			\
+	(ref)->hist[(ref)->histoff].name = session->name;		\
+	(ref)->hist[(ref)->histoff].file = __FILE__;			\
+	(ref)->hist[(ref)->histoff].line = __LINE__;			\
+	(ref)->hist[(ref)->histoff].state = s;				\
+	(ref)->histoff =						\
+	    ((ref)->histoff + 1) % WT_ELEMENTS((ref)->hist);		\
+	WT_PUBLISH((ref)->state, s);					\
+} while (0)
+#else
+#define	WT_REF_SET_STATE(ref, s) WT_PUBLISH((ref)->state, s)
+#endif
 };
 /*
  * WT_REF_SIZE is the expected structure size -- we verify the build to ensure
  * the compiler hasn't inserted padding which would break the world.
  */
 #ifdef HAVE_DIAGNOSTIC
-#define	WT_REF_SIZE	56 + 3*32 + 8
+#define	WT_REF_SIZE	(56 + 3 * sizeof(WT_REF_HIST) + 8)
 #else
 #define	WT_REF_SIZE	56
 #endif
@@ -1047,9 +1048,7 @@ struct __wt_ikey {
  */
 struct __wt_update {
 	volatile uint64_t txnid;	/* transaction ID */
-#if WT_TIMESTAMP_SIZE == 8
-	WT_DECL_TIMESTAMP(timestamp)	/* aligned uint64_t timestamp */
-#endif
+	wt_timestamp_t timestamp;	/* aligned uint64_t timestamp */
 
 	WT_UPDATE *next;		/* forward-linked list */
 
@@ -1067,10 +1066,6 @@ struct __wt_update {
 #define	WT_UPDATE_DATA_VALUE(upd)					\
 	((upd)->type == WT_UPDATE_STANDARD ||				\
 	(upd)->type == WT_UPDATE_TOMBSTONE)
-
-#if WT_TIMESTAMP_SIZE != 8
-	WT_DECL_TIMESTAMP(timestamp)	/* unaligned uint8_t array timestamp */
-#endif
 
 	/*
 	 * The update state is used for transaction prepare to manage
@@ -1090,7 +1085,7 @@ struct __wt_update {
  * WT_UPDATE_SIZE is the expected structure size excluding the payload data --
  * we verify the build to ensure the compiler hasn't inserted padding.
  */
-#define	WT_UPDATE_SIZE	(22 + WT_TIMESTAMP_SIZE)
+#define	WT_UPDATE_SIZE	30
 
 /*
  * The memory size of an update: include some padding because this is such a

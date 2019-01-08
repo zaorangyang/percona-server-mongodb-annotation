@@ -549,7 +549,9 @@ ExitCode _initAndListen(int listenPort) {
         if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
             // Note: For replica sets, ShardingStateRecovery happens on transition to primary.
             if (!repl::ReplicationCoordinator::get(startupOpCtx.get())->isReplEnabled()) {
-                uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
+                if (ShardingState::get(startupOpCtx.get())->enabled()) {
+                    uassertStatusOK(ShardingStateRecovery::recover(startupOpCtx.get()));
+                }
             }
         } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             initializeGlobalShardingStateForMongoD(startupOpCtx.get(),
@@ -561,6 +563,8 @@ ExitCode _initAndListen(int listenPort) {
             ShardingCatalogManager::create(
                 startupOpCtx->getServiceContext(),
                 makeShardingTaskExecutor(executor::makeNetworkInterface("AddShard-TaskExecutor")));
+
+            Grid::get(startupOpCtx.get())->setShardingInitialized();
         } else if (replSettings.usingReplSets()) {  // standalone replica set
             auto keysCollectionClient = stdx::make_unique<KeysCollectionClientDirect>();
             auto keyManager = std::make_shared<KeysCollectionManager>(

@@ -572,6 +572,17 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         myIndex = StatusWith<int>(-1);
     }
 
+    if (serverGlobalParams.enableMajorityReadConcern && localConfig.containsArbiter()) {
+        log() << startupWarningsLog;
+        log() << "** WARNING: This replica set uses arbiters, but readConcern:majority is enabled "
+              << startupWarningsLog;
+        log() << "**          for this node. This is not a recommended configuration. Please see "
+              << startupWarningsLog;
+        log() << "**          https://dochub.mongodb.org/core/psa-disable-rc-majority-4.0"
+              << startupWarningsLog;
+        log() << startupWarningsLog;
+    }
+
     // Do not check optime, if this node is an arbiter.
     bool isArbiter =
         myIndex.getValue() != -1 && localConfig.getMemberAt(myIndex.getValue()).isArbiter();
@@ -1380,8 +1391,8 @@ Status ReplicationCoordinatorImpl::_waitUntilClusterTimeForRead(OperationContext
 
     // TODO SERVER-34620: Re-enable speculative behavior when "atClusterTime" is specified.
     auto session = OperationContextSession::get(opCtx);
-    const bool speculative =
-        session && session->inMultiDocumentTransaction() && !readConcern.getArgsAtClusterTime();
+    const bool speculative = session && session->inActiveOrKilledMultiDocumentTransaction() &&
+        !readConcern.getArgsAtClusterTime();
 
     const bool isMajorityCommittedRead =
         (readConcern.getLevel() == ReadConcernLevel::kMajorityReadConcern ||
@@ -1972,7 +1983,7 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
     }
 
     auto session = OperationContextSession::get(opCtx);
-    if (session && session->inMultiDocumentTransaction()) {
+    if (session && session->inActiveOrKilledMultiDocumentTransaction()) {
         if (!_canAcceptNonLocalWrites && !getTestCommandsEnabled()) {
             return Status(ErrorCodes::NotMaster,
                           "Multi-document transactions are only allowed on replica set primaries.");

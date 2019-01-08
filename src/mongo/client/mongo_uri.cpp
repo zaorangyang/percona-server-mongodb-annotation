@@ -40,6 +40,7 @@
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/find_iterator.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/range/algorithm/count.hpp>
 
 #include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobjbuilder.h"
@@ -57,8 +58,6 @@ using namespace std::literals::string_literals;
 namespace {
 constexpr std::array<char, 16> hexits{
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
-const mongo::StringData kURIPrefix{"mongodb://"};
-const mongo::StringData kURISRVPrefix{"mongodb+srv://"};
 
 // This vector must remain sorted.  It is over pairs to facilitate a call to `std::includes` using
 // a `std::map<std::string, std::string>` as the other parameter.
@@ -87,13 +86,20 @@ void mongo::uriEncode(std::ostream& ss, StringData toEncode, StringData passthro
 mongo::StatusWith<std::string> mongo::uriDecode(StringData toDecode) {
     StringBuilder out;
     for (size_t i = 0; i < toDecode.size(); ++i) {
-        const auto c = toDecode[i];
+        const char c = toDecode[i];
         if (c == '%') {
             if (i + 2 > toDecode.size()) {
                 return Status(ErrorCodes::FailedToParse,
                               "Encountered partial escape sequence at end of string");
             }
-            out << fromHex(toDecode.substr(i + 1, 2));
+            auto swHex = fromHex(toDecode.substr(i + 1, 2));
+            if (swHex.isOK()) {
+                out << swHex.getValue();
+            } else {
+                return Status(ErrorCodes::FailedToParse,
+                              "The characters after the % do not form a hex value. Please escape "
+                              "the % or pass a valid hex value. ");
+            }
             i += 2;
         } else {
             out << c;
@@ -105,6 +111,10 @@ mongo::StatusWith<std::string> mongo::uriDecode(StringData toDecode) {
 namespace mongo {
 
 namespace {
+
+constexpr StringData kURIPrefix = "mongodb://"_sd;
+constexpr StringData kURISRVPrefix = "mongodb+srv://"_sd;
+constexpr StringData kDefaultMongoHost = "127.0.0.1:27017"_sd;
 
 /**
  * Helper Method for MongoURI::parse() to split a string into exactly 2 pieces by a char
@@ -513,8 +523,53 @@ const boost::optional<std::string> MongoURI::getAppName() const {
     const auto optIter = _options.find("appName");
     if (optIter != end(_options)) {
         return optIter->second;
-    } else {
-        return boost::none;
     }
+    return boost::none;
+}
+
+std::string MongoURI::canonicalizeURIAsString() const {
+    StringBuilder uri;
+    uri << kURIPrefix;
+    if (!_user.empty()) {
+        uri << uriEncode(_user);
+        if (!_password.empty()) {
+            uri << ":" << uriEncode(_password);
+        }
+        uri << "@";
+    }
+
+    const auto& servers = _connectString.getServers();
+    if (!servers.empty()) {
+        auto delimeter = "";
+        for (auto& hostAndPort : servers) {
+            if (boost::count(hostAndPort.host(), ':') > 1) {
+                uri << delimeter << "[" << uriEncode(hostAndPort.host()) << "]"
+                    << ":" << uriEncode(std::to_string(hostAndPort.port()));
+            } else if (StringData(hostAndPort.host()).endsWith(".sock")) {
+                uri << delimeter << uriEncode(hostAndPort.host());
+            } else {
+                uri << delimeter << uriEncode(hostAndPort.host()) << ":"
+                    << uriEncode(std::to_string(hostAndPort.port()));
+            }
+            delimeter = ",";
+        }
+    } else {
+        uri << kDefaultMongoHost;
+    }
+
+    uri << "/";
+    if (!_database.empty()) {
+        uri << uriEncode(_database);
+    }
+
+    if (!_options.empty()) {
+        auto delimeter = "";
+        uri << "?";
+        for (const auto& pair : _options) {
+            uri << delimeter << uriEncode(pair.first) << "=" << uriEncode(pair.second);
+            delimeter = "&";
+        }
+    }
+    return uri.str();
 }
 }  // namespace mongo

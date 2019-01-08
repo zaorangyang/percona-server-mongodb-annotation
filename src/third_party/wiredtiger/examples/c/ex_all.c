@@ -331,6 +331,8 @@ cursor_ops(WT_SESSION *session)
 	error_check(cursor->insert(cursor));
 	}
 
+	/* Modify requires an explicit transaction. */
+	error_check(session->begin_transaction(session, NULL));
 	{
 	/*! [Modify an existing record] */
 	WT_MODIFY entries[3];
@@ -361,6 +363,7 @@ cursor_ops(WT_SESSION *session)
 	error_check(cursor->modify(cursor, entries, 3));
 	/*! [Modify an existing record] */
 	}
+	error_check(session->commit_transaction(session, NULL));
 
 	{
 	/*! [Update an existing record or insert a new record] */
@@ -898,7 +901,6 @@ transaction_ops(WT_SESSION *session_arg)
 	error_check(session->commit_transaction(session, NULL));
 	/*! [transaction isolation] */
 
-#ifdef HAVE_TIMESTAMPS
 	{
 	/*! [transaction prepare] */
 	/*
@@ -917,7 +919,6 @@ transaction_ops(WT_SESSION *session_arg)
 	    session, "commit_timestamp=2b"));
 	/*! [transaction prepare] */
 	}
-#endif
 
 	/*! [session isolation configuration] */
 	/* Open a session configured for read-uncommitted isolation. */
@@ -944,10 +945,9 @@ transaction_ops(WT_SESSION *session_arg)
 
 	error_check(session->begin_transaction(session, NULL));
 
-#ifdef HAVE_TIMESTAMPS
 	{
 	/*! [query timestamp] */
-	char timestamp_buf[2 * WT_TIMESTAMP_SIZE + 1];
+	char timestamp_buf[2 * sizeof(uint64_t) + 1];
 
 	/*! [transaction timestamp] */
 	error_check(
@@ -976,7 +976,6 @@ transaction_ops(WT_SESSION *session_arg)
 	/*! [rollback to stable] */
 	error_check(conn->rollback_to_stable(conn, NULL));
 	/*! [rollback to stable] */
-#endif
 }
 
 /*! [Implement WT_COLLATOR] */

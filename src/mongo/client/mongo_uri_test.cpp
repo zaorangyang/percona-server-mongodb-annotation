@@ -41,6 +41,8 @@
 #include "mongo/unittest/unittest.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional_io.hpp>
 
 namespace mongo {
 namespace {
@@ -57,6 +59,11 @@ struct URITestCase {
 
 struct InvalidURITestCase {
     std::string URI;
+    boost::optional<Status> status;
+    InvalidURITestCase(std::string aURI, boost::optional<Status> aStatus = boost::none) {
+        URI = std::move(aURI);
+        status = std::move(aStatus);
+    }
 };
 
 const ConnectionString::ConnectionType kMaster = ConnectionString::MASTER;
@@ -356,6 +363,12 @@ const InvalidURITestCase invalidCases[] = {
     // Host list must actually be comma separated.
     {"mongodb://localhost:27017localhost:27018"},
 
+    // % symbol in password must be escaped.
+    {"mongodb://localhost:pass%word@127.0.0.1:27017",
+     Status(ErrorCodes::FailedToParse,
+            "The characters after the % do not form a hex value. Please escape the % or pass a "
+            "valid hex value. ")},
+
     // Domain sockets have to end in ".sock".
     {"mongodb://%2Fnotareal%2Fdomainsock"},
 
@@ -467,6 +480,9 @@ TEST(MongoURI, InvalidURIs) {
         unittest::log() << "Testing URI: " << testCase.URI << '\n';
         auto cs_status = MongoURI::parse(testCase.URI);
         ASSERT_NOT_OK(cs_status);
+        if (testCase.status) {
+            ASSERT_EQUALS(testCase.status, cs_status.getStatus());
+        }
     }
 }
 
@@ -542,7 +558,7 @@ TEST(MongoURI, specTests) {
 
             if (!valid) {
                 // This uri string is invalid --> parse the uri and ensure it fails
-                const InvalidURITestCase testCase = {uri};
+                const InvalidURITestCase testCase = InvalidURITestCase{uri};
                 unittest::log() << "Testing URI: " << testCase.URI << '\n';
                 auto cs_status = MongoURI::parse(testCase.URI);
                 ASSERT_NOT_OK(cs_status);

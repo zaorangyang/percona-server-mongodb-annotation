@@ -108,6 +108,8 @@ variables:
       <<: *jepsen_config_vars
 
 - &jstestfuzz_config_vars
+  num_files: 15
+  num_tasks: 10
   resmoke_args: --help # resmoke_args needs to be overridden to specify one of the jstestfuzz suites
   should_shuffle: false
   continue_on_failure: false
@@ -117,21 +119,13 @@ variables:
   # Note that timeout_secs is different from exec_timeout_secs, which applies to a task and times out regardless of whether output has been written to stdout.
   timeout_secs: 1800
 
-- &run_jstestfuzz_tests
-  func: "run tests"
-  vars:
-    <<: *jstestfuzz_config_vars
-
 # Used for tests that invoke 'resmoke.py --suites=jstestfuzz*'.
 - &jstestfuzz_template
   name: jstestfuzz_template
   exec_timeout_secs: 14400 # Time out the task if it runs for more than 4 hours.
-  depends_on:
-  - name: compile
+  depends_on: []
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-  - *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
 
 # Templates used by powercycle
 - &powercycle_remote_credentials
@@ -359,6 +353,12 @@ variables:
   - compile_unittests
   - unittests
 
+- &dbtest
+  name: dbtest!
+  execution_tasks:
+  - compile_dbtest
+  - dbtest
+
 - &compile_task_group_template
   name: compile_task_group_template
   max_hosts: 1
@@ -374,12 +374,14 @@ variables:
   - func: "save code coverage data"
   - func: "save mongo coredumps"
   - func: "save failed unittests"
+  - func: "save unstripped dbtest"
   - func: "save hang analyzer debugger files"
   - func: "save disk statistics"
   - func: "save system resource information"
   - func: "remove files"
     vars:
       files: >-
+        src/resmoke_error_code
         src/build/scons/config.log
         src/*.gcda.gcov
         src/gcov-intermediate-files.tgz
@@ -429,6 +431,7 @@ variables:
   modules:
   - enterprise
   display_tasks:
+  - *dbtest
   - *replica_sets_auth
   - *replica_sets_ese
   - *sharding_auth
@@ -451,8 +454,7 @@ variables:
     use_scons_cache: true
     multiversion_platform: windows
     multiversion_edition: enterprise
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: false
     jstestfuzz_num_generated_files: 35
   tasks:
@@ -470,7 +472,6 @@ variables:
   - name: benchmarks_orphaned
   - name: benchmarks_sharding
   - name: buildscripts_test
-  - name: dbtest
   - name: ese
   - name: external_auth
     distros:
@@ -481,12 +482,12 @@ variables:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
@@ -1057,30 +1058,25 @@ functions:
     command: shell.exec
     params:
       silent: true
+      shell: bash
       script: |
         cd src/src/mongo/embedded/mongo_embedded/java
 
-        echo -n "${mongodb_mobile_release_signing_secret_key}" > mobile-release-signing-key.secret
-        echo -n "${mongodb_mobile_release_signing_public_key}" > mobile-release-signing-key.public
+        echo '${mongodb_mobile_release_secring}' | base64 -d > embedded-android/secring.gpg
 
-        gpg --homedir ${workingdir}/.gnupg --allow-secret-key-import --import mobile-release-signing-key.secret
-        gpg --homedir ${workingdir}/.gnupg --import mobile-release-signing-key.public
-        # Required for gradle to pick up the keys
-        gpg --homedir ${workingdir}/.gnupg --keyring secring.gpg --export-secret-keys secring.gpg
-
-        echo -n <<EOF
+        cat <<EOF > local.properties
         signing.keyId=${mongodb_mobile_release_signing_keyid}
         signing.password=${mongodb_mobile_release_signing_password}
         signing.secretKeyRingFile=${mongodb_mobile_release_signing_secretkeyringfile}
 
         ossrhUsername=${mongodb_mobile_ossrh_username}
         ossrhPassword=${mongodb_mobile_ossrh_password}
-        EOF > local.properties
+        EOF
 
-        echo <<EOF
+        cat <<EOF > artifactory_mobile_creds.sh
         export artifactory_mobile_user=${artifactory_mobile_user}
         export artifactory_mobile_pass=${artifactory_mobile_pass}
-        EOF > artifactory_mobile_creds.sh
+        EOF
 
   "setup android toolchain" :
     command: shell.exec
@@ -1096,6 +1092,7 @@ functions:
   "build java embedded sdk":
     command: shell.exec
     params:
+      shell: bash
       script: |
         set -o errexit
         set -o verbose
@@ -1123,12 +1120,10 @@ functions:
                 ./gradlew clean :embedded-jar:build :embedded-jar:publishMavenPublicationToLocalRepository
 
                 # Is this a release?
-                echo "${version|-g}" | grep -q -- "-g"
-                if [ $? -eq 1 ]; then
+                if [ "${is_release|false}" = "true" ]; then
                     source ./artifactory_mobile_creds.sh
                     ./gradlew --info :embedded-jar:artifactoryPublish
                 fi
-
 
                 mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/java
                 cp -r embedded-jar/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/java
@@ -1142,8 +1137,7 @@ functions:
 
                 ./gradlew clean :embedded-android:build
                 # Is this a release?
-                echo "${version|-g}" | grep -q -- "-g"
-                if [ $? -eq 1 ]; then
+                if [ "${is_release|false}" = "true" ]; then
                     ./gradlew :embedded-android:uploadArchives closeAndReleaseRepository
                 fi
 
@@ -1204,7 +1198,7 @@ functions:
   "build new tools" :
     command: shell.exec
     params:
-      working_dir: src/src/mongo/gotools
+      working_dir: src/src/mongo/gotools/src/github.com/mongodb/mongo-tools
       script: |
         set -o verbose
         set -o errexit
@@ -1214,10 +1208,11 @@ functions:
             set -o igncr
         fi;
 
-        sed -i.bak "s/built-without-version-string/$(git describe)/" common/options/options.go
-        sed -i.bak "s/built-without-git-spec/$(git rev-parse HEAD)/" common/options/options.go
-
-        . ./${set_tools_gopath|set_gopath.sh}
+        # set_goenv provides set_goenv(), print_ldflags() and print_tags() used below
+        . ./set_goenv.sh
+        GOROOT="" set_goenv || exit
+        env | grep ^GO
+        go version
 
         build_tools="bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop"
 
@@ -1226,8 +1221,8 @@ functions:
         fi
 
         for i in $build_tools; do
-             ${gorootvars} go build ${tooltags|} -o "../../mongo-tools/$i${exe|}" $i/main/$i.go
-             "../../mongo-tools/$i${exe|}" --version
+            go build -ldflags "$(print_ldflags)" ${args} -tags "$(print_tags ${tooltags})" -o "../../../../../../mongo-tools/$i${exe|}" $i/main/$i.go
+            "../../../../../../mongo-tools/$i${exe|}" --version
         done
 
   "get modified patch files" :
@@ -1527,6 +1522,9 @@ functions:
           if [[ $resmoke_exit_code = 74 || $resmoke_exit_code = 75 ]]; then
             echo $resmoke_exit_code > run_tests_infrastructure_failure
             exit 0
+          elif [ $resmoke_exit_code != 0 ]; then
+            # On failure save the resmoke exit code.
+            echo $resmoke_exit_code > resmoke_error_code
           fi
           exit $resmoke_exit_code
           fi # end if [[ ${disable_unit_tests} && ! -f ${skip_tests|/dev/null} ]]
@@ -1753,6 +1751,47 @@ functions:
             exit $(cat jepsen_system_failure_${task_name}_${execution})
           fi
 
+  "generate fuzzer tasks":
+    - *git_get_project
+
+    - command: expansions.write
+      params:
+        file: src/expansions.yml
+
+    - command: shell.exec
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+
+          ${activate_virtualenv}
+          $python -m pip install git+https://github.com/evergreen-ci/shrub.py
+          $python buildscripts/evergreen_gen_fuzzer_tests.py --expansion-file expansions.yml
+
+    - command: archive.targz_pack
+      params:
+        target: generate_tasks_config.tgz
+        source_dir: src/generated_resmoke_config
+        include:
+          - "*"
+
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: generate_tasks_config.tgz
+        remote_file: ${project}/${build_variant}/${revision}/generate_tasks/${task_id}-${execution}.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: ${content_type|application/gzip}
+        display_name: Generated Task Config - Execution ${execution}
+
+    - command: generate.tasks
+      params:
+        files:
+          - src/generated_resmoke_config/${name}.json
+
   "run jstestfuzz":
     - command: shell.exec
       params:
@@ -1793,7 +1832,7 @@ functions:
 
           echo "jstestfuzz self-tests are starting"
           set +o errexit
-          npm test > npm_test-${task_id}.log 2>&1
+          npm test > npm_test.log 2>&1
           if [ $? -ne 0 ]; then
             echo "jstestfuzz self-tests failure"
             branch=$(git symbolic-ref --short HEAD)
@@ -1803,10 +1842,10 @@ functions:
             node --version
             which npm
             npm --version
-            cat npm_test-${task_id}.log
+            cat npm_test.log
             exit 1
           fi
-          rm -f npm_test-${task_id}.log
+          rm -f npm_test.log
           set -o errexit
           echo "jstestfuzz self-tests finished"
 
@@ -3134,6 +3173,33 @@ functions:
   - *tar_failed_unittests
   - *archive_failed_unittests
 
+  "detect failed dbtest": &detect_failed_dbtest
+    command: shell.exec
+    params:
+      working_dir: "src"
+      script: |
+        if [ -f resmoke_error_code ] && [ -f ../dbtest_unstripped.tgz ]; then
+          echo "Task dbtest failed with error $(cat resmoke_error_code), archiving the unstripped binary"
+          mv ../dbtest_unstripped.tgz ../dbtest.tgz
+        fi
+
+  "archive unstripped dbtest": &archive_unstripped_dbtest
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      local_file: dbtest.tgz
+      remote_file: ${project}/${build_variant}/${revision}/dbtest/dbtest-${build_id}-${task_name}-${execution}.tgz
+      bucket: mciuploads
+      permissions: public-read
+      content_type: application/tar
+      display_name: Unstripped dbtest binary - Execution ${execution}
+      optional: true
+
+  "save unstripped dbtest":
+  - *detect_failed_dbtest
+  - *archive_unstripped_dbtest
+
   ### Process & archive artifacts from hung processes ###
   "run hang analyzer":
     command: shell.exec
@@ -3404,6 +3470,25 @@ tasks:
           mv mongodb-*-debugsymbols.${ext|tgz} mongo-debugsymbols.tgz || true
           mv mongodb-*.${ext|tgz} mongodb-binaries.tgz
 
+    # Tar unstripped dbtest, to be archived in case of failure
+    - command: archive.targz_pack
+      params:
+        target: "dbtest_unstripped.tgz"
+        source_dir: "src"
+        include:
+          - "./dbtest*"
+
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        script: |
+          set -o errexit
+          set -o verbose
+           if [ "${is_patch}" = "true" ] && [ "${bypass_compile|false}" = "true" ]; then
+            exit 0
+          fi
+
           # If strip is on the path (everywhere except windows) then we should strip the test binaries
           # before tarring them up
           if [ -x ${strip_path|/usr/bin/strip} ]; then
@@ -3557,7 +3642,7 @@ tasks:
         permissions: public-read
         content_type: application/json
         display_name: Library Dependency Graph (library_dependency_graph.json)
-        build_variants: [enterprise-ubuntu1604-64]
+        build_variants: [enterprise-rhel-70-64-bit-kitchen-sink] # This must be the Dagger variant
 
 ## compile_unittests - build unittests ##
 - name: compile_unittests
@@ -3577,6 +3662,34 @@ tasks:
     - func: "run tests"
       vars:
         resmoke_args: --suites=unittests
+        run_multiple_jobs: true
+
+## compile_dbtest ##
+- name: compile_dbtest
+  commands:
+    - func: "scons compile"
+      vars:
+        targets: dbtest
+        task_compile_flags: >-
+          --detect-odr-violations
+
+     # Tar unstripped dbtest, to be archived in case of failure
+    - command: archive.targz_pack
+      params:
+        target: "dbtest_unstripped.tgz"
+        source_dir: "src"
+        include:
+          - "./dbtest*"
+
+ ## dbtest ##
+- name: dbtest
+  commands:
+    - func: "run diskstats"
+    - func: "monitor process threads"
+    - func: "collect system resource info"
+    - func: "run tests"
+      vars:
+        resmoke_args: --suites=dbtest --storageEngine=wiredTiger
         run_multiple_jobs: true
 
 ## embedded_sdk_build_and_test_* - build the embedded-dev and embedded-test targets only ##
@@ -4655,280 +4768,278 @@ tasks:
 
 ## jstestfuzz standalone update generational fuzzer ##
 - <<: *jstestfuzz_template
-  name: update_fuzzer
+  name: update_fuzzer_gen
   commands:
-  - func: "do setup"
-  - func: "do multiversion setup"
-  - func: "run jstestfuzz"
-    vars:
-      npm_command: update-fuzzer
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      task_path_suffix: /data/multiversion
+      num_files: 5
+      num_tasks: 10
+      npm_command: update-fuzzer
       resmoke_args: --suites=generational_fuzzer
+      name: update_fuzzer
+      task_path_suffix: "/data/multiversion"
 
 ## jstestfuzz replication update generational fuzzer ##
 - <<: *jstestfuzz_template
-  name: update_fuzzer_replication
+  name: update_fuzzer_replication_gen
   commands:
-  - func: "do setup"
-  - func: "do multiversion setup"
-  - func: "run jstestfuzz"
-    vars:
-      npm_command: update-fuzzer
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
-      task_path_suffix: /data/multiversion
+      num_files: 5
+      num_tasks: 10
+      npm_command: update-fuzzer
       resmoke_args: --suites=generational_fuzzer_replication
+      name: update_fuzzer_replication
+      task_path_suffix: "/data/multiversion"
 
 ## rollback generational fuzzer ##
 - <<: *jstestfuzz_template
-  name: rollback_fuzzer
+  name: rollback_fuzzer_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles 15
-      npm_command: rollback-fuzzer
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: 3
+      num_tasks: 5
+      npm_command: rollback-fuzzer
       resmoke_args: --suites=rollback_fuzzer
+      name: rollback_fuzzer
 
 ## rollback generational fuzzer with clean shutdowns ##
 - <<: *jstestfuzz_template
-  name: rollback_fuzzer_clean_shutdowns
+  name: rollback_fuzzer_clean_shutdowns_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles 4 --numLinesPerFile 300 --maxLinesBetweenEvents 50
-      npm_command: rollback-fuzzer
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: 1
+      num_tasks: 4
+      jstestfuzz_vars: --numLinesPerFile 300 --maxLinesBetweenEvents 50
+      npm_command: rollback-fuzzer
       resmoke_args: --suites=rollback_fuzzer_clean_shutdowns
+      name: rollback_fuzzer_clean_shutdowns
 
 ## rollback generational fuzzer with unclean shutdowns ##
 - <<: *jstestfuzz_template
-  name: rollback_fuzzer_unclean_shutdowns
+  name: rollback_fuzzer_unclean_shutdowns_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles 2 --numLinesPerFile 300 --maxLinesBetweenEvents 50
-      npm_command: rollback-fuzzer
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: 1
+      num_tasks: 4
+      jstestfuzz_vars: --numLinesPerFile 300 --maxLinesBetweenEvents 50
+      npm_command: rollback-fuzzer
       resmoke_args: --suites=rollback_fuzzer_unclean_shutdowns
+      name: rollback_fuzzer_unclean_shutdowns
 
 ## jstestfuzz ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz
+  name: jstestfuzz_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz --storageEngine=wiredTiger
+      npm_command: jstestfuzz
+      name: jstestfuzz
 
 ## jstestfuzz concurrent ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_concurrent
+  name: jstestfuzz_concurrent_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: ${jstestfuzz_concurrent_num_files|10}
+      num_tasks: 15
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz --storageEngine=wiredTiger --numClientsPerFixture=10
+      name: jstestfuzz_concurrent
 
 ## jstestfuzz concurrent replica set ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_concurrent_replication
+  name: jstestfuzz_concurrent_replication_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: ${jstestfuzz_concurrent_num_files|10}
+      num_tasks: 15
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_replication --storageEngine=wiredTiger --numClientsPerFixture=10
+      name: jstestfuzz_concurrent_replication
 
 ## jstestfuzz concurrent replica set with logical session ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_concurrent_replication_session
+  name: jstestfuzz_concurrent_replication_session_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: ${jstestfuzz_concurrent_num_files|10}
+      num_tasks: 15
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_replication_session --storageEngine=wiredTiger --numClientsPerFixture=10
+      name: jstestfuzz_concurrent_replication_session
 
 ## jstestfuzz concurrent sharded cluster ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_concurrent_sharded
+  name: jstestfuzz_concurrent_sharded_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: ${jstestfuzz_concurrent_num_files|10}
+      num_tasks: 15
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_sharded --storageEngine=wiredTiger --numClientsPerFixture=10
+      name: jstestfuzz_concurrent_sharded
 
 ## jstestfuzz concurrent sharded cluster causal consistency ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_concurrent_sharded_causal_consistency
+  name: jstestfuzz_concurrent_sharded_causal_consistency_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: ${jstestfuzz_concurrent_num_files|10}
+      num_tasks: 15
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_sharded_causal_consistency --storageEngine=wiredTiger --numClientsPerFixture=10
+      name: jstestfuzz_concurrent_sharded_causal_consistency
 
 ## jstestfuzz concurrent sharded cluster continuous stepdown ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_concurrent_sharded_continuous_stepdown
+  name: jstestfuzz_concurrent_sharded_continuous_stepdown_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles 25
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: ${jstestfuzz_concurrent_num_files|10}
+      num_tasks: 2
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_sharded_continuous_stepdown --storageEngine=wiredTiger --numClientsPerFixture=10
+      name: jstestfuzz_concurrent_sharded_continuous_stepdown
 
 ## jstestfuzz concurrent sharded cluster with logical session ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_concurrent_sharded_session
+  name: jstestfuzz_concurrent_sharded_session_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles ${jstestfuzz_num_generated_files|75}
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: ${jstestfuzz_concurrent_num_files|10}
+      num_tasks: 15
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_sharded_session --storageEngine=wiredTiger --numClientsPerFixture=10
+      name: jstestfuzz_concurrent_sharded_session
 
 # jstestfuzz interrupt #
 - <<: *jstestfuzz_template
-  name: jstestfuzz_interrupt
+  name: jstestfuzz_interrupt_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_interrupt --storageEngine=wiredTiger
+      name: jstestfuzz_interrupt
 
 # jstestfuzz interrupt #
 - <<: *jstestfuzz_template
-  name: jstestfuzz_interrupt_replication
+  name: jstestfuzz_interrupt_replication_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_interrupt_replication --storageEngine=wiredTiger
+      name: jstestfuzz_interrupt_replication
 
 ## jstestfuzz replica set ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_replication
+  name: jstestfuzz_replication_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_replication --storageEngine=wiredTiger
+      name: jstestfuzz_replication
 
 ## jstestfuzz initial sync replica set ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_replication_initsync
+  name: jstestfuzz_replication_initsync_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles 75
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: 8
+      num_tasks: 10
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_replication_initsync --storageEngine=wiredTiger
+      name: jstestfuzz_replication_initsync
 
 ## jstestfuzz replica set with logical session ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_replication_session
+  name: jstestfuzz_replication_session_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_replication_session --storageEngine=wiredTiger
+      name: jstestfuzz_replication_session
 
 ## jstestfuzz sharded cluster ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_sharded
+  name: jstestfuzz_sharded_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_sharded --storageEngine=wiredTiger
+      name: jstestfuzz_sharded
 
 ## jstestfuzz sharded cluster causal consistency ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_sharded_causal_consistency
+  name: jstestfuzz_sharded_causal_consistency_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_sharded_causal_consistency --storageEngine=wiredTiger
+      name: jstestfuzz_sharded_causal_consistency
 
 ## jstestfuzz sharded cluster continuous stepdown ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_sharded_continuous_stepdown
+  name: jstestfuzz_sharded_continuous_stepdown_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-    vars:
-      jstestfuzz_vars: --numGeneratedFiles 50
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      num_files: 5
+      num_tasks: 10
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_sharded_continuous_stepdown --storageEngine=wiredTiger
+      name: jstestfuzz_sharded_continuous_stepdown
 
 ## jstestfuzz sharded cluster with logical session ##
 - <<: *jstestfuzz_template
-  name: jstestfuzz_sharded_session
+  name: jstestfuzz_sharded_session_gen
   commands:
-  - func: "do setup"
-  - func: "run jstestfuzz"
-  - <<: *run_jstestfuzz_tests
+  - func: "generate fuzzer tasks"
     vars:
       <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
       resmoke_args: --suites=jstestfuzz_sharded_session --storageEngine=wiredTiger
+      name: jstestfuzz_sharded_session
 
 ## integration test suites ##
 
@@ -5184,15 +5295,6 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=change_streams_whole_cluster_sharded_collections_passthrough --storageEngine=wiredTiger
-      run_multiple_jobs: true
-
-- <<: *task_template
-  name: dbtest
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: --suites=dbtest --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -7408,6 +7510,17 @@ tasks:
       resmoke_args: --suites=watchdog --storageEngine=wiredTiger
       run_multiple_jobs: false
 
+# This is a separate task because it is only supported on Ubuntu 16.04+ which are not inmemory builders
+- <<: *task_template
+  name: watchdog_inmemory
+  commands:
+  - func: "do setup"
+  - func: "do watchdog setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=watchdog --storageEngine=inMemory
+      run_multiple_jobs: false
+
 - <<: *task_template
   name: free_monitoring
   commands:
@@ -7638,7 +7751,9 @@ tasks:
 - name: push
   patchable: false
   depends_on:
-  - name: "*"
+  - name: jsCore
+  - name: dbtest
+  - name: replica_sets_jscore_passthrough
   stepback: false
   commands:
     - func: "fetch artifacts"
@@ -8164,11 +8279,18 @@ task_groups:
   tasks:
   - compile
 - <<: *compile_task_group_template
+  name: dbtest_TG
+  tasks:
+  - compile_dbtest
+  - dbtest
+- <<: *compile_task_group_template
   name: compile_all_run_unittests_TG
   tasks:
   - compile
   - compile_unittests
   - unittests
+  - compile_dbtest
+  - dbtest
   - compile_all
 - name: embedded_sdk_build_and_test
   setup_group:
@@ -8231,10 +8353,10 @@ buildvariants:
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off --release
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8260,7 +8382,6 @@ buildvariants:
   - name: change_streams_whole_cluster_mongos_passthrough
   - name: change_streams_whole_cluster_secondary_reads_passthrough
   - name: change_streams_whole_cluster_sharded_collections_passthrough
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -8280,12 +8401,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: multiversion_auth
   - name: multiversion
@@ -8339,16 +8460,15 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --repeat=10 --shuffle
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - rhel62-large
-  - name: dbtest
   - name: integration_tests_standalone
   - name: integration_tests_replset
   - name: integration_tests_sharded
@@ -8400,10 +8520,10 @@ buildvariants:
     compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars --enable-free-mon=off
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *replica_sets_auth
   - *sharding
   - *sharding_auth
@@ -8442,7 +8562,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -8560,10 +8679,10 @@ buildvariants:
     # exclude those tests as well.
     test_flags: --nojournal --excludeWithAnyTags=requires_journaling,requires_replication,requires_mmapv1,requires_sharding,uses_transactions
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8575,7 +8694,6 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: concurrency
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -8584,10 +8702,10 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -8620,10 +8738,10 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags ssl"
+    tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8632,7 +8750,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -8649,12 +8766,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
@@ -8719,10 +8836,10 @@ buildvariants:
     packager_distro: ubuntu1804
     repo_edition: org
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags ssl"
+    tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8731,7 +8848,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -8747,12 +8863,12 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_txns
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
@@ -8811,38 +8927,39 @@ buildvariants:
     packager_distro: ubuntu1804
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1804-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: sharding_auth
   - name: snmp
   - name: ssl
   - name: sslSpecial
   - name: watchdog_mmapv1
+  - name: watchdog_inmemory
   - name: watchdog_wiredtiger
   - name: package
     distros:
@@ -8871,10 +8988,10 @@ buildvariants:
     packager_distro: ubuntu1604
     repo_edition: org
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags ssl"
+    tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -8883,7 +9000,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -8921,12 +9037,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
@@ -8984,20 +9100,19 @@ buildvariants:
     packager_arch: arm64
     packager_distro: ubuntu1604
     repo_edition: enterprise
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto libsasl2)" -tags 'sasl ssl'
+    tooltags: 'sasl ssl'
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: arm64
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -9011,12 +9126,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -9067,19 +9182,19 @@ buildvariants:
     packager_arch: arm64
     packager_distro: ubuntu1604
     repo_edition: org
-    gorootvars: PATH=/opt/mongodbtoolchain/v2/bin:$PATH
-    tooltags: -gccgoflags "$(pkg-config --libs --cflags libssl libcrypto)" -tags 'ssl'
+    tooltags: "ssl"
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: arm64
     multiversion_edition: targeted
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
-  - name: dbtest
   - name: free_monitoring
   - name: jsCore
+  - name: replica_sets_jscore_passthrough
   - name: push
     distros:
     - ubuntu1604-test
@@ -9104,13 +9219,13 @@ buildvariants:
     packager_arch: ppc64le
     packager_distro: ubuntu1604
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
-    tooltags: -tags 'sasl ssl'
+    tooltags: "ssl sasl"
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: ppc64le
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9119,7 +9234,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -9133,12 +9247,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
@@ -9191,13 +9305,13 @@ buildvariants:
     packager_arch: s390x
     packager_distro: ubuntu1604
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
-    tooltags: -tags 'sasl ssl'
+    tooltags: "ssl sasl"
     build_mongoreplay: true
     multiversion_platform: ubuntu1604
     multiversion_architecture: s390x
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9219,7 +9333,6 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: ese
   - name: failpoints
   - name: failpoints_auth
@@ -9237,12 +9350,12 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -9302,11 +9415,11 @@ buildvariants:
     packager_distro: amazon
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
     virtualenv: /opt/mongodbtoolchain/v2/bin/virtualenv
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9317,7 +9430,6 @@ buildvariants:
   - name: audit
   - name: auth
   - name: auth_audit
-  - name: dbtest
   - name: ese
   - name: failpoints_auth
   - name: jsCore
@@ -9326,12 +9438,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -9340,6 +9452,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: replica_sets_auth
   - name: replica_sets_ese
+  - name: replica_sets_jscore_passthrough
   - name: powercycle
   - name: sasl
   - name: sharding_auth
@@ -9381,11 +9494,11 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl'"
+    tooltags: "ssl"
     build_mongoreplay: true
     virtualenv: /opt/mongodbtoolchain/v2/bin/virtualenv
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9394,7 +9507,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -9411,12 +9523,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
@@ -9482,10 +9594,10 @@ buildvariants:
     packager_distro: amazon2
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9496,7 +9608,6 @@ buildvariants:
   - name: audit
   - name: auth
   - name: auth_audit
-  - name: dbtest
   - name: ese
   - name: failpoints_auth
   - name: jsCore
@@ -9505,12 +9616,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -9519,6 +9630,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: replica_sets_auth
   - name: replica_sets_ese
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: sharding_auth
   - name: sharding_auth_audit
@@ -9564,10 +9676,10 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl'"
+    tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9576,7 +9688,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -9593,12 +9704,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
@@ -9659,10 +9770,10 @@ buildvariants:
     python: python
     ext: zip
     use_scons_cache: true
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go"'
     tooltags: ""
     build_mongoreplay: false
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -9688,7 +9799,6 @@ buildvariants:
   - name: change_streams_whole_cluster_passthrough
   - name: change_streams_whole_cluster_mongos_passthrough
   - name: change_streams_whole_cluster_sharded_collections_passthrough
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: free_monitoring
@@ -9707,9 +9817,9 @@ buildvariants:
   - name: mongosTest
   - name: noPassthrough
   - name: noPassthroughWithMongod
-  - name: rollback_fuzzer
-  - name: rollback_fuzzer_clean_shutdowns
-  - name: rollback_fuzzer_unclean_shutdowns
+  - name: rollback_fuzzer_gen
+  - name: rollback_fuzzer_clean_shutdowns_gen
+  - name: rollback_fuzzer_unclean_shutdowns_gen
   - name: bulk_gle_passthrough
   - name: parallel
   - name: parallel_compatibility
@@ -9821,11 +9931,11 @@ buildvariants:
     use_scons_cache: true
     multiversion_platform: windows
     multiversion_edition: enterprise
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: false
     jstestfuzz_num_generated_files: 35
   display_tasks:
+  - *dbtest
   - *replica_sets_auth
   - *replica_sets_ese
   - *sharding_auth
@@ -9846,7 +9956,9 @@ buildvariants:
   - name: benchmarks_orphaned
   - name: benchmarks_sharding
   - name: buildscripts_test
-  - name: dbtest
+  - name: dbtest_TG
+    distros:
+    - windows-64-vs2015-large
   - name: ese
   - name: external_auth
     distros:
@@ -9857,12 +9969,12 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: replica_sets_auth_0
   - name: replica_sets_auth_1
   - name: replica_sets_auth_2
@@ -9879,6 +9991,7 @@ buildvariants:
   - name: replica_sets_ese_5
   - name: replica_sets_ese_6
   - name: replica_sets_ese_misc
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: sharding_auth_0
     distros:
@@ -10080,6 +10193,7 @@ buildvariants:
   name: enterprise-windows-64-2k8-compile-all
   display_name: "* Enterprise Windows 2008R2 compile_all"
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -10117,8 +10231,7 @@ buildvariants:
     ext: zip
     use_scons_cache: true
     test_flags: --serviceExecutor=adaptive --excludeWithAnyTags=requires_mmapv1
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: false
   tasks:
   - name: compile_TG
@@ -10151,10 +10264,10 @@ buildvariants:
     use_scons_cache: true
     multiversion_platform: windows
     multiversion_edition: enterprise
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: false
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -10162,7 +10275,6 @@ buildvariants:
     - windows-64-vs2015-large
   - name: audit
   - name: auth_audit
-  - name: dbtest
   - name: concurrency
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
@@ -10175,12 +10287,12 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -10222,10 +10334,10 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
-    tooltags: "-tags ssl"
+    tooltags: "ssl"
     build_mongoreplay: false
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -10246,7 +10358,6 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: free_monitoring
@@ -10260,22 +10371,22 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_session
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_causal_consistency
-  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
-  - name: jstestfuzz_concurrent_sharded_session
-  - name: jstestfuzz_interrupt
-  - name: jstestfuzz_interrupt_replication
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_session
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_causal_consistency
-  - name: jstestfuzz_sharded_continuous_stepdown
-  - name: jstestfuzz_sharded_session
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_replication_session_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_concurrent_sharded_causal_consistency_gen
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_concurrent_sharded_session_gen
+  - name: jstestfuzz_interrupt_gen
+  - name: jstestfuzz_interrupt_replication_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_replication_session_gen
+  - name: jstestfuzz_sharded_gen
+  - name: jstestfuzz_sharded_causal_consistency_gen
+  - name: jstestfuzz_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_sharded_session_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -10313,8 +10424,8 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
   - name: write_concern_majority_passthrough
   - name: push
     distros:
@@ -10340,8 +10451,7 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: false
   tasks:
   # This variant tests that unoptimized, DEBUG mongos and mongod binaries can run on Windows.
@@ -10371,10 +10481,10 @@ buildvariants:
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.11" LINKFLAGS="-mmacosx-version-min=10.11"
     num_jobs_available: 1
-    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.11 CGO_LDFLAGS=-mmacosx-version-min=10.11'
-    tooltags: "-tags 'ssl openssl_pre_1.0'"
+    tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -10409,7 +10519,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: free_monitoring
@@ -10422,20 +10531,20 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_session
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_causal_consistency
-  - name: jstestfuzz_concurrent_sharded_session
-  - name: jstestfuzz_interrupt
-  - name: jstestfuzz_interrupt_replication
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_session
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_causal_consistency
-  - name: jstestfuzz_sharded_session
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_replication_session_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_concurrent_sharded_causal_consistency_gen
+  - name: jstestfuzz_concurrent_sharded_session_gen
+  - name: jstestfuzz_interrupt_gen
+  - name: jstestfuzz_interrupt_replication_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_replication_session_gen
+  - name: jstestfuzz_sharded_gen
+  - name: jstestfuzz_sharded_causal_consistency_gen
+  - name: jstestfuzz_sharded_session_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -10449,9 +10558,9 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
   - name: retryable_writes_jscore_passthrough
-  - name: rollback_fuzzer
-  - name: rollback_fuzzer_clean_shutdowns
-  - name: rollback_fuzzer_unclean_shutdowns
+  - name: rollback_fuzzer_gen
+  - name: rollback_fuzzer_clean_shutdowns_gen
+  - name: rollback_fuzzer_unclean_shutdowns_gen
   - name: serial_run
   - name: session_jscore_passthrough
   - name: sharded_collections_jscore_passthrough
@@ -10478,16 +10587,15 @@ buildvariants:
     num_jobs_available: 1
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --dbg=on --opt=on -j$(sysctl -n hw.logicalcpu) --libc++ CCFLAGS="-mmacosx-version-min=10.11" LINKFLAGS="-mmacosx-version-min=10.11"
-    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CFLAGS=-mmacosx-version-min=10.11 CGO_LDFLAGS=-mmacosx-version-min=10.11'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
   - name: aggregation
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: jsCore
@@ -10515,31 +10623,31 @@ buildvariants:
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.11" LINKFLAGS="-mmacosx-version-min=10.11"
     num_jobs_available: 1
-    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.11 CGO_LDFLAGS=-mmacosx-version-min=10.11'
-    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
   - name: audit
   - name: auth_audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: ssl
   - name: sslSpecial
@@ -10560,8 +10668,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: osx
     push_arch: x86_64-enterprise
-    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
-    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.11 CGO_LDFLAGS=-mmacosx-version-min=10.11
+    tooltags: "ssl sasl"
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
     compile_flags: --ssl --ssl-provider=openssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.11" LINKFLAGS="-mmacosx-version-min=10.11" LIBPATH="$PWD/openssl_install_dir/lib" CPPPATH="$PWD/openssl_install_dir/include"
     num_jobs_available: 1
@@ -10570,23 +10677,23 @@ buildvariants:
     openssl_config_flags: "-mmacosx-version-min=10.11"
     openssl_make_flags: "-j$(sysctl -n hw.logicalcpu)"
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
   - name: audit
   - name: auth_audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: replica_sets_auth
   - name: sasl
   - name: ssl
@@ -11044,12 +11151,12 @@ buildvariants:
     packager_distro: rhel62
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
     jstestfuzz_num_generated_files: 40
+    jstestfuzz_concurrent_num_files: 10
   display_tasks:
-  - *unittests
+  - *dbtest
   - *replica_sets_auth
   - *replica_sets_ese
   - *sharding
@@ -11058,6 +11165,7 @@ buildvariants:
   - *sharding_ese
   - *sharding_last_stable_mongos_and_mixed_shards
   - *sharding_op_query
+  - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     requires:
@@ -11072,9 +11180,9 @@ buildvariants:
   - name: burn_in_tests
     distros:
     - rhel62-large
-  - name: rollback_fuzzer
-  - name: rollback_fuzzer_clean_shutdowns
-  - name: rollback_fuzzer_unclean_shutdowns
+  - name: rollback_fuzzer_gen
+  - name: rollback_fuzzer_clean_shutdowns_gen
+  - name: rollback_fuzzer_unclean_shutdowns_gen
   - name: aggregation
   - name: aggregation_ese
   - name: aggregation_auth
@@ -11123,7 +11231,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -11146,23 +11253,23 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_session
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_causal_consistency
-  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
-  - name: jstestfuzz_concurrent_sharded_session
-  - name: jstestfuzz_interrupt
-  - name: jstestfuzz_interrupt_replication
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_initsync
-  - name: jstestfuzz_replication_session
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_causal_consistency
-  - name: jstestfuzz_sharded_continuous_stepdown
-  - name: jstestfuzz_sharded_session
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_replication_session_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_concurrent_sharded_causal_consistency_gen
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_concurrent_sharded_session_gen
+  - name: jstestfuzz_interrupt_gen
+  - name: jstestfuzz_interrupt_replication_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_replication_initsync_gen
+  - name: jstestfuzz_replication_session_gen
+  - name: jstestfuzz_sharded_gen
+  - name: jstestfuzz_sharded_causal_consistency_gen
+  - name: jstestfuzz_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_sharded_session_gen
   - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
@@ -11602,8 +11709,8 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
   - name: write_concern_majority_passthrough
     distros:
     - rhel62-large
@@ -11630,11 +11737,10 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
-  - *unittests
+  - *dbtest
   - *replica_sets_auth
   - *replica_sets_ese
   - *sharding
@@ -11643,13 +11749,14 @@ buildvariants:
   - *sharding_ese
   - *sharding_last_stable_mongos_and_mixed_shards
   - *sharding_op_query
+  - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - rhel62-large
-  - name: rollback_fuzzer
-  - name: rollback_fuzzer_clean_shutdowns
-  - name: rollback_fuzzer_unclean_shutdowns
+  - name: rollback_fuzzer_gen
+  - name: rollback_fuzzer_clean_shutdowns_gen
+  - name: rollback_fuzzer_unclean_shutdowns_gen
   - name: aggregation
   - name: aggregation_ese
   - name: aggregation_auth
@@ -11676,7 +11783,6 @@ buildvariants:
   - name: concurrency_sharded_causal_consistency
   - name: concurrency_sharded_causal_consistency_and_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -11697,23 +11803,23 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_session
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_causal_consistency
-  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
-  - name: jstestfuzz_concurrent_sharded_session
-  - name: jstestfuzz_interrupt
-  - name: jstestfuzz_interrupt_replication
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_initsync
-  - name: jstestfuzz_replication_session
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_causal_consistency
-  - name: jstestfuzz_sharded_continuous_stepdown
-  - name: jstestfuzz_sharded_session
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_replication_session_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_concurrent_sharded_causal_consistency_gen
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_concurrent_sharded_session_gen
+  - name: jstestfuzz_interrupt_gen
+  - name: jstestfuzz_interrupt_replication_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_replication_initsync_gen
+  - name: jstestfuzz_replication_session_gen
+  - name: jstestfuzz_sharded_gen
+  - name: jstestfuzz_sharded_causal_consistency_gen
+  - name: jstestfuzz_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_sharded_session_gen
   - name: multiversion
   - name: multiversion_multistorage_engine
   - name: noPassthroughWithMongod
@@ -12127,8 +12233,8 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
   - name: write_concern_majority_passthrough
     distros:
     - rhel62-large
@@ -12158,16 +12264,16 @@ buildvariants:
     # Mixing --cache and --gcov doesn't work correctly yet. See SERVER-11084
     timeout_secs: 10800 # 3 hour timeout
     use_scons_cache: false
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
-  - name: rollback_fuzzer
-  - name: rollback_fuzzer_clean_shutdowns
-  - name: rollback_fuzzer_unclean_shutdowns
+  - name: rollback_fuzzer_gen
+  - name: rollback_fuzzer_clean_shutdowns_gen
+  - name: rollback_fuzzer_unclean_shutdowns_gen
   - name: aggregation
   - name: aggregation_ese
   - name: aggregation_auth
@@ -12203,7 +12309,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -12270,8 +12375,8 @@ buildvariants:
   - name: snmp
   - name: ssl
   - name: sslSpecial
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
   - name: write_concern_majority_passthrough
   - name: secondary_reads_passthrough
 
@@ -12296,10 +12401,10 @@ buildvariants:
     packager_distro: rhel70
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12313,23 +12418,23 @@ buildvariants:
   - name: auth_audit
   - name: benchmarks_orphaned
   - name: benchmarks_sharding
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: external_auth
   - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: sharding_auth
   - name: sharding_auth_audit
@@ -12344,11 +12449,12 @@ buildvariants:
 # This variant is to intentionally test uncommon features nightly
 - <<: *enterprise-rhel-70-64-bit-template
   name: enterprise-rhel-70-64-bit-kitchen-sink
-  display_name: "~ Enterprise RHEL 7.0 (Dagger, gperftools)"
+  display_name: "~ Enterprise RHEL 7.0 (Dagger, tcmalloc-profiling)"
+  batchtime: 1440 # 1 day
   expansions:
     <<: *enterprise-rhel-70-64-bit-expansions-template
     compile_flags: --ssl --use-cpu-profiler MONGO_DISTMOD=rhel70 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_gcc.vars
-    additional_targets: dagger
+    additional_targets: dagger # If this moves to another variant, update the compile_all task
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -12368,7 +12474,6 @@ buildvariants:
     compile_flags: MONGO_DISTMOD=ubuntu1604 --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: ""
     build_mongoreplay: true
   tasks:
@@ -12404,10 +12509,10 @@ buildvariants:
     packager_distro: rhel62
     repo_edition: org
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags ssl"
+    tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12416,7 +12521,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -12433,12 +12537,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
@@ -12509,10 +12613,10 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags ssl"
+    tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12521,7 +12625,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -12538,12 +12641,12 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -12615,13 +12718,13 @@ buildvariants:
     push_name: linux
     push_arch: ppc64le-enterprise-rhel71
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
-    tooltags: -tags 'sasl ssl'
+    tooltags: "ssl sasl"
     build_mongoreplay: true
     multiversion_platform: rhel71
     multiversion_architecture: ppc64le
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12643,7 +12746,6 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: ese
   - name: failpoints
   - name: failpoints_auth
@@ -12661,12 +12763,12 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -12727,13 +12829,13 @@ buildvariants:
     push_name: linux
     push_arch: s390x-enterprise-rhel72
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
-    tooltags: -tags 'sasl ssl'
+    tooltags: "ssl sasl"
     build_mongoreplay: true
     multiversion_platform: rhel72
     multiversion_architecture: s390x
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12755,7 +12857,6 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: ese
   - name: failpoints
   - name: failpoints_auth
@@ -12773,12 +12874,12 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -12839,10 +12940,10 @@ buildvariants:
     push_name: linux
     push_arch: s390x-enterprise-rhel67
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
-    tooltags: -tags 'sasl ssl'
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12864,7 +12965,6 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: ese
   - name: failpoints
   - name: failpoints_auth
@@ -12940,10 +13040,10 @@ buildvariants:
     push_name: linux
     push_arch: s390x-rhel67
     repo_edition: org
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
     build_mongoreplay: true
-    tooltags: "-tags ssl"
+    tooltags: "ssl"
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12951,6 +13051,7 @@ buildvariants:
     - rhel67-zseries-build
   - name: jsCore
   - name: ssl
+  - name: replica_sets_jscore_passthrough
   - name: push
     distros:
     - rhel62-large
@@ -12980,32 +13081,32 @@ buildvariants:
     packager_distro: ubuntu1404
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1404-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -13018,7 +13119,7 @@ buildvariants:
 
 
 - name: enterprise-ubuntu1604-64
-  display_name: Enterprise Ubuntu 16.04 (GCC 5.4)
+  display_name: Enterprise Ubuntu 16.04
   modules:
   - enterprise
   run_on:
@@ -13039,17 +13140,16 @@ buildvariants:
     packager_distro: ubuntu1604
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1604-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jepsen_register_findAndModify_WT
     distros:
@@ -13076,22 +13176,24 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: sharding_auth
   - name: snmp
   - name: ssl
   - name: sslSpecial
   - name: watchdog_mmapv1
+  - name: watchdog_inmemory
   - name: watchdog_wiredtiger
   - name: package
     distros:
@@ -13110,10 +13212,10 @@ buildvariants:
     lang_environment: LANG=C
     compile_flags: --link-model=dynamic --ssl CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -13130,10 +13232,10 @@ buildvariants:
     lang_environment: LANG=C
     compile_flags: --link-model=dynamic --ssl CC=/usr/bin/clang-3.8 CXX=/usr/bin/clang++-3.8 -j$(grep -c ^processor /proc/cpuinfo) CPPPATH=/usr/include/libcxxabi/
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -13166,32 +13268,32 @@ buildvariants:
     packager_distro: suse12
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - suse12-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -13224,13 +13326,13 @@ buildvariants:
     packager_arch: s390x
     packager_distro: suse12
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
-    tooltags: -tags 'sasl ssl'
+    tooltags: "ssl sasl"
     build_mongoreplay: true
     multiversion_platform: suse12
     multiversion_architecture: s390x
     multiversion_edition: enterprise
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -13252,7 +13354,6 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: ese
   - name: failpoints
   - name: failpoints_auth
@@ -13270,12 +13371,12 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -13322,7 +13423,6 @@ buildvariants:
   batchtime: 1440 # 1 day
   expansions:
     test_flags: --excludeWithAnyTags=requires_mmapv1
-    gorootvars: GOROOT=/opt/go PATH="/opt/go/bin:$PATH"
     push_path: linux
     push_bucket: downloads.mongodb.org
     push_name: linux
@@ -13338,10 +13438,10 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl'"
+    tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -13350,7 +13450,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -13366,12 +13465,12 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
@@ -13433,32 +13532,32 @@ buildvariants:
     packager_distro: debian81
     repo_edition: enterprise
     scons_cache: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - debian81-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -13491,10 +13590,10 @@ buildvariants:
     repo_edition: org
     scons_cache_scope: shared
     shared_scons_pruning: true
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl'"
+    tooltags: "ssl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -13503,7 +13602,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -13519,12 +13617,12 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
@@ -13587,33 +13685,33 @@ buildvariants:
     packager_arch: x86_64
     packager_distro: debian92
     repo_edition: enterprise
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     scons_cache_scope: shared
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - debian92-build
   - name: audit
-  - name: dbtest
   - name: ese
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
   - name: replica_sets_auth
+  - name: replica_sets_jscore_passthrough
   - name: sasl
   - name: sharding_auth
   - name: snmp
@@ -13647,12 +13745,12 @@ buildvariants:
     packager_arch: x86_64
     packager_distro: debian92
     repo_edition: org
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl'"
+    tooltags: "ssl"
     scons_cache_scope: shared
     shared_scons_pruning: true
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -13661,7 +13759,6 @@ buildvariants:
   - name: aggregation
   - name: aggregation_auth
   - name: auth
-  - name: dbtest
   - name: disk_wiredtiger
   - name: failpoints
   - name: failpoints_auth
@@ -13677,12 +13774,12 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: mongosTest
   - name: multiversion
   - name: noPassthrough
@@ -13741,10 +13838,10 @@ buildvariants:
     multiversion_edition: enterprise
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -13787,7 +13884,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -13803,22 +13899,22 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
-  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
-  - name: jstestfuzz_sharded_continuous_stepdown
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_session
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_causal_consistency
-  - name: jstestfuzz_concurrent_sharded_session
-  - name: jstestfuzz_interrupt
-  - name: jstestfuzz_interrupt_replication
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_session
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_session
-  - name: jstestfuzz_sharded_causal_consistency
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_replication_session_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_concurrent_sharded_causal_consistency_gen
+  - name: jstestfuzz_concurrent_sharded_session_gen
+  - name: jstestfuzz_interrupt_gen
+  - name: jstestfuzz_interrupt_replication_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_replication_session_gen
+  - name: jstestfuzz_sharded_gen
+  - name: jstestfuzz_sharded_session_gen
+  - name: jstestfuzz_sharded_causal_consistency_gen
   - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_replication_10sec_refresh_jscore_passthrough
@@ -13844,7 +13940,7 @@ buildvariants:
   - name: retryable_writes_jscore_passthrough
   - name: retryable_writes_jscore_stepdown_passthrough
   - name: rlp
-  - name: rollback_fuzzer
+  - name: rollback_fuzzer_gen
   - name: sasl
   - name: session_jscore_passthrough
   - name: sharded_collections_jscore_passthrough
@@ -13863,8 +13959,8 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
   - name: write_concern_majority_passthrough
   - name: secondary_reads_passthrough
     distros:
@@ -13890,11 +13986,11 @@ buildvariants:
       MONGO_DISTMOD=rhel62
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     build_mongoreplay: true
     additional_targets: mongoebench mongoed
   display_tasks:
   - *benchrun_embedded
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -13929,7 +14025,6 @@ buildvariants:
   - name: benchrun_embedded_update
     distros:
     - centos6-perf
-  - name: dbtest
   - name: disk_mobile
   - name: failpoints
   - name: failpoints_auth
@@ -13943,8 +14038,8 @@ buildvariants:
   - name: jsCore_mobile
   - name: jsCore_op_query
   - name: jsonSchema
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: powercycle_mobile
@@ -13971,11 +14066,10 @@ buildvariants:
         MONGO_DISTMOD=ubuntu1604
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     max_jobs: 8 # Avoid starting too many mongod's on ARM test servers
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: -gccgoflags "$(pkg-config --libs)"
     build_mongoreplay: true
     additional_targets: mongoebench mongoed
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -13984,7 +14078,6 @@ buildvariants:
   - name: aggregation_facet_unwind_passthrough
   - name: auth
   - name: concurrency
-  - name: dbtest
   - name: disk_mobile
   - name: failpoints
   - name: failpoints_auth
@@ -13997,8 +14090,8 @@ buildvariants:
   - name: jsCore_mobile
   - name: jsCore_op_query
   - name: jsonSchema
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: serial_run
@@ -14051,10 +14144,10 @@ buildvariants:
       CPPPATH=/opt/mongodbtoolchain/v2/include
       LINKFLAGS="-mmacosx-version-min=10.10"
     num_jobs_available: 1
-    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
     build_mongoreplay: true
     additional_targets: mongoebench mongoed
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -14063,7 +14156,6 @@ buildvariants:
   - name: aggregation_facet_unwind_passthrough
   - name: auth
   - name: concurrency
-  - name: dbtest
   - name: disk_mobile
   - name: failpoints
   - name: failpoints_auth
@@ -14076,8 +14168,8 @@ buildvariants:
   - name: jsCore_mobile
   - name: jsCore_op_query
   - name: jsonSchema
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
   - name: noPassthrough
   - name: noPassthroughWithMongod
   - name: serial_run
@@ -14094,10 +14186,10 @@ buildvariants:
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -14116,7 +14208,6 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -14132,12 +14223,12 @@ buildvariants:
   - name: jsCore_auth
   - name: jsCore_op_query
   - name: jsCore_compatibility
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -14153,7 +14244,7 @@ buildvariants:
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
-  - name: rollback_fuzzer
+  - name: rollback_fuzzer_gen
   - name: sharding
   - name: sharding_auth
   - name: sharding_op_query
@@ -14164,8 +14255,8 @@ buildvariants:
   - name: sharding_jscore_op_query_passthrough
   - name: sharding_jscore_passthrough_wire_ops
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
 
 - name: enterprise-rhel-71-ppc64le-inmem
   display_name: Enterprise RHEL 7.1 PPC64LE (inMemory) DEBUG
@@ -14180,10 +14271,10 @@ buildvariants:
     compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel71 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: $(echo "$(grep -c processor /proc/cpuinfo)/4" | bc)
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_mmapv1,requires_journaling,uses_transactions
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/ppc64le-mongodb-linux-gcc'
-    tooltags: -tags 'sasl ssl'
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -14203,7 +14294,6 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -14264,10 +14354,10 @@ buildvariants:
     compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_gcc.vars
     num_jobs_available: 2
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_mmapv1,requires_journaling,uses_transactions
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go CC=/opt/mongodbtoolchain/v2/bin/s390x-mongodb-linux-gcc'
-    tooltags: -tags 'sasl ssl'
+    tooltags: "ssl sasl"
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -14301,7 +14391,6 @@ buildvariants:
   - name: concurrency_simultaneous
     distros:
     - rhel72-zseries-build
-  - name: dbtest
   - name: failpoints
   - name: failpoints_auth
   - name: gle_auth
@@ -14373,18 +14462,18 @@ buildvariants:
     multiversion_platform: ubuntu1604
     multiversion_edition: enterprise
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl'"
+    tooltags: "ssl"
     build_mongoreplay: true
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
-  - name: rollback_fuzzer
-  - name: rollback_fuzzer_clean_shutdowns
-  - name: rollback_fuzzer_unclean_shutdowns
+  - name: rollback_fuzzer_gen
+  - name: rollback_fuzzer_clean_shutdowns_gen
+  - name: rollback_fuzzer_unclean_shutdowns_gen
   - name: aggregation
   - name: aggregation_ese
   - name: aggregation_auth
@@ -14424,7 +14513,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -14502,8 +14590,8 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
   - name: write_concern_majority_passthrough
   - name: secondary_reads_passthrough
 
@@ -14521,32 +14609,32 @@ buildvariants:
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under ASAN build.
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl'"
+    tooltags: "ssl"
     build_mongoreplay: true
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
   - name: free_monitoring
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_session
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_causal_consistency
-  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
-  - name: jstestfuzz_concurrent_sharded_session
-  - name: jstestfuzz_interrupt
-  - name: jstestfuzz_interrupt_replication
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_session
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_causal_consistency
-  - name: jstestfuzz_sharded_continuous_stepdown
-  - name: jstestfuzz_sharded_session
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_replication_session_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_concurrent_sharded_causal_consistency_gen
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_concurrent_sharded_session_gen
+  - name: jstestfuzz_interrupt_gen
+  - name: jstestfuzz_interrupt_replication_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_replication_session_gen
+  - name: jstestfuzz_sharded_gen
+  - name: jstestfuzz_sharded_causal_consistency_gen
+  - name: jstestfuzz_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_sharded_session_gen
 
 - name: ubuntu1604-debug-ubsan
   display_name: ~ UBSAN Enterprise Ubuntu 16.04 DEBUG
@@ -14566,19 +14654,19 @@ buildvariants:
     multiversion_platform: ubuntu1604
     multiversion_edition: enterprise
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under UBSAN build.
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
     scons_cache_scope: shared
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
   - name: aggregation
   - name: aggregation_ese
-  - name: rollback_fuzzer
-  - name: rollback_fuzzer_clean_shutdowns
-  - name: rollback_fuzzer_unclean_shutdowns
+  - name: rollback_fuzzer_gen
+  - name: rollback_fuzzer_clean_shutdowns_gen
+  - name: rollback_fuzzer_unclean_shutdowns_gen
   - name: aggregation_auth
   - name: aggregation_facet_unwind_passthrough
   - name: aggregation_mongos_passthrough
@@ -14617,7 +14705,6 @@ buildvariants:
   - name: concurrency_sharded_with_stepdowns
   - name: concurrency_sharded_with_stepdowns_and_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -14687,8 +14774,8 @@ buildvariants:
   - name: ssl
   - name: sslSpecial
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
   - name: write_concern_majority_passthrough
   - name: secondary_reads_passthrough
 
@@ -14707,16 +14794,15 @@ buildvariants:
     san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl'"
+    tooltags: "ssl"
     build_mongoreplay: true
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
-  - name: dbtest
   - name: jsCore
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
@@ -14740,13 +14826,13 @@ buildvariants:
     san_options: UBSAN_OPTIONS="print_stacktrace=1:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=0:handle_segv=0:handle_sigbus=0:handle_sigill=0:handle_sigfpe=0
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     num_jobs_available: $(($(grep -c ^processor /proc/cpuinfo) / 3)) # Avoid starting too many mongod's under {A,UB}SAN build.
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl'"
+    tooltags: "ssl"
     build_mongoreplay: false
     hang_analyzer_dump_core: false
     test_flags: --serviceExecutor=adaptive --excludeWithAnyTags=requires_mmapv1
     scons_cache_scope: shared
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -14770,7 +14856,6 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_wiredtiger
   - name: ese
   - name: failpoints
@@ -14846,11 +14931,11 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     scons_cache_scope: shared
     scons_cache_mode: all
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
     build_mongoreplay: true
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -14895,9 +14980,10 @@ buildvariants:
     packager_distro: rhel62
     repo_edition: enterprise
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
-    tooltags: -tags 'ssl sasl'
+    tooltags: "ssl sasl"
     build_mongoreplay: true
+  display_tasks:
+  - *dbtest
   tasks:
   - name: compile_TG
   - name: aggregation
@@ -14915,7 +15001,7 @@ buildvariants:
   - name: concurrency_sharded_causal_consistency
   - name: concurrency_sharded_causal_consistency_and_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
+  - name: dbtest_TG
   - name: disk_mmapv1
   - name: dur_jscore_passthrough
   - name: durability
@@ -14927,23 +15013,23 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_op_query
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_session
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_causal_consistency
-  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
-  - name: jstestfuzz_concurrent_sharded_session
-  - name: jstestfuzz_interrupt
-  - name: jstestfuzz_interrupt_replication
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_initsync
-  - name: jstestfuzz_replication_session
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_causal_consistency
-  - name: jstestfuzz_sharded_continuous_stepdown
-  - name: jstestfuzz_sharded_session
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_replication_session_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_concurrent_sharded_causal_consistency_gen
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_concurrent_sharded_session_gen
+  - name: jstestfuzz_interrupt_gen
+  - name: jstestfuzz_interrupt_replication_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_replication_initsync_gen
+  - name: jstestfuzz_replication_session_gen
+  - name: jstestfuzz_sharded_gen
+  - name: jstestfuzz_sharded_causal_consistency_gen
+  - name: jstestfuzz_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_sharded_session_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -14972,7 +15058,7 @@ buildvariants:
     distros:
     - rhel62-large
   - name: rlp
-  - name: rollback_fuzzer
+  - name: rollback_fuzzer_gen
   - name: serial_run
   - name: sharded_collections_jscore_passthrough
   - name: sharding
@@ -14984,8 +15070,8 @@ buildvariants:
   - name: slow1
   - name: snmp
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
 
 - name: enterprise-windows-64-2k8-mmapv1
   display_name: Enterprise Windows 2008R2 MMAPv1
@@ -14999,12 +15085,8 @@ buildvariants:
     test_flags: --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,uses_transactions,requires_document_locking
     platform_decompress: unzip
     exe: .exe
-    gorootvars: 'PATH="/cygdrive/c/go1.8/go/bin:/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:$PATH" GOROOT="c:/go1.8/go" CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"'
-    tooltags: "-tags 'ssl sasl'"
+    tooltags: "ssl sasl"
     build_mongoreplay: false
-    gorootvars: >-
-      PATH="/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin:/cygdrive/c/sasl/:$PATH"
-      CGO_CFLAGS="-D_WIN32_WINNT=0x0601 -DNTDDI_VERSION=0x06010000"
     multiversion_platform: windows
     multiversion_edition: enterprise
     msi_target: msi
@@ -15019,6 +15101,8 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     ext: zip
     use_scons_cache: true
+  display_tasks:
+  - *dbtest
   tasks:
   - name: compile_TG
   - name: aggregation
@@ -15050,7 +15134,7 @@ buildvariants:
   - name: concurrency_simultaneous
     distros:
     - windows-64-vs2015-large
-  - name: dbtest
+  - name: dbtest_TG
   - name: disk_mmapv1
   - name: dur_jscore_passthrough
   - name: durability
@@ -15062,23 +15146,23 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_op_query
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_session
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_causal_consistency
-  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
-  - name: jstestfuzz_concurrent_sharded_session
-  - name: jstestfuzz_interrupt
-  - name: jstestfuzz_interrupt_replication
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_initsync
-  - name: jstestfuzz_replication_session
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_causal_consistency
-  - name: jstestfuzz_sharded_continuous_stepdown
-  - name: jstestfuzz_sharded_session
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_replication_session_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_concurrent_sharded_causal_consistency_gen
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_concurrent_sharded_session_gen
+  - name: jstestfuzz_interrupt_gen
+  - name: jstestfuzz_interrupt_replication_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_replication_initsync_gen
+  - name: jstestfuzz_replication_session_gen
+  - name: jstestfuzz_sharded_gen
+  - name: jstestfuzz_sharded_causal_consistency_gen
+  - name: jstestfuzz_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_sharded_session_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -15104,7 +15188,7 @@ buildvariants:
   - name: replica_sets_jscore_passthrough
     distros:
     - windows-64-vs2015-large
-  - name: rollback_fuzzer
+  - name: rollback_fuzzer_gen
   - name: serial_run
   - name: sharded_collections_jscore_passthrough
   - name: sharding
@@ -15116,8 +15200,8 @@ buildvariants:
   - name: slow1
   - name: snmp
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
 
 - name: enterprise-osx-1010-mmapv1
   display_name: Enterprise macOS 10.10 MMAPv1
@@ -15136,9 +15220,10 @@ buildvariants:
     multiversion_platform: osx
     multiversion_edition: enterprise
     num_jobs_available: 1
-    gorootvars: 'PATH="/usr/local/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/usr/local/go1.8/go CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.11 CGO_LDFLAGS=-mmacosx-version-min=10.11'
-    tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
+    tooltags: "ssl sasl"
     build_mongoreplay: true
+  display_tasks:
+  - *dbtest
   tasks:
   - name: compile_TG
   - name: aggregation
@@ -15154,7 +15239,7 @@ buildvariants:
   - name: concurrency_sharded_causal_consistency
   - name: concurrency_sharded_causal_consistency_and_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
+  - name: dbtest_TG
   - name: disk_mmapv1
   - name: dur_jscore_passthrough
   - name: durability
@@ -15166,23 +15251,23 @@ buildvariants:
   - name: jsCore_compatibility
   - name: jsCore_decimal
   - name: jsCore_op_query
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_replication_session
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_concurrent_sharded_causal_consistency
-  - name: jstestfuzz_concurrent_sharded_continuous_stepdown
-  - name: jstestfuzz_concurrent_sharded_session
-  - name: jstestfuzz_interrupt
-  - name: jstestfuzz_interrupt_replication
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_replication_initsync
-  - name: jstestfuzz_replication_session
-  - name: jstestfuzz_sharded
-  - name: jstestfuzz_sharded_causal_consistency
-  - name: jstestfuzz_sharded_continuous_stepdown
-  - name: jstestfuzz_sharded_session
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_replication_session_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_concurrent_sharded_causal_consistency_gen
+  - name: jstestfuzz_concurrent_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_concurrent_sharded_session_gen
+  - name: jstestfuzz_interrupt_gen
+  - name: jstestfuzz_interrupt_replication_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_replication_initsync_gen
+  - name: jstestfuzz_replication_session_gen
+  - name: jstestfuzz_sharded_gen
+  - name: jstestfuzz_sharded_causal_consistency_gen
+  - name: jstestfuzz_sharded_continuous_stepdown_gen
+  - name: jstestfuzz_sharded_session_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough
@@ -15198,7 +15283,7 @@ buildvariants:
   - name: replica_sets_initsync_jscore_passthrough
   - name: replica_sets_initsync_static_jscore_passthrough
   - name: replica_sets_jscore_passthrough
-  - name: rollback_fuzzer
+  - name: rollback_fuzzer_gen
   - name: serial_run
   - name: sharded_collections_jscore_passthrough
   - name: sharding_gle_auth_basics_passthrough
@@ -15206,8 +15291,8 @@ buildvariants:
   - name: sharding_jscore_passthrough
   - name: slow1
   - name: tool
-  - name: update_fuzzer
-  - name: update_fuzzer_replication
+  - name: update_fuzzer_gen
+  - name: update_fuzzer_replication_gen
 
 - name: linux-64-duroff-mmapv1
   display_name: Linux (No Journal) MMAPv1
@@ -15223,10 +15308,10 @@ buildvariants:
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --nojournal --storageEngine=mmapv1 --excludeWithAnyTags=requires_wiredtiger,requires_journaling,uses_transactions,requires_document_locking
     scons_cache_scope: shared
-    gorootvars: 'PATH="/opt/go1.8/go/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/go1.8/go'
     tooltags: ""
     build_mongoreplay: false
   display_tasks:
+  - *dbtest
   - *unittests
   tasks:
   - name: compile_all_run_unittests_TG
@@ -15244,7 +15329,6 @@ buildvariants:
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_simultaneous
-  - name: dbtest
   - name: disk_mmapv1
   - name: durability
   - name: dur_jscore_passthrough
@@ -15253,12 +15337,12 @@ buildvariants:
   - name: jsCore
   - name: jsCore_auth
   - name: jsCore_compatibility
-  - name: jstestfuzz
-  - name: jstestfuzz_concurrent
-  - name: jstestfuzz_concurrent_replication
-  - name: jstestfuzz_concurrent_sharded
-  - name: jstestfuzz_replication
-  - name: jstestfuzz_sharded
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_concurrent_gen
+  - name: jstestfuzz_concurrent_replication_gen
+  - name: jstestfuzz_concurrent_sharded_gen
+  - name: jstestfuzz_replication_gen
+  - name: jstestfuzz_sharded_gen
   - name: logical_session_cache_replication_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_sharding_1sec_refresh_jscore_passthrough
   - name: logical_session_cache_standalone_1sec_refresh_jscore_passthrough

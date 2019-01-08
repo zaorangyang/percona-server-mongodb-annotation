@@ -67,6 +67,11 @@ using std::vector;
 
 namespace {
 constexpr auto checkValueType = &DocumentSourceChangeStream::checkValueType;
+
+bool isFCVChange(const Document& input) {
+    const auto ns = input[repl::OplogEntry::kNamespaceFieldName];
+    return NamespaceString(ns.getStringData()).isServerConfigurationCollection();
+}
 }  // namespace
 
 DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
@@ -123,8 +128,6 @@ DocumentSource::StageConstraints DocumentSourceChangeStreamTransform::constraint
                                  TransactionRequirement::kNotAllowed,
                                  ChangeStreamRequirement::kChangeStreamStage);
 
-    constraints.canSwapWithMatch = true;
-    constraints.canSwapWithLimit = true;
     // This transformation could be part of a 'collectionless' change stream on an entire
     // database or cluster, mark as independent of any collection if so.
     constraints.isIndependentOfAnyCollection = _isIndependentOfAnyCollection;
@@ -387,6 +390,27 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
     return doc.freeze();
 }
 
+void DocumentSourceChangeStreamTransform::switchResumeTokenFormat(
+    const Document& fcvUpdateOplogEntry) {
+    checkValueType(fcvUpdateOplogEntry[repl::OplogEntry::kObjectFieldName],
+                   repl::OplogEntry::kObjectFieldName,
+                   BSONType::Object);
+    Document opObject = fcvUpdateOplogEntry[repl::OplogEntry::kObjectFieldName].getDocument();
+    // The FCV update is done with a replacement-style update, so there will be no $set. Instead,
+    // 'opObject' is the entire new document.
+    Value newVersion = opObject["version"];
+
+    checkValueType(newVersion, "o.version", BSONType::String);
+    if (newVersion.getStringData() == "3.6") {
+        _resumeTokenFormat = ResumeToken::SerializationFormat::kBinData;
+    } else {
+        uassert(65537,
+                "Feature compatibility version updated to an unknown version",
+                newVersion.getStringData() == "4.0");
+        _resumeTokenFormat = ResumeToken::SerializationFormat::kHexString;
+    }
+}
+
 Value DocumentSourceChangeStreamTransform::serialize(
     boost::optional<ExplainOptions::Verbosity> explain) const {
     Document changeStreamOptions(_changeStreamSpec);
@@ -433,6 +457,11 @@ DocumentSource::GetModPathsReturn DocumentSourceChangeStreamTransform::getModifi
 DocumentSource::GetNextResult DocumentSourceChangeStreamTransform::getNext() {
     pExpCtx->checkForInterrupt();
 
+    uassert(50988,
+            "Illegal attempt to execute an internal change stream stage on mongos. A $changeStream "
+            "stage must be the first stage in a pipeline",
+            !pExpCtx->inMongos);
+
     // If we're unwinding an 'applyOps' from a transaction, check if there are any documents we have
     // stored that can be returned.
     if (_txnContext) {
@@ -444,6 +473,13 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamTransform::getNext() {
 
     // Get the next input document.
     auto input = pSource->getNext();
+
+    // Check for FCV changes.
+    while (input.isAdvanced() && isFCVChange(input.getDocument())) {
+        switchResumeTokenFormat(input.getDocument());
+        input = pSource->getNext();
+    }
+
     if (!input.isAdvanced()) {
         return input;
     }

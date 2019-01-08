@@ -145,7 +145,8 @@ protected:
         auto migrationOpCtx = migrationClient->makeOperationContext();
 
         // Check that there is a transaction in progress with a lower txnNumber.
-        ASSERT(session->inMultiDocumentTransaction());
+        ASSERT(session->inActiveOrKilledMultiDocumentTransaction());
+        ASSERT_FALSE(session->transactionIsAborted());
         ASSERT_LT(session->getActiveTxnNumberForTest(), newTxnNum);
 
         // Check that the transaction has some operations, so we can ensure they are cleared.
@@ -155,7 +156,7 @@ protected:
         // previous transaction.
         session->beginOrContinueTxnOnMigration(migrationOpCtx.get(), newTxnNum);
         ASSERT_EQ(session->getActiveTxnNumberForTest(), newTxnNum);
-        ASSERT_FALSE(session->inMultiDocumentTransaction());
+        ASSERT_FALSE(session->inActiveOrKilledMultiDocumentTransaction());
         ASSERT_FALSE(session->transactionIsAborted());
         ASSERT_EQ(session->transactionOperationsForTest().size(), 0u);
 
@@ -904,7 +905,8 @@ TEST_F(SessionTest, CannotSpecifyStartTransactionOnInProgressTxn) {
 
     // Autocommit should be set to false and we should be in a mult-doc transaction.
     ASSERT_FALSE(session.getAutocommit());
-    ASSERT_TRUE(session.inMultiDocumentTransaction());
+    ASSERT(session.inActiveOrKilledMultiDocumentTransaction());
+    ASSERT_FALSE(session.transactionIsAborted());
 
     // Cannot try to start a transaction that already started.
     ASSERT_THROWS_CODE(session.beginOrContinueTxn(opCtx(), txnNum, false, true, "testDB", "insert"),
@@ -2513,8 +2515,9 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowCommit) {
 
     session.unstashTransactionResources(opCtx(), "commitTransaction");
 
-    serverGlobalParams.slowMS = 10;
-    sleepmillis(serverGlobalParams.slowMS + 1);
+    // Sleep generously longer than the slowMS value.
+    serverGlobalParams.slowMS = 1;
+    sleepmillis(5 * serverGlobalParams.slowMS);
 
     startCapturingLogMessages();
     session.commitTransaction(opCtx());
@@ -2551,8 +2554,9 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowAbort) {
 
     session.unstashTransactionResources(opCtx(), "abortTransaction");
 
-    serverGlobalParams.slowMS = 10;
-    sleepmillis(serverGlobalParams.slowMS + 1);
+    // Sleep generously longer than the slowMS value.
+    serverGlobalParams.slowMS = 1;
+    sleepmillis(5 * serverGlobalParams.slowMS);
 
     startCapturingLogMessages();
     session.abortActiveTransaction(opCtx());
@@ -2594,8 +2598,9 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowStashedAbort) {
     ASSERT(txnResourceStashLocker);
     const auto lockerInfo = txnResourceStashLocker->getLockerInfo(boost::none);
 
-    serverGlobalParams.slowMS = 10;
-    sleepmillis(serverGlobalParams.slowMS + 1);
+    // Sleep generously longer than the slowMS value.
+    serverGlobalParams.slowMS = 1;
+    sleepmillis(5 * serverGlobalParams.slowMS);
 
     startCapturingLogMessages();
     session.abortArbitraryTransaction();

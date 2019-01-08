@@ -58,16 +58,17 @@ static char home[1024];			/* Program working dir */
  */
 #define	INVALID_KEY	UINT64_MAX
 #define	MAX_CKPT_INVL	5	/* Maximum interval between checkpoints */
-#define	MAX_DEFAULT_TH	12
 #define	MAX_TH		200	/* Maximum configurable threads */
 #define	MAX_TIME	40
 #define	MAX_VAL		1024
 #define	MIN_TH		5
 #define	MIN_TIME	10
 #define	PREPARE_FREQ	5
+#define	PREPARE_PCT	10
 #define	PREPARE_YIELD	(PREPARE_FREQ * 10)
 #define	RECORDS_FILE	"records-%" PRIu32
-#define	SESSION_MAX	MAX_TH + 3	/* Include program worker threads */
+/* Include worker threads and prepare extra sessions */
+#define	SESSION_MAX	(MAX_TH + 3 + MAX_TH * PREPARE_PCT)
 
 static const char * table_pfx = "table";
 static const char * const uri_local = "local";
@@ -126,7 +127,7 @@ thread_ts_run(void *arg)
 	WT_DECL_RET;
 	WT_SESSION *session;
 	THREAD_DATA *td;
-	char tscfg[64], ts_buf[WT_TIMESTAMP_SIZE];
+	char tscfg[64], ts_buf[WT_TS_HEX_SIZE];
 
 	td = (THREAD_DATA *)arg;
 
@@ -260,7 +261,7 @@ thread_run(void *arg)
 	 * are in use. Thread numbers start at 0 so we're always guaranteed
 	 * that at least one thread is using prepared transactions.
 	 */
-	use_prep = (use_ts && td->info % 10 == 0) ? true : false;
+	use_prep = (use_ts && td->info % PREPARE_PCT == 0) ? true : false;
 
 	/*
 	 * For the prepared case we have two sessions so that the oplog session
@@ -489,19 +490,6 @@ run_workload(uint32_t nth)
 	exit(EXIT_SUCCESS);
 }
 
-/*
- * Determines whether this is a timestamp build or not
- */
-static bool
-timestamp_build(void)
-{
-#ifdef HAVE_TIMESTAMPS
-	return (true);
-#else
-	return (false);
-#endif
-}
-
 extern int __wt_optind;
 extern char *__wt_optarg;
 
@@ -571,10 +559,6 @@ main(int argc, char *argv[])
 	const char *working_dir;
 	char buf[512], fname[64], kname[64], statname[1024];
 	bool fatal, rand_th, rand_time, verify_only;
-
-	/* We have nothing to do if this is not a timestamp build */
-	if (!timestamp_build())
-		return (EXIT_SUCCESS);
 
 	(void)testutil_set_progname(argv);
 
@@ -649,7 +633,7 @@ main(int argc, char *argv[])
 				timeout = MIN_TIME;
 		}
 		if (rand_th) {
-			nth = __wt_random(&rnd) % MAX_DEFAULT_TH;
+			nth = __wt_random(&rnd) % MAX_TH;
 			if (nth < MIN_TH)
 				nth = MIN_TH;
 		}

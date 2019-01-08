@@ -162,7 +162,7 @@ struct __wt_btree {
 
 	uint64_t write_gen;		/* Write generation */
 	uint64_t rec_max_txn;		/* Maximum txn seen (clean trees) */
-	WT_DECL_TIMESTAMP(rec_max_timestamp)
+	wt_timestamp_t rec_max_timestamp;
 
 	uint64_t checkpoint_gen;	/* Checkpoint generation */
 	WT_SESSION_IMPL *sync_session;	/* Syncing session */
@@ -181,16 +181,17 @@ struct __wt_btree {
 	 * operation that would conflict with a sync.
 	 */
 #define	WT_BTREE_SYNCING(btree)						\
-	(btree->syncing != WT_BTREE_SYNC_OFF)
+	((btree)->syncing != WT_BTREE_SYNC_OFF)
 #define	WT_SESSION_BTREE_SYNC(session)					\
-	(S2BT(session)->sync_session == session)
+	(S2BT(session)->sync_session == (session))
 #define	WT_SESSION_BTREE_SYNC_SAFE(session, btree)			\
 	((btree)->syncing != WT_BTREE_SYNC_RUNNING ||			\
-	    (btree)->sync_session == session)
+	    (btree)->sync_session == (session))
 
 	uint64_t    bytes_inmem;        /* Cache bytes in memory. */
 	uint64_t    bytes_dirty_intl;	/* Bytes in dirty internal pages. */
 	uint64_t    bytes_dirty_leaf;	/* Bytes in dirty leaf pages. */
+	uint64_t    bytes_dirty_total;	/* Bytes ever dirtied in cache. */
 
 	/*
 	 * We flush pages from the tree (in order to make checkpoint faster),

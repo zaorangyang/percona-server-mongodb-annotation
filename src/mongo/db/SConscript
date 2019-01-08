@@ -716,6 +716,9 @@ env.Library(
         'catalog/index_key_validate',
         'concurrency/write_conflict_exception',
     ],
+    LIBDEPS_PRIVATE=[
+        'index_d',
+    ]
 )
 
 env.Library(
@@ -1377,6 +1380,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/server_status',
+        '$BUILD_DIR/mongo/db/s/sharding_api_d',
     ]
 )
 

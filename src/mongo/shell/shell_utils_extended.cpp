@@ -33,8 +33,12 @@
 
 #include "mongo/platform/basic.h"
 
-#include <boost/filesystem/convenience.hpp>
-#include <boost/filesystem/fstream.hpp>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
+#include <boost/filesystem.hpp>
 #include <fstream>
 
 #include "mongo/scripting/engine.h"
@@ -153,15 +157,33 @@ BSONObj hostname(const BSONObj&, void* data) {
 const int CANT_OPEN_FILE = 13300;
 
 BSONObj cat(const BSONObj& args, void* data) {
-    BSONElement e = singleArg(args);
+    BSONObjIterator it(args);
+
+    auto filePath = it.next();
+    uassert(51012,
+            "the first argument to cat() must be a string containing the path to the file",
+            filePath.type() == mongo::String);
+
+    std::ios::openmode mode = std::ios::in;
+
+    auto useBinary = it.next();
+    if (!useBinary.eoo()) {
+        uassert(51013,
+                "the second argument to cat(), must be a boolean indicating whether "
+                "or not to read the file in binary mode. If omitted, the default is 'false'.",
+                useBinary.type() == mongo::Bool);
+
+        if (useBinary.Bool())
+            mode |= std::ios::binary;
+    }
+
     stringstream ss;
-    ifstream f(e.valuestrsafe());
+    ifstream f(filePath.valuestrsafe(), mode);
     uassert(CANT_OPEN_FILE, "couldn't open file", f.is_open());
 
     std::streamsize sz = 0;
     while (1) {
         char ch = 0;
-        // slow...maybe change one day
         f.get(ch);
         if (ch == 0)
             break;
@@ -253,7 +275,9 @@ BSONObj writeFile(const BSONObj& args, void* data) {
     // Parse the arguments.
 
     uassert(
-        40340, "writeFile requires 2 arguments: writeFile(filePath, content)", args.nFields() == 2);
+        40340,
+        "writeFile requires at least 2 arguments: writeFile(filePath, content, [useBinaryMode])",
+        args.nFields() >= 2);
 
     BSONObjIterator it(args);
 
@@ -282,7 +306,20 @@ BSONObj writeFile(const BSONObj& args, void* data) {
             "the file name must be compatible with POSIX and Windows",
             boost::filesystem::portable_name(normalizedFilePath.filename().string()));
 
-    boost::filesystem::ofstream ofs{normalizedFilePath};
+    std::ios::openmode mode = std::ios::out;
+
+    auto useBinary = it.next();
+    if (!useBinary.eoo()) {
+        uassert(51014,
+                "the third argument to writeFile(), must be a boolean indicating whether "
+                "or not to read the file in binary mode. If omitted, the default is 'false'.",
+                useBinary.type() == mongo::Bool);
+
+        if (useBinary.Bool())
+            mode |= std::ios::binary;
+    }
+
+    boost::filesystem::ofstream ofs{normalizedFilePath, mode};
     uassert(40346,
             str::stream() << "failed to open file " << normalizedFilePath.string()
                           << " for writing",
@@ -302,6 +339,35 @@ BSONObj getHostName(const BSONObj& a, void* data) {
     return BSON("" << buf);
 }
 
+BSONObj changeUmask(const BSONObj& a, void* data) {
+#ifdef _WIN32
+    uasserted(50977, "umask is not supported on windows");
+#else
+    uassert(50976,
+            "umask takes 1 argument, the octal mode of the umask",
+            a.nFields() == 1 && isNumericBSONType(a.firstElementType()));
+    auto val = a.firstElement().Number();
+    return BSON("" << umask(static_cast<mode_t>(val)));
+#endif
+}
+
+BSONObj getFileMode(const BSONObj& a, void* data) {
+    uassert(50975,
+            "getFileMode() takes one argument, the absolute path to a file",
+            a.nFields() == 1 && a.firstElementType() == String);
+    auto pathStr = a.firstElement().checkAndGetStringData();
+    boost::filesystem::path path(pathStr.rawData());
+    boost::system::error_code ec;
+    auto fileStatus = boost::filesystem::status(path, ec);
+    if (ec) {
+        uasserted(50974,
+                  str::stream() << "Unable to get status for file \"" << pathStr << "\": "
+                                << ec.message());
+    }
+
+    return BSON("" << fileStatus.permissions());
+}
+
 void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("getHostName", getHostName);
     scope.injectNative("removeFile", removeFile);
@@ -315,6 +381,8 @@ void installShellUtilsExtended(Scope& scope) {
     scope.injectNative("hostname", hostname);
     scope.injectNative("md5sumFile", md5sumFile);
     scope.injectNative("mkdir", mkdir);
+    scope.injectNative("umask", changeUmask);
+    scope.injectNative("getFileMode", getFileMode);
 }
 }
 }

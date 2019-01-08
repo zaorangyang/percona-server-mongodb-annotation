@@ -59,9 +59,6 @@ class test_prepare_lookaside02(wttest.WiredTigerTestCase, suite_subprocess):
     scenarios = make_scenarios(types, txn_end)
 
     def test_prepare_conflict(self):
-        if not wiredtiger.timestamp_build():
-            self.skipTest('requires a timestamp build')
-
         self.session.create(self.uri, self.s_config)
         c = self.session.open_cursor(self.uri)
 
@@ -81,7 +78,7 @@ class test_prepare_lookaside02(wttest.WiredTigerTestCase, suite_subprocess):
         else:
             self.session.rollback_transaction()
 
-        # Trigger a checkpoint, which could trigger reconcilation
+        # Trigger a checkpoint, which could trigger reconciliation
         self.conn.set_timestamp('stable_timestamp=' + timestamp_str(150))
         self.conn.set_timestamp('oldest_timestamp=' + timestamp_str(150))
         self.session.checkpoint()
@@ -102,7 +99,7 @@ class test_prepare_lookaside02(wttest.WiredTigerTestCase, suite_subprocess):
         else:
             self.session.rollback_transaction()
 
-        # Trigger a checkpoint, which could trigger reconcilation
+        # Trigger a checkpoint, which could trigger reconciliation
         self.conn.set_timestamp('stable_timestamp=' + timestamp_str(250))
         self.conn.set_timestamp('oldest_timestamp=' + timestamp_str(250))
         self.session.checkpoint()
@@ -135,7 +132,7 @@ class test_prepare_lookaside02(wttest.WiredTigerTestCase, suite_subprocess):
         c[3] = 1
         self.session.commit_transaction('commit_timestamp=' + timestamp_str(301))
 
-        # Trigger a checkpoint, which could trigger reconcilation
+        # Trigger a checkpoint, which could trigger reconciliation
         self.conn.set_timestamp('stable_timestamp=' + timestamp_str(350))
         self.conn.set_timestamp('oldest_timestamp=' + timestamp_str(350))
         self.session.checkpoint()
@@ -165,7 +162,7 @@ class test_prepare_lookaside02(wttest.WiredTigerTestCase, suite_subprocess):
         else:
             self.session.rollback_transaction()
 
-        # Trigger a checkpoint, which could trigger reconcilation
+        # Trigger a checkpoint, which could trigger reconciliation
         self.conn.set_timestamp('stable_timestamp=' + timestamp_str(450))
         self.conn.set_timestamp('oldest_timestamp=' + timestamp_str(450))
         self.session.checkpoint()
