@@ -66,6 +66,7 @@
 #include "mongo/db/storage/journal_listener.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_encryption_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_extensions.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_global_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_index.h"
@@ -450,6 +451,12 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         }
         _encryptionKeyDB = stdx::make_unique<EncryptionKeyDB>(keyDBPath.string());
         _encryptionKeyDB->init();
+        // setup encryption hooks
+        // WiredTigerEncryptionHooks instance should be created after EncryptionKeyDB (depends on it)
+        if (encryptionGlobalParams.encryptionCipherMode == "AES256-CBC")
+            EncryptionHooks::set(getGlobalServiceContext(), stdx::make_unique<WiredTigerEncryptionHooksCBC>());
+        else // AES256-GCM
+            EncryptionHooks::set(getGlobalServiceContext(), stdx::make_unique<WiredTigerEncryptionHooksGCM>());
     }
 
     std::stringstream ss;

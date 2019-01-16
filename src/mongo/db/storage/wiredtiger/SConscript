@@ -35,6 +35,8 @@ if wiredtiger:
         target='storage_wiredtiger_core',
         source= [
             'encryption_keydb.cpp',
+            'wiredtiger_data_protector.cpp',
+            'wiredtiger_encryption_hooks.cpp',
             'wiredtiger_global_options.cpp',
             'wiredtiger_index.cpp',
             'wiredtiger_kv_engine.cpp',
@@ -110,6 +112,18 @@ if wiredtiger:
         LIBDEPS=['storage_wiredtiger_core',
              ]
         )
+
+    wtEnv.CppUnitTest(
+        target='storage_wiredtiger_encryption_test',
+        source=[
+            'wiredtiger_encryption_test.cpp',
+        ],
+        LIBDEPS=[
+            'storage_wiredtiger_core',
+            '$BUILD_DIR/mongo/db/storage/encryption_hooks',
+            '$BUILD_DIR/mongo/util/clock_source_mock',
+        ],
+    )
 
     wtEnv.CppUnitTest(
         target='storage_wiredtiger_init_test',
