@@ -642,7 +642,7 @@ build_tarball(){
     fi
     #
 
-    PSM_TARGETS="mongod mongos mongo mongobridge"
+    PSM_TARGETS="mongod mongos mongo mongobridge perconadecrypt"
     TARBALL_SUFFIX=""
     if [ ${DEBUG} = 1 ]; then
     TARBALL_SUFFIX=".dbg"
