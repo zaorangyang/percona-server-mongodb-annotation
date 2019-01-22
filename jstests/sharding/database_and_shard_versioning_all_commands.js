@@ -465,7 +465,6 @@
 
         // Percona commands
         auditGetOptions: {skip: "executes locally on mongos (not sent to any remote node)"},
-        createBackup: {skip: "not allowed through mongos"},
     };
 
     class AllCommandsTestRunner {
