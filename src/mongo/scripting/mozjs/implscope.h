@@ -92,7 +92,7 @@ public:
 
     void reset() override;
 
-    void kill();
+    void kill() override;
 
     void interrupt();
 
@@ -113,6 +113,8 @@ public:
     bool hasOutOfMemoryException() override;
 
     void gc() override;
+
+    void sleep(Milliseconds ms);
 
     bool isJavaScriptProtectionEnabled() const;
 
@@ -352,6 +354,8 @@ public:
         static ASANHandles* getThreadASANHandles();
     };
 
+    void setStatus(Status status);
+
 private:
     template <typename ImplScopeFunction>
     auto _runSafely(ImplScopeFunction&& functionToRun) -> decltype(functionToRun());
@@ -407,7 +411,9 @@ private:
     JS::HandleObject _global;
     std::vector<JS::PersistentRootedValue> _funcs;
     InternedStringTable _internedStrings;
-    std::atomic<bool> _pendingKill;
+    Status _killStatus;
+    mutable std::mutex _mutex;
+    std::condition_variable _sleepCondition;
     std::string _error;
     unsigned int _opId;        // op id for this scope
     OperationContext* _opCtx;  // Op context for DbEval

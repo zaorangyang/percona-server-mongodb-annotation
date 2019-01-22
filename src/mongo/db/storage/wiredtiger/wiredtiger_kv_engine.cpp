@@ -467,8 +467,10 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     ss << "config_base=false,";
     ss << "statistics=(fast),";
 
-    // We are still using MongoDB's cursor cache, don't double up.
-    ss << "cache_cursors=false,";
+    if (!WiredTigerSessionCache::isEngineCachingCursors()) {
+        ss << "cache_cursors=false,";
+    }
+
     // Ensure WiredTiger creates data in the expected format and attempting to start with a
     // data directory created using a newer version will fail.
     ss << "compatibility=(release=\"3.0\",require_max=\"3.0\"),";
@@ -490,7 +492,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
     ss << extraOpenOptions;
     if (_readOnly) {
         invariant(!_durable);
-        ss << "readonly=true,";
+        ss << ",readonly=true,";
     }
     if (!_durable && !_readOnly) {
         // If we started without the journal, but previously used the journal then open with the
