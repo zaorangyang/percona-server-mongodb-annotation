@@ -215,6 +215,14 @@ Status addGeneralServerOptions(moe::OptionSection* options) {
                                moe::Int,
                                unixSockPermsBuilder.str());
 
+    options
+        ->addOptionChaining("security.relaxPermChecks",
+                            "relaxPermChecks",
+                            moe::Switch,
+                            "allow group read and write flags to be set for files specified with"
+                            " --keyFile and --encryptionKeyFile")
+        .hidden();
+
     options->addOptionChaining(
         "processManagement.fork", "fork", moe::Switch, "fork server process");
 
@@ -666,6 +674,10 @@ Status storeServerOptions(const moe::Environment& params) {
     if (params.count("net.unixDomainSocket.filePermissions")) {
         serverGlobalParams.unixSocketPermissions =
             params["net.unixDomainSocket.filePermissions"].as<int>();
+    }
+    if (params.count("security.relaxPermChecks") &&
+        params["security.relaxPermChecks"].as<bool>() == true) {
+        serverGlobalParams.relaxPermChecks = true;
     }
 
     if ((params.count("processManagement.fork") &&
