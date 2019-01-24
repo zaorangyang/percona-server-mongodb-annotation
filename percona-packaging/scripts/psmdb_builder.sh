@@ -709,6 +709,10 @@ build_tarball(){
     rm -rf vendor/pkg
     cp -r $(ls | grep -v build_tools) build_tools/src/github.com/mongodb/mongo-tools/
     cd build_tools/src/github.com/mongodb/mongo-tools
+    export GOROOT="/usr/local/go/"
+    export GOPATH=$(PWD)/
+    export PATH="/usr/local/go/bin:$(PATH):$(GOPATH)"
+    export GOBINPATH="/usr/local/go/bin"
     . ./set_tools_revision.sh
     sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
     sed -i 's|Gitspec="$(git rev-parse HEAD)"|Gitspec="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
