@@ -719,7 +719,7 @@ build_tarball(){
 	sed -i 's|go build|go build -a |' build.sh
     fi
     sed -i 's|exit $ec||' build.sh
-    . ./build.sh
+    . ./build.sh ${TOOLS_TAGS}
     mv bin/* ${PSMDIR_ABS}/${PSMDIR}/bin
     # end build tools
     #
