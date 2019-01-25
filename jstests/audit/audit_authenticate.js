@@ -25,6 +25,7 @@ auditTest(
 
         let beforeCmd = Date.now();
         assert(testDB.auth('john', 'john'), "could not auth as john (pwd john)");
+        testDB.logout();
 
         let beforeLoad = Date.now();
         var auditColl = getAuditEventsCollection(m, testDBName, undefined, true);
