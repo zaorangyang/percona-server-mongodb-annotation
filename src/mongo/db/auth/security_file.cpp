@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 
 #include "mongo/base/status_with.h"
+#include "mongo/db/server_options.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -55,7 +56,7 @@ StatusWith<std::string> readSecurityFile(const std::string& filename) {
     }
 
 #if !defined(_WIN32)
-    if (stats.st_uid == 0) {
+    if (serverGlobalParams.relaxPermChecks && stats.st_uid == 0) {
         /* In case the owner is root then permission of the key file
          * can be a bit more open than for the non root users. The
          * group read is also permissible values for the file permission.
