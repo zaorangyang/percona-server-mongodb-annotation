@@ -55,9 +55,10 @@ var checkLog;
          * Throws an exception on timeout.
          */
         var containsWithCount = function(conn, msg, expectedCount) {
-            var count = 0;
+            let count;
             assert.soon(
                 function() {
+                    count = 0;
                     var logMessages = getGlobalLog(conn);
                     if (logMessages === null) {
                         return false;
@@ -70,8 +71,8 @@ var checkLog;
 
                     return expectedCount === count;
                 },
-                'Expected ' + expectedCount + ', but instead saw ' + count +
-                    ' log entries containing the following message: ' + msg,
+                'Expected ' + expectedCount + ' log entries containing the following message: ' +
+                    msg + ' on node ' + conn.name,
                 5 * 60 * 1000,
                 300);
         };
