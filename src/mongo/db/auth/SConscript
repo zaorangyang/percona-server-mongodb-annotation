@@ -173,6 +173,7 @@ env.Library('security_file',
             ['security_file.cpp'],
             LIBDEPS=[
                 '$BUILD_DIR/mongo/base',
+                '$BUILD_DIR/mongo/db/server_options_core',
             ],
 )
 
