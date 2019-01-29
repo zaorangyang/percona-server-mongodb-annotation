@@ -71,7 +71,7 @@ std::string nsGetCollection(const std::string& ns);
  * them as "final" or "override" as appropriate.
  */
 class DBClientQueryInterface {
-    virtual std::unique_ptr<DBClientCursor> query(const std::string& ns,
+    virtual std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
                                                   Query query,
                                                   int nToReturn = 0,
                                                   int nToSkip = 0,
@@ -80,13 +80,13 @@ class DBClientQueryInterface {
                                                   int batchSize = 0) = 0;
 
     virtual unsigned long long query(stdx::function<void(const BSONObj&)> f,
-                                     const std::string& ns,
+                                     const NamespaceStringOrUUID& nsOrUuid,
                                      Query query,
                                      const BSONObj* fieldsToReturn = 0,
                                      int queryOptions = 0) = 0;
 
     virtual unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
-                                     const std::string& ns,
+                                     const NamespaceStringOrUUID& nsOrUuid,
                                      Query query,
                                      const BSONObj* fieldsToReturn = 0,
                                      int queryOptions = 0) = 0;
@@ -497,6 +497,13 @@ public:
 
     virtual void createIndexes(StringData ns, const std::vector<const IndexSpec*>& descriptor);
 
+    /**
+     * Creates indexes on the collection 'ns' as described by 'specs'.
+     *
+     * Failure to construct the indexes is reported by throwing an AssertionException.
+     */
+    virtual void createIndexes(StringData ns, const std::vector<BSONObj>& specs);
+
     virtual std::list<BSONObj> getIndexSpecs(const std::string& ns, int options = 0);
 
     virtual void dropIndex(const std::string& ns, BSONObj keys);
@@ -572,7 +579,7 @@ public:
      @return    cursor.   0 if error (connection failure)
      @throws AssertionException
     */
-    std::unique_ptr<DBClientCursor> query(const std::string& ns,
+    std::unique_ptr<DBClientCursor> query(const NamespaceStringOrUUID& nsOrUuid,
                                           Query query,
                                           int nToReturn = 0,
                                           int nToSkip = 0,
@@ -588,15 +595,19 @@ public:
 
         Use the DBClientCursorBatchIterator version, below, if you want to do items in large
         blocks, perhaps to avoid granular locking and such.
+
+        Note:
+        The version that takes a BSONObj cannot return the namespace queried when the query is
+        is done by UUID.  If this is required, use the DBClientBatchIterator version.
      */
     unsigned long long query(stdx::function<void(const BSONObj&)> f,
-                             const std::string& ns,
+                             const NamespaceStringOrUUID& nsOrUuid,
                              Query query,
                              const BSONObj* fieldsToReturn = 0,
                              int queryOptions = 0) final;
 
     unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
-                             const std::string& ns,
+                             const NamespaceStringOrUUID& nsOrUuid,
                              Query query,
                              const BSONObj* fieldsToReturn = 0,
                              int queryOptions = 0) override;

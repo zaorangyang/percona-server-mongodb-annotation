@@ -39,38 +39,7 @@
 
 namespace mongo {
 
-// static
-bool WorkingSetCommon::fetchAndInvalidateRecordId(OperationContext* opCtx,
-                                                  WorkingSetMember* member,
-                                                  const Collection* collection) {
-    // Already in our desired state.
-    if (member->getState() == WorkingSetMember::OWNED_OBJ) {
-        return true;
-    }
-
-    // We can't do anything without a RecordId.
-    if (!member->hasRecordId()) {
-        return false;
-    }
-
-    // Do the fetch, invalidate the DL.
-    member->obj = collection->docFor(opCtx, member->recordId);
-    member->obj.setValue(member->obj.value().getOwned());
-    member->recordId = RecordId();
-    member->transitionToOwnedObj();
-
-    return true;
-}
-
 void WorkingSetCommon::prepareForSnapshotChange(WorkingSet* workingSet) {
-    if (!supportsDocLocking()) {
-        // Non doc-locking storage engines use invalidations, so we don't need to examine the
-        // buffered working set ids. But we do need to clear the set of ids in order to keep our
-        // memory utilization in check.
-        workingSet->getAndClearYieldSensitiveIds();
-        return;
-    }
-
     for (auto id : workingSet->getAndClearYieldSensitiveIds()) {
         if (workingSet->isFree(id)) {
             continue;
@@ -90,9 +59,6 @@ bool WorkingSetCommon::fetch(OperationContext* opCtx,
                              WorkingSetID id,
                              unowned_ptr<SeekableRecordCursor> cursor) {
     WorkingSetMember* member = workingSet->get(id);
-
-    // The RecordFetcher should already have been transferred out of the WSM and used.
-    invariant(!member->hasFetcher());
 
     // We should have a RecordId but need to retrieve the obj. Get the obj now and reset all WSM
     // state appropriately.

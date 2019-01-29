@@ -278,7 +278,7 @@ void createIndexForApplyOps(OperationContext* opCtx,
         incrementOpsAppliedStats();
     }
     getGlobalServiceContext()->getOpObserver()->onCreateIndex(
-        opCtx, indexNss, indexCollection->uuid(), indexSpec, false);
+        opCtx, indexNss, *(indexCollection->uuid()), indexSpec, false);
 }
 
 namespace {
@@ -435,6 +435,16 @@ OpTime logOp(OperationContext* opCtx,
              const OplogLink& oplogLink,
              bool prepare,
              const OplogSlot& oplogSlot) {
+    // All collections should have UUIDs now, so all insert, update, and delete oplog entries should
+    // also have uuids. Some no-op (n) and command (c) entries may still elide the uuid field.
+    invariant(uuid || 'n' == *opstr || 'c' == *opstr,
+              str::stream() << "Expected uuid for logOp with opstr: " << opstr << ", nss: "
+                            << nss.ns()
+                            << ", obj: "
+                            << obj
+                            << ", os: "
+                            << o2);
+
     auto replCoord = ReplicationCoordinator::get(opCtx);
     // For commands, the test below is on the command ns and therefore does not check for
     // specific namespaces such as system.profile. This is the caller's responsibility.
@@ -447,10 +457,16 @@ OpTime logOp(OperationContext* opCtx,
     }
 
     const auto& oplogInfo = localOplogInfo(opCtx->getServiceContext());
-    Lock::DBLock lk(opCtx, NamespaceString::kLocalDb, MODE_IX);
-    Lock::CollectionLock lock(opCtx->lockState(), oplogInfo.oplogName, MODE_IX);
-    auto const oplog = oplogInfo.oplog;
 
+    // Obtain Collection exclusive intent write lock for non-document-locking storage engines.
+    boost::optional<Lock::DBLock> dbWriteLock;
+    boost::optional<Lock::CollectionLock> collWriteLock;
+    if (!opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking()) {
+        dbWriteLock.emplace(opCtx, NamespaceString::kLocalDb, MODE_IX);
+        collWriteLock.emplace(opCtx->lockState(), oplogInfo.oplogName, MODE_IX);
+    }
+
+    auto const oplog = oplogInfo.oplog;
     OplogSlot slot;
     WriteUnitOfWork wuow(opCtx);
     if (oplogSlot.opTime.isNull()) {
@@ -503,10 +519,16 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
     std::vector<OplogDocWriter> writers;
     writers.reserve(count);
     const auto& oplogInfo = localOplogInfo(opCtx->getServiceContext());
-    Lock::DBLock lk(opCtx, "local", MODE_IX);
-    Lock::CollectionLock lock(opCtx->lockState(), oplogInfo.oplogName, MODE_IX);
-    auto oplog = oplogInfo.oplog;
 
+    // Obtain Collection exclusive intent write lock for non-document-locking storage engines.
+    boost::optional<Lock::DBLock> dbWriteLock;
+    boost::optional<Lock::CollectionLock> collWriteLock;
+    if (!opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking()) {
+        dbWriteLock.emplace(opCtx, NamespaceString::kLocalDb, MODE_IX);
+        collWriteLock.emplace(opCtx->lockState(), oplogInfo.oplogName, MODE_IX);
+    }
+
+    auto oplog = oplogInfo.oplog;
     WriteUnitOfWork wuow(opCtx);
 
     OperationSessionInfo sessionInfo;
@@ -963,6 +985,14 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
           return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
       },
       {ErrorCodes::NamespaceNotFound}}},
+    {"abortTransaction",
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status { return Status::OK(); },
+      {}}},
 };
 
 }  // namespace
@@ -1002,45 +1032,6 @@ StatusWith<OplogApplication::Mode> OplogApplication::parseMode(const std::string
     MONGO_UNREACHABLE;
 }
 
-std::pair<BSONObj, NamespaceString> prepForApplyOpsIndexInsert(const BSONElement& fieldO,
-                                                               const BSONObj& op,
-                                                               const NamespaceString& requestNss) {
-    uassert(ErrorCodes::NoSuchKey,
-            str::stream() << "Missing expected index spec in field 'o': " << op,
-            !fieldO.eoo());
-    uassert(ErrorCodes::TypeMismatch,
-            str::stream() << "Expected object for index spec in field 'o': " << op,
-            fieldO.isABSONObj());
-    BSONObj indexSpec = fieldO.embeddedObject();
-
-    std::string indexNs;
-    uassertStatusOK(bsonExtractStringField(indexSpec, "ns", &indexNs));
-    const NamespaceString indexNss(indexNs);
-    uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Invalid namespace in index spec: " << op,
-            indexNss.isValid());
-    uassert(ErrorCodes::InvalidNamespace,
-            str::stream() << "Database name mismatch for database (" << requestNss.db()
-                          << ") while creating index: "
-                          << op,
-            requestNss.db() == indexNss.db());
-
-    if (!indexSpec["v"]) {
-        // If the "v" field isn't present in the index specification, then we assume it is a
-        // v=1 index from an older version of MongoDB. This is because
-        //   (1) we haven't built v=0 indexes as the default for a long time, and
-        //   (2) the index version has been included in the corresponding oplog entry since
-        //       v=2 indexes were introduced.
-        BSONObjBuilder bob;
-
-        bob.append("v", static_cast<int>(IndexVersion::kV1));
-        bob.appendElements(indexSpec);
-
-        indexSpec = bob.obj();
-    }
-
-    return std::make_pair(indexSpec, indexNss);
-}
 // @return failure status if an update should have happened and the document DNE.
 // See replset initial sync code.
 Status applyOperation_inlock(OperationContext* opCtx,
@@ -1200,14 +1191,6 @@ Status applyOperation_inlock(OperationContext* opCtx,
               str::stream() << "Oplog entry did not have 'ts' field when expected: " << redact(op));
 
     if (*opType == 'i') {
-        if (requestNss.isSystemDotIndexes()) {
-            BSONObj indexSpec;
-            NamespaceString indexNss;
-            std::tie(indexSpec, indexNss) =
-                repl::prepForApplyOpsIndexInsert(fieldO, op, requestNss);
-            createIndexForApplyOps(opCtx, indexSpec, indexNss, incrementOpsAppliedStats, mode);
-            return Status::OK();
-        }
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "Failed to apply insert due to missing collection: "
                               << op.toString(),

@@ -99,6 +99,11 @@ public:
     stdx::function<void(bool)> onTransactionCommitFn = [this](bool wasPrepared) {
         transactionCommitted = true;
     };
+
+    void onTransactionAbort(OperationContext* opCtx) override;
+    bool onTransactionAbortThrowsException = false;
+    bool transactionAborted = false;
+    stdx::function<void()> onTransactionAbortFn = [this]() { transactionAborted = true; };
 };
 
 void OpObserverMock::onTransactionPrepare(OperationContext* opCtx, const OplogSlot& prepareOpTime) {
@@ -122,6 +127,15 @@ void OpObserverMock::onTransactionCommit(OperationContext* opCtx, bool wasPrepar
     onTransactionCommitFn(wasPrepared);
 }
 
+void OpObserverMock::onTransactionAbort(OperationContext* opCtx) {
+    OpObserverNoop::onTransactionAbort(opCtx);
+    uassert(ErrorCodes::OperationFailed,
+            "onTransactionAbort() failed",
+            !onTransactionAbortThrowsException);
+    transactionAborted = true;
+    onTransactionAbortFn();
+}
+
 // When this class is in scope, makes the system behave as if we're in a DBDirectClient
 class DirectClientSetter {
 public:
@@ -141,7 +155,7 @@ private:
 
 class TxnParticipantTest : public MockReplCoordServerFixture {
 protected:
-    void setUp() final {
+    void setUp() override {
         MockReplCoordServerFixture::setUp();
 
         auto service = opCtx()->getServiceContext();
@@ -160,7 +174,7 @@ protected:
         opCtx()->setTxnNumber(_txnNumber);
     }
 
-    void tearDown() final {
+    void tearDown() override {
         // Clear all sessions to free up any stashed resources.
         SessionCatalog::get(opCtx()->getServiceContext())->reset_forTest();
 
@@ -536,13 +550,24 @@ TEST_F(TxnParticipantTest, AutocommitRequiredOnEveryTxnOp) {
                        AssertionException,
                        ErrorCodes::InvalidOptions);
 
-    // Setting 'autocommit=true' should throw an error.
-    ASSERT_THROWS_CODE(txnParticipant->beginOrContinue(txnNum, true, boost::none),
-                       AssertionException,
-                       ErrorCodes::InvalidOptions);
-
     // Including autocommit=false should succeed.
     txnParticipant->beginOrContinue(*opCtx()->getTxnNumber(), false, boost::none);
+}
+
+DEATH_TEST_F(TxnParticipantTest, AutocommitCannotBeTrue, "invariant") {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+
+    // Passing 'autocommit=true' is not allowed and should crash.
+    txnParticipant->beginOrContinue(*opCtx()->getTxnNumber(), true, boost::none);
+}
+
+DEATH_TEST_F(TxnParticipantTest, StartTransactionCannotBeFalse, "invariant") {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+
+    // Passing 'startTransaction=false' is not allowed and should crash.
+    txnParticipant->beginOrContinue(*opCtx()->getTxnNumber(), false, false);
 }
 
 TEST_F(TxnParticipantTest, SameTransactionPreservesStoredStatements) {
@@ -862,7 +887,7 @@ TEST_F(TxnParticipantTest, ConcurrencyOfCommitTransactionAndAbort) {
                        ErrorCodes::NoSuchTransaction);
 }
 
-TEST_F(TxnParticipantTest, ConcurrencyOfActiveAbortAndArbitraryAbort) {
+TEST_F(TxnParticipantTest, ConcurrencyOfActiveUnpreparedAbortAndArbitraryAbort) {
     OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
 
@@ -879,7 +904,7 @@ TEST_F(TxnParticipantTest, ConcurrencyOfActiveAbortAndArbitraryAbort) {
     ASSERT(opCtx()->getWriteUnitOfWork() == nullptr);
 }
 
-TEST_F(TxnParticipantTest, ConcurrencyOfActiveAbortAndMigration) {
+TEST_F(TxnParticipantTest, ConcurrencyOfActiveUnpreparedAbortAndMigration) {
     OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
 
@@ -892,12 +917,31 @@ TEST_F(TxnParticipantTest, ConcurrencyOfActiveAbortAndMigration) {
     const auto higherTxnNum = *opCtx()->getTxnNumber() + 1;
     bumpTxnNumberFromDifferentOpCtx(*opCtx()->getLogicalSessionId(), higherTxnNum);
 
-    // The operation throws for some reason and aborts implicitly.
-    // Abort active transaction after it's been aborted by migration is a no-op.
-    txnParticipant->abortActiveTransaction(opCtx());
+    ASSERT_THROWS_CODE(txnParticipant->abortActiveTransaction(opCtx()),
+                       AssertionException,
+                       ErrorCodes::ConflictingOperationInProgress);
 
-    // The session's state is None after migration, but we should have cleared
-    // the states of opCtx.
+    // The abort fails so the OperationContext state is not cleaned up until the operation is
+    // complete. The session has already moved on to a new transaction so the transaction will not
+    // remain active beyond this operation.
+    ASSERT_FALSE(opCtx()->getWriteUnitOfWork() == nullptr);
+}
+
+TEST_F(TxnParticipantTest, ConcurrencyOfActivePreparedAbortAndArbitraryAbort) {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+    ASSERT(txnParticipant->inMultiDocumentTransaction());
+    txnParticipant->prepareTransaction(opCtx());
+
+    // The transaction may be aborted without checking out the txnParticipant.
+    txnParticipant->abortArbitraryTransaction();
+
+    // The operation throws for some reason and aborts implicitly.
+    // Abort active transaction after it's been aborted by KillSession is a no-op.
+    txnParticipant->abortActiveTransaction(opCtx());
+    ASSERT(txnParticipant->transactionIsAborted());
     ASSERT(opCtx()->getWriteUnitOfWork() == nullptr);
 }
 
@@ -945,7 +989,7 @@ TEST_F(TxnParticipantTest, KillSessionsDuringPrepareDoesNotAbortTransaction) {
     ASSERT_FALSE(txnParticipant->transactionIsAborted());
 }
 
-DEATH_TEST_F(TxnParticipantTest, AbortDuringPrepareIsFatal, "Fatal assertion 50906") {
+DEATH_TEST_F(TxnParticipantTest, AbortDuringPrepareIsFatal, "Invariant") {
     OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "prepareTransaction");
@@ -1199,6 +1243,24 @@ TEST_F(TxnParticipantTest, CannotStartNewTransactionWhilePreparedTransactionInPr
     ASSERT(_opObserver->transactionPrepared);
 }
 
+TEST_F(TxnParticipantTest, CannotInsertInPreparedTransaction) {
+    OperationContextSessionMongod outerScopedSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+    auto operation = repl::OplogEntry::makeInsertOperation(kNss, kUUID, BSON("TestValue" << 0));
+    txnParticipant->addTransactionOperation(opCtx(), operation);
+
+    txnParticipant->prepareTransaction(opCtx());
+
+    ASSERT_THROWS_CODE(txnParticipant->unstashTransactionResources(opCtx(), "insert"),
+                       AssertionException,
+                       ErrorCodes::PreparedTransactionInProgress);
+
+    ASSERT_FALSE(txnParticipant->transactionIsAborted());
+    ASSERT(_opObserver->transactionPrepared);
+}
+
 TEST_F(TxnParticipantTest, MigrationThrowsOnPreparedTransaction) {
     OperationContextSessionMongod outerScopedSession(opCtx(), true, false, true);
     auto txnParticipant = TransactionParticipant::get(opCtx());
@@ -1289,190 +1351,6 @@ TEST_F(TxnParticipantTest, TransactionTooLargeWhileBuilding) {
                        ErrorCodes::TransactionTooLarge);
 }
 
-TEST_F(TxnParticipantTest, IncrementTotalStartedUponStartTransaction) {
-    unsigned long long beforeTransactionStart =
-        ServerTransactionsMetrics::get(opCtx())->getTotalStarted();
-
-    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
-
-    // Tests that the total transactions started counter is incremented by 1 when a new transaction
-    // is started.
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalStarted(),
-              beforeTransactionStart + 1U);
-}
-
-TEST_F(TxnParticipantTest, IncrementTotalCommittedOnCommit) {
-    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-    txnParticipant->unstashTransactionResources(opCtx(), "commitTransaction");
-
-    unsigned long long beforeCommitCount =
-        ServerTransactionsMetrics::get(opCtx())->getTotalCommitted();
-
-    txnParticipant->commitUnpreparedTransaction(opCtx());
-
-    // Assert that the committed counter is incremented by 1.
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalCommitted(), beforeCommitCount + 1U);
-}
-
-TEST_F(TxnParticipantTest, IncrementTotalAbortedUponAbort) {
-    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-    txnParticipant->unstashTransactionResources(opCtx(), "insert");
-
-    unsigned long long beforeAbortCount =
-        ServerTransactionsMetrics::get(opCtx())->getTotalAborted();
-
-    txnParticipant->abortArbitraryTransaction();
-
-    // Assert that the aborted counter is incremented by 1.
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalAborted(), beforeAbortCount + 1U);
-}
-
-TEST_F(TxnParticipantTest, TrackTotalOpenTransactionsWithAbort) {
-    unsigned long long beforeTransactionStart =
-        ServerTransactionsMetrics::get(opCtx())->getCurrentOpen();
-
-    // Tests that starting a transaction increments the open transactions counter by 1.
-    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-    txnParticipant->unstashTransactionResources(opCtx(), "insert");
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(),
-              beforeTransactionStart + 1U);
-
-    // Tests that stashing the transaction resources does not affect the open transactions counter.
-    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
-    txnParticipant->stashTransactionResources(opCtx());
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(),
-              beforeTransactionStart + 1U);
-
-    // Tests that aborting a transaction decrements the open transactions counter by 1.
-    txnParticipant->abortArbitraryTransaction();
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(), beforeTransactionStart);
-}
-
-TEST_F(TxnParticipantTest, TrackTotalOpenTransactionsWithCommit) {
-    unsigned long long beforeTransactionStart =
-        ServerTransactionsMetrics::get(opCtx())->getCurrentOpen();
-
-    // Tests that starting a transaction increments the open transactions counter by 1.
-    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-    txnParticipant->unstashTransactionResources(opCtx(), "insert");
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(),
-              beforeTransactionStart + 1U);
-
-    // Tests that stashing the transaction resources does not affect the open transactions counter.
-    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
-    txnParticipant->stashTransactionResources(opCtx());
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(),
-              beforeTransactionStart + 1U);
-
-    txnParticipant->unstashTransactionResources(opCtx(), "insert");
-
-    // Tests that committing a transaction decrements the open transactions counter by 1.
-    txnParticipant->commitUnpreparedTransaction(opCtx());
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(), beforeTransactionStart);
-}
-
-TEST_F(TxnParticipantTest, TrackTotalActiveAndInactiveTransactionsWithCommit) {
-    unsigned long long beforeActiveCounter =
-        ServerTransactionsMetrics::get(opCtx())->getCurrentActive();
-    unsigned long long beforeInactiveCounter =
-        ServerTransactionsMetrics::get(opCtx())->getCurrentInactive();
-
-    // Starting the transaction should put it into an inactive state.
-    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
-              beforeInactiveCounter + 1);
-
-    // Tests that the first unstash increments the active counter and decrements the inactive
-    // counter.
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-    txnParticipant->unstashTransactionResources(opCtx(), "insert");
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(),
-              beforeActiveCounter + 1U);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
-
-    // Tests that stashing the transaction resources decrements active counter and increments
-    // inactive counter.
-    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
-    txnParticipant->stashTransactionResources(opCtx());
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
-              beforeInactiveCounter + 1U);
-
-    // Tests that the second unstash increments the active counter and decrements the inactive
-    // counter.
-    txnParticipant->unstashTransactionResources(opCtx(), "insert");
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(),
-              beforeActiveCounter + 1U);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
-
-    // Tests that committing a transaction decrements the active counter only.
-    txnParticipant->commitUnpreparedTransaction(opCtx());
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
-}
-
-TEST_F(TxnParticipantTest, TrackTotalActiveAndInactiveTransactionsWithStashedAbort) {
-    unsigned long long beforeActiveCounter =
-        ServerTransactionsMetrics::get(opCtx())->getCurrentActive();
-    unsigned long long beforeInactiveCounter =
-        ServerTransactionsMetrics::get(opCtx())->getCurrentInactive();
-
-    // Starting the transaction should put it into an inactive state.
-    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
-              beforeInactiveCounter + 1);
-
-    // Tests that the first unstash increments the active counter and decrements the inactive
-    // counter.
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-    txnParticipant->unstashTransactionResources(opCtx(), "insert");
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(),
-              beforeActiveCounter + 1U);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
-
-    // Tests that stashing the transaction resources decrements active counter and increments
-    // inactive counter.
-    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
-    txnParticipant->stashTransactionResources(opCtx());
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
-              beforeInactiveCounter + 1U);
-
-    // Tests that aborting a stashed transaction decrements the inactive counter only.
-    txnParticipant->abortArbitraryTransaction();
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
-}
-
-TEST_F(TxnParticipantTest, TrackTotalActiveAndInactiveTransactionsWithUnstashedAbort) {
-    unsigned long long beforeActiveCounter =
-        ServerTransactionsMetrics::get(opCtx())->getCurrentActive();
-    unsigned long long beforeInactiveCounter =
-        ServerTransactionsMetrics::get(opCtx())->getCurrentInactive();
-
-    // Starting the transaction should put it into an inactive state.
-    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
-              beforeInactiveCounter + 1);
-
-    // Tests that the first unstash increments the active counter and decrements the inactive
-    // counter.
-    auto txnParticipant = TransactionParticipant::get(opCtx());
-    txnParticipant->unstashTransactionResources(opCtx(), "insert");
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(),
-              beforeActiveCounter + 1U);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
-
-    // Tests that aborting a stashed transaction decrements the active counter only.
-    txnParticipant->abortArbitraryTransaction();
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
-    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
-}
-
 TEST_F(TxnParticipantTest, StashInNestedSessionIsANoop) {
     OperationContextSessionMongod outerScopedSession(opCtx(), true, false, true);
     Locker* originalLocker = opCtx()->lockState();
@@ -1545,9 +1423,487 @@ TEST_F(TxnParticipantTest, UnstashInNestedSessionIsANoop) {
 }
 
 /**
+ * Test fixture for testing behavior that depends on a server's cluster role.
+ *
+ * Each test case relies on the txnNumber on the operation context, which cannot be changed, so
+ * define tests for behavior shared by config and shard servers as methods here and call them in the
+ * fixtures for config and shard servers defined below.
+ */
+class ShardedClusterParticipantTest : public TxnParticipantTest {
+protected:
+    void canSpecifyStartTransactionOnInProgressTxn() {
+        auto autocommit = false;
+        auto startTransaction = true;
+        OperationContextSessionMongod opCtxSession(
+            opCtx(), true /* shouldCheckOutSession */, autocommit, startTransaction);
+
+        auto txnParticipant = TransactionParticipant::get(opCtx());
+        ASSERT(txnParticipant->inMultiDocumentTransaction());
+
+        txnParticipant->beginOrContinue(*opCtx()->getTxnNumber(), autocommit, startTransaction);
+        ASSERT(txnParticipant->inMultiDocumentTransaction());
+    }
+
+    void canSpecifyStartTransactionOnAbortedTxn() {
+        auto autocommit = false;
+        auto startTransaction = true;
+        OperationContextSessionMongod opCtxSession(
+            opCtx(), true /* shouldCheckOutSession */, autocommit, startTransaction);
+
+        auto txnParticipant = TransactionParticipant::get(opCtx());
+        ASSERT(txnParticipant->inMultiDocumentTransaction());
+
+        txnParticipant->abortActiveTransaction(opCtx());
+        ASSERT(txnParticipant->transactionIsAborted());
+
+        txnParticipant->beginOrContinue(*opCtx()->getTxnNumber(), autocommit, startTransaction);
+        ASSERT(txnParticipant->inMultiDocumentTransaction());
+    }
+
+    void cannotSpecifyStartTransactionOnCommittedTxn() {
+        auto autocommit = false;
+        auto startTransaction = true;
+        OperationContextSessionMongod opCtxSession(
+            opCtx(), true /* shouldCheckOutSession */, autocommit, startTransaction);
+
+        auto txnParticipant = TransactionParticipant::get(opCtx());
+        ASSERT(txnParticipant->inMultiDocumentTransaction());
+
+        txnParticipant->unstashTransactionResources(opCtx(), "commitTransaction");
+        txnParticipant->commitUnpreparedTransaction(opCtx());
+
+        ASSERT_THROWS_CODE(
+            txnParticipant->beginOrContinue(*opCtx()->getTxnNumber(), autocommit, startTransaction),
+            AssertionException,
+            50911);
+    }
+
+    void cannotSpecifyStartTransactionOnPreparedTxn() {
+        auto autocommit = false;
+        auto startTransaction = true;
+        OperationContextSessionMongod opCtxSession(
+            opCtx(), true /* shouldCheckOutSession */, autocommit, startTransaction);
+
+        auto txnParticipant = TransactionParticipant::get(opCtx());
+        ASSERT(txnParticipant->inMultiDocumentTransaction());
+
+        txnParticipant->unstashTransactionResources(opCtx(), "insert");
+        auto operation = repl::OplogEntry::makeInsertOperation(kNss, kUUID, BSON("TestValue" << 0));
+        txnParticipant->addTransactionOperation(opCtx(), operation);
+        txnParticipant->prepareTransaction(opCtx());
+
+        ASSERT_THROWS_CODE(
+            txnParticipant->beginOrContinue(*opCtx()->getTxnNumber(), autocommit, startTransaction),
+            AssertionException,
+            50911);
+    }
+
+    void cannotSpecifyStartTransactionOnStartedRetryableWrite() {
+        boost::optional<bool> autocommit = boost::none;
+        boost::optional<bool> startTransaction = boost::none;
+        OperationContextSessionMongod opCtxSession(
+            opCtx(), true /* shouldCheckOutSession */, autocommit, startTransaction);
+
+        auto txnParticipant = TransactionParticipant::get(opCtx());
+        ASSERT_FALSE(txnParticipant->inMultiDocumentTransaction());
+
+        autocommit = false;
+        startTransaction = true;
+        ASSERT_THROWS_CODE(
+            txnParticipant->beginOrContinue(*opCtx()->getTxnNumber(), autocommit, startTransaction),
+            AssertionException,
+            50911);
+    }
+
+    // TODO SERVER-36639: Add tests that the active transaction number cannot be reused if the
+    // transaction is in the abort after prepare state (or any state indicating the participant
+    // has been involved in a two phase commit).
+};
+
+/**
+ * Test fixture for a transaction participant running on a shard server.
+ */
+class ShardTxnParticipantTest : public ShardedClusterParticipantTest {
+protected:
+    void setUp() final {
+        TxnParticipantTest::setUp();
+        serverGlobalParams.clusterRole = ClusterRole::ShardServer;
+    }
+
+    void tearDown() final {
+        serverGlobalParams.clusterRole = ClusterRole::None;
+        TxnParticipantTest::tearDown();
+    }
+};
+
+TEST_F(ShardTxnParticipantTest, CanSpecifyStartTransactionOnInProgressTxn) {
+    canSpecifyStartTransactionOnInProgressTxn();
+}
+
+TEST_F(ShardTxnParticipantTest, CanSpecifyStartTransactionOnAbortedTxn) {
+    canSpecifyStartTransactionOnAbortedTxn();
+}
+
+TEST_F(ShardTxnParticipantTest, CannotSpecifyStartTransactionOnCommittedTxn) {
+    cannotSpecifyStartTransactionOnCommittedTxn();
+}
+
+TEST_F(ShardTxnParticipantTest, CannotSpecifyStartTransactionOnPreparedTxn) {
+    cannotSpecifyStartTransactionOnPreparedTxn();
+}
+
+TEST_F(ShardTxnParticipantTest, CannotSpecifyStartTransactionOnStartedRetryableWrite) {
+    cannotSpecifyStartTransactionOnStartedRetryableWrite();
+}
+
+/**
+ * Test fixture for a transaction participant running on a config server.
+ */
+class ConfigTxnParticipantTest : public ShardedClusterParticipantTest {
+protected:
+    void setUp() final {
+        TxnParticipantTest::setUp();
+        serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
+    }
+
+    void tearDown() final {
+        serverGlobalParams.clusterRole = ClusterRole::None;
+        TxnParticipantTest::tearDown();
+    }
+};
+
+TEST_F(ConfigTxnParticipantTest, CanSpecifyStartTransactionOnInProgressTxn) {
+    canSpecifyStartTransactionOnInProgressTxn();
+}
+
+TEST_F(ConfigTxnParticipantTest, CanSpecifyStartTransactionOnAbortedTxn) {
+    canSpecifyStartTransactionOnAbortedTxn();
+}
+
+TEST_F(ConfigTxnParticipantTest, CannotSpecifyStartTransactionOnCommittedTxn) {
+    cannotSpecifyStartTransactionOnCommittedTxn();
+}
+
+TEST_F(ConfigTxnParticipantTest, CannotSpecifyStartTransactionOnPreparedTxn) {
+    cannotSpecifyStartTransactionOnPreparedTxn();
+}
+
+TEST_F(ConfigTxnParticipantTest, CannotSpecifyStartTransactionOnStartedRetryableWrite) {
+    cannotSpecifyStartTransactionOnStartedRetryableWrite();
+}
+
+TEST_F(TxnParticipantTest, KillSessionsDuringUnpreparedAbortSucceeds) {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "abortTransaction");
+
+    auto originalFn = _opObserver->onTransactionAbortFn;
+    _opObserver->onTransactionAbortFn = [&] {
+        originalFn();
+
+        // The transaction may be aborted without checking out the txnParticipant.
+        txnParticipant->abortArbitraryTransaction();
+        ASSERT(txnParticipant->transactionIsAborted());
+    };
+
+    txnParticipant->abortActiveTransaction(opCtx());
+
+    ASSERT(_opObserver->transactionAborted);
+    ASSERT(txnParticipant->transactionIsAborted());
+}
+
+TEST_F(TxnParticipantTest, ActiveAbortIsLegalDuringUnpreparedAbort) {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "abortTransaction");
+
+    auto sessionId = *opCtx()->getLogicalSessionId();
+    auto txnNumber = *opCtx()->getTxnNumber();
+    auto originalFn = _opObserver->onTransactionAbortFn;
+    _opObserver->onTransactionAbortFn = [&] {
+        originalFn();
+
+        auto func = [&](OperationContext* opCtx) {
+            opCtx->setLogicalSessionId(sessionId);
+            opCtx->setTxnNumber(txnNumber);
+
+            // Prevent recursion.
+            _opObserver->onTransactionAbortFn = originalFn;
+            txnParticipant->abortActiveTransaction(opCtx);
+            ASSERT(txnParticipant->transactionIsAborted());
+        };
+        runFunctionFromDifferentOpCtx(func);
+    };
+
+    txnParticipant->abortActiveTransaction(opCtx());
+    ASSERT(_opObserver->transactionAborted);
+    ASSERT(txnParticipant->transactionIsAborted());
+}
+
+TEST_F(TxnParticipantTest, ThrowDuringUnpreparedOnTransactionAbort) {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "abortTransaction");
+
+    _opObserver->onTransactionAbortThrowsException = true;
+
+    ASSERT_THROWS_CODE(txnParticipant->abortActiveTransaction(opCtx()),
+                       AssertionException,
+                       ErrorCodes::OperationFailed);
+}
+
+TEST_F(TxnParticipantTest, KillSessionsDuringPreparedAbortFails) {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "abortTransaction");
+    txnParticipant->prepareTransaction(opCtx());
+
+    auto originalFn = _opObserver->onTransactionAbortFn;
+    _opObserver->onTransactionAbortFn = [&] {
+        originalFn();
+
+        // KillSessions may attempt to abort without checking out the txnParticipant.
+        txnParticipant->abortArbitraryTransaction();
+        ASSERT_FALSE(txnParticipant->transactionIsAborted());
+        ASSERT(txnParticipant->transactionIsPrepared());
+    };
+
+    txnParticipant->abortActiveTransaction(opCtx());
+
+    ASSERT(_opObserver->transactionAborted);
+    ASSERT(txnParticipant->transactionIsAborted());
+}
+
+TEST_F(TxnParticipantTest, ActiveAbortSucceedsDuringPreparedAbort) {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "abortTransaction");
+    txnParticipant->prepareTransaction(opCtx());
+
+    auto sessionId = *opCtx()->getLogicalSessionId();
+    auto txnNumber = *opCtx()->getTxnNumber();
+    auto originalFn = _opObserver->onTransactionAbortFn;
+    _opObserver->onTransactionAbortFn = [&] {
+        originalFn();
+
+        auto func = [&](OperationContext* opCtx) {
+            opCtx->setLogicalSessionId(sessionId);
+            opCtx->setTxnNumber(txnNumber);
+
+            // Prevent recursion.
+            _opObserver->onTransactionAbortFn = originalFn;
+            txnParticipant->abortActiveTransaction(opCtx);
+            ASSERT(txnParticipant->transactionIsAborted());
+        };
+        runFunctionFromDifferentOpCtx(func);
+    };
+
+    txnParticipant->abortActiveTransaction(opCtx());
+    ASSERT(_opObserver->transactionAborted);
+    ASSERT(txnParticipant->transactionIsAborted());
+}
+
+TEST_F(TxnParticipantTest, ThrowDuringPreparedOnTransactionAbortIsFatal) {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "abortTransaction");
+    txnParticipant->prepareTransaction(opCtx());
+
+    _opObserver->onTransactionAbortThrowsException = true;
+
+    ASSERT_THROWS_CODE(txnParticipant->abortActiveTransaction(opCtx()),
+                       AssertionException,
+                       ErrorCodes::OperationFailed);
+}
+
+/**
  * Test fixture for transactions metrics.
  */
 class TransactionsMetricsTest : public TxnParticipantTest {};
+
+TEST_F(TransactionsMetricsTest, IncrementTotalStartedUponStartTransaction) {
+    unsigned long long beforeTransactionStart =
+        ServerTransactionsMetrics::get(opCtx())->getTotalStarted();
+
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+
+    // Tests that the total transactions started counter is incremented by 1 when a new transaction
+    // is started.
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalStarted(),
+              beforeTransactionStart + 1U);
+}
+
+TEST_F(TransactionsMetricsTest, IncrementTotalCommittedOnCommit) {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "commitTransaction");
+
+    unsigned long long beforeCommitCount =
+        ServerTransactionsMetrics::get(opCtx())->getTotalCommitted();
+
+    txnParticipant->commitUnpreparedTransaction(opCtx());
+
+    // Assert that the committed counter is incremented by 1.
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalCommitted(), beforeCommitCount + 1U);
+}
+
+TEST_F(TransactionsMetricsTest, IncrementTotalAbortedUponAbort) {
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+
+    unsigned long long beforeAbortCount =
+        ServerTransactionsMetrics::get(opCtx())->getTotalAborted();
+
+    txnParticipant->abortArbitraryTransaction();
+
+    // Assert that the aborted counter is incremented by 1.
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalAborted(), beforeAbortCount + 1U);
+}
+
+TEST_F(TransactionsMetricsTest, TrackTotalOpenTransactionsWithAbort) {
+    unsigned long long beforeTransactionStart =
+        ServerTransactionsMetrics::get(opCtx())->getCurrentOpen();
+
+    // Tests that starting a transaction increments the open transactions counter by 1.
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(),
+              beforeTransactionStart + 1U);
+
+    // Tests that stashing the transaction resources does not affect the open transactions counter.
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
+    txnParticipant->stashTransactionResources(opCtx());
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(),
+              beforeTransactionStart + 1U);
+
+    // Tests that aborting a transaction decrements the open transactions counter by 1.
+    txnParticipant->abortArbitraryTransaction();
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(), beforeTransactionStart);
+}
+
+TEST_F(TransactionsMetricsTest, TrackTotalOpenTransactionsWithCommit) {
+    unsigned long long beforeTransactionStart =
+        ServerTransactionsMetrics::get(opCtx())->getCurrentOpen();
+
+    // Tests that starting a transaction increments the open transactions counter by 1.
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(),
+              beforeTransactionStart + 1U);
+
+    // Tests that stashing the transaction resources does not affect the open transactions counter.
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
+    txnParticipant->stashTransactionResources(opCtx());
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(),
+              beforeTransactionStart + 1U);
+
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+
+    // Tests that committing a transaction decrements the open transactions counter by 1.
+    txnParticipant->commitUnpreparedTransaction(opCtx());
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentOpen(), beforeTransactionStart);
+}
+
+TEST_F(TransactionsMetricsTest, TrackTotalActiveAndInactiveTransactionsWithCommit) {
+    unsigned long long beforeActiveCounter =
+        ServerTransactionsMetrics::get(opCtx())->getCurrentActive();
+    unsigned long long beforeInactiveCounter =
+        ServerTransactionsMetrics::get(opCtx())->getCurrentInactive();
+
+    // Starting the transaction should put it into an inactive state.
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
+              beforeInactiveCounter + 1);
+
+    // Tests that the first unstash increments the active counter and decrements the inactive
+    // counter.
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(),
+              beforeActiveCounter + 1U);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
+
+    // Tests that stashing the transaction resources decrements active counter and increments
+    // inactive counter.
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
+    txnParticipant->stashTransactionResources(opCtx());
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
+              beforeInactiveCounter + 1U);
+
+    // Tests that the second unstash increments the active counter and decrements the inactive
+    // counter.
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(),
+              beforeActiveCounter + 1U);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
+
+    // Tests that committing a transaction decrements the active counter only.
+    txnParticipant->commitUnpreparedTransaction(opCtx());
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
+}
+
+TEST_F(TransactionsMetricsTest, TrackTotalActiveAndInactiveTransactionsWithStashedAbort) {
+    unsigned long long beforeActiveCounter =
+        ServerTransactionsMetrics::get(opCtx())->getCurrentActive();
+    unsigned long long beforeInactiveCounter =
+        ServerTransactionsMetrics::get(opCtx())->getCurrentInactive();
+
+    // Starting the transaction should put it into an inactive state.
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
+              beforeInactiveCounter + 1);
+
+    // Tests that the first unstash increments the active counter and decrements the inactive
+    // counter.
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(),
+              beforeActiveCounter + 1U);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
+
+    // Tests that stashing the transaction resources decrements active counter and increments
+    // inactive counter.
+    { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
+    txnParticipant->stashTransactionResources(opCtx());
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
+              beforeInactiveCounter + 1U);
+
+    // Tests that aborting a stashed transaction decrements the inactive counter only.
+    txnParticipant->abortArbitraryTransaction();
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
+}
+
+TEST_F(TransactionsMetricsTest, TrackTotalActiveAndInactiveTransactionsWithUnstashedAbort) {
+    unsigned long long beforeActiveCounter =
+        ServerTransactionsMetrics::get(opCtx())->getCurrentActive();
+    unsigned long long beforeInactiveCounter =
+        ServerTransactionsMetrics::get(opCtx())->getCurrentInactive();
+
+    // Starting the transaction should put it into an inactive state.
+    OperationContextSessionMongod opCtxSession(opCtx(), true, false, true);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
+              beforeInactiveCounter + 1);
+
+    // Tests that the first unstash increments the active counter and decrements the inactive
+    // counter.
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(),
+              beforeActiveCounter + 1U);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
+
+    // Tests that aborting a stashed transaction decrements the active counter only.
+    txnParticipant->abortArbitraryTransaction();
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
+}
 
 TEST_F(TransactionsMetricsTest, SingleTransactionStatsStartTimeShouldBeSetUponTransactionStart) {
     // Save the time before the transaction is created.
@@ -1582,7 +1938,6 @@ TEST_F(TransactionsMetricsTest, SingleTransactionStatsDurationShouldBeSetUponCom
 
     ASSERT_GTE(txnParticipant->getSingleTransactionStats().getDuration(curTimeMicros64()),
                timeBeforeTxnCommit - timeAfterTxnStart);
-
     ASSERT_LTE(txnParticipant->getSingleTransactionStats().getDuration(curTimeMicros64()),
                timeAfterTxnCommit - timeBeforeTxnStart);
 }
@@ -1603,7 +1958,6 @@ TEST_F(TransactionsMetricsTest, SingleTransactionStatsDurationShouldBeSetUponAbo
 
     ASSERT_GTE(txnParticipant->getSingleTransactionStats().getDuration(curTimeMicros64()),
                timeBeforeTxnAbort - timeAfterTxnStart);
-
     ASSERT_LTE(txnParticipant->getSingleTransactionStats().getDuration(curTimeMicros64()),
                timeAfterTxnAbort - timeBeforeTxnStart);
 }
@@ -1671,6 +2025,10 @@ TEST_F(TransactionsMetricsTest, TimeActiveMicrosShouldBeSetUponUnstashAndStash) 
               Microseconds{0});
 
     txnParticipant->unstashTransactionResources(opCtx(), "insert");
+
+    // Sleep a bit to make sure time active is nonzero.
+    sleepmillis(1);
+
     // The transaction machinery cannot store an empty locker.
     { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
     txnParticipant->stashTransactionResources(opCtx());
@@ -1818,6 +2176,10 @@ TEST_F(TransactionsMetricsTest, TimeActiveMicrosShouldNotBeSetIfUnstashHasBadRea
 
     // Transaction resources do not exist yet.
     txnParticipant->unstashTransactionResources(opCtx(), "find");
+
+    // Sleep a bit to make sure time active is nonzero.
+    sleepmillis(1);
+
     // The transaction machinery cannot store an empty locker.
     { Lock::GlobalLock lk(opCtx(), MODE_IX, Date_t::now(), Lock::InterruptBehavior::kThrow); }
     txnParticipant->stashTransactionResources(opCtx());
@@ -2094,13 +2456,11 @@ TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponStash) {
     txnParticipant->stashTransactionResources(opCtx());
 
     // LastClientInfo should have been set.
-    ASSERT_EQ(txnParticipant->getSingleTransactionStats().getLastClientInfo().clientHostAndPort,
-              "");
-    ASSERT_EQ(txnParticipant->getSingleTransactionStats().getLastClientInfo().connectionId, 0);
-    ASSERT_EQ(txnParticipant->getSingleTransactionStats().getLastClientInfo().appName, "appName");
-    ASSERT_BSONOBJ_EQ(
-        txnParticipant->getSingleTransactionStats().getLastClientInfo().clientMetadata,
-        obj.getField("client").Obj());
+    auto lastClientInfo = txnParticipant->getSingleTransactionStats().getLastClientInfo();
+    ASSERT_EQ(lastClientInfo.clientHostAndPort, "");
+    ASSERT_EQ(lastClientInfo.connectionId, 0);
+    ASSERT_EQ(lastClientInfo.appName, "appName");
+    ASSERT_BSONOBJ_EQ(lastClientInfo.clientMetadata, obj.getField("client").Obj());
 
     // Create another ClientMetadata object.
     auto newObj = constructClientMetadata("newAppName");
@@ -2112,11 +2472,9 @@ TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponStash) {
     txnParticipant->stashTransactionResources(opCtx());
 
     // LastClientInfo's clientMetadata should have been updated to the new ClientMetadata object.
-    ASSERT_EQ(txnParticipant->getSingleTransactionStats().getLastClientInfo().appName,
-              "newAppName");
-    ASSERT_BSONOBJ_EQ(
-        txnParticipant->getSingleTransactionStats().getLastClientInfo().clientMetadata,
-        newObj.getField("client").Obj());
+    lastClientInfo = txnParticipant->getSingleTransactionStats().getLastClientInfo();
+    ASSERT_EQ(lastClientInfo.appName, "newAppName");
+    ASSERT_BSONOBJ_EQ(lastClientInfo.clientMetadata, newObj.getField("client").Obj());
 }
 
 TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponCommit) {
@@ -2135,13 +2493,11 @@ TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponCommit) {
     txnParticipant->commitUnpreparedTransaction(opCtx());
 
     // LastClientInfo should have been set.
-    ASSERT_EQ(txnParticipant->getSingleTransactionStats().getLastClientInfo().clientHostAndPort,
-              "");
-    ASSERT_EQ(txnParticipant->getSingleTransactionStats().getLastClientInfo().connectionId, 0);
-    ASSERT_EQ(txnParticipant->getSingleTransactionStats().getLastClientInfo().appName, "appName");
-    ASSERT_BSONOBJ_EQ(
-        txnParticipant->getSingleTransactionStats().getLastClientInfo().clientMetadata,
-        obj.getField("client").Obj());
+    auto lastClientInfo = txnParticipant->getSingleTransactionStats().getLastClientInfo();
+    ASSERT_EQ(lastClientInfo.clientHostAndPort, "");
+    ASSERT_EQ(lastClientInfo.connectionId, 0);
+    ASSERT_EQ(lastClientInfo.appName, "appName");
+    ASSERT_BSONOBJ_EQ(lastClientInfo.clientMetadata, obj.getField("client").Obj());
 }
 
 TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponAbort) {
@@ -2159,13 +2515,11 @@ TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponAbort) {
     txnParticipant->abortActiveTransaction(opCtx());
 
     // LastClientInfo should have been set.
-    ASSERT_EQ(txnParticipant->getSingleTransactionStats().getLastClientInfo().clientHostAndPort,
-              "");
-    ASSERT_EQ(txnParticipant->getSingleTransactionStats().getLastClientInfo().connectionId, 0);
-    ASSERT_EQ(txnParticipant->getSingleTransactionStats().getLastClientInfo().appName, "appName");
-    ASSERT_BSONOBJ_EQ(
-        txnParticipant->getSingleTransactionStats().getLastClientInfo().clientMetadata,
-        obj.getField("client").Obj());
+    auto lastClientInfo = txnParticipant->getSingleTransactionStats().getLastClientInfo();
+    ASSERT_EQ(lastClientInfo.clientHostAndPort, "");
+    ASSERT_EQ(lastClientInfo.connectionId, 0);
+    ASSERT_EQ(lastClientInfo.appName, "appName");
+    ASSERT_BSONOBJ_EQ(lastClientInfo.clientMetadata, obj.getField("client").Obj());
 }
 
 /*
@@ -2238,7 +2592,8 @@ std::string buildTransactionInfoString(OperationContext* opCtx,
                                        const TxnNumber txnNum,
                                        const int metricValue) {
     // Calling transactionInfoForLog to get the actual transaction info string.
-    const auto lockerInfo = opCtx->lockState()->getLockerInfo();
+    const auto lockerInfo =
+        opCtx->lockState()->getLockerInfo(CurOp::get(*opCtx)->getLockStatsBase());
     // Building expected transaction info string.
     StringBuilder parametersInfo;
     buildParametersInfoString(
@@ -2304,7 +2659,7 @@ TEST_F(TransactionsMetricsTest, TestTransactionInfoForLogAfterCommit) {
     txnParticipant->unstashTransactionResources(opCtx(), "commitTransaction");
     txnParticipant->commitUnpreparedTransaction(opCtx());
 
-    const auto lockerInfo = opCtx()->lockState()->getLockerInfo();
+    const auto lockerInfo = opCtx()->lockState()->getLockerInfo(boost::none);
     ASSERT(lockerInfo);
     std::string testTransactionInfo =
         txnParticipant->transactionInfoForLogForTest(&lockerInfo->stats, true, readConcernArgs);
@@ -2340,7 +2695,7 @@ TEST_F(TransactionsMetricsTest, TestTransactionInfoForLogAfterAbort) {
     txnParticipant->unstashTransactionResources(opCtx(), "abortTransaction");
     txnParticipant->abortActiveTransaction(opCtx());
 
-    const auto lockerInfo = opCtx()->lockState()->getLockerInfo();
+    const auto lockerInfo = opCtx()->lockState()->getLockerInfo(boost::none);
     ASSERT(lockerInfo);
 
     std::string testTransactionInfo =
@@ -2370,7 +2725,7 @@ DEATH_TEST_F(TransactionsMetricsTest, TestTransactionInfoForLogWithNoLockerInfoS
 
     auto txnParticipant = TransactionParticipant::get(opCtx());
 
-    const auto lockerInfo = opCtx()->lockState()->getLockerInfo();
+    const auto lockerInfo = opCtx()->lockState()->getLockerInfo(boost::none);
     ASSERT(lockerInfo);
 
     txnParticipant->unstashTransactionResources(opCtx(), "commitTransaction");
@@ -2405,7 +2760,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowCommit) {
     txnParticipant->commitUnpreparedTransaction(opCtx());
     stopCapturingLogMessages();
 
-    const auto lockerInfo = opCtx()->lockState()->getLockerInfo();
+    const auto lockerInfo = opCtx()->lockState()->getLockerInfo(boost::none);
     ASSERT(lockerInfo);
     std::string expectedTransactionInfo = "transaction " +
         txnParticipant->transactionInfoForLogForTest(&lockerInfo->stats, true, readConcernArgs);
@@ -2438,7 +2793,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowAbort) {
     txnParticipant->abortActiveTransaction(opCtx());
     stopCapturingLogMessages();
 
-    const auto lockerInfo = opCtx()->lockState()->getLockerInfo();
+    const auto lockerInfo = opCtx()->lockState()->getLockerInfo(boost::none);
     ASSERT(lockerInfo);
     std::string expectedTransactionInfo = "transaction " +
         txnParticipant->transactionInfoForLogForTest(&lockerInfo->stats, false, readConcernArgs);
@@ -2469,7 +2824,7 @@ TEST_F(TransactionsMetricsTest, LogTransactionInfoAfterSlowStashedAbort) {
     txnParticipant->stashTransactionResources(opCtx());
     const auto txnResourceStashLocker = txnParticipant->getTxnResourceStashLockerForTest();
     ASSERT(txnResourceStashLocker);
-    const auto lockerInfo = txnResourceStashLocker->getLockerInfo();
+    const auto lockerInfo = txnResourceStashLocker->getLockerInfo(boost::none);
 
     serverGlobalParams.slowMS = 10;
     sleepmillis(serverGlobalParams.slowMS + 1);

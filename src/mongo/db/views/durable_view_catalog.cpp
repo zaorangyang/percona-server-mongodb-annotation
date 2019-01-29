@@ -95,12 +95,13 @@ Status DurableViewCatalogImpl::iterate(OperationContext* opCtx, Callback callbac
         }
 
         const auto viewName = viewDef["_id"].str();
-        const auto collectionNameIsValid = NamespaceString::validCollectionComponent(viewName);
-        valid &= collectionNameIsValid;
+        const auto viewNameIsValid = NamespaceString::validCollectionComponent(viewName) &&
+            NamespaceString::validDBName(nsToDatabaseSubstring(viewName));
+        valid &= viewNameIsValid;
 
         // Only perform validation via NamespaceString if the collection name has been determined to
         // be valid. If not valid then the NamespaceString constructor will uassert.
-        if (collectionNameIsValid) {
+        if (viewNameIsValid) {
             NamespaceString viewNss(viewName);
             valid &= viewNss.isValid() && viewNss.db() == _db->name();
         }
@@ -149,8 +150,7 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
         uassertStatusOK(
             systemViews->insertDocument(opCtx, InsertStatement(view), &CurOp::get(opCtx)->debug()));
     } else {
-        OplogUpdateEntryArgs args;
-        args.nss = systemViewsNs;
+        CollectionUpdateArgs args;
         args.update = view;
         args.criteria = BSON("_id" << name.ns());
         args.fromMigrate = false;

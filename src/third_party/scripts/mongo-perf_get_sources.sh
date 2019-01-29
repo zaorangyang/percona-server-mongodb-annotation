@@ -26,7 +26,7 @@ fi
 NAME=mongo-perf
 SRC_ROOT=$(mktemp -d /tmp/$NAME.XXXXXX)
 trap "rm -rf $SRC_ROOT" EXIT
-DEST_DIR=$(git rev-parse --show-toplevel)/src/third_party/$NAME
+DEST_DIR=$(git rev-parse --show-toplevel)/benchrun_embedded/testcases
 
 git clone --branch=master https://github.com/mongodb/mongo-perf.git $SRC_ROOT
 
@@ -34,7 +34,7 @@ pushd $SRC_ROOT
 
 # We pin to a particular commit of the mongodb/mongo-perf repository to make it clear what version
 # of the JavaScript test cases we are running.
-git checkout 824f1672b4e684ea4fdb4399e14374c5969467f9
+git checkout 7070ac74dd35fde2f59af01b155191382357ed1d
 
 # We use Python to get the number of CPUs in a platform-agnostic way.
 NUM_CPUS=$(python -c 'import multiprocessing; print(multiprocessing.cpu_count())')
@@ -45,16 +45,34 @@ NUM_CPUS=$(python -c 'import multiprocessing; print(multiprocessing.cpu_count())
 #
 # We don't generate JSON config files for tests that are tagged with "capped" or "where" because
 # they aren't supported by embedded.
-find testcases -type f -print0 | xargs -0 -I% -n1 -P$NUM_CPUS  \
-    python2 benchrun.py --testfiles %                          \
-                        --threads 1                            \
-                        --excludeFilter capped                 \
-                        --excludeFilter where                  \
-                        --generateMongoeBenchConfigFiles mongoebench/
+#
+# We generate JSON config files for tests that are tagged with "aggregation_identityview" or
+# "query_identityview" while using --readCmd=true because the find command is necessary to read from
+# a view. We use --readCmd=false for all other tests to match what etc/perf.yml does.
+find testcases -type f -print0 | xargs -0 -I% -n1 -P$NUM_CPUS          \
+    python2 benchrun.py --testfiles %                                  \
+                        --threads 1                                    \
+                        --excludeFilter capped                         \
+                        --excludeFilter where                          \
+                        --generateMongoeBenchConfigFiles mongoebench/  \
+                        --readCmd false                                \
+                        --writeCmd true                                \
+                        --excludeFilter aggregation_identityview       \
+                        --excludeFilter query_identityview
+
+find testcases -type f -print0 | xargs -0 -I% -n1 -P$NUM_CPUS          \
+    python2 benchrun.py --testfiles %                                  \
+                        --threads 1                                    \
+                        --excludeFilter capped                         \
+                        --excludeFilter where                          \
+                        --generateMongoeBenchConfigFiles mongoebench/  \
+                        --readCmd true                                 \
+                        --writeCmd true                                \
+                        --includeFilter aggregation_identityview query_identityview
 
 popd
 
 test -d $DEST_DIR && rm -r $DEST_DIR
-mkdir -p $DEST_DIR
+mkdir -p $(dirname $DEST_DIR)
 
-mv $SRC_ROOT/mongoebench/ $DEST_DIR/
+mv $SRC_ROOT/mongoebench $DEST_DIR

@@ -43,6 +43,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/write_ops_exec.h"
@@ -289,6 +290,7 @@ void MigrationDestinationManager::report(BSONObjBuilder& b,
 
     b.append("ns", _nss.ns());
     b.append("from", _fromShardConnString.toString());
+    b.append("fromShardId", _fromShard.toString());
     b.append("min", _min);
     b.append("max", _max);
     b.append("shardKeyPattern", _shardKeyPattern);
@@ -656,8 +658,11 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(OperationCont
 
             for (auto&& infoObj : indexInfoObjs.getValue()) {
                 // make sure to create index on secondaries as well
-                serviceContext->getOpObserver()->onCreateIndex(
-                    opCtx, collection->ns(), collection->uuid(), infoObj, true /* fromMigrate */);
+                serviceContext->getOpObserver()->onCreateIndex(opCtx,
+                                                               collection->ns(),
+                                                               *(collection->uuid()),
+                                                               infoObj,
+                                                               true /* fromMigrate */);
             }
 
             wunit.commit();

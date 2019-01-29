@@ -41,9 +41,6 @@ namespace mongo {
 
 class WorkingSet;
 
-// TODO SERVER-35333: when we have a means of uniquely identifying each $** sub-index generated
-// during planning, 'indexName' should change to be the unique ID for the specific sub-index used in
-// this solution.
 struct CountScanParams {
     CountScanParams(const IndexDescriptor& descriptor,
                     std::string indexName,
@@ -114,7 +111,6 @@ public:
     void doRestoreState() final;
     void doDetachFromOperationContext() final;
     void doReattachToOperationContext() final;
-    void doInvalidate(OperationContext* opCtx, const RecordId& dl, InvalidationType type) final;
 
     StageType stageType() const final {
         return STAGE_COUNT_SCAN;
@@ -136,7 +132,7 @@ private:
     std::unique_ptr<SortedDataInterface::Cursor> _cursor;
 
     // Could our index have duplicates?  If so, we use _returned to dedup.
-    bool _shouldDedup;
+    const bool _shouldDedup;
     stdx::unordered_set<RecordId, RecordId::Hasher> _returned;
 
     CountScanParams _params;

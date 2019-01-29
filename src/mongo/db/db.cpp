@@ -322,7 +322,7 @@ ExitCode _initAndListen(int listenPort) {
     serviceContext->setServiceEntryPoint(
         stdx::make_unique<ServiceEntryPointMongod>(serviceContext));
 
-    {
+    if (!storageGlobalParams.repair) {
         auto tl =
             transport::TransportLayerManager::createWithConfig(&serverGlobalParams, serviceContext);
         auto res = tl->setup();
@@ -332,7 +332,6 @@ ExitCode _initAndListen(int listenPort) {
         }
         serviceContext->setTransportLayer(std::move(tl));
     }
-
     initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
@@ -490,6 +489,9 @@ ExitCode _initAndListen(int listenPort) {
                   << "User and role management commands require auth data to have "
                   << "at least schema version " << AuthorizationManager::schemaVersion26Final
                   << " but startup could not verify schema version: " << status;
+            log() << "To manually repair the 'authSchema' document in the admin.system.version "
+                     "collection, start up with --setParameter "
+                     "startupAuthSchemaValidation=false to disable validation.";
             exitCleanly(EXIT_NEED_UPGRADE);
         }
 
@@ -642,10 +644,18 @@ ExitCode _initAndListen(int listenPort) {
         return EXIT_NET_ERROR;
     }
 
-    start = serviceContext->getTransportLayer()->start();
+    start = serviceContext->getServiceEntryPoint()->start();
     if (!start.isOK()) {
-        error() << "Failed to start the listener: " << start.toString();
+        error() << "Failed to start the service entry point: " << start;
         return EXIT_NET_ERROR;
+    }
+
+    if (!storageGlobalParams.repair) {
+        start = serviceContext->getTransportLayer()->start();
+        if (!start.isOK()) {
+            error() << "Failed to start the listener: " << start.toString();
+            return EXIT_NET_ERROR;
+        }
     }
 
     serviceContext->notifyStartupComplete();

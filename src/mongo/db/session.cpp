@@ -198,9 +198,7 @@ void updateSessionEntry(OperationContext* opCtx, const UpdateRequest& updateRequ
         throw WriteConflictException();
     }
 
-    OplogUpdateEntryArgs args;
-    args.nss = NamespaceString::kSessionTransactionsTableNamespace;
-    args.uuid = collection->uuid();
+    CollectionUpdateArgs args;
     args.update = updateRequest.getUpdates();
     args.criteria = toUpdateIdDoc;
     args.fromMigrate = false;
@@ -347,18 +345,10 @@ void Session::onMigrateCompletedOnPrimary(OperationContext* opCtx,
     _checkValid(ul);
     _checkIsActiveTransaction(ul, txnNumber);
 
-    // If the transaction has a populated lastWriteDate, we will use that as the most up-to-date
-    // value. Using the lastWriteDate from the oplog being migrated may move the lastWriteDate
-    // back. However, in the case that the transaction doesn't have the lastWriteDate populated,
-    // the oplog's value serves as a best-case fallback.
-    const auto txnLastStmtIdWriteDate = _getLastWriteDate(ul, txnNumber);
-    const auto updatedLastStmtIdWriteDate =
-        txnLastStmtIdWriteDate == Date_t::min() ? oplogLastStmtIdWriteDate : txnLastStmtIdWriteDate;
-
     // We do not migrate transaction oplog entries.
     auto txnState = boost::none;
     const auto updateRequest = _makeUpdateRequest(
-        ul, txnNumber, lastStmtIdWriteOpTime, updatedLastStmtIdWriteDate, txnState);
+        ul, txnNumber, lastStmtIdWriteOpTime, oplogLastStmtIdWriteDate, txnState);
 
     ul.unlock();
 
@@ -690,6 +680,32 @@ void Session::unlockTxnNumber() {
 
     _isTxnNumberLocked = false;
     _txnNumberLockConflictStatus = boost::none;
+}
+
+bool Session::isLockedTxnNumber(const TxnNumber expectedLockedNumber) const {
+    stdx::lock_guard<stdx::mutex> lg(_mutex);
+    invariant(_activeTxnNumber == expectedLockedNumber,
+              str::stream() << "Expected TxnNumber: " << expectedLockedNumber
+                            << ", Active TxnNumber: "
+                            << _activeTxnNumber);
+    return _isTxnNumberLocked;
+}
+
+void Session::setCurrentOperation(OperationContext* currentOperation) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    invariant(!_currentOperation);
+    _currentOperation = currentOperation;
+}
+
+void Session::clearCurrentOperation() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    invariant(_currentOperation);
+    _currentOperation = nullptr;
+}
+
+OperationContext* Session::getCurrentOperation() const {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    return _currentOperation;
 }
 
 }  // namespace mongo

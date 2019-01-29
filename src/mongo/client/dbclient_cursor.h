@@ -142,7 +142,7 @@ public:
     enum { QueryOptionLocal_forceOpQuery = 1 << 30 };
 
     DBClientCursor(DBClientBase* client,
-                   const std::string& ns,
+                   const NamespaceStringOrUUID& nsOrUuid,
                    const BSONObj& query,
                    int nToReturn,
                    int nToSkip,
@@ -151,7 +151,7 @@ public:
                    int bs);
 
     DBClientCursor(DBClientBase* client,
-                   const std::string& ns,
+                   const NamespaceStringOrUUID& nsOrUuid,
                    long long cursorId,
                    int nToReturn,
                    int options,
@@ -180,6 +180,9 @@ public:
         return ns.ns();
     }
 
+    const NamespaceString& getNamespaceString() const {
+        return ns;
+    }
     /**
      * actually does the query
      */
@@ -220,7 +223,7 @@ public:
 
 private:
     DBClientCursor(DBClientBase* client,
-                   const std::string& ns,
+                   const NamespaceStringOrUUID& nsOrUuid,
                    const BSONObj& query,
                    long long cursorId,
                    int nToReturn,
@@ -244,6 +247,10 @@ private:
     Batch batch;
     DBClientBase* _client;
     std::string _originalHost;
+    NamespaceStringOrUUID _nsOrUuid;
+    // 'ns' is initially the NamespaceString passed in, or the dbName if doing a find by UUID.
+    // After a successful 'find' command, 'ns' is updated to contain the namespace returned by that
+    // command.
     NamespaceString ns;
     const bool _isCommand;
     BSONObj query;
@@ -300,6 +307,10 @@ public:
     }
     int n() const {
         return _n;
+    }
+    // getNamespaceString() will return the NamespaceString returned by the 'find' command.
+    const NamespaceString& getNamespaceString() {
+        return _c.getNamespaceString();
     }
 
 private:

@@ -38,6 +38,7 @@
 #include "mongo/client/dbclient_base.h"
 #include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/generic_cursor.h"
+#include "mongo/db/matcher/expression.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/field_path.h"
@@ -204,7 +205,7 @@ public:
      * the given collection, either because the collection was dropped or has become sharded.
      */
     virtual std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
-        OperationContext* opCtx, UUID uuid) const = 0;
+        OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const = 0;
 
     /**
      * Returns zero or one documents with the document key 'documentKey'. 'documentKey' is treated
@@ -235,6 +236,27 @@ public:
     virtual BackupCursorState openBackupCursor(OperationContext* opCtx) = 0;
 
     virtual void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) = 0;
+
+    /**
+     * Returns a vector of BSON objects, where each entry in the vector describes a plan cache entry
+     * inside the cache for the given namespace. Only those entries which match the supplied
+     * MatchExpression are returned.
+     */
+    virtual std::vector<BSONObj> getMatchingPlanCacheEntryStats(OperationContext*,
+                                                                const NamespaceString&,
+                                                                const MatchExpression*) const = 0;
+
+    /**
+     * Returns true if there is an index on 'nss' with properties that will guarantee that a
+     * document with non-array values for each of 'uniqueKeyPaths' will have at most one matching
+     * document in 'nss'.
+     *
+     * Specifically, such an index must include all the fields, be unique, not be a partial index,
+     * and match the operation's collation as given by 'expCtx'.
+     */
+    virtual bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                             const NamespaceString& nss,
+                                             const std::set<FieldPath>& uniqueKeyPaths) const = 0;
 };
 
 }  // namespace mongo

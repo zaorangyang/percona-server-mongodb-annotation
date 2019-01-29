@@ -55,8 +55,6 @@ namespace mongo {
 namespace biggie {
 namespace {
 
-const int TempKeyMaxSize = 1024;  // this goes away with SERVER-3372
-
 // This function is the same as the one in record store--basically, using the git analogy, create
 // a working branch if one does not exist.
 StringStore* getRecoveryUnitBranch_forking(OperationContext* opCtx) {
@@ -83,13 +81,6 @@ BSONObj stripFieldNames(const BSONObj& obj) {
         bob.appendAs(it.next(), "");
     }
     return bob.obj();
-}
-
-Status dupKeyError(const BSONObj& key) {
-    StringBuilder sb;
-    sb << "E11000 duplicate key error ";
-    sb << "dup key: " << key;
-    return Status(ErrorCodes::DuplicateKey, sb.str());
 }
 
 // This function converts a key and an ordering to a KeyString.
@@ -222,29 +213,31 @@ int compareTwoKeys(
 SortedDataBuilderInterface::SortedDataBuilderInterface(OperationContext* opCtx,
                                                        bool dupsAllowed,
                                                        Ordering order,
-                                                       std::string prefix,
-                                                       std::string identEnd)
+                                                       const std::string& prefix,
+                                                       const std::string& identEnd,
+                                                       const std::string& collectionNamespace,
+                                                       const std::string& indexName)
     : _opCtx(opCtx),
       _dupsAllowed(dupsAllowed),
       _order(order),
       _prefix(prefix),
       _identEnd(identEnd),
+      _collectionNamespace(collectionNamespace),
+      _indexName(indexName),
       _hasLast(false),
       _lastKeyToString(""),
       _lastRID(-1) {}
 
-void SortedDataBuilderInterface::commit(bool mayInterrupt) {
+SpecialFormatInserted SortedDataBuilderInterface::commit(bool mayInterrupt) {
     biggie::RecoveryUnit* ru = checked_cast<biggie::RecoveryUnit*>(_opCtx->recoveryUnit());
     ru->forkIfNeeded();
     ru->commitUnitOfWork();
+    return SpecialFormatInserted::NoSpecialFormatInserted;
 }
 
-Status SortedDataBuilderInterface::addKey(const BSONObj& key, const RecordId& loc) {
+StatusWith<SpecialFormatInserted> SortedDataBuilderInterface::addKey(const BSONObj& key,
+                                                                     const RecordId& loc) {
     StringStore* workingCopy = getRecoveryUnitBranch_forking(_opCtx);
-
-    if (key.objsize() >= TempKeyMaxSize) {
-        return Status(ErrorCodes::KeyTooLong, "key too big");
-    }
 
     invariant(loc.isNormal());
     invariant(!hasFieldNames(key));
@@ -265,7 +258,7 @@ Status SortedDataBuilderInterface::addKey(const BSONObj& key, const RecordId& lo
                       "expected ascending (key, RecordId) order in bulk builder");
     }
     if (!_dupsAllowed && twoKeyCmp == 0 && twoRIDCmp != 0) {
-        return dupKeyError(key);
+        return dupKeyError(key, _collectionNamespace, _indexName);
     }
 
     std::string workingCopyInsertKey = combineKeyAndRID(key, loc, _prefix, _order);
@@ -282,23 +275,30 @@ Status SortedDataBuilderInterface::addKey(const BSONObj& key, const RecordId& lo
     _lastKeyToString = newKSToString;
     _lastRID = loc.repr();
 
-    return Status::OK();
+    return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
 }
 
 SortedDataBuilderInterface* SortedDataInterface::getBulkBuilder(OperationContext* opCtx,
                                                                 bool dupsAllowed) {
-    return new SortedDataBuilderInterface(opCtx, dupsAllowed, _order, _prefix, _identEnd);
+    return new SortedDataBuilderInterface(
+        opCtx, dupsAllowed, _order, _prefix, _identEnd, _collectionNamespace, _indexName);
 }
 
 // We append \1 to all idents we get, and therefore the KeyString with ident + \0 will only be
 // before elements in this ident, and the KeyString with ident + \2 will only be after elements in
 // this ident.
-SortedDataInterface::SortedDataInterface(const Ordering& ordering, bool isUnique, StringData ident)
+SortedDataInterface::SortedDataInterface(const Ordering& ordering,
+                                         bool isUnique,
+                                         StringData ident,
+                                         const std::string& collectionNamespace,
+                                         const std::string& indexName)
     : _order(ordering),
       // All entries in this ident will have a prefix of ident + \1.
       _prefix(ident.toString().append(1, '\1')),
       // Therefore, the string ident + \2 will be greater than all elements in this ident.
       _identEnd(ident.toString().append(1, '\2')),
+      _collectionNamespace(collectionNamespace),
+      _indexName(indexName),
       _isUnique(isUnique) {
     // This is the string representation of the KeyString before elements in this ident, which is
     // ident + \0. This is before all elements in this ident.
@@ -309,10 +309,10 @@ SortedDataInterface::SortedDataInterface(const Ordering& ordering, bool isUnique
     _KSForIdentEnd = combineKeyAndRID(BSONObj(), RecordId::min(), _identEnd, ordering);
 }
 
-Status SortedDataInterface::insert(OperationContext* opCtx,
-                                   const BSONObj& key,
-                                   const RecordId& loc,
-                                   bool dupsAllowed) {
+StatusWith<SpecialFormatInserted> SortedDataInterface::insert(OperationContext* opCtx,
+                                                              const BSONObj& key,
+                                                              const RecordId& loc,
+                                                              bool dupsAllowed) {
     // The KeyString representation of the key.
     std::unique_ptr<KeyString> workingCopyInternalKs = keyToKeyString(key, _order);
     // The KeyString of prefix (which is ident + \1), key, loc.
@@ -322,12 +322,8 @@ Status SortedDataInterface::insert(OperationContext* opCtx,
 
     StringStore* workingCopy = getRecoveryUnitBranch_forking(opCtx);
 
-    if (key.objsize() >= TempKeyMaxSize) {
-        return Status(ErrorCodes::KeyTooLong, "Error: key too long");
-    }
-
     if (workingCopy->find(workingCopyInsertKey) != workingCopy->end()) {
-        return Status::OK();
+        return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
     }
 
     // If dups are not allowed, then we need to check that we are not inserting something with an
@@ -348,7 +344,7 @@ Status SortedDataInterface::insert(OperationContext* opCtx,
             auto ks1 = keyToKeyString(ike.key, _order);
             auto ks2 = keyToKeyString(key, _order);
             if (ks1->compare(*ks2) == 0 && ike.loc.repr() != loc.repr()) {
-                return dupKeyError(key);
+                return dupKeyError(key, _collectionNamespace, _indexName);
             }
         }
     }
@@ -360,7 +356,7 @@ Status SortedDataInterface::insert(OperationContext* opCtx,
         std::string(reinterpret_cast<const char*>(workingCopyInternalKs->getTypeBits().getBuffer()),
                     workingCopyInternalKs->getTypeBits().getSize());
     workingCopy->insert(StringStore::value_type(workingCopyInsertKey, internalTbString));
-    return Status::OK();
+    return StatusWith<SpecialFormatInserted>(SpecialFormatInserted::NoSpecialFormatInserted);
 }
 
 void SortedDataInterface::unindex(OperationContext* opCtx,
@@ -406,7 +402,7 @@ Status SortedDataInterface::dupKeyCheck(OperationContext* opCtx,
         lowerBoundIterator->first.compare(_KSForIdentEnd) < 0 &&
         lowerBoundIterator->first.compare(
             combineKeyAndRID(key, RecordId::max(), _prefix, _order)) <= 0) {
-        return dupKeyError(key);
+        return dupKeyError(key, _collectionNamespace, _indexName);
     }
     return Status::OK();
 }

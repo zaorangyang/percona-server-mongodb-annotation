@@ -29,7 +29,6 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/write_ops.h"
-#include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/document_source_out_gen.h"
 #include "mongo/db/pipeline/document_source_out_in_place.h"
@@ -40,7 +39,7 @@ namespace mongo {
 using boost::intrusive_ptr;
 using std::vector;
 
-std::unique_ptr<LiteParsedDocumentSourceForeignCollections> DocumentSourceOut::liteParse(
+std::unique_ptr<DocumentSourceOut::LiteParsed> DocumentSourceOut::LiteParsed::parse(
     const AggregationRequest& request, const BSONElement& spec) {
 
     uassert(ErrorCodes::TypeMismatch,
@@ -50,9 +49,11 @@ std::unique_ptr<LiteParsedDocumentSourceForeignCollections> DocumentSourceOut::l
 
     NamespaceString targetNss;
     bool allowSharded;
+    WriteModeEnum mode;
     if (spec.type() == BSONType::String) {
         targetNss = NamespaceString(request.getNamespaceString().db(), spec.valueStringData());
         allowSharded = false;
+        mode = WriteModeEnum::kModeReplaceCollection;
     } else if (spec.type() == BSONType::Object) {
         auto outSpec =
             DocumentSourceOutSpec::parse(IDLParserErrorContext("$out"), spec.embeddedObject());
@@ -64,30 +65,109 @@ std::unique_ptr<LiteParsedDocumentSourceForeignCollections> DocumentSourceOut::l
                 NamespaceString(request.getNamespaceString().db(), outSpec.getTargetCollection());
         }
 
+        mode = outSpec.getMode();
+
         // Sharded output collections are not allowed with mode "replaceCollection".
-        allowSharded = outSpec.getMode() != WriteModeEnum::kModeReplaceCollection;
+        allowSharded = mode != WriteModeEnum::kModeReplaceCollection;
     }
 
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "Invalid $out target namespace, " << targetNss.ns(),
             targetNss.isValid());
 
-    ActionSet actions{ActionType::remove, ActionType::insert};
+    // All modes require the "insert" action.
+    ActionSet actions{ActionType::insert};
+    switch (mode) {
+        case WriteModeEnum::kModeReplaceCollection:
+            actions.addAction(ActionType::remove);
+            break;
+        case WriteModeEnum::kModeReplaceDocuments:
+            actions.addAction(ActionType::update);
+            break;
+        case WriteModeEnum::kModeInsertDocuments:
+            // "insertDocuments" mode only requires the "insert" action.
+            break;
+    }
+
     if (request.shouldBypassDocumentValidation()) {
         actions.addAction(ActionType::bypassDocumentValidation);
     }
 
     PrivilegeVector privileges{Privilege(ResourcePattern::forExactNamespace(targetNss), actions)};
 
-    return stdx::make_unique<LiteParsedDocumentSourceForeignCollections>(
+    return stdx::make_unique<DocumentSourceOut::LiteParsed>(
         std::move(targetNss), std::move(privileges), allowSharded);
 }
 
-REGISTER_DOCUMENT_SOURCE(out, DocumentSourceOut::liteParse, DocumentSourceOut::createFromBson);
+REGISTER_DOCUMENT_SOURCE(out,
+                         DocumentSourceOut::LiteParsed::parse,
+                         DocumentSourceOut::createFromBson);
 
 const char* DocumentSourceOut::getSourceName() const {
     return "$out";
 }
+
+namespace {
+/**
+ * Parses the fields of the 'uniqueKey' from the user-specified 'obj' from the $out spec, returning
+ * a set of field paths. Throws if 'obj' is invalid.
+ */
+std::set<FieldPath> parseUniqueKeyFromSpec(const BSONObj& obj) {
+    std::set<FieldPath> uniqueKey;
+    for (const auto& elem : obj) {
+        uassert(ErrorCodes::TypeMismatch,
+                str::stream() << "All fields of $out uniqueKey must be the number 1, but '"
+                              << elem.fieldNameStringData()
+                              << "' is of type "
+                              << elem.type(),
+                elem.isNumber());
+
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "All fields of $out uniqueKey must be the number 1, but '"
+                              << elem.fieldNameStringData()
+                              << "' has the invalid value "
+                              << elem.numberDouble(),
+                elem.numberDouble() == 1.0);
+
+        const auto res = uniqueKey.insert(FieldPath(elem.fieldNameStringData()));
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Found a duplicate field '" << elem.fieldNameStringData()
+                              << "' in $out uniqueKey",
+                res.second);
+    }
+
+    uassert(ErrorCodes::InvalidOptions,
+            "If explicitly specifying $out uniqueKey, must include at least one field",
+            uniqueKey.size() > 0);
+    return uniqueKey;
+}
+
+/**
+ * Extracts the fields of 'uniqueKey' from 'doc' and returns the key as a BSONObj. Throws if any
+ * field of the 'uniqueKey' extracted from 'doc' is nullish or an array.
+ */
+BSONObj extractUniqueKeyFromDoc(const Document& doc, const std::set<FieldPath>& uniqueKey) {
+    MutableDocument result;
+    for (const auto& field : uniqueKey) {
+        auto value = doc.getNestedField(field);
+        uassert(50943,
+                str::stream() << "$out write error: uniqueKey field '" << field.fullPath()
+                              << "' is an array in the document '"
+                              << doc.toString()
+                              << "'",
+                !value.isArray());
+        uassert(
+            50905,
+            str::stream() << "$out write error: uniqueKey field '" << field.fullPath()
+                          << "' cannot be missing, null, undefined or an array. Full document: '"
+                          << doc.toString()
+                          << "'",
+            !value.nullish());
+        result.addField(field.fullPath(), std::move(value));
+    }
+    return result.freeze().toBson();
+}
+}  // namespace
 
 DocumentSource::GetNextResult DocumentSourceOut::getNext() {
     pExpCtx->checkForInterrupt();
@@ -108,12 +188,16 @@ DocumentSource::GetNextResult DocumentSourceOut::getNext() {
     for (; nextInput.isAdvanced(); nextInput = pSource->getNext()) {
         auto doc = nextInput.releaseDocument();
 
+        // Generate an _id if the uniqueKey includes _id but the document doesn't have one.
+        if (_uniqueKeyIncludesId && doc.getField("_id"_sd).missing()) {
+            MutableDocument mutableDoc(std::move(doc));
+            mutableDoc["_id"_sd] = Value(OID::gen());
+            doc = mutableDoc.freeze();
+        }
+
         // Extract the unique key before converting the document to BSON.
-        auto uniqueKey = document_path_support::extractPathsFromDoc(doc, _uniqueKeyFields);
+        auto uniqueKey = extractUniqueKeyFromDoc(doc, _uniqueKeyFields);
         auto insertObj = doc.toBson();
-        uassert(50905,
-                str::stream() << "Failed to extract unique key from input document: " << insertObj,
-                uniqueKey.size() == _uniqueKeyFields.size());
 
         bufferedBytes += insertObj.objsize();
         if (!batch.empty() &&
@@ -122,7 +206,7 @@ DocumentSource::GetNextResult DocumentSourceOut::getNext() {
             batch.clear();
             bufferedBytes = insertObj.objsize();
         }
-        batch.emplace(std::move(insertObj), uniqueKey.toBson());
+        batch.emplace(std::move(insertObj), std::move(uniqueKey));
     }
     if (!batch.empty())
         spill(batch);
@@ -146,18 +230,17 @@ DocumentSource::GetNextResult DocumentSourceOut::getNext() {
     MONGO_UNREACHABLE;
 }
 
-DocumentSourceOut::DocumentSourceOut(const NamespaceString& outputNs,
-                                     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                     WriteModeEnum mode,
-                                     std::set<FieldPath> uniqueKey)
-    : DocumentSource(expCtx),
-      _done(false),
-      _outputNs(outputNs),
-      _mode(mode),
-      _uniqueKeyFields(std::move(uniqueKey)) {}
-
-intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
-    BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
+intrusive_ptr<DocumentSourceOut> DocumentSourceOut::create(
+    NamespaceString outputNs,
+    const intrusive_ptr<ExpressionContext>& expCtx,
+    WriteModeEnum mode,
+    std::set<FieldPath> uniqueKey) {
+    // TODO (SERVER-36832): Allow this combination.
+    uassert(
+        50939,
+        str::stream() << "$out with mode " << WriteMode_serializer(mode)
+                      << " is not supported when the output collection is in a different database",
+        !(mode == WriteModeEnum::kModeReplaceCollection && outputNs.db() != expCtx->ns.db()));
 
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             "$out cannot be used in a transaction",
@@ -167,40 +250,9 @@ intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
     uassert(ErrorCodes::InvalidOptions,
             "$out cannot be used with a 'majority' read concern level",
             readConcernLevel != repl::ReadConcernLevel::kMajorityReadConcern);
-
-    auto mode = WriteModeEnum::kModeReplaceCollection;
-    std::set<FieldPath> uniqueKey;
-    NamespaceString outputNs;
-    if (elem.type() == BSONType::String) {
-        outputNs = NamespaceString(expCtx->ns.db().toString() + '.' + elem.str());
-        uniqueKey.emplace("_id");
-    } else if (elem.type() == BSONType::Object) {
-        auto spec =
-            DocumentSourceOutSpec::parse(IDLParserErrorContext("$out"), elem.embeddedObject());
-
-        mode = spec.getMode();
-
-        // Convert unique key object to a vector of FieldPaths.
-        if (auto uniqueKeyObj = spec.getUniqueKey()) {
-            uniqueKey = uniqueKeyObj->getFieldNames<std::set<FieldPath>>();
-        } else {
-            // TODO SERVER-35954: If not present, build the unique key from the shard key of the
-            // output collection.
-            uniqueKey.emplace("_id");
-        }
-
-        // Retrieve the target database from the user command, otherwise use the namespace from the
-        // expression context.
-        if (auto targetDb = spec.getTargetDb()) {
-            outputNs = NamespaceString(*targetDb, spec.getTargetCollection());
-        } else {
-            outputNs = NamespaceString(expCtx->ns.db(), spec.getTargetCollection());
-        }
-    } else {
-        uasserted(16990,
-                  str::stream() << "$out only supports a string or object argument, not "
-                                << typeName(elem.type()));
-    }
+    uassert(ErrorCodes::InvalidOptions,
+            "$out cannot be used with a 'linearizable' read concern level",
+            readConcernLevel != repl::ReadConcernLevel::kLinearizableReadConcern);
 
     // Although we perform a check for "replaceCollection" mode with a sharded output collection
     // during lite parsing, we need to do it here as well in case mongos is stale or the command is
@@ -215,14 +267,82 @@ intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
 
     switch (mode) {
         case WriteModeEnum::kModeReplaceCollection:
-            return new DocumentSourceOutReplaceColl(outputNs, expCtx, mode, uniqueKey);
+            return new DocumentSourceOutReplaceColl(
+                std::move(outputNs), expCtx, mode, std::move(uniqueKey));
         case WriteModeEnum::kModeInsertDocuments:
-            return new DocumentSourceOutInPlace(outputNs, expCtx, mode, uniqueKey);
+            return new DocumentSourceOutInPlace(
+                std::move(outputNs), expCtx, mode, std::move(uniqueKey));
         case WriteModeEnum::kModeReplaceDocuments:
-            return new DocumentSourceOutInPlaceReplace(outputNs, expCtx, mode, uniqueKey);
+            return new DocumentSourceOutInPlaceReplace(
+                std::move(outputNs), expCtx, mode, std::move(uniqueKey));
         default:
             MONGO_UNREACHABLE;
     }
+}
+
+DocumentSourceOut::DocumentSourceOut(NamespaceString outputNs,
+                                     const intrusive_ptr<ExpressionContext>& expCtx,
+                                     WriteModeEnum mode,
+                                     std::set<FieldPath> uniqueKey)
+    : DocumentSource(expCtx),
+      _done(false),
+      _outputNs(std::move(outputNs)),
+      _mode(mode),
+      _uniqueKeyFields(std::move(uniqueKey)),
+      _uniqueKeyIncludesId(_uniqueKeyFields.count("_id") == 1) {}
+
+intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
+    BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
+
+    auto mode = WriteModeEnum::kModeReplaceCollection;
+    std::set<FieldPath> uniqueKey;
+    NamespaceString outputNs;
+    if (elem.type() == BSONType::String) {
+        outputNs = NamespaceString(expCtx->ns.db().toString() + '.' + elem.str());
+        uniqueKey.emplace("_id");
+    } else if (elem.type() == BSONType::Object) {
+        auto spec =
+            DocumentSourceOutSpec::parse(IDLParserErrorContext("$out"), elem.embeddedObject());
+
+        mode = spec.getMode();
+
+        // Retrieve the target database from the user command, otherwise use the namespace from the
+        // expression context.
+        if (auto targetDb = spec.getTargetDb()) {
+            outputNs = NamespaceString(*targetDb, spec.getTargetCollection());
+        } else {
+            outputNs = NamespaceString(expCtx->ns.db(), spec.getTargetCollection());
+        }
+
+        // Convert unique key object to a vector of FieldPaths.
+        if (auto userSpecifiedUniqueKey = spec.getUniqueKey()) {
+            uniqueKey = parseUniqueKeyFromSpec(userSpecifiedUniqueKey.get());
+
+            // TODO SERVER-36047 Check if this is the document key and skip the check below.
+            const bool isDocumentKey = false;
+            // Make sure the uniqueKey has a supporting index. TODO SERVER-36047 Figure out where
+            // this assertion should take place in a sharded environment. For now we will skip the
+            // check on mongos and will not test this check against a sharded collection or another
+            // database - meaning the assertion should always happen on the primary shard where the
+            // collection must exist.
+            uassert(50938,
+                    "Cannot find index to verify that $out's uniqueKey will be unique",
+                    expCtx->inMongos || isDocumentKey ||
+                        expCtx->mongoProcessInterface->uniqueKeyIsSupportedByIndex(
+                            expCtx, outputNs, uniqueKey));
+        } else {
+            std::vector<FieldPath> docKeyPaths = std::get<0>(
+                expCtx->mongoProcessInterface->collectDocumentKeyFields(expCtx->opCtx, outputNs));
+            uniqueKey = std::set<FieldPath>(std::make_move_iterator(docKeyPaths.begin()),
+                                            std::make_move_iterator(docKeyPaths.end()));
+        }
+    } else {
+        uasserted(16990,
+                  str::stream() << "$out only supports a string or object argument, not "
+                                << typeName(elem.type()));
+    }
+
+    return create(std::move(outputNs), expCtx, mode, std::move(uniqueKey));
 }
 
 Value DocumentSourceOut::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {

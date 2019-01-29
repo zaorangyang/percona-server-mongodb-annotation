@@ -64,7 +64,6 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/record_fetcher.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/update/update_driver.h"
 
@@ -130,9 +129,9 @@ std::unique_ptr<CollatorInterface> parseCollation(OperationContext* opCtx,
 }
 }  // namespace
 
-using std::unique_ptr;
 using std::endl;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 
 using logger::LogComponent;
@@ -299,7 +298,7 @@ Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
                                                const DocWriter* const* docs,
                                                Timestamp* timestamps,
                                                size_t nDocs) {
-    dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
+    dassert(opCtx->lockState()->isWriteLocked());
 
     // Since this is only for the OpLog, we can assume these for simplicity.
     // This also means that we do not need to forward this object to the OpObserver, which is good
@@ -513,9 +512,6 @@ void CollectionImpl::notifyCappedWaitersIfNeeded() {
 Status CollectionImpl::aboutToDeleteCapped(OperationContext* opCtx,
                                            const RecordId& loc,
                                            RecordData data) {
-    /* check if any cursors point to us.  if so, advance them. */
-    _cursorManager.invalidateDocument(opCtx, loc, INVALIDATION_DELETION);
-
     BSONObj doc = data.releaseToBson();
     int64_t* const nullKeysDeleted = nullptr;
     _indexCatalog.unindexRecord(opCtx, doc, loc, false, nullKeysDeleted);
@@ -550,9 +546,6 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
         deletedDoc.emplace(doc.value().getOwned());
     }
 
-    /* check if any cursors point to us.  if so, advance them. */
-    _cursorManager.invalidateDocument(opCtx, loc, INVALIDATION_DELETION);
-
     int64_t keysDeleted;
     _indexCatalog.unindexRecord(opCtx, doc.value(), loc, noWarn, &keysDeleted);
     if (opDebug) {
@@ -574,7 +567,7 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
                                         const BSONObj& newDoc,
                                         bool indexesAffected,
                                         OpDebug* opDebug,
-                                        OplogUpdateEntryArgs* args) {
+                                        CollectionUpdateArgs* args) {
     {
         auto status = checkValidation(opCtx, newDoc);
         if (!status.isOK()) {
@@ -652,7 +645,7 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
     args->preImageDoc = oldDoc.value().getOwned();
 
     Status updateStatus =
-        _recordStore->updateRecord(opCtx, oldLocation, newDoc.objdata(), newDoc.objsize(), this);
+        _recordStore->updateRecord(opCtx, oldLocation, newDoc.objdata(), newDoc.objsize());
 
     // Update each index with each respective UpdateTicket.
     if (indexesAffected) {
@@ -675,18 +668,12 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
     invariant(sid == opCtx->recoveryUnit()->getSnapshotId());
     args->updatedDoc = newDoc;
 
-    getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, *args);
+    invariant(uuid());
+    OplogUpdateEntryArgs entryArgs(*args, ns(), *uuid());
+    getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, entryArgs);
 
     return {oldLocation};
 }
-
-Status CollectionImpl::recordStoreGoingToUpdateInPlace(OperationContext* opCtx,
-                                                       const RecordId& loc) {
-    // Broadcast the mutation so that query results stay correct.
-    _cursorManager.invalidateDocument(opCtx, loc, INVALIDATION_MUTATION);
-    return Status::OK();
-}
-
 
 bool CollectionImpl::updateWithDamagesSupported() const {
     if (_validator)
@@ -701,13 +688,10 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
     const Snapshotted<RecordData>& oldRec,
     const char* damageSource,
     const mutablebson::DamageVector& damages,
-    OplogUpdateEntryArgs* args) {
+    CollectionUpdateArgs* args) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns().toString(), MODE_IX));
     invariant(oldRec.snapshotId() == opCtx->recoveryUnit()->getSnapshotId());
     invariant(updateWithDamagesSupported());
-
-    // Broadcast the mutation so that query results stay correct.
-    _cursorManager.invalidateDocument(opCtx, loc, INVALIDATION_MUTATION);
 
     auto newRecStatus =
         _recordStore->updateWithDamages(opCtx, loc, oldRec.value(), damageSource, damages);
@@ -715,7 +699,9 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
     if (newRecStatus.isOK()) {
         args->updatedDoc = newRecStatus.getValue().toBson();
 
-        getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, *args);
+        invariant(uuid());
+        OplogUpdateEntryArgs entryArgs(*args, ns(), *uuid());
+        getGlobalServiceContext()->getOpObserver()->onUpdate(opCtx, entryArgs);
     }
     return newRecStatus;
 }

@@ -122,10 +122,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(OperationContext*,
-                                                                     UUID) const final {
-        MONGO_UNREACHABLE;
-    }
+    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
+        OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const final;
 
     StatusWith<std::unique_ptr<Pipeline, PipelineDeleter>> makePipeline(
         const std::vector<BSONObj>& rawPipeline,
@@ -152,6 +150,25 @@ public:
 
     void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) final {
         MONGO_UNREACHABLE;
+    }
+
+    /**
+     * Mongos does not have a plan cache, so this method should never be called on mongos. Upstream
+     * checks are responsible for generating an error if a user attempts to introspect the plan
+     * cache on mongos.
+     */
+    std::vector<BSONObj> getMatchingPlanCacheEntryStats(OperationContext*,
+                                                        const NamespaceString&,
+                                                        const MatchExpression*) const final {
+        MONGO_UNREACHABLE;
+    }
+
+    bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>&,
+                                     const NamespaceString&,
+                                     const std::set<FieldPath>& uniqueKeyPaths) const final {
+        // TODO SERVER-36047 we'll have to contact the primary shard for the database to ask for the
+        // index specs.
+        return true;
     }
 
 protected:

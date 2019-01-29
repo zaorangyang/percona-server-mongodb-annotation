@@ -598,20 +598,30 @@ void QueryPlannerAccess::finishLeafNode(QuerySolutionNode* node, const IndexEntr
     }
 
     // For $** indexes, the IndexEntry key pattern is {'path.to.field': ±1} but the actual keys in
-    // the index are of the form {'_path': ±1, 'path.to.field': ±1}, where the value of the first
+    // the index are of the form {'$_path': ±1, 'path.to.field': ±1}, where the value of the first
     // field in each key is 'path.to.field'. We push a point-interval on 'path.to.field' into the
-    // bounds vector for the leading '_path' bound here. We also push corresponding fields into the
+    // bounds vector for the leading '$_path' bound here. We also push corresponding fields into the
     // IndexScanNode's keyPattern and its multikeyPaths vector.
     if (index.type == IndexType::INDEX_ALLPATHS) {
         invariant(bounds->fields.size() == 1 && index.keyPattern.nFields() == 1);
         invariant(!bounds->fields.front().name.empty());
         invariant(nodeIndex);
-        bounds->fields.insert(bounds->fields.begin(), {"_path"});
+        bounds->fields.insert(bounds->fields.begin(), {"$_path"});
         bounds->fields.front().intervals.push_back(
             IndexBoundsBuilder::makePointInterval(nodeIndex->keyPattern.firstElementFieldName()));
-        nodeIndex->keyPattern = BSON("_path" << nodeIndex->keyPattern.firstElement()
-                                             << nodeIndex->keyPattern.firstElement());
-        nodeIndex->multikeyPaths.insert(nodeIndex->multikeyPaths.begin(), {});
+        // If the bounds are [MinKey, MaxKey] then we're querying for any values in the given
+        // path. Therefore we must add bounds that allow subpaths (specifically the bound
+        // ["path.","path/") on "$_path").
+        const auto& intervals = bounds->fields.back().intervals;
+        if (!intervals.empty() && intervals.front().isMinToMaxInclusive()) {
+            bounds->fields.front().intervals.push_back(IndexBoundsBuilder::makeRangeInterval(
+                bounds->fields.back().name + '.',
+                bounds->fields.back().name + static_cast<char>('.' + 1),
+                BoundInclusion::kIncludeStartKeyOnly));
+        }
+        nodeIndex->keyPattern = BSON("$_path" << nodeIndex->keyPattern.firstElement()
+                                              << nodeIndex->keyPattern.firstElement());
+        nodeIndex->multikeyPaths.insert(nodeIndex->multikeyPaths.begin(), std::set<std::size_t>{});
     }
 
     // If the QuerySolutionNode's IndexEntry is available, use its keyPattern.
@@ -1005,6 +1015,16 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
     if (ixscanNodes.size() == 1) {
         andResult = std::move(ixscanNodes[0]);
     } else {
+        // $** indexes are prohibited from participating in either AND_SORTED or AND_HASH.
+        const bool allPathsIndexInvolvedInIntersection =
+            std::any_of(ixscanNodes.begin(), ixscanNodes.end(), [](const auto& ixScan) {
+                return ixScan->getType() == StageType::STAGE_IXSCAN &&
+                    static_cast<IndexScanNode*>(ixScan.get())->index.type == INDEX_ALLPATHS;
+            });
+        if (allPathsIndexInvolvedInIntersection) {
+            return nullptr;
+        }
+
         // Figure out if we want AndHashNode or AndSortedNode.
         bool allSortedByDiskLoc = true;
         for (size_t i = 0; i < ixscanNodes.size(); ++i) {

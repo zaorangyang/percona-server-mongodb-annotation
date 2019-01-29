@@ -41,27 +41,14 @@ using Action = TransactionCoordinator::StateMachine::Action;
 using Event = TransactionCoordinator::StateMachine::Event;
 using State = TransactionCoordinator::StateMachine::State;
 
-namespace {
-const Session::Decoration<boost::optional<TransactionCoordinator>> getTransactionCoordinator =
-    Session::declareDecoration<boost::optional<TransactionCoordinator>>();
-}  // namespace
-
-boost::optional<TransactionCoordinator>& TransactionCoordinator::get(OperationContext* opCtx) {
-    auto session = OperationContextSession::get(opCtx);
-    return getTransactionCoordinator(session);
-}
-
-void TransactionCoordinator::create(Session* session) {
-    invariant(!getTransactionCoordinator(session));
-    getTransactionCoordinator(session).emplace();
-}
-
 Action TransactionCoordinator::recvCoordinateCommit(const std::set<ShardId>& participants) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _participantList.recordFullList(participants);
     return _stateMachine.onEvent(Event::kRecvParticipantList);
 }
 
-Action TransactionCoordinator::recvVoteCommit(const ShardId& shardId, int prepareTimestamp) {
+Action TransactionCoordinator::recvVoteCommit(const ShardId& shardId, Timestamp prepareTimestamp) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _participantList.recordVoteCommit(shardId, prepareTimestamp);
 
     auto event = (_participantList.allParticipantsVotedCommit()) ? Event::kRecvFinalVoteCommit
@@ -70,11 +57,13 @@ Action TransactionCoordinator::recvVoteCommit(const ShardId& shardId, int prepar
 }
 
 Action TransactionCoordinator::recvVoteAbort(const ShardId& shardId) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _participantList.recordVoteAbort(shardId);
     return _stateMachine.onEvent(Event::kRecvVoteAbort);
 }
 
 void TransactionCoordinator::recvCommitAck(const ShardId& shardId) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _participantList.recordCommitAck(shardId);
     if (_participantList.allParticipantsAckedCommit()) {
         _stateMachine.onEvent(Event::kRecvFinalCommitAck);
@@ -82,6 +71,7 @@ void TransactionCoordinator::recvCommitAck(const ShardId& shardId) {
 }
 
 void TransactionCoordinator::recvAbortAck(const ShardId& shardId) {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
     _participantList.recordAbortAck(shardId);
     if (_participantList.allParticipantsAckedAbort()) {
         _stateMachine.onEvent(Event::kRecvFinalAbortAck);
@@ -177,7 +167,7 @@ void TransactionCoordinator::ParticipantList::recordFullList(
 }
 
 void TransactionCoordinator::ParticipantList::recordVoteCommit(const ShardId& shardId,
-                                                               int prepareTimestamp) {
+                                                               Timestamp prepareTimestamp) {
     if (!_fullListReceived) {
         _recordParticipant(shardId);
     }
@@ -204,11 +194,11 @@ void TransactionCoordinator::ParticipantList::recordVoteCommit(const ShardId& sh
     } else {
         uassert(ErrorCodes::InternalError,
                 str::stream() << "Transaction commit coordinator received prepareTimestamp "
-                              << prepareTimestamp
+                              << prepareTimestamp.toStringPretty()
                               << " from participant "
                               << shardId.toString()
                               << " that previously reported prepareTimestamp "
-                              << participant.prepareTimestamp,
+                              << participant.prepareTimestamp->toStringPretty(),
                 *participant.prepareTimestamp == prepareTimestamp);
     }
 }
@@ -285,29 +275,37 @@ bool TransactionCoordinator::ParticipantList::allParticipantsAckedCommit() const
         });
 }
 
+Timestamp TransactionCoordinator::ParticipantList::getHighestPrepareTimestamp() const {
+    invariant(_fullListReceived);
+    Timestamp highestPrepareTimestamp = Timestamp::min();
+    for (const auto& participant : _participants) {
+        invariant(participant.second.prepareTimestamp);
+        if (*participant.second.prepareTimestamp > highestPrepareTimestamp) {
+            highestPrepareTimestamp = *participant.second.prepareTimestamp;
+        }
+    }
+    return highestPrepareTimestamp;
+}
+
 std::set<ShardId> TransactionCoordinator::ParticipantList::getNonAckedCommitParticipants() const {
     std::set<ShardId> nonAckedCommitParticipants;
-    for_each(_participants.begin(),
-             _participants.end(),
-             [&nonAckedCommitParticipants](const std::pair<ShardId, Participant>& i) {
-                 if (i.second.ack != Participant::Ack::kCommit) {
-                     invariant(i.second.ack == Participant::Ack::kNone);
-                     nonAckedCommitParticipants.insert(i.first);
-                 }
-             });
+    for (const auto& kv : _participants) {
+        if (kv.second.ack != Participant::Ack::kCommit) {
+            invariant(kv.second.ack == Participant::Ack::kNone);
+            nonAckedCommitParticipants.insert(kv.first);
+        }
+    }
     return nonAckedCommitParticipants;
 }
 
 std::set<ShardId> TransactionCoordinator::ParticipantList::getNonAckedAbortParticipants() const {
     std::set<ShardId> nonAckedAbortParticipants;
-    for_each(_participants.begin(),
-             _participants.end(),
-             [&nonAckedAbortParticipants](const std::pair<ShardId, Participant>& i) {
-                 if (i.second.ack != Participant::Ack::kAbort) {
-                     invariant(i.second.ack == Participant::Ack::kNone);
-                     nonAckedAbortParticipants.insert(i.first);
-                 }
-             });
+    for (const auto& kv : _participants) {
+        if (kv.second.ack != Participant::Ack::kAbort) {
+            invariant(kv.second.ack == Participant::Ack::kNone);
+            nonAckedAbortParticipants.insert(kv.first);
+        }
+    }
     return nonAckedAbortParticipants;
 }
 

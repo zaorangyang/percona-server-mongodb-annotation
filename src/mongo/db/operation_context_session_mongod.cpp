@@ -28,6 +28,8 @@
 
 #include "mongo/db/operation_context_session_mongod.h"
 
+#include "mongo/db/transaction_coordinator.h"
+#include "mongo/db/transaction_coordinator_service.h"
 #include "mongo/db/transaction_participant.h"
 
 namespace mongo {
@@ -35,7 +37,8 @@ namespace mongo {
 OperationContextSessionMongod::OperationContextSessionMongod(OperationContext* opCtx,
                                                              bool shouldCheckOutSession,
                                                              boost::optional<bool> autocommit,
-                                                             boost::optional<bool> startTransaction)
+                                                             boost::optional<bool> startTransaction,
+                                                             boost::optional<bool> coordinator)
     : _operationContextSession(opCtx, shouldCheckOutSession) {
     if (shouldCheckOutSession && !opCtx->getClient()->isInDirectClient()) {
         auto session = OperationContextSession::get(opCtx);
@@ -44,6 +47,20 @@ OperationContextSessionMongod::OperationContextSessionMongod(OperationContext* o
         auto clientTxnNumber = *opCtx->getTxnNumber();
         session->refreshFromStorageIfNeeded(opCtx);
         session->beginOrContinueTxn(opCtx, clientTxnNumber);
+
+        if (startTransaction && *startTransaction) {
+            auto clientLsid = opCtx->getLogicalSessionId().get();
+            auto clockSource = opCtx->getServiceContext()->getFastClockSource();
+
+            // If this shard has been selected as the coordinator, set up the coordinator state
+            // to be ready to receive votes.
+            if (coordinator && *coordinator) {
+                TransactionCoordinatorService::get(opCtx)->createCoordinator(
+                    clientLsid,
+                    clientTxnNumber,
+                    clockSource->now() + Seconds(transactionLifetimeLimitSeconds.load()));
+            }
+        }
 
         auto txnParticipant = TransactionParticipant::get(opCtx);
         txnParticipant->beginOrContinue(clientTxnNumber, autocommit, startTransaction);

@@ -145,8 +145,13 @@ def _make_parser():  # pylint: disable=too-many-statements
                       " existing MongoDB cluster with the URL mongodb://localhost:[PORT]."
                       " This is useful for connecting to a server running in a debugger.")
 
-    parser.add_option("--repeat", type="int", dest="repeat", metavar="N",
+    parser.add_option("--repeat", "--repeatSuites", type="int", dest="repeat_suites", metavar="N",
                       help="Repeats the given suite(s) N times, or until one fails.")
+
+    parser.add_option("--repeatTests", type="int", dest="repeat_tests", metavar="N",
+                      help="Repeats the tests inside each suite N times. This applies to tests"
+                      " defined in the suite configuration as well as tests defined on the command"
+                      " line.")
 
     parser.add_option("--reportFailureStatus", type="choice", action="store",
                       dest="report_failure_status", choices=("fail",
@@ -290,8 +295,22 @@ def _make_parser():  # pylint: disable=too-many-statements
     benchmark_options.add_option("--benchmarkRepetitions", type="int", dest="benchmark_repetitions",
                                  metavar="BENCHMARK_REPETITIONS", help=benchmark_repetitions_help)
 
-    parser.set_defaults(logger_file="console", dry_run="off", find_suites=False, list_suites=False,
-                        suite_files="with_server", shuffle="auto", stagger_jobs="off")
+    benchrun_devices = ["Android", "Desktop"]
+    benchmark_options.add_option("--benchrunDevice", dest="benchrun_device", metavar="DEVICE",
+                                 type="choice", action="store", choices=benchrun_devices,
+                                 help=("The device to run the benchrun test on, choose from {}."
+                                       " Defaults to DEVICE='%default'.".format(benchrun_devices)))
+
+    benchmark_options.add_option("--benchrunReportRoot", dest="benchrun_report_root",
+                                 metavar="PATH", help="The root path for benchrun test report.")
+
+    benchmark_options.add_option("--benchrunEmbeddedRoot", dest="benchrun_embedded_root",
+                                 metavar="PATH",
+                                 help="The root path on the mobile device, for a benchrun test.")
+
+    parser.set_defaults(benchrun_device="Desktop", dry_run="off", find_suites=False,
+                        list_suites=False, logger_file="console", shuffle="auto",
+                        stagger_jobs="off", suite_files="with_server")
     return parser
 
 
@@ -326,10 +345,11 @@ def validate_benchmark_options():
     :return: None
     """
 
-    if _config.REPEAT > 1:
+    if _config.REPEAT_SUITES > 1 or _config.REPEAT_TESTS > 1:
         raise optparse.OptionValueError(
-            "--repeat cannot be used with benchmark tests. Please use --benchmarkMinTimeSecs to "
-            "increase the runtime of a single benchmark configuration.")
+            "--repeatSuites/--repeatTests cannot be used with benchmark tests. "
+            "Please use --benchmarkMinTimeSecs to increase the runtime of a single benchmark "
+            "configuration.")
 
     if _config.JOBS > 1:
         raise optparse.OptionValueError(
@@ -356,6 +376,8 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements
     _config.ARCHIVE_LIMIT_MB = config.pop("archive_limit_mb")
     _config.ARCHIVE_LIMIT_TESTS = config.pop("archive_limit_tests")
     _config.BASE_PORT = int(config.pop("base_port"))
+    _config.BENCHRUN_DEVICE = config.pop("benchrun_device")
+    _config.BENCHRUN_EMBEDDED_ROOT = config.pop("benchrun_embedded_root")
     _config.BUILDLOGGER_URL = config.pop("buildlogger_url")
     _config.DBPATH_PREFIX = _expand_user(config.pop("dbpath_prefix"))
     _config.DBTEST_EXECUTABLE = _expand_user(config.pop("dbtest_executable"))
@@ -374,7 +396,8 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements
     _config.NUM_CLIENTS_PER_FIXTURE = config.pop("num_clients_per_fixture")
     _config.PERF_REPORT_FILE = config.pop("perf_report_file")
     _config.RANDOM_SEED = config.pop("seed")
-    _config.REPEAT = config.pop("repeat")
+    _config.REPEAT_SUITES = config.pop("repeat_suites")
+    _config.REPEAT_TESTS = config.pop("repeat_tests")
     _config.REPORT_FAILURE_STATUS = config.pop("report_failure_status")
     _config.REPORT_FILE = config.pop("report_file")
     _config.SERVICE_EXECUTOR = config.pop("service_executor")
@@ -404,13 +427,14 @@ def _update_config_vars(values):  # pylint: disable=too-many-statements
     _config.WT_ENGINE_CONFIG = config.pop("wt_engine_config")
     _config.WT_INDEX_CONFIG = config.pop("wt_index_config")
 
-    # Benchmark options.
+    # Benchmark/Benchrun options.
     _config.BENCHMARK_FILTER = config.pop("benchmark_filter")
     _config.BENCHMARK_LIST_TESTS = config.pop("benchmark_list_tests")
     benchmark_min_time = config.pop("benchmark_min_time_secs")
     if benchmark_min_time is not None:
         _config.BENCHMARK_MIN_TIME = datetime.timedelta(seconds=benchmark_min_time)
     _config.BENCHMARK_REPETITIONS = config.pop("benchmark_repetitions")
+    _config.BENCHRUN_REPORT_ROOT = config.pop("benchrun_report_root")
 
     shuffle = config.pop("shuffle")
     if shuffle == "auto":

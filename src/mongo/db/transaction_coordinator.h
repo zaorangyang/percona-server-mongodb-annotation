@@ -33,7 +33,9 @@
 #include <set>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/s/shard_id.h"
+#include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/mongoutils/str.h"
@@ -53,9 +55,6 @@ class TransactionCoordinator {
 public:
     TransactionCoordinator() = default;
     ~TransactionCoordinator() = default;
-
-    static boost::optional<TransactionCoordinator>& get(OperationContext* opCtx);
-    static void create(Session* session);
 
     /**
      * The internal state machine, or "brain", used by the TransactionCoordinator to determine what
@@ -133,7 +132,7 @@ public:
      * Throws if the full participant list has been received and this shard is not one of the
      * participants.
      */
-    StateMachine::Action recvVoteCommit(const ShardId& shardId, int prepareTimestamp);
+    StateMachine::Action recvVoteCommit(const ShardId& shardId, Timestamp prepareTimestamp);
 
     /**
      * A participant sends a voteAbort command if it failed to prepare the transaction.
@@ -163,6 +162,10 @@ public:
         return _participantList.getNonAckedAbortParticipants();
     }
 
+    Timestamp getCommitTimestamp() const {
+        return _participantList.getHighestPrepareTimestamp();
+    }
+
     StateMachine::State state() const {
         return _stateMachine.state();
     }
@@ -170,7 +173,7 @@ public:
     class ParticipantList {
     public:
         void recordFullList(const std::set<ShardId>& participants);
-        void recordVoteCommit(const ShardId& shardId, int prepareTimestamp);
+        void recordVoteCommit(const ShardId& shardId, Timestamp prepareTimestamp);
         void recordVoteAbort(const ShardId& shardId);
         void recordCommitAck(const ShardId& shardId);
         void recordAbortAck(const ShardId& shardId);
@@ -178,6 +181,8 @@ public:
         bool allParticipantsVotedCommit() const;
         bool allParticipantsAckedAbort() const;
         bool allParticipantsAckedCommit() const;
+
+        Timestamp getHighestPrepareTimestamp() const;
 
         std::set<ShardId> getNonAckedCommitParticipants() const;
         std::set<ShardId> getNonAckedAbortParticipants() const;
@@ -189,8 +194,7 @@ public:
 
             Vote vote{Vote::kUnknown};
             Ack ack{Ack::kNone};
-            // TODO: Use a real Timestamp (OpTime?)
-            boost::optional<int> prepareTimestamp{boost::none};
+            boost::optional<Timestamp> prepareTimestamp{boost::none};
         };
 
     private:
@@ -202,6 +206,7 @@ public:
     };
 
 private:
+    stdx::mutex _mutex;
     ParticipantList _participantList;
     StateMachine _stateMachine;
 };

@@ -1425,8 +1425,7 @@ Status WiredTigerRecordStore::insertRecordsWithDocWriter(OperationContext* opCtx
 Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
                                            const RecordId& id,
                                            const char* data,
-                                           int len,
-                                           UpdateNotifier* notifier) {
+                                           int len) {
     dassert(opCtx->lockState()->isWriteLocked());
 
     WiredTigerCursor curwrap(_uri, _tableId, true, opCtx);
@@ -2081,7 +2080,7 @@ void StandardWiredTigerRecordStore::setKey(WT_CURSOR* cursor, RecordId id) const
 
 std::unique_ptr<SeekableRecordCursor> StandardWiredTigerRecordStore::getCursor(
     OperationContext* opCtx, bool forward) const {
-    dassert(opCtx->lockState()->isReadLocked() || _isOplog);
+    dassert(opCtx->lockState()->isReadLocked());
 
     if (_isOplog && forward) {
         WiredTigerRecoveryUnit* wru = WiredTigerRecoveryUnit::get(opCtx);

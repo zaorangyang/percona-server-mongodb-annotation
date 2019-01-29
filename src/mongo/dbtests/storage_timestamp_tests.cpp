@@ -246,7 +246,7 @@ public:
             // The op observer is not called from the index builder, but rather the
             // `createIndexes` command.
             _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                _opCtx, coll->ns(), coll->uuid(), indexInfoObj, false);
+                _opCtx, coll->ns(), *(coll->uuid()), indexInfoObj, false);
             wuow.commit();
         }
     }
@@ -1856,7 +1856,7 @@ public:
                 // The op observer is not called from the index builder, but rather the
                 // `createIndexes` command.
                 _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                    _opCtx, nss, autoColl.getCollection()->uuid(), indexInfoObj, false);
+                    _opCtx, nss, *(autoColl.getCollection()->uuid()), indexInfoObj, false);
             } else {
                 ASSERT_OK(
                     _opCtx->recoveryUnit()->setTimestamp(_clock->getClusterTime().asTimestamp()));
@@ -2644,7 +2644,7 @@ public:
             assertOplogDocumentExistsAtTimestamp(commitFilter, commitTimestamp, false);
             assertOplogDocumentExistsAtTimestamp(commitFilter, nullTs, false);
         }
-        txnParticipant->unstashTransactionResources(_opCtx, "insert");
+        txnParticipant->unstashTransactionResources(_opCtx, "commitTransaction");
 
         txnParticipant->commitPreparedTransaction(_opCtx, commitTimestamp);
 

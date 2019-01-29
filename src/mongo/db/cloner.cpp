@@ -96,16 +96,7 @@ BSONObj fixIndexSpec(const string& newDbName, BSONObj indexSpec) {
 
     for (auto&& indexSpecElem : indexSpec) {
         auto indexSpecElemFieldName = indexSpecElem.fieldNameStringData();
-        if (IndexDescriptor::kIndexVersionFieldName == indexSpecElemFieldName) {
-            IndexVersion indexVersion = static_cast<IndexVersion>(indexSpecElem.numberInt());
-            if (IndexVersion::kV0 == indexVersion) {
-                // We automatically upgrade v=0 indexes to v=1 indexes.
-                bob.append(IndexDescriptor::kIndexVersionFieldName,
-                           static_cast<int>(IndexVersion::kV1));
-            } else {
-                bob.append(IndexDescriptor::kIndexVersionFieldName, static_cast<int>(indexVersion));
-            }
-        } else if (IndexDescriptor::kNamespaceFieldName == indexSpecElemFieldName) {
+        if (IndexDescriptor::kNamespaceFieldName == indexSpecElemFieldName) {
             uassert(10024, "bad ns field for index during dbcopy", indexSpecElem.type() == String);
             const char* p = strchr(indexSpecElem.valuestr(), '.');
             uassert(10025, "bad ns field for index during dbcopy [2]", p);
@@ -139,8 +130,6 @@ struct Cloner::Fun {
         : lastLog(0), opCtx(opCtx), _dbName(dbName) {}
 
     void operator()(DBClientCursorBatchIterator& i) {
-        invariant(from_collection.coll() != "system.indexes");
-
         // XXX: can probably take dblock instead
         unique_ptr<Lock::GlobalWrite> globalWriteLock(new Lock::GlobalWrite(opCtx));
         uassert(
@@ -327,7 +316,7 @@ void Cloner::copy(OperationContext* opCtx,
     {
         Lock::TempRelease tempRelease(opCtx->lockState());
         _conn->query(stdx::function<void(DBClientCursorBatchIterator&)>(f),
-                     from_collection.ns(),
+                     from_collection,
                      query,
                      0,
                      options);
@@ -417,7 +406,7 @@ void Cloner::copyIndexes(OperationContext* opCtx,
     if (opCtx->writesAreReplicated()) {
         for (auto&& infoObj : indexInfoObjs) {
             getGlobalServiceContext()->getOpObserver()->onCreateIndex(
-                opCtx, collection->ns(), collection->uuid(), infoObj, false);
+                opCtx, collection->ns(), *(collection->uuid()), infoObj, false);
         }
     }
     wunit.commit();

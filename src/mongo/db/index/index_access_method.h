@@ -30,9 +30,11 @@
 
 #include <atomic>
 #include <memory>
+#include <set>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/field_ref.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
@@ -327,6 +329,15 @@ public:
     static std::pair<std::vector<BSONObj>, std::vector<BSONObj>> setDifference(
         const BSONObjSet& left, const BSONObjSet& right);
 
+    /**
+     * Returns the set of multikey metadata paths stored in the index. Only index types which can
+     * store metadata describing an arbitrarily large set of multikey paths need to override this
+     * method.
+     */
+    virtual std::set<FieldRef> getMultikeyPathSet(OperationContext* opCtx) const {
+        return {};
+    }
+
 protected:
     /**
      * Fills 'keys' with the keys that should be generated for 'obj' on this index.
@@ -348,11 +359,6 @@ protected:
                            MultikeyPaths* multikeyPaths) const = 0;
 
     /**
-     * Determines whether it's OK to ignore ErrorCodes::KeyTooLong for this OperationContext
-     */
-    bool ignoreKeyTooLong(OperationContext* opCtx);
-
-    /**
      * Determine whether the given Status represents an exception that should cause the indexing
      * process to abort. The 'key' argument is passed in to allow the offending entry to be logged
      * in the event that a non-fatal 'ErrorCodes::DuplicateKeyValue' is encountered during a
@@ -364,6 +370,18 @@ protected:
     const IndexDescriptor* _descriptor;
 
 private:
+    /**
+     * Determines whether it's OK to ignore ErrorCodes::KeyTooLong for this OperationContext
+     * TODO SERVER-36385: Remove this function.
+     */
+    bool ignoreKeyTooLong();
+
+    /**
+     * If true, we should check whether the index key exceeds the hardcoded limit.
+     * TODO SERVER-36385: Remove this function.
+     */
+    bool shouldCheckIndexKeySize(OperationContext* opCtx);
+
     void removeOneKey(OperationContext* opCtx,
                       const BSONObj& key,
                       const RecordId& loc,

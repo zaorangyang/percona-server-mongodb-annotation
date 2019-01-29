@@ -68,9 +68,6 @@
  *  nodes {Array.<Mongo>} - connection to replica set members
  */
 
-/* Global default timeout variable */
-const kReplDefaultTimeoutMS = 10 * 60 * 1000;
-
 var ReplSetTest = function(opts) {
     'use strict';
 
@@ -95,7 +92,9 @@ var ReplSetTest = function(opts) {
 
     var _causalConsistency;
 
-    this.kDefaultTimeoutMS = kReplDefaultTimeoutMS;
+    // Some code still references kDefaultTimeoutMS as a (non-static) member variable, so make sure
+    // it's still accessible that way.
+    this.kDefaultTimeoutMS = ReplSetTest.kDefaultTimeoutMS;
     var oplogName = 'oplog.rs';
 
     // Publicly exposed variables
@@ -1239,17 +1238,10 @@ var ReplSetTest = function(opts) {
         let master = rst.getPrimary();
         let id = tojson(rst.nodeList());
 
-        // Algorithm precondition: All nodes must be in primary/secondary state.
-        //
-        // 1) Perform a majority write. This will guarantee the primary updates its commit point
-        //    to the value of this write.
-        //
-        // 2) Perform a second write. This will guarantee that all nodes will update their commit
-        //    point to a time that is >= the previous write. That will trigger a stable checkpoint
-        //    on all persisted storage engine nodes.
-        // TODO(SERVER-33248): Remove this block. We should not need to prod the replica set to
-        // advance the commit point if the commit point being lagged is sufficient to choose a
-        // sync source.
+        // All nodes must be in primary/secondary state prior to this point. Perform a majority
+        // write to ensure there is a committed operation on the set. The commit point will
+        // propagate to all members and trigger a stable checkpoint on all persisted storage engines
+        // nodes.
         function advanceCommitPoint(master) {
             // Shadow 'db' so that we can call 'advanceCommitPoint' directly on the primary node.
             let db = master.getDB('admin');
@@ -1259,8 +1251,6 @@ var ReplSetTest = function(opts) {
                     "data": {"awaitLastStableRecoveryTimestamp": 1},
                     "writeConcern": {"w": "majority", "wtimeout": ReplSetTest.kDefaultTimeoutMS}
                 }));
-                assert.commandWorked(db.adminCommand(
-                    {"appendOplogNote": 1, "data": {"awaitLastStableRecoveryTimestamp": 2}}));
             };
 
             // TODO(SERVER-14017): Remove this extra sub-shell in favor of a cleaner authentication
@@ -2581,10 +2571,9 @@ var ReplSetTest = function(opts) {
 };
 
 /**
- * Declare kDefaultTimeoutMS as a static property so we don't have to initialize
- * a ReplSetTest object to use it.
+ *  Global default timeout (10 minutes).
  */
-ReplSetTest.kDefaultTimeoutMS = kReplDefaultTimeoutMS;
+ReplSetTest.kDefaultTimeoutMS = 10 * 60 * 1000;
 
 /**
  * Set of states that the replica set can be in. Used for the wait functions.

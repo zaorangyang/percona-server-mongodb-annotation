@@ -38,32 +38,10 @@ namespace {
 
 class ClusterDistinctTest : public ClusterCommandTestFixture {
 protected:
-    const Timestamp kAfterClusterTime = Timestamp(50, 2);
-
     const BSONObj kDistinctCmdTargeted{
         fromjson("{distinct: 'coll', key: 'x', query: {'_id': {$lt: -1}}}")};
 
     const BSONObj kDistinctCmdScatterGather{fromjson("{distinct: 'coll', key: '_id'}")};
-
-    BSONObj appendSnapshotReadConcern(BSONObj cmdObj, bool includeAfterClusterTime) {
-        BSONObjBuilder bob(cmdObj);
-        BSONObjBuilder readConcernBob =
-            bob.subobjStart(repl::ReadConcernArgs::kReadConcernFieldName);
-        readConcernBob.append("level", "snapshot");
-        if (includeAfterClusterTime) {
-            readConcernBob.append("afterClusterTime", kAfterClusterTime);
-        }
-        readConcernBob.doneFast();
-        return bob.obj();
-    }
-
-    BSONObj distinctCmdTargeted(bool includeAfterClusterTime = false) {
-        return appendSnapshotReadConcern(kDistinctCmdTargeted, includeAfterClusterTime);
-    }
-
-    BSONObj distinctCmdScatterGather(bool includeAfterClusterTime = false) {
-        return appendSnapshotReadConcern(kDistinctCmdScatterGather, includeAfterClusterTime);
-    }
 
     void expectInspectRequest(int shardIndex, InspectionCallback cb) override {
         onCommandForPoolExecutor([&](const executor::RemoteCommandRequest& request) {
@@ -82,79 +60,24 @@ protected:
 };
 
 TEST_F(ClusterDistinctTest, NoErrors) {
-    loadRoutingTableWithTwoChunksAndTwoShards(kNss);
-
-    // Target one shard.
-    runCommandSuccessful(distinctCmdTargeted(), true);
-
-    // Target all shards.
-    runCommandSuccessful(distinctCmdScatterGather(), false);
+    testNoErrors(kDistinctCmdTargeted, kDistinctCmdScatterGather);
 }
 
-// Verify distinct through mongos will retry on a snapshot error.
 TEST_F(ClusterDistinctTest, RetryOnSnapshotError) {
-    loadRoutingTableWithTwoChunksAndTwoShards(kNss);
-
-    // Target one shard.
-    runCommandOneError(distinctCmdTargeted(), ErrorCodes::SnapshotUnavailable, true);
-    runCommandOneError(distinctCmdTargeted(), ErrorCodes::SnapshotTooOld, true);
-
-    // Target all shards
-    runCommandOneError(distinctCmdScatterGather(), ErrorCodes::SnapshotUnavailable, false);
-    runCommandOneError(distinctCmdScatterGather(), ErrorCodes::SnapshotTooOld, false);
+    testRetryOnSnapshotError(kDistinctCmdTargeted, kDistinctCmdScatterGather);
 }
 
-// Verify distinct commands will retry up to its max retry attempts on snapshot errors
-// then return the final error it receives.
 TEST_F(ClusterDistinctTest, MaxRetriesSnapshotErrors) {
-    loadRoutingTableWithTwoChunksAndTwoShards(kNss);
-
-    // Target one shard.
-    runCommandMaxErrors(distinctCmdTargeted(), ErrorCodes::SnapshotUnavailable, true);
-    runCommandMaxErrors(distinctCmdTargeted(), ErrorCodes::SnapshotTooOld, true);
-
-    // Target all shards
-    runCommandMaxErrors(distinctCmdScatterGather(), ErrorCodes::SnapshotUnavailable, false);
-    runCommandMaxErrors(distinctCmdScatterGather(), ErrorCodes::SnapshotTooOld, false);
+    testMaxRetriesSnapshotErrors(kDistinctCmdTargeted, kDistinctCmdScatterGather);
 }
 
 TEST_F(ClusterDistinctTest, AttachesAtClusterTimeForSnapshotReadConcern) {
-    loadRoutingTableWithTwoChunksAndTwoShards(kNss);
-
-    auto containsAtClusterTime = [](const executor::RemoteCommandRequest& request) {
-        ASSERT(!request.cmdObj["readConcern"]["atClusterTime"].eoo());
-    };
-
-    // Target one shard.
-    runCommandInspectRequests(distinctCmdTargeted(), containsAtClusterTime, true);
-
-    // Target all shards.
-    runCommandInspectRequests(distinctCmdScatterGather(), containsAtClusterTime, false);
+    testAttachesAtClusterTimeForSnapshotReadConcern(kDistinctCmdTargeted,
+                                                    kDistinctCmdScatterGather);
 }
 
 TEST_F(ClusterDistinctTest, SnapshotReadConcernWithAfterClusterTime) {
-    loadRoutingTableWithTwoChunksAndTwoShards(kNss);
-
-    auto containsAtClusterTimeNoAfterClusterTime =
-        [&](const executor::RemoteCommandRequest& request) {
-            ASSERT(!request.cmdObj["readConcern"]["atClusterTime"].eoo());
-            ASSERT(request.cmdObj["readConcern"]["afterClusterTime"].eoo());
-
-            // The chosen atClusterTime should be greater than or equal to the request's
-            // afterClusterTime.
-            ASSERT_GTE(LogicalTime(request.cmdObj["readConcern"]["atClusterTime"].timestamp()),
-                       LogicalTime(kAfterClusterTime));
-        };
-
-    // Target one shard.
-    runCommandInspectRequests(distinctCmdTargeted(true /*includeAfterClusterTime*/),
-                              containsAtClusterTimeNoAfterClusterTime,
-                              true);
-
-    // Target all shards.
-    runCommandInspectRequests(distinctCmdScatterGather(true /*includeAfterClusterTime*/),
-                              containsAtClusterTimeNoAfterClusterTime,
-                              false);
+    testSnapshotReadConcernWithAfterClusterTime(kDistinctCmdTargeted, kDistinctCmdScatterGather);
 }
 
 }  // namespace

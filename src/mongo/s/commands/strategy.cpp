@@ -43,6 +43,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/handle_request_response.h"
 #include "mongo/db/initialize_operation_session_info.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/logical_clock.h"
@@ -221,10 +222,6 @@ void execCommandClient(OperationContext* opCtx,
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
 
     if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern) {
-        uassert(ErrorCodes::InvalidOptions,
-                "readConcern level snapshot is not supported on mongos",
-                getTestCommandsEnabled());
-
         // TODO SERVER-33708.
         if (!invocation->supportsReadConcern(readConcernArgs.getLevel())) {
             auto body = result->getBodyBuilder();
@@ -254,6 +251,10 @@ void execCommandClient(OperationContext* opCtx,
                        "read concern snapshot is not supported with atClusterTime on mongos"));
             return;
         }
+
+        uassert(ErrorCodes::InvalidOptions,
+                "read concern snapshot is only supported in a multi-statement transaction",
+                TransactionRouter::get(opCtx));
     }
 
     // attach tracking
@@ -287,10 +288,15 @@ void execCommandClient(OperationContext* opCtx,
 
 MONGO_FAIL_POINT_DEFINE(doNotRefreshShardsOnRetargettingError);
 
+/**
+ * Executes the command for the given request, and appends the result to replyBuilder
+ * and error labels, if any, to errorBuilder.
+ */
 void runCommand(OperationContext* opCtx,
                 const OpMsgRequest& request,
                 const NetworkOp opType,
-                rpc::ReplyBuilderInterface* replyBuilder) {
+                rpc::ReplyBuilderInterface* replyBuilder,
+                BSONObjBuilder* errorBuilder) {
     auto const commandName = request.getCommandName();
     auto const command = CommandHelpers::findCommand(commandName);
     if (!command) {
@@ -343,10 +349,11 @@ void runCommand(OperationContext* opCtx,
     }
 
     boost::optional<ScopedRouterSession> scopedSession;
-    if (auto osi = initializeOperationSessionInfo(
-            opCtx, request.body, command->requiresAuth(), true, true, true)) {
+    auto osi = initializeOperationSessionInfo(
+        opCtx, request.body, command->requiresAuth(), true, true, true);
 
-        if (osi->getAutocommit()) {
+    try {
+        if (osi && osi->getAutocommit()) {
             scopedSession.emplace(opCtx);
 
             auto txnRouter = TransactionRouter::get(opCtx);
@@ -360,9 +367,7 @@ void runCommand(OperationContext* opCtx,
 
             txnRouter->beginOrContinueTxn(opCtx, *txnNumber, startTransaction);
         }
-    }
 
-    try {
         for (int tries = 0;; ++tries) {
             // Try kMaxNumStaleVersionRetries times. On the last try, exceptions are rethrown.
             bool canRetry = tries < kMaxNumStaleVersionRetries - 1;
@@ -411,9 +416,21 @@ void runCommand(OperationContext* opCtx,
                     continue;
                 }
                 throw;
-            } catch (const ExceptionForCat<ErrorCategory::SnapshotError>&) {
+            } catch (ExceptionForCat<ErrorCategory::SnapshotError>& ex) {
                 // Simple retry on any type of snapshot error.
                 if (canRetry) {
+                    auto txnRouter = TransactionRouter::get(opCtx);
+                    invariant(txnRouter);
+
+                    if (txnRouter->canContinueOnSnapshotError()) {
+                        txnRouter->onSnapshotError();
+                    } else {
+                        // TODO SERVER-36589: Abort the entire transaction.
+                        ex.addContext(
+                            "Encountered snapshot error on subsequent transaction statement");
+                        throw;
+                    }
+
                     continue;
                 }
                 throw;
@@ -423,6 +440,8 @@ void runCommand(OperationContext* opCtx,
     } catch (const DBException& e) {
         command->incrementCommandsFailed();
         LastError::get(opCtx->getClient()).setLastError(e.code(), e.reason());
+        auto errorLabels = getErrorLabels(osi, command->getName(), e.code());
+        errorBuilder->appendElements(errorLabels);
         throw;
     }
 }
@@ -534,6 +553,7 @@ DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss
 
 DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
     auto reply = rpc::makeReplyBuilder(rpc::protocolForMessage(m));
+    BSONObjBuilder errorBuilder;
 
     bool propagateException = false;
 
@@ -556,7 +576,7 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
         std::string db = request.getDatabase().toString();
         try {
             LOG(3) << "Command begin db: " << db << " msg id: " << m.header().getId();
-            runCommand(opCtx, request, m.operation(), reply.get());
+            runCommand(opCtx, request, m.operation(), reply.get(), &errorBuilder);
             LOG(3) << "Command end db: " << db << " msg id: " << m.header().getId();
         } catch (const DBException& ex) {
             LOG(1) << "Exception thrown while processing command on " << db
@@ -574,6 +594,7 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
         auto bob = reply->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(bob, ex.toStatus());
         appendRequiredFieldsToResponse(opCtx, &bob);
+        bob.appendElements(errorBuilder.obj());
     }
 
     if (OpMsg::isFlagSet(m, OpMsg::kMoreToCome)) {
@@ -718,6 +739,7 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
 void Strategy::writeOp(OperationContext* opCtx, DbMessage* dbm) {
     const auto& msg = dbm->msg();
     rpc::OpMsgReplyBuilder reply;
+    BSONObjBuilder errorBuilder;
     runCommand(opCtx,
                [&]() {
                    switch (msg.operation()) {
@@ -735,7 +757,8 @@ void Strategy::writeOp(OperationContext* opCtx, DbMessage* dbm) {
                    }
                }(),
                msg.operation(),
-               &reply);  // built object is ignored
+               &reply,
+               &errorBuilder);  // built objects are ignored
 }
 
 void Strategy::explainFind(OperationContext* opCtx,

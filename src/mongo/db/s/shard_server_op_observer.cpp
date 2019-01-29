@@ -75,10 +75,9 @@ public:
 
         CatalogCacheLoader::get(_opCtx).notifyOfCollectionVersionUpdate(_nss);
 
-        // This is a hack to get around CollectionShardingState::refreshMetadata() requiring the X
-        // lock: markNotShardedAtStepdown() doesn't have a lock check. Temporary measure until
-        // SERVER-31595 removes the X lock requirement.
-        CollectionShardingRuntime::get(_opCtx, _nss)->markNotShardedAtStepdown();
+        // Force subsequent uses of the namespace to refresh the filtering metadata so they can
+        // synchronize with any work happening on the primary (e.g., migration critical section).
+        CollectionShardingRuntime::get(_opCtx, _nss)->clearFilteringMetadata();
     }
 
     void rollback() override {}
@@ -150,7 +149,8 @@ void incrementChunkOnInsertOrUpdate(OperationContext* opCtx,
                                     const NamespaceString& nss,
                                     const ChunkManager& chunkManager,
                                     const BSONObj& document,
-                                    long dataWritten) {
+                                    long dataWritten,
+                                    bool fromMigrate) {
     const auto& shardKeyPattern = chunkManager.getShardKeyPattern();
 
     // Each inserted/updated document should contain the shard key. The only instance in which a
@@ -171,15 +171,22 @@ void incrementChunkOnInsertOrUpdate(OperationContext* opCtx,
     auto chunk = chunkManager.findIntersectingChunkWithSimpleCollation(shardKey);
     auto chunkWritesTracker = chunk.getWritesTracker();
     chunkWritesTracker->addBytesWritten(dataWritten);
+    // Don't trigger chunk splits from inserts happening due to migration since
+    // we don't necessarily own that chunk yet
+    if (!fromMigrate) {
+        const auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
 
-    const auto balancerConfig = Grid::get(opCtx)->getBalancerConfiguration();
-
-    if (balancerConfig->getShouldAutoSplit() &&
-        chunkWritesTracker->shouldSplit(balancerConfig->getMaxChunkSizeBytes())) {
-        auto chunkSplitStateDriver = ChunkSplitStateDriver::tryInitiateSplit(chunkWritesTracker);
-        if (chunkSplitStateDriver) {
-            ChunkSplitter::get(opCtx).trySplitting(
-                std::move(chunkSplitStateDriver), nss, chunk.getMin(), chunk.getMax(), dataWritten);
+        if (balancerConfig->getShouldAutoSplit() &&
+            chunkWritesTracker->shouldSplit(balancerConfig->getMaxChunkSizeBytes())) {
+            auto chunkSplitStateDriver =
+                ChunkSplitStateDriver::tryInitiateSplit(chunkWritesTracker);
+            if (chunkSplitStateDriver) {
+                ChunkSplitter::get(opCtx).trySplitting(std::move(chunkSplitStateDriver),
+                                                       nss,
+                                                       chunk.getMin(),
+                                                       chunk.getMax(),
+                                                       dataWritten);
+            }
         }
     }
 }
@@ -215,8 +222,12 @@ void ShardServerOpObserver::onInserts(OperationContext* opCtx,
         }
 
         if (metadata->isSharded()) {
-            incrementChunkOnInsertOrUpdate(
-                opCtx, nss, *metadata->getChunkManager(), insertedDoc, insertedDoc.objsize());
+            incrementChunkOnInsertOrUpdate(opCtx,
+                                           nss,
+                                           *metadata->getChunkManager(),
+                                           insertedDoc,
+                                           insertedDoc.objsize(),
+                                           fromMigrate);
         }
     }
 }
@@ -249,14 +260,15 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
         const auto updatedNss([&] {
             std::string coll;
             fassert(40477,
-                    bsonExtractStringField(args.criteria, ShardCollectionType::ns.name(), &coll));
+                    bsonExtractStringField(
+                        args.updateArgs.criteria, ShardCollectionType::ns.name(), &coll));
             return NamespaceString(coll);
         }());
 
         // Parse the '$set' update
         BSONElement setElement;
         Status setStatus =
-            bsonExtractTypedField(args.update, StringData("$set"), Object, &setElement);
+            bsonExtractTypedField(args.updateArgs.update, StringData("$set"), Object, &setElement);
         if (setStatus.isOK()) {
             BSONObj setField = setElement.Obj();
 
@@ -270,10 +282,10 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
             }
 
             if (setField.hasField(ShardCollectionType::enterCriticalSectionCounter.name())) {
-                // This is a hack to get around CollectionShardingState::refreshMetadata() requiring
-                // the X lock: markNotShardedAtStepdown() doesn't have a lock check. Temporary
-                // measure until SERVER-31595 removes the X lock requirement.
-                CollectionShardingRuntime::get(opCtx, updatedNss)->markNotShardedAtStepdown();
+                // Force subsequent uses of the namespace to refresh the filtering metadata so they
+                // can synchronize with any work happening on the primary (e.g., migration critical
+                // section).
+                CollectionShardingRuntime::get(opCtx, updatedNss)->clearFilteringMetadata();
             }
         }
     }
@@ -293,12 +305,14 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
 
         // Extract which database was updated
         std::string db;
-        fassert(40478, bsonExtractStringField(args.criteria, ShardDatabaseType::name.name(), &db));
+        fassert(
+            40478,
+            bsonExtractStringField(args.updateArgs.criteria, ShardDatabaseType::name.name(), &db));
 
         // Parse the '$set' update
         BSONElement setElement;
         Status setStatus =
-            bsonExtractTypedField(args.update, StringData("$set"), Object, &setElement);
+            bsonExtractTypedField(args.updateArgs.update, StringData("$set"), Object, &setElement);
         if (setStatus.isOK()) {
             BSONObj setField = setElement.Obj();
 
@@ -315,8 +329,9 @@ void ShardServerOpObserver::onUpdate(OperationContext* opCtx, const OplogUpdateE
         incrementChunkOnInsertOrUpdate(opCtx,
                                        args.nss,
                                        *metadata->getChunkManager(),
-                                       args.updatedDoc,
-                                       args.updatedDoc.objsize());
+                                       args.updateArgs.updatedDoc,
+                                       args.updateArgs.updatedDoc.objsize(),
+                                       args.updateArgs.fromMigrate);
     }
 }
 

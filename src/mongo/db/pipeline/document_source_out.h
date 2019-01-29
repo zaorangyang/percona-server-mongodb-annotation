@@ -38,10 +38,28 @@ namespace mongo {
  */
 class DocumentSourceOut : public DocumentSource, public NeedsMergerDocumentSource {
 public:
-    static std::unique_ptr<LiteParsedDocumentSourceForeignCollections> liteParse(
-        const AggregationRequest& request, const BSONElement& spec);
+    /**
+     * A "lite parsed" $out stage is similar to other stages involving foreign collections except in
+     * some cases the foreign collection is allowed to be sharded.
+     */
+    class LiteParsed final : public LiteParsedDocumentSourceForeignCollections {
+    public:
+        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+                                                 const BSONElement& spec);
 
-    DocumentSourceOut(const NamespaceString& outputNs,
+        LiteParsed(NamespaceString outNss, PrivilegeVector privileges, bool allowShardedOutNss)
+            : LiteParsedDocumentSourceForeignCollections(outNss, privileges),
+              _allowShardedOutNss(allowShardedOutNss) {}
+
+        bool allowShardedForeignCollection(NamespaceString nss) const final {
+            return _allowShardedOutNss ? true : (_foreignNssSet.find(nss) == _foreignNssSet.end());
+        }
+
+    private:
+        bool _allowShardedOutNss;
+    };
+
+    DocumentSourceOut(NamespaceString outputNs,
                       const boost::intrusive_ptr<ExpressionContext>& expCtx,
                       WriteModeEnum mode,
                       std::set<FieldPath> uniqueKey);
@@ -52,27 +70,45 @@ public:
     const char* getSourceName() const final;
     Value serialize(boost::optional<ExplainOptions::Verbosity> explain = boost::none) const final;
     DepsTracker::State getDependencies(DepsTracker* deps) const final;
+    /**
+     * For purposes of tracking which fields come from where, this stage does not modify any fields.
+     */
+    GetModPathsReturn getModifiedPaths() const final {
+        return {GetModPathsReturn::Type::kFiniteSet, std::set<std::string>{}, {}};
+    }
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         return {StreamType::kStreaming,
                 PositionRequirement::kLast,
+                // A $out to an unsharded collection should merge on the primary shard to perform
+                // local writes. A $out to a sharded collection has no requirement, since each shard
+                // can perform its own portion of the write.
                 HostTypeRequirement::kPrimaryShard,
                 DiskUseRequirement::kWritesPersistentData,
                 FacetRequirement::kNotAllowed,
                 TransactionRequirement::kNotAllowed};
     }
 
-    // Virtuals for NeedsMergerDocumentSource
-    boost::intrusive_ptr<DocumentSource> getShardSource() final {
-        return NULL;
-    }
-    std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() final {
-        return {this};
-    }
-
     const NamespaceString& getOutputNs() const {
         return _outputNs;
     }
+
+    WriteModeEnum getMode() const {
+        return _mode;
+    }
+
+    boost::intrusive_ptr<DocumentSource> getShardSource() final {
+        return nullptr;
+    }
+    MergingLogic mergingLogic() final {
+        return {this};
+    }
+    virtual bool canRunInParallelBeforeOut(
+        const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const final {
+        // If someone is asking the question, this must be the $out stage in question, so yes!
+        return true;
+    }
+
 
     /**
      * Retrieves the namespace to direct each batch to, which may be a temporary namespace or the
@@ -128,6 +164,18 @@ public:
      */
     virtual void finalize() = 0;
 
+    /**
+     * Creates a new $out stage from the given arguments.
+     */
+    static boost::intrusive_ptr<DocumentSourceOut> create(
+        NamespaceString outputNs,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        WriteModeEnum,
+        std::set<FieldPath> uniqueKey = std::set<FieldPath>{"_id"});
+
+    /**
+     * Parses a $out stage from the user-supplied BSON.
+     */
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
@@ -142,6 +190,10 @@ private:
     // with this key pattern (up to order). Default is "_id" for unsharded collections, and "_id"
     // plus the shard key for sharded collections.
     std::set<FieldPath> _uniqueKeyFields;
+
+    // True if '_uniqueKeyFields' contains the _id. We store this as a separate boolean to avoid
+    // repeated lookups into the set.
+    bool _uniqueKeyIncludesId;
 };
 
 }  // namespace mongo

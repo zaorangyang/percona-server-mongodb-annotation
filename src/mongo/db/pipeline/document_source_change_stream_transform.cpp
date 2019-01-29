@@ -68,16 +68,21 @@ constexpr auto checkValueType = &DocumentSourceChangeStream::checkValueType;
 }  // namespace
 
 boost::intrusive_ptr<DocumentSourceChangeStreamTransform>
-DocumentSourceChangeStreamTransform::create(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                            BSONObj changeStreamSpec) {
-    return new DocumentSourceChangeStreamTransform(expCtx, changeStreamSpec);
+DocumentSourceChangeStreamTransform::create(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const ServerGlobalParams::FeatureCompatibility::Version& fcv,
+    BSONObj changeStreamSpec) {
+    return new DocumentSourceChangeStreamTransform(expCtx, fcv, changeStreamSpec);
 }
 
 DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, BSONObj changeStreamSpec)
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const ServerGlobalParams::FeatureCompatibility::Version& fcv,
+    BSONObj changeStreamSpec)
     : DocumentSource(expCtx),
       _changeStreamSpec(changeStreamSpec.getOwned()),
-      _isIndependentOfAnyCollection(expCtx->ns.isCollectionlessAggregateNS()) {
+      _isIndependentOfAnyCollection(expCtx->ns.isCollectionlessAggregateNS()),
+      _fcv(fcv) {
 
     _nsRegex.emplace(DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx->ns));
 
@@ -174,6 +179,10 @@ ResumeTokenData DocumentSourceChangeStreamTransform::getResumeToken(Value ts,
     if (!uuid.missing())
         resumeTokenData.uuid = uuid.getUuid();
 
+    if (_fcv < ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42) {
+        resumeTokenData.version = 0;
+    }
+
     return resumeTokenData;
 }
 
@@ -210,6 +219,7 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
     // Deal with CRUD operations and commands.
     auto opType = repl::OpType_parse(IDLParserErrorContext("ChangeStreamEntry.op"), op);
 
+    NamespaceString nss(ns.getString());
     // Ignore commands in the oplog when looking up the document key fields since a command implies
     // that the change stream is about to be invalidated (e.g. collection drop).
     if (!uuid.missing() && opType != repl::OpTypeEnum::kCommand) {
@@ -220,7 +230,7 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
         auto it = _documentKeyCache.find(uuid.getUuid());
         if (it == _documentKeyCache.end() || !it->second.isFinal) {
             auto docKeyFields = pExpCtx->mongoProcessInterface->collectDocumentKeyFields(
-                pExpCtx->opCtx, uuid.getUuid());
+                pExpCtx->opCtx, NamespaceStringOrUUID(nss.db().toString(), uuid.getUuid()));
             if (it == _documentKeyCache.end() || docKeyFields.second) {
                 _documentKeyCache[uuid.getUuid()] = DocumentKeyCacheEntry(docKeyFields);
             }
@@ -228,7 +238,6 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
 
         documentKeyFields = _documentKeyCache.find(uuid.getUuid())->second.documentKeyFields;
     }
-    NamespaceString nss(ns.getString());
     Value id = input.getNestedField("o._id");
     // Non-replace updates have the _id in field "o2".
     StringData operationType;

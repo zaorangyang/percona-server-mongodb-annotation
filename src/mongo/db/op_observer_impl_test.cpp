@@ -477,15 +477,16 @@ TEST_F(OpObserverTest, OnRollbackDoesntInvalidateAuthCacheWhenNoAuthNamespaceRol
 }
 
 TEST_F(OpObserverTest, MultipleAboutToDeleteAndOnDelete) {
+    auto uuid = UUID::gen();
     OpObserverImpl opObserver;
     auto opCtx = cc().makeOperationContext();
     NamespaceString nss = {"test", "coll"};
     AutoGetDb autoDb(opCtx.get(), nss.db(), MODE_X);
     WriteUnitOfWork wunit(opCtx.get());
     opObserver.aboutToDelete(opCtx.get(), nss, BSON("_id" << 1));
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, {});
     opObserver.aboutToDelete(opCtx.get(), nss, BSON("_id" << 1));
-    opObserver.onDelete(opCtx.get(), nss, {}, {}, false, {});
+    opObserver.onDelete(opCtx.get(), nss, uuid, {}, false, {});
 }
 
 /**
@@ -516,12 +517,12 @@ public:
 
 
 protected:
-    void checkCommonFields(const BSONObj& oplogEntry) {
+    void checkCommonFields(const BSONObj& oplogEntry, int expectedStmtId = 0) {
         ASSERT_EQ("c"_sd, oplogEntry.getStringField("op"));
         ASSERT_EQ("admin.$cmd"_sd, oplogEntry.getStringField("ns"));
         ASSERT_BSONOBJ_EQ(session()->getSessionId().toBSON(), oplogEntry.getObjectField("lsid"));
         ASSERT_EQ(*opCtx()->getTxnNumber(), oplogEntry.getField("txnNumber").safeNumberLong());
-        ASSERT_EQ(0, oplogEntry.getIntField("stmtId"));
+        ASSERT_EQ(expectedStmtId, oplogEntry.getIntField("stmtId"));
     }
 
     OperationContext* opCtx() {
@@ -573,15 +574,14 @@ TEST_F(OpObserverTransactionTest, TransactionalPrepareTest) {
                                      << "y"));
     opObserver().onInserts(opCtx(), nss1, uuid1, inserts1.begin(), inserts1.end(), false);
 
-    OplogUpdateEntryArgs update2;
-    update2.nss = nss2;
-    update2.uuid = uuid2;
-    update2.stmtId = 1;
-    update2.updatedDoc = BSON("_id" << 0 << "data"
-                                    << "y");
-    update2.update = BSON("$set" << BSON("data"
-                                         << "y"));
-    update2.criteria = BSON("_id" << 0);
+    CollectionUpdateArgs updateArgs2;
+    updateArgs2.stmtId = 1;
+    updateArgs2.updatedDoc = BSON("_id" << 0 << "data"
+                                        << "y");
+    updateArgs2.update = BSON("$set" << BSON("data"
+                                             << "y"));
+    updateArgs2.criteria = BSON("_id" << 0);
+    OplogUpdateEntryArgs update2(std::move(updateArgs2), nss2, uuid2);
     opObserver().onUpdate(opCtx(), update2);
 
     opObserver().aboutToDelete(opCtx(),
@@ -643,6 +643,98 @@ TEST_F(OpObserverTransactionTest, TransactionalPrepareTest) {
     ASSERT(oplogEntry.getPrepare());
     ASSERT(oplogEntry.getPrepare().get());
     ASSERT_EQ(oplogEntry.getTimestamp(), opCtx()->recoveryUnit()->getPrepareTimestamp());
+}
+
+TEST_F(OpObserverTransactionTest, TransactionalPreparedAbortTest) {
+    const NamespaceString nss("testDB", "testColl");
+    const auto uuid = CollectionUUID::gen();
+    const auto doc = BSON("_id" << 0 << "data"
+                                << "x");
+
+    const TxnNumber txnNum = 2;
+    opCtx()->setTxnNumber(txnNum);
+
+    OperationContextSessionMongod opSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+
+    std::vector<InsertStatement> insert;
+    insert.emplace_back(0, doc);
+    {
+        WriteUnitOfWork wuow(opCtx());
+        AutoGetCollection autoColl(opCtx(), nss, MODE_IX);
+        opObserver().onInserts(opCtx(), nss, uuid, insert.begin(), insert.end(), false);
+
+        txnParticipant->transitionToPreparedforTest();
+        const auto prepareSlot = repl::getNextOpTime(opCtx());
+        opObserver().onTransactionPrepare(opCtx(), prepareSlot);
+        session()->lockTxnNumber(txnNum,
+                                 Status(ErrorCodes::OperationFailed, "unittest lock failed"));
+
+        opObserver().onTransactionAbort(opCtx());
+        txnParticipant->transitionToAbortedforTest();
+    }
+
+    repl::OplogInterfaceLocal oplogInterface(opCtx(), NamespaceString::kRsOplogNamespace.ns());
+    auto oplogIter = oplogInterface.makeIterator();
+    {
+        auto oplogEntryObj = unittest::assertGet(oplogIter->next()).first;
+        checkCommonFields(oplogEntryObj, 1);
+        OplogEntry oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
+        auto o = oplogEntry.getObject();
+        auto oExpected = BSON("abortTransaction" << 1);
+        ASSERT_BSONOBJ_EQ(oExpected, o);
+        ASSERT_FALSE(oplogEntry.getPrepare());
+    }
+
+    {
+        auto oplogEntryObj = unittest::assertGet(oplogIter->next()).first;
+        checkCommonFields(oplogEntryObj);
+        OplogEntry oplogEntry = assertGet(OplogEntry::parse(oplogEntryObj));
+        auto o = oplogEntry.getObject();
+        auto oExpected = BSON("applyOps" << BSON_ARRAY(BSON("op"
+                                                            << "i"
+                                                            << "ns"
+                                                            << nss.toString()
+                                                            << "ui"
+                                                            << uuid
+                                                            << "o"
+                                                            << doc)));
+        ASSERT_BSONOBJ_EQ(oExpected, o);
+        ASSERT(oplogEntry.getPrepare());
+    }
+
+    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, oplogIter->next().getStatus());
+}
+
+TEST_F(OpObserverTransactionTest, TransactionalUnpreparedAbortTest) {
+    const NamespaceString nss("testDB", "testColl");
+    const auto uuid = CollectionUUID::gen();
+    const TxnNumber txnNum = 2;
+    opCtx()->setTxnNumber(txnNum);
+
+    OperationContextSessionMongod opSession(opCtx(), true, false, true);
+    auto txnParticipant = TransactionParticipant::get(opCtx());
+    txnParticipant->unstashTransactionResources(opCtx(), "insert");
+
+    std::vector<InsertStatement> insert;
+    insert.emplace_back(0,
+                        BSON("_id" << 0 << "data"
+                                   << "x"));
+
+    {
+        WriteUnitOfWork wuow(opCtx());
+        AutoGetCollection autoColl(opCtx(), nss, MODE_IX);
+        opObserver().onInserts(opCtx(), nss, uuid, insert.begin(), insert.end(), false);
+
+        txnParticipant->transitionToAbortedforTest();
+        opObserver().onTransactionAbort(opCtx());
+    }
+
+    // Assert no oplog entries were written.
+    repl::OplogInterfaceLocal oplogInterface(opCtx(), NamespaceString::kRsOplogNamespace.ns());
+    auto oplogIter = oplogInterface.makeIterator();
+    ASSERT_EQUALS(ErrorCodes::CollectionIsEmpty, oplogIter->next().getStatus());
 }
 
 TEST_F(OpObserverTransactionTest, PreparingEmptyTransactionLogsEmptyApplyOps) {
@@ -761,25 +853,23 @@ TEST_F(OpObserverTransactionTest, TransactionalUpdateTest) {
     auto txnParticipant = TransactionParticipant::get(opCtx());
     txnParticipant->unstashTransactionResources(opCtx(), "update");
 
-    OplogUpdateEntryArgs update1;
-    update1.nss = nss1;
-    update1.uuid = uuid1;
-    update1.stmtId = 0;
-    update1.updatedDoc = BSON("_id" << 0 << "data"
-                                    << "x");
-    update1.update = BSON("$set" << BSON("data"
-                                         << "x"));
-    update1.criteria = BSON("_id" << 0);
+    CollectionUpdateArgs updateArgs1;
+    updateArgs1.stmtId = 0;
+    updateArgs1.updatedDoc = BSON("_id" << 0 << "data"
+                                        << "x");
+    updateArgs1.update = BSON("$set" << BSON("data"
+                                             << "x"));
+    updateArgs1.criteria = BSON("_id" << 0);
+    OplogUpdateEntryArgs update1(std::move(updateArgs1), nss1, uuid1);
 
-    OplogUpdateEntryArgs update2;
-    update2.nss = nss2;
-    update2.uuid = uuid2;
-    update2.stmtId = 1;
-    update2.updatedDoc = BSON("_id" << 1 << "data"
-                                    << "y");
-    update2.update = BSON("$set" << BSON("data"
-                                         << "y"));
-    update2.criteria = BSON("_id" << 1);
+    CollectionUpdateArgs updateArgs2;
+    updateArgs2.stmtId = 1;
+    updateArgs2.updatedDoc = BSON("_id" << 1 << "data"
+                                        << "y");
+    updateArgs2.update = BSON("$set" << BSON("data"
+                                             << "y"));
+    updateArgs2.criteria = BSON("_id" << 1);
+    OplogUpdateEntryArgs update2(std::move(updateArgs2), nss2, uuid2);
 
     WriteUnitOfWork wuow(opCtx());
     AutoGetCollection autoColl1(opCtx(), nss1, MODE_IX);

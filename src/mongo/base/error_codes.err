@@ -258,14 +258,16 @@ error_code("TransactionTooLarge", 257)
 error_code("UnknownFeatureCompatibilityVersion", 258);
 error_code("KeyedExecutorRetry", 259);
 error_code("InvalidResumeToken", 260);
-error_code("TooManyFilesOpen", 261);
-error_code("FailPointSetFailed", 262)
-error_code("OperationNotSupportedInTransaction", 263)
-error_code("TooManyLogicalSessions", 264);
+error_code("TooManyLogicalSessions", 261);
+error_code("ExceededTimeLimit", 262);
+error_code("OperationNotSupportedInTransaction", 263);
+error_code("TooManyFilesOpen", 264);
 error_code("OrphanedRangeCleanUpFailed", 265);
-error_code("ExceededTimeLimit", 266);
+error_code("FailPointSetFailed", 266);
 error_code("PreparedTransactionInProgress", 267);
 error_code("CannotBackup", 268);
+error_code("DataModifiedByRepair", 269);
+error_code("RepairedReplicaSetNode", 270);
 # Error codes 4000-8999 are reserved.
 
 # Non-sequential error codes (for compatibility only)
@@ -279,6 +281,7 @@ error_code("InterruptedAtShutdown", 11600)
 error_code("Interrupted", 11601)
 error_code("InterruptedDueToStepDown", 11602)
 error_code("OutOfDiskSpace", 14031 )
+# TODO SERVER-36385: Mark KeyTooLong error as obsolete
 error_code("KeyTooLong", 17280);
 error_code("BackgroundOperationInProgressForDatabase", 12586);
 error_code("BackgroundOperationInProgressForNamespace", 12587);

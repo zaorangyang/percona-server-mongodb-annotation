@@ -51,6 +51,7 @@
 #include "mongo/db/exec/sort_key_generator.h"
 #include "mongo/db/exec/subplan.h"
 #include "mongo/db/exec/update.h"
+#include "mongo/db/index/all_paths_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
@@ -120,6 +121,32 @@ namespace {
 bool turnIxscanIntoCount(QuerySolution* soln);
 }  // namespace
 
+IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx, const IndexCatalogEntry& ice) {
+    auto desc = ice.descriptor();
+    invariant(desc);
+
+    auto accessMethod = ice.accessMethod();
+    invariant(accessMethod);
+
+    const bool isMultikey = desc->isMultikey(opCtx);
+
+    return {desc->keyPattern(),
+            desc->getIndexType(),
+            isMultikey,
+            // The fixed-size vector of multikey paths stored in the index catalog.
+            ice.getMultikeyPaths(opCtx),
+            // The set of multikey paths from special metadata keys stored in the index itself.
+            // Indexes that have these metadata keys do not store a fixed-size vector of multikey
+            // metadata in the index catalog. Depending on the index type, an index uses one of
+            // these mechanisms (or neither), but not both.
+            isMultikey ? accessMethod->getMultikeyPathSet(opCtx) : std::set<FieldRef>{},
+            desc->isSparse(),
+            desc->unique(),
+            IndexEntry::Identifier{desc->indexName()},
+            ice.getFilterExpression(),
+            desc->infoObj(),
+            ice.getCollator()};
+}
 
 void fillOutPlannerParams(OperationContext* opCtx,
                           Collection* collection,
@@ -130,16 +157,7 @@ void fillOutPlannerParams(OperationContext* opCtx,
     while (ii.more()) {
         const IndexDescriptor* desc = ii.next();
         IndexCatalogEntry* ice = ii.catalogEntry(desc);
-        plannerParams->indices.push_back(IndexEntry(desc->keyPattern(),
-                                                    desc->getAccessMethodName(),
-                                                    desc->isMultikey(opCtx),
-                                                    ice->getMultikeyPaths(opCtx),
-                                                    desc->isSparse(),
-                                                    desc->unique(),
-                                                    desc->indexName(),
-                                                    ice->getFilterExpression(),
-                                                    desc->infoObj(),
-                                                    ice->getCollator()));
+        plannerParams->indices.push_back(indexEntryFromIndexCatalogEntry(opCtx, *ice));
     }
 
     // If query supports index filters, filter params.indices by indices in query settings.
@@ -423,7 +441,7 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                 root.reset(rawRoot);
 
                 LOG(2) << "Using fast count: " << redact(canonicalQuery->toStringShort())
-                       << ", planSummary: " << redact(Explain::getPlanSummary(root.get()));
+                       << ", planSummary: " << Explain::getPlanSummary(root.get());
 
                 return PrepareExecutionResult(
                     std::move(canonicalQuery), std::move(solutions[i]), std::move(root));
@@ -440,7 +458,7 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
 
         LOG(2) << "Only one plan is available; it will be run but will not be cached. "
                << redact(canonicalQuery->toStringShort())
-               << ", planSummary: " << redact(Explain::getPlanSummary(root.get()));
+               << ", planSummary: " << Explain::getPlanSummary(root.get());
 
         return PrepareExecutionResult(
             std::move(canonicalQuery), std::move(solutions[0]), std::move(root));
@@ -1441,16 +1459,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
         const IndexDescriptor* desc = ii.next();
         IndexCatalogEntry* ice = ii.catalogEntry(desc);
         if (desc->keyPattern().hasField(parsedDistinct->getKey())) {
-            plannerParams.indices.push_back(IndexEntry(desc->keyPattern(),
-                                                       desc->getAccessMethodName(),
-                                                       desc->isMultikey(opCtx),
-                                                       ice->getMultikeyPaths(opCtx),
-                                                       desc->isSparse(),
-                                                       desc->unique(),
-                                                       desc->indexName(),
-                                                       ice->getFilterExpression(),
-                                                       desc->infoObj(),
-                                                       ice->getCollator()));
+            plannerParams.indices.push_back(indexEntryFromIndexCatalogEntry(opCtx, *ice));
         }
     }
 
@@ -1528,7 +1537,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
         unique_ptr<PlanStage> root(rawRoot);
 
         LOG(2) << "Using fast distinct: " << redact(cq->toStringShort())
-               << ", planSummary: " << redact(Explain::getPlanSummary(root.get()));
+               << ", planSummary: " << Explain::getPlanSummary(root.get());
 
         return PlanExecutor::make(opCtx,
                                   std::move(ws),
@@ -1558,7 +1567,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDistinct(
             unique_ptr<PlanStage> root(rawRoot);
 
             LOG(2) << "Using fast distinct: " << redact(cq->toStringShort())
-                   << ", planSummary: " << redact(Explain::getPlanSummary(root.get()));
+                   << ", planSummary: " << Explain::getPlanSummary(root.get());
 
             return PlanExecutor::make(opCtx,
                                       std::move(ws),

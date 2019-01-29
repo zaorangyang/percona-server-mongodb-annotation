@@ -83,8 +83,8 @@ public:
     Status attachCursorSourceToPipeline(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                         Pipeline* pipeline) final;
     std::string getShardName(OperationContext* opCtx) const final;
-    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(OperationContext* opCtx,
-                                                                     UUID uuid) const final;
+    std::pair<std::vector<FieldPath>, bool> collectDocumentKeyFields(
+        OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const final;
     boost::optional<Document> lookupSingleDocument(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const NamespaceString& nss,
@@ -97,6 +97,14 @@ public:
     void fsyncUnlock(OperationContext* opCtx) final;
     BackupCursorState openBackupCursor(OperationContext* opCtx) final;
     void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) final;
+
+    std::vector<BSONObj> getMatchingPlanCacheEntryStats(OperationContext*,
+                                                        const NamespaceString&,
+                                                        const MatchExpression*) const final;
+
+    bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                     const NamespaceString& nss,
+                                     const std::set<FieldPath>& uniqueKeyPaths) const final;
 
 protected:
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,

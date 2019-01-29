@@ -34,6 +34,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/session.h"
@@ -126,7 +127,7 @@ SessionCatalogMigrationSource::SessionCatalogMigrationSource(OperationContext* o
     query.sort(BSON("_id" << 1));
 
     DBDirectClient client(opCtx);
-    auto cursor = client.query(NamespaceString::kSessionTransactionsTableNamespace.ns(), query);
+    auto cursor = client.query(NamespaceString::kSessionTransactionsTableNamespace, query);
 
     while (cursor->more()) {
         auto nextSession = SessionTxnRecord::parse(

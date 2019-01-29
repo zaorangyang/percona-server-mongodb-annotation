@@ -58,7 +58,22 @@
     assert.commandFailed(
         db.runCommand({aggregate: 1, pipeline: [{$backupCursor: {}}], cursor: {}}));
 
+    // Close the cursor to reset state.
+    response = assert.commandWorked(
+        db.runCommand({killCursors: "$cmd.aggregate", cursors: [response.cursor.id]}));
+    assert.eq(1, response.cursorsKilled.length);
+
+    // Set a failpoint which will generate a uassert after the backup cursor is open.
+    assert.commandWorked(
+        db.adminCommand({configureFailPoint: "backupCursorErrorAfterOpen", mode: "alwaysOn"}));
+    assert.commandFailed(
+        db.runCommand({aggregate: 1, pipeline: [{$backupCursor: {}}], cursor: {}}));
+    assert.commandWorked(
+        db.adminCommand({configureFailPoint: "backupCursorErrorAfterOpen", mode: "off"}));
+
     // Demonstrate query cursor timeouts will kill backup cursors, closing the underlying resources.
+    assert.commandWorked(
+        db.runCommand({aggregate: 1, pipeline: [{$backupCursor: {}}], cursor: {}}));
     assert.commandWorked(db.adminCommand({setParameter: 1, cursorTimeoutMillis: 1}));
     assert.soon(() => {
         return db.runCommand({aggregate: 1, pipeline: [{$backupCursor: {}}], cursor: {}})['ok'] ==
@@ -66,4 +81,45 @@
     });
 
     MongoRunner.stopMongod(conn);
+
+    if (jsTest.options().noJournal) {
+        print("This test is being run with nojournal. Skipping ReplicaSet part.");
+        return;
+    }
+
+    // Run a replica set to verify the contents of the `metadata` document.
+    let rst = new ReplSetTest({name: "aggBackupCursor", nodes: 1});
+    rst.startSet();
+    rst.initiate();
+    db = rst.getPrimary().getDB("test");
+
+    backupCursor = db.aggregate([{$backupCursor: {}}]);
+    // The metadata document should be returned first.
+    let metadataDocEnvelope = backupCursor.next();
+    assert(metadataDocEnvelope.hasOwnProperty("metadata"));
+
+    let metadataDoc = metadataDocEnvelope["metadata"];
+    let oplogStart = metadataDoc["oplogStart"];
+    let oplogEnd = metadataDoc["oplogEnd"];
+    let checkpointTimestamp = metadataDoc["checkpointTimestamp"];
+
+    // When replication is run, there will always be an oplog with a start/end.
+    assert(oplogStart);
+    assert(oplogEnd);
+    // The first opTime will likely have term -1 (repl initiation).
+    assert.gte(oplogStart["t"], -1);
+    // The last opTime's term must be a positive value larger than the first.
+    assert.gte(oplogEnd["t"], oplogStart["t"]);
+    assert.gte(oplogEnd["t"], 1);
+    // The timestamp of the last optime must be larger than the first.
+    assert.gte(oplogEnd["ts"], oplogStart["ts"]);
+
+    // The checkpoint timestamp may or may not exist. If it exists, it must be between the start
+    // and end.
+    if (checkpointTimestamp != null) {
+        assert.gte(checkpointTimestamp, oplogStart["ts"]);
+        assert.gte(oplogEnd["ts"], checkpointTimestamp);
+    }
+
+    rst.stopSet();
 })();

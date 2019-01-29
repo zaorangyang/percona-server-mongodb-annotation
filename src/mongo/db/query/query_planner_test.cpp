@@ -1388,8 +1388,9 @@ TEST_F(QueryPlannerTest, DottedFieldCovering) {
     assertSolutionExists(
         "{proj: {spec: {_id: 0, 'a.b': 1}, node: "
         "{cscan: {dir: 1, filter: {'a.b': 5}}}}}");
-    // SERVER-2104
-    // assertSolutionExists("{proj: {spec: {_id: 0, 'a.b': 1}, node: {'a.b': 1}}}");
+    assertSolutionExists(
+        "{proj: {spec: {_id: 0, 'a.b': 1}, node: {ixscan: {filter: null, pattern: {'a.b': 1},"
+        "bounds: {'a.b': [[5,5,true,true]]}}}}}");
 }
 
 TEST_F(QueryPlannerTest, IdCovering) {
@@ -4296,7 +4297,7 @@ TEST_F(QueryPlannerTest, TagAccordingToCacheFailsOnBadInput) {
     std::unique_ptr<PlanCacheIndexTree> indexTree(new PlanCacheIndexTree());
     indexTree->setIndexEntry(IndexEntry(BSON("a" << 1), "a_1"));
 
-    std::map<StringData, size_t> indexMap;
+    std::map<IndexEntry::Identifier, size_t> indexMap;
 
     // Null filter.
     Status s = QueryPlanner::tagAccordingToCache(NULL, indexTree.get(), indexMap);
@@ -4311,7 +4312,7 @@ TEST_F(QueryPlannerTest, TagAccordingToCacheFailsOnBadInput) {
     ASSERT_NOT_OK(s);
 
     // Index found once added to the map.
-    indexMap["a_1"_sd] = 0;
+    indexMap[IndexEntry::Identifier{"a_1"}] = 0;
     s = QueryPlanner::tagAccordingToCache(scopedCq->root(), indexTree.get(), indexMap);
     ASSERT_OK(s);
 
@@ -5128,7 +5129,8 @@ TEST_F(QueryPlannerTest, ContainedOrPathLevelMultikeyCombineLeadingFields) {
     assertNumSolutions(3);
     assertSolutionExists(
         "{fetch: {filter: {a: {$gte: 0}}, node: {or: {nodes: ["
-        "{ixscan: {pattern: {a: 1, c: 1}, bounds: {a: [[0, 10, true, true]]}}},"
+        "{ixscan: {pattern: {a: 1, c: 1}, bounds: {a: [[0, 10, true, true]], c: [['MinKey', "
+        "'MaxKey', true, true]]}}},"
         "{ixscan: {pattern: {b: 1}, bounds: {b: [[6, 6, true, true]]}}}"
         "]}}}}");
     assertSolutionExists(

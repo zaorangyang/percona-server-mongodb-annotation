@@ -34,8 +34,10 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/uuid_catalog.h"
+#include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/ops/write_ops_exec.h"
@@ -115,6 +117,32 @@ Update buildUpdateOp(const NamespaceString& nss,
         return wcb;
     }());
     return updateOp;
+}
+
+// Returns true if the field names of 'keyPattern' are exactly those in 'uniqueKeyPaths', and each
+// of the elements of 'keyPattern' is numeric, i.e. not "text", "$**", or any other special type of
+// index.
+bool keyPatternNamesExactPaths(const BSONObj& keyPattern,
+                               const std::set<FieldPath>& uniqueKeyPaths) {
+    size_t nFieldsMatched = 0;
+    for (auto&& elem : keyPattern) {
+        if (!elem.isNumber()) {
+            return false;
+        }
+        if (uniqueKeyPaths.find(elem.fieldNameStringData()) == uniqueKeyPaths.end()) {
+            return false;
+        }
+        ++nFieldsMatched;
+    }
+    return nFieldsMatched == uniqueKeyPaths.size();
+}
+
+bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                       const IndexCatalogEntry* index,
+                       const std::set<FieldPath>& uniqueKeyPaths) {
+    return (index->descriptor()->unique() && !index->descriptor()->isPartial() &&
+            keyPatternNamesExactPaths(index->descriptor()->keyPattern(), uniqueKeyPaths) &&
+            CollatorInterface::collatorsMatch(index->getCollator(), expCtx->getCollator()));
 }
 
 }  // namespace
@@ -291,6 +319,10 @@ Status MongoDInterface::attachCursorSourceToPipeline(
 
     PipelineD::prepareCursorSource(autoColl->getCollection(), expCtx->ns, nullptr, pipeline);
 
+    // Optimize again, since there may be additional optimizations that can be done after adding
+    // the initial cursor stage.
+    pipeline->optimizePipeline();
+
     return Status::OK();
 }
 
@@ -303,16 +335,22 @@ std::string MongoDInterface::getShardName(OperationContext* opCtx) const {
 }
 
 std::pair<std::vector<FieldPath>, bool> MongoDInterface::collectDocumentKeyFields(
-    OperationContext* opCtx, UUID uuid) const {
+    OperationContext* opCtx, NamespaceStringOrUUID nssOrUUID) const {
     if (serverGlobalParams.clusterRole != ClusterRole::ShardServer) {
         return {{"_id"}, false};  // Nothing is sharded.
     }
-
-    // An empty namespace indicates that the collection has been dropped. Treat it as unsharded and
-    // mark the fields as final.
-    auto nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(uuid);
-    if (nss.isEmpty()) {
-        return {{"_id"}, true};
+    boost::optional<UUID> uuid;
+    NamespaceString nss;
+    if (nssOrUUID.uuid()) {
+        uuid = *(nssOrUUID.uuid());
+        nss = UUIDCatalog::get(opCtx).lookupNSSByUUID(*uuid);
+        // An empty namespace indicates that the collection has been dropped. Treat it as unsharded
+        // and mark the fields as final.
+        if (nss.isEmpty()) {
+            return {{"_id"}, true};
+        }
+    } else if (nssOrUUID.nss()) {
+        nss = *(nssOrUUID.nss());
     }
 
     // Before taking a collection lock to retrieve the shard key fields, consult the catalog cache
@@ -334,9 +372,10 @@ std::pair<std::vector<FieldPath>, bool> MongoDInterface::collectDocumentKeyField
         return CollectionShardingState::get(opCtx, nss)->getMetadata(opCtx);
     }();
 
-    // Collection is not sharded or UUID mismatch implies collection has been dropped and recreated
-    // as sharded.
-    if (!scm->isSharded() || !scm->uuidMatches(uuid)) {
+    // If the UUID is set in 'nssOrUuid', check that the UUID in the ScopedCollectionMetadata
+    // matches. Otherwise, this implies that the collection has been dropped and recreated as
+    // sharded.
+    if (!scm->isSharded() || (uuid && !scm->uuidMatches(*uuid))) {
         return {{"_id"}, false};
     }
 
@@ -414,6 +453,59 @@ void MongoDInterface::closeBackupCursor(OperationContext* opCtx, std::uint64_t c
     backupCursorService->closeBackupCursor(opCtx, cursorId);
 }
 
+std::vector<BSONObj> MongoDInterface::getMatchingPlanCacheEntryStats(
+    OperationContext* opCtx, const NamespaceString& nss, const MatchExpression* matchExp) const {
+    const auto serializer = [](const PlanCacheEntry& entry) {
+        BSONObjBuilder out;
+        Explain::planCacheEntryToBSON(entry, &out);
+        return out.obj();
+    };
+
+    const auto predicate = [&matchExp](const BSONObj& obj) {
+        return !matchExp ? true : matchExp->matchesBSON(obj);
+    };
+
+    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
+    const auto collection = autoColl.getCollection();
+    uassert(
+        50933, str::stream() << "collection '" << nss.toString() << "' does not exist", collection);
+
+    const auto infoCache = collection->infoCache();
+    invariant(infoCache);
+    const auto planCache = infoCache->getPlanCache();
+    invariant(planCache);
+
+    return planCache->getMatchingStats(serializer, predicate);
+}
+
+bool MongoDInterface::uniqueKeyIsSupportedByIndex(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const NamespaceString& nss,
+    const std::set<FieldPath>& uniqueKeyPaths) const {
+    auto* opCtx = expCtx->opCtx;
+    // We purposefully avoid a helper like AutoGetCollection here because we don't want to check the
+    // db version or do anything else. We simply want to protect against concurrent modifications to
+    // the catalog.
+    Lock::DBLock dbLock(opCtx, nss.db(), MODE_IS);
+    Lock::CollectionLock collLock(opCtx->lockState(), nss.ns(), MODE_IS);
+    const auto* collection = [&]() -> Collection* {
+        auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.db());
+        return db ? db->getCollection(opCtx, nss) : nullptr;
+    }();
+    if (!collection) {
+        return uniqueKeyPaths == std::set<FieldPath>{"_id"};
+    }
+
+    auto indexIterator = collection->getIndexCatalog()->getIndexIterator(opCtx, false);
+    while (indexIterator.more()) {
+        IndexDescriptor* descriptor = indexIterator.next();
+        if (supportsUniqueKey(expCtx, indexIterator.catalogEntry(descriptor), uniqueKeyPaths)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 BSONObj MongoDInterface::_reportCurrentOpForClient(OperationContext* opCtx,
                                                    Client* client,
                                                    CurrentOpTruncateMode truncateOps) const {
@@ -430,7 +522,8 @@ BSONObj MongoDInterface::_reportCurrentOpForClient(OperationContext* opCtx,
         }
 
         // Append lock stats before returning.
-        if (auto lockerInfo = clientOpCtx->lockState()->getLockerInfo()) {
+        if (auto lockerInfo = clientOpCtx->lockState()->getLockerInfo(
+                CurOp::get(*clientOpCtx)->getLockStatsBase())) {
             fillLockerInfo(*lockerInfo, builder);
         }
     }

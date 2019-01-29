@@ -628,6 +628,14 @@ public:
     }
 
     /**
+     * Given 'currentNames' which describes a set of paths which the caller is interested in,
+     * returns boost::none if any of those paths are modified by this stage, or a mapping from
+     * their old name to their new name if they are preserved but possibly renamed by this stage.
+     */
+    boost::optional<StringMap<std::string>> renamedPaths(
+        const std::set<std::string>& currentNames) const;
+
+    /**
      * Get the dependencies this operation needs to do its job. If overridden, subclasses must add
      * all paths needed to apply their transformation to 'deps->fields', and call
      * 'deps->setNeedsMetadata()' to indicate what metadata (e.g. text score), if any, is required.
@@ -698,6 +706,22 @@ private:
 class NeedsMergerDocumentSource {
 public:
     /**
+     * A struct representing the information needed to merge the cursors for the shards half of this
+     * pipeline. If 'inputSortPattern' is set, each document is expected to have sort key metadata
+     * which will be serialized in the '$sortKey' field. 'inputSortPattern' will then be used to
+     * describe which fields are ascending and which fields are descending when merging the streams
+     * together.
+     */
+    struct MergingLogic {
+        MergingLogic(boost::intrusive_ptr<DocumentSource>&& mergingStage,
+                     boost::optional<BSONObj> inputSortPattern = boost::none)
+            : mergingStage(std::move(mergingStage)), inputSortPattern(inputSortPattern) {}
+
+        boost::intrusive_ptr<DocumentSource> mergingStage;
+        boost::optional<BSONObj> inputSortPattern;
+    };
+
+    /**
      * Returns a source to be run on the shards, or NULL if no work should be done on the shards for
      * this stage. Must not mutate the existing source object; if different behaviour is required in
      * the split-pipeline case, a new source should be created and configured appropriately. It is
@@ -708,12 +732,22 @@ public:
     virtual boost::intrusive_ptr<DocumentSource> getShardSource() = 0;
 
     /**
-     * Returns a list of stages that combine results from the shards. Subclasses of this class
-     * should not return an empty list. Must not mutate the existing source object; if different
-     * behaviour is required, a new source should be created and configured appropriately. It is an
-     * error for getMergeSources() to return a pointer to the same object as getShardSource().
+     * Returns a struct representing what needs to be done to merge each shard's pipeline into a
+     * single stream of results. Must not mutate the existing source object; if different behaviour
+     * is required, a new source should be created and configured appropriately. It is an error for
+     * mergingLogic() to return a pointer to the same object as getShardSource().
      */
-    virtual std::list<boost::intrusive_ptr<DocumentSource>> getMergeSources() = 0;
+    virtual MergingLogic mergingLogic() = 0;
+
+    /**
+     * Returns true if it would be correct to execute this stage in parallel across the shards in
+     * cases where the final stage is an $out. For example, a $group stage which is just merging the
+     * groups from the shards can be run in parallel since it will preserve the shard key.
+     */
+    virtual bool canRunInParallelBeforeOut(
+        const std::set<std::string>& nameOfShardKeyFieldsUponEntryToStage) const {
+        return false;
+    }
 
 protected:
     // It is invalid to delete through a NeedsMergerDocumentSource-typed pointer.

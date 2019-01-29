@@ -43,6 +43,9 @@ DEFAULTS = {
     "archive_limit_mb": 5000,
     "archive_limit_tests": 10,
     "base_port": 20000,
+    "benchrun_device": "Desktop",
+    "benchrun_embedded_root": "/data/local/tmp/benchrun_embedded",
+    "benchrun_report_root": "benchrun_embedded/results",
     "buildlogger_url": "https://logkeeper.mongodb.org",
     "continue_on_failure": False,
     "dbpath_prefix": None,
@@ -60,7 +63,8 @@ DEFAULTS = {
     "no_journal": False,
     "num_clients_per_fixture": 1,
     "perf_report_file": None,
-    "repeat": 1,
+    "repeat_suites": 1,
+    "repeat_tests": 1,
     "report_failure_status": "fail",
     "report_file": None,
     "seed": long(time.time() * 256),  # Taken from random.py code in Python 2.7.
@@ -106,7 +110,8 @@ _SuiteOptions = collections.namedtuple("_SuiteOptions", [
     "fail_fast",
     "include_tags",
     "num_jobs",
-    "num_repeats",
+    "num_repeat_suites",
+    "num_repeat_tests",
     "report_failure_status",
 ])
 
@@ -168,7 +173,8 @@ class SuiteOptions(_SuiteOptions):
                 FAIL_FAST,
                 include_tags,
                 JOBS,
-                REPEAT,
+                REPEAT_SUITES,
+                REPEAT_TESTS,
                 REPORT_FAILURE_STATUS,
             ]))
 
@@ -296,7 +302,10 @@ PERF_REPORT_FILE = None
 RANDOM_SEED = None
 
 # If set, then each suite is repeated the specified number of times.
-REPEAT = None
+REPEAT_SUITES = None
+
+# If set, then each test is repeated the specified number of times inside the suites.
+REPEAT_TESTS = None
 
 # Controls if the test failure status should be reported as failed or be silently ignored.
 REPORT_FAILURE_STATUS = None
@@ -355,6 +364,11 @@ BENCHMARK_FILTER = None
 BENCHMARK_LIST_TESTS = None
 BENCHMARK_MIN_TIME = None
 BENCHMARK_REPETITIONS = None
+
+# Embedded Benchrun Test options.
+BENCHRUN_DEVICE = None
+BENCHRUN_EMBEDDED_ROOT = None
+BENCHRUN_REPORT_ROOT = None
 
 ##
 # Internally used configuration options that aren't exposed to the user

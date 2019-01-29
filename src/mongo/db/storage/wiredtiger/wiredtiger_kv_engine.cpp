@@ -69,6 +69,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/snapshot_window_options.h"
 #include "mongo/db/storage/journal_listener.h"
+#include "mongo/db/storage/storage_file_util.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_customization_hooks.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_extensions.h"
@@ -721,30 +722,65 @@ Status WiredTigerKVEngine::_salvageIfNeeded(const char* uri) {
         warning() << "Data file is missing for " << uri
                   << ". Attempting to drop and re-create the collection.";
 
-        auto swMetadata = WiredTigerUtil::getMetadataRaw(session, uri);
-        if (!swMetadata.isOK()) {
-            error() << "Failed to get metadata for " << uri;
-            return swMetadata.getStatus();
-        }
-
-        rc = session->drop(session, uri, NULL);
-        if (rc != 0) {
-            error() << "Failed to drop " << uri;
-            return wtRCToStatus(rc);
-        }
-
-        rc = session->create(session, uri, swMetadata.getValue().c_str());
-        if (rc != 0) {
-            error() << "Failed to create " << uri << " with config: " << swMetadata.getValue();
-            return wtRCToStatus(rc);
-        }
-        log() << "Successfully re-created " << uri << ".";
-        return Status::OK();
+        return _rebuildIdent(session, uri);
     }
 
-    // TODO need to cleanup the sizeStorer cache after salvaging.
     log() << "Verify failed on uri " << uri << ". Running a salvage operation.";
-    return wtRCToStatus(session->salvage(session, uri, NULL), "Salvage failed:");
+    auto status = wtRCToStatus(session->salvage(session, uri, NULL), "Salvage failed:");
+    if (status.isOK()) {
+        return {ErrorCodes::DataModifiedByRepair, str::stream() << "Salvaged data for " << uri};
+    }
+
+    warning() << "Salvage failed for uri " << uri << ": " << status.reason()
+              << ". The file will be moved out of the way and a new ident will be created.";
+
+    //  If the data is unsalvageable, we should completely rebuild the ident.
+    return _rebuildIdent(session, uri);
+}
+
+Status WiredTigerKVEngine::_rebuildIdent(WT_SESSION* session, const char* uri) {
+    invariant(_inRepairMode);
+
+    static const char tablePrefix[] = "table:";
+    invariant(std::string(uri).find(tablePrefix) == 0);
+
+    const std::string identName(uri + sizeof(tablePrefix) - 1);
+    auto filePath = getDataFilePathForIdent(identName);
+    if (filePath) {
+        const boost::filesystem::path corruptFile(filePath->string() + ".corrupt");
+        warning() << "Moving data file " << filePath->string() << " to backup as "
+                  << corruptFile.string();
+
+        auto status = fsyncRename(filePath.get(), corruptFile);
+        if (!status.isOK()) {
+            return status;
+        }
+    }
+
+    warning() << "Rebuilding ident " << identName;
+
+    // This is safe to call after moving the file because it only reads from the metadata, and not
+    // the data file itself.
+    auto swMetadata = WiredTigerUtil::getMetadataRaw(session, uri);
+    if (!swMetadata.isOK()) {
+        error() << "Failed to get metadata for " << uri;
+        return swMetadata.getStatus();
+    }
+
+    int rc = session->drop(session, uri, NULL);
+    if (rc != 0) {
+        error() << "Failed to drop " << uri;
+        return wtRCToStatus(rc);
+    }
+
+    rc = session->create(session, uri, swMetadata.getValue().c_str());
+    if (rc != 0) {
+        error() << "Failed to create " << uri << " with config: " << swMetadata.getValue();
+        return wtRCToStatus(rc);
+    }
+    log() << "Successfully re-created " << uri << ".";
+    return {ErrorCodes::DataModifiedByRepair,
+            str::stream() << "Re-created empty data file for " << uri};
 }
 
 int WiredTigerKVEngine::flushAllFiles(OperationContext* opCtx, bool sync) {
@@ -799,22 +835,21 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::beginNonBlockingBackup(
     std::vector<std::string> filesToCopy;
 
     const char* filename;
+    const auto dbPath = boost::filesystem::path(_path);
+    const auto wiredTigerLogFilePrefix = "WiredTigerLog";
     while ((wtRet = cursor->next(cursor)) == 0) {
         invariantWTOK(cursor->get_key(cursor, &filename));
 
         std::string name(filename);
 
-        // WiredTiger backup cursors do not return path information for journal files. If a
-        // filename fits the pattern of a WT log file, add the journal directory to the file being
-        // returned.
-        const auto wiredTigerLogFilePrefix = "WiredTigerLog";
+        auto filePath = dbPath;
         if (name.find(wiredTigerLogFilePrefix) == 0) {
             // TODO SERVER-13455:replace `journal/` with the configurable journal path.
-            auto path = boost::filesystem::path("journal");
-            path /= name;
-            name = path.string();
+            filePath /= boost::filesystem::path("journal");
         }
-        filesToCopy.push_back(std::move(name));
+        filePath /= name;
+
+        filesToCopy.push_back(filePath.string());
     }
     if (wtRet != WT_NOTFOUND) {
         return wtRCToStatus(wtRet, "Error opening backup cursor.");
@@ -962,24 +997,18 @@ Status WiredTigerKVEngine::recoverOrphanedIdent(OperationContext* opCtx,
 
     boost::filesystem::path tmpFile{*identFilePath};
     tmpFile += ".tmp";
-    if (boost::filesystem::exists(tmpFile, ec)) {
-        return {ErrorCodes::FileRenameFailed,
-                "Attempted to rename data file to an existing temporary file: " + tmpFile.string()};
-    }
 
     log() << "Renaming data file " + identFilePath->string() + " to temporary file " +
             tmpFile.string();
-
-    boost::filesystem::rename(*identFilePath, tmpFile, ec);
-    if (ec) {
-        return {ErrorCodes::FileRenameFailed,
-                "Error renaming data file to temporary file: " + ec.message()};
+    auto status = fsyncRename(identFilePath.get(), tmpFile);
+    if (!status.isOK()) {
+        return status;
     }
 
     log() << "Creating new RecordStore for collection " + ns + " with UUID: " +
             (options.uuid ? options.uuid->toString() : "none");
 
-    auto status = createGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
+    status = createGroupedRecordStore(opCtx, ns, ident, options, KVPrefix::kNotPrefixed);
     if (!status.isOK()) {
         return status;
     }
@@ -990,18 +1019,29 @@ Status WiredTigerKVEngine::recoverOrphanedIdent(OperationContext* opCtx,
     if (ec) {
         return {ErrorCodes::UnknownError, "Error deleting empty data file: " + ec.message()};
     }
+    status = fsyncParentDirectory(*identFilePath);
+    if (!status.isOK()) {
+        return status;
+    }
 
-    boost::filesystem::rename(tmpFile, *identFilePath, ec);
-    if (ec) {
-        return {ErrorCodes::FileRenameFailed,
-                "Error renaming data file back from temporary file: " + ec.message()};
+    status = fsyncRename(tmpFile, identFilePath.get());
+    if (!status.isOK()) {
+        return status;
     }
 
     log() << "Salvaging ident " + ident;
 
     WiredTigerSession sessionWrapper(_conn);
     WT_SESSION* session = sessionWrapper.getSession();
-    return wtRCToStatus(session->salvage(session, _uri(ident).c_str(), NULL), "Salvage failed: ");
+    status = wtRCToStatus(session->salvage(session, _uri(ident).c_str(), NULL), "Salvage failed: ");
+    if (status.isOK()) {
+        return {ErrorCodes::DataModifiedByRepair,
+                str::stream() << "Salvaged data for ident " << ident};
+    }
+    warning() << "Could not salvage data. Rebuilding ident: " << status.reason();
+
+    //  If the data is unsalvageable, we should completely rebuild the ident.
+    return _rebuildIdent(session, _uri(ident).c_str());
 #endif
 }
 

@@ -262,15 +262,7 @@ void addReadOnlyDbPrivileges(PrivilegeVector* privileges, StringData dbName) {
         privileges, Privilege(ResourcePattern::forDatabaseName(dbName), readRoleActions));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.indexes")),
-                  readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
         Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.js")),
-                  readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.namespaces")),
                   readRoleActions));
 }
 
@@ -292,14 +284,6 @@ void addUserAdminDbPrivileges(PrivilegeVector* privileges, StringData dbName) {
 void addDbAdminDbPrivileges(PrivilegeVector* privileges, StringData dbName) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forDatabaseName(dbName), dbAdminRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.indexes")),
-                  readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forExactNamespace(NamespaceString(dbName, "system.namespaces")),
-                  readRoleActions));
 
     ActionSet profileActions = readRoleActions;
     profileActions.addAction(ActionType::convertToCapped);
@@ -330,13 +314,7 @@ void addReadOnlyAnyDbPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::listDatabases));
     Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.indexes"), readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forCollectionName("system.js"), readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.namespaces"), readRoleActions));
 }
 
 void addReadWriteAnyDbPrivileges(PrivilegeVector* privileges) {
@@ -403,12 +381,6 @@ void addDbAdminAnyDbPrivileges(PrivilegeVector* privileges) {
         privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::listDatabases));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), dbAdminRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.indexes"), readRoleActions));
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.namespaces"), readRoleActions));
     ActionSet profileActions = readRoleActions;
     profileActions.addAction(ActionType::convertToCapped);
     profileActions.addAction(ActionType::createCollection);
@@ -512,14 +484,6 @@ void addQueryableBackupPrivileges(PrivilegeVector* privileges) {
         privileges, Privilege(ResourcePattern::forDatabaseName("local"), ActionType::find));
 
     Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.indexes"), ActionType::find));
-
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.namespaces"), ActionType::find));
-
-    Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forCollectionName("system.js"), ActionType::find));
 
     Privilege::addPrivilegeToPrivilegeVector(
@@ -588,10 +552,6 @@ void addRestorePrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forCollectionName("system.js"), actions));
 
-    // Need to be able to query system.namespaces to check existing collection options.
-    Privilege::addPrivilegeToPrivilegeVector(
-        privileges,
-        Privilege(ResourcePattern::forCollectionName("system.namespaces"), ActionType::find));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::listCollections));
 

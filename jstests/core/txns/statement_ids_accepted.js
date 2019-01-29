@@ -250,33 +250,6 @@
     }),
                                  ErrorCodes.Unauthorized);
 
-    jsTestLog("Check that coordinateCommitTransaction accepts a statement ID");
-    assert.commandWorked(sessionDb.runCommand({
-        insert: collName,
-        documents: [{_id: "doc3"}],
-        readConcern: {level: "snapshot"},
-        txnNumber: NumberLong(txnNumber),
-        stmtId: NumberInt(0),
-        startTransaction: true,
-        autocommit: false
-    }));
-    // coordinateCommitTransaction can only be run on the admin database.
-    assert.commandWorked(sessionDb.adminCommand({
-        coordinateCommitTransaction: 1,
-        participants: [],
-        txnNumber: NumberLong(txnNumber++),
-        stmtId: NumberInt(1),
-        autocommit: false
-    }));
-    assert.commandFailedWithCode(sessionDb.runCommand({
-        coordinateCommitTransaction: 1,
-        participants: [],
-        txnNumber: NumberLong(txnNumber++),
-        stmtId: NumberInt(0),
-        autocommit: false
-    }),
-                                 ErrorCodes.Unauthorized);
-
     // refreshLogicalSessionCacheNow is intentionally omitted.
 
     jsTestLog("Check that update accepts a statement ID");
