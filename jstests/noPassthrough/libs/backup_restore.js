@@ -3,9 +3,9 @@
  * - 3 node replica set
  * - Mongo CRUD client
  * - Mongo FSM client
- * - fsyncLock (or stop) Secondary
+ * - fsyncLock, stop or open a backupCursor on a Secondary
  * - cp (or rsync) DB files
- * - fsyncUnlock (or start) Secondary
+ * - fsyncUnlock, start or close a backupCursor on the Secondary
  * - Start mongod as hidden secondary
  * - Wait until new hidden node becomes secondary
  *
@@ -196,7 +196,8 @@ var BackupRestoreTest = function(options) {
                         };
                         var result = db.getSiblingDB('test').fsm_teardown.insert({a: 1}, wc);
                         assert.writeOK(result, 'teardown insert failed: ' + tojson(result));
-                        result = db.getSiblingDB('test').fsm_teardown.drop();
+                        result = db.getSiblingDB('test').fsm_teardown.drop(
+                            {writeConcern: {w: "majority"}});
                         assert(result, 'teardown drop failed');
                     });
                 } catch (e) {
@@ -233,7 +234,7 @@ var BackupRestoreTest = function(options) {
         var testName = jsTest.name();
 
         // Backup type (must be specified)
-        var allowedBackupKeys = ['fsyncLock', 'stopStart', 'rolling'];
+        var allowedBackupKeys = ['fsyncLock', 'stopStart', 'rolling', 'backupCursor'];
         assert(options.backup, "Backup option not supplied");
         assert.contains(options.backup,
                         allowedBackupKeys,
@@ -359,6 +360,16 @@ var BackupRestoreTest = function(options) {
             print("Copied files:", tojson(copiedFiles));
             assert.gt(copiedFiles.length, 0, testName + ' no files copied');
             rst.start(secondary.nodeId, {}, true);
+        } else if (options.backup == 'backupCursor') {
+            load("jstests/libs/backup_utils.js");
+
+            backupData(secondary, hiddenDbpath);
+            copiedFiles = ls(hiddenDbpath);
+            jsTestLog("Copying End: " + tojson({
+                          destinationFiles: copiedFiles,
+                          destinationJournal: ls(hiddenDbpath + '/journal')
+                      }));
+            assert.gt(copiedFiles.length, 0, testName + ' no files copied');
         }
 
         // Wait up to 5 minutes until restarted node is in state secondary.
@@ -403,6 +414,8 @@ var BackupRestoreTest = function(options) {
         // Wait up to 5 minutes until the new hidden node is in state RECOVERING.
         rst.waitForState(hiddenNode, [ReplSetTest.State.RECOVERING, ReplSetTest.State.SECONDARY]);
 
+        jsTestLog('Stopping CRUD and FSM clients');
+
         // Stop CRUD client and FSM client.
         var crudStatus = checkProgram(crudPid);
         assert(crudStatus.alive,
@@ -415,6 +428,14 @@ var BackupRestoreTest = function(options) {
                testName + ' FSM client was not running at end of test and exited with code: ' +
                    fsmStatus.exitCode);
         stopMongoProgramByPid(fsmPid);
+
+        // Make sure the test database is not in a drop-pending state. This can happen if we
+        // killed the FSM client while it was in the middle of dropping it.
+        assert.soonNoExcept(function() {
+            let result = primary.getDB("test").afterClientKills.insert(
+                {"a": 1}, {writeConcern: {w: "majority"}});
+            return (result.nInserted === 1);
+        }, "failed to insert to test collection", 10 * 60 * 1000);
 
         // Wait up to 5 minutes until the new hidden node is in state SECONDARY.
         jsTestLog('CRUD and FSM clients stopped. Waiting for hidden node ' + hiddenHost +

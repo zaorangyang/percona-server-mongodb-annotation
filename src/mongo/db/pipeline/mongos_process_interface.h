@@ -52,8 +52,8 @@ public:
         const Document& documentKey,
         boost::optional<BSONObj> readConcern) final;
 
-    std::vector<GenericCursor> getCursors(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) const final;
+    std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                              CurrentOpUserMode userMode) const final;
 
     DBClientBase* directClient() final {
         MONGO_UNREACHABLE;
@@ -63,14 +63,14 @@ public:
 
     void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                 const NamespaceString& ns,
-                const std::vector<BSONObj>& objs) final {
+                std::vector<BSONObj>&& objs) final {
         MONGO_UNREACHABLE;
     }
 
     void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                 const NamespaceString& ns,
-                const std::vector<BSONObj>& queries,
-                const std::vector<BSONObj>& updates,
+                std::vector<BSONObj>&& queries,
+                std::vector<BSONObj>&& updates,
                 bool upsert,
                 bool multi) final {
         MONGO_UNREACHABLE;
@@ -136,14 +136,6 @@ public:
      * The following methods only make sense for data-bearing nodes and should never be called on
      * a mongos.
      */
-    void fsyncLock(OperationContext* opCtx) final {
-        MONGO_UNREACHABLE;
-    }
-
-    void fsyncUnlock(OperationContext* opCtx) final {
-        MONGO_UNREACHABLE;
-    }
-
     BackupCursorState openBackupCursor(OperationContext* opCtx) final {
         MONGO_UNREACHABLE;
     }
@@ -165,11 +157,7 @@ public:
 
     bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>&,
                                      const NamespaceString&,
-                                     const std::set<FieldPath>& uniqueKeyPaths) const final {
-        // TODO SERVER-36047 we'll have to contact the primary shard for the database to ask for the
-        // index specs.
-        return true;
-    }
+                                     const std::set<FieldPath>& uniqueKeyPaths) const final;
 
 protected:
     BSONObj _reportCurrentOpForClient(OperationContext* opCtx,

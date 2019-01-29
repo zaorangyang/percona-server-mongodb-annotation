@@ -49,7 +49,6 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/multi_key_path_tracker.h"
-#include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/operation_context_session_mongod.h"
 #include "mongo/db/repl/apply_ops.h"
@@ -70,6 +69,7 @@
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/sync_tail.h"
 #include "mongo/db/repl/timestamp_block.h"
+#include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
@@ -173,7 +173,7 @@ public:
 
         auto registry = stdx::make_unique<OpObserverRegistry>();
         registry->addObserver(stdx::make_unique<UUIDCatalogObserver>());
-        registry->addObserver(stdx::make_unique<OpObserverImpl>());
+        registry->addObserver(stdx::make_unique<OpObserverShardingImpl>());
         _opCtx->getServiceContext()->setOpObserver(std::move(registry));
 
         repl::setOplogCollectionName(getGlobalServiceContext());
@@ -287,6 +287,7 @@ public:
                                  dbName,
                                  BSON("applyOps" << applyOpsList),
                                  repl::OplogApplication::Mode::kApplyOpsCmd,
+                                 {},
                                  &result);
         if (!status.isOK()) {
             return status;
@@ -305,6 +306,7 @@ public:
                                  dbName,
                                  BSON("applyOps" << applyOpsList << "allowAtomic" << false),
                                  repl::OplogApplication::Mode::kApplyOpsCmd,
+                                 {},
                                  &result);
         if (!status.isOK()) {
             return status;
@@ -645,6 +647,7 @@ public:
                                       << "o"
                                       << BSON("applyOps" << BSONArrayBuilder().obj())))),
                 repl::OplogApplication::Mode::kApplyOpsCmd,
+                {},
                 &result));
         }
 
@@ -721,6 +724,7 @@ public:
                            nss.db().toString(),
                            fullCommand.done(),
                            repl::OplogApplication::Mode::kApplyOpsCmd,
+                           {},
                            &result));
 
 
@@ -1251,7 +1255,7 @@ public:
         // The next logOp() call will get 'futureTs', which will be the timestamp at which we do
         // the write. Thus we expect the write to appear at 'futureTs' and not before.
         ASSERT_EQ(op.getTimestamp(), futureTs) << op.toBSON();
-        ASSERT_EQ(op.getNamespace().ns(), nss.getCommandNS().ns()) << op.toBSON();
+        ASSERT_EQ(op.getNss().ns(), nss.getCommandNS().ns()) << op.toBSON();
         ASSERT_BSONOBJ_EQ(op.getObject(), BSON("create" << nss.coll()));
 
         assertNamespaceInIdents(nss, pastTs, false);
@@ -2428,7 +2432,8 @@ class CreateCollectionWithSystemIndex : public StorageTimestampTest {
 public:
     void run() {
         // Only run on 'wiredTiger'. No other storage engines to-date support timestamp writes.
-        if (mongo::storageGlobalParams.engine != "wiredTiger") {
+        if (!(mongo::storageGlobalParams.engine == "wiredTiger" &&
+              mongo::serverGlobalParams.enableMajorityReadConcern)) {
             return;
         }
 
@@ -2600,7 +2605,7 @@ public:
         unittest::log() << "Prepare TS: " << prepareTs;
         logTimestamps();
 
-        auto commitTimestamp = Timestamp(99999, 99999);
+        auto commitTimestamp = commitEntryTs;
 
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS, LockMode::MODE_IS);
@@ -2624,7 +2629,7 @@ public:
         }
         txnParticipant->unstashTransactionResources(_opCtx, "insert");
 
-        txnParticipant->prepareTransaction(_opCtx);
+        txnParticipant->prepareTransaction(_opCtx, {});
 
         txnParticipant->stashTransactionResources(_opCtx);
         {
@@ -2655,7 +2660,7 @@ public:
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
-            assertDocumentAtTimestamp(coll, commitEntryTs, BSONObj());
+            assertDocumentAtTimestamp(coll, commitEntryTs, doc);
             assertDocumentAtTimestamp(coll, commitTimestamp, doc);
             assertDocumentAtTimestamp(coll, nullTs, doc);
 
@@ -2684,7 +2689,8 @@ public:
     void setupTests() {
         // Only run on storage engines that support snapshot reads.
         auto storageEngine = cc().getServiceContext()->getStorageEngine();
-        if (!storageEngine->supportsReadConcernSnapshot()) {
+        if (!storageEngine->supportsReadConcernSnapshot() ||
+            !mongo::serverGlobalParams.enableMajorityReadConcern) {
             unittest::log() << "Skipping this test suite because storage engine "
                             << storageGlobalParams.engine << " does not support timestamp writes.";
             return;

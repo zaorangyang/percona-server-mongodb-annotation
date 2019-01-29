@@ -40,6 +40,7 @@
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_cursor.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
@@ -186,9 +187,7 @@ public:
         return true;
     }
 
-    virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const final;
-
-    virtual bool supportsRecoverToStableTimestamp() const final;
+    virtual Timestamp getPinnedOplog() const final;
 
     virtual Status compact(OperationContext* opCtx,
                            RecordStoreCompactAdaptor* adaptor,

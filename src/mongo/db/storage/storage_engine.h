@@ -321,9 +321,20 @@ public:
     }
 
     /**
+     * Returns whether the storage engine can provide a recovery timestamp.
+     */
+    virtual bool supportsRecoveryTimestamp() const {
+        return false;
+    }
+
+    /**
      * Returns true if the storage engine supports the readConcern level "snapshot".
      */
     virtual bool supportsReadConcernSnapshot() const {
+        return false;
+    }
+
+    virtual bool supportsReadConcernMajority() const {
         return false;
     }
 
@@ -373,8 +384,18 @@ public:
     /**
      * Sets the highest timestamp at which the storage engine is allowed to take a checkpoint.
      * This timestamp can never decrease, and thus should be a timestamp that can never roll back.
+     *
+     * The maximumTruncationTimestamp (and newer) must not be truncated from the oplog in order to
+     * recover from the `stableTimestamp`.  `boost::none` implies there are no additional
+     * constraints to what may be truncated.
+     *
+     * For proper truncation of the oplog, this method requires min(stableTimestamp,
+     * maximumTruncationTimestamp) to be monotonically increasing (where `min(stableTimestamp,
+     * boost::none) => stableTimestamp`). Otherwise truncation can race and remove a document
+     * before a call to this method protects it.
      */
-    virtual void setStableTimestamp(Timestamp timestamp) {}
+    virtual void setStableTimestamp(Timestamp stableTimestamp,
+                                    boost::optional<Timestamp> maximumTruncationTimestamp) {}
 
     /**
      * Tells the storage engine the timestamp of the data at startup. This is necessary because

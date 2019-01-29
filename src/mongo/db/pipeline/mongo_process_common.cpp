@@ -30,19 +30,25 @@
 
 #include "mongo/db/pipeline/mongo_process_common.h"
 
+#include "mongo/bson/mutable/document.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/service_context.h"
+#include "mongo/util/net/socket_utils.h"
 
 namespace mongo {
 
-std::vector<BSONObj> MongoProcessCommon::getCurrentOps(OperationContext* opCtx,
-                                                       CurrentOpConnectionsMode connMode,
-                                                       CurrentOpSessionsMode sessionMode,
-                                                       CurrentOpUserMode userMode,
-                                                       CurrentOpTruncateMode truncateMode) const {
+std::vector<BSONObj> MongoProcessCommon::getCurrentOps(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    CurrentOpConnectionsMode connMode,
+    CurrentOpSessionsMode sessionMode,
+    CurrentOpUserMode userMode,
+    CurrentOpTruncateMode truncateMode,
+    CurrentOpCursorMode cursorMode) const {
+    OperationContext* opCtx = expCtx->opCtx;
     AuthorizationSession* ctxAuth = AuthorizationSession::get(opCtx->getClient());
 
     std::vector<BSONObj> ops;
@@ -69,12 +75,62 @@ std::vector<BSONObj> MongoProcessCommon::getCurrentOps(OperationContext* opCtx,
         ops.emplace_back(_reportCurrentOpForClient(opCtx, client, truncateMode));
     }
 
+    // If 'cursorMode' is set to include idle cursors, retrieve them and add them to ops.
+    if (cursorMode == CurrentOpCursorMode::kIncludeCursors) {
+
+        for (auto&& cursor : getIdleCursors(expCtx, userMode)) {
+            BSONObjBuilder cursorObj;
+            auto ns = cursor.getNs();
+            auto lsid = cursor.getLsid();
+            cursorObj.append("type", "idleCursor");
+            cursorObj.append("host", getHostNameCached());
+            cursorObj.append("ns", ns->toString());
+            // If in legacy read mode, lsid is not present.
+            if (lsid) {
+                cursorObj.append("lsid", lsid->toBSON());
+            }
+            cursor.setNs(boost::none);
+            cursor.setLsid(boost::none);
+            // On mongos, planSummary is not present.
+            auto planSummaryData = cursor.getPlanSummary();
+            if (planSummaryData) {
+                auto planSummaryText = planSummaryData->toString();
+                // Plan summary has to appear in the top level object, not the cursor object.
+                // We remove it, create the op, then put it back.
+                cursor.setPlanSummary(boost::none);
+                cursorObj.append("planSummary", planSummaryText);
+                cursorObj.append("cursor", cursor.toBSON());
+                cursor.setPlanSummary(StringData(planSummaryText));
+            } else {
+                cursorObj.append("cursor", cursor.toBSON());
+            }
+            ops.emplace_back(cursorObj.obj());
+            cursor.setNs(ns);
+            cursor.setLsid(lsid);
+        }
+    }
+
     // If we need to report on idle Sessions, defer to the mongoD or mongoS implementations.
     if (sessionMode == CurrentOpSessionsMode::kIncludeIdle) {
         _reportCurrentOpsForIdleSessions(opCtx, userMode, &ops);
     }
 
     return ops;
+}
+
+bool MongoProcessCommon::keyPatternNamesExactPaths(const BSONObj& keyPattern,
+                                                   const std::set<FieldPath>& uniqueKeyPaths) {
+    size_t nFieldsMatched = 0;
+    for (auto&& elem : keyPattern) {
+        if (!elem.isNumber()) {
+            return false;
+        }
+        if (uniqueKeyPaths.find(elem.fieldNameStringData()) == uniqueKeyPaths.end()) {
+            return false;
+        }
+        ++nFieldsMatched;
+    }
+    return nFieldsMatched == uniqueKeyPaths.size();
 }
 
 }  // namespace mongo

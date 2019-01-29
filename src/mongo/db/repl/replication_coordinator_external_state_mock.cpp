@@ -155,6 +155,10 @@ void ReplicationCoordinatorExternalStateMock::setLocalLastVoteDocument(
 void ReplicationCoordinatorExternalStateMock::setGlobalTimestamp(ServiceContext* service,
                                                                  const Timestamp& newTime) {}
 
+bool ReplicationCoordinatorExternalStateMock::oplogExists(OperationContext* opCtx) {
+    return true;
+}
+
 StatusWith<OpTime> ReplicationCoordinatorExternalStateMock::loadLastOpTime(
     OperationContext* opCtx) {
     return _lastOpTime;
@@ -191,8 +195,6 @@ void ReplicationCoordinatorExternalStateMock::setFirstOpTimeOfMyTerm(const OpTim
 void ReplicationCoordinatorExternalStateMock::closeConnections() {
     _connectionsClosed = true;
 }
-
-void ReplicationCoordinatorExternalStateMock::killAllUserOperations(OperationContext* opCtx) {}
 
 void ReplicationCoordinatorExternalStateMock::shardingOnStepDownHook() {}
 

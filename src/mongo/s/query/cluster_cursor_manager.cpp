@@ -161,6 +161,29 @@ long long ClusterCursorManager::PinnedCursor::getNumReturnedSoFar() const {
     return _cursor->getNumReturnedSoFar();
 }
 
+Date_t ClusterCursorManager::PinnedCursor::getLastUseDate() const {
+    invariant(_cursor);
+    return _cursor->getLastUseDate();
+}
+
+void ClusterCursorManager::PinnedCursor::setLastUseDate(Date_t now) {
+    invariant(_cursor);
+    _cursor->setLastUseDate(now);
+}
+Date_t ClusterCursorManager::PinnedCursor::getCreatedDate() const {
+    invariant(_cursor);
+    return _cursor->getCreatedDate();
+}
+void ClusterCursorManager::PinnedCursor::incNBatches() {
+    invariant(_cursor);
+    return _cursor->incNBatches();
+}
+
+long long ClusterCursorManager::PinnedCursor::getNBatches() const {
+    invariant(_cursor);
+    return _cursor->getNBatches();
+}
+
 void ClusterCursorManager::PinnedCursor::queueResult(const ClusterQueryResult& result) {
     invariant(_cursor);
     _cursor->queueResult(result);
@@ -169,6 +192,21 @@ void ClusterCursorManager::PinnedCursor::queueResult(const ClusterQueryResult& r
 bool ClusterCursorManager::PinnedCursor::remotesExhausted() {
     invariant(_cursor);
     return _cursor->remotesExhausted();
+}
+
+GenericCursor ClusterCursorManager::PinnedCursor::toGenericCursor() const {
+    GenericCursor gc;
+    gc.setCursorId(getCursorId());
+    gc.setNs(_nss);
+    gc.setLsid(getLsid());
+    gc.setNDocsReturned(getNumReturnedSoFar());
+    gc.setTailable(isTailable());
+    gc.setAwaitData(isTailableAndAwaitData());
+    gc.setOriginatingCommand(getOriginatingCommand());
+    gc.setLastAccessDate(getLastUseDate());
+    gc.setCreatedDate(getCreatedDate());
+    gc.setNBatchesReturned(getNBatches());
+    return gc;
 }
 
 Status ClusterCursorManager::PinnedCursor::setAwaitDataTimeout(Milliseconds awaitDataTimeout) {
@@ -330,7 +368,6 @@ StatusWith<ClusterCursorManager::PinnedCursor> ClusterCursorManager::checkOutCur
             return vivifyCursorStatus;
         }
     }
-
     cursor->reattachToOperationContext(opCtx);
     return PinnedCursor(this, std::move(cursor), nss, cursorId);
 }
@@ -347,6 +384,7 @@ void ClusterCursorManager::checkInCursor(std::unique_ptr<ClusterClientCursor> cu
     OperationContext* opCtx = cursor->getCurrentOperationContext();
     invariant(opCtx);
     cursor->detachFromOperationContext();
+    cursor->setLastUseDate(now);
 
     stdx::unique_lock<stdx::mutex> lk(_mutex);
 
@@ -572,25 +610,50 @@ void ClusterCursorManager::appendActiveSessions(LogicalSessionIdSet* lsids) cons
     }
 }
 
-std::vector<GenericCursor> ClusterCursorManager::getAllCursors() const {
+GenericCursor ClusterCursorManager::CursorEntry::cursorToGenericCursor(
+    CursorId cursorId, const NamespaceString& ns) const {
+    invariant(_cursor);
+    GenericCursor gc;
+    gc.setCursorId(cursorId);
+    gc.setNs(ns);
+    gc.setCreatedDate(_cursor->getCreatedDate());
+    gc.setLastAccessDate(_cursor->getLastUseDate());
+    gc.setLsid(_cursor->getLsid());
+    gc.setNDocsReturned(_cursor->getNumReturnedSoFar());
+    gc.setTailable(_cursor->isTailable());
+    gc.setAwaitData(_cursor->isTailableAndAwaitData());
+    gc.setOriginatingCommand(_cursor->getOriginatingCommand());
+    gc.setNoCursorTimeout(getLifetimeType() == CursorLifetime::Immortal);
+    gc.setNBatchesReturned(_cursor->getNBatches());
+    return gc;
+}
+
+std::vector<GenericCursor> ClusterCursorManager::getIdleCursors(
+    const OperationContext* opCtx, MongoProcessInterface::CurrentOpUserMode userMode) const {
     std::vector<GenericCursor> cursors;
 
     stdx::lock_guard<stdx::mutex> lk(_mutex);
 
+    AuthorizationSession* ctxAuth = AuthorizationSession::get(opCtx->getClient());
+
     for (const auto& nsContainerPair : _namespaceToContainerMap) {
         for (const auto& cursorIdEntryPair : nsContainerPair.second.entryMap) {
-            const CursorEntry& entry = cursorIdEntryPair.second;
 
-            if (entry.isKillPending()) {
-                // Don't include sessions for killed cursors.
+            const CursorEntry& entry = cursorIdEntryPair.second;
+            // If auth is enabled, and userMode is allUsers, check if the current user has
+            // permission to see this cursor.
+            if (ctxAuth->getAuthorizationManager().isAuthEnabled() &&
+                userMode == MongoProcessInterface::CurrentOpUserMode::kExcludeOthers &&
+                !ctxAuth->isCoauthorizedWith(entry.getAuthenticatedUsers())) {
+                continue;
+            }
+            if (entry.isKillPending() || entry.getOperationUsingCursor()) {
+                // Don't include sessions for killed or pinned cursors.
                 continue;
             }
 
-            cursors.emplace_back();
-            auto& gc = cursors.back();
-            gc.setId(cursorIdEntryPair.first);
-            gc.setNs(nsContainerPair.first);
-            gc.setLsid(entry.getLsid());
+            cursors.emplace_back(
+                entry.cursorToGenericCursor(cursorIdEntryPair.first, nsContainerPair.first));
         }
     }
 

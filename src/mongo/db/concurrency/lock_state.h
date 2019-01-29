@@ -187,11 +187,20 @@ public:
         const boost::optional<SingleThreadedLockStats> lockStatsBase) const final;
 
     virtual bool saveLockStateAndUnlock(LockSnapshot* stateOut);
+    virtual bool saveLockStateAndUnlockForPrepare(LockSnapshot* stateOut);
 
     virtual void restoreLockState(OperationContext* opCtx, const LockSnapshot& stateToRestore);
     virtual void restoreLockState(const LockSnapshot& stateToRestore) {
         restoreLockState(nullptr, stateToRestore);
     }
+
+    void restoreLockStateWithTemporaryGlobalResource(
+        OperationContext* opCtx,
+        const LockSnapshot& stateToRestore,
+        LockManager::TemporaryResourceQueue* tempGlobalResource) override;
+
+    void replaceGlobalLockStateWithTemporaryGlobalResource(
+        LockManager::TemporaryResourceQueue* tempGlobalResource) override;
 
     virtual void releaseTicket();
     virtual void reacquireTicket(OperationContext* opCtx);
@@ -330,6 +339,10 @@ private:
 
     // If true, shared locks will participate in two-phase locking.
     bool _sharedLocksShouldTwoPhaseLock = false;
+
+    // When true it means we are in the process of saving/restoring locks for prepared transactions.
+    // Two-phase locking gets disabled in this mode to allow yielding locks from within a WUOW.
+    bool _prepareModeForLockYields = false;
 
     // If this is set, dictates the max number of milliseconds that we will wait for lock
     // acquisition. Effectively resets lock acquisition deadlines to time out sooner. If set to 0,

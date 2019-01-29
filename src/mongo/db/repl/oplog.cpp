@@ -86,6 +86,7 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/platform/random.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/memory.h"
@@ -537,7 +538,9 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
     if (session) {
         sessionInfo.setSessionId(*opCtx->getLogicalSessionId());
         sessionInfo.setTxnNumber(*opCtx->getTxnNumber());
-        oplogLink.prevOpTime = session->getLastWriteOpTime(*opCtx->getTxnNumber());
+
+        const auto txnParticipant = TransactionParticipant::get(opCtx);
+        oplogLink.prevOpTime = txnParticipant->getLastWriteOpTime(*opCtx->getTxnNumber());
     }
 
     auto timestamps = stdx::make_unique<Timestamp[]>(count);
@@ -837,7 +840,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          BSONObj& cmd,
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
-          const NamespaceString nss(parseUUID(opCtx, ui));
+          const NamespaceString nss(parseUUIDorNs(opCtx, ns, ui, cmd));
           BSONElement first = cmd.firstElement();
           invariant(first.fieldNameStringData() == "createIndexes");
           uassert(ErrorCodes::InvalidNamespace,
@@ -963,7 +966,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const OpTime& opTime,
          OplogApplication::Mode mode) -> Status {
          BSONObjBuilder resultWeDontCareAbout;
-         return applyOps(opCtx, nsToDatabase(ns), cmd, mode, &resultWeDontCareAbout);
+         return applyOps(opCtx, nsToDatabase(ns), cmd, mode, opTime, &resultWeDontCareAbout);
      }}},
     {"convertToCapped",
      {[](OperationContext* opCtx,
@@ -985,14 +988,32 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
           return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
       },
       {ErrorCodes::NamespaceNotFound}}},
+    {"commitTransaction",
+     {[](OperationContext* opCtx,
+         const char* ns,
+         const BSONElement& ui,
+         BSONObj& cmd,
+         const OpTime& opTime,
+         OplogApplication::Mode mode) -> Status { return Status::OK(); }}},
     {"abortTransaction",
      {[](OperationContext* opCtx,
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
-         OplogApplication::Mode mode) -> Status { return Status::OK(); },
-      {}}},
+         OplogApplication::Mode mode) -> Status {
+         // We don't put transactions into the prepare state until the end of recovery, so there is
+         // no transaction to abort.
+         if (mode == OplogApplication::Mode::kRecovering) {
+             return Status::OK();
+         }
+         // Session has been checked out by sync_tail.
+         auto transaction = TransactionParticipant::get(opCtx);
+         invariant(transaction);
+         transaction->unstashTransactionResources(opCtx, "abortTransaction");
+         transaction->abortActiveTransaction(opCtx);
+         return Status::OK();
+     }}},
 };
 
 }  // namespace
@@ -1186,7 +1207,6 @@ Status applyOperation_inlock(OperationContext* opCtx,
         }
         return true;
     }();
-
     invariant(!assignOperationTimestamp || !fieldTs.eoo(),
               str::stream() << "Oplog entry did not have 'ts' field when expected: " << redact(op));
 
@@ -1523,6 +1543,9 @@ Status applyCommand_inlock(OperationContext* opCtx,
         return {ErrorCodes::InvalidNamespace, "invalid ns: " + std::string(nss.ns())};
     }
     {
+        // Command application doesn't always acquire the global writer lock for transaction
+        // commands, so we acquire its own locks here.
+        Lock::DBLock lock(opCtx, nss.db(), MODE_IS);
         Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.ns());
         if (db && !db->getCollection(opCtx, nss) && db->getViewCatalog()->lookup(opCtx, nss.ns())) {
             return {ErrorCodes::CommandNotSupportedOnView,
@@ -1547,10 +1570,6 @@ Status applyCommand_inlock(OperationContext* opCtx,
                                     << redact(op));
     }
 
-    // Applying commands in repl is done under Global W-lock, so it is safe to not
-    // perform the current DB checks after reacquiring the lock.
-    invariant(opCtx->lockState()->isW());
-
     // Parse optime from oplog entry unless we are applying this command in standalone or on a
     // primary (replicated writes enabled).
     OpTime opTime;
@@ -1561,30 +1580,35 @@ Status applyCommand_inlock(OperationContext* opCtx,
         }
     }
 
-    const bool assignCommandTimestamp = [opCtx, mode] {
+    const bool assignCommandTimestamp = [opCtx, mode, &op, &o] {
         const auto replMode = ReplicationCoordinator::get(opCtx)->getReplicationMode();
         if (opCtx->writesAreReplicated()) {
             // We do not assign timestamps on replicated writes since they will get their oplog
             // timestamp once they are logged.
             return false;
-        } else {
-            switch (replMode) {
-                case ReplicationCoordinator::modeReplSet: {
-                    // The 'applyOps' command never logs 'applyOps' oplog entries with nested
-                    // command operations, so this code will never be run from inside the 'applyOps'
-                    // command on secondaries. Thus, the timestamps in the command oplog
-                    // entries are always real timestamps from this oplog and we should
-                    // timestamp our writes with them.
-                    return true;
-                }
-                case ReplicationCoordinator::modeNone: {
-                    // Only assign timestamps on standalones during replication recovery when
-                    // started with 'recoverFromOplogAsStandalone'.
-                    return mode == OplogApplication::Mode::kRecovering;
-                }
-            }
-            MONGO_UNREACHABLE;
         }
+
+        // Don't assign commit timestamp for transaction commands.
+        const StringData commandName(o.firstElementFieldName());
+        if (op.getBoolField("prepare") || commandName == "abortTransaction")
+            return false;
+
+        switch (replMode) {
+            case ReplicationCoordinator::modeReplSet: {
+                // The 'applyOps' command never logs 'applyOps' oplog entries with nested
+                // command operations, so this code will never be run from inside the 'applyOps'
+                // command on secondaries. Thus, the timestamps in the command oplog
+                // entries are always real timestamps from this oplog and we should
+                // timestamp our writes with them.
+                return true;
+            }
+            case ReplicationCoordinator::modeNone: {
+                // Only assign timestamps on standalones during replication recovery when
+                // started with 'recoverFromOplogAsStandalone'.
+                return mode == OplogApplication::Mode::kRecovering;
+            }
+        }
+        MONGO_UNREACHABLE;
     }();
     invariant(!assignCommandTimestamp || !opTime.isNull(),
               str::stream() << "Oplog entry did not have 'ts' field when expected: " << redact(op));
@@ -1650,11 +1674,8 @@ Status applyCommand_inlock(OperationContext* opCtx,
         }
     }
 
-    // AuthorizationManager's logOp method registers a RecoveryUnit::Change
-    // and to do so we need to have begun a UnitOfWork
-    WriteUnitOfWork wuow(opCtx);
+
     getGlobalAuthorizationManager()->logOp(opCtx, opType, nss, o, nullptr);
-    wuow.commit();
     return Status::OK();
 }
 

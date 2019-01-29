@@ -55,6 +55,13 @@ public:
             return _allowShardedOutNss ? true : (_foreignNssSet.find(nss) == _foreignNssSet.end());
         }
 
+        bool allowedToPassthroughFromMongos() const final {
+            // Do not allow passthrough from mongos even if the source collection is unsharded. This
+            // ensures that the unique index verification happens once on mongos and can be bypassed
+            // on the shards.
+            return false;
+        }
+
     private:
         bool _allowShardedOutNss;
     };
@@ -128,7 +135,7 @@ public:
      *
      */
     struct BatchedObjects {
-        void emplace(BSONObj obj, BSONObj key) {
+        void emplace(BSONObj&& obj, BSONObj&& key) {
             objects.emplace_back(std::move(obj));
             uniqueKeys.emplace_back(std::move(key));
         }
@@ -155,8 +162,8 @@ public:
     /**
      * Writes the documents in 'batch' to the write namespace.
      */
-    virtual void spill(const BatchedObjects& batch) {
-        pExpCtx->mongoProcessInterface->insert(pExpCtx, getWriteNs(), batch.objects);
+    virtual void spill(BatchedObjects&& batch) {
+        pExpCtx->mongoProcessInterface->insert(pExpCtx, getWriteNs(), std::move(batch.objects));
     };
 
     /**

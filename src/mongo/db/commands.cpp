@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/audit.h"
@@ -71,7 +72,7 @@ const WriteConcernOptions kMajorityWriteConcern(
     // Note: Even though we're setting UNSET here, kMajority implies JOURNAL if journaling is
     // supported by the mongod.
     WriteConcernOptions::SyncMode::UNSET,
-    Seconds(60));
+    WriteConcernOptions::kWriteConcernTimeoutUserCommand);
 
 // Returns true if found to be authorized, false if undecided. Throws if unauthorized.
 bool checkAuthorizationImplPreParse(OperationContext* opCtx,
@@ -102,6 +103,40 @@ bool checkAuthorizationImplPreParse(OperationContext* opCtx,
             !command->requiresAuth() || authzSession->isAuthenticated());
     return false;
 }
+
+// The command names that are allowed in a multi-document transaction.
+const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
+                                        {"aggregate", 1},
+                                        {"commitTransaction", 1},
+                                        {"coordinateCommitTransaction", 1},
+                                        {"delete", 1},
+                                        {"distinct", 1},
+                                        {"doTxn", 1},
+                                        {"find", 1},
+                                        {"findandmodify", 1},
+                                        {"findAndModify", 1},
+                                        {"geoSearch", 1},
+                                        {"getMore", 1},
+                                        {"insert", 1},
+                                        {"killCursors", 1},
+                                        {"prepareTransaction", 1},
+                                        {"update", 1},
+                                        {"voteAbortTransaction", 1},
+                                        {"voteCommitTransaction", 1}};
+
+// The command names that are allowed in a multi-document transaction only when test commands are
+// enabled.
+const StringMap<int> txnCmdForTestingWhitelist = {{"dbHash", 1}};
+
+
+// The commands that can be run on the 'admin' database in multi-document transactions.
+const StringMap<int> txnAdminCommands = {{"abortTransaction", 1},
+                                         {"commitTransaction", 1},
+                                         {"coordinateCommitTransaction", 1},
+                                         {"doTxn", 1},
+                                         {"prepareTransaction", 1},
+                                         {"voteAbortTransaction", 1},
+                                         {"voteCommitTransaction", 1}};
 
 }  // namespace
 
@@ -142,10 +177,24 @@ void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
         explicit Hook(const CommandInvocation* invocation, const NamespaceString* nss)
             : _invocation(invocation), _nss(nss) {}
 
-        void redactForLogging(mutablebson::Document* cmdObj) const override {
+        void snipForLogging(mutablebson::Document* cmdObj) const override {
             if (_invocation) {
-                _invocation->definition()->redactForLogging(cmdObj);
+                _invocation->definition()->snipForLogging(cmdObj);
             }
+        }
+
+        StringData sensitiveFieldName() const override {
+            if (_invocation) {
+                return _invocation->definition()->sensitiveFieldName();
+            }
+            return StringData{};
+        }
+
+        StringData getName() const override {
+            if (!_invocation) {
+                return "Error"_sd;
+            }
+            return _invocation->definition()->getName();
         }
 
         NamespaceString ns() const override {
@@ -383,6 +432,31 @@ bool CommandHelpers::uassertShouldAttemptParse(OperationContext* opCtx,
     }
 }
 
+
+Status CommandHelpers::canUseTransactions(StringData dbName, StringData cmdName) {
+    if (cmdName == "count"_sd) {
+        return {ErrorCodes::OperationNotSupportedInTransaction,
+                "Cannot run 'count' in a multi-document transaction. Please see "
+                "http://dochub.mongodb.org/core/transaction-count for a recommended alternative."};
+    }
+
+    if (txnCmdWhitelist.find(cmdName) == txnCmdWhitelist.cend() &&
+        !(getTestCommandsEnabled() &&
+          txnCmdForTestingWhitelist.find(cmdName) != txnCmdForTestingWhitelist.cend())) {
+        return {ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Cannot run '" << cmdName << "' in a multi-document transaction."};
+    }
+
+    if (dbName == "config"_sd || dbName == "local"_sd ||
+        (dbName == "admin"_sd && txnAdminCommands.find(cmdName) == txnAdminCommands.cend())) {
+        return {ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Cannot run command against the '" << dbName
+                              << "' database in a transaction"};
+    }
+
+    return Status::OK();
+}
+
 constexpr StringData CommandHelpers::kHelpFieldName;
 
 //////////////////////////////////////////////////////////////
@@ -404,7 +478,7 @@ void CommandInvocation::checkAuthorization(OperationContext* opCtx,
             } catch (const ExceptionFor<ErrorCodes::Unauthorized>&) {
                 namespace mmb = mutablebson;
                 mmb::Document cmdToLog(request.body, mmb::Document::kInPlaceDisabled);
-                c->redactForLogging(&cmdToLog);
+                c->snipForLogging(&cmdToLog);
                 auto dbname = request.getDatabase();
                 uasserted(ErrorCodes::Unauthorized,
                           str::stream() << "not authorized on " << dbname << " to execute command "
@@ -475,6 +549,21 @@ private:
 };
 
 Command::~Command() = default;
+
+void Command::snipForLogging(mutablebson::Document* cmdObj) const {
+    StringData sensitiveField = sensitiveFieldName();
+    if (!sensitiveField.empty()) {
+
+        for (mutablebson::Element pwdElement =
+                 mutablebson::findFirstChildNamed(cmdObj->root(), sensitiveField);
+             pwdElement.ok();
+             pwdElement =
+                 mutablebson::findElementNamed(pwdElement.rightSibling(), sensitiveField)) {
+            uassertStatusOK(pwdElement.setValueString("xxx"));
+        }
+    }
+}
+
 
 std::unique_ptr<CommandInvocation> BasicCommand::parse(OperationContext* opCtx,
                                                        const OpMsgRequest& request) {

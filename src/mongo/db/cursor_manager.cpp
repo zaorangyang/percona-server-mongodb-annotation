@@ -340,9 +340,11 @@ void CursorManager::appendAllActiveSessions(OperationContext* opCtx, LogicalSess
     globalCursorIdCache->visitAllCursorManagers(opCtx, &visitor);
 }
 
-std::vector<GenericCursor> CursorManager::getAllCursors(OperationContext* opCtx) {
+std::vector<GenericCursor> CursorManager::getIdleCursors(
+    OperationContext* opCtx, MongoProcessInterface::CurrentOpUserMode userMode) {
     std::vector<GenericCursor> cursors;
-    auto visitor = [&](CursorManager& mgr) { mgr.appendActiveCursors(&cursors); };
+    AuthorizationSession* ctxAuth = AuthorizationSession::get(opCtx->getClient());
+    auto visitor = [&](CursorManager& mgr) { mgr.appendIdleCursors(ctxAuth, userMode, &cursors); };
     globalCursorIdCache->visitAllCursorManagers(opCtx, &visitor);
 
     return cursors;
@@ -563,7 +565,7 @@ StatusWith<ClientCursorPin> CursorManager::pinCursor(OperationContext* opCtx,
 
     cursor->_operationUsingCursor = opCtx;
 
-    // We use pinning of a cursor as a proxy for active, user-initiated use of a cursor.  Therefor,
+    // We use pinning of a cursor as a proxy for active, user-initiated use of a cursor.  Therefore,
     // we pass down to the logical session cache and vivify the record (updating last use).
     if (cursor->getSessionId()) {
         auto vivifyCursorStatus =
@@ -620,16 +622,25 @@ void CursorManager::appendActiveSessions(LogicalSessionIdSet* lsids) const {
     }
 }
 
-void CursorManager::appendActiveCursors(std::vector<GenericCursor>* cursors) const {
+void CursorManager::appendIdleCursors(AuthorizationSession* ctxAuth,
+                                      MongoProcessInterface::CurrentOpUserMode userMode,
+                                      std::vector<GenericCursor>* cursors) const {
     auto allPartitions = _cursorMap->lockAllPartitions();
     for (auto&& partition : allPartitions) {
         for (auto&& entry : partition) {
             auto cursor = entry.second;
-            cursors->emplace_back();
-            auto& gc = cursors->back();
-            gc.setId(cursor->_cursorid);
-            gc.setNs(cursor->nss());
-            gc.setLsid(cursor->getSessionId());
+
+            // Exclude cursors that this user does not own if auth is enabled.
+            if (ctxAuth->getAuthorizationManager().isAuthEnabled() &&
+                userMode == MongoProcessInterface::CurrentOpUserMode::kExcludeOthers &&
+                !ctxAuth->isCoauthorizedWith(cursor->getAuthenticatedUsers())) {
+                continue;
+            }
+            // Exclude pinned cursors.
+            if (cursor->_operationUsingCursor) {
+                continue;
+            }
+            cursors->emplace_back(cursor->toGenericCursor());
         }
     }
 }

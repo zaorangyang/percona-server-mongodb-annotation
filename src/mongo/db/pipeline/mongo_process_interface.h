@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/shim.h"
 #include "mongo/client/dbclient_base.h"
 #include "mongo/db/collection_index_usage_tracker.h"
 #include "mongo/db/generic_cursor.h"
@@ -45,7 +46,7 @@
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/query/explain_options.h"
-#include "mongo/db/storage/backup_cursor_service.h"
+#include "mongo/db/storage/backup_cursor_state.h"
 
 namespace mongo {
 
@@ -66,6 +67,14 @@ public:
     enum class CurrentOpTruncateMode { kNoTruncation, kTruncateOps };
     enum class CurrentOpLocalOpsMode { kLocalMongosOps, kRemoteShardOps };
     enum class CurrentOpSessionsMode { kIncludeIdle, kExcludeIdle };
+    enum class CurrentOpCursorMode { kIncludeCursors, kExcludeCursors };
+
+    /**
+     * Factory function to create MongoProcessInterface of the right type. The implementation will
+     * be installed by a lib higher up in the link graph depending on the application type.
+     */
+    static MONGO_DECLARE_SHIM(
+        (OperationContext * opCtx)->std::shared_ptr<MongoProcessInterface>) create;
 
     struct MakePipelineOptions {
         MakePipelineOptions(){};
@@ -101,7 +110,7 @@ public:
      */
     virtual void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                         const NamespaceString& ns,
-                        const std::vector<BSONObj>& objs) = 0;
+                        std::vector<BSONObj>&& objs) = 0;
 
     /**
      * Updates the documents matching 'queries' with the objects 'updates'. Throws a UserException
@@ -109,8 +118,8 @@ public:
      */
     virtual void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                         const NamespaceString& ns,
-                        const std::vector<BSONObj>& queries,
-                        const std::vector<BSONObj>& updates,
+                        std::vector<BSONObj>&& queries,
+                        std::vector<BSONObj>&& updates,
                         bool upsert,
                         bool multi) = 0;
 
@@ -186,11 +195,13 @@ public:
      * operation or, optionally, an idle connection. If userMode is kIncludeAllUsers, report
      * operations for all authenticated users; otherwise, report only the current user's operations.
      */
-    virtual std::vector<BSONObj> getCurrentOps(OperationContext* opCtx,
-                                               CurrentOpConnectionsMode connMode,
-                                               CurrentOpSessionsMode sessionMode,
-                                               CurrentOpUserMode userMode,
-                                               CurrentOpTruncateMode) const = 0;
+    virtual std::vector<BSONObj> getCurrentOps(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        CurrentOpConnectionsMode connMode,
+        CurrentOpSessionsMode sessionMode,
+        CurrentOpUserMode userMode,
+        CurrentOpTruncateMode,
+        CurrentOpCursorMode) const = 0;
 
     /**
      * Returns the name of the local shard if sharding is enabled, or an empty string.
@@ -221,18 +232,15 @@ public:
         boost::optional<BSONObj> readConcern) = 0;
 
     /**
-     * Returns a vector of all local cursors.
+     * Returns a vector of all idle (non-pinned) local cursors.
      */
-    virtual std::vector<GenericCursor> getCursors(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) const = 0;
+    virtual std::vector<GenericCursor> getIdleCursors(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        CurrentOpUserMode userMode) const = 0;
 
     /**
-     * The following methods forward to the BackupCursorService decorating the ServiceContext.
+     * The following methods forward to the BackupCursorHooks decorating the ServiceContext.
      */
-    virtual void fsyncLock(OperationContext* opCtx) = 0;
-
-    virtual void fsyncUnlock(OperationContext* opCtx) = 0;
-
     virtual BackupCursorState openBackupCursor(OperationContext* opCtx) = 0;
 
     virtual void closeBackupCursor(OperationContext* opCtx, std::uint64_t cursorId) = 0;

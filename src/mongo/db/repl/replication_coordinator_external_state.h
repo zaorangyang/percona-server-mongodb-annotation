@@ -174,6 +174,11 @@ public:
     virtual void setGlobalTimestamp(ServiceContext* service, const Timestamp& newTime) = 0;
 
     /**
+     * Checks if the oplog exists.
+     */
+    virtual bool oplogExists(OperationContext* opCtx) = 0;
+
+    /**
      * Gets the last optime of an operation performed on this host, from stable
      * storage.
      */
@@ -191,12 +196,6 @@ public:
      * This is used during stepdown, and transition out of primary.
      */
     virtual void closeConnections() = 0;
-
-    /**
-     * Kills all operations that have a Client that is associated with an incoming user
-     * connection. Also kills stashed transaction resources. Used during stepdown.
-     */
-    virtual void killAllUserOperations(OperationContext* opCtx) = 0;
 
     /**
      * Resets any active sharding metadata on this server and stops any sharding-related threads

@@ -38,6 +38,7 @@
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status_metric.h"
@@ -48,6 +49,7 @@
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
+#include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
@@ -229,6 +231,8 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
     invariant(client);
     OperationContext* clientOpCtx = client->getOperationContext();
 
+    infoBuilder->append("type", "op");
+
     const std::string hostName = getHostNameCachedAndPort();
     infoBuilder->append("host", hostName);
 
@@ -250,6 +254,32 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
     infoBuilder->append("currentOpTime",
                         opCtx->getServiceContext()->getPreciseClockSource()->now().toString());
 
+    auto authSession = AuthorizationSession::get(client);
+    // Depending on whether we're impersonating or not, this might be "effectiveUsers" or
+    // "userImpersonators".
+    const auto serializeAuthenticatedUsers = [&](StringData name) {
+        if (authSession->isAuthenticated()) {
+            BSONArrayBuilder users(infoBuilder->subarrayStart(name));
+            for (auto userIt = authSession->getAuthenticatedUserNames(); userIt.more();
+                 userIt.next()) {
+                userIt->serializeToBSON(&users);
+            }
+        }
+    };
+
+    auto maybeImpersonationData = rpc::getImpersonatedUserMetadata(clientOpCtx);
+    if (maybeImpersonationData) {
+        BSONArrayBuilder users(infoBuilder->subarrayStart("effectiveUsers"));
+        for (const auto& user : maybeImpersonationData->getUsers()) {
+            user.serializeToBSON(&users);
+        }
+
+        users.doneFast();
+        serializeAuthenticatedUsers("userImpersonators"_sd);
+    } else {
+        serializeAuthenticatedUsers("effectiveUsers"_sd);
+    }
+
     if (clientOpCtx) {
         infoBuilder->append("opid", clientOpCtx->getOpID());
         if (clientOpCtx->isKillPending()) {
@@ -263,6 +293,10 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
 
         CurOp::get(clientOpCtx)->reportState(infoBuilder, truncateOps);
     }
+}
+
+void CurOp::setGenericCursor_inlock(GenericCursor gc) {
+    _genericCursor = std::move(gc);
 }
 
 CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {
@@ -456,12 +490,28 @@ void CurOp::reportState(BSONObjBuilder* builder, bool truncateOps) {
 
     appendAsObjOrString("command", _opDescription, maxQuerySize, builder);
 
-    if (!_originatingCommand.isEmpty()) {
-        appendAsObjOrString("originatingCommand", _originatingCommand, maxQuerySize, builder);
-    }
-
     if (!_planSummary.empty()) {
         builder->append("planSummary", _planSummary);
+    }
+
+    if (_genericCursor) {
+        // This creates a new builder to truncate the object that will go into the curOp output. In
+        // order to make sure the object is not too large but not truncate the comment, we only
+        // truncate the originatingCommand and not the entire cursor.
+        BSONObjBuilder tempObj;
+        appendAsObjOrString(
+            "truncatedObj", _genericCursor->getOriginatingCommand().get(), maxQuerySize, &tempObj);
+        auto originatingCommand = tempObj.done().getObjectField("truncatedObj");
+        _genericCursor->setOriginatingCommand(originatingCommand.getOwned());
+        // lsid and ns exist in the top level curop object, so they need to be temporarily
+        // removed from the cursor object to avoid duplicating information.
+        auto lsid = _genericCursor->getLsid();
+        auto ns = _genericCursor->getNs();
+        _genericCursor->setLsid(boost::none);
+        _genericCursor->setNs(boost::none);
+        builder->append("cursor", _genericCursor->toBSON());
+        _genericCursor->setLsid(lsid);
+        _genericCursor->setNs(ns);
     }
 
     if (!_message.empty()) {
@@ -552,7 +602,7 @@ string OpDebug::report(Client* client,
             const Command* curCommand = curop.getCommand();
             if (curCommand) {
                 mutablebson::Document cmdToLog(query, mutablebson::Document::kInPlaceDisabled);
-                curCommand->redactForLogging(&cmdToLog);
+                curCommand->snipForLogging(&cmdToLog);
                 s << curCommand->getName() << " ";
                 s << redact(cmdToLog.getObject());
             } else {

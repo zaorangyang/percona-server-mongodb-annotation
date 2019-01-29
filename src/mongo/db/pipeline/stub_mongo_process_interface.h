@@ -59,14 +59,14 @@ public:
 
     void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                 const NamespaceString& ns,
-                const std::vector<BSONObj>& objs) override {
+                std::vector<BSONObj>&& objs) override {
         MONGO_UNREACHABLE;
     }
 
     void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                 const NamespaceString& ns,
-                const std::vector<BSONObj>& queries,
-                const std::vector<BSONObj>& updates,
+                std::vector<BSONObj>&& queries,
+                std::vector<BSONObj>&& updates,
                 bool upsert,
                 bool multi) final {
         MONGO_UNREACHABLE;
@@ -122,11 +122,12 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<BSONObj> getCurrentOps(OperationContext* opCtx,
+    std::vector<BSONObj> getCurrentOps(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                        CurrentOpConnectionsMode connMode,
                                        CurrentOpSessionsMode sessionMode,
                                        CurrentOpUserMode userMode,
-                                       CurrentOpTruncateMode truncateMode) const override {
+                                       CurrentOpTruncateMode truncateMode,
+                                       CurrentOpCursorMode cursorMode) const override {
         MONGO_UNREACHABLE;
     }
 
@@ -148,16 +149,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    std::vector<GenericCursor> getCursors(
-        const boost::intrusive_ptr<ExpressionContext>& expCtx) const {
-        MONGO_UNREACHABLE;
-    }
-
-    void fsyncLock(OperationContext* opCtx) final {
-        MONGO_UNREACHABLE;
-    }
-
-    void fsyncUnlock(OperationContext* opCtx) final {
+    std::vector<GenericCursor> getIdleCursors(const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                                              CurrentOpUserMode userMode) const {
         MONGO_UNREACHABLE;
     }
 

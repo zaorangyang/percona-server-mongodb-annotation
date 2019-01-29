@@ -346,7 +346,7 @@ Status RollbackImpl::_awaitBgIndexCompletion(OperationContext* opCtx) {
 }
 
 StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const OplogEntry& oplogEntry) {
-    NamespaceString opNss = oplogEntry.getNamespace();
+    NamespaceString opNss = oplogEntry.getNss();
     OpTypeEnum opType = oplogEntry.getOpType();
     std::set<NamespaceString> namespaces;
 
@@ -520,12 +520,11 @@ Status RollbackImpl::_findRecordStoreCounts(OperationContext* opCtx) {
 Status RollbackImpl::_processRollbackOp(const OplogEntry& oplogEntry) {
     ++_observerInfo.numberOfEntriesObserved;
 
-    NamespaceString opNss = oplogEntry.getNamespace();
+    NamespaceString opNss = oplogEntry.getNss();
     OpTypeEnum opType = oplogEntry.getOpType();
 
     // For applyOps entries, we process each sub-operation individually.
-    if (opType == OpTypeEnum::kCommand &&
-        oplogEntry.getCommandType() == OplogEntry::CommandType::kApplyOps) {
+    if (oplogEntry.getCommandType() == OplogEntry::CommandType::kApplyOps) {
         try {
             auto subOps = ApplyOps::extractOperations(oplogEntry);
             for (auto& subOp : subOps) {

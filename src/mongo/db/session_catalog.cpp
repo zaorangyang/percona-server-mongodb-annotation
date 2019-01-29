@@ -57,7 +57,7 @@ const auto operationSessionDecoration =
 
 SessionCatalog::~SessionCatalog() {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
-    for (const auto& entry : _txnTable) {
+    for (const auto& entry : _sessions) {
         auto& sri = entry.second;
         invariant(!sri->checkedOut);
     }
@@ -65,7 +65,7 @@ SessionCatalog::~SessionCatalog() {
 
 void SessionCatalog::reset_forTest() {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
-    _txnTable.clear();
+    _sessions.clear();
 }
 
 SessionCatalog* SessionCatalog::get(OperationContext* opCtx) {
@@ -128,6 +128,10 @@ ScopedCheckedOutSession SessionCatalog::checkOutSession(OperationContext* opCtx)
 
     stdx::unique_lock<stdx::mutex> ul(_mutex);
 
+    while (!_isSessionCheckoutAllowed()) {
+        opCtx->waitForConditionOrInterrupt(_checkingOutSessionsAllowedCond, ul);
+    }
+
     auto sri = _getOrCreateSessionRuntimeInfo(ul, opCtx, lsid);
 
     // Wait until the session is no longer checked out
@@ -136,6 +140,7 @@ ScopedCheckedOutSession SessionCatalog::checkOutSession(OperationContext* opCtx)
 
     invariant(!sri->checkedOut);
     sri->checkedOut = true;
+    ++_numCheckedOutSessions;
 
     return ScopedCheckedOutSession(opCtx, ScopedSession(std::move(sri)));
 }
@@ -168,12 +173,14 @@ void SessionCatalog::invalidateSessions(OperationContext* opCtx,
 
     const auto invalidateSessionFn = [&](WithLock, SessionRuntimeInfoMap::iterator it) {
         auto& sri = it->second;
-        sri->txnState.invalidate();
+        auto const txnParticipant =
+            TransactionParticipant::getFromNonCheckedOutSession(&sri->txnState);
+        txnParticipant->invalidate();
 
         // We cannot remove checked-out sessions from the cache, because operations expect to find
         // them there to check back in
         if (!sri->checkedOut) {
-            _txnTable.erase(it);
+            _sessions.erase(it);
         }
     };
 
@@ -183,13 +190,13 @@ void SessionCatalog::invalidateSessions(OperationContext* opCtx,
         const auto lsid = LogicalSessionId::parse(IDLParserErrorContext("lsid"),
                                                   singleSessionDoc->getField("_id").Obj());
 
-        auto it = _txnTable.find(lsid);
-        if (it != _txnTable.end()) {
+        auto it = _sessions.find(lsid);
+        if (it != _sessions.end()) {
             invalidateSessionFn(lg, it);
         }
     } else {
-        auto it = _txnTable.begin();
-        while (it != _txnTable.end()) {
+        auto it = _sessions.begin();
+        while (it != _sessions.end()) {
             invalidateSessionFn(lg, it++);
         }
     }
@@ -200,9 +207,9 @@ void SessionCatalog::scanSessions(OperationContext* opCtx,
                                   stdx::function<void(OperationContext*, Session*)> workerFn) {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    LOG(2) << "Beginning scanSessions. Scanning " << _txnTable.size() << " sessions.";
+    LOG(2) << "Beginning scanSessions. Scanning " << _sessions.size() << " sessions.";
 
-    for (auto it = _txnTable.begin(); it != _txnTable.end(); ++it) {
+    for (auto it = _sessions.begin(); it != _sessions.end(); ++it) {
         // TODO SERVER-33850: Rename KillAllSessionsByPattern and
         // ScopedKillAllSessionsByPatternImpersonator to not refer to session kill.
         if (const KillAllSessionsByPattern* pattern = matcher.match(it->first)) {
@@ -215,10 +222,11 @@ void SessionCatalog::scanSessions(OperationContext* opCtx,
 std::shared_ptr<SessionCatalog::SessionRuntimeInfo> SessionCatalog::_getOrCreateSessionRuntimeInfo(
     WithLock, OperationContext* opCtx, const LogicalSessionId& lsid) {
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
+    invariant(_isSessionCheckoutAllowed());
 
-    auto it = _txnTable.find(lsid);
-    if (it == _txnTable.end()) {
-        it = _txnTable.emplace(lsid, std::make_shared<SessionRuntimeInfo>(lsid)).first;
+    auto it = _sessions.find(lsid);
+    if (it == _sessions.end()) {
+        it = _sessions.emplace(lsid, std::make_shared<SessionRuntimeInfo>(lsid)).first;
     }
 
     return it->second;
@@ -227,14 +235,47 @@ std::shared_ptr<SessionCatalog::SessionRuntimeInfo> SessionCatalog::_getOrCreate
 void SessionCatalog::_releaseSession(const LogicalSessionId& lsid) {
     stdx::lock_guard<stdx::mutex> lg(_mutex);
 
-    auto it = _txnTable.find(lsid);
-    invariant(it != _txnTable.end());
+    auto it = _sessions.find(lsid);
+    invariant(it != _sessions.end());
 
     auto& sri = it->second;
     invariant(sri->checkedOut);
 
     sri->checkedOut = false;
     sri->availableCondVar.notify_one();
+    --_numCheckedOutSessions;
+    if (_numCheckedOutSessions == 0) {
+        _allSessionsCheckedInCond.notify_all();
+    }
+}
+
+SessionCatalog::PreventCheckingOutSessionsBlock::PreventCheckingOutSessionsBlock(
+    SessionCatalog* sessionCatalog)
+    : _sessionCatalog(sessionCatalog) {
+    invariant(sessionCatalog);
+
+    stdx::lock_guard<stdx::mutex> lg(sessionCatalog->_mutex);
+    ++sessionCatalog->_preventSessionCheckoutRequests;
+}
+
+SessionCatalog::PreventCheckingOutSessionsBlock::~PreventCheckingOutSessionsBlock() {
+    stdx::lock_guard<stdx::mutex> lg(_sessionCatalog->_mutex);
+
+    invariant(_sessionCatalog->_preventSessionCheckoutRequests > 0);
+    --_sessionCatalog->_preventSessionCheckoutRequests;
+    if (_sessionCatalog->_preventSessionCheckoutRequests == 0) {
+        _sessionCatalog->_checkingOutSessionsAllowedCond.notify_all();
+    }
+}
+
+void SessionCatalog::PreventCheckingOutSessionsBlock::waitForAllSessionsToBeCheckedIn(
+    OperationContext* opCtx) {
+    stdx::unique_lock<stdx::mutex> ul(_sessionCatalog->_mutex);
+
+    invariant(!_sessionCatalog->_isSessionCheckoutAllowed());
+    while (_sessionCatalog->_numCheckedOutSessions > 0) {
+        opCtx->waitForConditionOrInterrupt(_sessionCatalog->_allSessionsCheckedInCond, ul);
+    }
 }
 
 OperationContextSession::OperationContextSession(OperationContext* opCtx, bool checkOutSession)

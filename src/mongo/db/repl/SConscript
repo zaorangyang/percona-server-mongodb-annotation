@@ -99,7 +99,7 @@ env.CppUnitTest(
         'replmocks',
         'storage_interface_impl',
         '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/op_observer_d',
+        '$BUILD_DIR/mongo/db/s/op_observer_sharding_impl',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/rpc/command_status',
     ],
@@ -713,7 +713,7 @@ env.Library(
         'replmocks',
         'storage_interface_impl',
         '$BUILD_DIR/mongo/db/catalog/document_validation',
-        '$BUILD_DIR/mongo/db/op_observer_d',
+        '$BUILD_DIR/mongo/db/s/op_observer_sharding_impl',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
     ],
 )
@@ -822,12 +822,14 @@ env.Library(
         'replication_coordinator_impl.cpp',
         'replication_coordinator_impl_elect_v1.cpp',
         'replication_coordinator_impl_heartbeat.cpp',
+        'replication_state_transition_lock_guard.cpp',
         'vote_requester.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
+        '$BUILD_DIR/mongo/db/kill_sessions_local',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/executor/task_executor_interface',
@@ -1246,6 +1248,7 @@ env.Library(
     ],
     LIBDEPS=[
         'task_runner',
+        'oplogreader',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/fetcher',
         '$BUILD_DIR/mongo/client/remote_command_retry_scheduler',
@@ -1266,6 +1269,7 @@ env.CppUnitTest(
         'base_cloner_test_fixture',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
+        '$BUILD_DIR/mongo/dbtests/mocklib',
         '$BUILD_DIR/mongo/unittest/task_executor_proxy',
     ],
 )
@@ -1292,6 +1296,7 @@ env.CppUnitTest(
         'base_cloner_test_fixture',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/commands/list_collections_filter',
+        '$BUILD_DIR/mongo/dbtests/mocklib',
         '$BUILD_DIR/mongo/unittest/task_executor_proxy',
     ],
 )
@@ -1304,6 +1309,7 @@ env.Library(
     LIBDEPS=[
         'database_cloner',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/dbtests/mocklib',
     ],
 )
 

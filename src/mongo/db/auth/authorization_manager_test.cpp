@@ -78,7 +78,7 @@ class AuthorizationManagerTest : public ServiceContextTest {
 public:
     virtual ~AuthorizationManagerTest() {
         if (authzManager)
-            authzManager->invalidateUserCache();
+            authzManager->invalidateUserCache(opCtx.get());
     }
 
     AuthorizationManagerTest() {
@@ -252,9 +252,12 @@ private:
                                      << userName.getDB()),
                                 userDoc);
         if (status == ErrorCodes::NoMatchingDocument) {
-            status = Status(ErrorCodes::UserNotFound,
-                            mongoutils::str::stream() << "Could not find user "
-                                                      << userName.getFullName());
+            status =
+                Status(ErrorCodes::UserNotFound,
+                       mongoutils::str::stream() << "Could not find user \"" << userName.getUser()
+                                                 << "\" for db \""
+                                                 << userName.getDB()
+                                                 << "\"");
         }
         return status;
     }
@@ -262,11 +265,6 @@ private:
 
 class AuthorizationManagerWithExplicitUserPrivilegesTest : public ::mongo::unittest::Test {
 public:
-    virtual ~AuthorizationManagerWithExplicitUserPrivilegesTest() {
-        if (authzManager)
-            authzManager->invalidateUserCache();
-    }
-
     virtual void setUp() {
         auto localExternalState =
             stdx::make_unique<AuthzManagerExternalStateMockWithExplicitUserPrivileges>();

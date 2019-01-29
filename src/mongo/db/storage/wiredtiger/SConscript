@@ -37,6 +37,7 @@ if wiredtiger:
         target='storage_wiredtiger_core',
         source= [
             'wiredtiger_begin_transaction_block.cpp',
+            'wiredtiger_cursor.cpp',
             'wiredtiger_global_options.cpp',
             'wiredtiger_index.cpp',
             'wiredtiger_kv_engine.cpp',
@@ -83,6 +84,7 @@ if wiredtiger:
         LIBDEPS_PRIVATE= [
             '$BUILD_DIR/mongo/db/snapshot_window_options',
             '$BUILD_DIR/mongo/util/options_parser/options_parser',
+            '$BUILD_DIR/mongo/db/storage/storage_repair_observer',
             ],
         )
 
@@ -147,6 +149,8 @@ if wiredtiger:
             '$BUILD_DIR/mongo/util/clock_source_mock',
         ],
         LIBDEPS_PRIVATE=[
+            '$BUILD_DIR/mongo/db/auth/authmocks',
+            '$BUILD_DIR/mongo/db/index/index_access_methods',
             '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
             '$BUILD_DIR/mongo/db/repl/replmocks',
         ],
@@ -191,6 +195,7 @@ if wiredtiger:
                 'additional_wiredtiger_record_store_tests',
             ],
             LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/auth/authmocks',
                 '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
                 '$BUILD_DIR/mongo/db/repl/replmocks',
             ],
@@ -205,6 +210,7 @@ if wiredtiger:
                 'additional_wiredtiger_record_store_tests',
             ],
             LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/auth/authmocks',
                 '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
                 '$BUILD_DIR/mongo/db/repl/replmocks',
             ],
@@ -218,6 +224,9 @@ if wiredtiger:
             LIBDEPS=[
                 'additional_wiredtiger_index_tests',
             ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/auth/authmocks',
+            ]
         )
 
         wtEnv.CppUnitTest(
@@ -228,6 +237,9 @@ if wiredtiger:
             LIBDEPS=[
                 'additional_wiredtiger_index_tests',
             ],
+            LIBDEPS_PRIVATE=[
+                '$BUILD_DIR/mongo/db/auth/authmocks',
+            ]
         )
 
         wtEnv.CppUnitTest(

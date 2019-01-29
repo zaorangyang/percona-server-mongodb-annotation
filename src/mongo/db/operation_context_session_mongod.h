@@ -53,4 +53,19 @@ private:
     OperationContextSession _operationContextSession;
 };
 
+/**
+ * Similar to OperationContextSessionMongod, but marks the TransactionParticipant as valid without
+ * refreshing from disk and starts a new transaction unconditionally.
+ *
+ * NOTE: Only used by the replication oplog application logic on secondaries in order to replay
+ * prepared transactions.
+ */
+class OperationContextSessionMongodWithoutRefresh {
+public:
+    OperationContextSessionMongodWithoutRefresh(OperationContext* opCtx);
+
+private:
+    OperationContextSession _operationContextSession;
+};
+
 }  // namespace mongo

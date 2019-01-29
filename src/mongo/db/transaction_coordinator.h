@@ -29,6 +29,7 @@
 #pragma once
 
 #include <boost/optional.hpp>
+#include <list>
 #include <map>
 #include <set>
 
@@ -38,6 +39,7 @@
 #include "mongo/stdx/mutex.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decorable.h"
+#include "mongo/util/future.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -64,10 +66,10 @@ public:
         friend class TransactionCoordinator;
 
     public:
+        ~StateMachine();
         enum class State {
             kWaitingForParticipantList,
             kWaitingForVotes,
-            kWaitingForAbortAcks,
             kAborted,
             kWaitingForCommitAcks,
             kCommitted,
@@ -86,19 +88,34 @@ public:
             kRecvParticipantList,
             kRecvFinalVoteCommit,
             kRecvFinalCommitAck,
-            kRecvFinalAbortAck,
+            kRecvTryAbort,
         };
 
         // State machine outputs
         enum class Action { kNone, kSendCommit, kSendAbort };
 
-        Action onEvent(Event e);
+        // IMPORTANT: If there is a state transition, this will release the lock in order to signal
+        // any promises that may be waiting on a state change, and will not reacquire it.
+        Action onEvent(stdx::unique_lock<stdx::mutex> lk, Event e);
 
         State state() const {
             return _state;
         }
 
+        /**
+         * Returns a future that will be signaled when the state machine transitions to one of
+         * the states specified. If several are specified, the first state to be hit after the call
+         * to waitForTransitionTo will trigger the future. If the state machine is currently in one
+         * of the states specified when the function is called, the returned future will already be
+         * ready, and contain the current state. The set of states must ALWAYS include all terminal
+         * states of the state machine in order to prevent a Future that hangs forever, e.g.
+         * if the caller only waits for a state that has already happened or will never happen.
+         */
+        Future<State> waitForTransitionTo(const std::set<State>& states);
+
     private:
+        void _signalAllPromisesWaitingForState(stdx::unique_lock<stdx::mutex> lk, State state);
+
         struct Transition {
             Transition(Action action, State nextState) : action(action), nextState(nextState) {}
             Transition(State nextState) : Transition(Action::kNone, nextState) {}
@@ -109,8 +126,17 @@ public:
             boost::optional<State> nextState;
         };
 
+        struct StateTransitionPromise {
+            StateTransitionPromise(Promise<State> promiseArg, std::set<State> triggeringStatesArg)
+                : promise(std::move(promiseArg)), triggeringStates(triggeringStatesArg) {}
+
+            Promise<State> promise;
+            std::set<State> triggeringStates;
+        };
+
         static const std::map<State, std::map<Event, Transition>> transitionTable;
         State _state{State::kWaitingForParticipantList};
+        std::list<StateTransitionPromise> _stateTransitionPromises;
     };
 
     /**
@@ -145,21 +171,28 @@ public:
     StateMachine::Action recvVoteAbort(const ShardId& shardId);
 
     /**
+     * A tryAbort event is received by the coordinator when a transaction is implicitly aborted when
+     * a new transaction is received for the same session with a higher transaction number.
+     */
+    StateMachine::Action recvTryAbort();
+
+    /**
+     * Returns a Future which will be signaled when the TransactionCoordinator either commits
+     * or aborts. The resulting future will contain the final state of the coordinator.
+     */
+    Future<TransactionCoordinator::StateMachine::State> waitForCompletion();
+
+    /**
      * Marks this participant as having completed committing the transaction.
      */
     void recvCommitAck(const ShardId& shardId);
-
-    /**
-     * Marks this participant as having completed aborting the transaction.
-     */
-    void recvAbortAck(const ShardId& shardId);
 
     std::set<ShardId> getNonAckedCommitParticipants() const {
         return _participantList.getNonAckedCommitParticipants();
     }
 
-    std::set<ShardId> getNonAckedAbortParticipants() const {
-        return _participantList.getNonAckedAbortParticipants();
+    std::set<ShardId> getNonVotedAbortParticipants() const {
+        return _participantList.getNonVotedAbortParticipants();
     }
 
     Timestamp getCommitTimestamp() const {
@@ -185,12 +218,12 @@ public:
         Timestamp getHighestPrepareTimestamp() const;
 
         std::set<ShardId> getNonAckedCommitParticipants() const;
-        std::set<ShardId> getNonAckedAbortParticipants() const;
+        std::set<ShardId> getNonVotedAbortParticipants() const;
 
         class Participant {
         public:
             enum class Vote { kUnknown, kAbort, kCommit };
-            enum class Ack { kNone, kAbort, kCommit };
+            enum class Ack { kNone, kCommit };
 
             Vote vote{Vote::kUnknown};
             Ack ack{Ack::kNone};
@@ -218,7 +251,6 @@ inline StringBuilder& operator<<(StringBuilder& sb,
         // clang-format off
         case State::kWaitingForParticipantList:     return sb << "kWaitingForParticipantlist";
         case State::kWaitingForVotes:               return sb << "kWaitingForVotes";
-        case State::kWaitingForAbortAcks:           return sb << "kWaitingForAbortAcks";
         case State::kAborted:                       return sb << "kAborted";
         case State::kWaitingForCommitAcks:          return sb << "kWaitingForCommitAcks";
         case State::kCommitted:                     return sb << "kCommitted";
@@ -246,7 +278,6 @@ inline StringBuilder& operator<<(StringBuilder& sb,
         case Event::kRecvParticipantList:   return sb << "kRecvParticipantList";
         case Event::kRecvFinalVoteCommit:   return sb << "kRecvFinalVoteCommit";
         case Event::kRecvFinalCommitAck:    return sb << "kRecvFinalCommitAck";
-        case Event::kRecvFinalAbortAck:     return sb << "kRecvFinalAbortAck";
         // clang-format on
         default:
             MONGO_UNREACHABLE;

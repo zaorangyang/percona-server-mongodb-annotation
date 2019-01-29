@@ -27,7 +27,8 @@ DEFAULT_MONGOD_LOG_COMPONENT_VERBOSITY = {"replication": {"rollback": 2}}
 # The default verbosity setting for any tests running in Evergreen i.e. started with an Evergreen
 # task id.
 DEFAULT_EVERGREEN_MONGOD_LOG_COMPONENT_VERBOSITY = {
-    "replication": {"election": 4, "heartbeats": 2, "rollback": 2}, "storage": {"recovery": 2}
+    "replication": {"election": 4, "heartbeats": 2, "initialSync": 2, "rollback": 2},
+    "storage": {"recovery": 2}, "transaction": 4
 }
 
 
@@ -87,6 +88,7 @@ def mongod_program(  # pylint: disable=too-many-branches
     _apply_set_parameters(args, suite_set_parameters)
 
     shortcut_opts = {
+        "enableMajorityReadConcern": config.MAJORITY_READ_CONCERN,
         "nojournal": config.NO_JOURNAL,
         "serviceExecutor": config.SERVICE_EXECUTOR,
         "storageEngine": config.STORAGE_ENGINE,
@@ -181,6 +183,7 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     global_vars = kwargs.pop("global_vars", {}).copy()
 
     shortcut_opts = {
+        "enableMajorityReadConcern": (config.MAJORITY_READ_CONCERN, True),
         "noJournal": (config.NO_JOURNAL, False),
         "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
         "storageEngine": (config.STORAGE_ENGINE, ""),
@@ -321,6 +324,7 @@ def dbtest_program(logger, executable=None, suites=None, process_kwargs=None, **
     if suites is not None:
         args.extend(suites)
 
+    kwargs["enableMajorityReadConcern"] = config.MAJORITY_READ_CONCERN
     if config.STORAGE_ENGINE is not None:
         kwargs["storageEngine"] = config.STORAGE_ENGINE
 

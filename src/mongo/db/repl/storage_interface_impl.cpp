@@ -1053,7 +1053,7 @@ Status StorageInterfaceImpl::upgradeNonReplicatedUniqueIndexes(OperationContext*
 }
 
 void StorageInterfaceImpl::setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) {
-    serviceCtx->getStorageEngine()->setStableTimestamp(snapshotName);
+    serviceCtx->getStorageEngine()->setStableTimestamp(snapshotName, boost::none);
 }
 
 void StorageInterfaceImpl::setInitialDataTimestamp(ServiceContext* serviceCtx,
@@ -1067,6 +1067,10 @@ StatusWith<Timestamp> StorageInterfaceImpl::recoverToStableTimestamp(OperationCo
 
 bool StorageInterfaceImpl::supportsRecoverToStableTimestamp(ServiceContext* serviceCtx) const {
     return serviceCtx->getStorageEngine()->supportsRecoverToStableTimestamp();
+}
+
+bool StorageInterfaceImpl::supportsRecoveryTimestamp(ServiceContext* serviceCtx) const {
+    return serviceCtx->getStorageEngine()->supportsRecoveryTimestamp();
 }
 
 boost::optional<Timestamp> StorageInterfaceImpl::getRecoveryTimestamp(

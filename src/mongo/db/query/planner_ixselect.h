@@ -60,29 +60,18 @@ public:
                           stdx::unordered_set<std::string>* out);
 
     /**
-     * Find all indices prefixed by fields we have predicates over.  Only these indices are
-     * useful in answering the query.
+     * Finds all indices that correspond to the hinted index. Matches the index both by name and by
+     * key pattern.
      */
-    static void findRelevantIndices(const stdx::unordered_set<std::string>& fields,
-                                    const std::vector<IndexEntry>& indices,
-                                    std::vector<IndexEntry>* out);
+    static std::vector<IndexEntry> findIndexesByHint(const BSONObj& hintedIndex,
+                                                     const std::vector<IndexEntry>& allIndices);
 
     /**
-     * Return true if the index key pattern field 'keyPatternElt' (which belongs to 'index' and is
-     * at position 'keyPatternIndex' in the index's keyPattern) can be used to answer the predicate
-     * 'node'. When 'node' is a sub-tree of a larger MatchExpression, 'fullPathToNode' is the path
-     * traversed to get to this node, otherwise it is empty.
-     *
-     * For example, {field: "hashed"} can only be used with sets of equalities.
-     *              {field: "2d"} can only be used with some geo predicates.
-     *              {field: "2dsphere"} can only be used with some other geo predicates.
+     * Finds all indices prefixed by fields we have predicates over.  Only these indices are
+     * useful in answering the query.
      */
-    static bool compatible(const BSONElement& keyPatternElt,
-                           const IndexEntry& index,
-                           std::size_t keyPatternIndex,
-                           MatchExpression* node,
-                           StringData fullPathToNode,
-                           const CollatorInterface* collator);
+    static std::vector<IndexEntry> findRelevantIndices(
+        const stdx::unordered_set<std::string>& fields, const std::vector<IndexEntry>& allIndices);
 
     /**
      * Determine how useful all of our relevant 'indices' are to all predicates in the subtree
@@ -143,7 +132,18 @@ public:
      * "expanded" indexes (where the $** indexes in the given list have been expanded).
      */
     static std::vector<IndexEntry> expandIndexes(const stdx::unordered_set<std::string>& fields,
-                                                 const std::vector<IndexEntry>& allIndexes);
+                                                 const std::vector<IndexEntry>& relevantIndices);
+
+    /**
+     * Check if this match expression is a leaf and is supported by a wildcard index.
+     */
+    static bool nodeIsSupportedByWildcardIndex(const MatchExpression* queryExpr);
+
+    /*
+     * Return true if the given match expression can use a sparse index, false otherwise. This will
+     * not traverse the children of the given match expression.
+     */
+    static bool nodeIsSupportedBySparseIndex(const MatchExpression* queryExpr, bool isInElemMatch);
 
 private:
     /**
@@ -159,6 +159,16 @@ private:
         StringData fullPathToParentElemMatch{""_sd};
     };
 
+    /**
+     * Return true if the index key pattern field 'keyPatternElt' (which belongs to 'index' and is
+     * at position 'keyPatternIndex' in the index's keyPattern) can be used to answer the predicate
+     * 'node'. When 'node' is a sub-tree of a larger MatchExpression, 'fullPathToNode' is the path
+     * traversed to get to this node, otherwise it is empty.
+     *
+     * For example, {field: "hashed"} can only be used with sets of equalities.
+     *              {field: "2d"} can only be used with some geo predicates.
+     *              {field: "2dsphere"} can only be used with some other geo predicates.
+     */
     static bool _compatible(const BSONElement& keyPatternElt,
                             const IndexEntry& index,
                             std::size_t keyPatternIndex,
@@ -225,6 +235,17 @@ private:
      * predicate on every geo field in the index.
      */
     static void stripInvalidAssignmentsTo2dsphereIndices(MatchExpression* node,
+                                                         const std::vector<IndexEntry>& indices);
+
+    /**
+     * This function strips RelevantTag assignments to expanded 'wildcard' indexes, in cases where
+     * the assignment is incompatible with the query.
+     *
+     * Specifically, if the query has a TEXT node with both 'text' and 'wildcard' indexes present,
+     * then the 'wildcard' index will mark itself as relevant to the '_fts' path reported by the
+     * TEXT node. We therefore remove any such misassigned 'wildcard' tags here.
+     */
+    static void stripInvalidAssignmentsToWildcardIndexes(MatchExpression* root,
                                                          const std::vector<IndexEntry>& indices);
 
     /**

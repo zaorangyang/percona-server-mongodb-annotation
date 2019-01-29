@@ -50,6 +50,7 @@
 #include "mongo/db/query/collation/collation_spec.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -126,9 +127,15 @@ Status _applyOps(OperationContext* opCtx,
         Status status(ErrorCodes::InternalError, "");
 
         if (haveWrappingWUOW) {
-            invariant(opCtx->lockState()->isW());
+            // Atomic applyOps command already acquired the global write lock.
+            invariant(opCtx->lockState()->isW() ||
+                      oplogApplicationMode != repl::OplogApplication::Mode::kApplyOpsCmd);
+            // Only CRUD operations are allowed in atomic mode.
             invariant(*opType != 'c');
 
+            // ApplyOps does not have the global writer lock when applying transaction
+            // operations, so we need to acquire the DB and Collection locks.
+            Lock::DBLock dbLock(opCtx, nss.db(), MODE_IX);
             auto db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.ns());
             if (!db) {
                 // Retry in non-atomic mode, since MMAP cannot implicitly create a new database
@@ -143,6 +150,7 @@ Status _applyOps(OperationContext* opCtx,
             // implicitly created on upserts. We detect both cases here and fail early with
             // NamespaceNotFound.
             // Additionally for inserts, we fail early on non-existent collections.
+            Lock::CollectionLock collectionLock(opCtx->lockState(), nss.ns(), MODE_IX);
             auto collection = db->getCollection(opCtx, nss);
             if (!collection && (*opType == 'i' || *opType == 'u')) {
                 uasserted(
@@ -259,6 +267,53 @@ Status _applyOps(OperationContext* opCtx,
     return Status::OK();
 }
 
+Status _applyPrepareTransaction(OperationContext* opCtx,
+                                const std::string& dbName,
+                                const BSONObj& applyOpCmd,
+                                const ApplyOpsCommandInfo& info,
+                                repl::OplogApplication::Mode oplogApplicationMode,
+                                BSONObjBuilder* result,
+                                int* numApplied,
+                                BSONArrayBuilder* opsBuilder,
+                                const OpTime& optime) {
+    // Wait until the end of recovery to apply the operations from the prepared transaction.
+    if (oplogApplicationMode == OplogApplication::Mode::kRecovering) {
+        if (!serverGlobalParams.enableMajorityReadConcern) {
+            error() << "Cannot replay a prepared transaction when 'enableMajorityReadConcern' is "
+                       "set to false. Restart the server with --enableMajorityReadConcern=true "
+                       "to complete recovery.";
+        }
+        fassert(50964, serverGlobalParams.enableMajorityReadConcern);
+        return Status::OK();
+    }
+    // Return error if run via applyOps command.
+    uassert(50945,
+            "applyOps with prepared flag is only used internally by secondaries.",
+            oplogApplicationMode != repl::OplogApplication::Mode::kApplyOpsCmd);
+
+    // TODO: SERVER-36492 Only run on secondary until we support initial sync.
+    invariant(oplogApplicationMode == repl::OplogApplication::Mode::kSecondary);
+
+    uassert(
+        50946,
+        "applyOps with prepared must only include CRUD operations and cannot have precondition.",
+        !info.getPreCondition() && info.areOpsCrudOnly());
+
+    // Session has been checked out by sync_tail.
+    auto transaction = TransactionParticipant::get(opCtx);
+    invariant(transaction);
+
+    transaction->unstashTransactionResources(opCtx, "prepareTransaction");
+    auto status = _applyOps(
+        opCtx, dbName, applyOpCmd, info, oplogApplicationMode, result, numApplied, opsBuilder);
+    if (!status.isOK()) {
+        return status;
+    }
+    transaction->prepareTransaction(opCtx, optime);
+    transaction->stashTransactionResources(opCtx);
+    return Status::OK();
+}
+
 Status _checkPrecondition(OperationContext* opCtx,
                           const std::vector<BSONObj>& preConditions,
                           BSONObjBuilder* result) {
@@ -340,15 +395,35 @@ Status applyOps(OperationContext* opCtx,
                 const std::string& dbName,
                 const BSONObj& applyOpCmd,
                 repl::OplogApplication::Mode oplogApplicationMode,
+                boost::optional<OpTime> optime,
                 BSONObjBuilder* result) {
     auto info = ApplyOpsCommandInfo::parse(applyOpCmd);
+
+    int numApplied = 0;
+
+    // Apply prepare transaction operation if "prepare" is true.
+    // The lock requirement of transaction operations should be the same as that on the primary,
+    // so we don't acquire the locks conservatively for them.
+    if (info.getPrepare().get_value_or(false)) {
+        invariant(optime);
+        return _applyPrepareTransaction(opCtx,
+                                        dbName,
+                                        applyOpCmd,
+                                        info,
+                                        oplogApplicationMode,
+                                        result,
+                                        &numApplied,
+                                        nullptr,
+                                        *optime);
+    }
 
     boost::optional<Lock::GlobalWrite> globalWriteLock;
     boost::optional<Lock::DBLock> dbWriteLock;
 
     // There's only one case where we are allowed to take the database lock instead of the global
-    // lock - no preconditions; only CRUD ops; and non-atomic mode.
-    if (!info.getPreCondition() && info.areOpsCrudOnly() && !info.getAllowAtomic()) {
+    // lock - no preconditions; only CRUD ops; non-atomic mode; and not for transaction prepare.
+    if (!info.getPreCondition() && info.areOpsCrudOnly() && !info.getAllowAtomic() &&
+        !info.getPrepare()) {
         dbWriteLock.emplace(opCtx, dbName, MODE_IX);
     } else {
         globalWriteLock.emplace(opCtx);
@@ -370,7 +445,6 @@ Status applyOps(OperationContext* opCtx,
         }
     }
 
-    int numApplied = 0;
     if (!info.isAtomic()) {
         return _applyOps(
             opCtx, dbName, applyOpCmd, info, oplogApplicationMode, result, &numApplied, nullptr);

@@ -27,16 +27,6 @@ generateActionTypes = env.Command(
 env.Alias('generated-sources', generateActionTypes)
 
 env.Library(
-    target='auth_rolename',
-    source=[
-        'role_name.cpp'
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-    ],
-)
-
-env.Library(
     target='authentication_restriction',
     source=[
         'restriction_environment.cpp',
@@ -67,24 +57,12 @@ env.Library(
         'authorization_manager.cpp',
         'authorization_session.cpp',
         'auth_decorations.cpp',
+        'user_name.cpp',
+        'role_name.cpp',
     ],
     LIBDEPS=[
-        'auth_rolename',
-        'user_name',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/rpc/audit_metadata',
-    ],
-)
-
-
-env.Library(
-    target='user_name',
-    source=[
-        'user_name.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -163,7 +141,6 @@ env.Library(
     LIBDEPS=[
         'address_restriction',
         'auth',
-        'auth_rolename',
         'authentication_restriction',
         'authorization_manager_global',
         'authprivilege',
@@ -205,6 +182,9 @@ env.Library(
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/db/common',
     ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/rpc/metadata_impersonated_user',
+    ]
 )
 
 env.Library(
@@ -246,6 +226,7 @@ env.Library(
         'user',
         '$BUILD_DIR/mongo/base/secure_allocator',
         '$BUILD_DIR/mongo/crypto/sha_block_${MONGO_CRYPTO}',
+        '$BUILD_DIR/mongo/util/icu',
         '$BUILD_DIR/mongo/util/md5',
     ],
 )
@@ -314,7 +295,6 @@ env.Library(
         'authprivilege',
         'sasl_options',
         'user',
-        'user_name',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/base/secure_allocator',
         '$BUILD_DIR/mongo/crypto/sha_block_${MONGO_CRYPTO}',
@@ -349,6 +329,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/dbhelpers',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/server_parameters',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/concurrency/lock_manager',
     ],
 )
 

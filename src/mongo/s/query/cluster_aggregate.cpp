@@ -43,7 +43,6 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/document_source_change_stream.h"
-#include "mongo/db/pipeline/document_source_merge_cursors.h"
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
@@ -58,18 +57,20 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/commands/cluster_commands_helpers.h"
+#include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_aggregation_planner.h"
 #include "mongo/s/query/cluster_client_cursor_impl.h"
 #include "mongo/s/query/cluster_client_cursor_params.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/cluster_query_knobs.h"
+#include "mongo/s/query/document_source_merge_cursors.h"
 #include "mongo/s/query/establish_cursors.h"
+#include "mongo/s/query/owned_remote_cursor.h"
 #include "mongo/s/query/router_stage_pipeline.h"
 #include "mongo/s/query/store_possible_cursor.h"
 #include "mongo/s/stale_exception.h"
-#include "mongo/s/transaction/transaction_router.h"
+#include "mongo/s/transaction_router.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/socket_utils.h"
@@ -79,8 +80,13 @@ namespace mongo {
 using SplitPipeline = cluster_aggregation_planner::SplitPipeline;
 
 MONGO_FAIL_POINT_DEFINE(clusterAggregateHangBeforeEstablishingShardCursors);
+MONGO_FAIL_POINT_DEFINE(clusterAggregateFailToEstablishMergingShardCursor);
+MONGO_FAIL_POINT_DEFINE(clusterAggregateFailToDispatchExchangeConsumerPipeline);
+
+constexpr unsigned ClusterAggregate::kMaxViewRetries;
 
 namespace {
+
 // Given a document representing an aggregation command such as
 //
 //   {aggregate: "myCollection", pipeline: [], ...},
@@ -169,6 +175,7 @@ std::set<ShardId> getTargetedShards(OperationContext* opCtx,
  */
 BSONObj genericTransformForShards(MutableDocument&& cmdForShards,
                                   OperationContext* opCtx,
+                                  const boost::optional<ShardId>& shardId,
                                   const AggregationRequest& request,
                                   BSONObj collationObj) {
     cmdForShards[AggregationRequest::kFromMongosName] = Value(true);
@@ -192,12 +199,21 @@ BSONObj genericTransformForShards(MutableDocument&& cmdForShards,
             Value(static_cast<long long>(*opCtx->getTxnNumber()));
     }
 
+    auto aggCmd = cmdForShards.freeze().toBson();
+
+    if (shardId) {
+        if (auto txnRouter = TransactionRouter::get(opCtx)) {
+            aggCmd = txnRouter->attachTxnFieldsIfNeeded(*shardId, aggCmd);
+        }
+    }
+
     // agg creates temp collection and should handle implicit create separately.
-    return appendAllowImplicitCreate(cmdForShards.freeze().toBson(), true);
+    return appendAllowImplicitCreate(aggCmd, true);
 }
 
 BSONObj createPassthroughCommandForShard(OperationContext* opCtx,
                                          const AggregationRequest& request,
+                                         const boost::optional<ShardId>& shardId,
                                          Pipeline* pipeline,
                                          const BSONObj& originalCmdObj,
                                          BSONObj collationObj) {
@@ -209,14 +225,16 @@ BSONObj createPassthroughCommandForShard(OperationContext* opCtx,
     // This pipeline is not split, ensure that the write concern is propagated if present.
     targetedCmd["writeConcern"] = Value(originalCmdObj["writeConcern"]);
 
-    return genericTransformForShards(std::move(targetedCmd), opCtx, request, collationObj);
+    return genericTransformForShards(std::move(targetedCmd), opCtx, shardId, request, collationObj);
 }
 
-BSONObj createCommandForTargetedShards(OperationContext* opCtx,
-                                       const AggregationRequest& request,
-                                       const SplitPipeline& splitPipeline,
-                                       const BSONObj collationObj,
-                                       const boost::optional<ExchangeSpec> exchangeSpec) {
+BSONObj createCommandForTargetedShards(
+    OperationContext* opCtx,
+    const AggregationRequest& request,
+    const SplitPipeline& splitPipeline,
+    const BSONObj collationObj,
+    const boost::optional<cluster_aggregation_planner::ShardedExchangePolicy> exchangeSpec,
+    bool needsMerge) {
 
     // Create the command for the shards.
     MutableDocument targetedCmd(request.serializeToCommandObj());
@@ -226,19 +244,24 @@ BSONObj createCommandForTargetedShards(OperationContext* opCtx,
     // send to the shards.
     targetedCmd[AggregationRequest::kPipelineName] =
         Value(splitPipeline.shardsPipeline->serialize());
-    targetedCmd[AggregationRequest::kNeedsMergeName] = Value(true);
+    // When running on many shards with the exchange we may not need merging.
+    if (needsMerge) {
+        targetedCmd[AggregationRequest::kNeedsMergeName] = Value(true);
+    }
     targetedCmd[AggregationRequest::kCursorName] =
         Value(DOC(AggregationRequest::kBatchSizeName << 0));
 
     targetedCmd[AggregationRequest::kExchangeName] =
-        exchangeSpec ? Value(exchangeSpec->toBSON()) : Value();
+        exchangeSpec ? Value(exchangeSpec->exchangeSpec.toBSON()) : Value();
 
-    return genericTransformForShards(std::move(targetedCmd), opCtx, request, collationObj);
+    return genericTransformForShards(
+        std::move(targetedCmd), opCtx, boost::none, request, collationObj);
 }
 
 BSONObj createCommandForMergingShard(const AggregationRequest& request,
                                      const boost::intrusive_ptr<ExpressionContext>& mergeCtx,
                                      const BSONObj originalCmdObj,
+                                     const ShardId& shardId,
                                      const Pipeline* pipelineForMerging) {
     MutableDocument mergeCmd(request.serializeToCommandObj());
 
@@ -254,8 +277,14 @@ BSONObj createCommandForMergingShard(const AggregationRequest& request,
             : Value(Document{CollationSpec::kSimpleSpec});
     }
 
+    auto aggCmd = mergeCmd.freeze().toBson();
+
+    if (auto txnRouter = TransactionRouter::get(mergeCtx->opCtx)) {
+        aggCmd = txnRouter->attachTxnFieldsIfNeeded(shardId, aggCmd);
+    }
+
     // agg creates temp collection and should handle implicit create separately.
-    return appendAllowImplicitCreate(mergeCmd.freeze().toBson(), true);
+    return appendAllowImplicitCreate(aggCmd, true);
 }
 
 std::vector<RemoteCursor> establishShardCursors(
@@ -323,7 +352,7 @@ struct DispatchShardPipelineResults {
 
     // Populated if this *is not* an explain, this vector represents the cursors on the remote
     // shards.
-    std::vector<RemoteCursor> remoteCursors;
+    std::vector<OwnedRemoteCursor> remoteCursors;
 
     // Populated if this *is* an explain, this vector represents the results from each shard.
     std::vector<AsyncRequestsSender::Response> remoteExplainOutput;
@@ -337,11 +366,11 @@ struct DispatchShardPipelineResults {
     // The command object to send to the targeted shards.
     BSONObj commandForTargetedShards;
 
-    // How many producers are running the shard part of splitPipeline.
+    // How many exchange producers are running the shard part of splitPipeline.
     size_t numProducers;
 
-    // How many consumers are running the merging.
-    size_t numConsumers;
+    // The exchange specification if the query can run with the exchange otherwise boost::none.
+    boost::optional<cluster_aggregation_planner::ShardedExchangePolicy> exchangeSpec;
 };
 
 /**
@@ -407,16 +436,21 @@ DispatchShardPipelineResults dispatchShardPipeline(
                              (needsPrimaryShardMerge && executionNsRoutingInfo &&
                               *(shardIds.begin()) != executionNsRoutingInfo->db().primaryId()));
 
+    boost::optional<cluster_aggregation_planner::ShardedExchangePolicy> exchangeSpec;
+
     if (needsSplit) {
         splitPipeline = cluster_aggregation_planner::splitPipeline(std::move(pipeline));
+
+        exchangeSpec = cluster_aggregation_planner::checkIfEligibleForExchange(
+            opCtx, splitPipeline->mergePipeline.get());
     }
 
     // Generate the command object for the targeted shards.
     BSONObj targetedCommand = splitPipeline
         ? createCommandForTargetedShards(
-              opCtx, aggRequest, *splitPipeline, collationObj, aggRequest.getExchangeSpec())
+              opCtx, aggRequest, *splitPipeline, collationObj, exchangeSpec, true)
         : createPassthroughCommandForShard(
-              opCtx, aggRequest, pipeline.get(), originalCmdObj, collationObj);
+              opCtx, aggRequest, boost::none, pipeline.get(), originalCmdObj, collationObj);
 
     // Refresh the shard registry if we're targeting all shards.  We need the shard registry
     // to be at least as current as the logical time used when creating the command for
@@ -428,7 +462,6 @@ DispatchShardPipelineResults dispatchShardPipeline(
         }
     }
 
-    size_t consumers = 1;
     // Explain does not produce a cursor, so instead we scatter-gather commands to the shards.
     if (expCtx->explain) {
         if (mustRunOnAll) {
@@ -469,7 +502,12 @@ DispatchShardPipelineResults dispatchShardPipeline(
                                 << ") is not a multiple of producers ("
                                 << shardIds.size()
                                 << ")");
-        consumers = cursors.size() / shardIds.size();
+    }
+
+    // Convert remote cursors into a vector of "owned" cursors.
+    std::vector<OwnedRemoteCursor> ownedCursors;
+    for (auto&& cursor : cursors) {
+        ownedCursors.emplace_back(OwnedRemoteCursor(opCtx, std::move(cursor), executionNss));
     }
 
     // Record the number of shards involved in the aggregation. If we are required to merge on
@@ -480,13 +518,13 @@ DispatchShardPipelineResults dispatchShardPipeline(
                            !shardIds.count(executionNsRoutingInfo->db().primaryId()));
 
     return DispatchShardPipelineResults{needsPrimaryShardMerge,
-                                        std::move(cursors),
+                                        std::move(ownedCursors),
                                         std::move(shardResults),
                                         std::move(splitPipeline),
                                         std::move(pipeline),
                                         targetedCommand,
                                         shardIds.size(),
-                                        consumers};
+                                        exchangeSpec};
 }
 
 DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
@@ -500,20 +538,22 @@ DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
     invariant(!liteParsedPipeline.hasChangeStream());
     auto opCtx = expCtx->opCtx;
 
-    // TODO SERVER-35905 - we will use ShardDistributionInfo to determine shards that will run the
-    // consumers. For now we simply distribute to all shards.
-    std::vector<ShardId> shardIds;
-    Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx, &shardIds);
+    if (MONGO_FAIL_POINT(clusterAggregateFailToDispatchExchangeConsumerPipeline)) {
+        log() << "clusterAggregateFailToDispatchExchangeConsumerPipeline fail point enabled.";
+        uasserted(ErrorCodes::FailPointEnabled,
+                  "Asserting on exhange consumer pipeline dispatch due to failpoint.");
+    }
 
     // For all consumers construct a request with appropriate cursor ids and send to shards.
     std::vector<std::pair<ShardId, BSONObj>> requests;
-    for (size_t idx = 0; idx < shardDispatchResults->numConsumers; ++idx) {
-
+    auto numConsumers = shardDispatchResults->exchangeSpec->consumerShards.size();
+    std::vector<SplitPipeline> consumerPipelines;
+    for (size_t idx = 0; idx < numConsumers; ++idx) {
         // Pick this consumer's cursors from producers.
-        std::vector<RemoteCursor> producers;
+        std::vector<OwnedRemoteCursor> producers;
         for (size_t p = 0; p < shardDispatchResults->numProducers; ++p) {
-            producers.emplace_back(std::move(
-                shardDispatchResults->remoteCursors[p * shardDispatchResults->numConsumers + idx]));
+            producers.emplace_back(
+                std::move(shardDispatchResults->remoteCursors[p * numConsumers + idx]));
         }
 
         // Create a pipeline for a consumer and add the merging stage.
@@ -529,12 +569,13 @@ DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
             shardDispatchResults->splitPipeline->shardCursorsSortSpec,
             Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor());
 
-        SplitPipeline pipeline(std::move(consumerPipeline), nullptr, boost::none);
+        consumerPipelines.emplace_back(std::move(consumerPipeline), nullptr, boost::none);
 
-        auto consumerCmdObj =
-            createCommandForTargetedShards(opCtx, aggRequest, pipeline, collationObj, boost::none);
+        auto consumerCmdObj = createCommandForTargetedShards(
+            opCtx, aggRequest, consumerPipelines.back(), collationObj, boost::none, false);
 
-        requests.emplace_back(shardIds[idx % shardIds.size()], consumerCmdObj);
+        requests.emplace_back(shardDispatchResults->exchangeSpec->consumerShards[idx],
+                              consumerCmdObj);
     }
     auto cursors = establishCursors(opCtx,
                                     Grid::get(opCtx)->getExecutorPool()->getArbitraryExecutor(),
@@ -543,20 +584,33 @@ DispatchShardPipelineResults dispatchExchangeConsumerPipeline(
                                     requests,
                                     false /* do not allow partial results */);
 
+    // Convert remote cursors into a vector of "owned" cursors.
+    std::vector<OwnedRemoteCursor> ownedCursors;
+    for (auto&& cursor : cursors) {
+        ownedCursors.emplace_back(OwnedRemoteCursor(opCtx, std::move(cursor), executionNss));
+    }
+
     // The merging pipeline is just a union of the results from each of the shards involved on the
     // consumer side of the exchange.
     auto mergePipeline = uassertStatusOK(Pipeline::create({}, expCtx));
     mergePipeline->setSplitState(Pipeline::SplitState::kSplitForMerge);
 
     SplitPipeline splitPipeline{nullptr, std::move(mergePipeline), boost::none};
+
+    // Relinquish ownership of the local consumer pipelines' cursors as each shard is now
+    // responsible for its own producer cursors.
+    for (const auto& pipeline : consumerPipelines) {
+        const auto& mergeCursors =
+            static_cast<DocumentSourceMergeCursors*>(pipeline.shardsPipeline->peekFront());
+        mergeCursors->dismissCursorOwnership();
+    }
     return DispatchShardPipelineResults{false,
-                                        std::move(cursors),
+                                        std::move(ownedCursors),
                                         {} /*TODO SERVER-36279*/,
                                         std::move(splitPipeline),
                                         nullptr,
                                         BSONObj(),
-                                        shardDispatchResults->numConsumers,
-                                        1};
+                                        numConsumers};
 }
 
 Status appendExplainResults(DispatchShardPipelineResults&& dispatchResults,
@@ -564,15 +618,34 @@ Status appendExplainResults(DispatchShardPipelineResults&& dispatchResults,
                             BSONObjBuilder* result) {
     if (dispatchResults.splitPipeline) {
         auto* mergePipeline = dispatchResults.splitPipeline->mergePipeline.get();
-        *result << "mergeType"
-                << (mergePipeline->canRunOnMongos()
-                        ? "mongos"
-                        : mergePipeline->needsPrimaryShardMerger() ? "primaryShard" : "anyShard")
-                << "splitPipeline"
-                << Document{{"shardsPart",
-                             dispatchResults.splitPipeline->shardsPipeline->writeExplainOps(
-                                 *mergeCtx->explain)},
-                            {"mergerPart", mergePipeline->writeExplainOps(*mergeCtx->explain)}};
+        const char* mergeType = [&]() {
+            if (mergePipeline->canRunOnMongos()) {
+                return "mongos";
+            } else if (dispatchResults.exchangeSpec) {
+                return "exchange";
+            } else if (mergePipeline->needsPrimaryShardMerger()) {
+                return "primaryShard";
+            } else {
+                return "anyShard";
+            }
+        }();
+
+        *result << "mergeType" << mergeType;
+
+        MutableDocument pipelinesDoc;
+        pipelinesDoc.addField("shardsPart",
+                              Value(dispatchResults.splitPipeline->shardsPipeline->writeExplainOps(
+                                  *mergeCtx->explain)));
+        if (dispatchResults.exchangeSpec) {
+            BSONObjBuilder bob;
+            dispatchResults.exchangeSpec->exchangeSpec.serialize(&bob);
+            bob.append("consumerShards", dispatchResults.exchangeSpec->consumerShards);
+            pipelinesDoc.addField("exchange", Value(bob.obj()));
+        }
+        pipelinesDoc.addField("mergerPart",
+                              Value(mergePipeline->writeExplainOps(*mergeCtx->explain)));
+
+        *result << "splitPipeline" << pipelinesDoc.freeze();
     } else {
         *result << "splitPipeline" << BSONNULL;
     }
@@ -592,6 +665,12 @@ Shard::CommandResponse establishMergingShardCursor(OperationContext* opCtx,
                                                    const NamespaceString& nss,
                                                    const BSONObj mergeCmdObj,
                                                    const ShardId& mergingShardId) {
+    if (MONGO_FAIL_POINT(clusterAggregateFailToEstablishMergingShardCursor)) {
+        log() << "clusterAggregateFailToEstablishMergingShardCursor fail point enabled.";
+        uasserted(ErrorCodes::FailPointEnabled,
+                  "Asserting on establishing merging shard cursor due to failpoint.");
+    }
+
     const auto mergingShard =
         uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, mergingShardId));
 
@@ -623,6 +702,10 @@ BSONObj establishMergingMongosCursor(
         : boost::optional<long long>(request.getBatchSize());
     params.lsid = opCtx->getLogicalSessionId();
     params.txnNumber = opCtx->getTxnNumber();
+
+    if (TransactionRouter::get(opCtx)) {
+        params.isAutoCommit = false;
+    }
 
     auto ccc = cluster_aggregation_planner::buildClusterCursor(
         opCtx, std::move(pipelineForMerging), std::move(params));
@@ -916,12 +999,13 @@ Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& ex
     // We should never be in a situation where we call this function on a non-merge pipeline.
     invariant(shardDispatchResults.splitPipeline);
     auto* mergePipeline = shardDispatchResults.splitPipeline->mergePipeline.get();
+    invariant(mergePipeline);
     auto* opCtx = expCtx->opCtx;
 
     std::vector<ShardId> targetedShards;
     targetedShards.reserve(shardDispatchResults.remoteCursors.size());
     for (auto&& remoteCursor : shardDispatchResults.remoteCursors) {
-        targetedShards.emplace_back(remoteCursor.getShardId().toString());
+        targetedShards.emplace_back(remoteCursor->getShardId().toString());
     }
 
     cluster_aggregation_planner::addMergeCursorsSource(
@@ -962,7 +1046,8 @@ Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& ex
                                               targetedShards,
                                               routingInfo->db().primaryId());
 
-    auto mergeCmdObj = createCommandForMergingShard(request, expCtx, cmdObj, mergePipeline);
+    auto mergeCmdObj =
+        createCommandForMergingShard(request, expCtx, cmdObj, mergingShardId, mergePipeline);
 
     // Dispatch $mergeCursors to the chosen shard, store the resulting cursor, and return.
     auto mergeResponse =
@@ -970,6 +1055,12 @@ Status dispatchMergingPipeline(const boost::intrusive_ptr<ExpressionContext>& ex
 
     auto mergeCursorResponse = uassertStatusOK(storePossibleCursor(
         opCtx, namespaces.requestedNss, mergingShardId, mergeResponse, expCtx->tailableMode));
+
+    // Ownership for the shard cursors has been transferred to the merging shard. Dismiss the
+    // ownership in the current merging pipeline such that when it goes out of scope it does not
+    // attempt to kill the cursors.
+    auto mergeCursors = static_cast<DocumentSourceMergeCursors*>(mergePipeline->peekFront());
+    mergeCursors->dismissCursorOwnership();
 
     return appendCursorResponseToCommandResult(mergingShardId, mergeCursorResponse, result);
 }
@@ -1078,16 +1169,15 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     // If we sent the entire pipeline to a single shard, store the remote cursor and return.
     if (!shardDispatchResults.splitPipeline) {
         invariant(shardDispatchResults.remoteCursors.size() == 1);
-        auto& remoteCursor = shardDispatchResults.remoteCursors.front();
+        auto&& remoteCursor = std::move(shardDispatchResults.remoteCursors.front());
+        const auto shardId = remoteCursor->getShardId().toString();
         const auto reply = uassertStatusOK(storePossibleCursor(
-            opCtx, namespaces.requestedNss, remoteCursor, expCtx->tailableMode));
-        return appendCursorResponseToCommandResult(
-            remoteCursor.getShardId().toString(), reply, result);
+            opCtx, namespaces.requestedNss, std::move(remoteCursor), expCtx->tailableMode));
+        return appendCursorResponseToCommandResult(shardId, reply, result);
     }
 
-    // If we have more than 1 consumer (i.e. the exchange operator is in use) then dispatch all
-    // consumers.
-    if (shardDispatchResults.numConsumers > 1) {
+    // If we have the exchange spec then dispatch all consumers.
+    if (shardDispatchResults.exchangeSpec) {
         shardDispatchResults = dispatchExchangeConsumerPipeline(expCtx,
                                                                 namespaces.executionNss,
                                                                 cmdObj,
@@ -1096,6 +1186,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                                                 collationObj,
                                                                 &shardDispatchResults);
     }
+
     // If we reach here, we have a merge pipeline to dispatch.
     return dispatchMergingPipeline(expCtx,
                                    namespaces,
@@ -1140,16 +1231,15 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
     }
     auto shard = std::move(swShard.getValue());
 
-    // aggPassthrough is for unsharded collections since changing primary shardId will cause SSV
-    // error and hence shardId history does not need to be verified.
-    if (auto txnRouter = TransactionRouter::get(opCtx)) {
+    auto txnRouter = TransactionRouter::get(opCtx);
+    if (txnRouter) {
         txnRouter->computeAtClusterTimeForOneShard(opCtx, shardId);
     }
 
     // Format the command for the shard. This adds the 'fromMongos' field, wraps the command as an
     // explain if necessary, and rewrites the result into a format safe to forward to shards.
     cmdObj = CommandHelpers::filterCommandRequestForPassthrough(
-        createPassthroughCommandForShard(opCtx, aggRequest, nullptr, cmdObj, BSONObj()));
+        createPassthroughCommandForShard(opCtx, aggRequest, shardId, nullptr, cmdObj, BSONObj()));
 
     auto cmdResponse = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
         opCtx,
@@ -1187,22 +1277,48 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
 
     out->appendElementsUnique(CommandHelpers::filterCommandReplyForPassthrough(result));
 
-    auto status = getStatusFromCommandResult(out->asTempObj());
-    if (auto resolvedView = status.extraInfo<ResolvedView>()) {
-        auto resolvedAggRequest = resolvedView->asExpandedViewAggregation(aggRequest);
-        auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
-        out->resetToEmpty();
+    return getStatusFromCommandResult(out->asTempObj());
+}
 
-        // We pass both the underlying collection namespace and the view namespace here. The
-        // underlying collection namespace is used to execute the aggregation on mongoD. Any cursor
-        // returned will be registered under the view namespace so that subsequent getMore and
-        // killCursors calls against the view have access.
-        Namespaces nsStruct;
-        nsStruct.requestedNss = namespaces.requestedNss;
-        nsStruct.executionNss = resolvedView->getNamespace();
+Status ClusterAggregate::retryOnViewError(OperationContext* opCtx,
+                                          const AggregationRequest& request,
+                                          const ResolvedView& resolvedView,
+                                          const NamespaceString& requestedNss,
+                                          BSONObjBuilder* result,
+                                          unsigned numberRetries) {
+    if (numberRetries >= kMaxViewRetries) {
+        return Status(ErrorCodes::InternalError,
+                      "Failed to resolve view after max number of retries.");
+    }
 
-        return ClusterAggregate::runAggregate(
-            opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, out);
+    auto resolvedAggRequest = resolvedView.asExpandedViewAggregation(request);
+    auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
+    result->resetToEmpty();
+
+    if (auto txnRouter = TransactionRouter::get(opCtx)) {
+        txnRouter->onViewResolutionError();
+    }
+
+    // We pass both the underlying collection namespace and the view namespace here. The
+    // underlying collection namespace is used to execute the aggregation on mongoD. Any cursor
+    // returned will be registered under the view namespace so that subsequent getMore and
+    // killCursors calls against the view have access.
+    Namespaces nsStruct;
+    nsStruct.requestedNss = requestedNss;
+    nsStruct.executionNss = resolvedView.getNamespace();
+
+    auto status =
+        ClusterAggregate::runAggregate(opCtx, nsStruct, resolvedAggRequest, resolvedAggCmd, result);
+
+    // If the underlying namespace was changed to a view during retry, then re-run the aggregation
+    // on the new resolved namespace.
+    if (status.extraInfo<ResolvedView>()) {
+        return ClusterAggregate::retryOnViewError(opCtx,
+                                                  resolvedAggRequest,
+                                                  *status.extraInfo<ResolvedView>(),
+                                                  requestedNss,
+                                                  result,
+                                                  numberRetries + 1);
     }
 
     return status;

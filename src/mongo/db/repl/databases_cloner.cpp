@@ -26,7 +26,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplicationInitialSync
 
 #include "mongo/platform/basic.h"
 
@@ -230,6 +230,12 @@ void DatabasesCloner::setScheduleDbWorkFn_forTest(const CollectionCloner::Schedu
     _scheduleDbWorkFn = work;
 }
 
+void DatabasesCloner::setStartCollectionClonerFn(
+    const StartCollectionClonerFn& startCollectionCloner) {
+    LockGuard lk(_mutex);
+    _startCollectionClonerFn = startCollectionCloner;
+}
+
 StatusWith<std::vector<BSONElement>> DatabasesCloner::parseListDatabasesResponse_forTest(
     BSONObj dbResponse) {
     return _parseListDatabasesResponse(dbResponse);
@@ -338,8 +344,8 @@ void DatabasesCloner::_onListDatabaseFinish(
             if (status.isOK()) {
                 LOG(1) << "collection clone finished: " << srcNss;
             } else {
-                warning() << "collection clone for '" << srcNss << "' failed due to "
-                          << status.toString();
+                error() << "collection clone for '" << srcNss << "' failed due to "
+                        << status.toString();
             }
         };
         const auto onDbFinish = [this, dbName](const Status& status) {
@@ -359,6 +365,9 @@ void DatabasesCloner::_onListDatabaseFinish(
                 onDbFinish));
             if (_scheduleDbWorkFn) {
                 dbCloner->setScheduleDbWorkFn_forTest(_scheduleDbWorkFn);
+            }
+            if (_startCollectionClonerFn) {
+                dbCloner->setStartCollectionClonerFn(_startCollectionClonerFn);
             }
             // Start first database cloner.
             if (_databaseCloners.empty()) {

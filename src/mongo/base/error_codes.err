@@ -129,7 +129,7 @@ error_code("UnrecoverableRollbackError", 127)
 error_code("LockNotFound", 128)
 error_code("LockStateChangeFailed", 129)
 error_code("SymbolNotFound", 130)
-error_code("RLPInitializationFailed", 131)
+#error_code("RLPInitializationFailed", 131) # Removed in 4.2
 error_code("OBSOLETE_ConfigServersInconsistent", 132)
 error_code("FailedToSatisfyReadPreference", 133)
 error_code("ReadConcernMajorityNotAvailableYet", 134)
@@ -268,6 +268,7 @@ error_code("PreparedTransactionInProgress", 267);
 error_code("CannotBackup", 268);
 error_code("DataModifiedByRepair", 269);
 error_code("RepairedReplicaSetNode", 270);
+error_code("JSInterpreterFailureWithStack", 271, extra="JSExceptionInfo")
 # Error codes 4000-8999 are reserved.
 
 # Non-sequential error codes (for compatibility only)

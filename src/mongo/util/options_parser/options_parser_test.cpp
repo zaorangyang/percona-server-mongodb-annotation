@@ -1975,6 +1975,23 @@ TEST(ConfigFromFilesystem, Empty) {
     ASSERT_OK(parser.run(testOpts, argv, env_map, &environment));
 }
 
+TEST(ConfigFromFilesystem, Directory) {
+    moe::OptionsParser parser;
+    moe::Environment environment;
+
+    moe::OptionSection testOpts;
+    testOpts.addOptionChaining("config", "config", moe::String, "Config file to parse");
+
+    std::vector<std::string> argv;
+    argv.push_back("binaryname");
+    argv.push_back("--config");
+    argv.push_back(TEST_CONFIG_PATH(""));
+    std::map<std::string, std::string> env_map;
+
+    moe::Value value;
+    ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
+}
+
 TEST(ConfigFromFilesystem, NullByte) {
 
     moe::OptionsParser parser;
@@ -4719,6 +4736,32 @@ void TestFile(std::vector<unsigned char> contents, bool valid) {
     } else {
         ASSERT_NOT_OK(parser.run(testOpts, argv, env_map, &environment));
     }
+}
+
+TEST(YAMLConfigFile, canonicalize) {
+    moe::OptionSection opts;
+    opts.addOptionChaining("net.bindIpAll", "bind_ip_all", moe::Switch, "Bind all addresses")
+        .incompatibleWith("net.bindIp")
+        .canonicalize([](moe::Environment* env) {
+            auto status = env->remove("net.bindIpAll");
+            if (!status.isOK()) {
+                return status;
+            }
+            return env->set("net.bindIp", moe::Value("0.0.0.0"));
+        });
+    opts.addOptionChaining("net.bindIp", "bind_ip", moe::String, "Bind specific addresses")
+        .incompatibleWith("net.bindIpAll");
+
+    moe::OptionsParser parser;
+    moe::Environment env;
+    std::vector<std::string> argv = {
+        "binary", "--bind_ip_all",
+    };
+    std::map<std::string, std::string> env_map;
+    ASSERT_OK(parser.run(opts, argv, env_map, &env));
+    ASSERT_TRUE(env.count("net.bindIp"));
+    ASSERT_FALSE(env.count("net.bindIpAll"));
+    ASSERT_EQ(env["net.bindIp"].as<std::string>(), "0.0.0.0");
 }
 
 #if defined(_WIN32)

@@ -83,13 +83,15 @@ class DBClientQueryInterface {
                                      const NamespaceStringOrUUID& nsOrUuid,
                                      Query query,
                                      const BSONObj* fieldsToReturn = 0,
-                                     int queryOptions = 0) = 0;
+                                     int queryOptions = 0,
+                                     int batchSize = 0) = 0;
 
     virtual unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
                                      const NamespaceStringOrUUID& nsOrUuid,
                                      Query query,
                                      const BSONObj* fieldsToReturn = 0,
-                                     int queryOptions = 0) = 0;
+                                     int queryOptions = 0,
+                                     int batchSize = 0) = 0;
 };
 
 /**
@@ -588,10 +590,12 @@ public:
                                           int batchSize = 0) override;
 
 
-    /** Uses QueryOption_Exhaust, when available.
+    /** Uses QueryOption_Exhaust, when available and specified in 'queryOptions'.
 
         Exhaust mode sends back all data queries as fast as possible, with no back-and-forth for
-        OP_GETMORE.  If you are certain you will exhaust the query, it could be useful.
+        OP_GETMORE.  If you are certain you will exhaust the query, it could be useful.  If
+        exhaust mode is not specified in 'queryOptions' or not available, this call transparently
+        falls back to using ordinary getMores.
 
         Use the DBClientCursorBatchIterator version, below, if you want to do items in large
         blocks, perhaps to avoid granular locking and such.
@@ -604,13 +608,15 @@ public:
                              const NamespaceStringOrUUID& nsOrUuid,
                              Query query,
                              const BSONObj* fieldsToReturn = 0,
-                             int queryOptions = 0) final;
+                             int queryOptions = QueryOption_Exhaust,
+                             int batchSize = 0) final;
 
     unsigned long long query(stdx::function<void(DBClientCursorBatchIterator&)> f,
                              const NamespaceStringOrUUID& nsOrUuid,
                              Query query,
                              const BSONObj* fieldsToReturn = 0,
-                             int queryOptions = 0) override;
+                             int queryOptions = QueryOption_Exhaust,
+                             int batchSize = 0) override;
 
 
     /** don't use this - called automatically by DBClientCursor for you

@@ -42,6 +42,7 @@
 #include "mongo/base/init.h"
 #include "mongo/base/initializer_context.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/bson/util/builder.h"
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -53,6 +54,7 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/private/ssl_expiration.h"
+#include "mongo/util/net/sockaddr.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl.hpp"
 #include "mongo/util/net/ssl_options.h"
@@ -272,10 +274,11 @@ public:
     SSLConnectionInterface* accept(Socket* socket, const char* initialBytes, int len) final;
 
     SSLPeerInfo parseAndValidatePeerCertificateDeprecated(const SSLConnectionInterface* conn,
-                                                          const std::string& remoteHost) final;
+                                                          const std::string& remoteHost,
+                                                          const HostAndPort& hostForLogging) final;
 
     StatusWith<boost::optional<SSLPeerInfo>> parseAndValidatePeerCertificate(
-        PCtxtHandle ssl, const std::string& remoteHost) final;
+        PCtxtHandle ssl, const std::string& remoteHost, const HostAndPort& hostForLogging) final;
 
 
     const SSLConfiguration& getSSLConfiguration() const final {
@@ -1482,11 +1485,14 @@ Status SSLManagerWindows::_validateCertificate(PCCERT_CONTEXT cert,
 }
 
 SSLPeerInfo SSLManagerWindows::parseAndValidatePeerCertificateDeprecated(
-    const SSLConnectionInterface* conn, const std::string& remoteHost) {
+    const SSLConnectionInterface* conn,
+    const std::string& remoteHost,
+    const HostAndPort& hostForLogging) {
     auto swPeerSubjectName = parseAndValidatePeerCertificate(
         const_cast<SSLConnectionWindows*>(static_cast<const SSLConnectionWindows*>(conn))
             ->_engine.native_handle(),
-        remoteHost);
+        remoteHost,
+        hostForLogging);
     // We can't use uassertStatusOK here because we need to throw a SocketException.
     if (!swPeerSubjectName.isOK()) {
         throwSocketError(SocketErrorKind::CONNECT_ERROR, swPeerSubjectName.getStatus().reason());
@@ -1517,10 +1523,29 @@ StatusWith<std::vector<std::string>> getSubjectAlternativeNames(PCCERT_CONTEXT c
     CERT_ALT_NAME_INFO* altNames = reinterpret_cast<CERT_ALT_NAME_INFO*>(swBlob.getValue().data());
     for (size_t i = 0; i < altNames->cAltEntry; i++) {
         if (altNames->rgAltEntry[i].dwAltNameChoice == CERT_ALT_NAME_DNS_NAME) {
-            names.push_back(toUtf8String(altNames->rgAltEntry[i].pwszDNSName));
+            auto san = toUtf8String(altNames->rgAltEntry[i].pwszDNSName);
+            names.push_back(san);
+            auto swCIDRSan = CIDR::parse(san);
+            if (swCIDRSan.isOK()) {
+                warning() << "You have an IP Address in the DNS Name field on your "
+                             "certificate. This formulation is depreceated.";
+            }
+        } else if (altNames->rgAltEntry[i].dwAltNameChoice == CERT_ALT_NAME_IP_ADDRESS) {
+            auto ipAddrStruct = altNames->rgAltEntry[i].IPAddress;
+            struct sockaddr_storage ss;
+            memset(&ss, 0, sizeof(ss));
+            if (ipAddrStruct.cbData == 4) {
+                struct sockaddr_in* sa = reinterpret_cast<struct sockaddr_in*>(&ss);
+                sa->sin_family = AF_INET;
+                memcpy(&(sa->sin_addr), ipAddrStruct.pbData, ipAddrStruct.cbData);
+            } else if (ipAddrStruct.cbData == 16) {
+                struct sockaddr_in6* sa = reinterpret_cast<struct sockaddr_in6*>(&ss);
+                sa->sin6_family = AF_INET6;
+                memcpy(&(sa->sin6_addr), ipAddrStruct.pbData, ipAddrStruct.cbData);
+            }
+            names.push_back(SockAddr(ss, sizeof(struct sockaddr_storage)).getAddr());
         }
     }
-
     return names;
 }
 
@@ -1614,11 +1639,24 @@ Status validatePeerCertificate(const std::string& remoteHost,
     // certificates
     if (certChainPolicyStatus.dwError != S_OK &&
         certChainPolicyStatus.dwError != CRYPT_E_NO_REVOCATION_CHECK) {
+        auto swAltNames = getSubjectAlternativeNames(cert);
         if (certChainPolicyStatus.dwError == CERT_E_CN_NO_MATCH || allowInvalidCertificates) {
+            auto swCIDRRemoteHost = CIDR::parse(remoteHost);
+            if (swAltNames.isOK() && swCIDRRemoteHost.isOK()) {
+                auto remoteHostCIDR = swCIDRRemoteHost.getValue();
+                // Parsing the client's hostname
+                for (const auto& name : swAltNames.getValue()) {
+                    auto swCIDRHost = CIDR::parse(name);
+                    // Checking that the client hostname is an IP address
+                    // and it equals a SAN on the server cert
+                    if (swCIDRHost.isOK() && remoteHostCIDR == swCIDRHost.getValue()) {
+                        return Status::OK();
+                    }
+                }
+            }
 
             // Give the user a hint why the certificate validation failed.
             StringBuilder certificateNames;
-            auto swAltNames = getSubjectAlternativeNames(cert);
             if (swAltNames.isOK() && !swAltNames.getValue().empty()) {
                 for (auto& name : swAltNames.getValue()) {
                     certificateNames << name << " ";
@@ -1653,11 +1691,10 @@ Status validatePeerCertificate(const std::string& remoteHost,
             return Status(ErrorCodes::SSLHandshakeFailed, msg);
         }
     }
-
     return Status::OK();
 }
 
-Status recordTLSVersion(PCtxtHandle ssl) {
+StatusWith<TLSVersion> mapTLSVersion(PCtxtHandle ssl) {
     SecPkgContext_ConnectionInfo connInfo;
 
     SECURITY_STATUS ss = QueryContextAttributes(ssl, SECPKG_ATTR_CONNECTION_INFO, &connInfo);
@@ -1668,36 +1705,31 @@ Status recordTLSVersion(PCtxtHandle ssl) {
                                     << ss);
     }
 
-    auto& counts = mongo::TLSVersionCounts::get(getGlobalServiceContext());
     switch (connInfo.dwProtocol) {
         case SP_PROT_TLS1_CLIENT:
         case SP_PROT_TLS1_SERVER:
-            counts.tls10.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS10;
         case SP_PROT_TLS1_1_CLIENT:
         case SP_PROT_TLS1_1_SERVER:
-            counts.tls11.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS11;
         case SP_PROT_TLS1_2_CLIENT:
         case SP_PROT_TLS1_2_SERVER:
-            counts.tls12.addAndFetch(1);
-            break;
+            return TLSVersion::kTLS12;
         default:
-            // Do nothing
-            break;
+            return TLSVersion::kUnknown;
     }
-
-    return Status::OK();
 }
 
 StatusWith<boost::optional<SSLPeerInfo>> SSLManagerWindows::parseAndValidatePeerCertificate(
-    PCtxtHandle ssl, const std::string& remoteHost) {
+    PCtxtHandle ssl, const std::string& remoteHost, const HostAndPort& hostForLogging) {
     PCCERT_CONTEXT cert;
 
-    auto countStatus = recordTLSVersion(ssl);
-    if (!countStatus.isOK()) {
-        return countStatus;
+    auto tlsVersionStatus = mapTLSVersion(ssl);
+    if (!tlsVersionStatus.isOK()) {
+        return tlsVersionStatus.getStatus();
     }
+
+    recordTLSVersion(tlsVersionStatus.getValue(), hostForLogging);
 
     if (!_sslConfiguration.hasCA && isSSLServer)
         return {boost::none};
