@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -50,6 +52,7 @@ using std::unique_ptr;
 using std::vector;
 
 namespace {
+
 Value missingToNull(Value maybeMissing) {
     return maybeMissing.missing() ? Value(BSONNULL) : maybeMissing;
 }
@@ -94,7 +97,23 @@ Value deserializeSortKey(size_t sortPatternSize, BSONObj bsonSortKey) {
     return Value{std::move(keys)};
 }
 
+/**
+ * Generates a new file name on each call using a static, atomic and monotonically increasing
+ * number.
+ *
+ * Each user of the Sorter must implement this function to ensure that all temporary files that the
+ * Sorter instances produce are uniquely identified using a unique file name extension with separate
+ * atomic variable. This is necessary because the sorter.cpp code is separately included in multiple
+ * places, rather than compiled in one place and linked, and so cannot provide a globally unique ID.
+ */
+std::string nextFileName() {
+    static AtomicUInt32 documentSourceSortFileCounter;
+    return "extsort-doc-source-sort." +
+        std::to_string(documentSourceSortFileCounter.fetchAndAdd(1));
+}
+
 }  // namespace
+
 constexpr StringData DocumentSourceSort::kStageName;
 
 DocumentSourceSort::DocumentSourceSort(const intrusive_ptr<ExpressionContext>& pExpCtx)
@@ -524,6 +543,7 @@ bool DocumentSourceSort::canRunInParallelBeforeOut(
     // would generally require merging the streams before producing output.
     return false;
 }
+
 }  // namespace mongo
 
 #include "mongo/db/sorter/sorter.cpp"

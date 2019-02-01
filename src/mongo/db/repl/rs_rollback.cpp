@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2008-2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,7 +40,6 @@
 #include "mongo/bson/bsonelement_comparator.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
@@ -70,7 +71,8 @@
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
-#include "mongo/db/session_catalog.h"
+#include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
@@ -892,7 +894,7 @@ Status _syncRollback(OperationContext* opCtx,
 
     // Find the UUID of the transactions collection. An OperationContext is required because the
     // UUID is not known at compile time, so the SessionCatalog needs to load the collection.
-    how.transactionTableUUID = SessionCatalog::getTransactionTableUUID(opCtx);
+    how.transactionTableUUID = MongoDSessionCatalog::getTransactionTableUUID(opCtx);
 
     log() << "Finding the Common Point";
     try {
@@ -1425,7 +1427,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         oplogCollection->cappedTruncateAfter(opCtx, fixUpInfo.commonPointOurDiskloc, false);
     }
 
-    Status status = getGlobalAuthorizationManager()->initialize(opCtx);
+    Status status = AuthorizationManager::get(opCtx->getServiceContext())->initialize(opCtx);
     if (!status.isOK()) {
         severe() << "Failed to reinitialize auth data after rollback: " << redact(status);
         fassertFailedNoTrace(40496);
@@ -1433,7 +1435,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
     // If necessary, clear the memory of existing sessions.
     if (fixUpInfo.refetchTransactionDocs) {
-        SessionCatalog::get(opCtx)->invalidateSessions(opCtx, boost::none);
+        MongoDSessionCatalog::invalidateSessions(opCtx, boost::none);
     }
 
     if (auto validator = LogicalTimeValidator::get(opCtx)) {

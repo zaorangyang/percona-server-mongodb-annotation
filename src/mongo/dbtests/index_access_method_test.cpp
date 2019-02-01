@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -43,7 +45,7 @@ TEST(IndexAccessMethodSetDifference, EmptyInputsShouldHaveNoDifference) {
     SimpleBSONObjComparator bsonCmp;
     BSONObjSet left = bsonCmp.makeBSONObjSet();
     BSONObjSet right = bsonCmp.makeBSONObjSet();
-    auto diff = IndexAccessMethod::setDifference(left, right);
+    auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQ(0UL, diff.first.size());
     ASSERT_EQ(0UL, diff.second.size());
 }
@@ -52,7 +54,7 @@ TEST(IndexAccessMethodSetDifference, EmptyLeftShouldHaveNoDifference) {
     SimpleBSONObjComparator bsonCmp;
     BSONObjSet left = bsonCmp.makeBSONObjSet();
     BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 0)});
-    auto diff = IndexAccessMethod::setDifference(left, right);
+    auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQ(0UL, diff.first.size());
     ASSERT_EQ(1UL, diff.second.size());
 }
@@ -61,7 +63,7 @@ TEST(IndexAccessMethodSetDifference, EmptyRightShouldReturnAllOfLeft) {
     SimpleBSONObjComparator bsonCmp;
     BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 0), BSON("" << 1)});
     BSONObjSet right = bsonCmp.makeBSONObjSet();
-    auto diff = IndexAccessMethod::setDifference(left, right);
+    auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQ(2UL, diff.first.size());
     ASSERT_EQ(0UL, diff.second.size());
 }
@@ -76,7 +78,7 @@ TEST(IndexAccessMethodSetDifference, IdenticalSetsShouldHaveNoDifference) {
                                                BSON(""
                                                     << "string"),
                                                BSON("" << BSONNULL)});
-    auto diff = IndexAccessMethod::setDifference(left, right);
+    auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQ(0UL, diff.first.size());
     ASSERT_EQ(0UL, diff.second.size());
 }
@@ -89,7 +91,7 @@ void assertDistinct(BSONObj left, BSONObj right) {
     SimpleBSONObjComparator bsonCmp;
     BSONObjSet leftSet = bsonCmp.makeBSONObjSet({left});
     BSONObjSet rightSet = bsonCmp.makeBSONObjSet({right});
-    auto diff = IndexAccessMethod::setDifference(leftSet, rightSet);
+    auto diff = AbstractIndexAccessMethod::setDifference(leftSet, rightSet);
     ASSERT_EQ(1UL, diff.first.size());
     ASSERT_EQ(1UL, diff.second.size());
 }
@@ -145,7 +147,7 @@ TEST(IndexAccessMethodSetDifference, ShouldDetectOneDifferenceAmongManySimilarit
                                 BSON("" << BSON("sub"
                                                 << "document")),
                                 BSON("" << BSON_ARRAY(1 << "hi" << 42))});
-    auto diff = IndexAccessMethod::setDifference(left, right);
+    auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(1UL, diff.first.size());
     ASSERT_EQUALS(1UL, diff.second.size());
 }
@@ -154,7 +156,7 @@ TEST(IndexAccessMethodSetDifference, SingleObjInLeftShouldFindCorrespondingObjIn
     SimpleBSONObjComparator bsonCmp;
     BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 2)});
     BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
-    auto diff = IndexAccessMethod::setDifference(left, right);
+    auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(0UL, diff.first.size());
     ASSERT_EQUALS(2UL, diff.second.size());
 }
@@ -163,7 +165,7 @@ TEST(IndexAccessMethodSetDifference, SingleObjInRightShouldFindCorrespondingObjI
     SimpleBSONObjComparator bsonCmp;
     BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
     BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 2)});
-    auto diff = IndexAccessMethod::setDifference(left, right);
+    auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(2UL, diff.first.size());
     ASSERT_EQUALS(0UL, diff.second.size());
 }
@@ -172,7 +174,7 @@ TEST(IndexAccessMethodSetDifference, LeftSetAllSmallerThanRightShouldBeDisjoint)
     SimpleBSONObjComparator bsonCmp;
     BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
     BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 4), BSON("" << 5), BSON("" << 6)});
-    auto diff = IndexAccessMethod::setDifference(left, right);
+    auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(3UL, diff.first.size());
     ASSERT_EQUALS(3UL, diff.second.size());
     for (auto&& obj : diff.first) {
@@ -187,7 +189,7 @@ TEST(IndexAccessMethodSetDifference, LeftSetAllLargerThanRightShouldBeDisjoint) 
     SimpleBSONObjComparator bsonCmp;
     BSONObjSet left = bsonCmp.makeBSONObjSet({BSON("" << 4), BSON("" << 5), BSON("" << 6)});
     BSONObjSet right = bsonCmp.makeBSONObjSet({BSON("" << 1), BSON("" << 2), BSON("" << 3)});
-    auto diff = IndexAccessMethod::setDifference(left, right);
+    auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(3UL, diff.first.size());
     ASSERT_EQUALS(3UL, diff.second.size());
     for (auto&& obj : diff.first) {
@@ -204,7 +206,7 @@ TEST(IndexAccessMethodSetDifference, ShouldNotReportOverlapsFromNonDisjointSets)
         bsonCmp.makeBSONObjSet({BSON("" << 0), BSON("" << 1), BSON("" << 4), BSON("" << 6)});
     BSONObjSet right = bsonCmp.makeBSONObjSet(
         {BSON("" << -1), BSON("" << 1), BSON("" << 3), BSON("" << 4), BSON("" << 7)});
-    auto diff = IndexAccessMethod::setDifference(left, right);
+    auto diff = AbstractIndexAccessMethod::setDifference(left, right);
     ASSERT_EQUALS(2UL, diff.first.size());   // 0, 6.
     ASSERT_EQUALS(3UL, diff.second.size());  // -1, 3, 7.
     for (auto&& obj : diff.first) {

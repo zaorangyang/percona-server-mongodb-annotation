@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -239,26 +241,73 @@ TEST_F(TransactionCoordinatorServiceTest,
 }
 
 TEST_F(TransactionCoordinatorServiceTest,
+       RetryingCreateCoordinatorForSameLsidAndTxnNumberSucceeds) {
+
+    TransactionCoordinatorService coordinatorService;
+
+    coordinatorService.createCoordinator(operationContext(), lsid(), txnNumber(), kCommitDeadline);
+    // Retry create. This should succeed but not replace the old coordinator.
+    coordinatorService.createCoordinator(operationContext(), lsid(), txnNumber(), kCommitDeadline);
+
+    commitTransaction(coordinatorService, lsid(), txnNumber(), kTwoShardIdSet);
+}
+
+TEST_F(TransactionCoordinatorServiceTest,
        CreateCoordinatorWithHigherTxnNumberThanOngoingUncommittedTxnAbortsPreviousTxnAndSucceeds) {
-    // TODO (SERVER-37021): Implement once more validation is implemented for coordinator creation.
+
+    TransactionCoordinatorService coordinatorService;
+    coordinatorService.createCoordinator(operationContext(), lsid(), txnNumber(), kCommitDeadline);
+
+    // This is currently the only way we have to get the commit decision.
+    auto oldTxnCommitDecisionFuture = coordinatorService.coordinateCommit(
+        operationContext(), lsid(), txnNumber(), kTwoShardIdSet);
+
+    // Create a coordinator for a higher transaction number in the same session.
+    coordinatorService.createCoordinator(
+        operationContext(), lsid(), txnNumber() + 1, kCommitDeadline);
+
+    assertAbortSentAndRespondWithSuccess();
+    assertAbortSentAndRespondWithSuccess();
+
+    // We should have aborted the previous transaction.
+    ASSERT_EQ(static_cast<int>(oldTxnCommitDecisionFuture.get()),
+              static_cast<int>(TransactionCoordinatorService::CommitDecision::kAbort));
+
+    // Make sure the newly created one works fine.
+    commitTransaction(coordinatorService, lsid(), txnNumber() + 1, kTwoShardIdSet);
 }
 
-TEST_F(
-    TransactionCoordinatorServiceTest,
-    CreateCoordinatorWithHigherTxnNumberThanOngoingCommittingTxnWaitsForPreviousTxnToCommitAndSucceeds) {
-    // TODO (SERVER-37021): Implement once more validation is implemented for coordinator creation.
-}
+TEST_F(TransactionCoordinatorServiceTest,
+       CreateCoordinatorWithHigherTxnNumberThanOngoingCommittingTxnCommitsPreviousTxnAndSucceeds) {
 
-TEST_F(
-    TransactionCoordinatorServiceTest,
-    CreateCoordinatorWithSameTxnNumberAsOngoingUncommittedTxnThrowsIfPreviousCoordinatorHasReceivedEvents) {
-    // TODO (SERVER-37021): Implement once more validation is implemented for coordinator creation.
-}
+    TransactionCoordinatorService coordinatorService;
+    coordinatorService.createCoordinator(operationContext(), lsid(), txnNumber(), kCommitDeadline);
 
-TEST_F(
-    TransactionCoordinatorServiceTest,
-    CreateCoordinatorWithSameTxnNumberAsOngoingUncommittedTxnSucceedsIfPreviousCoordinatorHasNotReceivedEvents) {
-    // TODO (SERVER-37021): Implement once more validation is implemented for coordinator creation.
+    // Progress the transaction up until the point where it has sent commit and is waiting for
+    // commit acks.
+    auto oldTxnCommitDecisionFuture = coordinatorService.coordinateCommit(
+        operationContext(), lsid(), txnNumber(), kTwoShardIdSet);
+    coordinatorService.voteCommit(
+        operationContext(), lsid(), txnNumber(), kTwoShardIdList[0], kDummyTimestamp);
+    coordinatorService.voteCommit(
+        operationContext(), lsid(), txnNumber(), kTwoShardIdList[1], kDummyTimestamp);
+
+    // Create a coordinator for a higher transaction number in the same session. This should
+    // "tryAbort" on the old coordinator which should NOT abort it since it's already waiting for
+    // commit acks.
+    coordinatorService.createCoordinator(
+        operationContext(), lsid(), txnNumber() + 1, kCommitDeadline);
+
+    // Finish committing the old transaction by sending it commit acks from both participants.
+    assertCommitSentAndRespondWithSuccess();
+    assertCommitSentAndRespondWithSuccess();
+
+    // The old transaction should now be committed.
+    ASSERT_EQ(static_cast<int>(oldTxnCommitDecisionFuture.get()),
+              static_cast<int>(TransactionCoordinatorService::CommitDecision::kCommit));
+
+    // Make sure the newly created one works fine too.
+    commitTransaction(coordinatorService, lsid(), txnNumber() + 1, kTwoShardIdSet);
 }
 
 TEST_F(TransactionCoordinatorServiceTestSingleTxn,

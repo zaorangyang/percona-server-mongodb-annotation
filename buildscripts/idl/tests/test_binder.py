@@ -1,17 +1,31 @@
 #!/usr/bin/env python2
-# Copyright (C) 2017 MongoDB Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# Copyright (C) 2018-present MongoDB, Inc.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 # pylint: disable=too-many-lines
 """Test cases for IDL binder."""
@@ -1580,6 +1594,147 @@ class TestBinder(testcase.IDLTestcase):
                 fields:
                     field1: string
             """), idl.errors.ERROR_ID_UNKNOWN_TYPE)
+
+    def test_server_parameter_positive(self):
+        # type: () -> None
+        """Positive server parameter test cases."""
+
+        # server parameter without storage.
+        self.assert_bind(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                append_bson: baz
+                from_bson: buzz
+                from_string: qux
+            """))
+
+        # server parameter with storage.
+        # Also try valid set_at values.
+        for set_at in ["startup", "runtime", "[ startup, runtime ]"]:
+            self.assert_bind(
+                textwrap.dedent("""
+            server_parameters:
+                foo:
+                    set_at: %s
+                    description: bar
+                    cpp_varname: baz
+                """ % (set_at)))
+
+        # server parameter with storage and optional fields.
+        self.assert_bind(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                cpp_varname: baz
+                default: 42
+                on_update: buzz
+                validator:
+                    gt: 0
+                    gte: 1
+                    lte: 999
+                    lt: 1000
+                    callback: qux
+            """))
+
+        # Custom setting missing from_bson callback, okay because default impl works.
+        self.assert_bind(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                append_bson: baz
+                from_string: qux
+            """))
+
+    def test_server_parameter_negative(self):
+        # type: () -> None
+        """Negative server parameter test cases."""
+
+        # server parameter without storage requires all get/set callbacks.
+        self.assert_bind_fail(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                append_bson: baz
+                from_bson: buzz
+            """), idl.errors.ERROR_ID_SERVER_PARAM_MISSING_METHOD)
+
+        self.assert_bind_fail(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                from_bson: buzz
+                from_string: qux
+            """), idl.errors.ERROR_ID_SERVER_PARAM_MISSING_METHOD)
+
+        # server parameter without storage may not have storage fields.
+        self.assert_bind_fail(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                append_bson: baz
+                from_bson: buzz
+                from_string: qux
+                default: 42
+            """), idl.errors.ERROR_ID_SERVER_PARAM_ATTR_NO_STORAGE)
+
+        self.assert_bind_fail(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                append_bson: baz
+                from_bson: buzz
+                from_string: qux
+                on_update: flip
+            """), idl.errors.ERROR_ID_SERVER_PARAM_ATTR_NO_STORAGE)
+
+        self.assert_bind_fail(
+            textwrap.dedent("""
+        server_parameters:
+            foo:
+                set_at: startup
+                description: bar
+                append_bson: baz
+                from_bson: buzz
+                from_string: qux
+                validator: { gt: 0 }
+            """), idl.errors.ERROR_ID_SERVER_PARAM_ATTR_NO_STORAGE)
+
+        # server parameter with storage may not have set/get methodsa
+        for callback in ["append_bson", "from_bson", "from_string"]:
+            self.assert_bind_fail(
+                textwrap.dedent("""
+            server_parameters:
+                foo:
+                    set_at: startup
+                    description: bar
+                    cpp_varname: baz
+                    %s: buzz
+                """ % (callback)), idl.errors.ERROR_ID_SERVER_PARAM_ATTR_WITH_STORAGE)
+
+        # Invalid set_at values.
+        self.assert_bind_fail(
+            textwrap.dedent("""
+            server_parameters:
+                foo:
+                    set_at: shutdown
+                    description: bar
+                    cpp_varname: baz
+            """), idl.errors.ERROR_ID_BAD_SETAT_SPECIFIER)
 
 
 if __name__ == '__main__':

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,7 +37,8 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/catalog/multi_index_block_impl.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -59,9 +62,10 @@ CollectionBulkLoaderImpl::CollectionBulkLoaderImpl(ServiceContext::UniqueClient&
       _opCtx{std::move(opCtx)},
       _autoColl{std::move(autoColl)},
       _nss{_autoColl->getCollection()->ns()},
-      _idIndexBlock(stdx::make_unique<MultiIndexBlock>(_opCtx.get(), _autoColl->getCollection())),
+      _idIndexBlock(
+          std::make_unique<MultiIndexBlockImpl>(_opCtx.get(), _autoColl->getCollection())),
       _secondaryIndexesBlock(
-          stdx::make_unique<MultiIndexBlock>(_opCtx.get(), _autoColl->getCollection())),
+          std::make_unique<MultiIndexBlockImpl>(_opCtx.get(), _autoColl->getCollection())),
       _idIndexSpec(idIndexSpec.getOwned()) {
 
     invariant(_opCtx);
@@ -111,22 +115,18 @@ Status CollectionBulkLoaderImpl::insertDocuments(const std::vector<BSONObj>::con
         UnreplicatedWritesBlock uwb(_opCtx.get());
 
         for (auto iter = begin; iter != end; ++iter) {
-            std::vector<MultiIndexBlock*> indexers;
-            if (_idIndexBlock) {
-                indexers.push_back(_idIndexBlock.get());
-            }
-            if (_secondaryIndexesBlock) {
-                indexers.push_back(_secondaryIndexesBlock.get());
-            }
-
             Status status = writeConflictRetry(
                 _opCtx.get(), "CollectionBulkLoaderImpl::insertDocuments", _nss.ns(), [&] {
                     WriteUnitOfWork wunit(_opCtx.get());
-                    if (!indexers.empty()) {
+                    const auto& doc = *iter;
+                    if (_idIndexBlock || _secondaryIndexesBlock) {
                         // This flavor of insertDocument will not update any pre-existing indexes,
                         // only the indexers passed in.
-                        const auto status = _autoColl->getCollection()->insertDocument(
-                            _opCtx.get(), *iter, indexers);
+                        auto onRecordInserted = [&](const RecordId& loc) {
+                            return _addDocumentToIndexBlocks(doc, loc);
+                        };
+                        const auto status = _autoColl->getCollection()->insertDocumentForBulkLoader(
+                            _opCtx.get(), doc, onRecordInserted);
                         if (!status.isOK()) {
                             return status;
                         }
@@ -134,7 +134,7 @@ Status CollectionBulkLoaderImpl::insertDocuments(const std::vector<BSONObj>::con
                         // For capped collections, we use regular insertDocument, which will update
                         // pre-existing indexes.
                         const auto status = _autoColl->getCollection()->insertDocument(
-                            _opCtx.get(), InsertStatement(*iter), nullptr);
+                            _opCtx.get(), InsertStatement(doc), nullptr);
                         if (!status.isOK()) {
                             return status;
                         }
@@ -255,6 +255,25 @@ Status CollectionBulkLoaderImpl::_runTaskReleaseResourcesOnFailure(F task) noexc
     } catch (...) {
         std::terminate();
     }
+}
+
+Status CollectionBulkLoaderImpl::_addDocumentToIndexBlocks(const BSONObj& doc,
+                                                           const RecordId& loc) {
+    if (_idIndexBlock) {
+        auto status = _idIndexBlock->insert(doc, loc);
+        if (!status.isOK()) {
+            return status.withContext("failed to add document to _id index");
+        }
+    }
+
+    if (_secondaryIndexesBlock) {
+        auto status = _secondaryIndexesBlock->insert(doc, loc);
+        if (!status.isOK()) {
+            return status.withContext("failed to add document to secondary indexes");
+        }
+    }
+
+    return Status::OK();
 }
 
 CollectionBulkLoaderImpl::Stats CollectionBulkLoaderImpl::getStats() const {

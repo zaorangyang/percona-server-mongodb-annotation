@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -70,36 +72,27 @@ StringMap<std::vector<ShardId>> getTagToShardIds(OperationContext* opCtx,
         return tagToShardIds;
     }
 
-    // get all docs in config.shards
-    auto configServer = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-    auto findShardsStatus =
+    // Get all docs in config.shards through a query instead of going through the shard registry
+    // because we need the zones as well
+    const auto configServer = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    const auto shardDocs = uassertStatusOK(
         configServer->exhaustiveFindOnConfig(opCtx,
                                              ReadPreferenceSetting(ReadPreference::Nearest),
                                              repl::ReadConcernLevel::kMajorityReadConcern,
                                              ShardType::ConfigNS,
                                              BSONObj(),
                                              BSONObj(),
-                                             0);
-    uassertStatusOK(findShardsStatus);
-    uassert(ErrorCodes::InternalError,
-            str::stream() << "cannot find any shard documents",
-            !findShardsStatus.getValue().docs.empty());
+                                             0));
+    uassert(50986, str::stream() << "Could not find any shard documents", !shardDocs.docs.empty());
 
     for (const auto& tag : tags) {
         tagToShardIds[tag.getTag()] = {};
     }
 
-    const auto& shardDocList = findShardsStatus.getValue().docs;
-
-    for (const auto& shardDoc : shardDocList) {
-        auto shardParseStatus = ShardType::fromBSON(shardDoc);
-        uassertStatusOK(shardParseStatus);
-        auto parsedShard = shardParseStatus.getValue();
+    for (const auto& shardDoc : shardDocs.docs) {
+        auto parsedShard = uassertStatusOK(ShardType::fromBSON(shardDoc));
         for (const auto& tag : parsedShard.getTags()) {
-            auto it = tagToShardIds.find(tag);
-            if (it != tagToShardIds.end()) {
-                it->second.push_back(parsedShard.getName());
-            }
+            tagToShardIds[tag].push_back(parsedShard.getName());
         }
     }
 
@@ -212,10 +205,7 @@ InitialSplitPolicy::generateShardCollectionInitialZonedChunks(
     const StringMap<std::vector<ShardId>>& tagToShards,
     const std::vector<ShardId>& allShardIds) {
     invariant(!allShardIds.empty());
-
-    uassert(ErrorCodes::InvalidOptions,
-            str::stream() << "cannot find zone split points because no zone docs were found",
-            !tags.empty());
+    invariant(!tags.empty());
 
     ChunkVersion version(1, 0, OID::gen());
     const auto& keyPattern = shardKeyPattern.getKeyPattern();
@@ -230,16 +220,30 @@ InitialSplitPolicy::generateShardCollectionInitialZonedChunks(
             const ShardId shardId = allShardIds[indx++ % allShardIds.size()];
             appendChunk(nss, lastChunkMax, tag.getMinKey(), &version, validAfter, shardId, &chunks);
         }
-        // create a chunk for the zone
+
+        // check that this tag is associated with a shard and if so create a chunk for the zone.
+        const auto it = tagToShards.find(tag.getTag());
+        invariant(it != tagToShards.end());
+        const auto& shardIdsForChunk = it->second;
+        uassert(50973,
+                str::stream()
+                    << "cannot shard collection "
+                    << nss.ns()
+                    << " because it is associated with zone: "
+                    << tag.getTag()
+                    << " which is not associated with a shard. please add this zone to a shard.",
+                !shardIdsForChunk.empty());
+
         appendChunk(nss,
                     tag.getMinKey(),
                     tag.getMaxKey(),
                     &version,
                     validAfter,
-                    tagToShards.find(tag.getTag())->second[0],
+                    shardIdsForChunk[0],
                     &chunks);
         lastChunkMax = tag.getMaxKey();
     }
+
     if (lastChunkMax.woCompare(keyPattern.globalMax()) < 0) {
         // existing zones do not span to $maxKey so create a chunk for that
         const ShardId shardId = allShardIds[indx++ % allShardIds.size()];
@@ -325,12 +329,11 @@ InitialSplitPolicy::ShardCollectionConfig InitialSplitPolicy::createFirstChunks(
         }
     }
 
-    const auto tagToShards = getTagToShardIds(opCtx, tags);
-    const Timestamp& validAfter = LogicalClock::get(opCtx)->getClusterTime().asTimestamp();
-
-    uassert(ErrorCodes::InternalError,
+    uassert(ErrorCodes::InvalidOptions,
             str::stream() << "cannot generate initial chunks based on both split points and tags",
             tags.empty() || finalSplitPoints.empty());
+
+    const auto validAfter = LogicalClock::get(opCtx)->getClusterTime().asTimestamp();
 
     auto initialChunks = tags.empty()
         ? InitialSplitPolicy::generateShardCollectionInitialChunks(nss,
@@ -341,7 +344,7 @@ InitialSplitPolicy::ShardCollectionConfig InitialSplitPolicy::createFirstChunks(
                                                                    shardIds,
                                                                    numContiguousChunksPerShard)
         : InitialSplitPolicy::generateShardCollectionInitialZonedChunks(
-              nss, shardKeyPattern, validAfter, tags, tagToShards, shardIds);
+              nss, shardKeyPattern, validAfter, tags, getTagToShardIds(opCtx, tags), shardIds);
 
     return initialChunks;
 }

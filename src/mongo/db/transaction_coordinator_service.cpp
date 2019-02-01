@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +28,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
+#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kTransaction
 
 #include "mongo/platform/basic.h"
 
@@ -84,20 +86,27 @@ void TransactionCoordinatorService::createCoordinator(OperationContext* opCtx,
                                                       LogicalSessionId lsid,
                                                       TxnNumber txnNumber,
                                                       Date_t commitDeadline) {
-    // TODO (SERVER-37021): Validate lsid and txnNumber against latest txnNumber on session in the
-    // catalog.
-
-    auto latestTxnNumAndCoordinator = _coordinatorCatalog->getLatestOnSession(lsid);
-    // TODO (SERVER-37039): The below removal logic for a coordinator will change/be removed once we
-    // allow multiple coordinators for a session.
-    if (latestTxnNumAndCoordinator) {
+    if (auto latestTxnNumAndCoordinator = _coordinatorCatalog->getLatestOnSession(lsid)) {
         auto latestCoordinator = latestTxnNumAndCoordinator.get().second;
+        if (txnNumber == latestTxnNumAndCoordinator.get().first) {
+            // If we're trying to re-create a coordinator for an already-existing lsid and
+            // txnNumber, we should be able to continue to use that coordinator, which MUST be in
+            // an unused state. In the state machine, the initial state is encoded as
+            // kWaitingForParticipantList, but this uassert won't necessarily catch all bugs
+            // because it's possible that the participant list (via coordinateCommit) could be en
+            // route when we reach this point or that votes have been received before reaching
+            // coordinateCommit.
+            uassert(50968,
+                    "Cannot start a new transaction with the same session ID and transaction "
+                    "number as a transaction that has already begun two-phase commit.",
+                    latestCoordinator->state() ==
+                        TransactionCoordinator::StateMachine::State::kWaitingForParticipantList);
+
+            return;
+        }
         // Call tryAbort on previous coordinator.
         auto actionToTake = latestCoordinator.get()->recvTryAbort();
         doCoordinatorAction(opCtx, latestCoordinator, actionToTake);
-
-        // Wait for coordinator to finish committing or aborting.
-        latestCoordinator->waitForCompletion().get(opCtx);
     }
 
     _coordinatorCatalog->create(lsid, txnNumber);
@@ -116,16 +125,6 @@ TransactionCoordinatorService::coordinateCommit(OperationContext* opCtx,
     if (!coordinator) {
         return TransactionCoordinatorService::CommitDecision::kAbort;
     }
-
-    // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-    // transactions are stable.
-    StringBuilder ss;
-    ss << "[";
-    for (const auto& shardId : participantList) {
-        ss << shardId << " ";
-    }
-    ss << "]";
-    LOG(0) << "Coordinator shard received participant list with shards " << ss.str();
 
     auto actionToTake = coordinator.get()->recvCoordinateCommit(participantList);
     doCoordinatorAction(opCtx, coordinator.get(), actionToTake);
@@ -153,11 +152,6 @@ void TransactionCoordinatorService::voteCommit(OperationContext* opCtx,
         return;
     }
 
-    // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-    // transactions are stable.
-    LOG(0) << "Coordinator shard received voteCommit from " << shardId << " with prepare timestamp "
-           << prepareTimestamp;
-
     auto actionToTake = coordinator.get()->recvVoteCommit(shardId, prepareTimestamp);
     doCoordinatorAction(opCtx, coordinator.get(), actionToTake);
 }
@@ -169,9 +163,6 @@ void TransactionCoordinatorService::voteAbort(OperationContext* opCtx,
     auto coordinator = _coordinatorCatalog->get(lsid, txnNumber);
 
     if (coordinator) {
-        // TODO (SERVER-36687): Remove log line or demote to lower log level once cross-shard
-        // transactions are stable.
-        LOG(0) << "Coordinator shard received voteAbort from " << shardId;
         auto actionToTake = coordinator.get()->recvVoteAbort(shardId);
         doCoordinatorAction(opCtx, coordinator.get(), actionToTake);
     }

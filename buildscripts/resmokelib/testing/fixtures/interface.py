@@ -103,7 +103,8 @@ class Fixture(object):
         This is NOT a driver connection string, but a connection string of the format
         expected by the mongo::ConnectionString class.
         """
-        raise NotImplementedError("get_connection_string must be implemented by Fixture subclasses")
+        raise NotImplementedError(
+            "get_internal_connection_string must be implemented by Fixture subclasses")
 
     def get_driver_connection_url(self):
         """Return the mongodb connection string as defined below.
@@ -194,6 +195,10 @@ class NoOpFixture(Fixture):
     """
 
     REGISTERED_NAME = "NoOpFixture"
+
+    def mongo_client(self, read_preference=None, timeout_millis=None):
+        """Return the mongo_client connection."""
+        raise NotImplementedError("NoOpFixture does not support a mongo_client")
 
     def get_internal_connection_string(self):
         """Return the internal connection string."""

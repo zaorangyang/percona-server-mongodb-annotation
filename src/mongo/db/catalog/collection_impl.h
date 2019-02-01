@@ -1,23 +1,25 @@
-/*-
- *    Copyright (C) 2017 MongoDB Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -78,16 +80,18 @@ public:
         return _ns;
     }
 
+    void setNs(NamespaceString nss) final;
+
     OptionalCollectionUUID uuid() const {
         return _uuid;
     }
 
     const IndexCatalog* getIndexCatalog() const final {
-        return &_indexCatalog;
+        return _indexCatalog.get();
     }
 
     IndexCatalog* getIndexCatalog() final {
-        return &_indexCatalog;
+        return _indexCatalog.get();
     }
 
     const RecordStore* getRecordStore() const final {
@@ -99,7 +103,7 @@ public:
     }
 
     CursorManager* getCursorManager() const final {
-        return &_cursorManager;
+        return _cursorManager.get();
     }
 
     bool requiresIdIndex() const final;
@@ -178,13 +182,15 @@ public:
                                    size_t nDocs) final;
 
     /**
-     * Inserts a document into the record store and adds it to the MultiIndexBlocks passed in.
+     * Inserts a document into the record store for a bulk loader that manages the index building
+     * outside this Collection. The bulk loader is notified with the RecordId of the document
+     * inserted into the RecordStore.
      *
      * NOTE: It is up to caller to commit the indexes.
      */
-    Status insertDocument(OperationContext* opCtx,
-                          const BSONObj& doc,
-                          const std::vector<MultiIndexBlock*>& indexBlocks) final;
+    Status insertDocumentForBulkLoader(OperationContext* opCtx,
+                                       const BSONObj& doc,
+                                       const OnRecordInsertedFn& onRecordInserted) final;
 
     /**
      * Updates the document @ oldLocation with newDoc.
@@ -220,8 +226,6 @@ public:
                                                      CollectionUpdateArgs* args) final;
 
     // -----------
-
-    StatusWith<CompactStats> compact(OperationContext* opCtx, const CompactOptions* options) final;
 
     /**
      * removes all documents as fast as possible
@@ -356,6 +360,11 @@ public:
      */
     const CollatorInterface* getDefaultCollator() const final;
 
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
+        OperationContext* opCtx,
+        PlanExecutor::YieldPolicy yieldPolicy,
+        ScanDirection scanDirection) final;
+
 private:
     inline DatabaseCatalogEntry* dbce() const final {
         return this->_dbce;
@@ -386,14 +395,14 @@ private:
 
     int _magic;
 
-    const NamespaceString _ns;
+    NamespaceString _ns;
     OptionalCollectionUUID _uuid;
     CollectionCatalogEntry* const _details;
     RecordStore* const _recordStore;
     DatabaseCatalogEntry* const _dbce;
     const bool _needCappedLock;
     CollectionInfoCache _infoCache;
-    IndexCatalog _indexCatalog;
+    std::unique_ptr<IndexCatalog> _indexCatalog;
 
 
     // The default collation which is applied to operations and indices which have no collation of
@@ -411,10 +420,7 @@ private:
     ValidationAction _validationAction;
     ValidationLevel _validationLevel;
 
-    // this is mutable because read only users of the Collection class
-    // use it keep state.  This seems valid as const correctness of Collection
-    // should be about the data.
-    mutable CursorManager _cursorManager;
+    std::unique_ptr<CursorManager> _cursorManager;
 
     // Notifier object for awaitData. Threads polling a capped collection for new data can wait
     // on this object until notified of the arrival of new data.
@@ -426,7 +432,5 @@ private:
     boost::optional<Timestamp> _minVisibleSnapshot;
 
     Collection* _this;
-
-    friend class NamespaceDetails;
 };
 }  // namespace mongo

@@ -1,16 +1,29 @@
-# Copyright (C) 2017 MongoDB Inc.
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 """
 IDL Parser.
@@ -475,6 +488,33 @@ def _parse_command(ctxt, spec, name, node):
     spec.symbols.add_command(ctxt, command)
 
 
+def _parse_server_parameter(ctxt, spec, name, node):
+    # type: (errors.ParserContext, syntax.IDLSpec, unicode, Union[yaml.nodes.MappingNode, yaml.nodes.ScalarNode, yaml.nodes.SequenceNode]) -> None
+    """Parse a server_parameters section in the IDL file."""
+    if not ctxt.is_mapping_node(node, "server_parameters"):
+        return
+
+    param = syntax.ServerParameter(ctxt.file_name, node.start_mark.line, node.start_mark.column)
+    param.name = name
+
+    _generic_parser(
+        ctxt, node, "server_parameters", param, {
+            "set_at": _RuleDesc('scalar_or_sequence', _RuleDesc.REQUIRED),
+            "description": _RuleDesc('scalar', _RuleDesc.REQUIRED),
+            "cpp_vartype": _RuleDesc('scalar'),
+            "cpp_varname": _RuleDesc('scalar'),
+            "default": _RuleDesc('scalar'),
+            "deprecated_name": _RuleDesc('scalar_or_sequence'),
+            "from_bson": _RuleDesc('scalar'),
+            "append_bson": _RuleDesc('scalar'),
+            "from_string": _RuleDesc('scalar'),
+            "validator": _RuleDesc('mapping', mapping_parser_func=_parse_validator),
+            "on_update": _RuleDesc("scalar"),
+        })
+
+    spec.server_parameters.append(param)
+
+
 def _prefix_with_namespace(cpp_namespace, cpp_name):
     # type: (unicode, unicode) -> unicode
     """Preface a C++ type name with a namespace if not already qualified or a primitive type."""
@@ -553,6 +593,8 @@ def _parse(stream, error_file_name):
             _parse_mapping(ctxt, spec, second_node, 'structs', _parse_struct)
         elif first_name == "commands":
             _parse_mapping(ctxt, spec, second_node, 'commands', _parse_command)
+        elif first_name == "server_parameters":
+            _parse_mapping(ctxt, spec, second_node, "server_parameters", _parse_server_parameter)
         else:
             ctxt.add_unknown_root_node_error(first_node)
 

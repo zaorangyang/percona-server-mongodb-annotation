@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/index/wildcard_key_generator.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
@@ -49,6 +52,24 @@ std::unique_ptr<MatchExpression> parseMatchExpression(const BSONObj& obj,
                            << status.getStatus().toString());
     }
     return std::move(status.getValue());
+}
+
+// Helper which constructs a $** IndexEntry and returns it along with an owned ProjectionExecAgg.
+// The latter simulates the ProjectionExecAgg which, during normal operation, is owned and
+// maintained by the $** index's IndexAccessMethod, and is required because the plan cache will
+// obtain unowned pointers to it.
+std::pair<IndexEntry, std::unique_ptr<ProjectionExecAgg>> makeWildcardEntry(
+    BSONObj keyPattern, const MatchExpression* filterExpr = nullptr) {
+    auto projExec = WildcardKeyGenerator::createProjectionExec(keyPattern, {});
+    return {IndexEntry(keyPattern,
+                       false,  // multikey
+                       false,  // sparse
+                       false,  // unique
+                       IndexEntry::Identifier{"indexName"},
+                       filterExpr,
+                       BSONObj(),
+                       projExec.get()),
+            std::move(projExec)};
 }
 
 // Test sparse index discriminators for a simple sparse index.
@@ -411,13 +432,8 @@ TEST(PlanCacheIndexabilityTest, CompoundIndexCollationDiscriminator) {
 
 TEST(PlanCacheIndexabilityTest, WildcardDiscriminator) {
     PlanCacheIndexabilityState state;
-    state.updateDiscriminators({IndexEntry(BSON("a.$**" << 1),
-                                           false,  // multikey
-                                           false,  // sparse
-                                           false,  // unique
-                                           IndexEntry::Identifier{"indexName"},
-                                           nullptr,
-                                           BSONObj())});
+    auto entryProjExecPair = makeWildcardEntry(BSON("a.$**" << 1));
+    state.updateDiscriminators({entryProjExecPair.first});
 
     const auto unindexedPathDiscriminators = state.buildWildcardDiscriminators("notIndexed");
     ASSERT_EQ(0U, unindexedPathDiscriminators.size());
@@ -464,16 +480,10 @@ TEST(PlanCacheIndexabilityTest, WildcardDiscriminator) {
 
 TEST(PlanCacheIndexabilityTest, WildcardWithCollationDiscriminator) {
     PlanCacheIndexabilityState state;
-    IndexEntry entry(BSON("a.$**" << 1),
-                     false,  // multikey
-                     false,  // sparse
-                     false,  // unique
-                     IndexEntry::Identifier{"indexName"},
-                     nullptr,
-                     BSONObj());
+    auto entryProjExecPair = makeWildcardEntry(BSON("a.$**" << 1));
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
-    entry.collator = &collator;
-    state.updateDiscriminators({entry});
+    entryProjExecPair.first.collator = &collator;
+    state.updateDiscriminators({entryProjExecPair.first});
 
     const auto unindexedPathDiscriminators = state.buildWildcardDiscriminators("notIndexed");
     ASSERT_EQ(0U, unindexedPathDiscriminators.size());
@@ -499,14 +509,8 @@ TEST(PlanCacheIndexabilityTest, WildcardPartialIndexDiscriminator) {
     // expression will store (unowned) pointers into it.
     BSONObj filterObj = fromjson("{a: {$gt: 5}}");
     auto filterExpr = parseMatchExpression(filterObj);
-    IndexEntry entry(BSON("$**" << 1),
-                     false,  // multikey
-                     false,  // sparse
-                     false,  // unique
-                     IndexEntry::Identifier{"indexName"},
-                     filterExpr.get(),
-                     BSONObj());
-    state.updateDiscriminators({entry});
+    auto entryProjExecPair = makeWildcardEntry(BSON("$**" << 1), filterExpr.get());
+    state.updateDiscriminators({entryProjExecPair.first});
 
     auto discriminatorsA = state.buildWildcardDiscriminators("a");
     ASSERT_EQ(1U, discriminatorsA.size());
@@ -526,13 +530,8 @@ TEST(PlanCacheIndexabilityTest, WildcardPartialIndexDiscriminator) {
 TEST(PlanCacheIndexabilityTest,
      WildcardIndexDiscriminatesBetweenEqualityToEmptyObjAndOtherObjComparisons) {
     PlanCacheIndexabilityState state;
-    state.updateDiscriminators({IndexEntry(BSON("a.$**" << 1),
-                                           false,  // multikey
-                                           false,  // sparse
-                                           false,  // unique
-                                           IndexEntry::Identifier{"indexName"},
-                                           nullptr,
-                                           BSONObj())});
+    auto entryProjExecPair = makeWildcardEntry(BSON("a.$**" << 1));
+    state.updateDiscriminators({entryProjExecPair.first});
 
     auto discriminatorsA = state.buildWildcardDiscriminators("a");
     ASSERT_EQ(1U, discriminatorsA.size());

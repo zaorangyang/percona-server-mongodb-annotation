@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
@@ -42,6 +44,7 @@
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/s/active_shard_collection_registry.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/config/initial_split_policy.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
@@ -542,43 +545,6 @@ void shardCollection(OperationContext* opCtx,
                              ShardingCatalogClient::kMajorityWriteConcern);
 }
 
-std::vector<TagsType> getExistingTags(OperationContext* opCtx, const NamespaceString& nss) {
-    auto configServer = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-    auto tagStatus =
-        configServer->exhaustiveFindOnConfig(opCtx,
-                                             kConfigReadSelector,
-                                             repl::ReadConcernLevel::kMajorityReadConcern,
-                                             TagsType::ConfigNS,
-                                             BSON(TagsType::ns(nss.ns())),
-                                             BSONObj(),
-                                             0);
-    uassertStatusOK(tagStatus);
-
-    const auto& tagDocList = tagStatus.getValue().docs;
-    std::vector<TagsType> tags;
-    for (const auto& tagDoc : tagDocList) {
-        auto tagParseStatus = TagsType::fromBSON(tagDoc);
-        uassertStatusOK(tagParseStatus);
-        const auto& parsedTag = tagParseStatus.getValue();
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "the min and max of the existing zone " << parsedTag.getMinKey()
-                              << " -->> "
-                              << parsedTag.getMaxKey()
-                              << " have non-matching number of keys",
-                parsedTag.getMinKey().nFields() == parsedTag.getMaxKey().nFields());
-
-        const auto& rangeMin = parsedTag.getMinKey();
-        const auto& rangeMax = parsedTag.getMaxKey();
-        uassert(ErrorCodes::InvalidOptions,
-                str::stream() << "zone " << rangeMin << " -->> " << rangeMax
-                              << " has min greater than max",
-                rangeMin.woCompare(rangeMax) < 0);
-
-        tags.push_back(parsedTag);
-    }
-    return tags;
-}
-
 /**
  * Internal sharding command run on primary shard server to shard a collection.
  */
@@ -620,6 +586,7 @@ public:
              const std::string& dbname,
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
+        auto const grid = Grid::get(opCtx);
         auto const shardingState = ShardingState::get(opCtx);
         uassertStatusOK(shardingState->canAcceptShardedCommands());
 
@@ -627,90 +594,119 @@ public:
             IDLParserErrorContext("_shardsvrShardCollection"), cmdObj);
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
-        // Take the collection critical section so that no writes can happen.
-        CollectionCriticalSection critSec(opCtx, nss);
+        auto scopedShardCollection = uassertStatusOK(
+            ActiveShardCollectionRegistry::get(opCtx).registerShardCollection(request));
+        Status status = {ErrorCodes::InternalError, "Uninitialized value"};
 
-        auto proposedKey(request.getKey().getOwned());
-        ShardKeyPattern shardKeyPattern(proposedKey);
-
-        createCollectionOrValidateExisting(opCtx, nss, proposedKey, shardKeyPattern, request);
-
-        // Read zone info
-        auto tags = getExistingTags(opCtx, nss);
-
-        if (!tags.empty()) {
-            validateShardKeyAgainstExistingZones(opCtx, proposedKey, shardKeyPattern, tags);
-        }
-
-        boost::optional<UUID> uuid;
-        if (request.getGetUUIDfromPrimaryShard()) {
-            uuid = getUUIDFromPrimaryShard(opCtx, nss);
+        // Check if this collection is currently being sharded and if so, join it
+        if (!scopedShardCollection.mustExecute()) {
+            status = scopedShardCollection.waitForCompletion(opCtx);
+            result << "collectionsharded" << nss.ns();
         } else {
-            uuid = UUID::gen();
-        }
+            try {
+                // Take the collection critical section so that no writes can happen.
+                CollectionCriticalSection critSec(opCtx, nss);
 
-        auto shardRegistry = Grid::get(opCtx)->shardRegistry();
-        shardRegistry->reload(opCtx);
+                auto proposedKey(request.getKey().getOwned());
+                ShardKeyPattern shardKeyPattern(proposedKey);
 
-        DBDirectClient localClient(opCtx);
-        bool isEmpty = (localClient.count(nss.ns()) == 0);
+                createCollectionOrValidateExisting(
+                    opCtx, nss, proposedKey, shardKeyPattern, request);
 
-        std::vector<ShardId> shardIds;
-        shardRegistry->getAllShardIds(opCtx, &shardIds);
-        const int numShards = shardIds.size();
+                // Read zone info
+                const auto catalogClient = grid->catalogClient();
+                auto tags = uassertStatusOK(catalogClient->getTagsForCollection(opCtx, nss));
 
-        std::vector<BSONObj> initialSplitPoints;
-        std::vector<BSONObj> finalSplitPoints;
+                if (!tags.empty()) {
+                    validateShardKeyAgainstExistingZones(opCtx, proposedKey, shardKeyPattern, tags);
+                }
 
-        if (request.getInitialSplitPoints()) {
-            finalSplitPoints = std::move(*request.getInitialSplitPoints());
-        } else if (!tags.empty()) {
-            // no need to find split points since we will create chunks based on
-            // the existing zones
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "found existing zones but the collection is not empty",
-                    isEmpty);
-        } else {
-            InitialSplitPolicy::calculateHashedSplitPointsForEmptyCollection(
-                shardKeyPattern,
-                isEmpty,
-                numShards,
-                request.getNumInitialChunks(),
-                &initialSplitPoints,
-                &finalSplitPoints);
-        }
+                boost::optional<UUID> uuid;
+                if (request.getGetUUIDfromPrimaryShard()) {
+                    uuid = getUUIDFromPrimaryShard(opCtx, nss);
+                } else {
+                    uuid = UUID::gen();
+                }
 
-        result << "collectionsharded" << nss.ns();
-        if (uuid) {
-            result << "collectionUUID" << *uuid;
-        }
+                const auto shardRegistry = grid->shardRegistry();
+                shardRegistry->reload(opCtx);
 
-        critSec.enterCommitPhase();
+                DBDirectClient localClient(opCtx);
+                bool isEmpty = (localClient.count(nss.ns()) == 0);
 
-        LOG(0) << "CMD: shardcollection: " << cmdObj;
+                std::vector<ShardId> shardIds;
+                shardRegistry->getAllShardIds(opCtx, &shardIds);
+                const int numShards = shardIds.size();
 
-        audit::logShardCollection(Client::getCurrent(), nss.ns(), proposedKey, request.getUnique());
+                std::vector<BSONObj> initialSplitPoints;
+                std::vector<BSONObj> finalSplitPoints;
 
-        // The initial chunks are distributed evenly across shards if the initial split points were
-        // specified in the request by mapReduce or if we are using a hashed shard key. Otherwise,
-        // all the initial chunks are placed on the primary shard.
-        const bool fromMapReduce = bool(request.getInitialSplitPoints());
-        const int numContiguousChunksPerShard = initialSplitPoints.empty()
-            ? 1
-            : (finalSplitPoints.size() + 1) / (initialSplitPoints.size() + 1);
-
-        // Step 6. Actually shard the collection.
-        shardCollection(opCtx,
-                        nss,
-                        uuid,
+                if (request.getInitialSplitPoints()) {
+                    finalSplitPoints = std::move(*request.getInitialSplitPoints());
+                } else if (!tags.empty()) {
+                    // no need to find split points since we will create chunks based on
+                    // the existing zones
+                    uassert(ErrorCodes::InvalidOptions,
+                            str::stream() << "found existing zones but the collection is not empty",
+                            isEmpty);
+                } else {
+                    InitialSplitPolicy::calculateHashedSplitPointsForEmptyCollection(
                         shardKeyPattern,
-                        *request.getCollation(),
-                        request.getUnique(),
-                        finalSplitPoints,
-                        tags,
-                        fromMapReduce,
-                        ShardingState::get(opCtx)->shardId(),
-                        numContiguousChunksPerShard);
+                        isEmpty,
+                        numShards,
+                        request.getNumInitialChunks(),
+                        &initialSplitPoints,
+                        &finalSplitPoints);
+                }
+
+                result << "collectionsharded" << nss.ns();
+                if (uuid) {
+                    result << "collectionUUID" << *uuid;
+                }
+
+                critSec.enterCommitPhase();
+
+                LOG(0) << "CMD: shardcollection: " << cmdObj;
+
+                audit::logShardCollection(
+                    Client::getCurrent(), nss.ns(), proposedKey, request.getUnique());
+
+                // The initial chunks are distributed evenly across shards if the initial split
+                // points were specified in the request by mapReduce or if we are using a hashed
+                // shard key. Otherwise, all the initial chunks are placed on the primary shard.
+                const bool fromMapReduce = bool(request.getInitialSplitPoints());
+                const int numContiguousChunksPerShard = initialSplitPoints.empty()
+                    ? 1
+                    : (finalSplitPoints.size() + 1) / (initialSplitPoints.size() + 1);
+
+                // Step 6. Actually shard the collection.
+                shardCollection(opCtx,
+                                nss,
+                                uuid,
+                                shardKeyPattern,
+                                *request.getCollation(),
+                                request.getUnique(),
+                                finalSplitPoints,
+                                tags,
+                                fromMapReduce,
+                                ShardingState::get(opCtx)->shardId(),
+                                numContiguousChunksPerShard);
+
+                status = Status::OK();
+            } catch (const DBException& e) {
+                status = e.toStatus();
+            } catch (const std::exception& e) {
+                scopedShardCollection.signalComplete(
+                    {ErrorCodes::InternalError,
+                     str::stream()
+                         << "Severe error occurred while running shardCollection command: "
+                         << e.what()});
+                throw;
+            }
+            scopedShardCollection.signalComplete(status);
+        }
+
+        uassertStatusOK(status);
 
         return true;
     }

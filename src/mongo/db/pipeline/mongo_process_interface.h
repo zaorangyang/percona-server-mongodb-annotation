@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -106,22 +108,29 @@ public:
     virtual bool isSharded(OperationContext* opCtx, const NamespaceString& ns) = 0;
 
     /**
-     * Inserts 'objs' into 'ns' and throws a UserException if the insert fails.
+     * Inserts 'objs' into 'ns' and throws a UserException if the insert fails. If 'targetEpoch' is
+     * set, throws ErrorCodes::StaleEpoch if the targeted collection does not have the same epoch or
+     * the epoch changes during the course of the insert.
      */
     virtual void insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                         const NamespaceString& ns,
-                        std::vector<BSONObj>&& objs) = 0;
+                        std::vector<BSONObj>&& objs,
+                        const WriteConcernOptions& wc,
+                        boost::optional<OID> targetEpoch) = 0;
 
     /**
      * Updates the documents matching 'queries' with the objects 'updates'. Throws a UserException
-     * if any of the updates fail.
+     * if any of the updates fail. If 'targetEpoch' is set, throws ErrorCodes::StaleEpoch if the
+     * targeted collection does not have the same epoch, or if the epoch changes during the update.
      */
     virtual void update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                         const NamespaceString& ns,
                         std::vector<BSONObj>&& queries,
                         std::vector<BSONObj>&& updates,
+                        const WriteConcernOptions& wc,
                         bool upsert,
-                        bool multi) = 0;
+                        bool multi,
+                        boost::optional<OID> targetEpoch) = 0;
 
     virtual CollectionIndexUsageMap getIndexStats(OperationContext* opCtx,
                                                   const NamespaceString& ns) = 0;
@@ -265,6 +274,16 @@ public:
     virtual bool uniqueKeyIsSupportedByIndex(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                              const NamespaceString& nss,
                                              const std::set<FieldPath>& uniqueKeyPaths) const = 0;
+
+    /**
+     * Refreshes the CatalogCache entry for the namespace 'nss', and returns the epoch associated
+     * with that namespace, if any. Note that this refresh will not necessarily force a new
+     * request to be sent to the config servers. If another thread has already requested a refresh,
+     * it will instead wait for that response.
+     */
+    virtual boost::optional<OID> refreshAndGetEpoch(
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const NamespaceString& nss) const = 0;
 };
 
 }  // namespace mongo

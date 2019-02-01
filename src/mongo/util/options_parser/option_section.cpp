@@ -1,28 +1,31 @@
-/* Copyright 2013 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/util/options_parser/option_section.h"
@@ -43,17 +46,31 @@ using std::shared_ptr;
 // Registration interface
 
 // TODO: Make sure the section we are adding does not have duplicate options
-Status OptionSection::addSection(const OptionSection& subSection) {
-    std::list<OptionDescription>::const_iterator oditerator;
-    for (oditerator = subSection._options.begin(); oditerator != subSection._options.end();
-         oditerator++) {
-        if (oditerator->_positionalStart != -1) {
-            StringBuilder sb;
-            sb << "Attempted to add subsection with positional option: " << oditerator->_dottedName;
-            return Status(ErrorCodes::InternalError, sb.str());
+Status OptionSection::addSection(const OptionSection& newSection) {
+    if (newSection._subSections.size()) {
+        return {ErrorCodes::InternalError, "Option subsections may not contain nested subsections"};
+    }
+
+    for (const auto& opt : newSection._options) {
+        if (opt._positionalStart != -1) {
+            return {ErrorCodes::InternalError,
+                    str::stream() << "Attempted to add subsection with positional option: "
+                                  << opt._dottedName};
         }
     }
-    _subSections.push_back(subSection);
+
+    for (auto& oldSection : _subSections) {
+        if (newSection._name == oldSection._name) {
+            // Matches existing section name, merge options.
+            std::copy(newSection._options.cbegin(),
+                      newSection._options.cend(),
+                      std::back_inserter(oldSection._options));
+            return Status::OK();
+        }
+    }
+
+    // New section name, just adopt it.
+    _subSections.push_back(newSection);
     return Status::OK();
 }
 
@@ -580,6 +597,10 @@ Status OptionSection::countOptions(int* numOptions, bool visibleOnly, OptionSour
     }
 
     return Status::OK();
+}
+
+size_t OptionSection::countSubSections() const {
+    return _subSections.size();
 }
 
 Status OptionSection::getConstraints(std::vector<std::shared_ptr<Constraint>>* constraints) const {

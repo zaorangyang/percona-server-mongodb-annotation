@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -359,38 +361,11 @@ public:
     virtual bool saveLockStateAndUnlock(LockSnapshot* stateOut) = 0;
 
     /**
-     * Like saveLockStateAndUnlock but allows saving locks from within a WUOW.  Used during
-     * replication state transitions for yielding locks held by prepared transactions.
-     */
-    virtual bool saveLockStateAndUnlockForPrepare(LockSnapshot* stateOut) = 0;
-
-    /**
      * Re-locks all locks whose state was stored in 'stateToRestore'.
      * @param opCtx An operation context that enables the restoration to be interrupted.
      */
     virtual void restoreLockState(OperationContext* opCtx, const LockSnapshot& stateToRestore) = 0;
     virtual void restoreLockState(const LockSnapshot& stateToRestore) = 0;
-
-    /**
-     * Works like restoreLockState but for any global locks in the state to restore, rather than
-     * restoring them into the true global lock resource owned by the LockManager,
-     * restores the global locks into the TemporaryResourceQueue for the global resource that is
-     * provided.  Locks on resources other than the global lock are restored to their true
-     * LockManager-owned resource objects.
-     * Also allows restoring locks from within a WUOW.
-     */
-    virtual void restoreLockStateWithTemporaryGlobalResource(
-        OperationContext* opCtx,
-        const LockSnapshot& stateToRestore,
-        LockManager::TemporaryResourceQueue* tempGlobalResource) = 0;
-
-    /**
-     * Atomically releases the global X lock from the true global resource managed by the
-     * LockManager and transfers the locks from the 'tempGlobalResource' into the true global
-     * resource.
-     */
-    virtual void replaceGlobalLockStateWithTemporaryGlobalResource(
-        LockManager::TemporaryResourceQueue* tempGlobalResource) = 0;
 
     /**
      * Releases the ticket associated with the Locker. This allows locks to be held without

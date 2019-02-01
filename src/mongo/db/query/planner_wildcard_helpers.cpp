@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
@@ -265,12 +267,15 @@ bool boundsOverlapObjectTypeBracket(const OrderedIntervalList& oil) {
                                                      BoundInclusion::kExcludeBothStartAndEndKeys);
     }();
 
-    // Determine whether any of the ordered intervals overlap with the object type bracket. If the
-    // current interval precedes the bracket, we must check the next interval in sequence. If the
-    // interval succeeds the bracket then we can stop checking, since the ordered list is never
-    // descending. If we neither precede nor succeed the object type bracket, then we overlap it.
-    invariant(oil.computeDirection() != Interval::Direction::kDirectionDescending);
-    for (const auto& interval : oil.intervals) {
+    // Determine whether any of the ordered intervals overlap with the object type bracket. Because
+    // Interval's various bounds-comparison methods all depend upon the bounds being in ascending
+    // order, we reverse the direction of the input OIL if necessary here.
+    const bool isDescending = (oil.computeDirection() == Interval::Direction::kDirectionDescending);
+    const auto& oilAscending = (isDescending ? oil.reverseClone() : oil);
+    // Iterate through each of the OIL's intervals. If the current interval precedes the bracket, we
+    // must check the next interval in sequence. If the interval succeeds the bracket then we can
+    // stop checking. If we neither precede nor succeed the object type bracket, then they overlap.
+    for (const auto& interval : oilAscending.intervals) {
         switch (interval.compare(objectTypeBracketBounds)) {
             case Interval::IntervalComparison::INTERVAL_PRECEDES_COULD_UNION:
             case Interval::IntervalComparison::INTERVAL_PRECEDES:
@@ -303,8 +308,9 @@ void expandWildcardIndexEntry(const IndexEntry& wildcardIndex,
     // fixed-size vector of multikey metadata until after they are expanded.
     invariant(wildcardIndex.multikeyPaths.empty());
 
-    const auto projExec = WildcardKeyGenerator::createProjectionExec(
-        wildcardIndex.keyPattern, wildcardIndex.infoObj.getObjectField("wildcardProjection"));
+    // Obtain the projection executor from the parent wildcard IndexEntry.
+    const auto* projExec = wildcardIndex.wildcardProjection;
+    invariant(projExec);
 
     const auto projectedFields = projExec->applyProjectionToFields(fields);
 
@@ -349,7 +355,8 @@ void expandWildcardIndexEntry(const IndexEntry& wildcardIndex,
                          {wildcardIndex.identifier.catalogName, fieldName},
                          wildcardIndex.filterExpr,
                          wildcardIndex.infoObj,
-                         wildcardIndex.collator);
+                         wildcardIndex.collator,
+                         wildcardIndex.wildcardProjection);
 
         invariant("$_path"_sd != fieldName);
         out->push_back(std::move(entry));
@@ -389,7 +396,10 @@ BoundsTightness translateWildcardIndexBoundsAndTightness(const IndexEntry& index
     return (arrayIndicesTraversedByQuery.empty() ? tightnessIn : BoundsTightness::INEXACT_FETCH);
 }
 
-void finalizeWildcardIndexScanConfiguration(IndexEntry* index, IndexBounds* bounds) {
+void finalizeWildcardIndexScanConfiguration(IndexScanNode* scan) {
+    IndexEntry* index = &scan->index;
+    IndexBounds* bounds = &scan->bounds;
+
     // We should only ever reach this point when processing a $** index. Sanity check the arguments.
     invariant(index && index->type == IndexType::INDEX_WILDCARD);
     invariant(index->keyPattern.nFields() == 1);
@@ -448,6 +458,11 @@ void finalizeWildcardIndexScanConfiguration(IndexEntry* index, IndexBounds* boun
         if (requiresSubpathBounds) {
             pathIntervals.push_back(IndexBoundsBuilder::makeRangeInterval(
                 path + subPathStart, path + subPathEnd, BoundInclusion::kIncludeStartKeyOnly));
+
+            // Queries which scan subpaths for a single wildcard index should be deduped. The index
+            // bounds may include multiple keys associated with the same document. Therefore, we
+            // instruct the IXSCAN to dedup keys which point to the same object.
+            scan->shouldDedup = true;
         }
     }
     // Ensure that the bounds' intervals are correctly aligned.

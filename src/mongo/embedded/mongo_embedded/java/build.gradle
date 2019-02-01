@@ -1,54 +1,27 @@
-/**
- *    Copyright (C) 2018 MongoDB Inc.
- *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
- *    This program is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
- *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- *    As a special exception, the copyright holders give permission to link the
- *    code of portions of this program with the OpenSSL library under certain
- *    conditions as described in each individual source file and distribute
- *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
- */
-
 ext.jnaVersion = '4.5.2'
 ext.libraryName = 'embedded-capi'
-ext.licenseShort = 'AGPL-3.0'
+ext.licenseShort = 'MongoDB Embedded License'
 ext.pomName = 'MongoDB Embedded for Java'
 ext.pomDescription = 'The MongoDB Embedded SDK for Java'
 ext.pomUrl = 'http://www.mongodb.org'
-ext.pomLicenseName = 'GNU Affero General Public License version 3'
-ext.pomLicenseUrl = 'http://www.gnu.org/licenses/agpl-3.0.html'
+ext.pomLicenseName = 'MongoDB Embedded License'
+ext.pomLicenseUrl = 'https://www.mongodb.com/licensing/embedded-license'
 ext.pomScmConnection = 'https://github.com/mongodb/mongo.git'
 ext.pomScmDevConnection = 'git@github.com:mongodb/mongo.git'
 ext.pomScmUrl = 'https://github.com/mongodb/mongo'
 
 buildscript {
     repositories {
+        google()
         jcenter()
         mavenCentral()
-        google()
     }
     dependencies {
         classpath 'com.netflix.nebula:gradle-extra-configurations-plugin:1.12.+'
         classpath 'com.android.tools.build:gradle:3.1.2'
         classpath 'digital.wup:android-maven-publish:3.6.2'
-        classpath 'com.jfrog.bintray.gradle:gradle-bintray-plugin:1.+'
+        classpath 'org.jfrog.buildinfo:build-info-extractor-gradle:latest.release'
+        classpath "io.codearte.gradle.nexus:gradle-nexus-staging-plugin:0.12.0"
     }
 }
 
@@ -61,13 +34,22 @@ def getGitVersion() {
         new ByteArrayOutputStream().withStream { os ->
             def result = exec {
                 executable 'git'
-                args 'describe', '--tags', '--always', '--dirty'
+                args 'describe', '--tags', '--always'
                 standardOutput = os
             }
             outputAsString = os.toString().substring(1).trim()
         }
 
         return outputAsString
+    }
+}
+
+File localPropsFile = file('./local.properties')
+if (localPropsFile.exists()) {
+    Properties p = new Properties()
+    p.load(new FileInputStream(localPropsFile))
+    p.each { name, value ->
+        ext[name] = value
     }
 }
 
@@ -83,4 +65,10 @@ allprojects {
 
 task clean(type: Delete) {
     delete rootProject.buildDir
+}
+
+apply plugin: 'io.codearte.nexus-staging'
+
+nexusStaging {
+    packageGroup = "org.mongodb"
 }

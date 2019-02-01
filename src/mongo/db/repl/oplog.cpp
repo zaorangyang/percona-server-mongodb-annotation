@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2008-2014 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
@@ -40,7 +42,6 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/background.h"
 #include "mongo/db/catalog/capped_utils.h"
@@ -75,11 +76,11 @@
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/dbcheck.h"
-#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/timestamp_block.h"
+#include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
@@ -231,6 +232,11 @@ void createIndexForApplyOps(OperationContext* opCtx,
                             const NamespaceString& indexNss,
                             IncrementOpsAppliedStatsFn incrementOpsAppliedStats,
                             OplogApplication::Mode mode) {
+    // Lock the database if it's not locked.
+    boost::optional<Lock::DBLock> dbLock;
+    if (!opCtx->lockState()->isLocked()) {
+        dbLock.emplace(opCtx, indexNss.db(), MODE_X);
+    }
     // Check if collection exists.
     Database* db = DatabaseHolder::getDatabaseHolder().get(opCtx, indexNss.ns());
     auto indexCollection = db ? db->getCollection(opCtx, indexNss) : nullptr;
@@ -643,6 +649,8 @@ long long getNewOplogSizeBytes(OperationContext* opCtx, const ReplSettings& repl
 void createOplog(OperationContext* opCtx, const std::string& oplogCollectionName, bool isReplSet) {
     Lock::GlobalWrite lk(opCtx);
 
+    const auto service = opCtx->getServiceContext();
+
     const ReplSettings& replSettings = ReplicationCoordinator::get(opCtx)->getSettings();
 
     OldClientContext ctx(opCtx, oplogCollectionName);
@@ -685,13 +693,13 @@ void createOplog(OperationContext* opCtx, const std::string& oplogCollectionName
         invariant(ctx.db()->createCollection(opCtx, oplogCollectionName, options));
         acquireOplogCollectionForLogging(opCtx);
         if (!isReplSet) {
-            opCtx->getServiceContext()->getOpObserver()->onOpMessage(opCtx, BSONObj());
+            service->getOpObserver()->onOpMessage(opCtx, BSONObj());
         }
         uow.commit();
     });
 
     /* sync here so we don't get any surprising lag later when we try to sync */
-    StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
+    StorageEngine* storageEngine = service->getStorageEngine();
     storageEngine->flushAllFiles(opCtx, true);
 
     log() << "******" << endl;
@@ -790,6 +798,7 @@ using OpApplyFn = stdx::function<Status(OperationContext* opCtx,
                                         const BSONElement& ui,
                                         BSONObj& cmd,
                                         const OpTime& opTime,
+                                        const OplogEntry& entry,
                                         OplogApplication::Mode mode)>;
 
 struct ApplyOpMetadata {
@@ -813,6 +822,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           const NamespaceString nss(parseNs(ns, cmd));
           if (auto idIndexElem = cmd["idIndex"]) {
@@ -839,6 +849,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           const NamespaceString nss(parseUUIDorNs(opCtx, ns, ui, cmd));
           BSONElement first = cmd.firstElement();
@@ -861,6 +872,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           NamespaceString nss;
           std::tie(std::ignore, nss) = parseCollModUUIDAndNss(opCtx, ui, ns, cmd);
@@ -876,6 +888,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           return dropDatabase(opCtx, NamespaceString(ns).db().toString());
       },
@@ -886,6 +899,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           auto nss = parseUUIDorNs(opCtx, ns, ui, cmd);
@@ -910,6 +924,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
@@ -921,6 +936,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
@@ -932,6 +948,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
@@ -943,6 +960,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           BSONObjBuilder resultWeDontCareAbout;
           return dropIndexes(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd, &resultWeDontCareAbout);
@@ -954,6 +972,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           return renameCollectionForApplyOps(opCtx, nsToDatabase(ns), ui, cmd, opTime);
       },
@@ -964,9 +983,9 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
-         BSONObjBuilder resultWeDontCareAbout;
-         return applyOps(opCtx, nsToDatabase(ns), cmd, mode, opTime, &resultWeDontCareAbout);
+         return applyApplyOpsOplogEntry(opCtx, entry, mode);
      }}},
     {"convertToCapped",
      {[](OperationContext* opCtx,
@@ -974,8 +993,10 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
-          return convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
+          convertToCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd), cmd["size"].number());
+          return Status::OK();
       },
       {ErrorCodes::NamespaceNotFound}}},
     {"emptycapped",
@@ -984,6 +1005,7 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
           return emptyCapped(opCtx, parseUUIDorNs(opCtx, ns, ui, cmd));
       },
@@ -994,25 +1016,19 @@ std::map<std::string, ApplyOpMetadata> opsMap = {
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
-         OplogApplication::Mode mode) -> Status { return Status::OK(); }}},
+         const OplogEntry& entry,
+         OplogApplication::Mode mode) -> Status {
+         return applyCommitTransaction(opCtx, entry, mode);
+     }}},
     {"abortTransaction",
      {[](OperationContext* opCtx,
          const char* ns,
          const BSONElement& ui,
          BSONObj& cmd,
          const OpTime& opTime,
+         const OplogEntry& entry,
          OplogApplication::Mode mode) -> Status {
-         // We don't put transactions into the prepare state until the end of recovery, so there is
-         // no transaction to abort.
-         if (mode == OplogApplication::Mode::kRecovering) {
-             return Status::OK();
-         }
-         // Session has been checked out by sync_tail.
-         auto transaction = TransactionParticipant::get(opCtx);
-         invariant(transaction);
-         transaction->unstashTransactionResources(opCtx, "abortTransaction");
-         transaction->abortActiveTransaction(opCtx);
-         return Status::OK();
+         return applyAbortTransaction(opCtx, entry, mode);
      }}},
 };
 
@@ -1510,6 +1526,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
 
 Status applyCommand_inlock(OperationContext* opCtx,
                            const BSONObj& op,
+                           const OplogEntry& entry,
                            OplogApplication::Mode mode) {
     LOG(3) << "applying command op: " << redact(op)
            << ", oplog application mode: " << OplogApplication::modeToString(mode);
@@ -1590,7 +1607,8 @@ Status applyCommand_inlock(OperationContext* opCtx,
 
         // Don't assign commit timestamp for transaction commands.
         const StringData commandName(o.firstElementFieldName());
-        if (op.getBoolField("prepare") || commandName == "abortTransaction")
+        if (op.getBoolField("prepare") || commandName == "abortTransaction" ||
+            commandName == "commitTransaction")
             return false;
 
         switch (replMode) {
@@ -1629,7 +1647,8 @@ Status applyCommand_inlock(OperationContext* opCtx,
             // If 'writeTime' is not null, any writes in this scope will be given 'writeTime' as
             // their timestamp at commit.
             TimestampBlock tsBlock(opCtx, writeTime);
-            status = curOpToApply.applyFunc(opCtx, nss.ns().c_str(), fieldUI, o, opTime, mode);
+            status =
+                curOpToApply.applyFunc(opCtx, nss.ns().c_str(), fieldUI, o, opTime, entry, mode);
         } catch (...) {
             status = exceptionToStatus();
         }
@@ -1674,8 +1693,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
         }
     }
 
-
-    getGlobalAuthorizationManager()->logOp(opCtx, opType, nss, o, nullptr);
+    AuthorizationManager::get(opCtx->getServiceContext())->logOp(opCtx, opType, nss, o, nullptr);
     return Status::OK();
 }
 
@@ -1702,7 +1720,6 @@ void oplogCheckCloseDatabase(OperationContext* opCtx, Database* db) {
         localOplogInfo(opCtx->getServiceContext()).oplog = nullptr;
     }
 }
-
 
 void acquireOplogCollectionForLogging(OperationContext* opCtx) {
     auto& oplogInfo = localOplogInfo(opCtx->getServiceContext());

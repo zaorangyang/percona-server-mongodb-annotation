@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,6 +33,7 @@
 #include <set>
 #include <string>
 
+#include "mongo/db/exec/projection_exec_agg.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
@@ -104,7 +107,8 @@ struct IndexEntry {
                Identifier ident,
                const MatchExpression* fe,
                const BSONObj& io,
-               const CollatorInterface* ci)
+               const CollatorInterface* ci,
+               const ProjectionExecAgg* projExec)
         : keyPattern(kp),
           multikey(mk),
           multikeyPaths(mkp),
@@ -115,9 +119,12 @@ struct IndexEntry {
           filterExpr(fe),
           infoObj(io),
           type(type),
-          collator(ci) {
+          collator(ci),
+          wildcardProjection(projExec) {
         // The caller must not supply multikey metadata in two different formats.
         invariant(multikeyPaths.empty() || multikeyPathSet.empty());
+        // We always expect a projection executor for $** indexes, and none otherwise.
+        invariant((type == IndexType::INDEX_WILDCARD) == (projExec != nullptr));
     }
 
     /**
@@ -129,14 +136,16 @@ struct IndexEntry {
                bool unq,
                Identifier ident,
                const MatchExpression* fe,
-               const BSONObj& io)
+               const BSONObj& io,
+               const ProjectionExecAgg* projExec = nullptr)
         : keyPattern(kp),
           multikey(mk),
           sparse(sp),
           unique(unq),
           identifier(std::move(ident)),
           filterExpr(fe),
-          infoObj(io) {
+          infoObj(io),
+          wildcardProjection(projExec) {
         type = IndexNames::nameToType(IndexNames::findPluginName(keyPattern));
     }
 
@@ -217,6 +226,10 @@ struct IndexEntry {
     // Null if this index orders strings according to the simple binary compare. If non-null,
     // represents the collator used to generate index keys for indexed strings.
     const CollatorInterface* collator = nullptr;
+
+    // For $** indexes, a pointer to the projection executor owned by the index access method. Null
+    // unless this IndexEntry represents a wildcard index, in which case this is always non-null.
+    const ProjectionExecAgg* wildcardProjection = nullptr;
 };
 
 std::ostream& operator<<(std::ostream& stream, const IndexEntry::Identifier& ident);

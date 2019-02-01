@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -56,6 +58,7 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/server_transactions_metrics.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/network_interface_mock.h"
@@ -3785,6 +3788,8 @@ TEST_F(StableOpTimeTest, CalculateStableOpTime) {
 
     initReplSetMode();
     auto repl = getReplCoord();
+    getStorageInterface()->supportsDocLockingBool = true;
+    auto txnMetrics = ServerTransactionsMetrics::get(getGlobalServiceContext());
     OpTime commitPoint;
     boost::optional<OpTime> expectedStableOpTime, stableOpTime;
     std::set<OpTime> stableOpTimeCandidates;
@@ -3847,6 +3852,22 @@ TEST_F(StableOpTimeTest, CalculateStableOpTime) {
     expectedStableOpTime = OpTime({0, 1}, term);
     stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
     ASSERT_EQ(expectedStableOpTime, stableOpTime);
+
+    // Set the oldest oplog entry OpTime for non-majority committed aborts/commits associated
+    // with a multi-document transaction to be before the current commit point. We will then
+    // make expectedStableOpTime the new stable optime because it is the only candidate before
+    // the oldestNonMajCommittedOpTime.
+    commitPoint = OpTime({1, 5}, term);
+    const auto oldestNonMajCommittedOpTime = OpTime({1, 3}, term);
+    const auto finishOpTime = OpTime({1, 3}, term);
+    stableOpTimeCandidates = {oldestNonMajCommittedOpTime, OpTime({1, 4}, term)};
+
+    // Adds the oldestNonMajCommittedOpTime to both sets.
+    txnMetrics->addActiveOpTime(oldestNonMajCommittedOpTime);
+    // Update the finishOpTime.
+    txnMetrics->removeActiveOpTime(oldestNonMajCommittedOpTime, finishOpTime);
+    stableOpTime = repl->calculateStableOpTime_forTest(stableOpTimeCandidates, commitPoint);
+    ASSERT_EQ(oldestNonMajCommittedOpTime, stableOpTime);
 }
 
 TEST_F(StableOpTimeTest, CleanupStableOpTimeCandidates) {

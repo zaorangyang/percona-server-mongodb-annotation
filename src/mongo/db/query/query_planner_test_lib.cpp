@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -129,59 +131,6 @@ bool intervalMatches(const BSONObj& testInt, const Interval trueInt) {
     return trueInt.equals(toCompare);
 }
 
-/**
- * Returns whether the BSON representation of the index bounds in
- * 'testBounds' matches 'trueBounds'.
- *
- * 'testBounds' should be of the following format:
- *    {<field 1>: <oil 1>, <field 2>: <oil 2>, ...}
- * Each ordered interval list (e.g. <oil 1>) is an array of arrays of
- * the format:
- *    [[<low 1>,<high 1>,<lowInclusive 1>,<highInclusive 1>], ...]
- *
- * For example,
- *    {a: [[1,2,true,false], [3,4,false,true]], b: [[-Infinity, Infinity]]}
- * Means that the index bounds on field 'a' consist of the two intervals
- * [1, 2) and (3, 4] and the index bounds on field 'b' are [-Infinity, Infinity].
- */
-bool boundsMatch(const BSONObj& testBounds, const IndexBounds trueBounds, bool relaxBoundsCheck) {
-    // Iterate over the fields on which we have index bounds.
-    BSONObjIterator fieldIt(testBounds);
-    size_t fieldItCount = 0;
-    while (fieldIt.more()) {
-        BSONElement arrEl = fieldIt.next();
-        if (arrEl.fieldNameStringData() != trueBounds.getFieldName(fieldItCount)) {
-            return false;
-        }
-        if (arrEl.type() != Array) {
-            return false;
-        }
-        // Iterate over an ordered interval list for
-        // a particular field.
-        BSONObjIterator oilIt(arrEl.Obj());
-        size_t oilItCount = 0;
-        while (oilIt.more()) {
-            BSONElement intervalEl = oilIt.next();
-            if (intervalEl.type() != Array) {
-                return false;
-            }
-            Interval trueInt = trueBounds.getInterval(fieldItCount, oilItCount);
-            if (!intervalMatches(intervalEl.Obj(), trueInt)) {
-                return false;
-            }
-            ++oilItCount;
-        }
-
-        if (!relaxBoundsCheck && oilItCount != trueBounds.getNumIntervals(fieldItCount)) {
-            return false;
-        }
-
-        ++fieldItCount;
-    }
-
-    return true;
-}
-
 bool bsonObjFieldsAreInSet(BSONObj obj, const std::set<std::string>& allowedFields) {
     BSONObjIterator i(obj);
     while (i.more()) {
@@ -249,6 +198,46 @@ static bool childrenMatch(const BSONObj& testSoln,
 
     // Ensure we've matched all children of the QuerySolutionNode.
     return matchedNodeIndexes.size() == trueSoln->children.size();
+}
+
+bool QueryPlannerTestLib::boundsMatch(const BSONObj& testBounds,
+                                      const IndexBounds trueBounds,
+                                      bool relaxBoundsCheck) {
+    // Iterate over the fields on which we have index bounds.
+    BSONObjIterator fieldIt(testBounds);
+    size_t fieldItCount = 0;
+    while (fieldIt.more()) {
+        BSONElement arrEl = fieldIt.next();
+        if (arrEl.fieldNameStringData() != trueBounds.getFieldName(fieldItCount)) {
+            return false;
+        }
+        if (arrEl.type() != Array) {
+            return false;
+        }
+        // Iterate over an ordered interval list for
+        // a particular field.
+        BSONObjIterator oilIt(arrEl.Obj());
+        size_t oilItCount = 0;
+        while (oilIt.more()) {
+            BSONElement intervalEl = oilIt.next();
+            if (intervalEl.type() != Array) {
+                return false;
+            }
+            Interval trueInt = trueBounds.getInterval(fieldItCount, oilItCount);
+            if (!intervalMatches(intervalEl.Obj(), trueInt)) {
+                return false;
+            }
+            ++oilItCount;
+        }
+
+        if (!relaxBoundsCheck && oilItCount != trueBounds.getNumIntervals(fieldItCount)) {
+            return false;
+        }
+
+        ++fieldItCount;
+    }
+
+    return true;
 }
 
 // static

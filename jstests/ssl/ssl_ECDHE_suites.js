@@ -1,13 +1,12 @@
-// Test that a client can authenicate against the server with roles.
+// Test that a client can authenticate against the server with roles.
 // Also validates RFC2253
 load('jstests/ssl/libs/ssl_helpers.js');
 
 (function() {
     "use strict";
 
-    if (getBuildInfo().buildEnvironment.target_os === "macOS") {
-        return;
-    }
+    // Amazon linux does not currently support ECDHE
+    const EXCLUDED_BUILDS = ['amazon', 'amzn64'];
 
     const suites = [
         "SSLV2 Cipher Suites",
@@ -20,6 +19,13 @@ load('jstests/ssl/libs/ssl_helpers.js');
     const SERVER_CERT = "jstests/libs/server.pem";
 
     function runSSLYze(port) {
+        let target_os = buildInfo().buildEnvironment.target_os;
+        let target_arch = buildInfo().buildEnvironment.target_arch;
+
+        if (target_os === "macOS" || target_arch !== "x86_64") {
+            return null;
+        }
+
         let python = "/usr/bin/env python3";
         let sslyze = " jstests/ssl/sslyze_tester.py ";
 
@@ -43,10 +49,9 @@ load('jstests/ssl/libs/ssl_helpers.js');
 
         try {
             let ciphers = cat("jstests/ssl/ciphers.json");
-            let cipherDict = JSON.parse(ciphers);
-            return cipherDict;
+            return JSON.parse(ciphers);
         } catch (e) {
-            jsTestLog("Failed to parse: " + ciphers + "\n" + ciphers);
+            jsTestLog("Failed to parse ciphers.json");
             throw e;
         } finally {
             const python_delete_command = python + sslyze + "--delete";
@@ -61,33 +66,39 @@ load('jstests/ssl/libs/ssl_helpers.js');
 
     function testSSLYzeOutput(cipherDict) {
         // Checking that SSL 1.0, 2.0, 3.0 and TLS 1.0 are not accepted
-        for (var i = 0; i < 3; i++) {
-            assert.eq(cipherDict[suites[i]].length, 0);
-        }
+        suites.slice(0, 3).forEach(tlsVersion => assert(cipherDict[tlsVersion].length === 0));
 
         // Printing TLS 1.1, 1.2, and 1.3 suites that are accepted
-        for (var i = 3; i < 6; i++) {
-            const TLSVersion = cipherDict[suites[i]].toString().split(",");
-            print('*************************\n' + suites[i] + ": ");
-            for (var j = 0; j < TLSVersion.length; j++) {
-                print(TLSVersion[j]);
-            }
+        let hasECDHE = false;
+        suites.slice(3, 6).forEach(tlsVersion => {
+            print('*************************\n' + tlsVersion + ": ");
+            cipherDict[tlsVersion].forEach(cipher => {
+                print(cipher);
+                if (cipher.includes('ECDHE'))
+                    hasECDHE = true;
+            });
+        });
+
+        // All platforms except Amazon Linux 1 should support ECDHE
+        if (!EXCLUDED_BUILDS.includes(buildInfo().buildEnvironment.distmod)) {
+            assert(hasECDHE, 'Supports at least one ECDHE cipher suite');
         }
     }
 
     print("1. Testing x.509 auth to mongod");
     {
         const x509_options = {
-            sslMode: "requireSSL",
-            sslCAFile: CA_CERT,
-            sslPEMKeyFile: SERVER_CERT,
+            tlsMode: "preferTLS",
+            tlsCAFile: CA_CERT,
+            tlsPEMKeyFile: SERVER_CERT,
             ipv6: "",
             bind_ip_all: ""
         };
         let mongod = MongoRunner.runMongod(x509_options);
-        var cipherDict = runSSLYze(mongod.port);
-        testSSLYzeOutput(cipherDict);
-
+        const cipherDict = runSSLYze(mongod.port);
+        if (cipherDict !== null) {
+            testSSLYzeOutput(cipherDict);
+        }
         MongoRunner.stopMongod(mongod);
     }
 }());

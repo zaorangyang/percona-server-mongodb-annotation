@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -38,7 +40,8 @@
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/catalog/multi_index_block_impl.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -147,8 +150,9 @@ Status renameCollectionCommon(OperationContext* opCtx,
     boost::optional<OldClientContext> ctx;
     ctx.emplace(opCtx, source.ns());
 
-    bool userInitiatedWritesAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, source);
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    bool userInitiatedWritesAndNotPrimary =
+        opCtx->writesAreReplicated() && !replCoord->canAcceptWritesFor(opCtx, source);
 
     if (userInitiatedWritesAndNotPrimary) {
         return Status(ErrorCodes::NotMaster,
@@ -175,6 +179,14 @@ Status renameCollectionCommon(OperationContext* opCtx,
         if (css->getMetadata(opCtx)->isSharded()) {
             return {ErrorCodes::IllegalOperation, "source namespace cannot be sharded"};
         }
+    }
+
+    // Disallow renaming from a replicated to an unreplicated collection or vice versa.
+    auto sourceIsUnreplicated = replCoord->isOplogDisabledFor(opCtx, source);
+    auto targetIsUnreplicated = replCoord->isOplogDisabledFor(opCtx, target);
+    if (sourceIsUnreplicated != targetIsUnreplicated) {
+        return {ErrorCodes::IllegalOperation,
+                "Cannot rename collections between a replicated and an unreplicated database"};
     }
 
     // Ensure that collection name does not exceed maximum length.
@@ -279,7 +291,6 @@ Status renameCollectionCommon(OperationContext* opCtx,
             // If this rename collection is replicated, check for long index names in the target
             // collection that may exceed the MMAPv1 namespace limit when the target collection
             // is renamed with a drop-pending namespace.
-            auto replCoord = repl::ReplicationCoordinator::get(opCtx);
             auto isOplogDisabledForNamespace = replCoord->isOplogDisabledFor(opCtx, target);
             if (!isOplogDisabledForNamespace) {
                 invariant(opCtx->writesAreReplicated());
@@ -420,7 +431,7 @@ Status renameCollectionCommon(OperationContext* opCtx,
 
     // Copy the index descriptions from the source collection, adjusting the ns field.
     {
-        MultiIndexBlock indexer(opCtx, tmpColl);
+        MultiIndexBlockImpl indexer(opCtx, tmpColl);
         indexer.allowInterruption();
 
         std::vector<BSONObj> indexesToCopy;

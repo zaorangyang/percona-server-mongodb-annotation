@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -43,6 +45,7 @@
 #include "mongo/db/exec/text.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/plan_summary_stats.h"
@@ -643,13 +646,17 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
     // field will always be false in the case of EOF or idhack plans.
     bool indexFilterSet = false;
     boost::optional<uint32_t> queryHash;
+    boost::optional<uint32_t> planCacheKeyHash;
     if (collection && exec->getCanonicalQuery()) {
         const CollectionInfoCache* infoCache = collection->infoCache();
         const QuerySettings* querySettings = infoCache->getQuerySettings();
         PlanCacheKey planCacheKey =
             infoCache->getPlanCache()->computeKey(*exec->getCanonicalQuery());
-        queryHash = PlanCache::computeQueryHash(planCacheKey);
-        if (auto allowedIndicesFilter = querySettings->getAllowedIndicesFilter(planCacheKey)) {
+        planCacheKeyHash = canonical_query_encoder::computeHash(planCacheKey.toString());
+        queryHash = canonical_query_encoder::computeHash(planCacheKey.getStableKeyStringData());
+
+        if (auto allowedIndicesFilter =
+                querySettings->getAllowedIndicesFilter(planCacheKey.getStableKey())) {
             // Found an index filter set on the query shape.
             indexFilterSet = true;
         }
@@ -671,6 +678,10 @@ void Explain::generatePlannerInfo(PlanExecutor* exec,
 
     if (queryHash) {
         plannerBob.append("queryHash", unsignedIntToFixedLengthHex(*queryHash));
+    }
+
+    if (planCacheKeyHash) {
+        plannerBob.append("planCacheKey", unsignedIntToFixedLengthHex(*planCacheKeyHash));
     }
 
     BSONObjBuilder winningPlanBob(plannerBob.subobjStart("winningPlan"));
@@ -997,6 +1008,7 @@ void Explain::planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* 
     }
     shapeBuilder.doneFast();
     out->append("queryHash", unsignedIntToFixedLengthHex(entry.queryHash));
+    out->append("planCacheKey", unsignedIntToFixedLengthHex(entry.planCacheKey));
 
     // Append whether or not the entry is active.
     out->append("isActive", entry.isActive);

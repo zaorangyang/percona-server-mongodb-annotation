@@ -1,16 +1,29 @@
-# Copyright (C) 2017 MongoDB Inc.
+# Copyright (C) 2018-present MongoDB, Inc.
 #
-# This program is free software: you can redistribute it and/or  modify
-# it under the terms of the GNU Affero General Public License, version 3,
-# as published by the Free Software Foundation.
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the Server Side Public License, version 1,
+# as published by MongoDB, Inc.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
+# Server Side Public License for more details.
 #
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# You should have received a copy of the Server Side Public License
+# along with this program. If not, see
+# <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+# As a special exception, the copyright holders give permission to link the
+# code of portions of this program with the OpenSSL library under certain
+# conditions as described in each individual source file and distribute
+# linked combinations including the program with the OpenSSL library. You
+# must comply with the Server Side Public License in all respects for
+# all of the code used other than as permitted herein. If you modify file(s)
+# with this exception, you may extend this exception to your version of the
+# file(s), but you are not obligated to do so. If you do not wish to do so,
+# delete this exception statement from your version. If you delete this
+# exception statement from all source files in the program, then also delete
+# it in the license file.
 #
 # pylint: disable=too-many-lines
 """Transform idl.syntax trees from the parser into well-defined idl.ast trees."""
@@ -806,6 +819,72 @@ def _bind_enum(ctxt, idl_enum):
     return ast_enum
 
 
+def _bind_server_parameter(ctxt, param):
+    # type: (errors.ParserContext, syntax.ServerParameter) -> ast.ServerParameter
+    # pylint: disable=too-many-branches
+    """Bind a serverParameter setting."""
+    ast_param = ast.ServerParameter(param.file_name, param.line, param.column)
+    ast_param.name = param.name
+    ast_param.description = param.description
+    ast_param.cpp_vartype = param.cpp_vartype
+    ast_param.cpp_varname = param.cpp_varname
+    ast_param.deprecated_name = param.deprecated_name
+
+    custom_required_fields = ["from_string", "append_bson"]
+    standard_optional_fields = ["default", "on_update", "validator"]
+
+    if param.cpp_varname is None:
+        # Custom SCP, uses callbacks.
+        ast_param.append_bson = param.append_bson
+        ast_param.from_bson = param.from_bson
+        ast_param.from_string = param.from_string
+
+        # Check for required callbacks.
+        for req in custom_required_fields:
+            if getattr(param, req) is None:
+                ctxt.add_missing_server_parameter_method(param, req)
+
+        # Check for disallowed declared-storage fields.
+        for conflict in standard_optional_fields:
+            if getattr(param, conflict) is not None:
+                ctxt.add_server_parameter_attr_without_storage(param, conflict)
+    else:
+        # Standard SCP, allows optional fields, but not custom callbacks.
+        for conflict in custom_required_fields + ["from_bson"]:
+            if getattr(param, conflict) is not None:
+                ctxt.add_server_parameter_attr_with_storage(param, conflict)
+
+        ast_param.default = param.default
+        ast_param.on_update = param.on_update
+
+    set_at = 0
+    for psa in param.set_at:
+        if psa.lower() == 'startup':
+            set_at |= 1
+        elif psa.lower() == 'runtime':
+            set_at |= 2
+        else:
+            ctxt.add_bad_setat_specifier(param, psa)
+            return None
+
+    if set_at == 1:
+        ast_param.set_at = "ServerParameterType::kStartupOnly"
+    elif set_at == 2:
+        ast_param.set_at = "ServerParameterType::kRuntimeOnly"
+    elif set_at == 3:
+        ast_param.set_at = "ServerParameterType::kStartupAndRuntime"
+    else:
+        # Can't happen based on above logic.
+        ctxt.add_bad_setat_specifier(param, ','.join(param.set_at))
+
+    if param.validator is not None:
+        ast_param.validator = _bind_validator(ctxt, param.validator)
+        if ast_param.validator is None:
+            return None
+
+    return ast_param
+
+
 def bind(parsed_spec):
     # type: (syntax.IDLSpec) -> ast.IDLBoundSpec
     """Read an idl.syntax, create an idl.ast tree, and validate the final IDL Specification."""
@@ -830,6 +909,9 @@ def bind(parsed_spec):
     for struct in parsed_spec.symbols.structs:
         if not struct.imported:
             bound_spec.structs.append(_bind_struct(ctxt, parsed_spec, struct))
+
+    for server_parameter in parsed_spec.server_parameters:
+        bound_spec.server_parameters.append(_bind_server_parameter(ctxt, server_parameter))
 
     if ctxt.errors.has_errors():
         return ast.IDLBoundSpec(None, ctxt.errors)

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,7 +31,6 @@
 #pragma once
 
 #include <boost/optional.hpp>
-#include <queue>
 
 #include "mongo/base/status.h"
 #include "mongo/db/catalog/util/partitioned.h"
@@ -136,6 +137,13 @@ public:
     };
 
     /**
+     * RegistrationToken is the type of key used to register this PlanExecutor with the
+     * CursorManager.
+     */
+    using RegistrationToken =
+        boost::optional<Partitioned<stdx::unordered_set<PlanExecutor*>>::PartitionId>;
+
+    /**
      * This class will ensure a PlanExecutor is disposed before it is deleted.
      */
     class Deleter {
@@ -144,9 +152,10 @@ public:
          * Constructs an empty deleter. Useful for creating a
          * unique_ptr<PlanExecutor, PlanExecutor::Deleter> without populating it.
          */
-        Deleter() {}
+        Deleter() = default;
 
-        Deleter(OperationContext* opCtx, const Collection* collection);
+        inline Deleter(OperationContext* opCtx, CursorManager* cursorManager)
+            : _opCtx(opCtx), _cursorManager(cursorManager) {}
 
         /**
          * If an owner of a std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> wants to assume
@@ -162,7 +171,19 @@ public:
          * been registered with the CursorManager, will deregister it. If 'execPtr' is a yielding
          * PlanExecutor, callers must hold a lock on the collection in at least MODE_IS.
          */
-        void operator()(PlanExecutor* execPtr);
+        inline void operator()(PlanExecutor* execPtr) {
+            try {
+                // It is illegal to invoke operator() on a default constructed Deleter.
+                invariant(_opCtx);
+                if (!_dismissed) {
+                    execPtr->dispose(_opCtx, _cursorManager);
+                }
+                delete execPtr;
+            } catch (...) {
+                std::terminate();
+            }
+        }
+
 
     private:
         OperationContext* _opCtx = nullptr;
@@ -236,6 +257,13 @@ public:
         const Collection* collection,
         YieldPolicy yieldPolicy);
 
+    /**
+     * A PlanExecutor must be disposed before destruction. In most cases, this will happen
+     * automatically through a PlanExecutor::Deleter or a ClientCursor.
+     */
+    PlanExecutor() = default;
+    virtual ~PlanExecutor() = default;
+
     //
     // Accessors
     //
@@ -243,38 +271,27 @@ public:
     /**
      * Get the working set used by this executor, without transferring ownership.
      */
-    WorkingSet* getWorkingSet() const;
+    virtual WorkingSet* getWorkingSet() const = 0;
 
     /**
      * Get the stage tree wrapped by this executor, without transferring ownership.
      */
-    PlanStage* getRootStage() const;
+    virtual PlanStage* getRootStage() const = 0;
 
     /**
      * Get the query that this executor is executing, without transferring ownership.
      */
-    CanonicalQuery* getCanonicalQuery() const;
+    virtual CanonicalQuery* getCanonicalQuery() const = 0;
 
     /**
      * Return the NS that the query is running over.
      */
-    const NamespaceString& nss() const {
-        return _nss;
-    }
+    virtual const NamespaceString& nss() const = 0;
 
     /**
      * Return the OperationContext that the plan is currently executing within.
      */
-    OperationContext* getOpCtx() const;
-
-    /**
-     * Generates a tree of stats objects with a separate lifetime from the execution
-     * stage tree wrapped by this PlanExecutor.
-     *
-     * This may be called without holding any locks. It also may be called on a PlanExecutor that
-     * has been killed or has produced an error.
-     */
-    std::unique_ptr<PlanStageStats> getStats() const;
+    virtual OperationContext* getOpCtx() const = 0;
 
     //
     // Methods that just pass down to the PlanStage tree.
@@ -286,23 +303,21 @@ public:
      * While in the "saved" state, it is only legal to call restoreState,
      * detachFromOperationContext, or the destructor.
      */
-    void saveState();
+    virtual void saveState() = 0;
 
     /**
-     * Restores the state saved by a saveState() call.
+     * Restores the state saved by a saveState() call. When this method returns successfully, the
+     * execution tree can once again be executed via work().
      *
-     * Returns Status::OK() if the state was successfully restored and the execution tree can be
-     * work()'d.
+     * Throws a UserException if the state cannot be successfully restored (e.g. a collection was
+     * dropped or the position of a capped cursor was lost during a yield). If restore fails, it is
+     * only safe to call dispose(), detachFromOperationContext(), or the destructor.
      *
-     * Returns ErrorCodes::QueryPlanKilled if the PlanExecutor was killed while saved.
-     *
-     * If allowed, will yield and retry if a WriteConflictException is encountered. If the time
-     * limit is exceeded during this retry process, returns ErrorCodes::MaxTimeMSExpired. If this
-     * PlanExecutor is killed during this retry process, returns ErrorCodes::QueryPlanKilled. In
-     * this scenario, locks will have been released, and will not be held when control returns to
-     * the caller.
+     * If allowed by the executor's yield policy, will yield and retry internally if a
+     * WriteConflictException is encountered. If the time limit is exceeded during this retry
+     * process, throws ErrorCodes::MaxTimeMSExpired.
      */
-    Status restoreState();
+    virtual void restoreState() = 0;
 
     /**
      * Detaches from the OperationContext and releases any storage-engine state.
@@ -311,7 +326,7 @@ public:
      * only legal to call reattachToOperationContext or the destructor. It is not legal to call
      * detachFromOperationContext() while already in the detached state.
      */
-    void detachFromOperationContext();
+    virtual void detachFromOperationContext() = 0;
 
     /**
      * Reattaches to the OperationContext and reacquires any storage-engine state.
@@ -319,7 +334,7 @@ public:
      * It is only legal to call this in the "detached" state. On return, the cursor is left in a
      * "saved" state, so callers must still call restoreState to use this object.
      */
-    void reattachToOperationContext(OperationContext* opCtx);
+    virtual void reattachToOperationContext(OperationContext* opCtx) = 0;
 
     /**
      * Same as restoreState but without the logic to retry if a WriteConflictException is
@@ -327,7 +342,7 @@ public:
      *
      * This is only public for PlanYieldPolicy. DO NOT CALL ANYWHERE ELSE.
      */
-    Status restoreStateWithoutRetrying();
+    virtual void restoreStateWithoutRetrying() = 0;
 
     //
     // Running Support
@@ -342,9 +357,9 @@ public:
      *
      * If a YIELD_AUTO policy is set, then this method may yield.
      */
-    ExecState getNextSnapshotted(Snapshotted<BSONObj>* objOut, RecordId* dlOut);
+    virtual ExecState getNextSnapshotted(Snapshotted<BSONObj>* objOut, RecordId* dlOut) = 0;
 
-    ExecState getNext(BSONObj* objOut, RecordId* dlOut);
+    virtual ExecState getNext(BSONObj* objOut, RecordId* dlOut) = 0;
 
     /**
      * Returns 'true' if the plan is done producing results (or writing), 'false' otherwise.
@@ -352,7 +367,7 @@ public:
      * Tailable cursors are a possible exception to this: they may have further results even if
      * isEOF() returns true.
      */
-    bool isEOF();
+    virtual bool isEOF() = 0;
 
     /**
      * Execute the plan to completion, throwing out the results.  Used when you want to work the
@@ -364,7 +379,7 @@ public:
      * error occurs, it is illegal to subsequently access the collection, since it may have been
      * dropped.
      */
-    Status executePlan();
+    virtual Status executePlan() = 0;
 
     //
     // Concurrency-related methods.
@@ -378,7 +393,7 @@ public:
      * method is called multiple times, only the first 'killStatus' will be retained. It is an error
      * to call this method with Status::OK.
      */
-    void markAsKilled(Status killStatus);
+    virtual void markAsKilled(Status killStatus) = 0;
 
     /**
      * Cleans up any state associated with this PlanExecutor. Must be called before deleting this
@@ -393,7 +408,7 @@ public:
      *    is the owner's responsibility to call dispose() with a valid OperationContext before
      *    deleting the PlanExecutor.
      */
-    void dispose(OperationContext* opCtx, CursorManager* cursorManager);
+    virtual void dispose(OperationContext* opCtx, CursorManager* cursorManager) = 0;
 
     /**
      * Helper method to aid in displaying an ExecState for debug or other recreational purposes.
@@ -412,173 +427,39 @@ public:
      * If used in combination with getNextSnapshotted(), then the SnapshotId associated with
      * 'obj' will be null when 'obj' is dequeued.
      */
-    void enqueue(const BSONObj& obj);
+    virtual void enqueue(const BSONObj& obj) = 0;
 
     /**
      * Helper method which returns a set of BSONObj, where each represents a sort order of our
      * output.
      */
-    BSONObjSet getOutputSorts() const;
+    virtual BSONObjSet getOutputSorts() const = 0;
 
     /**
      * Communicate to this PlanExecutor that it is no longer registered with the CursorManager as a
      * 'non-cached PlanExecutor'.
      */
-    void unsetRegistered() {
-        _registrationToken.reset();
-    }
-
-    boost::optional<Partitioned<stdx::unordered_set<PlanExecutor*>>::PartitionId>
-    getRegistrationToken() const& {
-        return _registrationToken;
-    }
+    virtual void unsetRegistered() = 0;
+    virtual RegistrationToken getRegistrationToken() const& = 0;
     void getRegistrationToken() && = delete;
+    virtual void setRegistrationToken(RegistrationToken token) & = 0;
 
-    void setRegistrationToken(
-        Partitioned<stdx::unordered_set<PlanExecutor*>>::PartitionId token) & {
-        invariant(!_registrationToken);
-        _registrationToken = token;
-    }
+    virtual bool isMarkedAsKilled() const = 0;
+    virtual Status getKillStatus() = 0;
 
-    bool isMarkedAsKilled() const {
-        return !_killStatus.isOK();
-    }
-
-    Status getKillStatus() {
-        invariant(isMarkedAsKilled());
-        return _killStatus;
-    }
-
-    bool isDisposed() const {
-        return _currentState == kDisposed;
-    }
-
-    bool isDetached() const {
-        return _currentState == kDetached;
-    }
+    virtual bool isDisposed() const = 0;
+    virtual bool isDetached() const = 0;
 
     /**
      * If the last oplog timestamp is being tracked for this PlanExecutor, return it.
      * Otherwise return a null timestamp.
      */
-    Timestamp getLatestOplogTimestamp();
-
-private:
-    /**
-     * Returns true if the PlanExecutor should listen for inserts, which is when a getMore is called
-     * on a tailable and awaitData cursor that still has time left and hasn't been interrupted.
-     */
-    bool shouldListenForInserts();
+    virtual Timestamp getLatestOplogTimestamp() = 0;
 
     /**
-     * Returns true if the PlanExecutor should wait for data to be inserted, which is when a getMore
-     * is called on a tailable and awaitData cursor on a capped collection.  Returns false if an EOF
-     * should be returned immediately.
+     * Turns a BSONObj representing an error status produced by getNext() into a Status.
      */
-    bool shouldWaitForInserts();
-
-    /**
-     * Gets the CappedInsertNotifier for a capped collection.  Returns nullptr if this plan executor
-     * is not capable of yielding based on a notifier.
-     */
-    std::shared_ptr<CappedInsertNotifier> getCappedInsertNotifier();
-
-    /**
-     * Yields locks and waits for inserts to the collection. Returns ADVANCED if there has been an
-     * insertion and there may be new results. Returns DEAD if the PlanExecutor was killed during a
-     * yield. This method is only to be used for tailable and awaitData cursors, so rather than
-     * returning DEAD if the operation has exceeded its time limit, we return IS_EOF to preserve
-     * this PlanExecutor for future use.
-     *
-     * If an error is encountered and 'errorObj' is provided, it is populated with an object
-     * describing the error.
-     */
-    ExecState waitForInserts(CappedInsertNotifierData* notifierData,
-                             Snapshotted<BSONObj>* errorObj);
-
-    ExecState getNextImpl(Snapshotted<BSONObj>* objOut, RecordId* dlOut);
-
-    /**
-     * New PlanExecutor instances are created with the static make() methods above.
-     */
-    PlanExecutor(OperationContext* opCtx,
-                 std::unique_ptr<WorkingSet> ws,
-                 std::unique_ptr<PlanStage> rt,
-                 std::unique_ptr<QuerySolution> qs,
-                 std::unique_ptr<CanonicalQuery> cq,
-                 const Collection* collection,
-                 NamespaceString nss,
-                 YieldPolicy yieldPolicy);
-
-    /**
-     * A PlanExecutor must be disposed before destruction. In most cases, this will happen
-     * automatically through a PlanExecutor::Deleter or a ClientCursor.
-     */
-    ~PlanExecutor();
-
-    /**
-     * Public factory methods delegate to this private factory to do their work.
-     */
-    static StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> make(
-        OperationContext* opCtx,
-        std::unique_ptr<WorkingSet> ws,
-        std::unique_ptr<PlanStage> rt,
-        std::unique_ptr<QuerySolution> qs,
-        std::unique_ptr<CanonicalQuery> cq,
-        const Collection* collection,
-        NamespaceString nss,
-        YieldPolicy yieldPolicy);
-
-    /**
-     * Clients of PlanExecutor expect that on receiving a new instance from one of the make()
-     * factory methods, plan selection has already been completed. In order to enforce this
-     * property, this function is called to do plan selection prior to returning the new
-     * PlanExecutor.
-     *
-     * If the tree contains plan selection stages, such as MultiPlanStage or SubplanStage,
-     * this calls into their underlying plan selection facilities. Otherwise, does nothing.
-     *
-     * If a YIELD_AUTO policy is set then locks are yielded during plan selection.
-     *
-     * Returns a non-OK status if query planning fails. In particular, this function returns
-     * ErrorCodes::QueryPlanKilled if plan execution cannot proceed due to a concurrent write or
-     * catalog operation.
-     */
-    Status pickBestPlan(const Collection* collection);
-
-    // The OperationContext that we're executing within. This can be updated if necessary by using
-    // detachFromOperationContext() and reattachToOperationContext().
-    OperationContext* _opCtx;
-
-    std::unique_ptr<CanonicalQuery> _cq;
-    std::unique_ptr<WorkingSet> _workingSet;
-    std::unique_ptr<QuerySolution> _qs;
-    std::unique_ptr<PlanStage> _root;
-
-    // If _killStatus has a non-OK value, then we have been killed and the value represents the
-    // reason for the kill.
-    Status _killStatus = Status::OK();
-
-    // What namespace are we operating over?
-    NamespaceString _nss;
-
-    // This is used to handle automatic yielding when allowed by the YieldPolicy. Never NULL.
-    // TODO make this a non-pointer member. This requires some header shuffling so that this
-    // file includes plan_yield_policy.h rather than the other way around.
-    const std::unique_ptr<PlanYieldPolicy> _yieldPolicy;
-
-    // A stash of results generated by this plan that the user of the PlanExecutor didn't want
-    // to consume yet. We empty the queue before retrieving further results from the plan
-    // stages.
-    std::queue<BSONObj> _stash;
-
-    enum { kUsable, kSaved, kDetached, kDisposed } _currentState = kUsable;
-
-    // Set if this PlanExecutor is registered with the CursorManager.
-    boost::optional<Partitioned<stdx::unordered_set<PlanExecutor*>>::PartitionId>
-        _registrationToken;
-
-    bool _everDetachedFromOperationContext = false;
+    virtual Status getMemberObjectStatus(const BSONObj& memberObj) const = 0;
 };
 
 }  // namespace mongo

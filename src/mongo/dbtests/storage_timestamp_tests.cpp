@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2017 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -37,7 +39,8 @@
 #include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/catalog/multi_index_block_impl.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -72,6 +75,7 @@
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/session.h"
+#include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/kv/kv_storage_engine.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/dbtests/dbtests.h"
@@ -228,7 +232,7 @@ public:
     void createIndex(Collection* coll, std::string indexName, const BSONObj& indexKey) {
 
         // Build an index.
-        MultiIndexBlock indexer(_opCtx, coll);
+        MultiIndexBlockImpl indexer(_opCtx, coll);
         BSONObj indexInfoObj;
         {
             auto swIndexInfoObj = indexer.init({BSON(
@@ -287,7 +291,6 @@ public:
                                  dbName,
                                  BSON("applyOps" << applyOpsList),
                                  repl::OplogApplication::Mode::kApplyOpsCmd,
-                                 {},
                                  &result);
         if (!status.isOK()) {
             return status;
@@ -306,7 +309,6 @@ public:
                                  dbName,
                                  BSON("applyOps" << applyOpsList << "allowAtomic" << false),
                                  repl::OplogApplication::Mode::kApplyOpsCmd,
-                                 {},
                                  &result);
         if (!status.isOK()) {
             return status;
@@ -639,7 +641,7 @@ public:
                                    << BSON("_id" << idx))
                          << BSON("ts" << firstInsertTime.addTicks(idx).asTimestamp() << "t" << 1LL
                                       << "h"
-                                      << 1
+                                      << 1LL
                                       << "op"
                                       << "c"
                                       << "ns"
@@ -647,7 +649,6 @@ public:
                                       << "o"
                                       << BSON("applyOps" << BSONArrayBuilder().obj())))),
                 repl::OplogApplication::Mode::kApplyOpsCmd,
-                {},
                 &result));
         }
 
@@ -665,7 +666,7 @@ public:
 class SecondaryArrayInsertTimes : public StorageTimestampTest {
 public:
     void run() {
-        // In order for applyOps to assign timestamps, we must be in non-replicated mode.
+        // In order for oplog application to assign timestamps, we must be in non-replicated mode.
         repl::UnreplicatedWritesBlock uwb(_opCtx);
 
         // Create a new collection.
@@ -676,57 +677,37 @@ public:
 
         const std::uint32_t docsToInsert = 10;
         const LogicalTime firstInsertTime = _clock->reserveTicks(docsToInsert);
-        BSONObjBuilder fullCommand;
-        BSONArrayBuilder applyOpsB(fullCommand.subarrayStart("applyOps"));
 
-        BSONObjBuilder applyOpsElem1Builder;
+        BSONObjBuilder oplogEntryBuilder;
 
         // Populate the "ts" field with an array of all the grouped inserts' timestamps.
-        BSONArrayBuilder tsArrayBuilder(applyOpsElem1Builder.subarrayStart("ts"));
+        BSONArrayBuilder tsArrayBuilder(oplogEntryBuilder.subarrayStart("ts"));
         for (std::uint32_t idx = 0; idx < docsToInsert; ++idx) {
             tsArrayBuilder.append(firstInsertTime.addTicks(idx).asTimestamp());
         }
         tsArrayBuilder.done();
 
         // Populate the "t" (term) field with an array of all the grouped inserts' terms.
-        BSONArrayBuilder tArrayBuilder(applyOpsElem1Builder.subarrayStart("t"));
+        BSONArrayBuilder tArrayBuilder(oplogEntryBuilder.subarrayStart("t"));
         for (std::uint32_t idx = 0; idx < docsToInsert; ++idx) {
             tArrayBuilder.append(1LL);
         }
         tArrayBuilder.done();
 
         // Populate the "o" field with an array of all the grouped inserts.
-        BSONArrayBuilder oArrayBuilder(applyOpsElem1Builder.subarrayStart("o"));
+        BSONArrayBuilder oArrayBuilder(oplogEntryBuilder.subarrayStart("o"));
         for (std::uint32_t idx = 0; idx < docsToInsert; ++idx) {
             oArrayBuilder.append(BSON("_id" << idx));
         }
         oArrayBuilder.done();
 
-        applyOpsElem1Builder << "h" << 0xBEEFBEEFLL << "v" << 2 << "op"
-                             << "i"
-                             << "ns" << nss.ns() << "ui" << autoColl.getCollection()->uuid().get();
+        oplogEntryBuilder << "h" << 0xBEEFBEEFLL << "v" << 2 << "op"
+                          << "i"
+                          << "ns" << nss.ns() << "ui" << autoColl.getCollection()->uuid().get();
 
-        applyOpsB.append(applyOpsElem1Builder.done());
-
-        BSONObjBuilder applyOpsElem2Builder;
-        applyOpsElem2Builder << "ts" << firstInsertTime.addTicks(docsToInsert).asTimestamp() << "t"
-                             << 1LL << "h" << 1 << "op"
-                             << "c"
-                             << "ns"
-                             << "test.$cmd"
-                             << "o" << BSON("applyOps" << BSONArrayBuilder().obj());
-
-        applyOpsB.append(applyOpsElem2Builder.done());
-        applyOpsB.done();
-        // Apply the group of inserts.
-        BSONObjBuilder result;
-        ASSERT_OK(applyOps(_opCtx,
-                           nss.db().toString(),
-                           fullCommand.done(),
-                           repl::OplogApplication::Mode::kApplyOpsCmd,
-                           {},
-                           &result));
-
+        auto oplogEntry = oplogEntryBuilder.done();
+        ASSERT_OK(repl::SyncTail::syncApply(
+            _opCtx, oplogEntry, repl::OplogApplication::Mode::kSecondary));
 
         for (std::uint32_t idx = 0; idx < docsToInsert; ++idx) {
             OneOffRead oor(_opCtx, firstInsertTime.addTicks(idx).asTimestamp());
@@ -1818,7 +1799,7 @@ public:
         std::vector<std::string> origIdents = kvCatalog->getAllIdents(_opCtx);
 
         // Build an index on `{a: 1}`. This index will be multikey.
-        MultiIndexBlock indexer(_opCtx, autoColl.getCollection());
+        MultiIndexBlockImpl indexer(_opCtx, autoColl.getCollection());
         const LogicalTime beforeIndexBuild = _clock->reserveTicks(2);
         BSONObj indexInfoObj;
         {
@@ -2497,7 +2478,7 @@ public:
         auto service = _opCtx->getServiceContext();
         auto sessionCatalog = SessionCatalog::get(service);
         sessionCatalog->reset_forTest();
-        sessionCatalog->onStepUp(_opCtx);
+        MongoDSessionCatalog::onStepUp(_opCtx);
 
         reset(nss);
         UUID ui = UUID::gen();
@@ -2517,7 +2498,10 @@ public:
         _opCtx->setLogicalSessionId(sessionId);
         _opCtx->setTxnNumber(26);
 
-        ocs = std::make_unique<OperationContextSessionMongod>(_opCtx, true, false, true);
+        OperationSessionInfoFromClient sessionInfo;
+        sessionInfo.setAutocommit(false);
+        sessionInfo.setStartTransaction(true);
+        ocs = std::make_unique<OperationContextSessionMongod>(_opCtx, true, sessionInfo);
 
         auto txnParticipant = TransactionParticipant::get(_opCtx);
         ASSERT(txnParticipant);

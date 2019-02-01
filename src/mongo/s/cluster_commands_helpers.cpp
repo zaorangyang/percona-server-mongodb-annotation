@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -107,7 +109,7 @@ std::vector<AsyncRequestsSender::Request> buildUnversionedRequestsForShards(
         // requests to unsharded collections, so they should only be targeting
         // the primary shard.
         if (auto txnRouter = TransactionRouter::get(opCtx)) {
-            txnRouter->computeAtClusterTimeForOneShard(opCtx, shardIds[0]);
+            txnRouter->computeAndSetAtClusterTimeForUnsharded(opCtx, shardIds[0]);
         }
     } else {
         invariant(repl::ReadConcernArgs::get(opCtx).getLevel() !=
@@ -161,7 +163,7 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
     routingInfo.cm()->getShardIdsForQuery(opCtx, query, collation, &shardIds);
 
     if (auto txnRouter = TransactionRouter::get(opCtx)) {
-        txnRouter->computeAtClusterTime(opCtx, false, shardIds, nss, query, collation);
+        txnRouter->computeAndSetAtClusterTime(opCtx, false, shardIds, nss, query, collation);
     }
 
     for (const ShardId& shardId : shardIds) {
@@ -562,6 +564,22 @@ std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
 
     // The collection is unsharded. Target only the primary shard for the database.
     return {routingInfo.db().primaryId()};
+}
+
+StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoForTxnCmd(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    auto catalogCache = Grid::get(opCtx)->catalogCache();
+
+    // Return the latest routing table if not running in a transaction with snapshot level read
+    // concern.
+    auto txnRouter = TransactionRouter::get(opCtx);
+    if (!txnRouter || !txnRouter->getAtClusterTime()) {
+        return catalogCache->getCollectionRoutingInfo(opCtx, nss);
+    }
+
+    auto atClusterTime = txnRouter->getAtClusterTime();
+    return catalogCache->getCollectionRoutingInfoAt(
+        opCtx, nss, atClusterTime->getTime().asTimestamp());
 }
 
 }  // namespace mongo

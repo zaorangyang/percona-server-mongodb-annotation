@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -146,35 +148,30 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanGeo2dOr) {
 }
 
 /**
- * Test the SubplanStage's ability to plan an individual branch using the plan cache.
+ * Helper function to verify that branches of an $or can be subplanned from the cache. Assumes that
+ * the indexes to be tested have already been created for the given WriteContextForTest.
  */
-TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanFromCache) {
-    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
-
-    addIndex(BSON("a" << 1));
-    addIndex(BSON("a" << 1 << "b" << 1));
-    addIndex(BSON("c" << 1));
-
-    for (int i = 0; i < 10; i++) {
-        insert(BSON("a" << 1 << "b" << i << "c" << i));
-    }
-
+void assertSubplanFromCache(QueryStageSubplanTest* test, const dbtests::WriteContextForTests& ctx) {
     // This query should result in a plan cache entry for the first $or branch, because
     // there are two competing indices. The second branch has only one relevant index, so
     // its winning plan should not be cached.
     BSONObj query = fromjson("{$or: [{a: 1, b: 3}, {c: 1}]}");
 
+    for (int i = 0; i < 10; i++) {
+        test->insert(BSON("a" << 1 << "b" << i << "c" << i));
+    }
+
     Collection* collection = ctx.getCollection();
 
     auto qr = stdx::make_unique<QueryRequest>(nss);
     qr->setFilter(query);
-    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx(), std::move(qr));
+    auto statusWithCQ = CanonicalQuery::canonicalize(test->opCtx(), std::move(qr));
     ASSERT_OK(statusWithCQ.getStatus());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
     // Get planner params.
     QueryPlannerParams plannerParams;
-    fillOutPlannerParams(opCtx(), collection, cq.get(), &plannerParams);
+    fillOutPlannerParams(test->opCtx(), collection, cq.get(), &plannerParams);
 
     // For the remainder of this test, ensure that cache entries are available immediately, and
     // don't need go through an 'inactive' state before being usable.
@@ -182,9 +179,10 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanFromCache) {
 
     WorkingSet ws;
     std::unique_ptr<SubplanStage> subplan(
-        new SubplanStage(opCtx(), collection, &ws, plannerParams, cq.get()));
+        new SubplanStage(test->opCtx(), collection, &ws, plannerParams, cq.get()));
 
-    PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD, _clock);
+    PlanYieldPolicy yieldPolicy(PlanExecutor::NO_YIELD,
+                                test->serviceContext()->getFastClockSource());
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
     // Nothing is in the cache yet, so neither branch should have been planned from
@@ -195,12 +193,37 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanFromCache) {
     // If we repeat the same query, the plan for the first branch should have come from
     // the cache.
     ws.clear();
-    subplan.reset(new SubplanStage(opCtx(), collection, &ws, plannerParams, cq.get()));
+    subplan.reset(new SubplanStage(test->opCtx(), collection, &ws, plannerParams, cq.get()));
 
     ASSERT_OK(subplan->pickBestPlan(&yieldPolicy));
 
     ASSERT_TRUE(subplan->branchPlannedFromCache(0));
     ASSERT_FALSE(subplan->branchPlannedFromCache(1));
+}
+
+/**
+ * Test the SubplanStage's ability to plan an individual branch using the plan cache.
+ */
+TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanFromCache) {
+    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+
+    addIndex(BSON("a" << 1));
+    addIndex(BSON("a" << 1 << "b" << 1));
+    addIndex(BSON("c" << 1));
+
+    assertSubplanFromCache(this, ctx);
+}
+
+/**
+ * Test that the SubplanStage can plan an individual branch from the cache using a $** index.
+ */
+TEST_F(QueryStageSubplanTest, QueryStageSubplanPlanFromCacheWithWildcardIndex) {
+    dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
+
+    addIndex(BSON("$**" << 1));
+    addIndex(BSON("a.$**" << 1));
+
+    assertSubplanFromCache(this, ctx);
 }
 
 /**
@@ -212,6 +235,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheZeroResults) {
     addIndex(BSON("a" << 1 << "b" << 1));
     addIndex(BSON("a" << 1));
     addIndex(BSON("c" << 1));
+    addIndex(BSON("$**" << 1));
 
     for (int i = 0; i < 10; i++) {
         insert(BSON("a" << 1 << "b" << i << "c" << i));
@@ -259,7 +283,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheZeroResults) {
 }
 
 /**
- * Ensure that the subplan stage doesn't create a plan cache entry if there are no query results.
+ * Ensure that the subplan stage doesn't create a plan cache entry if the candidate plans tie.
  */
 TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheTies) {
     dbtests::WriteContextForTests ctx(opCtx(), nss.ns());
@@ -267,6 +291,7 @@ TEST_F(QueryStageSubplanTest, QueryStageSubplanDontCacheTies) {
     addIndex(BSON("a" << 1 << "b" << 1));
     addIndex(BSON("a" << 1 << "c" << 1));
     addIndex(BSON("d" << 1));
+    addIndex(BSON("$**" << 1));
 
     for (int i = 0; i < 10; i++) {
         insert(BSON("a" << 1 << "e" << 1 << "d" << 1));

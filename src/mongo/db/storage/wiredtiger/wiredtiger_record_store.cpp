@@ -1,26 +1,27 @@
 // wiredtiger_record_store.cpp
 
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -820,20 +821,6 @@ RecordData WiredTigerRecordStore::_getData(const WiredTigerCursor& cursor) const
     return RecordData(static_cast<const char*>(value.data), value.size).getOwned();
 }
 
-RecordData WiredTigerRecordStore::dataFor(OperationContext* opCtx, const RecordId& id) const {
-    dassert(opCtx->lockState()->isReadLocked());
-
-    // ownership passes to the shared_array created below
-    WiredTigerCursor curwrap(_uri, _tableId, true, opCtx);
-    WT_CURSOR* c = curwrap.get();
-    invariant(c);
-    setKey(c, id);
-    int ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return c->search(c); });
-    massert(28556, "Didn't find RecordId in WiredTigerRecordStore", ret != WT_NOTFOUND);
-    invariantWTOK(ret);
-    return _getData(curwrap);
-}
-
 bool WiredTigerRecordStore::findRecord(OperationContext* opCtx,
                                        const RecordId& id,
                                        RecordData* out) const {
@@ -1228,8 +1215,8 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp mayT
 
 Status WiredTigerRecordStore::insertRecords(OperationContext* opCtx,
                                             std::vector<Record>* records,
-                                            std::vector<Timestamp>* timestamps) {
-    return _insertRecords(opCtx, records->data(), timestamps->data(), records->size());
+                                            const std::vector<Timestamp>& timestamps) {
+    return _insertRecords(opCtx, records->data(), timestamps.data(), records->size());
 }
 
 Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
@@ -1310,17 +1297,6 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
     }
 
     return Status::OK();
-}
-
-StatusWith<RecordId> WiredTigerRecordStore::insertRecord(OperationContext* opCtx,
-                                                         const char* data,
-                                                         int len,
-                                                         Timestamp timestamp) {
-    Record record = {RecordId(), RecordData(data, len)};
-    Status status = _insertRecords(opCtx, &record, &timestamp, 1);
-    if (!status.isOK())
-        return StatusWith<RecordId>(status);
-    return StatusWith<RecordId>(record.id);
 }
 
 bool WiredTigerRecordStore::isOpHidden_forTest(const RecordId& id) const {
@@ -1490,10 +1466,7 @@ Status WiredTigerRecordStore::truncate(OperationContext* opCtx) {
     return Status::OK();
 }
 
-Status WiredTigerRecordStore::compact(OperationContext* opCtx,
-                                      RecordStoreCompactAdaptor* adaptor,
-                                      const CompactOptions* options,
-                                      CompactStats* stats) {
+Status WiredTigerRecordStore::compact(OperationContext* opCtx) {
     dassert(opCtx->lockState()->isWriteLocked());
 
     WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();

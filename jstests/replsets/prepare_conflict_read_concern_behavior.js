@@ -66,11 +66,13 @@
                 .operationTime;
         const prepareTimestamp = PrepareHelpers.prepareTransaction(session);
 
+        // TODO: Once we no longer hold the stable optime behind the earliest prepare optime
+        // whose corresponding commit/abort oplog entry optime is not majority committed, allow
+        // this insert to be majority committed.
         const clusterTimeAfterPrepare =
             assert
-                .commandWorked(testColl.runCommand(
-                    "insert",
-                    {documents: [{_id: 3, in_prepared_txn: 3}], writeConcern: {w: "majority"}}))
+                .commandWorked(
+                    testColl.runCommand("insert", {documents: [{_id: 3, in_prepared_txn: 3}]}))
                 .operationTime;
 
         jsTestLog("prepareTimestamp: " + prepareTimestamp + " clusterTimeBeforePrepare: " +
@@ -80,9 +82,12 @@
         assert.gt(prepareTimestamp, clusterTimeBeforePrepare);
         assert.gt(clusterTimeAfterPrepare, prepareTimestamp);
 
-        jsTestLog(
-            "Test read with read concern 'majority' doesn't block on a prepared transaction.");
-        assert.commandWorked(read({level: 'majority'}, successTimeout, testDB, collName, 2));
+        // TODO: Once we no longer hold the stable optime behind the earliest prepare optime
+        // whose corresponding commit/abort oplog entry optime is not majority committed, uncomment
+        // this read.
+        // jsTestLog(
+        //     "Test read with read concern 'majority' doesn't block on a prepared transaction.");
+        // assert.commandWorked(read({level: 'majority'}, successTimeout, testDB, collName, 2));
 
         jsTestLog("Test read with read concern 'local' doesn't block on a prepared transaction.");
         assert.commandWorked(read({level: 'local'}, successTimeout, testDB, collName, 2));
@@ -131,17 +136,20 @@
         session2.startTransaction(
             {readConcern: {level: "snapshot", atClusterTime: clusterTimeAfterPrepare}});
 
-        jsTestLog("Test read with read concern 'snapshot' and a read timestamp after " +
-                  "prepareTimestamp on non-prepared documents doesn't block on a prepared " +
-                  "transaction.");
-        assert.commandWorked(read({}, failureTimeout, sessionDB2, collName2, 1));
+        // TODO: Once we no longer hold the stable optime behind the earliest prepare optime
+        // whose corresponding commit/abort oplog entry optime is not majority committed, uncomment
+        // this read.
+        // jsTestLog("Test read with read concern 'snapshot' and a read timestamp after " +
+        //           "prepareTimestamp on non-prepared documents doesn't block on a prepared " +
+        //           "transaction.");
+        // assert.commandWorked(read({}, failureTimeout, sessionDB2, collName2, 1));
 
         jsTestLog("Test read with read concern 'snapshot' and a read timestamp after " +
                   "prepareTimestamp blocks on a prepared transaction.");
         assert.commandFailedWithCode(read({}, failureTimeout, sessionDB2, collName),
                                      ErrorCodes.MaxTimeMSExpired);
 
-        session2.abortTransaction();
+        session2.abortTransaction_forTesting();
         session2.startTransaction(
             {readConcern: {level: "snapshot", atClusterTime: clusterTimeBeforePrepare}});
 
@@ -149,10 +157,10 @@
                   "prepareTimestamp doesn't block on a prepared transaction.");
         assert.commandWorked(read({}, successTimeout, sessionDB2, collName, 1));
 
-        session.abortTransaction();
+        session.abortTransaction_forTesting();
         session.endSession();
 
-        session2.abortTransaction();
+        session2.abortTransaction_forTesting();
         session2.endSession();
     }
 

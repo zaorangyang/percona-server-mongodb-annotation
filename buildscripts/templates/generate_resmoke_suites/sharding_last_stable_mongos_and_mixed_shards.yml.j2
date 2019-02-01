@@ -57,11 +57,15 @@ selector:
   - jstests/sharding/snapshot_cursor_commands_mongos.js
   - jstests/sharding/transactions_error_labels.js
   - jstests/sharding/transactions_implicit_abort.js
+  - jstests/sharding/transactions_read_concerns.js
+  - jstests/sharding/transactions_reject_writes_for_moved_chunks.js
   - jstests/sharding/transactions_snapshot_errors_first_statement.js
   - jstests/sharding/transactions_snapshot_errors_subsequent_statements.js
   - jstests/sharding/transactions_stale_database_version_errors.js
   - jstests/sharding/transactions_stale_shard_version_errors.js
+  - jstests/sharding/transactions_target_at_point_in_time.js
   - jstests/sharding/transactions_view_resolution.js
+  - jstests/sharding/transactions_writes_not_retryable.js
   - jstests/sharding/txn_agg.js
   - jstests/sharding/txn_basic_two_phase_commit.js
   - jstests/sharding/txn_coordinator_commands_basic_requirements.js

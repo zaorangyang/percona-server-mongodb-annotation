@@ -1,28 +1,31 @@
-/*    Copyright 2009 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 
@@ -50,104 +53,6 @@
 #include "mongo/util/text.h"
 
 namespace mongo {
-
-namespace {
-
-ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>
-    setDiffieHellmanParameterPEMFile(ServerParameterSet::getGlobal(),
-                                     "opensslDiffieHellmanParameters",
-                                     &sslGlobalParams.sslPEMTempDHParam);
-
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly>
-    suppressNoTLSPeerCertificateWarning(ServerParameterSet::getGlobal(),
-                                        "suppressNoTLSPeerCertificateWarning",
-                                        &sslGlobalParams.suppressNoTLSPeerCertificateWarning);
-
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly> tlsWithholdClientCertificate(
-    ServerParameterSet::getGlobal(),
-    "tlsWithholdClientCertificate",
-    &sslGlobalParams.tlsWithholdClientCertificate);
-
-// Deprecated alias for tlsWithholdClientCertificate
-ExportedServerParameter<bool, ServerParameterType::kStartupOnly> sslWithholdClientCertificate(
-    ServerParameterSet::getGlobal(),
-    "sslWithholdClientCertificate",
-    &sslGlobalParams.tlsWithholdClientCertificate);
-
-}  // namespace
-
-class OpenSSLCipherConfigParameter
-    : public ExportedServerParameter<std::string, ServerParameterType::kStartupOnly> {
-public:
-    OpenSSLCipherConfigParameter()
-        : ExportedServerParameter<std::string, ServerParameterType::kStartupOnly>(
-              ServerParameterSet::getGlobal(),
-              "opensslCipherConfig",
-              &sslGlobalParams.sslCipherConfig) {}
-    Status validate(const std::string& potentialNewValue) final {
-        if (!sslGlobalParams.sslCipherConfig.empty()) {
-            return Status(
-                ErrorCodes::BadValue,
-                "opensslCipherConfig setParameter is incompatible with net.tls.tlsCipherConfig");
-        }
-        // Note that there is very little validation that we can do here.
-        // OpenSSL exposes no API to validate a cipher config string. The only way to figure out
-        // what a string maps to is to make an SSL_CTX object, set the string on it, then parse the
-        // resulting STACK_OF object. If provided an invalid entry in the string, it will silently
-        // ignore it. Because an entry in the string may map to multiple ciphers, or remove ciphers
-        // from the final set produced by the full string, we can't tell if any entry failed
-        // to parse.
-        return Status::OK();
-    }
-} openSSLCipherConfig;
-
-/**
- * Configurable via --setParameter disableNonSSLConnectionLogging=true. If false (default)
- * if the sslMode is set to preferSSL, we will log connections that are not using SSL.
- * If true, such log messages will be suppressed.
- */
-class DisableNonSSLConnectionLoggingParameter
-    : public ExportedServerParameter<bool, ServerParameterType::kStartupOnly> {
-public:
-    DisableNonSSLConnectionLoggingParameter()
-        : ExportedServerParameter<bool, ServerParameterType::kStartupOnly>(
-              ServerParameterSet::getGlobal(),
-              "disableNonSSLConnectionLogging",
-              &sslGlobalParams.disableNonSSLConnectionLogging) {}
-    Status validate(const bool& potentialNewValue) final {
-        warning() << "Option: disableNonSSLConnectionLogging is deprecated. Please use "
-                  << "disableNonTLSConnectionLogging instead.";
-        if (sslGlobalParams.disableNonSSLConnectionLoggingSet) {
-            return Status(ErrorCodes::BadValue,
-                          "Error parsing command line: Multiple occurrences of option "
-                          "disableNonTLSConnectionLogging");
-        }
-        sslGlobalParams.disableNonSSLConnectionLoggingSet = true;
-        return Status::OK();
-    }
-} disableNonSSLConnectionLogging;
-
-class DisableNonTLSConnectionLoggingParameter
-    : public ExportedServerParameter<bool, ServerParameterType::kStartupOnly> {
-public:
-    DisableNonTLSConnectionLoggingParameter()
-        : ExportedServerParameter<bool, ServerParameterType::kStartupOnly>(
-              ServerParameterSet::getGlobal(),
-              "disableNonTLSConnectionLogging",
-              &sslGlobalParams.disableNonSSLConnectionLogging) {}
-    Status validate(const bool& potentialNewValue) final {
-        if (sslGlobalParams.disableNonSSLConnectionLoggingSet) {
-            return Status(ErrorCodes::BadValue,
-                          "Error parsing command line: Multiple occurrences of option "
-                          "disableNonTLSConnectionLogging");
-        }
-        sslGlobalParams.disableNonSSLConnectionLoggingSet = true;
-        return Status::OK();
-    }
-} disableNonTLSConnectionLogging;
-
-#ifdef MONGO_CONFIG_SSL
-
 namespace {
 #if MONGO_CONFIG_SSL_PROVIDER == MONGO_CONFIG_SSL_PROVIDER_OPENSSL
 // OpenSSL has a more complete library of OID to SN mappings.
@@ -817,11 +722,8 @@ void recordTLSVersion(TLSVersion version, const HostAndPort& hostForLogging) {
     }
 }
 
-#endif
-
 }  // namespace mongo
 
-#ifdef MONGO_CONFIG_SSL
 // TODO SERVER-11601 Use NFC Unicode canonicalization
 bool mongo::hostNameMatchForX509Certificates(std::string nameToMatch, std::string certHostName) {
     nameToMatch = removeFQDNRoot(std::move(nameToMatch));
@@ -840,4 +742,3 @@ bool mongo::hostNameMatchForX509Certificates(std::string nameToMatch, std::strin
         return !strcasecmp(nameToMatch.c_str(), certHostName.c_str());
     }
 }
-#endif

@@ -1,35 +1,38 @@
+
 /**
- * Copyright (C) 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_out_gen.h"
+#include "mongo/db/write_concern_options.h"
 
 namespace mongo {
 
@@ -69,7 +72,8 @@ public:
     DocumentSourceOut(NamespaceString outputNs,
                       const boost::intrusive_ptr<ExpressionContext>& expCtx,
                       WriteModeEnum mode,
-                      std::set<FieldPath> uniqueKey);
+                      std::set<FieldPath> uniqueKey,
+                      boost::optional<OID> targetEpoch);
 
     virtual ~DocumentSourceOut() = default;
 
@@ -163,7 +167,8 @@ public:
      * Writes the documents in 'batch' to the write namespace.
      */
     virtual void spill(BatchedObjects&& batch) {
-        pExpCtx->mongoProcessInterface->insert(pExpCtx, getWriteNs(), std::move(batch.objects));
+        pExpCtx->mongoProcessInterface->insert(
+            pExpCtx, getWriteNs(), std::move(batch.objects), _writeConcern, _targetEpoch);
     };
 
     /**
@@ -178,7 +183,8 @@ public:
         NamespaceString outputNs,
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         WriteModeEnum,
-        std::set<FieldPath> uniqueKey = std::set<FieldPath>{"_id"});
+        std::set<FieldPath> uniqueKey = std::set<FieldPath>{"_id"},
+        boost::optional<OID> targetEpoch = boost::none);
 
     /**
      * Parses a $out stage from the user-supplied BSON.
@@ -186,11 +192,21 @@ public:
     static boost::intrusive_ptr<DocumentSource> createFromBson(
         BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
 
+protected:
+    // Stash the writeConcern of the original command as the operation context may change by the
+    // time we start to spill $out writes. This is because certain aggregations (e.g. $exchange)
+    // establish cursors with batchSize 0 then run subsequent getMore's which use a new operation
+    // context. The getMore's will not have an attached writeConcern however we still want to
+    // respect the writeConcern of the original command.
+    WriteConcernOptions _writeConcern;
+
+    const NamespaceString _outputNs;
+    boost::optional<OID> _targetEpoch;
+
 private:
     bool _initialized = false;
     bool _done = false;
 
-    const NamespaceString _outputNs;
     WriteModeEnum _mode;
 
     // Holds the unique key used for uniquely identifying documents. There must exist a unique index

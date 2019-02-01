@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
@@ -40,8 +42,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/ops/write_ops_exec.h"
-#include "mongo/db/ops/write_ops_gen.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
 #include "mongo/db/pipeline/pipeline_d.h"
 #include "mongo/db/s/collection_sharding_state.h"
@@ -51,9 +51,6 @@
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
 #include "mongo/db/transaction_participant.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -67,58 +64,6 @@ using write_ops::Update;
 using write_ops::UpdateOpEntry;
 
 namespace {
-
-/**
- * Builds an ordered insert op on namespace 'nss' and documents to be written 'objs'.
- */
-Insert buildInsertOp(const NamespaceString& nss,
-                     std::vector<BSONObj>&& objs,
-                     bool bypassDocValidation) {
-    Insert insertOp(nss);
-    insertOp.setDocuments(std::move(objs));
-    insertOp.setWriteCommandBase([&] {
-        write_ops::WriteCommandBase wcb;
-        wcb.setOrdered(true);
-        wcb.setBypassDocumentValidation(bypassDocValidation);
-        return wcb;
-    }());
-    return insertOp;
-}
-
-/**
- * Builds an ordered update op on namespace 'nss' with update entries {q: <queries>, u: <updates>}.
- *
- * Note that 'queries' and 'updates' must be the same length.
- */
-Update buildUpdateOp(const NamespaceString& nss,
-                     std::vector<BSONObj>&& queries,
-                     std::vector<BSONObj>&& updates,
-                     bool upsert,
-                     bool multi,
-                     bool bypassDocValidation) {
-    Update updateOp(nss);
-    updateOp.setUpdates([&] {
-        std::vector<UpdateOpEntry> updateEntries;
-        for (size_t index = 0; index < queries.size(); ++index) {
-            updateEntries.push_back([&] {
-                UpdateOpEntry entry;
-                entry.setQ(std::move(queries[index]));
-                entry.setU(std::move(updates[index]));
-                entry.setUpsert(upsert);
-                entry.setMulti(multi);
-                return entry;
-            }());
-        }
-        return updateEntries;
-    }());
-    updateOp.setWriteCommandBase([&] {
-        write_ops::WriteCommandBase wcb;
-        wcb.setOrdered(true);
-        wcb.setBypassDocumentValidation(bypassDocValidation);
-        return wcb;
-    }());
-    return updateOp;
-}
 
 // Returns true if the field names of 'keyPattern' are exactly those in 'uniqueKeyPaths', and each
 // of the elements of 'keyPattern' is numeric, i.e. not "text", "$**", or any other special type of
@@ -159,28 +104,84 @@ DBClientBase* MongoInterfaceStandalone::directClient() {
 }
 
 bool MongoInterfaceStandalone::isSharded(OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    AutoGetCollectionForRead autoColl(opCtx, nss);
     auto const css = CollectionShardingState::get(opCtx, nss);
     return css->getMetadata(opCtx)->isSharded();
 }
 
+Insert MongoInterfaceStandalone::buildInsertOp(const NamespaceString& nss,
+                                               std::vector<BSONObj>&& objs,
+                                               bool bypassDocValidation) {
+    Insert insertOp(nss);
+    insertOp.setDocuments(std::move(objs));
+    insertOp.setWriteCommandBase([&] {
+        write_ops::WriteCommandBase wcb;
+        wcb.setOrdered(false);
+        wcb.setBypassDocumentValidation(bypassDocValidation);
+        return wcb;
+    }());
+    return insertOp;
+}
+
+Update MongoInterfaceStandalone::buildUpdateOp(const NamespaceString& nss,
+                                               std::vector<BSONObj>&& queries,
+                                               std::vector<BSONObj>&& updates,
+                                               bool upsert,
+                                               bool multi,
+                                               bool bypassDocValidation) {
+    Update updateOp(nss);
+    updateOp.setUpdates([&] {
+        std::vector<UpdateOpEntry> updateEntries;
+        for (size_t index = 0; index < queries.size(); ++index) {
+            updateEntries.push_back([&] {
+                UpdateOpEntry entry;
+                entry.setQ(std::move(queries[index]));
+                entry.setU(std::move(updates[index]));
+                entry.setUpsert(upsert);
+                entry.setMulti(multi);
+                return entry;
+            }());
+        }
+        return updateEntries;
+    }());
+    updateOp.setWriteCommandBase([&] {
+        write_ops::WriteCommandBase wcb;
+        wcb.setOrdered(false);
+        wcb.setBypassDocumentValidation(bypassDocValidation);
+        return wcb;
+    }());
+    return updateOp;
+}
+
 void MongoInterfaceStandalone::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                       const NamespaceString& ns,
-                                      std::vector<BSONObj>&& objs) {
+                                      std::vector<BSONObj>&& objs,
+                                      const WriteConcernOptions& wc,
+                                      boost::optional<OID> targetEpoch) {
     auto writeResults = performInserts(
         expCtx->opCtx, buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation));
 
-    // Only need to check that the final result passed because the inserts are ordered and the batch
-    // will stop on the first failure.
-    uassertStatusOKWithContext(writeResults.results.back().getStatus(), "Insert failed: ");
+    // Need to check each result in the batch since the writes are unordered.
+    uassertStatusOKWithContext(
+        [&writeResults]() {
+            for (const auto& result : writeResults.results) {
+                if (result.getStatus() != Status::OK()) {
+                    return result.getStatus();
+                }
+            }
+            return Status::OK();
+        }(),
+        "Insert failed: ");
 }
 
 void MongoInterfaceStandalone::update(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                       const NamespaceString& ns,
                                       std::vector<BSONObj>&& queries,
                                       std::vector<BSONObj>&& updates,
+                                      const WriteConcernOptions& wc,
                                       bool upsert,
-                                      bool multi) {
+                                      bool multi,
+                                      boost::optional<OID> targetEpoch) {
     auto writeResults = performUpdates(expCtx->opCtx,
                                        buildUpdateOp(ns,
                                                      std::move(queries),
@@ -189,9 +190,17 @@ void MongoInterfaceStandalone::update(const boost::intrusive_ptr<ExpressionConte
                                                      multi,
                                                      expCtx->bypassDocumentValidation));
 
-    // Only need to check that the final result passed because the updates are ordered and the batch
-    // will stop on the first failure.
-    uassertStatusOKWithContext(writeResults.results.back().getStatus(), "Update failed: ");
+    // Need to check each result in the batch since the writes are unordered.
+    uassertStatusOKWithContext(
+        [&writeResults]() {
+            for (const auto& result : writeResults.results) {
+                if (result.getStatus() != Status::OK()) {
+                    return result.getStatus();
+                }
+            }
+            return Status::OK();
+        }(),
+        "Update failed: ");
 }
 
 CollectionIndexUsageMap MongoInterfaceStandalone::getIndexStats(OperationContext* opCtx,
@@ -489,9 +498,8 @@ void MongoInterfaceStandalone::_reportCurrentOpsForIdleSessions(OperationContext
                               : KillAllSessionsByPatternSet{{}});
 
     sessionCatalog->scanSessions(
-        opCtx,
         {std::move(sessionFilter)},
-        [&](OperationContext* opCtx, Session* session) {
+        [&](WithLock sessionCatalogLock, Session* session) {
             auto op =
                 TransactionParticipant::getFromNonCheckedOutSession(session)->reportStashedState();
             if (!op.isEmpty()) {

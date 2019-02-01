@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -44,6 +46,7 @@
 #include "mongo/db/s/session_catalog_migration_destination.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog.h"
+#include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/db/transaction_participant.h"
@@ -131,7 +134,7 @@ public:
                 ->setFindHostReturnValue(kDonorConnStr.getServers()[0]);
         }
 
-        SessionCatalog::get(getServiceContext())->onStepUp(operationContext());
+        MongoDSessionCatalog::onStepUp(operationContext());
         LogicalSessionCache::set(getServiceContext(), stdx::make_unique<LogicalSessionCacheNoop>());
     }
 
@@ -248,8 +251,7 @@ public:
             // requests with txnNumbers aren't allowed. To get around this, we have to manually set
             // up the session state and perform the insert.
             initializeOperationSessionInfo(innerOpCtx.get(), insertBuilder.obj(), true, true, true);
-            OperationContextSessionMongod sessionTxnState(
-                innerOpCtx.get(), true, boost::none, boost::none);
+            OperationContextSessionMongod sessionTxnState(innerOpCtx.get(), true, {});
 
             const auto reply = performInserts(innerOpCtx.get(), insertRequest);
             ASSERT(reply.results.size() == 1);

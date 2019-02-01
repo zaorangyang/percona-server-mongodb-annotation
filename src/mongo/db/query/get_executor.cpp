@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -58,6 +60,7 @@
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/ops/update_lifecycle.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/index_bounds_builder.h"
@@ -66,6 +69,7 @@
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/planner_access.h"
 #include "mongo/db/query/planner_analysis.h"
+#include "mongo/db/query/planner_ixselect.h"
 #include "mongo/db/query/planner_wildcard_helpers.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_planner.h"
@@ -123,7 +127,9 @@ namespace wcp = ::mongo::wildcard_planning;
 bool turnIxscanIntoCount(QuerySolution* soln);
 }  // namespace
 
-IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx, const IndexCatalogEntry& ice) {
+IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
+                                           const IndexCatalogEntry& ice,
+                                           const CanonicalQuery* canonicalQuery) {
     auto desc = ice.descriptor();
     invariant(desc);
 
@@ -131,6 +137,30 @@ IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx, const IndexC
     invariant(accessMethod);
 
     const bool isMultikey = desc->isMultikey(opCtx);
+
+    const ProjectionExecAgg* projExec = nullptr;
+    std::set<FieldRef> multikeyPathSet;
+    if (desc->getIndexType() == IndexType::INDEX_WILDCARD) {
+        projExec = static_cast<const WildcardAccessMethod*>(accessMethod)->getProjectionExec();
+        if (isMultikey) {
+            MultikeyMetadataAccessStats mkAccessStats;
+
+            if (canonicalQuery) {
+                stdx::unordered_set<std::string> fields;
+                QueryPlannerIXSelect::getFields(canonicalQuery->root(), &fields);
+                const auto projectedFields = projExec->applyProjectionToFields(fields);
+
+                multikeyPathSet =
+                    accessMethod->getMultikeyPathSet(opCtx, projectedFields, &mkAccessStats);
+            } else {
+                multikeyPathSet = accessMethod->getMultikeyPathSet(opCtx, &mkAccessStats);
+            }
+
+            LOG(2) << "Multikey path metadata range index scan stats: { index: "
+                   << desc->indexName() << ", numSeeks: " << mkAccessStats.keysExamined
+                   << ", keysExamined: " << mkAccessStats.keysExamined << "}";
+        }
+    }
 
     return {desc->keyPattern(),
             desc->getIndexType(),
@@ -141,38 +171,40 @@ IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx, const IndexC
             // Indexes that have these metadata keys do not store a fixed-size vector of multikey
             // metadata in the index catalog. Depending on the index type, an index uses one of
             // these mechanisms (or neither), but not both.
-            isMultikey ? accessMethod->getMultikeyPathSet(opCtx) : std::set<FieldRef>{},
+            multikeyPathSet,
             desc->isSparse(),
             desc->unique(),
             IndexEntry::Identifier{desc->indexName()},
             ice.getFilterExpression(),
             desc->infoObj(),
-            ice.getCollator()};
+            ice.getCollator(),
+            projExec};
 }
 
 void fillOutPlannerParams(OperationContext* opCtx,
                           Collection* collection,
                           CanonicalQuery* canonicalQuery,
                           QueryPlannerParams* plannerParams) {
+    invariant(canonicalQuery);
     // If it's not NULL, we may have indices.  Access the catalog and fill out IndexEntry(s)
     IndexCatalog::IndexIterator ii = collection->getIndexCatalog()->getIndexIterator(opCtx, false);
     while (ii.more()) {
         const IndexDescriptor* desc = ii.next();
         IndexCatalogEntry* ice = ii.catalogEntry(desc);
-        plannerParams->indices.push_back(indexEntryFromIndexCatalogEntry(opCtx, *ice));
+        plannerParams->indices.push_back(
+            indexEntryFromIndexCatalogEntry(opCtx, *ice, canonicalQuery));
     }
 
     // If query supports index filters, filter params.indices by indices in query settings.
     // Ignore index filters when it is possible to use the id-hack.
     if (!IDHackStage::supportsQuery(collection, *canonicalQuery)) {
         QuerySettings* querySettings = collection->infoCache()->getQuerySettings();
-        PlanCacheKey planCacheKey =
-            collection->infoCache()->getPlanCache()->computeKey(*canonicalQuery);
+        const auto key = canonicalQuery->encodeKey();
 
         // Filter index catalog if index filters are specified for query.
         // Also, signal to planner that application hint should be ignored.
         if (boost::optional<AllowedIndicesFilter> allowedIndicesFilter =
-                querySettings->getAllowedIndicesFilter(planCacheKey)) {
+                querySettings->getAllowedIndicesFilter(key)) {
             filterAllowedIndexEntries(*allowedIndicesFilter, &plannerParams->indices);
             plannerParams->indexFiltersApplied = true;
         }
@@ -281,7 +313,6 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
                                                     unique_ptr<CanonicalQuery> canonicalQuery,
                                                     size_t plannerOptions) {
     invariant(canonicalQuery);
-
     unique_ptr<PlanStage> root;
 
     // This can happen as we're called by internal clients as well.
@@ -368,10 +399,13 @@ StatusWith<PrepareExecutionResult> prepareExecution(OperationContext* opCtx,
 
     // Check that the query should be cached.
     if (collection->infoCache()->getPlanCache()->shouldCacheQuery(*canonicalQuery)) {
-        auto planCacheKey = collection->infoCache()->getPlanCache()->computeKey(*canonicalQuery);
-
         // Fill in opDebug information.
-        CurOp::get(opCtx)->debug().queryHash = PlanCache::computeQueryHash(planCacheKey);
+        const auto planCacheKey =
+            collection->infoCache()->getPlanCache()->computeKey(*canonicalQuery);
+        CurOp::get(opCtx)->debug().queryHash =
+            canonical_query_encoder::computeHash(planCacheKey.getStableKeyStringData());
+        CurOp::get(opCtx)->debug().planCacheKey =
+            canonical_query_encoder::computeHash(planCacheKey.toString());
 
         // Try to look up a cached solution for the query.
         if (auto cs =
@@ -622,7 +656,6 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
 
     // Build our collection scan.
     CollectionScanParams params;
-    params.collection = collection;
     if (startLoc) {
         LOG(3) << "Using direct oplog seek";
         params.start = *startLoc;
@@ -644,7 +677,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getOplogStartHack(
     }
 
     auto ws = make_unique<WorkingSet>();
-    auto cs = make_unique<CollectionScan>(opCtx, params, ws.get(), cq->root());
+    auto cs = make_unique<CollectionScan>(opCtx, collection, params, ws.get(), cq->root());
     return PlanExecutor::make(
         opCtx, std::move(ws), std::move(cs), std::move(cq), collection, PlanExecutor::YIELD_AUTO);
 }
@@ -1468,13 +1501,15 @@ QueryPlannerParams fillOutPlannerParamsForDistinct(OperationContext* opCtx,
         const IndexDescriptor* desc = ii.next();
         IndexCatalogEntry* ice = ii.catalogEntry(desc);
         if (desc->keyPattern().hasField(parsedDistinct.getKey())) {
-            plannerParams.indices.push_back(indexEntryFromIndexCatalogEntry(opCtx, *ice));
+            plannerParams.indices.push_back(
+                indexEntryFromIndexCatalogEntry(opCtx, *ice, parsedDistinct.getQuery()));
         } else if (desc->getIndexType() == IndexType::INDEX_WILDCARD && !query.isEmpty()) {
             // Check whether the $** projection captures the field over which we are distinct-ing.
-            const auto proj = WildcardKeyGenerator::createProjectionExec(desc->keyPattern(),
-                                                                         desc->pathProjection());
+            const auto* proj =
+                static_cast<WildcardAccessMethod*>(ii.accessMethod(desc))->getProjectionExec();
             if (proj->applyProjectionToOneField(parsedDistinct.getKey())) {
-                plannerParams.indices.push_back(indexEntryFromIndexCatalogEntry(opCtx, *ice));
+                plannerParams.indices.push_back(
+                    indexEntryFromIndexCatalogEntry(opCtx, *ice, parsedDistinct.getQuery()));
             }
         }
     }

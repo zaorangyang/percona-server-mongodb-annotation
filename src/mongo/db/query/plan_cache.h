@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -42,8 +44,69 @@
 
 namespace mongo {
 
-// A PlanCacheKey is a string-ified version of a query's predicate/projection/sort.
-typedef std::string PlanCacheKey;
+/**
+ * Represents the "key" used in the PlanCache mapping from query shape -> query plan.
+ */
+class PlanCacheKey {
+public:
+    PlanCacheKey(CanonicalQuery::QueryShapeString shapeString, std::string indexabilityString) {
+        _lengthOfStablePart = shapeString.size();
+        _key = std::move(shapeString);
+        _key += indexabilityString;
+    }
+
+    CanonicalQuery::QueryShapeString getStableKey() const {
+        return std::string(_key, 0, _lengthOfStablePart);
+    }
+
+    StringData getStableKeyStringData() const {
+        return StringData(_key.c_str(), _lengthOfStablePart);
+    }
+
+    /**
+     * Return the "unstable" portion of the key, which may vary across catalog changes.
+     */
+    StringData getUnstablePart() const {
+        return StringData(_key.c_str() + _lengthOfStablePart, _key.size() - _lengthOfStablePart);
+    }
+
+    StringData stringData() const {
+        return _key;
+    }
+
+    const std::string& toString() const {
+        return _key;
+    }
+
+    bool operator==(const PlanCacheKey& other) const {
+        return other._key == _key && other._lengthOfStablePart == _lengthOfStablePart;
+    }
+
+    bool operator!=(const PlanCacheKey& other) const {
+        return !(*this == other);
+    }
+
+private:
+    // Key is broken into two parts:
+    // <stable key> | <indexability discriminators>
+    // Combined, the two parts make up the plan cache key. We store them in one std::string so that
+    // we can easily/cheaply extract the stable key.
+    std::string _key;
+
+    // How long the "stable key" is.
+    size_t _lengthOfStablePart;
+};
+
+std::ostream& operator<<(std::ostream& stream, const PlanCacheKey& key);
+StringBuilder& operator<<(StringBuilder& builder, const PlanCacheKey& key);
+
+class PlanCacheKeyHasher {
+public:
+    std::size_t operator()(const PlanCacheKey& k) const {
+        return std::hash<std::string>{}(k.toString());
+    }
+};
+
 
 struct PlanRankingDecision;
 struct QuerySolution;
@@ -223,7 +286,8 @@ public:
      */
     PlanCacheEntry(const std::vector<QuerySolution*>& solutions,
                    PlanRankingDecision* why,
-                   uint32_t queryHash);
+                   uint32_t queryHash,
+                   uint32_t planCacheKey);
 
     ~PlanCacheEntry();
 
@@ -258,6 +322,9 @@ public:
     // Hash of the PlanCacheKey. Intended as an identifier for the query shape in logs and other
     // diagnostic output.
     uint32_t queryHash;
+
+    // Hash of the "stable" PlanCacheKey, which is the same regardless of what indexes are around.
+    uint32_t planCacheKey;
 
     //
     // Performance stats
@@ -425,12 +492,6 @@ public:
     PlanCacheKey computeKey(const CanonicalQuery&) const;
 
     /**
-     * Returns a hash of the plan cache key. This hash may not be stable between different versions
-     * of the server.
-     */
-    static uint32_t computeQueryHash(const PlanCacheKey& key);
-
-    /**
      * Returns a copy of a cache entry.
      * Used by planCacheListPlans to display plan details.
      *
@@ -466,6 +527,10 @@ public:
         const std::function<BSONObj(const PlanCacheEntry&)>& serializationFunc,
         const std::function<bool(const BSONObj&)>& filterFunc) const;
 
+    void setNs(NamespaceString ns) {
+        _ns = ns.toString();
+    }
+
 private:
     struct NewEntryState {
         bool shouldBeCreated = false;
@@ -474,15 +539,12 @@ private:
 
     NewEntryState getNewEntryState(const CanonicalQuery& query,
                                    uint32_t queryHash,
+                                   uint32_t planCacheKey,
                                    PlanCacheEntry* oldEntry,
                                    size_t newWorks,
                                    double growthCoefficient);
 
-    void encodeKeyForMatch(const MatchExpression* tree, StringBuilder* keyBuilder) const;
-    void encodeKeyForSort(const BSONObj& sortObj, StringBuilder* keyBuilder) const;
-    void encodeKeyForProj(const BSONObj& projObj, StringBuilder* keyBuilder) const;
-
-    LRUKeyValue<PlanCacheKey, PlanCacheEntry> _cache;
+    LRUKeyValue<PlanCacheKey, PlanCacheEntry, PlanCacheKeyHasher> _cache;
 
     // Protects _cache.
     mutable stdx::mutex _cacheMutex;

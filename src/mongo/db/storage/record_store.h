@@ -1,32 +1,32 @@
-// record_store.h
 
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
@@ -35,6 +35,7 @@
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/bson/mutable/damage_vector.h"
 #include "mongo/db/exec/collection_scan_common.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
 #include "mongo/db/storage/record_data.h"
 
@@ -45,14 +46,28 @@ class Collection;
 struct CompactOptions;
 struct CompactStats;
 class MAdvise;
-class NamespaceDetails;
 class OperationContext;
 
-class RecordStoreCompactAdaptor;
 class RecordStore;
 
 struct ValidateResults;
 class ValidateAdaptor;
+
+struct CompactOptions {
+    // padding
+    enum PaddingMode { PRESERVE, NONE, MANUAL } paddingMode = NONE;
+
+    // only used if _paddingMode == MANUAL
+    double paddingFactor = 1;  // what to multiple document size by
+    int paddingBytes = 0;      // what to add to ducment size after multiplication
+
+    // other
+    bool validateDocuments = true;
+
+    std::string toString() const;
+};
+
+struct CompactStats {};
 
 /**
  * Allows inserting a Record "in-place" without creating a copy ahead of time.
@@ -244,8 +259,12 @@ public:
     // name of the RecordStore implementation
     virtual const char* name() const = 0;
 
-    virtual const std::string& ns() const {
+    const std::string& ns() const {
         return _ns;
+    }
+
+    void setNs(NamespaceString ns) {
+        _ns = ns.ns();
     }
 
     virtual const std::string& getIdent() const = 0;
@@ -282,13 +301,15 @@ public:
     /**
      * Get the RecordData at loc, which must exist.
      *
-     * If unowned data is returned, it is valid until the next modification of this Record or
-     * the lock on this collection is released.
+     * If unowned data is returned, it is only valid until either of these happens:
+     *  - The record is modified
+     *  - The snapshot from which it was obtained is abandoned
+     *  - The lock on the collection is released
      *
-     * In general, prefer findRecord or RecordCursor::seekExact since they can tell you if a
-     * record has been removed.
+     * In general, prefer findRecord or RecordCursor::seekExact since they can tell you if a record
+     * has been removed.
      */
-    virtual RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const {
+    RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const {
         RecordData data;
         invariant(findRecord(opCtx, loc, &data));
         return data;
@@ -321,24 +342,26 @@ public:
 
     virtual void deleteRecord(OperationContext* opCtx, const RecordId& dl) = 0;
 
-    virtual StatusWith<RecordId> insertRecord(OperationContext* opCtx,
-                                              const char* data,
-                                              int len,
-                                              Timestamp timestamp) = 0;
-
+    /**
+     * Inserts the specified records into this RecordStore by copying the passed-in record data and
+     * updates 'inOutRecords' to contain the ids of the inserted records.
+     */
     virtual Status insertRecords(OperationContext* opCtx,
-                                 std::vector<Record>* records,
-                                 std::vector<Timestamp>* timestamps) {
-        int index = 0;
-        for (auto& record : *records) {
-            StatusWith<RecordId> res =
-                insertRecord(opCtx, record.data.data(), record.data.size(), (*timestamps)[index++]);
-            if (!res.isOK())
-                return res.getStatus();
+                                 std::vector<Record>* inOutRecords,
+                                 const std::vector<Timestamp>& timestamps) = 0;
 
-            record.id = res.getValue();
-        }
-        return Status::OK();
+    /**
+     * A thin wrapper around insertRecords() to simplify handling of single document inserts.
+     */
+    StatusWith<RecordId> insertRecord(OperationContext* opCtx,
+                                      const char* data,
+                                      int len,
+                                      Timestamp timestamp) {
+        std::vector<Record> inOutRecords{Record{RecordId(), RecordData(data, len)}};
+        Status status = insertRecords(opCtx, &inOutRecords, std::vector<Timestamp>{timestamp});
+        if (!status.isOK())
+            return status;
+        return inOutRecords.front().id;
     }
 
     /**
@@ -474,12 +497,8 @@ public:
      * Attempt to reduce the storage space used by this RecordStore.
      *
      * Only called if compactSupported() returns true.
-     * No RecordStoreCompactAdaptor will be passed if compactsInPlace() returns true.
      */
-    virtual Status compact(OperationContext* opCtx,
-                           RecordStoreCompactAdaptor* adaptor,
-                           const CompactOptions* options,
-                           CompactStats* stats) {
+    virtual Status compact(OperationContext* opCtx) {
         MONGO_UNREACHABLE;
     }
 
@@ -586,14 +605,6 @@ public:
 
 protected:
     std::string _ns;
-};
-
-class RecordStoreCompactAdaptor {
-public:
-    virtual ~RecordStoreCompactAdaptor() {}
-    virtual bool isDataValid(const RecordData& recData) = 0;
-    virtual size_t dataSize(const RecordData& recData) = 0;
-    virtual void inserted(const RecordData& recData, const RecordId& newLocation) = 0;
 };
 
 struct ValidateResults {

@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -212,7 +214,7 @@ void AsyncRequestsSender::_scheduleRequests() {
 
                 // Push a noop response to the queue to indicate that a remote is ready for
                 // re-processing due to failure.
-                _responseQueue.push(boost::none);
+                _responseQueue.producer.push(boost::none);
             }
         }
     }
@@ -234,8 +236,9 @@ Status AsyncRequestsSender::_scheduleRequest(size_t remoteIndex) {
 
     auto callbackStatus = _executor->scheduleRemoteCommand(
         request,
-        [remoteIndex, this](const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
-            _responseQueue.push(Job{cbData, remoteIndex});
+        [ remoteIndex, producer = _responseQueue.producer ](
+            const executor::TaskExecutor::RemoteCommandCallbackArgs& cbData) {
+            producer.push(Job{cbData, remoteIndex});
         },
         _baton);
     if (!callbackStatus.isOK()) {
@@ -248,7 +251,7 @@ Status AsyncRequestsSender::_scheduleRequest(size_t remoteIndex) {
 
 // Passing opCtx means you'd like to opt into opCtx interruption.  During cleanup we actually don't.
 void AsyncRequestsSender::_makeProgress() {
-    auto job = _responseQueue.pop(_opCtx);
+    auto job = _responseQueue.consumer.pop(_opCtx);
 
     if (!job) {
         return;
@@ -296,14 +299,8 @@ Status AsyncRequestsSender::RemoteData::resolveShardIdToHostAndPort(
                       str::stream() << "Could not find shard " << shardId);
     }
 
-    // It shouldn't be necessary to run without interruption here, but there's a subtle race around
-    // exiting early while callbacks hold a reference to this type.  The easiest way to work around
-    // it is to unconditionally block in targeting (for now).
-    auto findHostStatus = ars->_opCtx->runWithoutInterruption([&] {
-        return shard->getTargeter()
-            ->findHostWithMaxWait(readPref, Seconds{20})
-            .getNoThrow(ars->_opCtx);
-    });
+    auto findHostStatus =
+        shard->getTargeter()->findHostWithMaxWait(readPref, Seconds{20}).getNoThrow(ars->_opCtx);
 
     if (findHostStatus.isOK())
         shardHostAndPort = std::move(findHostStatus.getValue());

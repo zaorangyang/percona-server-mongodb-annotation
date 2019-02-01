@@ -1,29 +1,31 @@
-/*
- *    Copyright (C) 2013 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault;
@@ -341,6 +343,13 @@ Status storeMongoShellOptions(const moe::Environment& params,
         shellGlobalParams.gssapiHostName = params["gssapiHostName"].as<string>();
     }
 
+    if (params.count("net.compression.compressors")) {
+        auto compressors = params["net.compression.compressors"].as<string>();
+        if (compressors != "disabled") {
+            shellGlobalParams.networkMessageCompressors = std::move(compressors);
+        }
+    }
+
     if (params.count("shell")) {
         shellGlobalParams.runShell = true;
     }
@@ -456,37 +465,55 @@ Status storeMongoShellOptions(const moe::Environment& params,
 
         auto cs = cs_status.getValue();
         auto uriOptions = cs.getOptions();
-        StringBuilder sb;
-        sb << "ERROR: Cannot specify ";
 
-        if (!shellGlobalParams.username.empty() && !cs.getUser().empty() &&
-            shellGlobalParams.username != cs.getUser()) {
-            sb << "different usernames";
-        } else if (!shellGlobalParams.password.empty() && !cs.getPassword().empty() &&
-                   shellGlobalParams.password != cs.getPassword()) {
-            sb << "different passwords";
-        } else if (!shellGlobalParams.authenticationMechanism.empty() &&
-                   uriOptions.count("authMechanism") &&
-                   uriOptions["authMechanism"] != shellGlobalParams.authenticationMechanism) {
-            sb << "different authentication mechanisms";
-        } else if (!shellGlobalParams.authenticationDatabase.empty() &&
-                   uriOptions.count("authSource") &&
-                   uriOptions["authSource"] != shellGlobalParams.authenticationDatabase) {
-            sb << "different authentication databases ";
-        } else if (shellGlobalParams.gssapiServiceName != saslDefaultServiceName &&
-                   uriOptions.count("gssapiServiceName")) {
-            sb << "the GSSAPI service name";
-        } else {
-            return Status::OK();
-        }
+        auto handleURIOptions = [&] {
+            StringBuilder sb;
+            sb << "ERROR: Cannot specify ";
 
-        sb << " in connection URI and as a command-line option";
-        return Status(ErrorCodes::InvalidOptions, sb.str());
+            if (!shellGlobalParams.username.empty() && !cs.getUser().empty() &&
+                shellGlobalParams.username != cs.getUser()) {
+                sb << "different usernames";
+            } else if (!shellGlobalParams.password.empty() && !cs.getPassword().empty() &&
+                       shellGlobalParams.password != cs.getPassword()) {
+                sb << "different passwords";
+            } else if (!shellGlobalParams.authenticationMechanism.empty() &&
+                       uriOptions.count("authMechanism") &&
+                       uriOptions["authMechanism"] != shellGlobalParams.authenticationMechanism) {
+                sb << "different authentication mechanisms";
+            } else if (!shellGlobalParams.authenticationDatabase.empty() &&
+                       uriOptions.count("authSource") &&
+                       uriOptions["authSource"] != shellGlobalParams.authenticationDatabase) {
+                sb << "different authentication databases";
+            } else if (shellGlobalParams.gssapiServiceName != saslDefaultServiceName &&
+                       uriOptions.count("gssapiServiceName")) {
+                sb << "the GSSAPI service name";
+            } else if (!shellGlobalParams.networkMessageCompressors.empty() &&
+                       uriOptions.count("compressors") &&
+                       uriOptions["compressors"] != shellGlobalParams.networkMessageCompressors) {
+                sb << "different network message compressors";
+            } else {
+                return Status::OK();
+            }
+
+            sb << " in connection URI and as a command-line option";
+            return Status(ErrorCodes::InvalidOptions, sb.str());
+        };
+
+        auto uriStatus = handleURIOptions();
+        if (!uriStatus.isOK())
+            return uriStatus;
+
+        if (uriOptions.count("compressors"))
+            shellGlobalParams.networkMessageCompressors = uriOptions["compressors"];
     }
 
-    auto ret = storeMessageCompressionOptions(params);
-    if (!ret.isOK())
-        return ret;
+    if (!shellGlobalParams.networkMessageCompressors.empty()) {
+        const auto ret =
+            storeMessageCompressionOptions(shellGlobalParams.networkMessageCompressors);
+        if (!ret.isOK()) {
+            return ret;
+        }
+    }
 
     if (params.count("setShellParameter")) {
         auto ssp = params["setShellParameter"].as<std::map<std::string, std::string>>();

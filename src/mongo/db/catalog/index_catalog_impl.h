@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -53,11 +55,9 @@ struct InsertDeleteOptions;
  * how many: 1 per Collection.
  * lifecycle: attached to a Collection.
  */
-class IndexCatalogImpl : public IndexCatalog::Impl {
+class IndexCatalogImpl : public IndexCatalog {
 public:
-    explicit IndexCatalogImpl(IndexCatalog* this_,
-                              Collection* collection,
-                              int maxNumIndexesAllowed);
+    explicit IndexCatalogImpl(Collection* collection, int maxNumIndexesAllowed);
     ~IndexCatalogImpl() override;
 
     // must be called before used
@@ -173,41 +173,9 @@ public:
      */
     Status checkUnfinished() const override;
 
-    class IndexIteratorImpl : public IndexCatalog::IndexIterator::Impl {
-    public:
-        IndexIteratorImpl(OperationContext* opCtx,
-                          const IndexCatalog* cat,
-                          bool includeUnfinishedIndexes);
-
-        bool more() override;
-        IndexDescriptor* next() override;
-
-        // returns the access method for the last return IndexDescriptor
-        IndexAccessMethod* accessMethod(const IndexDescriptor* desc) override;
-
-        // returns the IndexCatalogEntry for the last return IndexDescriptor
-        IndexCatalogEntry* catalogEntry(const IndexDescriptor* desc) override;
-
-    private:
-        IndexIteratorImpl* clone_impl() const override;
-
-        void _advance();
-
-        bool _includeUnfinishedIndexes;
-
-        OperationContext* const _opCtx;
-        const IndexCatalog* _catalog;
-        IndexCatalogEntryContainer::const_iterator _iterator;
-
-        bool _start;  // only true before we've called next() or more()
-
-        IndexCatalogEntry* _prev;
-        IndexCatalogEntry* _next;
-
-        friend class IndexCatalog;
-    };
-
     using IndexIterator = IndexCatalog::IndexIterator;
+    IndexIterator getIndexIterator(OperationContext* const opCtx,
+                                   const bool includeUnfinishedIndexes) const override;
 
     // ---- index set modifiers ------
 
@@ -229,7 +197,8 @@ public:
      */
     void dropAllIndexes(OperationContext* opCtx,
                         bool includingIdIndex,
-                        stdx::function<void(const IndexDescriptor*)> onDropFn = nullptr) override;
+                        stdx::function<void(const IndexDescriptor*)> onDropFn) override;
+    void dropAllIndexes(OperationContext* opCtx, bool includingIdIndex) override;
 
     Status dropIndex(OperationContext* opCtx, IndexDescriptor* desc) override;
 
@@ -274,11 +243,14 @@ public:
      *    b) _indexBuildsInProgress++
      * 2) indexes entry in .ns file
      */
-    class IndexBuildBlock {
+    class IndexBuildBlock : public IndexCatalog::IndexBuildBlockInterface {
         MONGO_DISALLOW_COPYING(IndexBuildBlock);
 
     public:
-        IndexBuildBlock(OperationContext* opCtx, Collection* collection, const BSONObj& spec);
+        IndexBuildBlock(OperationContext* opCtx,
+                        Collection* collection,
+                        IndexCatalogImpl* catalog,
+                        const BSONObj& spec);
 
         ~IndexBuildBlock();
 
@@ -313,7 +285,7 @@ public:
 
     private:
         Collection* const _collection;
-        IndexCatalog* const _catalog;
+        IndexCatalogImpl* const _catalog;
         const std::string _ns;
 
         BSONObj _spec;
@@ -322,7 +294,6 @@ public:
         std::string _indexNamespace;
 
         IndexCatalogEntry* _entry;
-        bool _inProgress;
 
         OperationContext* _opCtx;
     };
@@ -353,17 +324,24 @@ public:
         return _getAccessMethodName(keyPattern);
     }
 
+    std::unique_ptr<IndexCatalog::IndexBuildBlockInterface> createIndexBuildBlock(
+        OperationContext* opCtx, const BSONObj& spec) override;
+
+    std::string::size_type getLongestIndexNameLength(OperationContext* opCtx) const override;
+
     // public static helpers
 
-    static BSONObj fixIndexKey(const BSONObj& key);
+    BSONObj fixIndexKey(const BSONObj& key) const override;
 
     /**
      * Fills out 'options' in order to indicate whether to allow dups or relax
      * index constraints, as needed by replication.
      */
-    static void prepareInsertDeleteOptions(OperationContext* opCtx,
-                                           const IndexDescriptor* desc,
-                                           InsertDeleteOptions* options);
+    void prepareInsertDeleteOptions(OperationContext* opCtx,
+                                    const IndexDescriptor* desc,
+                                    InsertDeleteOptions* options) const override;
+
+    void setNs(NamespaceString ns) override;
 
 private:
     static const BSONObj _idObj;  // { _id : 1 }
@@ -395,18 +373,10 @@ private:
                           bool logIfError,
                           int64_t* keysDeletedOut);
 
-    inline const IndexCatalogEntryContainer& _getEntries() const override {
-        return this->_entries;
-    }
-
-    inline IndexCatalogEntryContainer& _getEntries() override {
-        return this->_entries;
-    }
-
     /**
      * this does no sanity checks
      */
-    Status _dropIndex(OperationContext* opCtx, IndexCatalogEntry* entry) override;
+    Status _dropIndex(OperationContext* opCtx, IndexCatalogEntry* entry);
 
     // just does disk hanges
     // doesn't change memory state, etc...
@@ -425,22 +395,13 @@ private:
     // conform to the standard for insertion.  This function adds the 'v' field if it didn't
     // exist, removes the '_id' field if it exists, applies plugin-level transformations if
     // appropriate, etc.
-    static StatusWith<BSONObj> _fixIndexSpec(OperationContext* opCtx,
-                                             Collection* collection,
-                                             const BSONObj& spec);
+    StatusWith<BSONObj> _fixIndexSpec(OperationContext* opCtx,
+                                      Collection* collection,
+                                      const BSONObj& spec) const;
 
     Status _isSpecOk(OperationContext* opCtx, const BSONObj& spec) const;
 
     Status _doesSpecConflictWithExisting(OperationContext* opCtx, const BSONObj& spec) const;
-
-    inline const Collection* _getCollection() const override {
-        return this->_collection;
-    }
-
-    inline Collection* _getCollection() override {
-        return this->_collection;
-    }
-
 
     int _magic;
     Collection* const _collection;
@@ -453,22 +414,5 @@ private:
     // Certain operations are prohibited until someone fixes.
     // Retrieve by calling getAndClearUnfinishedIndexes().
     std::vector<BSONObj> _unfinishedIndexes;
-
-    IndexCatalog* const _this;
-
-
-    inline static IndexCatalogEntry* _setupInMemoryStructures(
-        IndexCatalog* const this_,
-        OperationContext* const opCtx,
-        std::unique_ptr<IndexDescriptor> descriptor,
-        const bool initFromDisk) {
-        return this_->_setupInMemoryStructures(opCtx, std::move(descriptor), initFromDisk);
-    }
-
-    inline static Status _dropIndex(IndexCatalog* const this_,
-                                    OperationContext* const opCtx,
-                                    IndexCatalogEntry* const desc) {
-        return this_->_dropIndex(opCtx, desc);
-    }
 };
 }  // namespace mongo

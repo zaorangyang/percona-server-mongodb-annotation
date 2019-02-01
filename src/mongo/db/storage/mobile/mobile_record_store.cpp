@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -257,13 +259,6 @@ long long MobileRecordStore::numRecords(OperationContext* opCtx) const {
     return _numRecs;
 }
 
-RecordData MobileRecordStore::dataFor(OperationContext* opCtx, const RecordId& recId) const {
-    RecordData recData;
-    bool recFound = findRecord(opCtx, recId, &recData);
-    invariant(recFound);
-    return recData;
-}
-
 bool MobileRecordStore::findRecord(OperationContext* opCtx,
                                    const RecordId& recId,
                                    RecordData* rd) const {
@@ -303,25 +298,31 @@ void MobileRecordStore::deleteRecord(OperationContext* opCtx, const RecordId& re
     deleteStmt.step(SQLITE_DONE);
 }
 
-StatusWith<RecordId> MobileRecordStore::insertRecord(OperationContext* opCtx,
-                                                     const char* data,
-                                                     int len,
-                                                     Timestamp) {
+Status MobileRecordStore::insertRecords(OperationContext* opCtx,
+                                        std::vector<Record>* inOutRecords,
+                                        const std::vector<Timestamp>& timestamps) {
     // Inserts record into SQLite table (or replaces if duplicate record id).
     MobileSession* session = MobileRecoveryUnit::get(opCtx)->getSession(opCtx, false);
 
-    _changeNumRecs(opCtx, 1);
-    _changeDataSize(opCtx, len);
+    for (auto& record : *inOutRecords) {
+        const auto data = record.data.data();
+        const auto len = record.data.size();
 
-    std::string insertQuery =
-        "INSERT OR REPLACE INTO \"" + _ident + "\"(rec_id, data) VALUES(?, ?);";
-    SqliteStatement insertStmt(*session, insertQuery);
-    RecordId recId = _nextId();
-    insertStmt.bindInt(0, recId.repr());
-    insertStmt.bindBlob(1, data, len);
-    insertStmt.step(SQLITE_DONE);
+        _changeNumRecs(opCtx, 1);
+        _changeDataSize(opCtx, len);
 
-    return StatusWith<RecordId>(recId);
+        std::string insertQuery =
+            "INSERT OR REPLACE INTO \"" + _ident + "\"(rec_id, data) VALUES(?, ?);";
+        SqliteStatement insertStmt(*session, insertQuery);
+        RecordId recId = _nextId();
+        insertStmt.bindInt(0, recId.repr());
+        insertStmt.bindBlob(1, data, len);
+        insertStmt.step(SQLITE_DONE);
+
+        record.id = recId;
+    }
+
+    return Status::OK();
 }
 
 Status MobileRecordStore::insertRecordsWithDocWriter(OperationContext* opCtx,

@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
@@ -35,19 +37,25 @@
 #include <string>
 
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/internal_user_auth.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
-
-using std::shared_ptr;
-using std::endl;
-using std::string;
-
 namespace repl {
+namespace {
+
+// Gets the singleton AuthorizationManager object for this server process
+//
+// TODO (SERVER-37563): Pass the service context instead of calling getGlobalServiceContext.
+AuthorizationManager* getGlobalAuthorizationManager() {
+    AuthorizationManager* globalAuthManager = AuthorizationManager::get(getGlobalServiceContext());
+    fassert(16842, globalAuthManager != nullptr);
+    return globalAuthManager;
+}
+
+}  // namespace
 
 bool replAuthenticate(DBClientBase* conn) {
     if (isInternalAuthSet())
@@ -70,12 +78,13 @@ OplogReader::OplogReader() {
 bool OplogReader::connect(const HostAndPort& host) {
     if (conn() == NULL || _host != host) {
         resetConnection();
-        _conn = shared_ptr<DBClientConnection>(
+        _conn = std::shared_ptr<DBClientConnection>(
             new DBClientConnection(false, durationCount<Seconds>(kSocketTimeout)));
-        string errmsg;
+
+        std::string errmsg;
         if (!_conn->connect(host, StringData(), errmsg) || !replAuthenticate(_conn.get())) {
             resetConnection();
-            error() << errmsg << endl;
+            error() << errmsg;
             return false;
         }
         _conn->setTags(transport::Session::kKeepOpen);
@@ -93,7 +102,7 @@ void OplogReader::tailCheck() {
 
 void OplogReader::tailingQuery(const char* ns, const BSONObj& query) {
     verify(!haveCursor());
-    LOG(2) << ns << ".find(" << redact(query) << ')' << endl;
+    LOG(2) << ns << ".find(" << redact(query) << ')';
     cursor.reset(
         _conn->query(NamespaceString(ns), query, 0, 0, nullptr, _tailingQueryOptions).release());
 }

@@ -72,6 +72,7 @@ selector:
   - jstests/sharding/bulk_insert.js
   - jstests/sharding/printShardingStatus.js
   - jstests/sharding/refresh_sessions.js
+  - jstests/sharding/shard_collection_existing_zones.js
   # Balancer writes (direct write to config database with no retries)
   - jstests/sharding/convert_to_and_from_sharded.js
   - jstests/sharding/remove2.js
@@ -176,6 +177,11 @@ selector:
   #  - jstests/sharding/names.js
   #  - jstests/sharding/remove1.js
   #  - jstests/sharding/remove2.js
+
+  # Moves a chunk before continuing a transaction, which can lead to snapshot errors if the
+  # CSRS failovers are sufficiently slow.
+  - jstests/sharding/transactions_reject_writes_for_moved_chunks.js
+  - jstests/sharding/transactions_target_at_point_in_time.js
 
 executor:
   config:

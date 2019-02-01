@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,6 +29,9 @@
  */
 
 #pragma once
+
+#include <boost/optional.hpp>
+#include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/logical_session_id.h"
@@ -54,8 +59,6 @@ class SessionCatalog {
     friend class ScopedCheckedOutSession;
 
 public:
-    class PreventCheckingOutSessionsBlock;
-
     SessionCatalog() = default;
     ~SessionCatalog();
 
@@ -66,36 +69,30 @@ public:
     static SessionCatalog* get(ServiceContext* service);
 
     /**
-     * Fetches the UUID of the transaction table, or an empty optional if the collection does not
-     * exist or has no UUID. Acquires a lock on the collection. Required for rollback via refetch.
-     */
-    static boost::optional<UUID> getTransactionTableUUID(OperationContext* opCtx);
-
-    /**
      * Resets the transaction table to an uninitialized state.
      * Meant only for testing.
      */
     void reset_forTest();
 
     /**
-     * Invoked when the node enters the primary state. Ensures that the transactions collection is
-     * created. Throws on severe exceptions due to which it is not safe to continue the step-up
-     * process.
-     */
-    void onStepUp(OperationContext* opCtx);
-
-    /**
      * Potentially blocking call, which uses the session information stored in the specified
-     * operation context and either creates a new session runtime state (if one doesn't exist) or
-     * "checks-out" the existing one (if it is not currently in use).
+     * operation context and either creates a brand new session object (if one doesn't exist) or
+     * "checks-out" the existing one (if it is not currently in use or marked for kill).
      *
-     * Checking out a session puts it in the 'in use' state and all subsequent calls to checkout
-     * will block until it is put back in the 'available' state when the returned object goes out of
-     * scope.
+     * Checking out a session puts it in the 'checked out' state and all subsequent calls to
+     * checkout will block until it is checked back in. This happens when the returned object goes
+     * out of scope.
      *
      * Throws exception on errors.
      */
     ScopedCheckedOutSession checkOutSession(OperationContext* opCtx);
+
+    /**
+     * See the description of 'Session::kill' for more information on the session kill usage
+     * pattern.
+     */
+    ScopedCheckedOutSession checkOutSessionForKill(OperationContext* opCtx,
+                                                   Session::KillToken killToken);
 
     /**
      * Returns a reference to the specified cached session regardless of whether it is checked-out
@@ -109,47 +106,38 @@ public:
     ScopedSession getOrCreateSession(OperationContext* opCtx, const LogicalSessionId& lsid);
 
     /**
-     * Callback to be invoked when it is suspected that the on-disk session contents might not be in
-     * sync with what is in the sessions cache.
+     * Iterates through the SessionCatalog under the SessionCatalog mutex and applies 'workerFn' to
+     * each Session which matches the specified 'matcher'.
      *
-     * If no specific document is available, the method will invalidate all sessions. Otherwise if
-     * one is avaiable (which is the case for insert/update/delete), it must contain _id field with
-     * a valid session entry, in which case only that particular session will be invalidated. If the
-     * _id field is missing or doesn't contain a valid serialization of logical session, the method
-     * will throw. This prevents invalid entries from making it in the collection.
-     */
-    void invalidateSessions(OperationContext* opCtx, boost::optional<BSONObj> singleSessionDoc);
-
-    /**
+     * NOTE: Since this method runs with the session catalog mutex, the work done by 'workerFn' is
+     * not allowed to block, perform I/O or acquire any lock manager locks.
      * Iterates through the SessionCatalog and applies 'workerFn' to each Session. This locks the
      * SessionCatalog.
+     *
      * TODO SERVER-33850: Take Matcher out of the SessionKiller namespace.
      */
-    void scanSessions(OperationContext* opCtx,
-                      const SessionKiller::Matcher& matcher,
-                      stdx::function<void(OperationContext*, Session*)> workerFn);
+    using ScanSessionsCallbackFn = stdx::function<void(WithLock, Session*)>;
+    void scanSessions(const SessionKiller::Matcher& matcher,
+                      const ScanSessionsCallbackFn& workerFn);
+
+    /**
+     * Shortcut to invoke 'kill' on the specified session under the SessionCatalog mutex. Throws a
+     * NoSuchSession exception if the session doesn't exist.
+     */
+    Session::KillToken killSession(const LogicalSessionId& lsid);
 
 private:
     struct SessionRuntimeInfo {
-        SessionRuntimeInfo(LogicalSessionId lsid) : txnState(std::move(lsid)) {}
+        SessionRuntimeInfo(LogicalSessionId lsid) : session(std::move(lsid)) {}
 
-        // Current check-out state of the session. If set to false, the session can be checked out.
-        // If set to true, the session is in use by another operation and the caller must wait to
-        // check it out.
-        bool checkedOut{false};
+        // Must only be accessed when the state is kInUse and only by the operation context, which
+        // currently has it checked out
+        Session session;
 
         // Signaled when the state becomes available. Uses the transaction table's mutex to protect
         // the state transitions.
         stdx::condition_variable availableCondVar;
-
-        // Must only be accessed when the state is kInUse and only by the operation context, which
-        // currently has it checked out
-        Session txnState;
     };
-
-    using SessionRuntimeInfoMap = stdx::unordered_map<LogicalSessionId,
-                                                      std::shared_ptr<SessionRuntimeInfo>,
-                                                      LogicalSessionIdHash>;
 
     /**
      * May release and re-acquire it zero or more times before returning. The returned
@@ -162,49 +150,13 @@ private:
     /**
      * Makes a session, previously checked out through 'checkoutSession', available again.
      */
-    void _releaseSession(const LogicalSessionId& lsid);
+    void _releaseSession(const LogicalSessionId& lsid,
+                         boost::optional<Session::KillToken> killToken);
 
-    bool _isSessionCheckoutAllowed() const {
-        return _preventSessionCheckoutRequests == 0;
-    };
-
-    // Protects members below.
     stdx::mutex _mutex;
 
     // Owns the Session objects for all current Sessions.
-    SessionRuntimeInfoMap _sessions;
-
-    // Count of the number of Sessions that are currently checked out.
-    uint32_t _numCheckedOutSessions{0};
-
-    // When >0 all Session checkout or creation requests will block.
-    uint32_t _preventSessionCheckoutRequests{0};
-
-    // Condition that is signaled when the number of checked out sessions goes to 0.
-    stdx::condition_variable _allSessionsCheckedInCond;
-
-    // Condition that is signaled when checking out Sessions becomes legal again after having
-    // previously been forbidden.
-    stdx::condition_variable _checkingOutSessionsAllowedCond;
-};
-
-/**
- * While this object is in scope, all requests to check out a Session will block.
- */
-class SessionCatalog::PreventCheckingOutSessionsBlock {
-    MONGO_DISALLOW_COPYING(PreventCheckingOutSessionsBlock);
-
-public:
-    explicit PreventCheckingOutSessionsBlock(SessionCatalog* sessionCatalog);
-    ~PreventCheckingOutSessionsBlock();
-
-    /**
-     * Waits until there are no Sessions checked out in the SessionCatalog.
-     */
-    void waitForAllSessionsToBeCheckedIn(OperationContext* opCtx);
-
-private:
-    SessionCatalog* _sessionCatalog{nullptr};
+    LogicalSessionIdMap<std::shared_ptr<SessionRuntimeInfo>> _sessions;
 };
 
 /**
@@ -218,7 +170,7 @@ public:
     }
 
     Session* get() const {
-        return &_sri->txnState;
+        return &_sri->session;
     }
 
     Session* operator->() const {
@@ -245,13 +197,16 @@ class ScopedCheckedOutSession {
     MONGO_DISALLOW_COPYING(ScopedCheckedOutSession);
 
     friend ScopedCheckedOutSession SessionCatalog::checkOutSession(OperationContext*);
+    friend ScopedCheckedOutSession SessionCatalog::checkOutSessionForKill(OperationContext*,
+                                                                          Session::KillToken);
 
 public:
     ScopedCheckedOutSession(ScopedCheckedOutSession&&) = default;
 
     ~ScopedCheckedOutSession() {
         if (_scopedSession) {
-            SessionCatalog::get(_opCtx)->_releaseSession(_scopedSession->getSessionId());
+            SessionCatalog::get(_opCtx)->_releaseSession(_scopedSession->getSessionId(),
+                                                         std::move(_killToken));
         }
     }
 
@@ -272,10 +227,16 @@ public:
     }
 
 private:
-    ScopedCheckedOutSession(OperationContext* opCtx, ScopedSession scopedSession)
-        : _opCtx(opCtx), _scopedSession(std::move(scopedSession)) {}
+    ScopedCheckedOutSession(OperationContext* opCtx,
+                            ScopedSession scopedSession,
+                            boost::optional<Session::KillToken> killToken)
+        : _opCtx(opCtx),
+          _killToken(std::move(killToken)),
+          _scopedSession(std::move(scopedSession)) {}
 
     OperationContext* const _opCtx;
+
+    boost::optional<Session::KillToken> _killToken;
 
     ScopedSession _scopedSession;
 };

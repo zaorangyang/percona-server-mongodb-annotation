@@ -207,7 +207,10 @@ class _TestList(object):
             else:
                 path = os.path.normpath(path)
                 if path not in self._roots:
-                    raise ValueError("Unrecognized test file: {}".format(path))
+                    raise ValueError(
+                        ("Excluded test file {} does not exist, perhaps it was renamed or removed"
+                         " , and should be modified in, or removed from, the exclude_files list.".
+                         format(path)))
                 self._filtered.discard(path)
 
     def match_tag_expression(self, tag_expression, get_tags):
@@ -633,11 +636,11 @@ class _DbTestSelector(_Selector):
         return test_files.get_tests()
 
 
-class _JsonTestSelectorConfig(_SelectorConfig):
+class _FileBasedSelectorConfig(_SelectorConfig):
     """_SelectorConfig subclass for json_schema_test and mql_model_mongod_test tests."""
 
     def __init__(self, roots, include_files=None, exclude_files=None):
-        """Initialize _JsonTestSelectorConfig."""
+        """Initialize _FileBasedSelectorConfig."""
         _SelectorConfig.__init__(self, roots=roots, include_files=include_files,
                                  exclude_files=exclude_files)
 
@@ -676,17 +679,18 @@ _SELECTOR_REGISTRY = {
     "cpp_integration_test": (_CppTestSelectorConfig, _CppTestSelector),
     "cpp_unit_test": (_CppTestSelectorConfig, _CppTestSelector),
     "benchmark_test": (_CppTestSelectorConfig, _CppTestSelector),
-    "benchrun_embedded_test": (_JsonTestSelectorConfig, _Selector),
+    "benchrun_embedded_test": (_FileBasedSelectorConfig, _Selector),
     "db_test": (_DbTestSelectorConfig, _DbTestSelector),
     "fsm_workload_test": (_JSTestSelectorConfig, _JSTestSelector),
     "parallel_fsm_workload_test": (_MultiJSTestSelectorConfig, _MultiJSTestSelector),
-    "json_schema_test": (_JsonTestSelectorConfig, _Selector),
+    "json_schema_test": (_FileBasedSelectorConfig, _Selector),
     "js_test": (_JSTestSelectorConfig, _JSTestSelector),
-    "mql_model_haskell_test": (_JsonTestSelectorConfig, _Selector),
-    "mql_model_mongod_test": (_JsonTestSelectorConfig, _Selector),
+    "mql_model_haskell_test": (_FileBasedSelectorConfig, _Selector),
+    "mql_model_mongod_test": (_FileBasedSelectorConfig, _Selector),
     "multi_stmt_txn_passthrough": (_JSTestSelectorConfig, _JSTestSelector),
     "py_test": (_PyTestCaseSelectorConfig, _Selector),
     "sleep_test": (_SleepTestCaseSelectorConfig, _SleepTestCaseSelector),
+    "genny_test": (_FileBasedSelectorConfig, _Selector),
 }
 
 

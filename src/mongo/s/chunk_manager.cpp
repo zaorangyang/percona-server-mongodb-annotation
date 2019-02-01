@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -84,9 +86,8 @@ RoutingTableHistory::RoutingTableHistory(NamespaceString nss,
       _defaultCollator(std::move(defaultCollator)),
       _unique(unique),
       _chunkMap(std::move(chunkMap)),
-      _shardVersions(
-          _constructShardVersionMap(collectionVersion.epoch(), _chunkMap, _shardKeyOrdering)),
-      _collectionVersion(collectionVersion) {}
+      _collectionVersion(collectionVersion),
+      _shardVersions(_constructShardVersionMap()) {}
 
 Chunk ChunkManager::findIntersectingChunk(const BSONObj& shardKey, const BSONObj& collation) const {
     const bool hasSimpleCollation = (collation.isEmpty() && !_rt->getDefaultCollator()) ||
@@ -286,10 +287,11 @@ IndexBounds ChunkManager::getIndexBoundsForQuery(const BSONObj& key,
                           false /* sparse */,
                           false /* unique */,
                           IndexEntry::Identifier{"shardkey"},
-                          NULL /* filterExpr */,
+                          nullptr /* filterExpr */,
                           BSONObj(),
-                          NULL /* collator */);
-    plannerParams.indices.push_back(indexEntry);
+                          nullptr, /* collator */
+                          nullptr /* projExec */);
+    plannerParams.indices.push_back(std::move(indexEntry));
 
     auto solutions = uassertStatusOK(QueryPlanner::plan(canonicalQuery, plannerParams));
 
@@ -403,66 +405,65 @@ std::string RoutingTableHistory::toString() const {
     return sb.str();
 }
 
-ShardVersionMap RoutingTableHistory::_constructShardVersionMap(const OID& epoch,
-                                                               const ChunkInfoMap& chunkMap,
-                                                               Ordering shardKeyOrdering) {
+ShardVersionMap RoutingTableHistory::_constructShardVersionMap() const {
+    const OID& epoch = _collectionVersion.epoch();
+
     ShardVersionMap shardVersions;
-    ChunkInfoMap::const_iterator current = chunkMap.cbegin();
+    ChunkInfoMap::const_iterator current = _chunkMap.cbegin();
 
     boost::optional<BSONObj> firstMin = boost::none;
     boost::optional<BSONObj> lastMax = boost::none;
 
-    while (current != chunkMap.cend()) {
+    while (current != _chunkMap.cend()) {
         const auto& firstChunkInRange = current->second;
+        const auto& currentRangeShardId = firstChunkInRange->getShardIdAt(boost::none);
 
         // Tracks the max shard version for the shard on which the current range will reside
-        auto shardVersionIt = shardVersions.find(firstChunkInRange->getShardIdAt(boost::none));
+        auto shardVersionIt = shardVersions.find(currentRangeShardId);
         if (shardVersionIt == shardVersions.end()) {
-            shardVersionIt = shardVersions
-                                 .emplace(firstChunkInRange->getShardIdAt(boost::none),
-                                          ChunkVersion(0, 0, epoch))
-                                 .first;
+            shardVersionIt =
+                shardVersions.emplace(currentRangeShardId, ChunkVersion(0, 0, epoch)).first;
         }
 
         auto& maxShardVersion = shardVersionIt->second;
 
-        current = std::find_if(
-            current,
-            chunkMap.cend(),
-            [&firstChunkInRange, &maxShardVersion](const ChunkInfoMap::value_type& chunkMapEntry) {
-                const auto& currentChunk = chunkMapEntry.second;
+        current =
+            std::find_if(current,
+                         _chunkMap.cend(),
+                         [&currentRangeShardId,
+                          &maxShardVersion](const ChunkInfoMap::value_type& chunkMapEntry) {
+                             const auto& currentChunk = chunkMapEntry.second;
 
-                if (currentChunk->getShardIdAt(boost::none) !=
-                    firstChunkInRange->getShardIdAt(boost::none))
-                    return true;
+                             if (currentChunk->getShardIdAt(boost::none) != currentRangeShardId)
+                                 return true;
 
-                if (currentChunk->getLastmod() > maxShardVersion)
-                    maxShardVersion = currentChunk->getLastmod();
+                             if (currentChunk->getLastmod() > maxShardVersion)
+                                 maxShardVersion = currentChunk->getLastmod();
 
-                return false;
-            });
+                             return false;
+                         });
 
         const auto rangeLast = std::prev(current);
 
-        const BSONObj rangeMin = firstChunkInRange->getMin();
-        const BSONObj rangeMax = rangeLast->second->getMax();
+        const auto& rangeMin = firstChunkInRange->getMin();
+        const auto& rangeMax = rangeLast->second->getMax();
 
-        if (lastMax) {
-            uassert(ErrorCodes::ConflictingOperationInProgress,
-                    str::stream()
-                        << "Metadata contains chunks with the same or out-of-order max value; "
-                           "expected "
-                        << lastMax.get()
-                        << " < "
-                        << rangeMax,
-                    SimpleBSONObjComparator::kInstance.evaluate(lastMax.get() < rangeMax));
-            // Make sure there are no gaps in the ranges
-            uassert(ErrorCodes::ConflictingOperationInProgress,
-                    str::stream() << "Gap or an overlap between ranges "
-                                  << ChunkRange(rangeMin, rangeMax).toString()
-                                  << " and "
-                                  << lastMax.get(),
-                    SimpleBSONObjComparator::kInstance.evaluate(lastMax.get() == rangeMin));
+        // Check the continuity of the chunks map
+        if (lastMax && !SimpleBSONObjComparator::kInstance.evaluate(*lastMax == rangeMin)) {
+            if (SimpleBSONObjComparator::kInstance.evaluate(*lastMax < rangeMin))
+                uasserted(ErrorCodes::ConflictingOperationInProgress,
+                          str::stream()
+                              << "Gap exists in the routing table between chunks "
+                              << _chunkMap.at(_extractKeyString(*lastMax))->getRange().toString()
+                              << " and "
+                              << rangeLast->second->getRange().toString());
+            else
+                uasserted(ErrorCodes::ConflictingOperationInProgress,
+                          str::stream()
+                              << "Overlap exists in the routing table between chunks "
+                              << _chunkMap.at(_extractKeyString(*lastMax))->getRange().toString()
+                              << " and "
+                              << rangeLast->second->getRange().toString());
         }
 
         if (!firstMin)
@@ -475,7 +476,7 @@ ShardVersionMap RoutingTableHistory::_constructShardVersionMap(const OID& epoch,
         invariant(maxShardVersion.isSet());
     }
 
-    if (!chunkMap.empty()) {
+    if (!_chunkMap.empty()) {
         invariant(!shardVersions.empty());
         invariant(firstMin.is_initialized());
         invariant(lastMax.is_initialized());

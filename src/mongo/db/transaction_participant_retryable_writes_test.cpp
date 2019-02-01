@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2017 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -41,8 +43,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_transactions_metrics.h"
 #include "mongo/db/service_context.h"
-#include "mongo/db/session_catalog.h"
-#include "mongo/db/stats/fill_locker_info.h"
+#include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/stdx/future.h"
 #include "mongo/stdx/memory.h"
@@ -120,6 +121,20 @@ public:
         onTransactionCommitFn =
             [this](boost::optional<OplogSlot> commitOplogEntryOpTime,
                    boost::optional<Timestamp> commitTimestamp) { transactionCommitted = true; };
+
+    repl::OpTime onDropCollection(OperationContext* opCtx,
+                                  const NamespaceString& collectionName,
+                                  OptionalCollectionUUID uuid,
+                                  const CollectionDropType dropType) override {
+        // If the oplog is not disabled for this namespace, then we need to reserve an op time for
+        // the drop.
+        if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collectionName)) {
+            OpObserver::Times::get(opCtx).reservedOpTimes.push_back(dropOpTime);
+        }
+        return {};
+    }
+
+    const repl::OpTime dropOpTime = {Timestamp(Seconds(100), 1U), 1LL};
 };
 
 class TransactionParticipantRetryableWritesTest : public MockReplCoordServerFixture {
@@ -127,10 +142,9 @@ protected:
     void setUp() final {
         MockReplCoordServerFixture::setUp();
 
-        auto service = opCtx()->getServiceContext();
-        SessionCatalog::get(service)->reset_forTest();
-        SessionCatalog::get(service)->onStepUp(opCtx());
+        MongoDSessionCatalog::onStepUp(opCtx());
 
+        const auto service = opCtx()->getServiceContext();
         OpObserverRegistry* opObserverRegistry =
             dynamic_cast<OpObserverRegistry*>(service->getOpObserver());
         auto mockObserver = stdx::make_unique<OpObserverMock>();
@@ -139,8 +153,11 @@ protected:
     }
 
     void tearDown() final {
-        MockReplCoordServerFixture::tearDown();
         _opObserver = nullptr;
+
+        SessionCatalog::get(opCtx()->getServiceContext())->reset_forTest();
+
+        MockReplCoordServerFixture::tearDown();
     }
 
     SessionCatalog* catalog() {

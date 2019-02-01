@@ -46,6 +46,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/lasterror',
         'cluster_last_error_info',
         'grid',
+        'sharding_router_api',
         'sharding_routing_table',
     ],
 )
@@ -53,7 +54,6 @@ env.Library(
 env.Library(
     target='sharding_router_api',
     source=[
-        'at_cluster_time_util.cpp',
         'cluster_commands_helpers.cpp',
         'multi_statement_transaction_requests_sender.cpp',
         'transaction_router.cpp',
@@ -322,6 +322,18 @@ env.Library(
     ],
 )
 
+env.CppUnitTest(
+    target='sharding_task_executor_test',
+    source=[
+        'sharding_task_executor_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/auth/authmocks',
+        'sharding_task_executor',
+        'shard_server_test_fixture',
+    ],
+)
+
 # This library contains sharding functionality used by both mongod and mongos
 env.Library(
     target='grid',
@@ -375,6 +387,7 @@ env.CppUnitTest(
         'catalog_cache_refresh_test.cpp',
         'chunk_manager_index_bounds_test.cpp',
         'chunk_manager_query_test.cpp',
+        'chunk_test.cpp',
         'routing_table_history_test.cpp',
         'shard_key_pattern_test.cpp',
     ],
@@ -502,19 +515,6 @@ env.CppUnitTest(
     LIBDEPS=[
         'sharding_router_api',
         'sharding_router_test_fixture',
-    ]
-)
-
-env.CppUnitTest(
-    target='append_at_cluster_time_test',
-    source=[
-        'append_at_cluster_time_test.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/logical_time',
-        '$BUILD_DIR/mongo/unittest/unittest',
-        'sharding_router_api',
     ]
 )
 

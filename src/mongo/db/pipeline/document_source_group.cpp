@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -27,6 +29,8 @@
  */
 
 #include "mongo/platform/basic.h"
+
+#include <boost/filesystem/operations.hpp>
 
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
@@ -39,8 +43,27 @@
 #include "mongo/db/pipeline/value.h"
 #include "mongo/db/pipeline/value_comparator.h"
 #include "mongo/stdx/memory.h"
+#include "mongo/util/destructor_guard.h"
 
 namespace mongo {
+
+namespace {
+
+/**
+ * Generates a new file name on each call using a static, atomic and monotonically increasing
+ * number.
+ *
+ * Each user of the Sorter must implement this function to ensure that all temporary files that the
+ * Sorter instances produce are uniquely identified using a unique file name extension with separate
+ * atomic variable. This is necessary because the sorter.cpp code is separately included in multiple
+ * places, rather than compiled in one place and linked, and so cannot provide a globally unique ID.
+ */
+std::string nextFileName() {
+    static AtomicUInt32 documentSourceGroupFileCounter;
+    return "extsort-doc-group." + std::to_string(documentSourceGroupFileCounter.fetchAndAdd(1));
+}
+
+}  // namespace
 
 using boost::intrusive_ptr;
 using std::pair;
@@ -343,7 +366,18 @@ DocumentSourceGroup::DocumentSourceGroup(const intrusive_ptr<ExpressionContext>&
       _initialized(false),
       _groups(pExpCtx->getValueComparator().makeUnorderedValueMap<Accumulators>()),
       _spilled(false),
-      _allowDiskUse(pExpCtx->allowDiskUse && !pExpCtx->inMongos) {}
+      _allowDiskUse(pExpCtx->allowDiskUse && !pExpCtx->inMongos) {
+    if (!pExpCtx->inMongos && (pExpCtx->allowDiskUse || kDebugBuild)) {
+        // We spill to disk in debug mode, regardless of allowDiskUse, to stress the system.
+        _fileName = pExpCtx->tempDir + "/" + nextFileName();
+    }
+}
+
+DocumentSourceGroup::~DocumentSourceGroup() {
+    if (_ownsFileDeletion) {
+        DESTRUCTOR_GUARD(boost::filesystem::remove(_fileName));
+    }
+}
 
 void DocumentSourceGroup::addAccumulator(AccumulationStatement accumulationStatement) {
     _accumulatedFields.push_back(accumulationStatement);
@@ -635,7 +669,11 @@ DocumentSource::GetNextResult DocumentSourceGroup::initialize() {
                 _groups = pExpCtx->getValueComparator().makeUnorderedValueMap<Accumulators>();
 
                 _sorterIterator.reset(Sorter<Value, Value>::Iterator::merge(
-                    _sortedFiles, SortOptions(), SorterComparator(pExpCtx->getValueComparator())));
+                    _sortedFiles,
+                    _fileName,
+                    SortOptions(),
+                    SorterComparator(pExpCtx->getValueComparator())));
+                _ownsFileDeletion = false;
 
                 // prepare current to accumulate data
                 _currentAccumulators.reserve(numAccumulators);
@@ -673,7 +711,8 @@ shared_ptr<Sorter<Value, Value>::Iterator> DocumentSourceGroup::spill() {
 
     stable_sort(ptrs.begin(), ptrs.end(), SpillSTLComparator(pExpCtx->getValueComparator()));
 
-    SortedFileWriter<Value, Value> writer(SortOptions().TempDir(pExpCtx->tempDir));
+    SortedFileWriter<Value, Value> writer(
+        SortOptions().TempDir(pExpCtx->tempDir), _fileName, _nextSortedFileWriterOffset);
     switch (_accumulatedFields.size()) {  // same as ptrs[i]->second.size() for all i.
         case 0:                           // no values, essentially a distinct
             for (size_t i = 0; i < ptrs.size(); i++) {
@@ -701,7 +740,9 @@ shared_ptr<Sorter<Value, Value>::Iterator> DocumentSourceGroup::spill() {
 
     _groups->clear();
 
-    return shared_ptr<Sorter<Value, Value>::Iterator>(writer.done());
+    Sorter<Value, Value>::Iterator* iteratorPtr = writer.done();
+    _nextSortedFileWriterOffset = writer.getFileEndOffset();
+    return shared_ptr<Sorter<Value, Value>::Iterator>(iteratorPtr);
 }
 
 boost::optional<BSONObj> DocumentSourceGroup::findRelevantInputSort() const {
@@ -1013,6 +1054,7 @@ DocumentSourceGroup::rewriteGroupAsTransformOnFirstDocument() const {
 
     return GroupFromFirstDocumentTransformation::create(pExpCtx, groupId, std::move(fields));
 }
+
 }  // namespace mongo
 
 #include "mongo/db/sorter/sorter.cpp"

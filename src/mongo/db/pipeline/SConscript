@@ -280,8 +280,9 @@ env.Library(
         'mongo_process_common.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
+        '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/generic_cursor',
+        '$BUILD_DIR/mongo/s/sharding_router_api',
         'field_path',
     ]
 )
@@ -319,7 +320,6 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/s/query/async_results_merger',
-        '$BUILD_DIR/mongo/s/sharding_router_api',
         'mongo_process_common',
     ]
 )
@@ -361,7 +361,6 @@ pipelineeEnv.Library(
         'document_source_internal_split_pipeline.cpp',
         'document_source_limit.cpp',
         'document_source_list_cached_and_active_users.cpp',
-        'document_source_list_local_cursors.cpp',
         'document_source_list_local_sessions.cpp',
         'document_source_list_sessions.cpp',
         'document_source_lookup.cpp',
@@ -389,7 +388,7 @@ pipelineeEnv.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
-        '$BUILD_DIR/mongo/db/auth/authorization_manager_global',
+        '$BUILD_DIR/mongo/db/auth/auth',
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/generic_cursor',
@@ -420,6 +419,7 @@ pipelineeEnv.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
+        '$BUILD_DIR/mongo/rpc/command_status',
     ]
 )
 
@@ -496,6 +496,7 @@ env.Library(
     target='parsed_aggregation_projection',
     source=[
         'parsed_aggregation_projection.cpp',
+        'parsed_aggregation_projection_node.cpp',
         'parsed_exclusion_projection.cpp',
         'parsed_inclusion_projection.cpp',
         'parsed_add_fields.cpp',

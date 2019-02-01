@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2016 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -43,6 +45,7 @@
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/query/query_test_service_context.h"
 #include "mongo/db/server_options.h"
+#include "mongo/unittest/ensure_fcv.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -51,35 +54,10 @@ namespace {
 using index_key_validate::validateIndexSpec;
 using index_key_validate::validateIdIndexSpec;
 using index_key_validate::validateIndexSpecCollation;
+using unittest::EnsureFCV;
 
 const NamespaceString kTestNamespace("test", "index_spec_validate");
 constexpr OperationContext* kDefaultOpCtx = nullptr;
-
-/**
- * Helper class to ensure proper FCV & test commands enabled.
- */
-class TestCommandFcvGuard {
-
-public:
-    TestCommandFcvGuard() {
-        _prevVersion = serverGlobalParams.featureCompatibility.getVersion();
-        serverGlobalParams.featureCompatibility.setVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
-        // TODO: Remove test command enabling/disabling in SERVER-36198
-        _prevEnabled = getTestCommandsEnabled();
-        setTestCommandsEnabled(true);
-    }
-
-    ~TestCommandFcvGuard() {
-        serverGlobalParams.featureCompatibility.setVersion(_prevVersion);
-        setTestCommandsEnabled(_prevEnabled);
-    }
-
-private:
-    bool _prevEnabled;
-    ServerGlobalParams::FeatureCompatibility::Version _prevVersion;
-};
-
 
 /**
  * Helper function used to return the fields of a BSONObj in a consistent order.
@@ -833,7 +811,7 @@ TEST(IndexSpecPartialFilterTest, AcceptsValidPartialFilterExpression) {
 }
 
 TEST(IndexSpecWildcard, SucceedsWithInclusion) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
@@ -845,7 +823,7 @@ TEST(IndexSpecWildcard, SucceedsWithInclusion) {
 }
 
 TEST(IndexSpecWildcard, SucceedsWithExclusion) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
@@ -857,7 +835,7 @@ TEST(IndexSpecWildcard, SucceedsWithExclusion) {
 }
 
 TEST(IndexSpecWildcard, SucceedsWithExclusionIncludingId) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
@@ -869,7 +847,7 @@ TEST(IndexSpecWildcard, SucceedsWithExclusionIncludingId) {
 }
 
 TEST(IndexSpecWildcard, SucceedsWithInclusionExcludingId) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
@@ -881,7 +859,7 @@ TEST(IndexSpecWildcard, SucceedsWithInclusionExcludingId) {
 }
 
 TEST(IndexSpecWildcard, FailsWithInclusionExcludingIdSubfield) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
@@ -893,7 +871,7 @@ TEST(IndexSpecWildcard, FailsWithInclusionExcludingIdSubfield) {
 }
 
 TEST(IndexSpecWildcard, FailsWithExclusionIncludingIdSubfield) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
@@ -905,7 +883,7 @@ TEST(IndexSpecWildcard, FailsWithExclusionIncludingIdSubfield) {
 }
 
 TEST(IndexSpecWildcard, FailsWithImproperFeatureCompatabilityVersion) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     serverGlobalParams.featureCompatibility.setVersion(
         ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
@@ -917,7 +895,7 @@ TEST(IndexSpecWildcard, FailsWithImproperFeatureCompatabilityVersion) {
 }
 
 TEST(IndexSpecWildcard, FailsWithMixedProjection) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
@@ -929,7 +907,7 @@ TEST(IndexSpecWildcard, FailsWithMixedProjection) {
 }
 
 TEST(IndexSpecWildcard, FailsWithComputedFieldsInProjection) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
@@ -942,7 +920,7 @@ TEST(IndexSpecWildcard, FailsWithComputedFieldsInProjection) {
 }
 
 TEST(IndexSpecWildcard, FailsWhenProjectionPluginNotWildcard) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("a" << 1) << "name"
                                                << "indexName"
@@ -954,7 +932,7 @@ TEST(IndexSpecWildcard, FailsWhenProjectionPluginNotWildcard) {
 }
 
 TEST(IndexSpecWildcard, FailsWhenProjectionIsNotAnObject) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
@@ -966,7 +944,7 @@ TEST(IndexSpecWildcard, FailsWhenProjectionIsNotAnObject) {
 }
 
 TEST(IndexSpecWildcard, FailsWithEmptyProjection) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("$**" << 1) << "name"
                                                << "indexName"
@@ -978,7 +956,7 @@ TEST(IndexSpecWildcard, FailsWithEmptyProjection) {
 }
 
 TEST(IndexSpecWildcard, FailsWhenInclusionWithSubpath) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("a.$**" << 1) << "name"
                                                << "indexName"
@@ -990,7 +968,7 @@ TEST(IndexSpecWildcard, FailsWhenInclusionWithSubpath) {
 }
 
 TEST(IndexSpecWildcard, FailsWhenExclusionWithSubpath) {
-    TestCommandFcvGuard guard;
+    EnsureFCV guard(ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42);
     auto result = validateIndexSpec(kDefaultOpCtx,
                                     BSON("key" << BSON("a.$**" << 1) << "name"
                                                << "indexName"

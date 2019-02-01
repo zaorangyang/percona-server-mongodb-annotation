@@ -1,23 +1,25 @@
+
 /**
- *    Copyright 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,7 +36,9 @@
 
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/collection_options.h"
-#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/catalog/multi_index_block_impl.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/catalog/uuid_catalog.h"
 #include "mongo/db/client.h"
@@ -93,7 +97,8 @@ public:
 
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
-                                  OptionalCollectionUUID uuid) override;
+                                  OptionalCollectionUUID uuid,
+                                  CollectionDropType dropType) override;
 
     void onRenameCollection(OperationContext* opCtx,
                             const NamespaceString& fromCollection,
@@ -124,6 +129,8 @@ public:
     bool onRenameCollectionCalled = false;
     OptionalCollectionUUID onRenameCollectionDropTarget;
     repl::OpTime renameOpTime = {Timestamp(Seconds(100), 1U), 1LL};
+
+    repl::OpTime dropOpTime = {Timestamp(Seconds(100), 1U), 1LL};
 
 private:
     /**
@@ -174,10 +181,16 @@ void OpObserverMock::onCreateCollection(OperationContext* opCtx,
 
 repl::OpTime OpObserverMock::onDropCollection(OperationContext* opCtx,
                                               const NamespaceString& collectionName,
-                                              OptionalCollectionUUID uuid) {
+                                              OptionalCollectionUUID uuid,
+                                              const CollectionDropType dropType) {
     _logOp(opCtx, collectionName, "drop");
-    OpObserver::Times::get(opCtx).reservedOpTimes.push_back(
-        OpObserverNoop::onDropCollection(opCtx, collectionName, uuid));
+    // If the oplog is not disabled for this namespace, then we need to reserve an op time for the
+    // drop.
+    if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collectionName)) {
+        OpObserver::Times::get(opCtx).reservedOpTimes.push_back(dropOpTime);
+    }
+    auto noopOptime = OpObserverNoop::onDropCollection(opCtx, collectionName, uuid, dropType);
+    invariant(noopOptime.isNull());
     return {};
 }
 
@@ -404,7 +417,7 @@ void _createIndex(OperationContext* opCtx,
                 << "ns"
                 << nss.ns());
 
-        MultiIndexBlock indexer(opCtx, collection);
+        MultiIndexBlockImpl indexer(opCtx, collection);
         ASSERT_OK(indexer.init(indexInfoObj).getStatus());
         WriteUnitOfWork wuow(opCtx);
         indexer.commit();
@@ -429,6 +442,19 @@ void _insertDocument(OperationContext* opCtx, const NamespaceString& nss, const 
         ASSERT_OK(collection->insertDocument(opCtx, InsertStatement(doc), opDebug));
         wuow.commit();
     });
+}
+
+/**
+ * Retrieves the pointer to a collection associated with the given namespace string from the
+ * catalog. The caller must hold the appropriate locks from the lock manager.
+ */
+Collection* _getCollection_inlock(OperationContext* opCtx, const NamespaceString& nss) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss.ns(), MODE_IS));
+    auto* db = DatabaseHolder::getDatabaseHolder().get(opCtx, nss.db());
+    if (!db) {
+        return nullptr;
+    }
+    return db->getCollection(opCtx, nss.ns());
 }
 
 TEST_F(RenameCollectionTest, RenameCollectionReturnsNamespaceNotFoundIfDatabaseDoesNotExist) {
@@ -1093,6 +1119,137 @@ TEST_F(RenameCollectionTest,
     Lock::GlobalWrite globalWrite(_opCtx.get());
     ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
     ASSERT_TRUE(_opObserver->onInsertsIsGlobalWriteLockExclusive);
+}
+
+TEST_F(RenameCollectionTest, CollectionPointerRemainsValidThroughRename) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    Lock::GlobalWrite globalWrite(_opCtx.get());
+
+    // Get a pointer to the source collection, and ensure that it reports the expected namespace
+    // string.
+    Collection* sourceColl = _getCollection_inlock(_opCtx.get(), _sourceNss);
+    ASSERT(sourceColl);
+
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNss, {}));
+
+    // Retrieve the pointer associated with the target namespace, and ensure that its the same
+    // pointer (i.e. the renamed collection has the very same Collection instance).
+    Collection* targetColl = _getCollection_inlock(_opCtx.get(), _targetNss);
+    ASSERT(targetColl);
+    ASSERT_EQ(targetColl, sourceColl);
+
+    // Verify that the Collection reports that its namespace is now the target namespace.
+    ASSERT_EQ(targetColl->ns(), _targetNss);
+}
+
+TEST_F(RenameCollectionTest, CollectionCatalogEntryPointerRemainsValidThroughRename) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    Lock::GlobalWrite globalWrite(_opCtx.get());
+
+    // Get a pointer to the source collection, and ensure that it reports the expected namespace
+    // string.
+    Collection* sourceColl = _getCollection_inlock(_opCtx.get(), _sourceNss);
+    ASSERT(sourceColl);
+    auto* sourceCatalogEntry = sourceColl->getCatalogEntry();
+    ASSERT(sourceCatalogEntry);
+    ASSERT_EQ(sourceCatalogEntry->ns(), _sourceNss);
+
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNss, {}));
+
+    // Verify that the CollectionCatalogEntry reports that its namespace is now the target
+    // namespace.
+    ASSERT_EQ(sourceCatalogEntry->ns(), _targetNss);
+}
+
+TEST_F(RenameCollectionTest, CatalogPointersRenameValidThroughRenameAfterDroppingTarget) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    _createCollection(_opCtx.get(), _targetNss);
+    Lock::GlobalWrite globalWrite(_opCtx.get());
+
+    Collection* sourceColl = _getCollection_inlock(_opCtx.get(), _sourceNss);
+    ASSERT(sourceColl);
+    auto* sourceCatalogEntry = sourceColl->getCatalogEntry();
+    ASSERT(sourceCatalogEntry);
+
+    RenameCollectionOptions options;
+    options.dropTarget = true;
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNss, options));
+
+    // The same catalog pointers should now report that they are associated with the target
+    // namespace.
+    ASSERT_EQ(sourceColl->ns(), _targetNss);
+    ASSERT_EQ(sourceCatalogEntry->ns(), _targetNss);
+}
+
+TEST_F(RenameCollectionTest, CatalogPointersRenameValidThroughRenameForApplyOps) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    Collection* sourceColl = AutoGetCollectionForRead(_opCtx.get(), _sourceNss).getCollection();
+    ASSERT(sourceColl);
+
+    auto uuidDoc = BSON("ui" << UUID::gen());
+    auto cmd = BSON("renameCollection" << _sourceNss.ns() << "to" << _targetNss.ns());
+    ASSERT_OK(renameCollectionForApplyOps(
+        _opCtx.get(), _sourceNss.db().toString(), uuidDoc["ui"], cmd, {}));
+    ASSERT_FALSE(_collectionExists(_opCtx.get(), _sourceNss));
+
+    Collection* targetColl = AutoGetCollectionForRead(_opCtx.get(), _targetNss).getCollection();
+    ASSERT(targetColl);
+    ASSERT_EQ(targetColl, sourceColl);
+    ASSERT_EQ(targetColl->ns(), _targetNss);
+}
+
+TEST_F(RenameCollectionTest, RenameAcrossDatabasesDoesNotPreserveCatalogPointers) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    Lock::GlobalWrite globalWrite(_opCtx.get());
+
+    // Get a pointer to the source collection, and ensure that it reports the expected namespace
+    // string.
+    Collection* sourceColl = _getCollection_inlock(_opCtx.get(), _sourceNss);
+    ASSERT(sourceColl);
+    auto* sourceCatalogEntry = sourceColl->getCatalogEntry();
+    ASSERT(sourceCatalogEntry);
+
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNssDifferentDb, {}));
+
+    // Verify that the CollectionCatalogEntry reports that its namespace is now the target
+    // namespace.
+    Collection* targetColl = _getCollection_inlock(_opCtx.get(), _targetNssDifferentDb);
+    ASSERT(targetColl);
+    ASSERT_NE(targetColl, sourceColl);
+    auto* targetCatalogEntry = targetColl->getCatalogEntry();
+    ASSERT(targetCatalogEntry);
+    ASSERT_NE(targetCatalogEntry, sourceCatalogEntry);
+}
+
+TEST_F(RenameCollectionTest, UUIDCatalogMappingRemainsIntactThroughRename) {
+    _createCollection(_opCtx.get(), _sourceNss);
+    Lock::GlobalWrite globalWrite(_opCtx.get());
+    auto& uuidCatalog = UUIDCatalog::get(_opCtx.get());
+    Collection* sourceColl = _getCollection_inlock(_opCtx.get(), _sourceNss);
+    ASSERT(sourceColl);
+    ASSERT_EQ(sourceColl, uuidCatalog.lookupCollectionByUUID(*sourceColl->uuid()));
+    ASSERT_OK(renameCollection(_opCtx.get(), _sourceNss, _targetNss, {}));
+    ASSERT_EQ(sourceColl, uuidCatalog.lookupCollectionByUUID(*sourceColl->uuid()));
+}
+
+TEST_F(RenameCollectionTest, FailRenameCollectionFromReplicatedToUnreplicatedDB) {
+    NamespaceString sourceNss("foo.isReplicated");
+    NamespaceString targetNss("local.isUnreplicated");
+
+    _createCollection(_opCtx.get(), sourceNss);
+
+    ASSERT_EQUALS(ErrorCodes::IllegalOperation,
+                  renameCollection(_opCtx.get(), sourceNss, targetNss, {}));
+}
+
+TEST_F(RenameCollectionTest, FailRenameCollectionFromUnreplicatedToReplicatedDB) {
+    NamespaceString sourceNss("foo.system.profile");
+    NamespaceString targetNss("foo.bar");
+
+    _createCollection(_opCtx.get(), sourceNss);
+
+    ASSERT_EQUALS(ErrorCodes::IllegalOperation,
+                  renameCollection(_opCtx.get(), sourceNss, targetNss, {}));
 }
 
 }  // namespace

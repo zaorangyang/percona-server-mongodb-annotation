@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -70,6 +72,7 @@
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/server_transactions_metrics.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
@@ -92,6 +95,7 @@ namespace repl {
 
 MONGO_FAIL_POINT_DEFINE(stepdownHangBeforePerformingPostMemberStateUpdateActions);
 MONGO_FAIL_POINT_DEFINE(transitionToPrimaryHangBeforeTakingGlobalExclusiveLock);
+MONGO_FAIL_POINT_DEFINE(holdStableTimestampAtSpecificTimestamp);
 
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -572,6 +576,17 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
                   << localConfig.getReplSetName() << ", but command line reports "
                   << _settings.ourSetName() << "; waitng for reconfig or remote heartbeat";
         myIndex = StatusWith<int>(-1);
+    }
+
+    if (serverGlobalParams.enableMajorityReadConcern && localConfig.containsArbiter()) {
+        log() << startupWarningsLog;
+        log() << "** WARNING: This replica set uses arbiters, but readConcern:majority is enabled "
+              << startupWarningsLog;
+        log() << "**          for this node. This is not a recommended configuration. Please see "
+              << startupWarningsLog;
+        log() << "**          https://dochub.mongodb.org/core/psa-disable-rc-majority"
+              << startupWarningsLog;
+        log() << startupWarningsLog;
     }
 
     // Do not check optime, if this node is an arbiter.
@@ -1762,7 +1777,7 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
             // The stepdown attempt failed. We now release the global lock to allow secondaries
             // to read the oplog, then wait until enough secondaries are caught up for us to
             // finish stepdown.
-            transitionGuard.releaseGlobalLockForStepdownAttempt();
+            transitionGuard.releaseGlobalLock();
             invariant(!opCtx->lockState()->isLocked());
 
             // Make sure we re-acquire the global lock before returning so that we're always holding
@@ -1779,7 +1794,7 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
                 // clean up a failed stepdown attempt, we might as well spend whatever time we need
                 // to acquire it now.  For the same reason, we also disable lock acquisition
                 // interruption, to guarantee that we get the lock eventually.
-                transitionGuard.reacquireGlobalLockForStepdownAttempt();
+                transitionGuard.reacquireGlobalLock();
                 invariant(opCtx->lockState()->isW());
                 lk.lock();
             });
@@ -2774,6 +2789,10 @@ void ReplicationCoordinatorImpl::signalDropPendingCollectionsRemovedFromStorage(
     _wakeReadyWaiters_inlock();
 }
 
+boost::optional<Timestamp> ReplicationCoordinatorImpl::getRecoveryTimestamp() {
+    return _storage->getRecoveryTimestamp(getServiceContext());
+}
+
 void ReplicationCoordinatorImpl::_enterDrainMode_inlock() {
     _applierState = ApplierState::Draining;
     _externalState->stopProducer();
@@ -3054,7 +3073,30 @@ boost::optional<OpTime> ReplicationCoordinatorImpl::_calculateStableOpTime_inloc
         maximumStableTimestamp =
             std::min(_storage->getAllCommittedTimestamp(_service), commitPoint.getTimestamp());
     }
-    const auto maximumStableOpTime = OpTime(maximumStableTimestamp, commitPoint.getTerm());
+
+    MONGO_FAIL_POINT_BLOCK(holdStableTimestampAtSpecificTimestamp, data) {
+        const BSONObj& dataObj = data.getData();
+        const auto holdStableTimestamp = dataObj["timestamp"].timestamp();
+        maximumStableTimestamp = std::min(maximumStableTimestamp, holdStableTimestamp);
+    }
+
+    auto maximumStableOpTime = OpTime(maximumStableTimestamp, commitPoint.getTerm());
+
+    // When calculating the stable optime, compare it to the oldest oplog entry timestamp across
+    // transactions whose corresponding commit/abort oplog entries have not been majority committed.
+    const auto serverTxnMetrics = ServerTransactionsMetrics::get(getGlobalServiceContext());
+    const auto oldestNonMajCommittedOpTime =
+        serverTxnMetrics->getOldestNonMajorityCommittedOpTime();
+
+    if (oldestNonMajCommittedOpTime) {
+        if (oldestNonMajCommittedOpTime->getTimestamp() < maximumStableTimestamp) {
+            // If there is an oldest non-majority committed timestamp that is less than the current
+            // max stable timestamp, then update the max stable timestamp/optime accordingly.
+            maximumStableTimestamp = oldestNonMajCommittedOpTime->getTimestamp();
+            maximumStableOpTime =
+                OpTime(maximumStableTimestamp, oldestNonMajCommittedOpTime->getTerm());
+        }
+    }
 
     // Find the greatest optime candidate that is less than or equal to the commit point.
     // To do this we first find the upper bound of 'commitPoint', which points to the smallest
@@ -3112,6 +3154,16 @@ boost::optional<OpTime> ReplicationCoordinatorImpl::_getStableOpTime_inlock() {
         invariant(snapshotOpTime <= commitPoint);
     }
 
+    // If we advanced the commit point and have prepared transactions, check if their commit or
+    // abort timestamps are <= the commit point. If so, remove them from our oldest non-majority
+    // committed optimes set because we know that the commit/abort oplog entries are majority
+    // committed.
+    // We must remove these optimes before calling _calculateStableOpTime_inlock because we want
+    // we want the stable timestamp to advance up to the commit point if all transactions are
+    // committed or aborted.
+    auto txnMetrics = ServerTransactionsMetrics::get(getGlobalServiceContext());
+    txnMetrics->removeOpTimesLessThanOrEqToCommittedOpTime(commitPoint);
+
     // Compute the current stable optime.
     auto stableOpTime = _calculateStableOpTime_inlock(_stableOpTimeCandidates, commitPoint);
     if (stableOpTime) {
@@ -3124,7 +3176,6 @@ boost::optional<OpTime> ReplicationCoordinatorImpl::_getStableOpTime_inlock() {
 }
 
 void ReplicationCoordinatorImpl::_setStableTimestampForStorage_inlock() {
-
     // Get the current stable optime.
     auto stableOpTime = _getStableOpTime_inlock();
 

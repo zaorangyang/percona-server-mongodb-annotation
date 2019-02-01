@@ -1,34 +1,37 @@
+
 /**
- * Copyright 2011 (c) 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/document_source_out_gen.h"
 #include "mongo/db/pipeline/document_source_out_in_place.h"
@@ -236,7 +239,9 @@ intrusive_ptr<DocumentSourceOut> DocumentSourceOut::create(
     NamespaceString outputNs,
     const intrusive_ptr<ExpressionContext>& expCtx,
     WriteModeEnum mode,
-    std::set<FieldPath> uniqueKey) {
+    std::set<FieldPath> uniqueKey,
+    boost::optional<OID> targetEpoch) {
+
     // TODO (SERVER-36832): Allow this combination.
     uassert(
         50939,
@@ -270,13 +275,13 @@ intrusive_ptr<DocumentSourceOut> DocumentSourceOut::create(
     switch (mode) {
         case WriteModeEnum::kModeReplaceCollection:
             return new DocumentSourceOutReplaceColl(
-                std::move(outputNs), expCtx, mode, std::move(uniqueKey));
+                std::move(outputNs), expCtx, mode, std::move(uniqueKey), targetEpoch);
         case WriteModeEnum::kModeInsertDocuments:
             return new DocumentSourceOutInPlace(
-                std::move(outputNs), expCtx, mode, std::move(uniqueKey));
+                std::move(outputNs), expCtx, mode, std::move(uniqueKey), targetEpoch);
         case WriteModeEnum::kModeReplaceDocuments:
             return new DocumentSourceOutInPlaceReplace(
-                std::move(outputNs), expCtx, mode, std::move(uniqueKey));
+                std::move(outputNs), expCtx, mode, std::move(uniqueKey), targetEpoch);
         default:
             MONGO_UNREACHABLE;
     }
@@ -285,10 +290,13 @@ intrusive_ptr<DocumentSourceOut> DocumentSourceOut::create(
 DocumentSourceOut::DocumentSourceOut(NamespaceString outputNs,
                                      const intrusive_ptr<ExpressionContext>& expCtx,
                                      WriteModeEnum mode,
-                                     std::set<FieldPath> uniqueKey)
+                                     std::set<FieldPath> uniqueKey,
+                                     boost::optional<OID> targetEpoch)
     : DocumentSource(expCtx),
-      _done(false),
+      _writeConcern(expCtx->opCtx->getWriteConcern()),
       _outputNs(std::move(outputNs)),
+      _targetEpoch(targetEpoch),
+      _done(false),
       _mode(mode),
       _uniqueKeyFields(std::move(uniqueKey)),
       _uniqueKeyIncludesId(_uniqueKeyFields.count("_id") == 1) {}
@@ -299,6 +307,7 @@ intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
     auto mode = WriteModeEnum::kModeReplaceCollection;
     std::set<FieldPath> uniqueKey;
     NamespaceString outputNs;
+    boost::optional<OID> targetEpoch;
     if (elem.type() == BSONType::String) {
         outputNs = NamespaceString(expCtx->ns.db().toString() + '.' + elem.str());
         uniqueKey.emplace("_id");
@@ -307,6 +316,10 @@ intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
             DocumentSourceOutSpec::parse(IDLParserErrorContext("$out"), elem.embeddedObject());
 
         mode = spec.getMode();
+        targetEpoch = spec.getTargetEpoch();
+        uassert(50984,
+                "$out received unexpected 'targetEpoch' on mongos",
+                !(expCtx->inMongos && bool(targetEpoch)));
 
         // Retrieve the target database from the user command, otherwise use the namespace from the
         // expression context.
@@ -317,26 +330,40 @@ intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
         }
 
         // Convert unique key object to a vector of FieldPaths.
-        std::vector<FieldPath> docKeyPaths = std::get<0>(
-            expCtx->mongoProcessInterface->collectDocumentKeyFields(expCtx->opCtx, outputNs));
-        std::set<FieldPath> docKeyPathsSet =
-            std::set<FieldPath>(std::make_move_iterator(docKeyPaths.begin()),
-                                std::make_move_iterator(docKeyPaths.end()));
         if (auto userSpecifiedUniqueKey = spec.getUniqueKey()) {
             uniqueKey = parseUniqueKeyFromSpec(userSpecifiedUniqueKey.get());
-
-            // Skip the unique index check if the provided uniqueKey is the documentKey.
-            const bool isDocumentKey = (uniqueKey == docKeyPathsSet);
 
             // Make sure the uniqueKey has a supporting index. Skip this check if the command is
             // sent from mongos since the uniqueKey check would've happened already.
             uassert(50938,
-                    "Cannot find index to verify that $out's unique key will be unique",
-                    expCtx->fromMongos || isDocumentKey ||
+                    str::stream()
+                        << "Cannot find index to verify that $out's unique key will be unique: "
+                        << userSpecifiedUniqueKey,
+                    expCtx->fromMongos ||
                         expCtx->mongoProcessInterface->uniqueKeyIsSupportedByIndex(
                             expCtx, outputNs, uniqueKey));
         } else {
-            uniqueKey = std::move(docKeyPathsSet);
+            if (expCtx->inMongos && mode != WriteModeEnum::kModeReplaceCollection) {
+                // In case there are multiple shards which will perform this $out in parallel, we
+                // need to figure out and attach the collection's epoch to ensure each shard is
+                // talking about the same version of the collection. This mongos will coordinate
+                // that. We force a catalog refresh to do so because there is no shard versioning
+                // protocol on this namespace. We will also figure out and attach the uniqueKey to
+                // send to the shards. We don't need to do this for 'replaceCollection' mode since
+                // that mode cannot currently target a sharded collection.
+
+                // There are cases where the aggregation could fail if the collection is dropped or
+                // re-created during or near the time of the aggregation. This is okay - we are
+                // mostly paranoid that this mongos is very stale and want to prevent returning an
+                // error if the collection was dropped a long time ago. Because of this, we are okay
+                // with piggy-backing off another thread's request to refresh the cache, simply
+                // waiting for that request to return instead of forcing another refresh.
+                targetEpoch = expCtx->mongoProcessInterface->refreshAndGetEpoch(expCtx, outputNs);
+            }
+            std::vector<FieldPath> docKeyPaths = std::get<0>(
+                expCtx->mongoProcessInterface->collectDocumentKeyFields(expCtx->opCtx, outputNs));
+            uniqueKey = std::set<FieldPath>(std::make_move_iterator(docKeyPaths.begin()),
+                                            std::make_move_iterator(docKeyPaths.end()));
         }
     } else {
         uasserted(16990,
@@ -344,20 +371,23 @@ intrusive_ptr<DocumentSource> DocumentSourceOut::createFromBson(
                                 << typeName(elem.type()));
     }
 
-    return create(std::move(outputNs), expCtx, mode, std::move(uniqueKey));
+    return create(std::move(outputNs), expCtx, mode, std::move(uniqueKey), targetEpoch);
 }
 
 Value DocumentSourceOut::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
-    MutableDocument serialized(
-        Document{{DocumentSourceOutSpec::kTargetCollectionFieldName, _outputNs.coll()},
-                 {DocumentSourceOutSpec::kTargetDbFieldName, _outputNs.db()},
-                 {DocumentSourceOutSpec::kModeFieldName, WriteMode_serializer(_mode)}});
-    BSONObjBuilder uniqueKeyBob;
-    for (auto path : _uniqueKeyFields) {
-        uniqueKeyBob.append(path.fullPath(), 1);
-    }
-    serialized[DocumentSourceOutSpec::kUniqueKeyFieldName] = Value(uniqueKeyBob.done());
-    return Value(Document{{getSourceName(), serialized.freeze()}});
+    DocumentSourceOutSpec spec;
+    spec.setTargetDb(_outputNs.db());
+    spec.setTargetCollection(_outputNs.coll());
+    spec.setMode(_mode);
+    spec.setUniqueKey([&]() {
+        BSONObjBuilder uniqueKeyBob;
+        for (auto path : _uniqueKeyFields) {
+            uniqueKeyBob.append(path.fullPath(), 1);
+        }
+        return uniqueKeyBob.obj();
+    }());
+    spec.setTargetEpoch(_targetEpoch);
+    return Value(Document{{getSourceName(), spec.toBSON()}});
 }
 
 DepsTracker::State DocumentSourceOut::getDependencies(DepsTracker* deps) const {

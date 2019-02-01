@@ -1,30 +1,32 @@
+
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kReplication
 
@@ -56,7 +58,6 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/operation_context_session_mongod.h"
 #include "mongo/db/query/query_knobs.h"
 #include "mongo/db/repl/applier_helpers.h"
 #include "mongo/db/repl/apply_ops.h"
@@ -87,6 +88,7 @@ namespace repl {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(pauseBatchApplicationBeforeCompletion);
+MONGO_FAIL_POINT_DEFINE(hangAfterRecordingOpApplicationStartTime);
 
 // The oplog entries applied
 Counter64 opsAppliedStats;
@@ -226,6 +228,41 @@ NamespaceStringOrUUID getNsOrUUID(const NamespaceString& nss, const BSONObj& op)
     return nss;
 }
 
+/**
+ * Used for logging a report of ops that take longer than "slowMS" to apply. This is called
+ * right before returning from syncApply, and it returns the same status.
+ */
+Status finishAndLogApply(ClockSource* clockSource,
+                         Status finalStatus,
+                         Date_t applyStartTime,
+                         OpTypeEnum opType,
+                         const BSONObj& op) {
+
+    if (finalStatus.isOK()) {
+        auto applyEndTime = clockSource->now();
+        auto diffMS = durationCount<Milliseconds>(applyEndTime - applyStartTime);
+
+        // This op was slow to apply, so we should log a report of it.
+        if (diffMS > serverGlobalParams.slowMS) {
+
+            StringBuilder s;
+            s << "applied op: ";
+
+            if (opType == OpTypeEnum::kCommand) {
+                s << "command ";
+            } else {
+                s << "CRUD ";
+            }
+
+            s << redact(op);
+            s << ", took " << diffMS << "ms";
+
+            log() << s.str();
+        }
+    }
+    return finalStatus;
+}
+
 }  // namespace
 
 // static
@@ -262,7 +299,20 @@ Status SyncTail::syncApply(OperationContext* opCtx,
         return status;
     };
 
+    auto clockSource = opCtx->getServiceContext()->getFastClockSource();
+    auto applyStartTime = clockSource->now();
+
+    if (MONGO_FAIL_POINT(hangAfterRecordingOpApplicationStartTime)) {
+        log() << "syncApply - fail point hangAfterRecordingOpApplicationStartTime enabled. "
+              << "Blocking until fail point is disabled. ";
+        MONGO_FAIL_POINT_PAUSE_WHILE_SET(hangAfterRecordingOpApplicationStartTime);
+    }
+
     auto opType = OpType_parse(IDLParserErrorContext("syncApply"), op["op"].valuestrsafe());
+
+    auto finishApply = [&](Status status) {
+        return finishAndLogApply(clockSource, status, applyStartTime, opType, op);
+    };
 
     if (opType == OpTypeEnum::kNoop) {
         if (nss.db() == "") {
@@ -270,9 +320,9 @@ Status SyncTail::syncApply(OperationContext* opCtx,
         }
         Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
         OldClientContext ctx(opCtx, nss.ns());
-        return applyOp(ctx.db());
+        return finishApply(applyOp(ctx.db()));
     } else if (OplogEntry::isCrudOpType(opType)) {
-        return writeConflictRetry(opCtx, "syncApply_CRUD", nss.ns(), [&] {
+        return finishApply(writeConflictRetry(opCtx, "syncApply_CRUD", nss.ns(), [&] {
             // Need to throw instead of returning a status for it to be properly ignored.
             try {
                 AutoGetCollection autoColl(opCtx, getNsOrUUID(nss, op), MODE_IX);
@@ -299,25 +349,29 @@ Status SyncTail::syncApply(OperationContext* opCtx,
                 ex.addContext(str::stream() << "Failed to apply operation: " << redact(op));
                 throw;
             }
-        });
+        }));
     } else if (opType == OpTypeEnum::kCommand) {
-        return writeConflictRetry(opCtx, "syncApply_command", nss.ns(), [&] {
+        return finishApply(writeConflictRetry(opCtx, "syncApply_command", nss.ns(), [&] {
             // A command may need a global write lock. so we will conservatively go
             // ahead and grab one for non-transaction commands.
             // Transactions have to acquire the same locks on secondaries as on primary.
             boost::optional<Lock::GlobalWrite> globalWriteLock;
 
             // TODO SERVER-37180 Remove this double-parsing.
+            // The command entry has been parsed before, so it must be valid.
+            auto entry = uassertStatusOK(OplogEntry::parse(op));
             const StringData commandName(op["o"].embeddedObject().firstElementFieldName());
-            if (!op.getBoolField("prepare") && commandName != "abortTransaction") {
+            // SERVER-37313: createIndex does not need to take the Global X lock.
+            if (!op.getBoolField("prepare") && commandName != "abortTransaction" &&
+                commandName != "createIndexes" && commandName != "commitTransaction") {
                 globalWriteLock.emplace(opCtx);
             }
 
             // special case apply for commands to avoid implicit database creation
-            Status status = applyCommand_inlock(opCtx, op, oplogApplicationMode);
+            Status status = applyCommand_inlock(opCtx, op, entry, oplogApplicationMode);
             incrementOpsAppliedStats();
             return status;
-        });
+        }));
     }
 
     MONGO_UNREACHABLE;
@@ -579,9 +633,6 @@ void fillWriterVectors(OperationContext* opCtx,
     }
 }
 
-}  // namespace
-
-namespace {
 void tryToGoLiveAsASecondary(OperationContext* opCtx,
                              ReplicationCoordinator* replCoord,
                              OpTime minValid) {
@@ -628,7 +679,8 @@ void tryToGoLiveAsASecondary(OperationContext* opCtx,
                   << ". Current state: " << replCoord->getMemberState() << causedBy(status);
     }
 }
-}
+
+}  // namespace
 
 class SyncTail::OpQueueBatcher {
     MONGO_DISALLOW_COPYING(OpQueueBatcher);
@@ -1172,22 +1224,6 @@ Status multiSyncApply(OperationContext* opCtx,
 
             // If we didn't create a group, try to apply the op individually.
             try {
-                // The write on transaction table may be applied concurrently, so refreshing state
-                // from disk may read that write, causing starting a new transaction on an existing
-                // txnNumber. Thus, we start a new transaction without refreshing state from disk.
-                boost::optional<OperationContextSessionMongodWithoutRefresh> sessionTxnState;
-                if (entry.shouldPrepare() ||
-                    entry.getCommandType() == OplogEntry::CommandType::kAbortTransaction) {
-                    // The update on transaction table may be scheduled to the same writer.
-                    invariant(ops->size() <= 2);
-                    // Transaction operations are in its own batch, so we can modify their opCtx.
-                    invariant(entry.getSessionId());
-                    invariant(entry.getTxnNumber());
-                    opCtx->setLogicalSessionId(*entry.getSessionId());
-                    opCtx->setTxnNumber(*entry.getTxnNumber());
-                    // Check out the session, with autoCommit = false and startMultiDocTxn = true.
-                    sessionTxnState.emplace(opCtx);
-                }
                 const Status status = SyncTail::syncApply(opCtx, entry.raw, oplogApplicationMode);
 
                 if (!status.isOK()) {

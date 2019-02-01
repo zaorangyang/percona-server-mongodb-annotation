@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2018 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -92,13 +94,6 @@ public:
          * Returns a const pointer to the stashed lock state, or nullptr if no stashed locks exist.
          */
         const Locker* locker() const {
-            return _locker.get();
-        }
-
-        /**
-         * Same as above but non-const.
-         */
-        Locker* locker() {
             return _locker.get();
         }
 
@@ -291,11 +286,12 @@ public:
 
     std::string transactionInfoForLogForTest(const SingleThreadedLockStats* lockStats,
                                              bool committed,
-                                             repl::ReadConcernArgs readConcernArgs) {
+                                             repl::ReadConcernArgs readConcernArgs,
+                                             bool wasPrepared) {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
         TransactionState::StateFlag terminationCause =
             committed ? TransactionState::kCommitted : TransactionState::kAborted;
-        return _transactionInfoForLog(lockStats, terminationCause, readConcernArgs);
+        return _transactionInfoForLog(lockStats, terminationCause, readConcernArgs, wasPrepared);
     }
 
     /**
@@ -319,12 +315,9 @@ public:
     void abortArbitraryTransaction();
 
     /**
-     * Same as abortArbitraryTransaction, except only executes if _transactionExpireDate indicates
-     * that the transaction has expired.
-     *
-     * Not called with session checked out.
+     * Returns whether the transaction has exceedet its expiration time.
      */
-    void abortArbitraryTransactionIfExpired();
+    bool expired() const;
 
     /*
     * Aborts the transaction inside the transaction, releasing transaction resources.
@@ -340,16 +333,6 @@ public:
      * abortActiveTransaction.
      */
     void abortActiveUnpreparedOrStashPreparedTransaction(OperationContext* opCtx);
-
-    /**
-     * If the transaction is not prepared, aborts the transaction and releases its resources.
-     * If the transaction is prepared, yields the transaction's locks and adds the Locker and
-     * LockSnapshot of the yielded locks to the end of the 'yieldedLocks' output vector.
-     *
-     * Not called with session checked out.
-     */
-    void abortOrYieldArbitraryTransaction(
-        std::vector<std::pair<Locker*, Locker::LockSnapshot>>* yieldedLocks);
 
     void addMultikeyPathInfo(MultikeyPathInfo info) {
         _multikeyPathInfo.push_back(std::move(info));
@@ -711,7 +694,8 @@ private:
     // passed in order for this method to be called.
     std::string _transactionInfoForLog(const SingleThreadedLockStats* lockStats,
                                        TransactionState::StateFlag terminationCause,
-                                       repl::ReadConcernArgs readConcernArgs);
+                                       repl::ReadConcernArgs readConcernArgs,
+                                       bool wasPrepared);
 
     // Reports transaction stats for both active and inactive transactions using the provided
     // builder.  The lock may be either a lock on _mutex or a lock on _metricsMutex.
@@ -808,8 +792,11 @@ private:
     // Tracks and updates transaction metrics upon the appropriate transaction event.
     TransactionMetricsObserver _transactionMetricsObserver;
 
-    // Tracks the Timestamp of the first oplog entry written by this TransactionParticipant.
-    boost::optional<Timestamp> _oldestOplogEntryTS;
+    // Tracks the OpTime of the first oplog entry written by this TransactionParticipant.
+    boost::optional<repl::OpTime> _oldestOplogEntryOpTime;
+
+    // Tracks the OpTime of the abort/commit oplog entry associated with this transaction.
+    boost::optional<repl::OpTime> _finishOpTime;
 };
 
 }  // namespace mongo

@@ -1,26 +1,25 @@
-// biggie_record_store.cpp
 
 /**
- *    Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
- *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,28 +28,24 @@
  *    it in the license file.
  */
 
-
-// ALERT: need to remodify db.cpp to actually create an fcv on line about 422.
-// (!storageGlobalParams.readOnly && (storageGlobalParams.engine != "devnull");)
-// once this stuff actually gets implemented!!!
-
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
 
-#include "mongo/db/storage/biggie/biggie_record_store.h"
+#include "mongo/platform/basic.h"
+
+#include <cstring>
+#include <memory>
+#include <utility>
+
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/storage/biggie/biggie_record_store.h"
 #include "mongo/db/storage/biggie/biggie_recovery_unit.h"
 #include "mongo/db/storage/biggie/store.h"
 #include "mongo/db/storage/key_string.h"
+#include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log.h"
-
-#include <cstring>
-#include <iomanip>
-#include <memory>
-#include <sstream>
-#include <utility>
 
 namespace mongo {
 namespace biggie {
@@ -66,6 +61,12 @@ std::string createKey(StringData ident, int64_t recordId) {
     KeyString ks(version, BSON("" << ident << "" << recordId), allAscending);
     return std::string(ks.getBuffer(), ks.getSize());
 }
+
+std::string createKey(StringData ident) {
+    KeyString ks(version, BSON("" << ident), allAscending);
+    return std::string(ks.getBuffer(), ks.getSize());
+}
+
 int64_t extractRecordId(const std::string& keyStr) {
     KeyString ks(version, sample, allAscending);
     ks.resetFromBuffer(keyStr.c_str(), keyStr.size());
@@ -74,12 +75,14 @@ int64_t extractRecordId(const std::string& keyStr) {
     ++it;
     return (*it).Long();
 }
+
 StringStore* getRecoveryUnitBranch_forking(OperationContext* opCtx) {
     biggie::RecoveryUnit* biggieRCU = checked_cast<biggie::RecoveryUnit*>(opCtx->recoveryUnit());
     invariant(biggieRCU);
     biggieRCU->forkIfNeeded();
     return biggieRCU->getWorkingCopy();
 }
+
 void dirtyRecoveryUnit(OperationContext* opCtx) {
     biggie::RecoveryUnit* biggieRCU = checked_cast<biggie::RecoveryUnit*>(opCtx->recoveryUnit());
     biggieRCU->makeDirty();
@@ -100,7 +103,15 @@ RecordStore::RecordStore(StringData ns,
       _ident(_identStr.data(), _identStr.size()),
       _prefix(createKey(_ident, std::numeric_limits<int64_t>::min())),
       _postfix(createKey(_ident, std::numeric_limits<int64_t>::max())),
-      _cappedCallback(cappedCallback) {}
+      _cappedCallback(cappedCallback) {
+    if (_isCapped) {
+        invariant(_cappedMaxSize > 0);
+        invariant(_cappedMaxDocs == -1 || _cappedMaxDocs > 0);
+    } else {
+        invariant(_cappedMaxSize == -1);
+        invariant(_cappedMaxDocs == -1);
+    }
+}
 
 const char* RecordStore::name() const {
     return "biggie";
@@ -132,16 +143,15 @@ bool RecordStore::isCapped() const {
     return _isCapped;
 }
 
+void RecordStore::setCappedCallback(CappedCallback* cb) {
+    stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+    _cappedCallback = cb;
+}
+
 int64_t RecordStore::storageSize(OperationContext* opCtx,
                                  BSONObjBuilder* extraInfo,
                                  int infoLevel) const {
     return dataSize(opCtx);
-}
-
-RecordData RecordStore::dataFor(OperationContext* opCtx, const RecordId& loc) const {
-    RecordData rd;
-    invariant(findRecord(opCtx, loc, &rd));
-    return rd;
 }
 
 bool RecordStore::findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const {
@@ -161,16 +171,28 @@ void RecordStore::deleteRecord(OperationContext* opCtx, const RecordId& dl) {
     dirtyRecoveryUnit(opCtx);
 }
 
-StatusWith<RecordId> RecordStore::insertRecord(OperationContext* opCtx,
-                                               const char* data,
-                                               int len,
-                                               Timestamp) {
-    int64_t thisRecordId = nextRecordId();
+Status RecordStore::insertRecords(OperationContext* opCtx,
+                                  std::vector<Record>* inOutRecords,
+                                  const std::vector<Timestamp>& timestamps) {
+    int64_t totalSize = 0;
+    for (auto& record : *inOutRecords)
+        totalSize += record.data.size();
+
+    // Caller will retry one element at a time.
+    if (_isCapped && totalSize > _cappedMaxSize)
+        return Status(ErrorCodes::BadValue, "object to insert exceeds cappedMaxSize");
+
     StringStore* workingCopy = getRecoveryUnitBranch_forking(opCtx);
-    workingCopy->insert(
-        StringStore::value_type{createKey(_ident, thisRecordId), std::string(data, len)});
+    for (auto& record : *inOutRecords) {
+        int64_t thisRecordId = nextRecordId();
+        workingCopy->insert(StringStore::value_type{
+            createKey(_ident, thisRecordId), std::string(record.data.data(), record.data.size())});
+        record.id = RecordId(thisRecordId);
+    }
+
+    cappedDeleteAsNeeded(opCtx, workingCopy);
     dirtyRecoveryUnit(opCtx);
-    return StatusWith<RecordId>(RecordId(thisRecordId));
+    return Status::OK();
 }
 
 Status RecordStore::insertRecordsWithDocWriter(OperationContext* opCtx,
@@ -179,17 +201,30 @@ Status RecordStore::insertRecordsWithDocWriter(OperationContext* opCtx,
                                                size_t nDocs,
                                                RecordId* idsOut) {
     // TODO : Eventually write directly into StringStore
+
+    int64_t totalSize = 0;
+    for (size_t i = 0; i < nDocs; i++)
+        totalSize += docs[i]->documentSize();
+
+    // Caller will retry one element at a time.
+    if (_isCapped && totalSize > _cappedMaxSize)
+        return Status(ErrorCodes::BadValue, "object to insert exceeds cappedMaxSize");
+
     StringStore* workingCopy = getRecoveryUnitBranch_forking(opCtx);
     for (size_t i = 0; i < nDocs; i++) {
+        const size_t len = docs[i]->documentSize();
+
         int64_t thisRecordId = nextRecordId();
         std::string key = createKey(_ident, thisRecordId);
-        const size_t len = docs[i]->documentSize();
+
         StringStore::value_type vt{key, std::string(len, '\0')};
         // TODO: change to .data() in c++17 once that is in the codebase
         docs[i]->writeDocument(&vt.second[0]);
         workingCopy->insert(std::move(vt));
-        idsOut[i] = RecordId(thisRecordId);
+        if (idsOut)
+            idsOut[i] = RecordId(thisRecordId);
     }
+    cappedDeleteAsNeeded(opCtx, workingCopy);
     dirtyRecoveryUnit(opCtx);
     return Status::OK();
 }
@@ -203,6 +238,7 @@ Status RecordStore::updateRecord(OperationContext* opCtx,
     StringStore::const_iterator it = workingCopy->find(key);
     invariant(it != workingCopy->end());
     workingCopy->update(StringStore::value_type{key, std::string(data, len)});
+    cappedDeleteAsNeeded(opCtx, workingCopy);
     dirtyRecoveryUnit(opCtx);
     return Status::OK();
 }
@@ -228,6 +264,7 @@ std::unique_ptr<SeekableRecordCursor> RecordStore::getCursor(OperationContext* o
 }
 
 Status RecordStore::truncate(OperationContext* opCtx) {
+
     StringStore* str = getRecoveryUnitBranch_forking(opCtx);
     StringStore::const_iterator end = str->upper_bound(_postfix);
     std::vector<std::string> toDelete;
@@ -236,17 +273,40 @@ Status RecordStore::truncate(OperationContext* opCtx) {
     }
     if (!toDelete.empty()) {
         size_t numErased = 0;
-        ON_BLOCK_EXIT([opCtx]() { dirtyRecoveryUnit(opCtx); });
         for (const auto& key : toDelete) {
             numErased += str->erase(key);
         }
         invariant(numErased == toDelete.size());
+        dirtyRecoveryUnit(opCtx);
     }
     return Status::OK();
 }
 
 void RecordStore::cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive) {
-    // TODO : implement.
+    StringStore* workingCopy = getRecoveryUnitBranch_forking(opCtx);
+
+    WriteUnitOfWork wuow(opCtx);
+    const auto recordKey = createKey(_ident, end.repr());
+    auto recordIt =
+        inclusive ? workingCopy->lower_bound(recordKey) : workingCopy->upper_bound(recordKey);
+    auto endIt = workingCopy->upper_bound(_postfix);
+
+    while (recordIt != endIt) {
+        stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+        if (_cappedCallback) {
+            // Documents are guaranteed to have a RecordId at the end of the KeyString, unlike
+            // unique indexes.
+            RecordId rid = RecordId(extractRecordId(recordIt->first));
+            RecordData rd = RecordData(recordIt->second.c_str(), recordIt->second.length());
+            uassertStatusOK(_cappedCallback->aboutToDeleteCapped(opCtx, rid, rd));
+        }
+
+        // Don't need to increment the iterator because the iterator gets revalidated and placed
+        // on the next item after the erase.
+        workingCopy->erase(recordIt->first);
+    }
+    dirtyRecoveryUnit(opCtx);
+    wuow.commit();
 }
 
 Status RecordStore::validate(OperationContext* opCtx,
@@ -264,7 +324,7 @@ Status RecordStore::validate(OperationContext* opCtx,
         size_t dataSize;
         RecordId rid;
         rid = RecordId(extractRecordId(it->first));
-        RecordData rd = RecordData(rec.c_str(), rec.length() - 1);
+        RecordData rd = RecordData(rec.c_str(), rec.length());
         const Status status = adaptor->validate(rid, rd, &dataSize);
         if (!status.isOK()) {
             if (results->valid) {
@@ -283,7 +343,11 @@ Status RecordStore::validate(OperationContext* opCtx,
 void RecordStore::appendCustomStats(OperationContext* opCtx,
                                     BSONObjBuilder* result,
                                     double scale) const {
-    // TODO: Implement.
+    result->appendBool("capped", _isCapped);
+    if (_isCapped) {
+        result->appendIntOrLL("max", _cappedMaxDocs);
+        result->appendIntOrLL("maxSize", _cappedMaxSize / scale);
+    }
 }
 
 Status RecordStore::touch(OperationContext* opCtx, BSONObjBuilder* output) const {
@@ -300,10 +364,53 @@ void RecordStore::updateStatsAfterRepair(OperationContext* opCtx,
     // TODO: Implement.
 }
 
+bool RecordStore::cappedAndNeedDelete(OperationContext* opCtx, StringStore* workingCopy) {
+    if (!_isCapped)
+        return false;
+
+    const auto subTreeKey = createKey(_ident);
+
+    if (workingCopy->subtreeDataSize(subTreeKey) > static_cast<size_t>(_cappedMaxSize))
+        return true;
+
+    if ((_cappedMaxDocs != -1) &&
+        workingCopy->subtreeSize(subTreeKey) > static_cast<size_t>(_cappedMaxDocs))
+        return true;
+    return false;
+}
+
+void RecordStore::cappedDeleteAsNeeded(OperationContext* opCtx, StringStore* workingCopy) {
+
+    const auto subTreeKey = createKey(_ident);
+
+    // Create the lowest key for this identifier and use lower_bound() to get to the first one.
+    auto recordIt = workingCopy->lower_bound(_prefix);
+
+    // Ensure only one thread at a time can do deletes, otherwise they'll conflict.
+    stdx::lock_guard<stdx::mutex> cappedDeleterLock(_cappedDeleterMutex);
+
+    while (cappedAndNeedDelete(opCtx, workingCopy)) {
+        DEV invariant(workingCopy->subtreeSize(subTreeKey) > 0);
+
+        stdx::lock_guard<stdx::mutex> cappedCallbackLock(_cappedCallbackMutex);
+        if (_cappedCallback) {
+            RecordId rid = RecordId(extractRecordId(recordIt->first));
+            RecordData rd = RecordData(recordIt->second.c_str(), recordIt->second.length());
+            uassertStatusOK(_cappedCallback->aboutToDeleteCapped(opCtx, rid, rd));
+        }
+
+        // Don't need to increment the iterator because the iterator gets revalidated and placed
+        // on the next item after the erase.
+        workingCopy->erase(recordIt->first);
+    }
+    dirtyRecoveryUnit(opCtx);
+}
+
 RecordStore::Cursor::Cursor(OperationContext* opCtx, const RecordStore& rs) : opCtx(opCtx) {
     _ident = rs._ident;
     _prefix = rs._prefix;
     _postfix = rs._postfix;
+    _isCapped = rs._isCapped;
 }
 
 boost::optional<Record> RecordStore::Cursor::next() {
@@ -346,7 +453,9 @@ bool RecordStore::Cursor::restore() {
     StringStore* workingCopy = getRecoveryUnitBranch_forking(opCtx);
     it = (_savedPosition) ? workingCopy->lower_bound(_savedPosition.value()) : workingCopy->end();
     _lastMoveWasRestore = it == workingCopy->end() || it->first != _savedPosition.value();
-    return true;
+
+    // Capped iterators die on invalidation rather than advancing.
+    return !(_isCapped && _lastMoveWasRestore);
 }
 
 void RecordStore::Cursor::detachFromOperationContext() {
@@ -369,6 +478,7 @@ RecordStore::ReverseCursor::ReverseCursor(OperationContext* opCtx, const RecordS
     _ident = rs._ident;
     _prefix = rs._prefix;
     _postfix = rs._postfix;
+    _isCapped = rs._isCapped;
 }
 
 boost::optional<Record> RecordStore::ReverseCursor::next() {
@@ -417,7 +527,9 @@ bool RecordStore::ReverseCursor::restore() {
         ? StringStore::const_reverse_iterator(workingCopy->upper_bound(_savedPosition.value()))
         : workingCopy->rend();
     _lastMoveWasRestore = (it == workingCopy->rend() || it->first != _savedPosition.value());
-    return true;
+
+    // Capped iterators die on invalidation rather than advancing.
+    return !(_isCapped && _lastMoveWasRestore);
 }
 
 void RecordStore::ReverseCursor::detachFromOperationContext() {

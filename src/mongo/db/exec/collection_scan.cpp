@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -55,18 +57,18 @@ using stdx::make_unique;
 const char* CollectionScan::kStageType = "COLLSCAN";
 
 CollectionScan::CollectionScan(OperationContext* opCtx,
+                               const Collection* collection,
                                const CollectionScanParams& params,
                                WorkingSet* workingSet,
                                const MatchExpression* filter)
-    : PlanStage(kStageType, opCtx),
+    : RequiresCollectionStage(kStageType, opCtx, collection),
       _workingSet(workingSet),
       _filter(filter),
-      _params(params),
-      _isDead(false) {
+      _params(params) {
     // Explain reports the direction of the collection scan.
     _specificStats.direction = params.direction;
     _specificStats.maxTs = params.maxTs;
-    invariant(!_params.shouldTrackLatestOplogTimestamp || _params.collection->ns().isOplog());
+    invariant(!_params.shouldTrackLatestOplogTimestamp || collection->ns().isOplog());
 
     if (params.maxTs) {
         _endConditionBSON = BSON("$gte" << *(params.maxTs));
@@ -76,17 +78,6 @@ CollectionScan::CollectionScan(OperationContext* opCtx,
 }
 
 PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
-    if (_isDead) {
-        Status status(
-            ErrorCodes::CappedPositionLost,
-            str::stream()
-                << "CollectionScan died due to position in capped collection being deleted. "
-                << "Last seen record id: "
-                << _lastSeenId);
-        *out = WorkingSetCommon::allocateStatusMember(_workingSet, status);
-        return PlanStage::DEAD;
-    }
-
     if (_commonStats.isEOF) {
         return PlanStage::IS_EOF;
     }
@@ -108,14 +99,13 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                 // the cursor. Also call abandonSnapshot to make sure that we are using a fresh
                 // storage engine snapshot while waiting. Otherwise, we will end up reading from the
                 // snapshot where the oplog entries are not yet visible even after the wait.
-                invariant(!_params.tailable && _params.collection->ns().isOplog());
+                invariant(!_params.tailable && collection()->ns().isOplog());
 
                 getOpCtx()->recoveryUnit()->abandonSnapshot();
-                _params.collection->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(
-                    getOpCtx());
+                collection()->getRecordStore()->waitForAllEarlierOplogWritesToBeVisible(getOpCtx());
             }
 
-            _cursor = _params.collection->getCursor(getOpCtx(), forward);
+            _cursor = collection()->getCursor(getOpCtx(), forward);
 
             if (!_lastSeenId.isNull()) {
                 invariant(_params.tailable);
@@ -126,7 +116,6 @@ PlanStage::StageState CollectionScan::doWork(WorkingSetID* out) {
                 // returned this one. This is only possible in the tailing case because that is the
                 // only time we'd need to create a cursor after already getting a record out of it.
                 if (!_cursor->seekExact(_lastSeenId)) {
-                    _isDead = true;
                     Status status(ErrorCodes::CappedPositionLost,
                                   str::stream() << "CollectionScan died due to failure to restore "
                                                 << "tailable cursor position. "
@@ -219,20 +208,24 @@ PlanStage::StageState CollectionScan::returnIfMatches(WorkingSetMember* member,
 }
 
 bool CollectionScan::isEOF() {
-    return _commonStats.isEOF || _isDead;
+    return _commonStats.isEOF;
 }
 
-void CollectionScan::doSaveState() {
+void CollectionScan::saveState(RequiresCollTag) {
     if (_cursor) {
         _cursor->save();
     }
 }
 
-void CollectionScan::doRestoreState() {
+void CollectionScan::restoreState(RequiresCollTag) {
     if (_cursor) {
-        if (!_cursor->restore()) {
-            _isDead = true;
-        }
+        const bool couldRestore = _cursor->restore();
+        uassert(ErrorCodes::CappedPositionLost,
+                str::stream()
+                    << "CollectionScan died due to position in capped collection being deleted. "
+                    << "Last seen record id: "
+                    << _lastSeenId,
+                couldRestore);
     }
 }
 

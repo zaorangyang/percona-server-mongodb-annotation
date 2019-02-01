@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -56,8 +58,6 @@ class LockManager {
 public:
     LockManager();
     ~LockManager();
-
-    class TemporaryResourceQueue;
 
     /**
       * Acquires lock on the specified resource in the specified mode and returns the outcome
@@ -140,10 +140,6 @@ private:
     // The lockheads need access to the partitions
     friend struct LockHead;
 
-    // ReplicationLockManagerManipulator manipulates LockManager state directly in order to
-    // encapsulate specific logic for replication state transitions.
-    friend class ReplicationLockManagerManipulator;
-
     // These types describe the locks hash table
 
     struct LockBucket {
@@ -206,7 +202,7 @@ private:
      *
      * @param lock Lock whose grant state should be recalculated.
      * @param checkConflictQueue Whether to go through the conflict queue. This is an
-     *          optimization in that we only need to check the conflict queue if one of the
+     *          optimisation in that we only need to check the conflict queue if one of the
      *          granted modes, which was conflicting before became zero.
      */
     void _onLockModeChanged(LockHead* lock, bool checkConflictQueue);
@@ -317,148 +313,6 @@ private:
     WaitForGraph _graph;
 
     bool _foundCycle;
-};
-
-/**
- * There is one of these objects for each resource that has a lock request. Empty objects (i.e.
- * LockHead with no requests) are allowed to exist on the lock manager's hash table.
- *
- * The memory and lifetime is controlled entirely by the LockManager class.
- *
- * Not thread-safe and should only be accessed under the LockManager's bucket lock. Must be locked
- * before locking a partition, not after.
- *
- * This struct *should* just be a private sub-class of LockManager since it is effectively an
- * implementation detail of LockManager.  The reason it isn't is because it is also used by
- * ReplicationLockManagerManipulator and because it is forward-declared in lock_manager_defs.h.
- * Nevertheless this struct should be thought of as an implementation detail of LockManager and
- * should not be used directly except by LockManager and friend classes of LockManager that serve to
- * extend LockManager functionality.
- */
-struct LockHead {
-private:
-    friend class DeadlockDetector;
-    friend class LockManager;
-    friend class ReplicationLockManagerManipulator;
-
-    /**
-     * Used for initialization of a LockHead, which might have been retrieved from cache and also in
-     * order to keep the LockHead structure a POD.
-     */
-    void initNew(ResourceId resId);
-
-    /**
-     * True iff there may be partitions with granted requests for this resource.
-     */
-    bool partitioned() const;
-
-    /**
-     * Locates the request corresponding to the particular locker or returns nullptr. Must be called
-     * with the bucket holding this lock head locked.
-     */
-    LockRequest* findRequest(LockerId lockerId) const;
-
-    /**
-     * Finish creation of request and put it on the LockHead's conflict or granted queues. Returns
-     * LOCK_WAITING for conflict case and LOCK_OK otherwise.
-     */
-    LockResult newRequest(LockRequest* request);
-
-    /**
-     * Lock each partitioned LockHead in turn, and move any (granted) intent mode requests for
-     * lock->resourceId to lock, which must itself already be locked.
-     */
-    void migratePartitionedLockHeads();
-
-    // Methods to maintain the granted queue
-    void incGrantedModeCount(LockMode mode);
-
-    void decGrantedModeCount(LockMode mode);
-
-    // Methods to maintain the conflict queue
-    void incConflictModeCount(LockMode mode);
-
-    void decConflictModeCount(LockMode mode);
-
-    // Id of the resource which is protected by this lock. Initialized at construction time and does
-    // not change.
-    ResourceId resourceId;
-
-    //
-    // Granted queue
-    //
-
-    // Doubly-linked list of requests, which have been granted. Newly granted requests go to
-    // the end of the queue. Conversion requests are granted from the beginning forward.
-    LockRequestList grantedList;
-
-    // Counts the grants and conversion counts for each of the supported lock modes. These
-    // counts should exactly match the aggregated modes on the granted list.
-    uint32_t grantedCounts[LockModesCount];
-
-    // Bit-mask of the granted + converting modes on the granted queue. Maintained in lock-step
-    // with the grantedCounts array.
-    uint32_t grantedModes;
-
-    //
-    // Conflict queue
-    //
-
-    // Doubly-linked list of requests, which have not been granted yet because they conflict
-    // with the set of granted modes. Requests are queued at the end of the queue and are
-    // granted from the beginning forward, which gives these locks FIFO ordering. Exceptions
-    // are high-priority locks, such as the MMAP V1 flush lock.
-    LockRequestList conflictList;
-
-    // Counts the conflicting requests for each of the lock modes. These counts should exactly
-    // match the aggregated modes on the conflicts list.
-    uint32_t conflictCounts[LockModesCount];
-
-    // Bit-mask of the conflict modes on the conflict queue. Maintained in lock-step with the
-    // conflictCounts array.
-    uint32_t conflictModes;
-
-    // References partitions that may have PartitionedLockHeads for this LockHead.
-    // Non-empty implies the lock has no conflicts and only has intent modes as grantedModes.
-    // TODO: Remove this vector and make LockHead a POD
-    std::vector<LockManager::Partition*> partitions;
-
-    //
-    // Conversion
-    //
-
-    // Counts the number of requests on the granted queue, which have requested any kind of
-    // conflicting conversion and are blocked (i.e. all requests which are currently
-    // STATUS_CONVERTING). This is an optimization for unlocking in that we do not need to
-    // check the granted queue for requests in STATUS_CONVERTING if this count is zero. This
-    // saves cycles in the regular case and only burdens the less-frequent lock upgrade case.
-    uint32_t conversionsCount;
-
-    // Counts the number of requests on the granted queue, which have requested that the policy
-    // be switched to compatible-first. As long as this value is > 0, the policy will stay
-    // compatible-first.
-    uint32_t compatibleFirstCount;
-};
-
-/**
- * This class wraps a LockHead and is used to represent a temporary state for a resource managed by
- * the LockManager.  This allows us to prepare lock requests against a resource without those
- * requests actually being present in the "true" version of the resource which is actually being
- * managed by the LockManager.  We use this to avoid exposing LockHead, which is an implementation
- * detail of the LockManager, while still providing a handle to state for a LockManager resource.
- */
-class LockManager::TemporaryResourceQueue {
-public:
-    explicit TemporaryResourceQueue(ResourceId resourceId);
-
-    ResourceId getResourceId() const {
-        return _lockHead.resourceId;
-    }
-
-private:
-    friend class ReplicationLockManagerManipulator;
-
-    LockHead _lockHead;
 };
 
 }  // namespace mongo

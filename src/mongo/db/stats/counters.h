@@ -1,24 +1,26 @@
 // counters.h
-/*
- *    Copyright (C) 2010 10gen Inc.
+
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -59,34 +61,34 @@ public:
     BSONObj getObj() const;
 
     // thse are used by snmp, and other things, do not remove
-    const AtomicUInt32* getInsert() const {
+    const AtomicInt64* getInsert() const {
         return &_insert;
     }
-    const AtomicUInt32* getQuery() const {
+    const AtomicInt64* getQuery() const {
         return &_query;
     }
-    const AtomicUInt32* getUpdate() const {
+    const AtomicInt64* getUpdate() const {
         return &_update;
     }
-    const AtomicUInt32* getDelete() const {
+    const AtomicInt64* getDelete() const {
         return &_delete;
     }
-    const AtomicUInt32* getGetMore() const {
+    const AtomicInt64* getGetMore() const {
         return &_getmore;
     }
-    const AtomicUInt32* getCommand() const {
+    const AtomicInt64* getCommand() const {
         return &_command;
     }
 
 private:
     void _checkWrap();
 
-    CacheAligned<AtomicUInt32> _insert;
-    CacheAligned<AtomicUInt32> _query;
-    CacheAligned<AtomicUInt32> _update;
-    CacheAligned<AtomicUInt32> _delete;
-    CacheAligned<AtomicUInt32> _getmore;
-    CacheAligned<AtomicUInt32> _command;
+    CacheAligned<AtomicInt64> _insert;
+    CacheAligned<AtomicInt64> _query;
+    CacheAligned<AtomicInt64> _update;
+    CacheAligned<AtomicInt64> _delete;
+    CacheAligned<AtomicInt64> _getmore;
+    CacheAligned<AtomicInt64> _command;
 };
 
 extern OpCounters globalOpCounters;

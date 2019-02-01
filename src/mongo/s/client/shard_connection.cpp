@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -44,6 +46,7 @@
 #include "mongo/s/cluster_last_error_info.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
+#include "mongo/s/transaction_router.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/log.h"
@@ -375,11 +378,15 @@ MONGO_INITIALIZER(InitializeShardedConnectionPool)(InitializerContext* context) 
 
 DBConnectionPool shardConnectionPool;
 
-ShardConnection::ShardConnection(const ConnectionString& connectionString,
+ShardConnection::ShardConnection(OperationContext* opCtx,
+                                 const ConnectionString& connectionString,
                                  const std::string& ns,
                                  std::shared_ptr<ChunkManager> manager)
-    : _cs(connectionString), _ns(ns), _manager(manager), _finishedInit(false) {
+    : _cs(connectionString), _ns(ns), _manager(manager) {
     invariant(_cs.isValid());
+
+    // This code should never run under a cross-shard transaction
+    invariant(!TransactionRouter::get(opCtx));
 
     // Make sure we specified a manager for the correct namespace
     if (_ns.size() && _manager) {
@@ -387,11 +394,12 @@ ShardConnection::ShardConnection(const ConnectionString& connectionString,
     }
 
     auto csString = _cs.toString();
+
     _conn = ClientConnections::threadInstance()->get(csString, _ns);
     if (isMongos()) {
         // In mongos, we record this connection as having been used for useful work to provide
         // useful information in getLastError.
-        ClusterLastErrorInfo::get(cc())->addShardHost(csString);
+        ClusterLastErrorInfo::get(opCtx->getClient())->addShardHost(csString);
     }
 }
 

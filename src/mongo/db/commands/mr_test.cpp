@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -44,6 +46,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/op_observer_noop.h"
 #include "mongo/db/op_observer_registry.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/service_context_d_test_fixture.h"
@@ -296,12 +299,19 @@ public:
                             const BSONObj& idIndex,
                             const OplogSlot& createOpTime) override;
 
+    repl::OpTime onDropCollection(OperationContext* opCtx,
+                                  const NamespaceString& collectionName,
+                                  OptionalCollectionUUID uuid,
+                                  CollectionDropType dropType) override;
+
     // Hook for onInserts. Defaults to a no-op function but may be overridden to inject exceptions
     // while mapReduce inserts its results into the temporary output collection.
     std::function<void()> onInsertsFn = [] {};
 
     // Holds namespaces of temporary collections created by mapReduce.
     std::vector<NamespaceString> tempNamespaces;
+
+    const repl::OpTime dropOpTime = {Timestamp(Seconds(100), 1U), 1LL};
 };
 
 void MapReduceOpObserver::onInserts(OperationContext* opCtx,
@@ -323,6 +333,18 @@ void MapReduceOpObserver::onCreateCollection(OperationContext*,
         return;
     }
     tempNamespaces.push_back(collectionName);
+}
+
+repl::OpTime MapReduceOpObserver::onDropCollection(OperationContext* opCtx,
+                                                   const NamespaceString& collectionName,
+                                                   OptionalCollectionUUID uuid,
+                                                   const CollectionDropType dropType) {
+    // If the oplog is not disabled for this namespace, then we need to reserve an op time for the
+    // drop.
+    if (!repl::ReplicationCoordinator::get(opCtx)->isOplogDisabledFor(opCtx, collectionName)) {
+        OpObserver::Times::get(opCtx).reservedOpTimes.push_back(dropOpTime);
+    }
+    return {};
 }
 
 /**
@@ -379,6 +401,10 @@ void MapReduceCommandTest::setUp() {
         [](OperationContext* opCtx) { return std::make_unique<DBDirectClient>(opCtx); });
     repl::ReplicationCoordinator::set(service,
                                       std::make_unique<repl::ReplicationCoordinatorMock>(service));
+
+    repl::DropPendingCollectionReaper::set(
+        service,
+        stdx::make_unique<repl::DropPendingCollectionReaper>(repl::StorageInterface::get(service)));
 
     // Set up an OpObserver to track the temporary collections mapReduce creates.
     auto opObserver = std::make_unique<MapReduceOpObserver>();

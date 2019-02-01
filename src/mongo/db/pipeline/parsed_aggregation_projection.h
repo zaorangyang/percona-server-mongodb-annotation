@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2016 MongoDB, Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -140,25 +142,38 @@ private:
  */
 class ParsedAggregationProjection : public TransformerInterface {
 public:
-    // Allows the caller to indicate whether the projection should default to including or excluding
-    // the _id field in the event that the projection spec does not specify the desired behavior.
-    // For instance, given a projection {a: 1}, specifying 'kExcludeId' is equivalent to projecting
-    // {a: 1, _id: 0} while 'kIncludeId' is equivalent to the projection {a: 1, _id: 1}. If the user
-    // explicitly specifies a projection on _id, then this will override the default policy; for
-    // instance, {a: 1, _id: 0} will exclude _id for both 'kExcludeId' and 'kIncludeId'.
-    enum class ProjectionDefaultIdPolicy { kIncludeId, kExcludeId };
+    struct ProjectionPolicies {
+        // Allows the caller to indicate whether the projection should default to including or
+        // excluding the _id field in the event that the projection spec does not specify the
+        // desired behavior. For instance, given a projection {a: 1}, specifying 'kExcludeId' is
+        // equivalent to projecting {a: 1, _id: 0} while 'kIncludeId' is equivalent to the
+        // projection {a: 1, _id: 1}. If the user explicitly specifies a projection on _id, then
+        // this will override the default policy; for instance, {a: 1, _id: 0} will exclude _id for
+        // both 'kExcludeId' and 'kIncludeId'.
+        enum class DefaultIdPolicy { kIncludeId, kExcludeId };
 
-    // Allows the caller to specify how the projection should handle nested arrays; that is, an
-    // array whose immediate parent is itself an array. For example, in the case of sample document
-    // {a: [1, 2, [3, 4], {b: [5, 6]}]} the array [3, 4] is a nested array. The array [5, 6] is not,
-    // because there is an intervening object between it and its closest array ancestor.
-    enum class ProjectionArrayRecursionPolicy { kRecurseNestedArrays, kDoNotRecurseNestedArrays };
+        // Allows the caller to specify how the projection should handle nested arrays; that is, an
+        // array whose immediate parent is itself an array. For example, in the case of sample
+        // document {a: [1, 2, [3, 4], {b: [5, 6]}]} the array [3, 4] is a nested array. The array
+        // [5, 6] is not, because there is an intervening object between it and its closest array
+        // ancestor.
+        enum class ArrayRecursionPolicy { kRecurseNestedArrays, kDoNotRecurseNestedArrays };
 
-    // Allows the caller to specify whether computed fields should be allowed within inclusion
-    // projections; they are implicitly prohibited within exclusion projections.
-    enum class ProjectionParseMode {
-        kBanComputedFields,   // No computed fields are permitted in the projection spec.
-        kAllowComputedFields  // Computed fields are permitted.
+        // Allows the caller to specify whether computed fields should be allowed within inclusion
+        // projections. Computed fields are implicitly prohibited by exclusion projections.
+        enum class ComputedFieldsPolicy { kBanComputedFields, kAllowComputedFields };
+
+        ProjectionPolicies(
+            DefaultIdPolicy idPolicy = DefaultIdPolicy::kIncludeId,
+            ArrayRecursionPolicy arrayRecursionPolicy = ArrayRecursionPolicy::kRecurseNestedArrays,
+            ComputedFieldsPolicy computedFieldsPolicy = ComputedFieldsPolicy::kAllowComputedFields)
+            : idPolicy(idPolicy),
+              arrayRecursionPolicy(arrayRecursionPolicy),
+              computedFieldsPolicy(computedFieldsPolicy) {}
+
+        DefaultIdPolicy idPolicy;
+        ArrayRecursionPolicy arrayRecursionPolicy;
+        ComputedFieldsPolicy computedFieldsPolicy;
     };
 
     /**
@@ -169,9 +184,7 @@ public:
     static std::unique_ptr<ParsedAggregationProjection> create(
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         const BSONObj& spec,
-        ProjectionDefaultIdPolicy defaultIdPolicy,
-        ProjectionArrayRecursionPolicy arrayRecursionPolicy,
-        ProjectionParseMode parseRules = ProjectionParseMode::kAllowComputedFields);
+        ProjectionPolicies policies);
 
     virtual ~ParsedAggregationProjection() = default;
 
@@ -204,11 +217,8 @@ public:
 
 protected:
     ParsedAggregationProjection(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                                ProjectionDefaultIdPolicy defaultIdPolicy,
-                                ProjectionArrayRecursionPolicy arrayRecursionPolicy)
-        : _expCtx(expCtx),
-          _arrayRecursionPolicy(arrayRecursionPolicy),
-          _defaultIdPolicy(defaultIdPolicy){};
+                                ProjectionPolicies policies)
+        : _expCtx(expCtx), _policies(policies){};
 
     /**
      * Apply the projection to 'input'.
@@ -217,8 +227,7 @@ protected:
 
     boost::intrusive_ptr<ExpressionContext> _expCtx;
 
-    ProjectionArrayRecursionPolicy _arrayRecursionPolicy;
-    ProjectionDefaultIdPolicy _defaultIdPolicy;
+    ProjectionPolicies _policies;
 };
 }  // namespace parsed_aggregation_projection
 }  // namespace mongo

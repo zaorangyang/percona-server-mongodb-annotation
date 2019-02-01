@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2017 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -83,16 +85,13 @@ Status makePrimaryConnection(OperationContext* opCtx, boost::optional<ScopedDbCo
 }
 
 template <typename Callback>
-auto runIfStandaloneOrPrimary(const NamespaceString& ns,
-                              LockMode mode,
-                              OperationContext* opCtx,
-                              Callback callback)
+auto runIfStandaloneOrPrimary(const NamespaceString& ns, OperationContext* opCtx, Callback callback)
     -> boost::optional<decltype(std::declval<Callback>()())> {
     bool isStandaloneOrPrimary;
     {
-        Lock::DBLock lk(opCtx, ns.db(), mode);
+        Lock::DBLock lk(opCtx, ns.db(), MODE_IS);
         Lock::CollectionLock lock(
-            opCtx->lockState(), NamespaceString::kLogicalSessionsNamespace.ns(), mode);
+            opCtx->lockState(), NamespaceString::kLogicalSessionsNamespace.ns(), MODE_IS);
 
         auto coord = mongo::repl::ReplicationCoordinator::get(opCtx);
 
@@ -133,13 +132,12 @@ auto sendToPrimary(OperationContext* opCtx, Callback callback)
 
 template <typename LocalCallback, typename RemoteCallback>
 auto dispatch(const NamespaceString& ns,
-              LockMode mode,
               OperationContext* opCtx,
               LocalCallback localCallback,
               RemoteCallback remoteCallback)
     -> decltype(std::declval<RemoteCallback>()(static_cast<DBClientBase*>(nullptr))) {
     // If we are the primary, write directly to ourself.
-    auto result = runIfStandaloneOrPrimary(ns, mode, opCtx, [&] { return localCallback(); });
+    auto result = runIfStandaloneOrPrimary(ns, opCtx, [&] { return localCallback(); });
 
     if (result) {
         return *result;
@@ -153,13 +151,24 @@ auto dispatch(const NamespaceString& ns,
 Status SessionsCollectionRS::setupSessionsCollection(OperationContext* opCtx) {
     return dispatch(
         NamespaceString::kLogicalSessionsNamespace,
-        MODE_IX,
         opCtx,
         [&] {
-            // Creating the TTL index will auto-generate the collection.
+            auto existsStatus = checkSessionsCollectionExists(opCtx);
+            if (existsStatus.isOK()) {
+                return Status::OK();
+            }
+
             DBDirectClient client(opCtx);
+            BSONObj cmd;
+
+            if (existsStatus.code() == ErrorCodes::IndexOptionsConflict) {
+                cmd = generateCollModCmd();
+            } else {
+                // Creating the TTL index will auto-generate the collection.
+                cmd = generateCreateIndexesCmd();
+            }
+
             BSONObj info;
-            auto cmd = generateCreateIndexesCmd();
             if (!client.runCommand(
                     NamespaceString::kLogicalSessionsNamespace.db().toString(), cmd, info)) {
                 return getStatusFromCommandResult(info);
@@ -167,21 +176,40 @@ Status SessionsCollectionRS::setupSessionsCollection(OperationContext* opCtx) {
 
             return Status::OK();
         },
-        [&](DBClientBase* client) {
-            BSONObj info;
-            auto cmd = generateCreateIndexesCmd();
-            if (!client->runCommand(
-                    NamespaceString::kLogicalSessionsNamespace.db().toString(), cmd, info)) {
-                return getStatusFromCommandResult(info);
-            }
-            return Status::OK();
-        });
+        [&](DBClientBase*) { return checkSessionsCollectionExists(opCtx); });
+}
+
+Status SessionsCollectionRS::checkSessionsCollectionExists(OperationContext* opCtx) {
+    DBDirectClient client(opCtx);
+
+    auto indexes = client.getIndexSpecs(NamespaceString::kLogicalSessionsNamespace.toString());
+
+    if (indexes.size() == 0u) {
+        return Status{ErrorCodes::NamespaceNotFound, "config.system.sessions does not exist"};
+    }
+
+    auto index = std::find_if(indexes.begin(), indexes.end(), [](const BSONObj& index) {
+        return index.getField("name").String() == kSessionsTTLIndex;
+    });
+
+    if (index == indexes.end()) {
+        return Status{ErrorCodes::IndexNotFound,
+                      "config.system.sessions does not have the required TTL index"};
+    }
+
+    if (!index->hasField("expireAfterSeconds") ||
+        index->getField("expireAfterSeconds").Int() != (localLogicalSessionTimeoutMinutes * 60)) {
+        return Status{
+            ErrorCodes::IndexOptionsConflict,
+            "config.system.sessions currently has the incorrect timeout for the TTL index"};
+    }
+
+    return Status::OK();
 }
 
 Status SessionsCollectionRS::refreshSessions(OperationContext* opCtx,
                                              const LogicalSessionRecordSet& sessions) {
     return dispatch(NamespaceString::kLogicalSessionsNamespace,
-                    MODE_IX,
                     opCtx,
                     [&] {
                         DBDirectClient client(opCtx);
@@ -201,7 +229,6 @@ Status SessionsCollectionRS::refreshSessions(OperationContext* opCtx,
 Status SessionsCollectionRS::removeRecords(OperationContext* opCtx,
                                            const LogicalSessionIdSet& sessions) {
     return dispatch(NamespaceString::kLogicalSessionsNamespace,
-                    MODE_IX,
                     opCtx,
                     [&] {
                         DBDirectClient client(opCtx);
@@ -221,7 +248,6 @@ Status SessionsCollectionRS::removeRecords(OperationContext* opCtx,
 StatusWith<LogicalSessionIdSet> SessionsCollectionRS::findRemovedSessions(
     OperationContext* opCtx, const LogicalSessionIdSet& sessions) {
     return dispatch(NamespaceString::kLogicalSessionsNamespace,
-                    MODE_IS,
                     opCtx,
                     [&] {
                         DBDirectClient client(opCtx);
@@ -242,7 +268,6 @@ Status SessionsCollectionRS::removeTransactionRecords(OperationContext* opCtx,
                                                       const LogicalSessionIdSet& sessions) {
     return dispatch(
         NamespaceString::kSessionTransactionsTableNamespace,
-        MODE_IX,
         opCtx,
         [&] {
             DBDirectClient client(opCtx);

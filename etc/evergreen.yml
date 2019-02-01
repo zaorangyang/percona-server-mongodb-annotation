@@ -490,6 +490,7 @@ variables:
     - windows-64-vs2015-large
   - name: burn_in_tests
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: audit
   - name: auth_audit
   - name: benchmarks_orphaned
@@ -1093,6 +1094,35 @@ functions:
         done
         fi
 
+  "setup gradle signing keys":
+    command: shell.exec
+    params:
+      silent: true
+      script: |
+        cd src/src/mongo/embedded/mongo_embedded/java
+
+        echo -n "${mongodb_mobile_release_signing_secret_key}" > mobile-release-signing-key.secret
+        echo -n "${mongodb_mobile_release_signing_public_key}" > mobile-release-signing-key.public
+
+        gpg --homedir ${workingdir}/.gnupg --allow-secret-key-import --import mobile-release-signing-key.secret
+        gpg --homedir ${workingdir}/.gnupg --import mobile-release-signing-key.public
+        # Required for gradle to pick up the keys
+        gpg --homedir ${workingdir}/.gnupg --keyring secring.gpg --export-secret-keys secring.gpg
+
+        echo -n <<EOF
+        signing.keyId=${mongodb_mobile_release_signing_keyid}
+        signing.password=${mongodb_mobile_release_signing_password}
+        signing.secretKeyRingFile=${mongodb_mobile_release_signing_secretkeyringfile}
+
+        ossrhUsername=${mongodb_mobile_ossrh_username}
+        ossrhPassword=${mongodb_mobile_ossrh_password}
+        EOF > local.properties
+
+        echo <<EOF
+        export artifactory_mobile_user=${artifactory_mobile_user}
+        export artifactory_mobile_pass=${artifactory_mobile_pass}
+        EOF > artifactory_mobile_creds.sh
+
   "setup android toolchain" :
     command: shell.exec
     params:
@@ -1102,6 +1132,67 @@ functions:
         if [ "${setup_android_toolchain|}" = "true" ]; then
             ${activate_virtualenv}
             PYTHON=$python ${compile_env|} src/buildscripts/setup-android-toolchain.sh ${android_toolchain_target_arch} ${android_toolchain_api_version}
+        fi
+
+  "build java embedded sdk":
+    command: shell.exec
+    params:
+      script: |
+        set -o errexit
+        set -o verbose
+
+        # If the android toolchain has not been setup the android sdk will not
+        # be available and we should not build the android version of mongodb
+        # embedded.
+        if [ "${setup_android_toolchain|}" = "true" ]; then
+            export ANDROID_HOME=$(pwd)/android_sdk
+
+            cd src/src/mongo/embedded/mongo_embedded/java
+
+            # TODO: Clean this up later where we can remove duplication
+            if [ ${package_type|embedded-android} = "embedded-jar" ]; then
+                tar zxvf ../../../../../../embedded-sdk-java-linux-x86-64.tgz
+                mkdir -p jniLibs/linux-x86-64
+                cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/linux-x86-64
+                rm -rf ./mongo-embedded-sdk-${version}
+
+                tar zxvf ../../../../../../embedded-sdk-java-darwin.tgz
+                mkdir -p jniLibs/darwin
+                cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.dylib jniLibs/darwin
+                rm -rf ./mongo-embedded-sdk-${version}
+
+                ./gradlew clean :embedded-jar:build :embedded-jar:publishMavenPublicationToLocalRepository
+
+                # Is this a release?
+                echo "${version|-g}" | grep -q -- "-g"
+                if [ $? -eq 1 ]; then
+                    echo "Releases disabled on master."
+                    #source ./artifactory_mobile_creds.sh
+                    #./gradlew --info :embedded-jar:artifactoryPublish
+                fi
+
+
+                mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/java
+                cp -r embedded-jar/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/java
+            else
+                for arch in arm64-v8a armeabi-v7a x86_64 ; do
+                    tar zxvf ../../../../../../embedded-sdk-android-$arch.tgz
+                    mkdir -p jniLibs/$arch
+                    cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/$arch
+                    rm -rf ./mongo-embedded-sdk-${version}
+                done
+
+                ./gradlew clean :embedded-android:build
+                # Is this a release?
+                echo "${version|-g}" | grep -q -- "-g"
+                if [ $? -eq 1 ]; then
+                    echo "Releases disabled on master."
+                    #./gradlew :embedded-android:uploadArchives closeAndReleaseRepository
+                fi
+
+                mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/android
+                cp -r embedded-android/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/android
+            fi
         fi
 
   "shared scons cache pruning" :
@@ -3672,13 +3763,61 @@ tasks:
 
           rm -rf mongo-c-driver
 
+          # NOTE: If you change the C Driver version here, also change the substitution in the CocoaPod podspec below in the apple builder.
           git clone --branch r1.13 --depth 1 https://github.com/mongodb/mongo-c-driver.git
           cd mongo-c-driver
 
+          # Fixup VERSION so we don't end up with -dev on it. Remove this once we are building a stable version and CDRIVER-2861 is resolved.
+          cp -f VERSION_RELEASED VERSION_CURRENT
+
           trap "cat CMakeFiles/CMakeOutput.log" EXIT
           export ${compile_env|}
-          ${cmake_path|/opt/cmake/bin/cmake} -DCMAKE_INSTALL_PREFIX=$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp -DENABLE_SHM_COUNTERS=OFF -DENABLE_SNAPPY=OFF -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF -DENABLE_ZLIB=OFF -DENABLE_SSL=OFF -DENABLE_SASL=OFF -DENABLE_TESTS=OFF -DENABLE_SRV=OFF -DENABLE_EXAMPLES=OFF -DENABLE_STATIC=OFF ${cdriver_cmake_flags}
+          ${cmake_path|/opt/cmake/bin/cmake} -DCMAKE_INSTALL_PREFIX=$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp -DENABLE_SHM_COUNTERS=OFF -DENABLE_SNAPPY=OFF -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF -DENABLE_TESTS=OFF -DENABLE_EXAMPLES=OFF -DENABLE_STATIC=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=${cdriver_cmake_osx_deployment_target|} ${cdriver_cmake_flags}
           make install VERBOSE=1
+
+          # TODO: Remove this when we upgrade to a version of the C driver that has CDRIVER-2854 fixed.
+          mkdir -p $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/share/doc/mongo-c-driver
+          cp COPYING $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/share/doc/mongo-c-driver
+          cp THIRD_PARTY_NOTICES $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/share/doc/mongo-c-driver
+          if [ -d $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks ]; then
+
+              # We need to account for the fact that on the Darwin
+              # mobile platforms, things shouldn't go to the Resources
+              # directory but on macOS they should. If the Resources
+              # directory is there (it should be for the plist file),
+              # then use it, otherwise just use the framework root.
+              if [ -e $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/mongoc.framework/Resources ]; then
+                  cp COPYING $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/mongoc.framework/Resources
+                  cp THIRD_PARTY_NOTICES $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/mongoc.framework/Resources
+                  plutil -insert MinimumOSVersion -string ${cdriver_cmake_osx_deployment_target} $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/mongoc.framework/Resources/Info.plist
+              else
+                  cp COPYING $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/mongoc.framework
+                  cp THIRD_PARTY_NOTICES $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/mongoc.framework
+                  plutil -insert MinimumOSVersion -string ${cdriver_cmake_osx_deployment_target} $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/mongoc.framework/Info.plist
+              fi
+
+              if [ -e $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/bson.framework/Resources ]; then
+                  cp COPYING $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/bson.framework/Resources
+                  cp THIRD_PARTY_NOTICES $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/bson.framework/Resources
+                  plutil -insert MinimumOSVersion -string ${cdriver_cmake_osx_deployment_target} $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/bson.framework/Resources/Info.plist
+              else
+                  cp COPYING $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/bson.framework
+                  cp THIRD_PARTY_NOTICES $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/bson.framework
+                  plutil -insert MinimumOSVersion -string ${cdriver_cmake_osx_deployment_target} $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks/bson.framework/Info.plist
+              fi
+
+          fi
+
+          # CMake doesn't seem to do the dSYM for us for the framework
+          if [ -e $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks ]; then
+              pushd $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp/Frameworks
+              xcrun dsymutil -o bson.framework.dSYM bson.framework/bson
+              xcrun strip -Sx bson.framework/bson
+              xcrun dsymutil -o mongoc.framework.dSYM mongoc.framework/mongoc
+              xcrun strip -Sx mongoc.framework/mongoc
+              popd
+          fi
+
           mv $WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp $WORKDIR/src/build/mongo-embedded-sdk-$VERSION
 
 - name: embedded_sdk_install_dev
@@ -3697,9 +3836,35 @@ tasks:
           --use-system-mongo-c=on
           --wiredtiger=off
           --allocator=system
+          --separate-debug
           CPPPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libbson-1.0 $BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/include/libmongoc-1.0'
         task_compile_flags_extra: >-
           --link-model=dynamic-sdk
+
+    # Unfortunately, it is very hard to get the symbol map filename
+    # correct in SCons. We work around that here by letting SCons give
+    # them a well known name, and then renaming them appropriately
+    # once we have finished the build.
+    - command: shell.exec
+      params:
+        working_dir: "src/build"
+        script: |
+          set -o errexit
+          set -o verbose
+
+          cd mongo-embedded-sdk-${version}
+
+          if [ -e Frameworks/mongo_embedded.framework/BCSymbolMaps ]; then
+              pushd Frameworks/mongo_embedded.framework
+              mv BCSymbolMaps/libmongo_embedded.dylib.bcsymbolmap BCSymbolMaps/$(dwarfdump -u mongo_embedded | awk '{ print $2 }').bcsymbolmap
+              popd
+          fi
+
+          if [ -e Frameworks/mongoc_embedded.framework/BCSymbolMaps ]; then
+              pushd Frameworks/mongoc_embedded.framework
+              mv BCSymbolMaps/libmongoc_embedded.dylib.bcsymbolmap BCSymbolMaps/$(dwarfdump -u mongoc_embedded | awk '{ print $2 }').bcsymbolmap
+              popd
+          fi
 
 - name: embedded_sdk_s3_put
   commands:
@@ -3711,6 +3876,14 @@ tasks:
           set -o errexit
           set -o verbose
 
+          cat <<EOF > mongo-embedded-sdk-${version}/README-Licenses.txt
+          The software accompanying this file is Copyright (C) 2018 MongoDB, Inc. and
+          is licensed to you on the terms set forth in the following files:
+            - mongo-c-driver: share/doc/mongo-c-driver/COPYING
+            - mongo_embedded: share/doc/mongo_embedded/LICENSE-Embedded.txt
+            - mongoc_embedded: share/doc/mongo_embedded/LICENSE-Embedded.txt
+          EOF
+
           tar cfvz embedded-sdk.tgz mongo-embedded-sdk-${version}
 
     # Upload it so we can download from EVG.
@@ -3720,7 +3893,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "src/build/embedded-sdk.tgz"
-        remote_file: ${project}/embedded-sdk/${build_variant}/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/${build_variant}/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: application/tar
@@ -3754,7 +3927,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "src/build/embedded-sdk-tests.tgz"
-        remote_file: ${project}/embedded-sdk-test/${build_variant}/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk-test/${build_variant}/${revision}/mongo-embedded-sdk-test-${version}.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: application/tar
@@ -3787,11 +3960,10 @@ tasks:
               ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_test" --tempPath /data
               ${compile_env|} buildscripts/runiossim.sh ${ios_sim_device} ${ios_sim_runtime} "build/mongo-embedded-sdk-${version}/bin/mongoc_embedded_test" --tempPath /data
           elif [ ${enable_embedded_tests|false} = "android_emulator" ]; then
-              # strip because the binaries with debug symbols are too big for the default storage on the emulator
-              find build/mongo-embedded-sdk-${version}/bin -type f | xargs $(dirname $(pwd))/android_toolchain-${android_toolchain_target_arch}-${android_toolchain_api_version}/bin/*-linux-android*-strip
-              find build/mongo-embedded-sdk-${version}/lib -type f -name "*.so" | xargs $(dirname $(pwd))/android_toolchain-${android_toolchain_target_arch}-${android_toolchain_api_version}/bin/*-linux-android*-strip
-              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}" "bin/mongo_embedded_test" --tempPath /data
-              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}" "bin/mongoc_embedded_test" --tempPath /data
+              cp -r build/mongo-embedded-sdk-${version} build/mongo-embedded-sdk-${version}-exec
+              find build/mongo-embedded-sdk-${version}-exec/bin build/mongo-embedded-sdk-${version}-exec/lib -type f -name "*.debug" -delete
+              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}-exec" "bin/mongo_embedded_test" --tempPath /data
+              ${compile_env|} buildscripts/runandroidsim.sh $(dirname $(pwd))/android_sdk ${android_toolchain_system_image_arch} ${android_system_image_version} "build/mongo-embedded-sdk-${version}-exec" "bin/mongoc_embedded_test" --tempPath /data
           elif [ ${enable_embedded_tests|false} = "native" ]; then
             "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_test"
             "build/mongo-embedded-sdk-${version}/bin/mongoc_embedded_test"
@@ -3821,7 +3993,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "src/build/embedded-sdk.tgz"
-        remote_file: ${project}/embedded-sdk/${build_variant}-latest.tgz
+        remote_file: ${project}/embedded-sdk/mongo-${build_variant}-latest.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
@@ -3837,7 +4009,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "src/build/embedded-sdk-tests.tgz"
-        remote_file: ${project}/embedded-sdk-test/${build_variant}-latest.tgz
+        remote_file: ${project}/embedded-sdk-test/mongo-${build_variant}-latest.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: ${content_type|application/x-gzip}
@@ -3862,48 +4034,25 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-android-arm32/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-android-arm32/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "embedded-sdk-android-armeabi-v7a.tgz"
     - command: s3.get
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-android-arm64/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-android-arm64/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "embedded-sdk-android-arm64-v8a.tgz"
     - command: s3.get
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-android-x86_64/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-android-x86_64/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "embedded-sdk-android-x86_64.tgz"
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          if [ "${setup_android_toolchain|}" = "true" ]; then
-            export ANDROID_HOME=$(pwd)/android_sdk
-
-            cd src/src/mongo/embedded/mongo_embedded/java
-
-            chmod +x gradlew
-
-            for arch in arm64-v8a armeabi-v7a x86_64 ; do
-                tar zxvf ../../../../../../embedded-sdk-android-$arch.tgz
-                mkdir -p jniLibs/$arch
-                cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/$arch
-                rm -rf ./mongo-embedded-sdk-${version}
-            done
-
-            ./gradlew clean :aar:build :aar:publishMavenAarPublicationToLocalRepository
-
-            mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/android
-            cp -r aar/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/android
-          fi
+    - func: "setup gradle signing keys"
+    - func: "build java embedded sdk"
     - command: shell.exec
       params:
         script: |
@@ -3919,7 +4068,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "src/build/mongo-embedded-sdk-${version}.tgz"
-        remote_file: "${project}/embedded-sdk/embedded-sdk-android-multiarch/${revision}/${version}.tgz"
+        remote_file: "${project}/embedded-sdk/embedded-sdk-android-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
         bucket: mciuploads
         permissions: public-read
         content_type: application/tar
@@ -3945,7 +4094,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "src/build/mongo-embedded-sdk-${version}.tgz"
-        remote_file: ${project}/embedded-sdk/${build_variant}-latest.tgz
+        remote_file: ${project}/embedded-sdk/mongo-${build_variant}-latest.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: application/tar
@@ -3968,44 +4117,20 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-ubuntu-1604-x86_64/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-ubuntu-1604-x86_64/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "embedded-sdk-java-linux-x86-64.tgz"
     - command: s3.get
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-macosx-10.10/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-macosx-10.10/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
         local_file: "embedded-sdk-java-darwin.tgz"
-    - command: shell.exec
-      params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          if [ "${setup_android_toolchain|}" = "true" ]; then
-            export ANDROID_HOME=$(pwd)/android_sdk
-
-            cd src/src/mongo/embedded/mongo_embedded/java
-
-            chmod +x gradlew
-
-            tar zxvf ../../../../../../embedded-sdk-java-linux-x86-64.tgz
-            mkdir -p jniLibs/linux-x86-64
-            cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.so jniLibs/linux-x86-64
-            rm -rf ./mongo-embedded-sdk-${version}
-
-            tar zxvf ../../../../../../embedded-sdk-java-darwin.tgz
-            mkdir -p jniLibs/darwin
-            cp ./mongo-embedded-sdk-${version}/lib/libmongo_embedded.dylib jniLibs/darwin
-            rm -rf ./mongo-embedded-sdk-${version}
-
-            ./gradlew clean :jar:build :jar:publishMavenPublicationToLocalRepository
-
-            mkdir -p ../../../../../build/mongo-embedded-sdk-${version}/java
-            cp -r jar/build/repo/* ../../../../../build/mongo-embedded-sdk-${version}/java
-          fi
+    - func: "setup gradle signing keys"
+    - func: "build java embedded sdk"
+      vars:
+        package_type: embedded-jar
     - command: shell.exec
       params:
         script: |
@@ -4021,7 +4146,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "src/build/mongo-embedded-sdk-${version}.tgz"
-        remote_file: "${project}/embedded-sdk/embedded-sdk-java-multiarch/${revision}/${version}.tgz"
+        remote_file: "${project}/embedded-sdk/embedded-sdk-java-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
         bucket: mciuploads
         permissions: public-read
         content_type: application/tar
@@ -4046,7 +4171,7 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "src/build/mongo-embedded-sdk-${version}.tgz"
-        remote_file: ${project}/embedded-sdk/${build_variant}-latest.tgz
+        remote_file: ${project}/embedded-sdk/mongo-${build_variant}-latest.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: application/tar
@@ -4055,9 +4180,11 @@ tasks:
 - name: embedded_sdk_multiarch_apple_package
   depends_on:
     - name: embedded_sdk_s3_put
-      variant: embedded-sdk-iphoneos-10.2
+      variant: embedded-sdk-macosx-10.10
     - name: embedded_sdk_s3_put
-      variant: embedded-sdk-iphonesimulator-10.2
+      variant: embedded-sdk-iphoneos-11.0
+    - name: embedded_sdk_s3_put
+      variant: embedded-sdk-iphonesimulator-11.0
     - name: embedded_sdk_s3_put
       variant: embedded-sdk-appletvos-10.2
     - name: embedded_sdk_s3_put
@@ -4079,49 +4206,57 @@ tasks:
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-iphoneos-10.2/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-macosx-10.10/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
-        local_file: "iPhoneOS/embedded-sdk.tgz"
+        local_file: "mongo-embedded-sdk-${version}/MacOS/embedded-sdk.tgz"
 
     - command: s3.get
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-iphonesimulator-10.2/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-iphoneos-11.0/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
-        local_file: "iPhoneSimulator/embedded-sdk.tgz"
+        local_file: "mongo-embedded-sdk-${version}/iPhoneOS/embedded-sdk.tgz"
 
     - command: s3.get
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvos-10.2/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-iphonesimulator-11.0/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
-        local_file: "AppleTVOS/embedded-sdk.tgz"
+        local_file: "mongo-embedded-sdk-${version}/iPhoneSimulator/embedded-sdk.tgz"
 
     - command: s3.get
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvsimulator-10.2/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvos-10.2/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
-        local_file: "AppleTVSimulator/embedded-sdk.tgz"
+        local_file: "mongo-embedded-sdk-${version}/AppleTVOS/embedded-sdk.tgz"
 
     - command: s3.get
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-watchos-4.2/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-appletvsimulator-10.2/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
-        local_file: "WatchOS/embedded-sdk.tgz"
+        local_file: "mongo-embedded-sdk-${version}/AppleTVSimulator/embedded-sdk.tgz"
 
     - command: s3.get
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
-        remote_file: ${project}/embedded-sdk/embedded-sdk-watchsimulator-4.2/${revision}/${version}.tgz
+        remote_file: ${project}/embedded-sdk/embedded-sdk-watchos-4.2/${revision}/mongo-embedded-sdk-${version}.tgz
         bucket: mciuploads
-        local_file: "WatchSimulator/embedded-sdk.tgz"
+        local_file: "mongo-embedded-sdk-${version}/WatchOS/embedded-sdk.tgz"
+
+    - command: s3.get
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        remote_file: ${project}/embedded-sdk/embedded-sdk-watchsimulator-4.2/${revision}/mongo-embedded-sdk-${version}.tgz
+        bucket: mciuploads
+        local_file: "mongo-embedded-sdk-${version}/WatchSimulator/embedded-sdk.tgz"
 
     - command: shell.exec
       params:
@@ -4129,9 +4264,11 @@ tasks:
           set -o errexit
           set -o verbose
 
+          pushd mongo-embedded-sdk-${version}
+
           for directory in *OS *Simulator; do
               pushd $directory
-              tar --include "*/Frameworks*" --include "*/LICENSE*" --strip-components=1 -xf ./embedded-sdk.tgz
+              tar --include "*/Frameworks/*" --strip-components=1 -xf ./embedded-sdk.tgz
               popd
           done
 
@@ -4143,18 +4280,114 @@ tasks:
               done
           done
 
-          tar --exclude "*/*.tgz" -zcvf mongo-embedded-sdk-${version}.tgz ./*OS
+          for platform in iPhone AppleTV Watch; do
+              for framework in bson mongoc; do
+                  _OSDSYM=$(printf ./%sOS/Frameworks/%s.framework.dSYM/Contents/Resources/DWARF/%s $platform $framework $framework)
+                  _SimulatorDSYM=$(printf ./%sSimulator/Frameworks/%s.framework.dSYM/Contents/Resources/DWARF/%s $platform $framework $framework)
+                  ${compile_env|} xcrun lipo $_OSDSYM $_SimulatorDSYM -create -output $_OSDSYM
+              done
+
+              for framework in mongo_embedded mongoc_embedded; do
+                  _OSDSYM=$(printf ./%sOS/Frameworks/%s.framework.dSYM/Contents/Resources/DWARF/lib%s.dylib $platform $framework $framework)
+                  _SimulatorDSYM=$(printf ./%sSimulator/Frameworks/%s.framework.dSYM/Contents/Resources/DWARF/lib%s.dylib $platform $framework $framework)
+                  ${compile_env|} xcrun lipo $_OSDSYM $_SimulatorDSYM -create -output $_OSDSYM
+              done
+          done
+
+          for platform in iPhone AppleTV Watch; do
+              for framework in mongo_embedded mongoc_embedded; do
+                  _OSBCSymbolMaps=$(printf ./%sOS/Frameworks/%s.framework/BCSymbolMaps $platform $framework)
+                  _SimulatorBCSymbolMaps=$(printf ./%sSimulator/Frameworks/%s.framework/BCSymbolMaps $platform $framework)
+                  if [ -e $_SimulatorBCSymbolMaps -a -e $_OSBCSymbolMaps ]; then
+                      cp $_SimulatorBCSymbolMaps/* $_OSBCSymbolMaps/
+                  fi
+              done
+          done
+
+          popd
+
+          cat <<EOF > mongo-embedded-sdk-${version}/README-Licenses.txt
+          The software accompanying this file is Copyright (C) 2018 MongoDB, Inc. and
+          is licensed to you on the terms set forth in the following files:
+            - mongo-c-driver: iPhoneOS/Frameworks/mongoc.framework/COPYING
+            - mongo_embedded: iPhoneOS/Frameworks/mongo_embedded.framework/LICENSE-Embedded.txt
+            - mongoc_embedded: iPhoneOS/Frameworks/mongoc_embedded.framework/LICENSE-Embedded.txt
+          EOF
+          tar --exclude "mongo-embedded-sdk-${version}/*/*.tgz" -zcvf mongo-embedded-sdk-${version}.tgz \
+              ./mongo-embedded-sdk-${version}/*OS \
+              ./mongo-embedded-sdk-${version}/README-Licenses.txt
+
+          cat <<EOF > mongo-embedded-sdk-${version}/README-Licenses.txt
+          The software accompanying this file is Copyright (C) 2018 MongoDB, Inc. and
+          is licensed to you on the terms set forth in the following files:
+            - mongo-c-driver: iPhoneOS/Frameworks/mongoc.framework/COPYING
+          EOF
+          tar --exclude "mongo-embedded-sdk-${version}/*/*.tgz" -zcvf mongo-embedded-sdk-${version}-mongo-c-driver.tgz \
+              ./mongo-embedded-sdk-${version}/*OS/Frameworks/bson.framework{,.dSYM} \
+              ./mongo-embedded-sdk-${version}/*OS/Frameworks/mongoc.framework{,.dSYM} \
+              ./mongo-embedded-sdk-${version}/README-Licenses.txt
+
+          cat <<EOF > mongo-embedded-sdk-${version}/README-Licenses.txt
+          The software accompanying this file is Copyright (C) 2018 MongoDB, Inc. and
+          is licensed to you on the terms set forth in the following files:
+            - mongo_embedded: iPhoneOS/Frameworks/mongo_embedded.framework/LICENSE-Embedded.txt
+          EOF
+          tar --exclude "mongo-embedded-sdk-${version}/*/*.tgz" -zcvf mongo-embedded-sdk-${version}-mongo-embedded.tgz \
+              ./mongo-embedded-sdk-${version}/*OS/Frameworks/mongo_embedded.framework{,.dSYM} \
+              ./mongo-embedded-sdk-${version}/README-Licenses.txt
+
+          cat <<EOF > mongo-embedded-sdk-${version}/README-Licenses.txt
+          The software accompanying this file is Copyright (C) 2018 MongoDB, Inc. and
+          is licensed to you on the terms set forth in the following files:
+            - mongoc_embedded: iPhoneOS/Frameworks/mongoc_embedded.framework/LICENSE-Embedded.txt
+          EOF
+          tar --exclude "mongo-embedded-sdk-${version}/*/*.tgz" -zcvf mongo-embedded-sdk-${version}-mongoc-embedded.tgz \
+              ./mongo-embedded-sdk-${version}/*OS/Frameworks/mongoc_embedded.framework{,.dSYM} \
+              ./mongo-embedded-sdk-${version}/README-Licenses.txt
 
     - command: s3.put
       params:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "mongo-embedded-sdk-${version}.tgz"
-        remote_file: "${project}/embedded-sdk/embedded-sdk-apple-multiarch/${revision}/${version}.tgz"
+        remote_file: "${project}/embedded-sdk/embedded-sdk-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
         bucket: mciuploads
         permissions: public-read
         content_type: application/tar
         display_name: "Embedded SDK Tar Archive"
+
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "mongo-embedded-sdk-${version}-mongo-c-driver.tgz"
+        remote_file: "${project}/embedded-sdk/mongo-c-driver-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+        display_name: "MongoDB C Driver Tar Archive"
+
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "mongo-embedded-sdk-${version}-mongo-embedded.tgz"
+        remote_file: "${project}/embedded-sdk/mongo-embedded-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+        display_name: "MongoDB Embedded Tar Archive"
+
+    - command: s3.put
+      params:
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "mongo-embedded-sdk-${version}-mongoc-embedded.tgz"
+        remote_file: "${project}/embedded-sdk/mongoc-embedded-apple-multiarch/${revision}/mongo-embedded-sdk-${version}.tgz"
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+        display_name: "MongoDB Embedded C Driver Transport Tar Archive"
 
     # If this is a patch build, blow away the file so our subsequent and optional s3.put
     # doesn't run. That way, we won't overwrite the latest part in our patches.
@@ -4166,6 +4399,9 @@ tasks:
 
           if [ "${is_patch}" = "true" ]; then
             rm -f mongo-embedded-sdk-${version}.tgz
+            rm -f mongo-embedded-sdk-${version}-mongo-c-driver.tgz
+            rm -f mongo-embedded-sdk-${version}-mongo-embedded.tgz
+            rm -f mongo-embedded-sdk-${version}-mongoc-embedded.tgz
           fi
 
     # A second put, this time to -latest, to give devs a reasonable
@@ -4177,10 +4413,59 @@ tasks:
         aws_key: ${aws_key}
         aws_secret: ${aws_secret}
         local_file: "mongo-embedded-sdk-${version}.tgz"
-        remote_file: ${project}/embedded-sdk/${build_variant}-latest.tgz
+        remote_file: ${project}/embedded-sdk/mongo-${build_variant}-latest.tgz
         bucket: mciuploads
         permissions: public-read
         content_type: application/tar
+
+    - command: s3.put
+      params:
+        visibility: none
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "mongo-embedded-sdk-${version}-mongo-c-driver.tgz"
+        remote_file: ${project}/embedded-sdk/mongo-c-driver-cocoapod-latest.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+
+    - command: s3.put
+      params:
+        visibility: none
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "mongo-embedded-sdk-${version}-mongo-embedded.tgz"
+        remote_file: ${project}/embedded-sdk/mongo-embedded-cocoapod-latest.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+
+    - command: s3.put
+      params:
+        visibility: none
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: "mongo-embedded-sdk-${version}-mongoc-embedded.tgz"
+        remote_file: ${project}/embedded-sdk/mongoc-embedded-cocoapod-latest.tgz
+        bucket: mciuploads
+        permissions: public-read
+        content_type: application/tar
+
+    - command: shell.exec
+      params:
+        script: |
+          set -o errexit
+          set -o verbose
+
+          sed s/@VERSION@/1.13.0/g src/src/mongo/embedded/mongoc_embedded/mongo-embedded-c-driver.podspec.in | tee mongo-embedded-c-driver.podspec
+          sed s/@VERSION@/${version}/g src/src/mongo/embedded/mongo_embedded/mongo_embedded.podspec.in | tee mongo_embedded.podspec
+          sed s/@VERSION@/${version}/g src/src/mongo/embedded/mongoc_embedded/mongoc_embedded.podspec.in | tee mongoc_embedded.podspec
+
+          # conditional cocoapods deployment here, pending integration with release process
+          #sudo gem install cocoapods
 
 - name: compile_benchmarks
   depends_on: []
@@ -4232,17 +4517,18 @@ tasks:
           set -o verbose
 
           ${activate_virtualenv}
-          python3 -m pip install -r etc/pip/lint-requirements.txt
-          python2 -m pip install -r etc/pip/lint-requirements.txt
+          python3 -m pip install -I -r etc/pip/lint-requirements.txt
+          python2 -m pip install -I -r etc/pip/lint-requirements.txt
           export MYPY="$(
-            PATH+=':/opt/mongodbtoolchain/v2/bin'
             if command -V cygpath 2>/dev/null; then
                 PATH+=":$(cypath "${workdir}")/venv_3/Scripts"
             else
                 PATH+=":${workdir}/venv_3/bin"
             fi
+            PATH+=':/opt/mongodbtoolchain/v2/bin'
             which mypy
           )"
+          echo "Found mypy executable at '$MYPY'"
           ${compile_env|} python2 ./buildscripts/scons.py ${compile_flags|} --stack-size=1024 lint
 
 - name: verify_pip
@@ -4266,8 +4552,8 @@ tasks:
         ${activate_virtualenv}
         # This installs the explicit project versions which would be installed in the toolchain
         # from this patch
-        python2 -m pip install -r etc/pip/constraints.txt
-        python3 -m pip install -r etc/pip/constraints.txt
+        python2 -m pip install -I -r etc/pip/constraints.txt
+        python3 -m pip install -I -r etc/pip/constraints.txt
 
         python2 -m pip freeze >requirements.txt.python2.old
         python3 -m pip freeze >requirements.txt.python3.old
@@ -4548,7 +4834,7 @@ tasks:
 
 ## Standalone generational fuzzer for aggregation pipelines ##
 - &aggregation_multiversion_fuzzer_template
-  <<: *jstestfuzz_template 
+  <<: *jstestfuzz_template
   name: aggregation_multiversion_fuzzer
   commands:
   - func: "do setup"
@@ -4608,6 +4894,20 @@ tasks:
     vars:
       <<: *jstestfuzz_config_vars
       task_path_suffix: /data/multiversion
+      resmoke_args: --suites=generational_fuzzer
+
+## Standalone fuzzer for checking wildcard index correctness ##
+- <<: *jstestfuzz_template
+  name: aggregation_wildcard_fuzzer
+  commands:
+  - func: "do setup"
+  - func: "run jstestfuzz"
+    vars:
+      jstestfuzz_vars: --numGeneratedFiles 50 --diffTestingMode wildcard
+      npm_command: agg-fuzzer
+  - <<: *run_jstestfuzz_tests
+    vars:
+      <<: *jstestfuzz_config_vars
       resmoke_args: --suites=generational_fuzzer
 
 ## jstestfuzz standalone update generational fuzzer ##
@@ -5405,6 +5705,15 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=causally_consistent_jscore_txns_passthrough --storageEngine=wiredTiger
+      run_multiple_jobs: true
+
+- <<: *task_template
+  name: sharded_causally_consistent_jscore_txns_passthrough
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=sharded_causally_consistent_jscore_txns_passthrough --storageEngine=wiredTiger
       run_multiple_jobs: true
 
 - <<: *task_template
@@ -7334,6 +7643,17 @@ tasks:
       resmoke_args: --suites=watchdog --storageEngine=wiredTiger
       run_multiple_jobs: false
 
+# This is a separate task because it is only supported on Ubuntu 16.04+ which are not inmemory builders
+- <<: *task_template
+  name: watchdog_inmemory
+  commands:
+  - func: "do setup"
+  - func: "do watchdog setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=watchdog --storageEngine=inMemory
+      run_multiple_jobs: false
+
 - <<: *task_template
   name: free_monitoring
   commands:
@@ -8246,6 +8566,7 @@ buildvariants:
   - name: aggregation_multiversion_fuzzer_7
   - name: aggregation_multiversion_fuzzer_8
   - name: aggregation_multiversion_fuzzer_9
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz_sharded
   - name: mongosTest
   - name: multiversion_auth
@@ -8279,6 +8600,7 @@ buildvariants:
   - name: sharding_auth
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
@@ -8463,6 +8785,7 @@ buildvariants:
   - name: serial_run
   - name: session_jscore_passthrough
   - name: sharded_causally_consistent_jscore_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding_0
@@ -8565,6 +8888,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_sharded
@@ -8652,6 +8976,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8692,6 +9017,7 @@ buildvariants:
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
   - name: ssl
@@ -8751,6 +9077,7 @@ buildvariants:
   - name: jsCore_decimal
   - name: jsCore_txns
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8784,6 +9111,7 @@ buildvariants:
   - name: sharding_auth
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
   - name: ssl
@@ -8833,6 +9161,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -8849,6 +9178,7 @@ buildvariants:
   - name: snmp
   - name: ssl
   - name: sslSpecial
+  - name: watchdog_inmemory
   - name: watchdog_wiredtiger
   - name: package
     distros:
@@ -8896,7 +9226,6 @@ buildvariants:
   - name: snmp
   - name: ssl
   - name: sslSpecial
-  - name: watchdog_wiredtiger
 
 - name: enterprise-ubuntu1804-64-clang-cxx17
   display_name: ~ Enterprise Ubuntu 18.04 (System clang 6.0 C++17 libc++ DEBUG)
@@ -9012,6 +9341,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9046,6 +9376,7 @@ buildvariants:
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
   - name: ssl
@@ -9103,6 +9434,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9133,6 +9465,7 @@ buildvariants:
   - name: sharding_auth
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
   - name: ssl
@@ -9226,6 +9559,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9256,6 +9590,7 @@ buildvariants:
   - name: sharding_auth
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
   - name: ssl
@@ -9353,6 +9688,7 @@ buildvariants:
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -9422,6 +9758,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9444,6 +9781,7 @@ buildvariants:
   - name: sharding_ese
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
@@ -9508,6 +9846,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9542,6 +9881,7 @@ buildvariants:
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
@@ -9604,6 +9944,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9625,6 +9966,7 @@ buildvariants:
   - name: sharding_ese
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
@@ -9693,6 +10035,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9727,6 +10070,7 @@ buildvariants:
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
@@ -9779,7 +10123,6 @@ buildvariants:
   - name: aggregation_one_shard_sharded_collections
   - name: aggregation_read_concern_majority_passthrough
   - name: aggregation_sharded_collections_passthrough
-  - name: aggregation_multiversion_fuzzer
   - name: aggregation_expression_multiversion_fuzzer
   - name: auth
   - name: causally_consistent_jscore_passthrough
@@ -9973,6 +10316,7 @@ buildvariants:
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
   - name: aggregation_expression_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -9999,6 +10343,7 @@ buildvariants:
   - name: replica_sets_ese_misc
   - name: replica_sets_jscore_passthrough
   - name: sasl
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharding_auth_0
     distros:
@@ -10315,6 +10660,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -10328,6 +10674,7 @@ buildvariants:
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharding_auth
     distros:
@@ -10403,6 +10750,7 @@ buildvariants:
   - name: causally_consistent_jscore_txns_passthrough
   - name: jsonSchema
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -10439,6 +10787,7 @@ buildvariants:
   - name: replica_sets
   - name: replica_sets_jscore_passthrough
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -10512,9 +10861,9 @@ buildvariants:
     push_name: macos
     push_arch: x86_64
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
+    compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.11" LINKFLAGS="-mmacosx-version-min=10.11"
     num_jobs_available: 1
-    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.11 CGO_LDFLAGS=-mmacosx-version-min=10.11'
     tooltags: "-tags 'ssl openssl_pre_1.0'"
     build_mongoreplay: true
   display_tasks:
@@ -10598,6 +10947,7 @@ buildvariants:
   - name: rollback_fuzzer_unclean_shutdowns
   - name: serial_run
   - name: session_jscore_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding_gle_auth_basics_passthrough
@@ -10621,8 +10971,8 @@ buildvariants:
   expansions:
     num_jobs_available: 1
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: --dbg=on --opt=on -j$(sysctl -n hw.logicalcpu) --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
-    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    compile_flags: --dbg=on --opt=on -j$(sysctl -n hw.logicalcpu) --libc++ CCFLAGS="-mmacosx-version-min=10.11" LINKFLAGS="-mmacosx-version-min=10.11"
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CGO_CFLAGS=-mmacosx-version-min=10.11 CGO_LDFLAGS=-mmacosx-version-min=10.11'
     tooltags: ""
     build_mongoreplay: true
   display_tasks:
@@ -10657,9 +11007,9 @@ buildvariants:
     push_name: macos
     push_arch: x86_64-enterprise
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10"
+    compile_flags: --ssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.11" LINKFLAGS="-mmacosx-version-min=10.11"
     num_jobs_available: 1
-    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10'
+    gorootvars: 'PATH="/opt/golang/go1.10/bin:/opt/mongodbtoolchain/v2/bin/:$PATH" GOROOT=/opt/golang/go1.10 CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.11 CGO_LDFLAGS=-mmacosx-version-min=10.11'
     tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
     build_mongoreplay: true
   display_tasks:
@@ -10706,13 +11056,13 @@ buildvariants:
     push_name: osx
     push_arch: x86_64-enterprise
     tooltags: "-tags 'ssl sasl openssl_pre_1.0'"
-    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.10 CGO_LDFLAGS=-mmacosx-version-min=10.10
+    gorootvars: CGO_CPPFLAGS=-I/opt/mongodbtoolchain/v2/include CGO_CFLAGS=-mmacosx-version-min=10.11 CGO_LDFLAGS=-mmacosx-version-min=10.11
     compile_env: DEVELOPER_DIR=/Applications/Xcode8.3.app
-    compile_flags: --ssl --ssl-provider=openssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.10" LINKFLAGS="-mmacosx-version-min=10.10" LIBPATH="$PWD/openssl_install_dir/lib" CPPPATH="$PWD/openssl_install_dir/include"
+    compile_flags: --ssl --ssl-provider=openssl -j$(sysctl -n hw.logicalcpu) --release --libc++ CCFLAGS="-mmacosx-version-min=10.11" LINKFLAGS="-mmacosx-version-min=10.11" LIBPATH="$PWD/openssl_install_dir/lib" CPPPATH="$PWD/openssl_install_dir/include"
     num_jobs_available: 1
     build_mongoreplay: true
     build_openssl: true
-    openssl_config_flags: "-mmacosx-version-min=10.10"
+    openssl_config_flags: "-mmacosx-version-min=10.11"
     openssl_make_flags: "-j$(sysctl -n hw.logicalcpu)"
   display_tasks:
   - *dbtest
@@ -10756,23 +11106,24 @@ buildvariants:
       --variables-files=etc/scons/xcode_macosx.vars
       FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
+    cdriver_cmake_osx_deployment_target: "10.10"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)"
+        -DCMAKE_OSX_ARCHITECTURES=x86_64
         -DENABLE_APPLE_FRAMEWORK=ON
         -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DCMAKE_SYSTEM_PROCESSOR=x86_64
-        -DCMAKE_C_FLAGS="-arch x86_64 -mmacosx-version-min=10.10 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -mmacosx-version-min=10.10 -flto"
+        -DENABLE_SSL=DARWIN
+        -DENABLE_ZLIB=BUNDLED
+        -DCMAKE_C_FLAGS="-Wunguarded-availability"
     disable_unit_tests: true
     enable_embedded_tests: native
     dump_scons_config_on_failure: true
   tasks:
   - name: embedded_sdk_build_and_test
 
-- name: embedded-sdk-iphoneos-10.2
-  display_name: "Embedded SDK - iOS 10.2"
+- name: embedded-sdk-iphoneos-11.0
+  display_name: "Embedded SDK - iOS 11.0"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -10785,21 +11136,26 @@ buildvariants:
       --variables-files=etc/scons/xcode_ios.vars
       FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
+    cdriver_cmake_osx_deployment_target: "11.0"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
+        -DCMAKE_OSX_ARCHITECTURES=arm64
         -DENABLE_APPLE_FRAMEWORK=ON
         -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch arm64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
+        -DENABLE_SSL=OFF
+        -DENABLE_SASL=OFF
+        -DENABLE_ZLIB=OFF
+        -DENABLE_SNAPPY=OFF
+        -DCMAKE_C_FLAGS="-fembed-bitcode -Wunguarded-availability"
+        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode"
     disable_unit_tests: true
     dump_scons_config_on_failure: true
   tasks:
   - name: embedded_sdk_build_and_test
 
-- name: embedded-sdk-iphonesimulator-10.2
-  display_name: "Embedded SDK - iOS Simulator 10.2"
+- name: embedded-sdk-iphonesimulator-11.0
+  display_name: "Embedded SDK - iOS Simulator 11.0"
   run_on:
   - macos-1012
   batchtime: 1440 # 1 day
@@ -10812,18 +11168,23 @@ buildvariants:
       --variables-files=etc/scons/xcode_ios_sim.vars
       FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
+    cdriver_cmake_osx_deployment_target: "11.0"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+        -DCMAKE_OSX_ARCHITECTURES=x86_64
         -DENABLE_APPLE_FRAMEWORK=ON
         -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -miphoneos-version-min=10.2 -flto"
+        -DENABLE_SSL=OFF
+        -DENABLE_SASL=OFF
+        -DENABLE_ZLIB=OFF
+        -DENABLE_SNAPPY=OFF
+        -DCMAKE_C_FLAGS="-fembed-bitcode -Wunguarded-availability"
+        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode"
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: iPhone-7
-    ios_sim_runtime: iOS-10-2
+    ios_sim_runtime: iOS-11-0
     dump_scons_config_on_failure: true
   tasks:
   - name: embedded_sdk_build_and_test
@@ -10842,14 +11203,19 @@ buildvariants:
       --variables-files=etc/scons/xcode_tvos.vars
       FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
+    cdriver_cmake_osx_deployment_target: "10.2"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk appletvos --show-sdk-path)"
+        -DCMAKE_OSX_ARCHITECTURES=arm64
         -DENABLE_APPLE_FRAMEWORK=ON
         -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DCMAKE_C_FLAGS="-arch arm64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch arm64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
+        -DENABLE_SSL=OFF
+        -DENABLE_SASL=OFF
+        -DENABLE_ZLIB=OFF
+        -DENABLE_SNAPPY=OFF
+        -DCMAKE_C_FLAGS="-fembed-bitcode -Wunguarded-availability"
+        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode"
     disable_unit_tests: true
     dump_scons_config_on_failure: true
   tasks:
@@ -10869,14 +11235,19 @@ buildvariants:
       --variables-files=etc/scons/xcode_tvos_sim.vars
       FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
+    cdriver_cmake_osx_deployment_target: "10.2"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk appletvsimulator --show-sdk-path)"
+        -DCMAKE_OSX_ARCHITECTURES=x86_64
         -DENABLE_APPLE_FRAMEWORK=ON
         -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DCMAKE_C_FLAGS="-arch x86_64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch x86_64 -fembed-bitcode -mtvos-version-min=10.2 -flto"
+        -DENABLE_SSL=OFF
+        -DENABLE_SASL=OFF
+        -DENABLE_ZLIB=OFF
+        -DENABLE_SNAPPY=OFF
+        -DCMAKE_C_FLAGS="-fembed-bitcode -Wunguarded-availability"
+        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode"
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: Apple-TV-1080p
@@ -10899,14 +11270,19 @@ buildvariants:
       --variables-files=etc/scons/xcode_watchos.vars
       FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
+    cdriver_cmake_osx_deployment_target: "4.2"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk watchos --show-sdk-path)"
+        -DCMAKE_OSX_ARCHITECTURES=armv7k
         -DENABLE_APPLE_FRAMEWORK=ON
         -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DCMAKE_C_FLAGS="-arch armv7k -fembed-bitcode -mwatchos-version-min=4.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch armv7k -fembed-bitcode -mwatchos-version-min=4.2 -flto"
+        -DENABLE_SSL=OFF
+        -DENABLE_SASL=OFF
+        -DENABLE_ZLIB=OFF
+        -DENABLE_SNAPPY=OFF
+        -DCMAKE_C_FLAGS="-fembed-bitcode -fapplication-extension -Wunguarded-availability"
+        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode -fapplication-extension"
     disable_unit_tests: true
     dump_scons_config_on_failure: true
   tasks:
@@ -10926,14 +11302,19 @@ buildvariants:
       --variables-files=etc/scons/xcode_watchos_sim.vars
       FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
       --lto
+    cdriver_cmake_osx_deployment_target: "4.2"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
-        -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk watchsimulator --show-sdk-path)"
+        -DCMAKE_OSX_ARCHITECTURES=i386
         -DENABLE_APPLE_FRAMEWORK=ON
         -DCMAKE_INSTALL_BINDIR=Frameworks
-        -DCMAKE_C_FLAGS="-arch i386 -fembed-bitcode -mwatchos-version-min=4.2 -flto"
-        -DCMAKE_SHARED_LINKER_FLAGS="-arch i386 -fembed-bitcode -mwatchos-version-min=4.2 -flto"
+        -DENABLE_SSL=OFF
+        -DENABLE_SASL=OFF
+        -DENABLE_ZLIB=OFF
+        -DENABLE_SNAPPY=OFF
+        -DCMAKE_C_FLAGS="-fembed-bitcode -fapplication-extension -Wunguarded-availability"
+        -DCMAKE_SHARED_LINKER_FLAGS="-fembed-bitcode -fapplication-extension"
     disable_unit_tests: true
     enable_embedded_tests: ios_tvos_simulator
     ios_sim_device: Apple-Watch-Series-3-42mm
@@ -10997,13 +11378,14 @@ buildvariants:
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DANDROID_NATIVE_API_LEVEL=21
         -DANDROID_ABI=armeabi-v7a
-        -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
         -DCMAKE_FIND_ROOT_PATH="$WORKDIR/android_toolchain-arm-21;$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DENABLE_ZLIB=OFF
+        -DENABLE_SRV=OFF
         -DCMAKE_C_FLAGS="-flto"
         -DCMAKE_SHARED_LINKER_FLAGS="-flto"
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
@@ -11038,13 +11420,14 @@ buildvariants:
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DANDROID_NATIVE_API_LEVEL=21
         -DANDROID_ABI=arm64-v8a
-        -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
         -DCMAKE_FIND_ROOT_PATH="$WORKDIR/android_toolchain-arm64-21;$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DENABLE_ZLIB=OFF
+        -DENABLE_SRV=OFF
         -DCMAKE_C_FLAGS="-flto"
         -DCMAKE_SHARED_LINKER_FLAGS="-flto"
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
@@ -11079,13 +11462,14 @@ buildvariants:
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DANDROID_NATIVE_API_LEVEL=21
         -DANDROID_ABI=x86_64
-        -DTHREADS_PTHREAD_ARG=2
         -DCMAKE_TOOLCHAIN_FILE=$WORKDIR/android_sdk/ndk-bundle/build/cmake/android.toolchain.cmake
         -DCMAKE_FIND_ROOT_PATH="$WORKDIR/android_toolchain-x86_64-21;$WORKDIR/src/build/mongo-embedded-sdk-$VERSION-tmp"
         -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY
         -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER
         -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY
+        -DENABLE_ZLIB=OFF
+        -DENABLE_SRV=OFF
         -DCMAKE_C_FLAGS="-flto"
         -DCMAKE_SHARED_LINKER_FLAGS="-flto"
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
@@ -11264,6 +11648,7 @@ buildvariants:
   - name: jsonSchema
   - name: aggregation_multiversion_fuzzer
   - name: aggregation_expression_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -11388,6 +11773,7 @@ buildvariants:
     - rhel62-large
   - name: sasl
   - name: session_jscore_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding_0
@@ -12325,7 +12711,6 @@ buildvariants:
   - name: aggregation_ese
   - name: aggregation_auth
   - name: aggregation_mongos_passthrough
-  - name: aggregation_multiversion_fuzzer
   - name: aggregation_one_shard_sharded_collections
   - name: aggregation_read_concern_majority_passthrough
   - name: aggregation_sharded_collections_passthrough
@@ -12405,6 +12790,7 @@ buildvariants:
   - name: retryable_writes_jscore_passthrough
   - name: sasl
   - name: session_jscore_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -12474,6 +12860,7 @@ buildvariants:
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
   - name: aggregation_expression_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -12588,6 +12975,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -12633,6 +13021,7 @@ buildvariants:
   - name: sharding_auth
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
   - name: sharding_last_stable_mongos_and_mixed_shards
@@ -12736,6 +13125,7 @@ buildvariants:
   - name: replica_sets
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharding
   - name: sharding_auth
@@ -12820,6 +13210,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -12841,6 +13232,7 @@ buildvariants:
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -12954,6 +13346,7 @@ buildvariants:
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -12988,7 +13381,7 @@ buildvariants:
   batchtime: 1440 # 1 day
   stepback: false
   expansions:
-    compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_gcc.vars --use-s390x-crc32=off
+    compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_gcc.vars --use-hardware-crc32=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --excludeWithAnyTags=blacklist_from_rhel_67_s390x
     has_packages: true
@@ -13060,6 +13453,7 @@ buildvariants:
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -13091,7 +13485,7 @@ buildvariants:
   - rhel67-zseries-test
   batchtime: 1440 # 1 day
   expansions:
-    compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_gcc.vars --use-s390x-crc32=off
+    compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_gcc.vars --use-hardware-crc32=off
     num_jobs_available: $(grep -c ^processor /proc/cpuinfo)
     test_flags: --excludeWithAnyTags=blacklist_from_rhel_67_s390x
     has_packages: true
@@ -13161,6 +13555,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -13236,6 +13631,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -13252,6 +13648,7 @@ buildvariants:
   - name: snmp
   - name: ssl
   - name: sslSpecial
+  - name: watchdog_inmemory
   - name: watchdog_wiredtiger
   - name: package
     distros:
@@ -13342,6 +13739,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -13452,6 +13850,7 @@ buildvariants:
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -13527,6 +13926,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -13561,6 +13961,7 @@ buildvariants:
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
   - name: ssl
@@ -13612,6 +14013,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -13682,6 +14084,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -13768,6 +14171,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -13841,6 +14245,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -13875,6 +14280,7 @@ buildvariants:
   - name: sharding_last_stable_mongos_and_mixed_shards
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
@@ -13972,6 +14378,7 @@ buildvariants:
   - name: jsCore_txns
   - name: causally_consistent_jscore_txns_passthrough
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz_concurrent_sharded_continuous_stepdown
   - name: jstestfuzz_sharded_continuous_stepdown
   - name: jstestfuzz
@@ -14015,6 +14422,7 @@ buildvariants:
   - name: rollback_fuzzer
   - name: sasl
   - name: session_jscore_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_core_txns
   - name: sharded_collections_jscore_passthrough
   - name: sharding
@@ -14327,6 +14735,7 @@ buildvariants:
   - name: jsCore_op_query
   - name: jsCore_compatibility
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -14354,6 +14763,7 @@ buildvariants:
   - name: sharding_op_query
   - name: slow1
   - name: serial_run
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding_jscore_passthrough
@@ -14430,6 +14840,7 @@ buildvariants:
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -14532,6 +14943,7 @@ buildvariants:
   - name: replica_sets_auth
   - name: replica_sets_jscore_passthrough
   - name: sasl
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -14685,6 +15097,7 @@ buildvariants:
   - name: retryable_writes_jscore_stepdown_passthrough
   - name: sasl
   - name: session_jscore_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -14734,6 +15147,7 @@ buildvariants:
   - name: compile_all_run_unittests_TG
   - name: free_monitoring
   - name: aggregation_multiversion_fuzzer
+  - name: aggregation_wildcard_fuzzer
   - name: jstestfuzz
   - name: jstestfuzz_concurrent
   - name: jstestfuzz_concurrent_replication
@@ -14871,6 +15285,7 @@ buildvariants:
   - name: retryable_writes_jscore_stepdown_passthrough
   - name: sasl
   - name: session_jscore_passthrough
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding
@@ -15016,6 +15431,7 @@ buildvariants:
   - name: replica_sets_initsync_static_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
   - name: sasl
+  - name: sharded_causally_consistent_jscore_txns_passthrough
   - name: sharded_collections_jscore_passthrough
   - name: sharded_core_txns
   - name: sharding

@@ -1,29 +1,31 @@
+
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
@@ -84,10 +86,10 @@ public:
 
     int countResults(CollectionScanParams::Direction direction, const BSONObj& filterObj) {
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
+        auto collection = ctx.getCollection();
 
         // Configure the scan.
         CollectionScanParams params;
-        params.collection = ctx.getCollection();
         params.direction = direction;
         params.tailable = false;
 
@@ -103,10 +105,10 @@ public:
         // Make a scan and have the runner own it.
         unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
         unique_ptr<PlanStage> ps =
-            make_unique<CollectionScan>(&_opCtx, params, ws.get(), filterExpr.get());
+            make_unique<CollectionScan>(&_opCtx, collection, params, ws.get(), filterExpr.get());
 
         auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(ps), params.collection, PlanExecutor::NO_YIELD);
+            &_opCtx, std::move(ws), std::move(ps), collection, PlanExecutor::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -126,11 +128,10 @@ public:
         WorkingSet ws;
 
         CollectionScanParams params;
-        params.collection = collection;
         params.direction = direction;
         params.tailable = false;
 
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, params, &ws, NULL));
+        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, collection, params, &ws, NULL));
         while (!scan->isEOF()) {
             WorkingSetID id = WorkingSet::INVALID_ID;
             PlanStage::StageState state = scan->work(&id);
@@ -208,19 +209,20 @@ class QueryStageCollscanObjectsInOrderForward : public QueryStageCollectionScanB
 public:
     void run() {
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
+        auto collection = ctx.getCollection();
 
         // Configure the scan.
         CollectionScanParams params;
-        params.collection = ctx.getCollection();
         params.direction = CollectionScanParams::FORWARD;
         params.tailable = false;
 
         // Make a scan and have the runner own it.
         unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
-        unique_ptr<PlanStage> ps = make_unique<CollectionScan>(&_opCtx, params, ws.get(), nullptr);
+        unique_ptr<PlanStage> ps =
+            make_unique<CollectionScan>(&_opCtx, collection, params, ws.get(), nullptr);
 
         auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(ps), params.collection, PlanExecutor::NO_YIELD);
+            &_opCtx, std::move(ws), std::move(ps), collection, PlanExecutor::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -244,17 +246,18 @@ class QueryStageCollscanObjectsInOrderBackward : public QueryStageCollectionScan
 public:
     void run() {
         AutoGetCollectionForReadCommand ctx(&_opCtx, nss);
+        auto collection = ctx.getCollection();
 
         CollectionScanParams params;
-        params.collection = ctx.getCollection();
         params.direction = CollectionScanParams::BACKWARD;
         params.tailable = false;
 
         unique_ptr<WorkingSet> ws = make_unique<WorkingSet>();
-        unique_ptr<PlanStage> ps = make_unique<CollectionScan>(&_opCtx, params, ws.get(), nullptr);
+        unique_ptr<PlanStage> ps =
+            make_unique<CollectionScan>(&_opCtx, collection, params, ws.get(), nullptr);
 
         auto statusWithPlanExecutor = PlanExecutor::make(
-            &_opCtx, std::move(ws), std::move(ps), params.collection, PlanExecutor::NO_YIELD);
+            &_opCtx, std::move(ws), std::move(ps), collection, PlanExecutor::NO_YIELD);
         ASSERT_OK(statusWithPlanExecutor.getStatus());
         auto exec = std::move(statusWithPlanExecutor.getValue());
 
@@ -287,12 +290,11 @@ public:
 
         // Configure the scan.
         CollectionScanParams params;
-        params.collection = coll;
         params.direction = CollectionScanParams::FORWARD;
         params.tailable = false;
 
         WorkingSet ws;
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, params, &ws, NULL));
+        unique_ptr<PlanStage> scan(new CollectionScan(&_opCtx, coll, params, &ws, NULL));
 
         int count = 0;
         while (count < 10) {
@@ -347,12 +349,11 @@ public:
 
         // Configure the scan.
         CollectionScanParams params;
-        params.collection = coll;
         params.direction = CollectionScanParams::BACKWARD;
         params.tailable = false;
 
         WorkingSet ws;
-        unique_ptr<CollectionScan> scan(new CollectionScan(&_opCtx, params, &ws, NULL));
+        unique_ptr<PlanStage> scan(new CollectionScan(&_opCtx, coll, params, &ws, NULL));
 
         int count = 0;
         while (count < 10) {

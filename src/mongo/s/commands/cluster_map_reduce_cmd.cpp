@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -225,11 +227,13 @@ public:
                 }
 
                 outputCollNss = NamespaceString(outDB, finalColShort);
-                uassert(ErrorCodes::InvalidNamespace,
-                        "Invalid output namespace",
-                        outputCollNss.isValid());
             }
+        } else if (outElmt.type() == String) {
+            outputCollNss = NamespaceString(outDB, outElmt.String());
         }
+        uassert(ErrorCodes::InvalidNamespace,
+                "Invalid output namespace",
+                inlineOutput || outputCollNss.isValid());
 
         auto const catalogCache = Grid::get(opCtx)->catalogCache();
 
@@ -287,7 +291,7 @@ public:
 
             invariant(inputRoutingInfo.db().primary());
 
-            ShardConnection conn(inputRoutingInfo.db().primary()->getConnString(), "");
+            ShardConnection conn(opCtx, inputRoutingInfo.db().primary()->getConnString(), "");
 
             BSONObj res;
             bool ok = conn->runCommand(
@@ -330,21 +334,24 @@ public:
 
         auto splitPts = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
 
+        // TODO: take distributed lock to prevent split / migration?
+        try {
+            Strategy::commandOp(
+                opCtx, dbname, shardedCommand, nss.ns(), q, collation, &mrCommandResults);
+        } catch (DBException& e) {
+            e.addContext(str::stream() << "could not run map command on all shards for ns "
+                                       << nss.ns()
+                                       << " and query "
+                                       << q);
+            throw;
+        }
+
+        // Now that the output collections of the first phase ("tmp.mrs.<>") have been created, make
+        // a best effort to drop them if any part of the second phase fails.
+        ON_BLOCK_EXIT([&]() { cleanUp(servers, dbname, shardResultCollection); });
+
         {
             bool ok = true;
-
-            // TODO: take distributed lock to prevent split / migration?
-
-            try {
-                Strategy::commandOp(
-                    opCtx, dbname, shardedCommand, nss.ns(), q, collation, &mrCommandResults);
-            } catch (DBException& e) {
-                e.addContext(str::stream() << "could not run map command on all shards for ns "
-                                           << nss.ns()
-                                           << " and query "
-                                           << q);
-                throw;
-            }
 
             for (const auto& mrResult : mrCommandResults) {
                 // Need to gather list of all servers even if an error happened
@@ -392,8 +399,6 @@ public:
             }
 
             if (!ok) {
-                cleanUp(servers, dbname, shardResultCollection);
-
                 // Add "code" to the top-level response, if the failure of the sharded command
                 // can be accounted to a single error.
                 int code = getUniqueCodeFromCommandResults(mrCommandResults);
@@ -449,7 +454,7 @@ public:
             const auto outputShard =
                 uassertStatusOK(shardRegistry->getShard(opCtx, outputDbInfo.primaryId()));
 
-            ShardConnection conn(outputShard->getConnString(), outputCollNss.ns());
+            ShardConnection conn(opCtx, outputShard->getConnString(), outputCollNss.ns());
             ok = conn->runCommand(
                 outDB, appendAllowImplicitCreate(finalCmd.obj(), true), singleResult);
 
@@ -610,8 +615,6 @@ public:
                                   << "; expected that collection to be sharded, but it was not",
                     outputRoutingInfo.cm());
         }
-
-        cleanUp(servers, dbname, shardResultCollection);
 
         if (!ok) {
             errmsg = str::stream() << "MR post processing failed: " << singleResult.toString();

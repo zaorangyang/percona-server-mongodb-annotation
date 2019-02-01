@@ -1,23 +1,25 @@
+
 /**
- *    Copyright (C) 2009-2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -39,6 +41,8 @@
 #include "mongo/unittest/unittest.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <boost/optional.hpp>
+#include <boost/optional/optional_io.hpp>
 
 namespace mongo {
 namespace {
@@ -55,6 +59,11 @@ struct URITestCase {
 
 struct InvalidURITestCase {
     std::string URI;
+    boost::optional<Status> status;
+    InvalidURITestCase(std::string aURI, boost::optional<Status> aStatus = boost::none) {
+        URI = std::move(aURI);
+        status = std::move(aStatus);
+    }
 };
 
 const ConnectionString::ConnectionType kMaster = ConnectionString::MASTER;
@@ -354,6 +363,12 @@ const InvalidURITestCase invalidCases[] = {
     // Host list must actually be comma separated.
     {"mongodb://localhost:27017localhost:27018"},
 
+    // % symbol in password must be escaped.
+    {"mongodb://localhost:pass%word@127.0.0.1:27017",
+     Status(ErrorCodes::FailedToParse,
+            "The characters after the % do not form a hex value. Please escape the % or pass a "
+            "valid hex value. ")},
+
     // Domain sockets have to end in ".sock".
     {"mongodb://%2Fnotareal%2Fdomainsock"},
 
@@ -465,6 +480,9 @@ TEST(MongoURI, InvalidURIs) {
         unittest::log() << "Testing URI: " << testCase.URI << '\n';
         auto cs_status = MongoURI::parse(testCase.URI);
         ASSERT_NOT_OK(cs_status);
+        if (testCase.status) {
+            ASSERT_EQUALS(testCase.status, cs_status.getStatus());
+        }
     }
 }
 
@@ -540,7 +558,7 @@ TEST(MongoURI, specTests) {
 
             if (!valid) {
                 // This uri string is invalid --> parse the uri and ensure it fails
-                const InvalidURITestCase testCase = {uri};
+                const InvalidURITestCase testCase = InvalidURITestCase{uri};
                 unittest::log() << "Testing URI: " << testCase.URI << '\n';
                 auto cs_status = MongoURI::parse(testCase.URI);
                 ASSERT_NOT_OK(cs_status);

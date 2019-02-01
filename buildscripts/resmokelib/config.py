@@ -37,6 +37,10 @@ DEFAULT_BENCHMARK_MIN_TIME = datetime.timedelta(seconds=5)
 # starts, as well as those started by individual tests.
 DEFAULT_DBPATH_PREFIX = os.path.normpath("/data/db")
 
+# Default location for the genny executable. Override this in the YAML suite configuration if
+# desired.
+DEFAULT_GENNY_EXECUTABLE = os.path.normpath("genny/build/src/driver/genny")
+
 # Names below correspond to how they are specified via the command line or in the options YAML file.
 DEFAULTS = {
     "archive_file": None,
@@ -52,6 +56,7 @@ DEFAULTS = {
     "dbtest_executable": None,
     "dry_run": None,
     "exclude_with_any_tags": None,
+    "genny_executable": None,
     "include_with_any_tags": None,
     "jobs": 1,
     "mongo_executable": None,
@@ -265,6 +270,9 @@ EXCLUDED_TAG = "__TEMPORARILY_DISABLED__"
 
 # If true, then a test failure or error will cause resmoke.py to exit and not run any more tests.
 FAIL_FAST = None
+
+# Executable file for genny, passed in as a command line arg.
+GENNY_EXECUTABLE = None
 
 # If set, then only jstests that have at least one of the specified tags will be run during the
 # jstest portion of the suite(s).

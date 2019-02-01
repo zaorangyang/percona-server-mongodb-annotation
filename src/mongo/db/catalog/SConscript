@@ -106,6 +106,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        'index_catalog_entry',
     ],
 )
 
@@ -146,7 +147,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'database',
-        'index_create',
+        'multi_index_block',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/db_raii',
@@ -181,12 +182,36 @@ env.Library(
 )
 
 env.Library(
-    target='index_create',
+    target='multi_index_block',
     source=[
-        'index_create.cpp',
+        'multi_index_block_impl.cpp',
     ],
     LIBDEPS=[
+        'collection',
+        'collection_info_cache',
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/audit',
+        '$BUILD_DIR/mongo/db/background',
+        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/curop',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/server_parameters',
+        '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/db/storage/write_unit_of_work',
+        '$BUILD_DIR/mongo/util/fail_point',
+        '$BUILD_DIR/mongo/util/progress_meter',
+    ],
+)
+
+env.CppUnitTest(
+    target='multi_index_block_test',
+    source=[
+        'multi_index_block_test.cpp'
+    ],
+    LIBDEPS=[
+        'collection',
+        'multi_index_block',
+        '$BUILD_DIR/mongo/db/namespace_string',
     ],
 )
 
@@ -244,7 +269,6 @@ env.Library(
     target='catalog_impl',
     source=[
         "catalog_control.cpp",
-        "collection_compact.cpp",
         "collection_impl.cpp",
         "collection_info_cache_impl.cpp",
         "database_holder_impl.cpp",
@@ -252,7 +276,6 @@ env.Library(
         "index_catalog_entry_impl.cpp",
         "index_catalog_impl.cpp",
         "index_consistency.cpp",
-        "index_create_impl.cpp",
         "private/record_store_validate_adaptor.cpp",
     ],
     LIBDEPS=[
@@ -264,7 +287,6 @@ env.Library(
         'health_log',
         'index_catalog',
         'index_catalog_entry',
-        'index_create',
         'index_key_validate',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/background',
@@ -299,6 +321,7 @@ env.Library(
     source=[
         'capped_utils.cpp',
         'coll_mod.cpp',
+        "collection_compact.cpp",
         'create_collection.cpp',
         'drop_collection.cpp',
         'drop_database.cpp',
@@ -317,7 +340,8 @@ env.Library(
         'collection',
         'database',
         'index_catalog',
-        'index_create',
+        'index_key_validate',
+        'multi_index_block',
     ],
 )
 
@@ -363,7 +387,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         'catalog_helpers',
-        'index_create',
+        'multi_index_block',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/namespace_string',

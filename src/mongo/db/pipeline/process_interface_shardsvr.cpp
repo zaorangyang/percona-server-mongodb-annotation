@@ -1,29 +1,31 @@
+
 /**
- * Copyright (C) 2018 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects
- * for all of the code used other than as permitted herein. If you modify
- * file(s) with this exception, you may extend this exception to your
- * version of the file(s), but you are not obligated to do so. If you do not
- * wish to do so, delete this exception statement from your version. If you
- * delete this exception statement from all source files in the program,
- * then also delete it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
@@ -42,15 +44,8 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_gen.h"
-#include "mongo/db/pipeline/document_source_cursor.h"
-#include "mongo/db/pipeline/pipeline_d.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/session_catalog.h"
-#include "mongo/db/stats/fill_locker_info.h"
-#include "mongo/db/stats/storage_stats.h"
-#include "mongo/db/storage/backup_cursor_hooks.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/write_ops/cluster_write.h"
@@ -68,82 +63,12 @@ using write_ops::UpdateOpEntry;
 
 namespace {
 
-/**
- * Builds an ordered insert op on namespace 'nss' and documents to be written 'objs'.
- */
-Insert buildInsertOp(const NamespaceString& nss,
-                     std::vector<BSONObj>&& objs,
-                     bool bypassDocValidation) {
-    Insert insertOp(nss);
-    insertOp.setDocuments(std::move(objs));
-    insertOp.setWriteCommandBase([&] {
-        write_ops::WriteCommandBase wcb;
-        wcb.setOrdered(true);
-        wcb.setBypassDocumentValidation(bypassDocValidation);
-        return wcb;
-    }());
-    return insertOp;
-}
-
-/**
- * Builds an ordered update op on namespace 'nss' with update entries {q: <queries>, u: <updates>}.
- *
- * Note that 'queries' and 'updates' must be the same length.
- */
-Update buildUpdateOp(const NamespaceString& nss,
-                     std::vector<BSONObj>&& queries,
-                     std::vector<BSONObj>&& updates,
-                     bool upsert,
-                     bool multi,
-                     bool bypassDocValidation) {
-    Update updateOp(nss);
-    updateOp.setUpdates([&] {
-        std::vector<UpdateOpEntry> updateEntries;
-        for (size_t index = 0; index < queries.size(); ++index) {
-            updateEntries.push_back([&] {
-                UpdateOpEntry entry;
-                entry.setQ(std::move(queries[index]));
-                entry.setU(std::move(updates[index]));
-                entry.setUpsert(upsert);
-                entry.setMulti(multi);
-                return entry;
-            }());
-        }
-        return updateEntries;
-    }());
-    updateOp.setWriteCommandBase([&] {
-        write_ops::WriteCommandBase wcb;
-        wcb.setOrdered(true);
-        wcb.setBypassDocumentValidation(bypassDocValidation);
-        return wcb;
-    }());
-    return updateOp;
-}
-
-// Returns true if the field names of 'keyPattern' are exactly those in 'uniqueKeyPaths', and each
-// of the elements of 'keyPattern' is numeric, i.e. not "text", "$**", or any other special type of
-// index.
-bool keyPatternNamesExactPaths(const BSONObj& keyPattern,
-                               const std::set<FieldPath>& uniqueKeyPaths) {
-    size_t nFieldsMatched = 0;
-    for (auto&& elem : keyPattern) {
-        if (!elem.isNumber()) {
-            return false;
-        }
-        if (uniqueKeyPaths.find(elem.fieldNameStringData()) == uniqueKeyPaths.end()) {
-            return false;
-        }
-        ++nFieldsMatched;
+// Attaches the write concern to the given batch request. If it looks like 'writeConcern' has
+// been default initialized to {w: 0, wtimeout: 0} then we do not bother attaching it.
+void attachWriteConcern(BatchedCommandRequest* request, const WriteConcernOptions& writeConcern) {
+    if (!writeConcern.wMode.empty() || writeConcern.wNumNodes > 0) {
+        request->setWriteConcern(writeConcern.toBSON());
     }
-    return nFieldsMatched == uniqueKeyPaths.size();
-}
-
-bool supportsUniqueKey(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                       const IndexCatalogEntry* index,
-                       const std::set<FieldPath>& uniqueKeyPaths) {
-    return (index->descriptor()->unique() && !index->descriptor()->isPartial() &&
-            keyPatternNamesExactPaths(index->descriptor()->keyPattern(), uniqueKeyPaths) &&
-            CollatorInterface::collatorsMatch(index->getCollator(), expCtx->getCollator()));
 }
 
 }  // namespace
@@ -208,15 +133,20 @@ std::pair<std::vector<FieldPath>, bool> MongoInterfaceShardServer::collectDocume
 
 void MongoInterfaceShardServer::insert(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                        const NamespaceString& ns,
-                                       std::vector<BSONObj>&& objs) {
+                                       std::vector<BSONObj>&& objs,
+                                       const WriteConcernOptions& wc,
+                                       boost::optional<OID> targetEpoch) {
     BatchedCommandResponse response;
     BatchWriteExecStats stats;
 
-    ClusterWriter::write(
-        expCtx->opCtx,
-        BatchedCommandRequest(buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation)),
-        &stats,
-        &response);
+    BatchedCommandRequest insertCommand(
+        buildInsertOp(ns, std::move(objs), expCtx->bypassDocumentValidation));
+
+    // If applicable, attach a write concern to the batched command request.
+    attachWriteConcern(&insertCommand, wc);
+
+    ClusterWriter::write(expCtx->opCtx, insertCommand, &stats, &response, targetEpoch);
+
     // TODO SERVER-35403: Add more context for which shard produced the error.
     uassertStatusOKWithContext(response.toStatus(), "Insert failed: ");
 }
@@ -225,19 +155,25 @@ void MongoInterfaceShardServer::update(const boost::intrusive_ptr<ExpressionCont
                                        const NamespaceString& ns,
                                        std::vector<BSONObj>&& queries,
                                        std::vector<BSONObj>&& updates,
+                                       const WriteConcernOptions& wc,
                                        bool upsert,
-                                       bool multi) {
+                                       bool multi,
+                                       boost::optional<OID> targetEpoch) {
     BatchedCommandResponse response;
     BatchWriteExecStats stats;
-    ClusterWriter::write(expCtx->opCtx,
-                         BatchedCommandRequest(buildUpdateOp(ns,
-                                                             std::move(queries),
-                                                             std::move(updates),
-                                                             upsert,
-                                                             multi,
-                                                             expCtx->bypassDocumentValidation)),
-                         &stats,
-                         &response);
+
+    BatchedCommandRequest updateCommand(buildUpdateOp(ns,
+                                                      std::move(queries),
+                                                      std::move(updates),
+                                                      upsert,
+                                                      multi,
+                                                      expCtx->bypassDocumentValidation));
+
+    // If applicable, attach a write concern to the batched command request.
+    attachWriteConcern(&updateCommand, wc);
+
+    ClusterWriter::write(expCtx->opCtx, updateCommand, &stats, &response, targetEpoch);
+
     // TODO SERVER-35403: Add more context for which shard produced the error.
     uassertStatusOKWithContext(response.toStatus(), "Update failed: ");
 }
