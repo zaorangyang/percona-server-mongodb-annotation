@@ -228,24 +228,35 @@ install_gcc_54_deb(){
         rm -rf /usr/local/gcc-5.4.0
         mv gcc-5.4.0 /usr/local/
     fi
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xstretch ]; then
-        wget https://jenkins.percona.com/downloads/gcc-5.4.0/gcc-5.4.0_debian-jessie-x64.tar.gz -O /tmp/gcc-5.4.0_debian-${DEBIAN}-x64.tar.gz
-        tar -zxf /tmp/gcc-5.4.0_debian-${DEBIAN}-x64.tar.gz
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+        apt-get -y install gcc-5 g++-5
+    fi
+    if [ x"${DEBIAN}" = xstretch ]; then
+        wget https://jenkins.percona.com/downloads/gcc-5.4.0/gcc-5.4.0_Debian-stretch-x64.tar.gz -O /tmp/gcc-5.4.0_ubuntu-${DEBIAN}-x64.tar.gz
+        tar -zxf /tmp/gcc-5.4.0_ubuntu-${DEBIAN}-x64.tar.gz
         rm -rf /usr/local/gcc-5.4.0
         mv gcc-5.4.0 /usr/local/
-        echo "OUTPUT_FORMAT(elf64-x86-64)" > libstdc++.so && echo "INPUT ( /usr/local/gcc-5.4.0/lib64/libstdc++.a )" >> libstdc++.so
-        mv libstdc++.so /usr/local/gcc-5.4.0/lib64/
     fi
 }
 
 set_compiler(){
-    export CC=/usr/local/gcc-5.4.0/bin/gcc-5.4
-    export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+        export CC=/usr/bin/gcc-5
+        export CXX=/usr/bin/g++-5
+    else
+        export CC=/usr/local/gcc-5.4.0/bin/gcc-5.4
+        export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
+    fi
 }
 
 fix_rules(){
-    sed -i 's|CC = gcc-5|CC = /usr/local/gcc-5.4.0/bin/gcc-5.4|' debian/rules
-    sed -i 's|CXX = g++-5|CXX = /usr/local/gcc-5.4.0/bin/g++-5.4|' debian/rules
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+        sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-5|' debian/rules
+        sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-5|' debian/rules
+    else
+        sed -i 's|CC = gcc-5|CC = /usr/local/gcc-5.4.0/bin/gcc-5.4|' debian/rules
+        sed -i 's|CXX = g++-5|CXX = /usr/local/gcc-5.4.0/bin/g++-5.4|' debian/rules
+    fi
     sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules 
 }
 
@@ -445,7 +456,7 @@ build_rpm(){
     RHEL=$(rpm --eval %rhel)
     ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
 
-    echo "CC and CXX should be modified once correct compiller would be installed on Centosed"
+    echo "CC and CXX should be modified once correct compiller would be installed on Centos"
     export CC=/usr/local/gcc-5.4.0/bin/gcc-5.4
     export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
     #
@@ -560,6 +571,7 @@ build_deb(){
     cd ${PRODUCT}-${VERSION}
     pip install --user -r buildscripts/requirements.txt
     #
+    cp -av percona-packaging/debian/rules debian/
     set_compiler
     fix_rules
     sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' mongo-tools/set_goenv.sh
@@ -593,8 +605,7 @@ build_tarball(){
     export DEBIAN="$(lsb_release -sc)"
     export PATH=/usr/local/go/bin:$PATH
     #
-    export CC=/usr/local/gcc-5.4.0/bin/gcc-5.4
-    export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
+    set_compiler
     #
     PSM_TARGETS="mongod mongos mongo mongobridge perconadecrypt"
     TARBALL_SUFFIX=""
