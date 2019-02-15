@@ -229,53 +229,36 @@ install_gcc_54_deb(){
         rm -rf /usr/local/gcc-5.4.0
         mv gcc-5.4.0 /usr/local/
     fi
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+        apt-get -y install gcc-5 g++-5
+    fi
+    if [ x"${DEBIAN}" = xstretch ]; then
+        wget https://jenkins.percona.com/downloads/gcc-5.4.0/gcc-5.4.0_Debian-stretch-x64.tar.gz -O /tmp/gcc-5.4.0_ubuntu-${DEBIAN}-x64.tar.gz
+        tar -zxf /tmp/gcc-5.4.0_ubuntu-${DEBIAN}-x64.tar.gz
+        rm -rf /usr/local/gcc-5.4.0
+        mv gcc-5.4.0 /usr/local/
+    fi
 }
 
 set_compiler(){
-    if [ x"${DEBIAN}" = xjessie -o x"${DEBIAN}" = xwheezy -o x"${DEBIAN}" = xtrusty -o x"${DEBIAN}" = xxenial ]; then
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+        export CC=/usr/bin/gcc-5
+        export CXX=/usr/bin/g++-5
+    else
         export CC=/usr/local/gcc-5.4.0/bin/gcc-5.4
         export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
-    fi
-    if [ x"${DEBIAN}" = xstretch ]; then
-        export CC=/usr/bin/gcc-6
-        export CXX=/usr/bin/g++-6
-    fi
-    if [ x"${DEBIAN}" = xartful -o x"${DEBIAN}" = xbionic ]; then
-        export CC=/usr/bin/gcc-7
-        export CXX=/usr/bin/g++-7
-    fi
-    if [ x"${DEBIAN}" = xcosmic ]; then
-        export CC=/usr/bin/gcc-8
-        export CXX=/usr/bin/g++-8
     fi
 }
 
 fix_rules(){
-    if [ x"${DEBIAN}" = xjessie -o x"${DEBIAN}" = xwheezy -o x"${DEBIAN}" = xtrusty -o x"${DEBIAN}" = xxenial ]; then
+    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+        sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-5|' debian/rules
+        sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-5|' debian/rules
+    else
         sed -i 's|CC = gcc-5|CC = /usr/local/gcc-5.4.0/bin/gcc-5.4|' debian/rules
         sed -i 's|CXX = g++-5|CXX = /usr/local/gcc-5.4.0/bin/g++-5.4|' debian/rules
     fi
-    if [ x"${DEBIAN}" = xstretch ]; then
-        sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-6|' debian/rules
-        sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-6|' debian/rules  
-        sed -i 's|CC = /usr/local/gcc-5.4.0/bin/gcc-5.4|CC = /usr/bin/gcc-6|' debian/rules
-        sed -i 's|CXX = /usr/local/gcc-5.4.0/bin/g++-5.4|CXX = /usr/bin/g++-6|' debian/rules
-        sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules 
-    fi
-    if [ x"${DEBIAN}" = xartful -o x"${DEBIAN}" = xbionic ]; then
-        sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-7|' debian/rules
-        sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-7|' debian/rules
-        sed -i 's|CC = /usr/local/gcc-5.4.0/bin/gcc-5.4|CC = /usr/bin/gcc-7|' debian/rules
-        sed -i 's|CXX = /usr/local/gcc-5.4.0/bin/g++-5.4|CXX = /usr/bin/g++-7|' debian/rules
-        sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules 
-    fi
-    if [ x"${DEBIAN}" = xcosmic ]; then
-        sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-8|' debian/rules
-        sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-8|' debian/rules
-        sed -i 's|CC = /usr/local/gcc-5.4.0/bin/gcc-5.4|CC = /usr/bin/gcc-8|' debian/rules
-        sed -i 's|CXX = /usr/local/gcc-5.4.0/bin/g++-5.4|CXX = /usr/bin/g++-8|' debian/rules
-        sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules 
-    fi
+    sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules 
 }
 
 install_deps() {
@@ -589,6 +572,7 @@ build_deb(){
     cd ${PRODUCT}-36-${VERSION}
     pip install --user -r buildscripts/requirements.txt
     #
+    cp -av percona-packaging/debian/rules debian/
     set_compiler
     fix_rules
     sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' mongo-tools/set_goenv.sh
@@ -622,21 +606,8 @@ build_tarball(){
     export DEBIAN="$(lsb_release -sc)"
     export PATH=/usr/local/go/bin:$PATH
     #
-    if [ -f /etc/debian_version ]; then
-        if [ x"${DEBIAN}" = xwheezy -o x"${DEBIAN}" = xjessie -o x"${DEBIAN}" = xtrusty -o x"${DEBIAN}" = xxenial ]; then
-            export CC=/usr/local/gcc-5.4.0/bin/gcc-5.4
-            export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
-        else
-            export CC=gcc-5
-            export CXX=g++-5
-        fi
-    else
-        export CC=/usr/local/gcc-5.4.0/bin/gcc-5.4
-        export CXX=/usr/local/gcc-5.4.0/bin/g++-5.4
-        
-    fi
+    set_compiler
     #
-
     PSM_TARGETS="mongod mongos mongo mongobridge perconadecrypt"
     TARBALL_SUFFIX=""
     if [ ${DEBUG} = 1 ]; then
