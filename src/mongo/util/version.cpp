@@ -131,7 +131,8 @@ std::string VersionInfoInterface::makeVersionString(StringData binaryName) const
 }
 
 void VersionInfoInterface::appendBuildInfo(BSONObjBuilder* result) const {
-    *result << "version" << version() << "gitVersion" << gitVersion()
+    // The 'psmdbVersion' key is used to distinguish between MongoDB and PSMDB.
+    *result << "version" << version() << "psmdbVersion" << version() << "gitVersion" << gitVersion()
 #if defined(_WIN32)
             << "targetMinOS" << targetMinOS()
 #endif
