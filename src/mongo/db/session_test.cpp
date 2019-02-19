@@ -766,7 +766,7 @@ TEST_F(SessionTest, ReportStashedResources) {
     ASSERT_EQ(
         dateFromISOString(transactionDocument.getField("expiryTime").valueStringData()).getValue(),
         Date_t::fromMillisSinceEpoch(session.getSingleTransactionStats()->getStartTime() / 1000) +
-            stdx::chrono::seconds{transactionLifetimeLimitSeconds.load()});
+            Seconds{transactionLifetimeLimitSeconds.load()});
     ASSERT_EQ(stashedState.getField("client").valueStringData().toString(), "");
     ASSERT_EQ(stashedState.getField("connectionId").numberLong(), 0);
     ASSERT_EQ(stashedState.getField("appName").valueStringData().toString(), "appName");
@@ -843,7 +843,7 @@ TEST_F(SessionTest, ReportUnstashedResources) {
     ASSERT_EQ(
         dateFromISOString(transactionDocument.getField("expiryTime").valueStringData()).getValue(),
         Date_t::fromMillisSinceEpoch(session.getSingleTransactionStats()->getStartTime() / 1000) +
-            stdx::chrono::seconds{transactionLifetimeLimitSeconds.load()});
+            Seconds{transactionLifetimeLimitSeconds.load()});
     // For the following time metrics, we are only verifying that the transaction sub-document is
     // being constructed correctly with proper types because we have other tests to verify that the
     // values are being tracked correctly.
@@ -1526,6 +1526,47 @@ TEST_F(SessionTest, TrackTotalActiveAndInactiveTransactionsWithUnstashedAbort) {
     session.abortArbitraryTransaction();
     ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
     ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
+}
+
+TEST_F(SessionTest, TransactionErrorsBeforeUnstash) {
+    const auto sessionId = makeLogicalSessionIdForTest();
+    Session session(sessionId);
+    session.refreshFromStorageIfNeeded(opCtx());
+
+    const TxnNumber txnNum = 1;
+    opCtx()->setLogicalSessionId(sessionId);
+    opCtx()->setTxnNumber(txnNum);
+
+    unsigned long long beforeActiveCounter =
+        ServerTransactionsMetrics::get(opCtx())->getCurrentActive();
+    unsigned long long beforeInactiveCounter =
+        ServerTransactionsMetrics::get(opCtx())->getCurrentInactive();
+    unsigned long long beforeAbortedCounter =
+        ServerTransactionsMetrics::get(opCtx())->getTotalAborted();
+
+    // The first transaction statement checks out the session and begins the transaction but returns
+    // before unstashTransactionResources().
+    session.beginOrContinueTxn(opCtx(), txnNum, false, true, "testDB", "insert");
+
+    // The transaction is now inactive.
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(),
+              beforeInactiveCounter + 1U);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalAborted(), beforeAbortedCounter);
+
+    // The second transaction statement continues the transaction. Since there are no stashed
+    // transaction resources, it is not safe to continue the transaction, so the transaction is
+    // aborted.
+    ASSERT_THROWS_CODE(
+        session.beginOrContinueTxn(opCtx(), txnNum, false, boost::none, "testDB", "insert"),
+        AssertionException,
+        ErrorCodes::NoSuchTransaction);
+
+    // The transaction is now aborted.
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentActive(), beforeActiveCounter);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getCurrentInactive(), beforeInactiveCounter);
+    ASSERT_EQ(ServerTransactionsMetrics::get(opCtx())->getTotalAborted(),
+              beforeAbortedCounter + 1U);
 }
 
 /**

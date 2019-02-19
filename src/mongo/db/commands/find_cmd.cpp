@@ -52,6 +52,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/log.h"
 
@@ -135,11 +136,11 @@ public:
                    BSONObjBuilder* out) const override {
         std::string dbname = request.getDatabase().toString();
         const BSONObj& cmdObj = request.body;
-        // Acquire locks and resolve possible UUID. The RAII object is optional, because in the case
-        // of a view, the locks need to be released.
+        // Acquire locks. The RAII object is optional, because in the case of a view, the locks
+        // need to be released.
         boost::optional<AutoGetCollectionForReadCommand> ctx;
         ctx.emplace(opCtx,
-                    CommandHelpers::parseNsOrUUID(dbname, cmdObj),
+                    CommandHelpers::parseNsCollectionRequired(dbname, cmdObj),
                     AutoGetCollection::ViewMode::kViewsPermitted);
         const auto nss = ctx->getNss();
 
@@ -226,6 +227,7 @@ public:
              BSONObjBuilder& result) override {
         // Although it is a command, a find command gets counted as a query.
         globalOpCounters.gotQuery();
+        ServerReadConcernMetrics::get(opCtx)->recordReadConcern(repl::ReadConcernArgs::get(opCtx));
 
         // Parse the command BSON to a QueryRequest.
         const bool isExplain = false;

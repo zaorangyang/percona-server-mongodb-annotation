@@ -243,57 +243,6 @@ void validateAndDeduceFullRequestOptions(OperationContext* opCtx,
 }
 
 /**
- * Throws an exception if the collection is already sharded with different options.
- *
- * If the collection is already sharded with the same options, returns the existing collection's
- * full spec, else returns boost::none.
- */
-boost::optional<CollectionType> checkIfAlreadyShardedWithSameOptions(
-    OperationContext* opCtx,
-    const NamespaceString& nss,
-    const ConfigsvrShardCollectionRequest& request) {
-    auto existingColls =
-        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-                            opCtx,
-                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                            repl::ReadConcernLevel::kLocalReadConcern,
-                            CollectionType::ConfigNS,
-                            BSON("_id" << nss.ns() << "dropped" << false),
-                            BSONObj(),
-                            1))
-            .docs;
-
-    if (!existingColls.empty()) {
-        auto existingOptions = uassertStatusOK(CollectionType::fromBSON(existingColls.front()));
-
-        CollectionType requestedOptions;
-        requestedOptions.setNs(nss);
-        requestedOptions.setKeyPattern(KeyPattern(request.getKey()));
-        requestedOptions.setDefaultCollation(*request.getCollation());
-        requestedOptions.setUnique(request.getUnique());
-
-        // If the collection is already sharded, fail if the deduced options in this request do not
-        // match the options the collection was originally sharded with.
-        uassert(ErrorCodes::AlreadyInitialized,
-                str::stream() << "sharding already enabled for collection " << nss.ns()
-                              << " with options "
-                              << existingOptions.toString(),
-                requestedOptions.hasSameOptions(existingOptions));
-
-        // We did a local read of the collection entry above and found that this shardCollection
-        // request was already satisfied. However, the data may not be majority committed (a
-        // previous shardCollection attempt may have failed with a writeConcern error).
-        // Since the current Client doesn't know the opTime of the last write to the collection
-        // entry, make it wait for the last opTime in the system when we wait for writeConcern.
-        repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
-        return existingOptions;
-    }
-
-    // Not currently sharded.
-    return boost::none;
-}
-
-/**
  * Compares the proposed shard key with the collection's existing indexes on the primary shard to
  * ensure they are a legal combination.
  *
@@ -448,22 +397,9 @@ void validateShardKeyAgainstExistingIndexes(OperationContext* opCtx,
  */
 void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
                                          const NamespaceString& nss,
-                                         int numShards,
                                          const std::vector<ShardId>& shardIds,
-                                         bool isEmpty,
-                                         const ShardKeyPattern& shardKeyPattern,
                                          const std::vector<BSONObj>& finalSplitPoints) {
-    auto catalogCache = Grid::get(opCtx)->catalogCache();
-
-    if (!shardKeyPattern.isHashedPattern()) {
-        // Only initially move chunks when using a hashed shard key.
-        return;
-    }
-
-    if (!isEmpty) {
-        // If the collection is not empty, rely on the balancer to migrate the chunks.
-        return;
-    }
+    const auto catalogCache = Grid::get(opCtx)->catalogCache();
 
     auto routingInfo = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
     uassert(ErrorCodes::ConflictingOperationInProgress,
@@ -474,13 +410,18 @@ void migrateAndFurtherSplitInitialChunks(OperationContext* opCtx,
     auto chunkManager = routingInfo.cm();
 
     // Move and commit each "big chunk" to a different shard.
-    int i = 0;
+    auto nextShardId = [&, indx = 0 ]() mutable {
+        return shardIds[indx++ % shardIds.size()];
+    };
+
     for (auto chunk : chunkManager->chunks()) {
-        const ShardId& shardId = shardIds[i++ % numShards];
+        const auto shardId = nextShardId();
+
         const auto toStatus = Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId);
         if (!toStatus.isOK()) {
             continue;
         }
+
         const auto to = toStatus.getValue();
 
         // Can't move chunk to shard it's already on
@@ -699,11 +640,9 @@ public:
 
         std::vector<ShardId> shardIds;
         shardRegistry->getAllShardIds(opCtx, &shardIds);
-        const int numShards = shardIds.size();
-
         uassert(ErrorCodes::IllegalOperation,
                 "cannot shard collections before there are shards",
-                numShards > 0);
+                !shardIds.empty());
 
         // Handle collections in the config db separately.
         if (nss.db() == NamespaceString::kConfigDb) {
@@ -739,22 +678,13 @@ public:
         ON_BLOCK_EXIT([&conn] { conn.done(); });
 
         // Step 1.
-        validateAndDeduceFullRequestOptions(opCtx, nss, shardKeyPattern, numShards, conn, &request);
+        validateAndDeduceFullRequestOptions(
+            opCtx, nss, shardKeyPattern, shardIds.size(), conn, &request);
 
         // The collation option should have been set to the collection default collation after being
         // validated.
         invariant(request.getCollation());
 
-        // Step 2.
-        if (auto existingColl = checkIfAlreadyShardedWithSameOptions(opCtx, nss, request)) {
-            result << "collectionsharded" << nss.ns();
-            if (existingColl->getUUID()) {
-                result << "collectionUUID" << *existingColl->getUUID();
-            }
-            return true;
-        }
-
-        bool isEmpty = (conn->count(nss.ns()) == 0);
         boost::optional<UUID> uuid;
 
         // The primary shard will read the config.tags collection so we need to lock the zone
@@ -800,6 +730,39 @@ public:
 
             return true;
         } else {
+            // Step 2.
+            if (auto existingColl =
+                    InitialSplitPolicy::checkIfCollectionAlreadyShardedWithSameOptions(
+                        opCtx,
+                        nss,
+                        shardsvrShardCollectionRequest,
+                        repl::ReadConcernLevel::kLocalReadConcern)) {
+                result << "collectionsharded" << nss.ns();
+                if (existingColl->getUUID()) {
+                    result << "collectionUUID" << *existingColl->getUUID();
+                }
+                repl::ReplClientInfo::forClient(opCtx->getClient())
+                    .setLastOpToSystemLastOpTime(opCtx);
+                return true;
+            }
+
+            // This check for empty collection is racy, because it is not guaranteed that documents
+            // will not show up in the collection right after the count below has executed. It is
+            // left here for backwards compatiblity with pre-4.0.4 clusters, which do not support
+            // sharding being performed by the primary shard.
+            const bool isEmpty = (conn->count(nss.ns()) == 0);
+
+            // Map/reduce with output to an empty collection assumes it has full control of the
+            // output collection and it would be an unsupported operation if the collection is being
+            // concurrently written
+            const bool fromMapReduce = bool(request.getInitialSplitPoints());
+            if (fromMapReduce) {
+                uassert(ErrorCodes::ConflictingOperationInProgress,
+                        str::stream() << "Map reduce with sharded output to a new collection found "
+                                      << nss.ns()
+                                      << " to be non-empty which is not supported.",
+                        isEmpty);
+            }
 
             // Step 3.
             validateShardKeyAgainstExistingIndexes(
@@ -816,12 +779,12 @@ public:
             std::vector<BSONObj> initialSplitPoints;  // there will be at most numShards-1 of these
             std::vector<BSONObj> finalSplitPoints;    // all of the desired split points
             if (request.getInitialSplitPoints()) {
-                initialSplitPoints = std::move(*request.getInitialSplitPoints());
+                initialSplitPoints = *request.getInitialSplitPoints();
             } else {
                 InitialSplitPolicy::calculateHashedSplitPointsForEmptyCollection(
                     shardKeyPattern,
                     isEmpty,
-                    numShards,
+                    shardIds.size(),
                     request.getNumInitialChunks(),
                     &initialSplitPoints,
                     &finalSplitPoints);
@@ -830,15 +793,7 @@ public:
             LOG(0) << "CMD: shardcollection: " << cmdObj;
 
             audit::logShardCollection(
-                Client::getCurrent(), nss.ns(), proposedKey, request.getUnique());
-
-            // The initial chunks are distributed evenly across shards only if the initial split
-            // points
-            // were specified in the request, i.e., by mapReduce. Otherwise, all the initial chunks
-            // are
-            // placed on the primary shard, and may be distributed across shards through migrations
-            // (below) if using a hashed shard key.
-            const bool distributeInitialChunks = bool(request.getInitialSplitPoints());
+                opCtx->getClient(), nss.ns(), proposedKey, request.getUnique());
 
             // Step 6. Actually shard the collection.
             catalogManager->shardCollection(opCtx,
@@ -848,7 +803,7 @@ public:
                                             *request.getCollation(),
                                             request.getUnique(),
                                             initialSplitPoints,
-                                            distributeInitialChunks,
+                                            fromMapReduce,
                                             primaryShardId);
             result << "collectionsharded" << nss.ns();
             if (uuid) {
@@ -862,9 +817,12 @@ public:
             collDistLock.reset();
             dbDistLock.reset();
 
-            // Step 7. Migrate initial chunks to distribute them across shards.
-            migrateAndFurtherSplitInitialChunks(
-                opCtx, nss, numShards, shardIds, isEmpty, shardKeyPattern, finalSplitPoints);
+            // Step 7. If the collection is empty and using hashed sharding, migrate initial chunks
+            // to spread them evenly across shards from the beginning. Otherwise rely on the
+            // balancer to do it.
+            if (isEmpty && shardKeyPattern.isHashedPattern()) {
+                migrateAndFurtherSplitInitialChunks(opCtx, nss, shardIds, finalSplitPoints);
+            }
 
             return true;
         }

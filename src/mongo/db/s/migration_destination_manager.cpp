@@ -851,7 +851,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
                                       ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                                       "admin",
                                       migrateCloneRequest,
-                                      Shard::RetryPolicy::kIdempotent),
+                                      Shard::RetryPolicy::kNoRetry),
                 "_migrateClone failed: ");
 
             uassertStatusOKWithContext(Shard::CommandResponse::getEffectiveStatus(res),
@@ -888,7 +888,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
                                       ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                                       "admin",
                                       xferModsRequest,
-                                      Shard::RetryPolicy::kIdempotent),
+                                      Shard::RetryPolicy::kNoRetry),
                 "_transferMods failed: ");
 
             uassertStatusOKWithContext(Shard::CommandResponse::getEffectiveStatus(res),
@@ -900,7 +900,9 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
                 break;
             }
 
-            _applyMigrateOp(opCtx, mods, &lastOpApplied);
+            if (!_applyMigrateOp(opCtx, mods, &lastOpApplied)) {
+                continue;
+            }
 
             const int maxIterations = 3600 * 50;
 
@@ -968,7 +970,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* opCtx) {
                                       ReadPreferenceSetting(ReadPreference::PrimaryOnly),
                                       "admin",
                                       xferModsRequest,
-                                      Shard::RetryPolicy::kIdempotent),
+                                      Shard::RetryPolicy::kNoRetry),
                 "_transferMods failed in STEADY STATE: ");
 
             uassertStatusOKWithContext(Shard::CommandResponse::getEffectiveStatus(res),

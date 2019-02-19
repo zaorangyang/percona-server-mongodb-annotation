@@ -71,6 +71,7 @@
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -132,9 +133,15 @@ const StringMap<int> sessionCheckoutWhitelist = {{"abortTransaction", 1},
                                                  {"refreshLogicalSessionCacheNow", 1},
                                                  {"update", 1}};
 
-bool shouldActivateFailCommandFailPoint(const BSONObj& data, StringData cmdName) {
+bool shouldActivateFailCommandFailPoint(const BSONObj& data, StringData cmdName, Client* client) {
     if (cmdName == "configureFailPoint"_sd)  // Banned even if in failCommands.
         return false;
+
+    if (client->session() && (client->session()->getTags() & transport::Session::kInternalClient)) {
+        if (!data.hasField("failInternalCommands") || !data.getBoolField("failInternalCommands")) {
+            return false;
+        }
+    }
 
     for (auto&& failCommand : data.getObjectField("failCommands")) {
         if (failCommand.type() == String && failCommand.valueStringData() == cmdName) {
@@ -528,7 +535,8 @@ bool runCommandImpl(OperationContext* opCtx,
 
         auto waitForWriteConcern = [&](auto&& bb) {
             MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
-                return shouldActivateFailCommandFailPoint(data, request.getCommandName()) &&
+                return shouldActivateFailCommandFailPoint(
+                           data, request.getCommandName(), opCtx->getClient()) &&
                     data.hasField("writeConcernError");
             }) {
                 bb.append(data.getData()["writeConcernError"]);
@@ -593,7 +601,7 @@ bool runCommandImpl(OperationContext* opCtx,
  */
 void evaluateFailCommandFailPoint(OperationContext* opCtx, StringData commandName) {
     MONGO_FAIL_POINT_BLOCK_IF(failCommand, data, [&](const BSONObj& data) {
-        return shouldActivateFailCommandFailPoint(data, commandName) &&
+        return shouldActivateFailCommandFailPoint(data, commandName, opCtx->getClient()) &&
             (data.hasField("closeConnection") || data.hasField("errorCode"));
     }) {
         bool closeConnection;
@@ -698,16 +706,6 @@ void execCommandDatabase(OperationContext* opCtx,
                     shouldCheckoutSession || !opCtx->getTxnNumber());
         }
 
-        // This constructor will check out the session and start a transaction, if necessary. It
-        // handles the appropriate state management for both multi-statement transactions and
-        // retryable writes.
-        OperationContextSession sessionTxnState(opCtx,
-                                                shouldCheckoutSession,
-                                                autocommitVal,
-                                                startMultiDocTxn,
-                                                dbname,
-                                                command->getName());
-
         std::unique_ptr<MaintenanceModeSetter> mmSetter;
 
         BSONElement cmdOptionMaxTimeMSField;
@@ -751,12 +749,14 @@ void execCommandDatabase(OperationContext* opCtx,
 
         if (!opCtx->getClient()->isInDirectClient() &&
             !MONGO_FAIL_POINT(skipCheckingForNotMasterInCommandDispatch)) {
+            const bool inMultiDocumentTransaction = (autocommitVal == false);
             auto allowed = command->secondaryAllowed(opCtx->getServiceContext());
             bool alwaysAllowed = allowed == Command::AllowedOnSecondary::kAlways;
-            bool couldHaveOptedIn = allowed == Command::AllowedOnSecondary::kOptIn;
+            bool couldHaveOptedIn =
+                allowed == Command::AllowedOnSecondary::kOptIn && !inMultiDocumentTransaction;
             bool optedIn =
                 couldHaveOptedIn && ReadPreferenceSetting::get(opCtx).canRunOnSecondary();
-            bool canRunHere = commandCanRunHere(opCtx, dbname, command);
+            bool canRunHere = commandCanRunHere(opCtx, dbname, command, inMultiDocumentTransaction);
             if (!canRunHere && couldHaveOptedIn) {
                 uasserted(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
             }
@@ -813,6 +813,16 @@ void execCommandDatabase(OperationContext* opCtx,
                     !opCtx->getClient()->isInDirectClient());
             opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
         }
+
+        // This constructor will check out the session and start a transaction, if necessary. It
+        // handles the appropriate state management for both multi-statement transactions and
+        // retryable writes.
+        OperationContextSession sessionTxnState(opCtx,
+                                                shouldCheckoutSession,
+                                                autocommitVal,
+                                                startMultiDocTxn,
+                                                dbname,
+                                                command->getName());
 
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
         auto session = OperationContextSession::get(opCtx);
@@ -1050,6 +1060,7 @@ DbResponse receivedQuery(OperationContext* opCtx,
                          const ServiceEntryPointCommon::Hooks& behaviors) {
     invariant(!nss.isCommand());
     globalOpCounters.gotQuery();
+    ServerReadConcernMetrics::get(opCtx)->recordReadConcern(repl::ReadConcernArgs::get(opCtx));
 
     DbMessage d(m);
     QueryMessage q(d);
