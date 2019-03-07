@@ -52,6 +52,7 @@
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/log.h"
 
@@ -133,7 +134,7 @@ public:
                    const BSONObj& cmdObj,
                    ExplainOptions::Verbosity verbosity,
                    BSONObjBuilder* out) const override {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
+        const NamespaceString nss(parseNsCollectionRequired(dbname, cmdObj));
         if (!nss.isValid()) {
             return {ErrorCodes::InvalidNamespace,
                     str::stream() << "Invalid collection name: " << nss.ns()};
@@ -228,6 +229,7 @@ public:
              BSONObjBuilder& result) override {
         // Although it is a command, a find command gets counted as a query.
         globalOpCounters.gotQuery();
+        ServerReadConcernMetrics::get(opCtx)->recordReadConcern(repl::ReadConcernArgs::get(opCtx));
 
         // Parse the command BSON to a QueryRequest.
         const bool isExplain = false;

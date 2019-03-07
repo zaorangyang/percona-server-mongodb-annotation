@@ -236,14 +236,17 @@ public:
 
         boost::optional<AutoGetCollectionForReadCommand> autoColl;
         if (expCtx->uuid) {
-            autoColl.emplace(expCtx->opCtx, expCtx->ns.db(), *expCtx->uuid);
+            autoColl.emplace(expCtx->opCtx,
+                             expCtx->ns.db(),
+                             *expCtx->uuid,
+                             AutoStatsTracker::LogMode::kUpdateTop);
             if (autoColl->getCollection() == nullptr) {
                 // The UUID doesn't exist anymore.
                 return {ErrorCodes::NamespaceNotFound,
                         "No namespace with UUID " + expCtx->uuid->toString()};
             }
         } else {
-            autoColl.emplace(expCtx->opCtx, expCtx->ns);
+            autoColl.emplace(expCtx->opCtx, expCtx->ns, AutoStatsTracker::LogMode::kUpdateTop);
         }
 
         // makePipeline() is only called to perform secondary aggregation requests and expects the
@@ -888,10 +891,12 @@ void PipelineD::addCursorSource(Collection* collection,
     intrusive_ptr<DocumentSourceCursor> pSource = DocumentSourceCursor::create(
         collection, std::move(exec), expCtx, failsForExecutionLevelExplain);
 
-    // Note the query, sort, and projection for explain.
+    // Add the cursor to the pipeline first so that it's correctly disposed of as part of the
+    // pipeline if an exception is thrown during this method.
+    pipeline->addInitialSource(pSource);
+
     pSource->setQuery(queryObj);
     pSource->setSort(sortObj);
-
     if (deps.hasNoRequirements()) {
         pSource->shouldProduceEmptyDocs();
     }
@@ -908,7 +913,6 @@ void PipelineD::addCursorSource(Collection* collection,
 
         pSource->setProjection(deps.toProjection(), deps.toParsedDeps());
     }
-    pipeline->addInitialSource(pSource);
 }
 
 Timestamp PipelineD::getLatestOplogTimestamp(const Pipeline* pipeline) {

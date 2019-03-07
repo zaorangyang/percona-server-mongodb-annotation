@@ -28,55 +28,43 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#pragma once
 
-#include "mongo/db/commands.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/grid.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/stats/read_concern_stats_gen.h"
 
 namespace mongo {
-namespace {
 
-class FlushRouterConfigCmd : public BasicCommand {
+/**
+ * Container for server-wide statistics on readConcern levels used by operations.
+ */
+class ServerReadConcernMetrics {
+    MONGO_DISALLOW_COPYING(ServerReadConcernMetrics);
+
 public:
-    FlushRouterConfigCmd() : BasicCommand("flushRouterConfig", "flushrouterconfig") {}
+    ServerReadConcernMetrics() = default;
 
-    virtual bool slaveOk() const {
-        return true;
-    }
+    static ServerReadConcernMetrics* get(ServiceContext* service);
+    static ServerReadConcernMetrics* get(OperationContext* opCtx);
 
-    virtual bool adminOnly() const {
-        return true;
-    }
+    /**
+     * Updates counter for the level of 'readConcernArgs'.
+     */
+    void recordReadConcern(const repl::ReadConcernArgs& readConcernArgs);
 
+    /**
+     * Appends the accumulated stats to a readConcern stats object.
+     */
+    void updateStats(ReadConcernStats* stats, OperationContext* opCtx);
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
+private:
+    AtomicWord<unsigned long long> _levelAvailableCount{0};
+    AtomicWord<unsigned long long> _levelLinearizableCount{0};
+    AtomicWord<unsigned long long> _levelLocalCount{0};
+    AtomicWord<unsigned long long> _levelMajorityCount{0};
+    AtomicWord<unsigned long long> _noLevelCount{0};
+};
 
-    virtual void help(std::stringstream& help) const {
-        help << "flush all router config";
-    }
-
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) {
-        ActionSet actions;
-        actions.addAction(ActionType::flushRouterConfig);
-        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-    }
-
-    virtual bool run(OperationContext* opCtx,
-                     const std::string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        Grid::get(opCtx)->catalogCache()->purgeAllDatabases();
-
-        result.appendBool("flushed", true);
-        return true;
-    }
-
-} flushRouterConfigCmd;
-
-}  // namespace
 }  // namespace mongo

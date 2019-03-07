@@ -158,6 +158,8 @@ public:
     StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> reconcileCatalogAndIdents(
         OperationContext* opCtx) override;
 
+    std::string getFilesystemPathForDb(const std::string& dbName) const override;
+
 private:
     class RemoveDBChange;
 

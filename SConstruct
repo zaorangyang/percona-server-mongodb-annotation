@@ -13,6 +13,7 @@ import subprocess
 import sys
 import textwrap
 import uuid
+import multiprocessing
 
 import SCons
 
@@ -1207,27 +1208,6 @@ if has_option("cache"):
     if has_option("gcov"):
         env.FatalError("Mixing --cache and --gcov doesn't work correctly yet. See SERVER-11084")
     env.CacheDir(str(env.Dir(cacheDir)))
-
-    if get_option("cache") == "nolinked":
-        def noCacheEmitter(target, source, env):
-            for t in target:
-                env.NoCache(t)
-            return target, source
-
-        def addNoCacheEmitter(builder):
-            origEmitter = builder.emitter
-            if SCons.Util.is_Dict(origEmitter):
-                for k,v in origEmitter:
-                    origEmitter[k] = SCons.Builder.ListEmitter([v, noCacheEmitter])
-            elif SCons.Util.is_List(origEmitter):
-                emitter.append(noCacheEmitter)
-            else:
-                builder.emitter = SCons.Builder.ListEmitter([origEmitter, noCacheEmitter])
-
-        addNoCacheEmitter(env['BUILDERS']['Program'])
-        addNoCacheEmitter(env['BUILDERS']['StaticLibrary'])
-        addNoCacheEmitter(env['BUILDERS']['SharedLibrary'])
-        addNoCacheEmitter(env['BUILDERS']['LoadableModule'])
 
 # Normalize the link model. If it is auto, then for now both developer and release builds
 # use the "static" mode. Somday later, we probably want to make the developer build default
@@ -3323,13 +3303,65 @@ vcxprojFile = env.Command(
     r"$PYTHON buildscripts\make_vcxproj.py mongodb")
 vcxproj = env.Alias("vcxproj", vcxprojFile)
 
-env.Alias("distsrc-tar", env.DistSrc("mongodb-src-${MONGO_VERSION}.tar"))
-env.Alias("distsrc-tgz", env.GZip(
+distSrc = env.DistSrc("mongodb-src-${MONGO_VERSION}.tar")
+env.NoCache(distSrc)
+env.Alias("distsrc-tar", distSrc)
+
+distSrcGzip = env.GZip(
     target="mongodb-src-${MONGO_VERSION}.tgz",
-    source=["mongodb-src-${MONGO_VERSION}.tar"])
-)
-env.Alias("distsrc-zip", env.DistSrc("mongodb-src-${MONGO_VERSION}.zip"))
+    source=[distSrc])
+env.NoCache(distSrcGzip)
+env.Alias("distsrc-tgz", distSrcGzip)
+
+distSrcZip = env.DistSrc("mongodb-src-${MONGO_VERSION}.zip")
+env.NoCache(distSrcZip)
+env.Alias("distsrc-zip", distSrcZip)
+
 env.Alias("distsrc", "distsrc-tgz")
+
+# Defaults for SCons provided flags. SetOption only sets the option to our value
+# if the user did not provide it. So for any flag here if it's explicitly passed
+# the values below set with SetOption will be overwritten.
+#
+# Default j to the number of CPUs on the system. Note: in containers this
+# reports the number of CPUs for the host system. We're relying on the standard
+# library here and perhaps in a future version of Python it will instead report
+# the correct number when in a container.
+try:
+    env.SetOption('num_jobs', multiprocessing.cpu_count())
+# On some platforms (like Windows) on Python 2.7 multiprocessing.cpu_count
+# is not implemented. After we upgrade to Python 3.4+ we can use alternative
+# methods that are cross-platform.
+except NotImplementedError:
+    pass
+
+# Keep this late in the game so that we can investigate attributes set by all the tools that have run.
+if has_option("cache"):
+    if get_option("cache") == "nolinked":
+        def noCacheEmitter(target, source, env):
+            for t in target:
+                try:
+                    if getattr(t.attributes, 'thin_archive', False):
+                        continue
+                except(AttributeError):
+                    pass
+                env.NoCache(t)
+            return target, source
+
+        def addNoCacheEmitter(builder):
+            origEmitter = builder.emitter
+            if SCons.Util.is_Dict(origEmitter):
+                for k,v in origEmitter:
+                    origEmitter[k] = SCons.Builder.ListEmitter([v, noCacheEmitter])
+            elif SCons.Util.is_List(origEmitter):
+                origEmitter.append(noCacheEmitter)
+            else:
+                builder.emitter = SCons.Builder.ListEmitter([origEmitter, noCacheEmitter])
+
+        addNoCacheEmitter(env['BUILDERS']['Program'])
+        addNoCacheEmitter(env['BUILDERS']['StaticLibrary'])
+        addNoCacheEmitter(env['BUILDERS']['SharedLibrary'])
+        addNoCacheEmitter(env['BUILDERS']['LoadableModule'])
 
 env.SConscript(
     dirs=[

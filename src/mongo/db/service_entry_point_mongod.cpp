@@ -68,6 +68,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/metadata.h"
@@ -911,6 +912,7 @@ DbResponse receivedQuery(OperationContext* opCtx,
                          const Message& m) {
     invariant(!nss.isCommand());
     globalOpCounters.gotQuery();
+    ServerReadConcernMetrics::get(opCtx)->recordReadConcern(repl::ReadConcernArgs::get(opCtx));
 
     DbMessage d(m);
     QueryMessage q(d);
