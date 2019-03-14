@@ -22,7 +22,7 @@ Usage: $0 [OPTIONS]
         --psm_release       PSM_RELEASE(mandatory)
         --mongo_tools_tag   MONGO_TOOLS_TAG(mandatory)
         --debug             build debug tarball
-        
+
         --help) usage ;;
 Example $0 --builddir=/tmp/PSMDB --get_sources=1 --build_src_rpm=1 --build_rpm=1
 EOF
@@ -40,7 +40,7 @@ parse_arguments() {
         pick_args=1
         shift
     fi
-  
+
     for arg do
         val=$(echo "$arg" | sed -e 's;^--[^=]*=;;')
         case "$arg" in
@@ -58,7 +58,7 @@ parse_arguments() {
             --psm_release=*) PSM_RELEASE="$val" ;;
             --mongo_tools_tag=*) MONGO_TOOLS_TAG="$val" ;;
             --debug=*) DEBUG="$val" ;;
-            --help) usage ;;      
+            --help) usage ;;
             *)
               if test -n "$pick_args"
               then
@@ -176,7 +176,7 @@ get_sources(){
     cp ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz $WORKDIR/source_tarball
     cp ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz $CURDIR/source_tarball
     cd $CURDIR
-    rm -rf percona-server-mongodb   
+    rm -rf percona-server-mongodb
     return
 }
 
@@ -257,7 +257,7 @@ fix_rules(){
         sed -i 's|CC = gcc-5|CC = /usr/local/gcc-5.4.0/bin/gcc-5.4|' debian/rules
         sed -i 's|CXX = g++-5|CXX = /usr/local/gcc-5.4.0/bin/g++-5.4|' debian/rules
     fi
-    sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules 
+    sed -i 's:release:release --disable-warnings-as-errors :g' debian/rules
 }
 
 install_deps() {
@@ -266,7 +266,7 @@ install_deps() {
         echo "Dependencies will not be installed"
         return;
     fi
-    if [ ! $( id -u ) -eq 0 ]
+    if [ $( id -u ) -ne 0 ]
     then
         echo "It is not possible to instal dependencies. Please run as root"
         exit 1
@@ -279,18 +279,40 @@ install_deps() {
       wget http://jenkins.percona.com/yum-repo/percona-dev.repo
       mv -f percona-dev.repo /etc/yum.repos.d/
       yum clean all
-      yum -y install epel-release
-      rm -fr /usr/local/gcc-5.4.0
       RHEL=$(rpm --eval %rhel)
-      if [ x"$RHEL" = x6 ]; then
-        yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel libpcap-devel scons make rpm-build rpmbuild percona-devtoolset-gcc percona-devtoolset-binutils percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel python27 python27-devel rpmlint libcurl-devel
+      # CHANGEME ON RH8 RELEASE
+      if [[ ${RHEL} -lt 8 ]]; then
+          yum -y install epel-release
+      fi
+      #
+      rm -fr /usr/local/gcc-5.4.0
+
+      yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
+      yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel
+
+      if [[ ${RHEL} -eq 8 ]]; then
+        yum -y install python2-scons python2-pip python36-devel
+        yum -y install redhat-rpm-config python2-devel
+      fi
+
+      if [[ ${RHEL} -lt 8 ]]; then
+        yum -y install python27 python27-devel
         wget https://bootstrap.pypa.io/get-pip.py
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
-      else
-        yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint
       fi
+      if [ "x${RHEL}" == "x6" ]; then
+        pip2.7 install --user -r buildscripts/requirements.txt
+      fi
+      if [ "x${RHEL}" == "x7" ]; then
+        pip install --user -r buildscripts/requirements.txt
+      fi
+      if [ "x${RHEL}" == "x8" ]; then
+        /usr/bin/pip3.6 install --user typing pyyaml regex Cheetah3
+        /usr/bin/pip2.7 install --user typing pyyaml regex Cheetah
+      fi
+#
       install_golang
       install_gcc_54_centos
     else
@@ -442,11 +464,6 @@ build_rpm(){
     rpm2cpio ${SRC_RPM} | cpio -id
     TARF=$(find . -name 'percona-server-mongodb*.tar.gz' | sort | tail -n1)
     tar vxzf ${TARF} --wildcards '*/buildscripts' --strip=1
-    if [ "x${RHEL}" == "x6" ]; then
-    pip2.7 install --user -r buildscripts/requirements.txt
-    else
-    pip install --user -r buildscripts/requirements.txt
-    fi
     #
     cd $WORKDIR
     if [ -f /opt/percona-devtoolset/enable ]; then
@@ -502,7 +519,7 @@ build_source_deb(){
     TARFILE=$(basename $(find . -name 'percona-server-mongodb*.tar.gz' | sort | tail -n1))
     DEBIAN=$(lsb_release -sc)
     ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
-    tar zxf ${TARFILE} 
+    tar zxf ${TARFILE}
     BUILDDIR=${TARFILE%.tar.gz}
     #
     rm -fr ${BUILDDIR}/debian
