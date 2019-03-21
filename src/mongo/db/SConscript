@@ -24,6 +24,7 @@ env.SConscript(
         'catalog',
         'commands',
         'concurrency',
+        'encryption',
         'exec',
         'free_mon',
         'fts',
@@ -468,6 +469,7 @@ env.Library(
         "global_settings.cpp",
     ],
     LIBDEPS=[
+        'encryption/encryption_options',
         'repl/repl_settings',
     ],
 )

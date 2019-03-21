@@ -1,7 +1,7 @@
 /*======
 This file is part of Percona Server for MongoDB.
 
-Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
+Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
     Percona Server for MongoDB is free software: you can redistribute
     it and/or modify it under the terms of the GNU Affero General
@@ -20,31 +20,20 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 
 #pragma once
 
-#include <string>
-
-#include "mongo/base/status.h"
-
-namespace mongo {
-    class OperationContext;
-}
-
 namespace percona {
 
 /**
- * The interface which provides the ability to perform hot
- * backups of the storage engine.
+ * The interface which provides the ability to execute KeyDB-related
+ * functions in an engine independent way
  */
-struct Backupable {
-    virtual ~Backupable() {}
+struct KeyDBAPI {
+    virtual ~KeyDBAPI() {}
 
     /**
-     * Perform hot backup.
-     * @param path destination path to perform backup into.
-     * @return Status code of the operation.
+     * Returns whether the engine supports feature compatibility version 3.6
      */
-    virtual mongo::Status hotBackup(mongo::OperationContext* opCtx, const std::string& path) {
-        return mongo::Status(mongo::ErrorCodes::IllegalOperation,
-                             "This engine doesn't support hot backup.");
+    virtual void keydbDropDatabase(const std::string& db) {
+        // do nothing for engines which do not support KeyDB
     }
 };
 

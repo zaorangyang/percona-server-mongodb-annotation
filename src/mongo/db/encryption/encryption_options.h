@@ -1,7 +1,7 @@
 /*======
 This file is part of Percona Server for MongoDB.
 
-Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
+Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
     Percona Server for MongoDB is free software: you can redistribute
     it and/or modify it under the terms of the GNU Affero General
@@ -22,30 +22,14 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
 
 #include <string>
 
-#include "mongo/base/status.h"
-
 namespace mongo {
-    class OperationContext;
-}
 
-namespace percona {
-
-/**
- * The interface which provides the ability to perform hot
- * backups of the storage engine.
- */
-struct Backupable {
-    virtual ~Backupable() {}
-
-    /**
-     * Perform hot backup.
-     * @param path destination path to perform backup into.
-     * @return Status code of the operation.
-     */
-    virtual mongo::Status hotBackup(mongo::OperationContext* opCtx, const std::string& path) {
-        return mongo::Status(mongo::ErrorCodes::IllegalOperation,
-                             "This engine doesn't support hot backup.");
-    }
+struct EncryptionGlobalParams {
+    bool enableEncryption = false;
+    std::string encryptionCipherMode = "AES256-CBC";
+    std::string encryptionKeyFile;
 };
 
-}  // end of percona namespace.
+extern EncryptionGlobalParams encryptionGlobalParams;
+
+}  // namespace mongo

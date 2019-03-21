@@ -366,6 +366,9 @@ if env.TargetOSIs('windows'):
     env.Alias('generated-sources', generatedDbManifest)
     env.Depends("db/db.res", generatedDbManifest)
 
+# Do not discard encryption extension's entry point
+env.Append( LINKFLAGS=["-upercona_encryption_extension_init"] );
+
 mongod = env.Program(
     target="mongod",
     source=[

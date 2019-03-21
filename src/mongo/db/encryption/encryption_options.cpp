@@ -1,7 +1,7 @@
 /*======
 This file is part of Percona Server for MongoDB.
 
-Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
+Copyright (c) 2006, 2018, Percona and/or its affiliates. All rights reserved.
 
     Percona Server for MongoDB is free software: you can redistribute
     it and/or modify it under the terms of the GNU Affero General
@@ -18,17 +18,10 @@ Copyright (c) 2006, 2016, Percona and/or its affiliates. All rights reserved.
     <http://www.gnu.org/licenses/>.
 ======= */
 
-#pragma once
+#include "mongo/db/encryption/encryption_options.h"
 
-#include "mongo/db/backup/backupable.h"
-#include "mongo/db/storage/keydb_api.h"
+namespace mongo {
 
-namespace percona {
+EncryptionGlobalParams encryptionGlobalParams;
 
-/**
- * Storage engine extension interface.
- */
-class EngineExtension : public Backupable, public KeyDBAPI {
-};
-
-}  // end of percona namespace.
+}  // namespace mongo

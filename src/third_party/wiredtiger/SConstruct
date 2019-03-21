@@ -258,6 +258,9 @@ def filtered_filelist(f):
 filelistfile = r'dist/filelist'
 wtsources = list(filtered_filelist(open(filelistfile)))
 
+# unconditionally add Percona encryption extension
+wtsources.append("ext/encryptors/percona/encryption_extension.c")
+
 if useZlib:
     wtsources.append("ext/compressors/zlib/zlib_compress.c")
 

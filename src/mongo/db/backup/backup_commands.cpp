@@ -60,14 +60,14 @@ public:
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
     }
-    bool errmsgRun(mongo::OperationContext* txn,
+    bool errmsgRun(mongo::OperationContext* opCtx,
              const std::string& db,
              const BSONObj& cmdObj,
              std::string& errmsg,
              BSONObjBuilder& result) override;
 } createBackupCmd;
 
-bool CreateBackupCommand::errmsgRun(mongo::OperationContext* txn,
+bool CreateBackupCommand::errmsgRun(mongo::OperationContext* opCtx,
                               const std::string& db,
                               const BSONObj& cmdObj,
                               std::string& errmsg,
@@ -92,10 +92,10 @@ bool CreateBackupCommand::errmsgRun(mongo::OperationContext* txn,
 
     // Flush all files first.
     auto se = getGlobalServiceContext()->getStorageEngine();
-    se->flushAllFiles(txn, true);
+    se->flushAllFiles(opCtx, true);
 
     // Do the backup itself.
-    const auto status = se->hotBackup(dest);
+    const auto status = se->hotBackup(opCtx, dest);
 
     if (!status.isOK()) {
         errmsg = status.reason();

@@ -21,9 +21,9 @@ env.Library(
     LIBDEPS_DEPENDENTS=[
         '$BUILD_DIR/mongo/mongodmain',
     ],
-    PROGDEPS_DEPENDENTS=[
-        '$BUILD_DIR/mongo/mongos',
-    ],
+    #PROGDEPS_DEPENDENTS=[
+    #    '$BUILD_DIR/mongo/mongos',
+    #],
 )
 
 if wiredtiger:
@@ -36,6 +36,7 @@ if wiredtiger:
     wtEnv.Library(
         target='storage_wiredtiger_core',
         source= [
+            'encryption_keydb.cpp',
             'wiredtiger_begin_transaction_block.cpp',
             'wiredtiger_cursor.cpp',
             'wiredtiger_global_options.cpp',

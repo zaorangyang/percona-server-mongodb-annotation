@@ -34,16 +34,44 @@
 
 #include "mongo/base/init.h"
 #include "mongo/base/string_data.h"
+#include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/stdx/memory.h"
 
 namespace mongo {
 namespace {
 
+class WiredTigerCustomizationHooksEncryption : public WiredTigerCustomizationHooks {
+public:
+    /**
+     * Returns true if the customization hooks are enabled.
+     */
+    virtual bool enabled() const {
+        return true;
+    }
+
+    /**
+     *  Gets an additional configuration string for the provided table name on a
+     *  `WT_SESSION::create` call.
+     */
+    virtual std::string getTableCreateConfig(StringData tableName) {
+        NamespaceString ns(tableName);
+        auto keyid = ns.db();
+        if (keyid.empty())
+            keyid = "/default"_sd;
+        return str::stream() << "encryption=(name=percona,keyid=\"" << keyid << "\"),";
+    }
+};
+
 ServiceContext::ConstructorActionRegisterer setWiredTigerCustomizationHooks{
     "SetWiredTigerCustomizationHooks", [](ServiceContext* service) {
-        auto customizationHooks = stdx::make_unique<WiredTigerCustomizationHooks>();
-        WiredTigerCustomizationHooks::set(service, std::move(customizationHooks));
+        if (encryptionGlobalParams.enableEncryption) {
+            auto customizationHooks = stdx::make_unique<WiredTigerCustomizationHooksEncryption>();
+            WiredTigerCustomizationHooks::set(service, std::move(customizationHooks));
+        } else {
+            auto customizationHooks = stdx::make_unique<WiredTigerCustomizationHooks>();
+            WiredTigerCustomizationHooks::set(service, std::move(customizationHooks));
+        }
     }};
 
 const auto getCustomizationHooks =
