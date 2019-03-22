@@ -89,9 +89,7 @@ void PeriodicRunnerImpl::shutdown() {
         _running = false;
 
         for (auto& job : _jobs) {
-            if (job->isAlive()) {
-                job->stop();
-            }
+            job->stop();
         }
         _jobs.clear();
     }
@@ -103,6 +101,8 @@ PeriodicRunnerImpl::PeriodicJobImpl::PeriodicJobImpl(PeriodicJob job,
     : _job(std::move(job)), _clockSource(source), _serviceContext(svc) {}
 
 void PeriodicRunnerImpl::PeriodicJobImpl::_run() {
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    invariant(_execStatus == PeriodicJobImpl::ExecutionStatus::NOT_SCHEDULED);
     _thread = stdx::thread([this] {
         Client::initThread(_job.name, _serviceContext, nullptr);
         while (true) {
@@ -127,14 +127,10 @@ void PeriodicRunnerImpl::PeriodicJobImpl::_run() {
             }
         }
     });
+    _execStatus = PeriodicJobImpl::ExecutionStatus::RUNNING;
 }
 
 void PeriodicRunnerImpl::PeriodicJobImpl::start() {
-    {
-        stdx::lock_guard<stdx::mutex> lk(_mutex);
-        invariant(_execStatus == PeriodicJobImpl::ExecutionStatus::NOT_SCHEDULED);
-        _execStatus = PeriodicJobImpl::ExecutionStatus::RUNNING;
-    }
     _run();
 }
 
@@ -156,18 +152,15 @@ void PeriodicRunnerImpl::PeriodicJobImpl::resume() {
 void PeriodicRunnerImpl::PeriodicJobImpl::stop() {
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
-        invariant(isAlive());
+        if (_execStatus != ExecutionStatus::RUNNING && _execStatus != ExecutionStatus::PAUSED)
+            return;
+
         invariant(_thread.joinable());
 
         _execStatus = PeriodicJobImpl::ExecutionStatus::CANCELED;
     }
-    invariant(_thread.joinable());
     _condvar.notify_one();
     _thread.join();
-}
-
-bool PeriodicRunnerImpl::PeriodicJobImpl::isAlive() {
-    return _execStatus == ExecutionStatus::RUNNING || _execStatus == ExecutionStatus::PAUSED;
 }
 
 namespace {

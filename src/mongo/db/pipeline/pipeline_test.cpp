@@ -56,6 +56,7 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/death_test.h"
+#include "mongo/unittest/temp_dir.h"
 
 namespace mongo {
 namespace {
@@ -98,6 +99,8 @@ void assertPipelineOptimizesAndSerializesTo(std::string inputPipeJson,
     AggregationRequest request(kTestNss, rawPipeline);
     intrusive_ptr<ExpressionContextForTest> ctx =
         new ExpressionContextForTest(opCtx.get(), request);
+    TempDir tempDir("PipelineTest");
+    ctx->tempDir = tempDir.path();
 
     // For $graphLookup and $lookup, we have to populate the resolvedNamespaces so that the
     // operations will be able to have a resolved view definition.
@@ -690,10 +693,15 @@ TEST(PipelineOptimizationTest, MatchWithNorOnlySplitsIndependentChildren) {
         "[{$unwind: {path: '$a'}}, "
         "{$match: {$nor: [{$and: [{a: {$eq: 1}}, {b: {$eq: 1}}]}, {b: {$eq: 2}} ]}}]";
     string outputPipe =
-        "[{$match: {$nor: [{b: {$eq: 2}}]}}, "
-        "{$unwind: {path: '$a'}}, "
-        "{$match: {$nor: [{$and: [{a: {$eq: 1}}, {b: {$eq: 1}}]}]}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+        R"(
+        [{$match: {b: {$not: {$eq: 2}}}},
+         {$unwind: {path: '$a'}},
+         {$match: {$nor: [{$and: [{a: {$eq: 1}}, {b: {$eq: 1}}]}]}}])";
+    string serializedPipe = R"(
+        [{$match: {$nor: [{b: {$eq: 2}}]}},
+         {$unwind: {path: '$a'}},
+         {$match: {$nor: [{$and: [{a: {$eq: 1}}, {b: {$eq: 1}}]}]}}])";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchWithOrDoesNotSplit) {
@@ -951,10 +959,15 @@ TEST(PipelineOptimizationTest, NorCanSplitAcrossProjectWithRename) {
         "[{$project: {_id: false, x: true, y: '$z'}},"
         "{$match: {$nor: [{w: {$eq: 1}}, {y: {$eq: 1}}]}}]";
     string outputPipe =
-        "[{$match: {$nor: [{z: {$eq: 1}}]}},"
-        "{$project: {_id: false, x: true, y: '$z'}},"
-        "{$match: {$nor: [{w: {$eq: 1}}]}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+        R"([{$match: {z : {$not: {$eq: 1}}}},
+             {$project: {_id: false, x: true, y: "$z"}},
+             {$match: {w: {$not: {$eq: 1}}}}])";
+    string serializedPipe = R"(
+        [{$match: {$nor: [ {z : {$eq: 1}}]}},
+         {$project: {_id: false, x: true, y: "$z"}},
+         {$match: {$nor: [ {w: {$eq: 1}}]}}]
+        )";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, MatchCanMoveAcrossSeveralRenames) {
@@ -969,7 +982,13 @@ TEST(PipelineOptimizationTest, MatchCanMoveAcrossSeveralRenames) {
         "{$match: {z: {$eq: 2}}},"
         "{$addFields: {b: '$c'}},"
         "{$project: {_id: true, z: true, a: '$b'}}]";
-    assertPipelineOptimizesTo(inputPipe, outputPipe);
+    string serializedPipe = R"(
+        [{$match: {d : {$eq: 1}}},
+         {$project: {_id: false, c: "$d"}},
+         {$match: {z : {$eq: 2}}},
+         {$addFields: {b: "$c"}},
+         {$project: {_id: true, z: true, a: "$b"}}])";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
 TEST(PipelineOptimizationTest, RenameShouldNotBeAppliedToDependentMatch) {
@@ -1533,6 +1552,7 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupSwapsWithIndependentMatch) {
 
     intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest(kTestNss));
     expCtx->opCtx = opCtx.get();
+    expCtx->uuid = UUID::gen();
     setMockReplicationCoordinatorOnOpCtx(expCtx->opCtx);
 
     auto spec = BSON("$changeStream" << BSON("fullDocument"
@@ -1558,6 +1578,7 @@ TEST(PipelineOptimizationTest, ChangeStreamLookupDoesNotSwapWithMatchOnPostImage
 
     intrusive_ptr<ExpressionContext> expCtx(new ExpressionContextForTest(kTestNss));
     expCtx->opCtx = opCtx.get();
+    expCtx->uuid = UUID::gen();
     setMockReplicationCoordinatorOnOpCtx(expCtx->opCtx);
 
     auto spec = BSON("$changeStream" << BSON("fullDocument"
@@ -1749,6 +1770,8 @@ public:
         AggregationRequest request(kTestNss, rawPipeline);
         intrusive_ptr<ExpressionContextForTest> ctx =
             new ExpressionContextForTest(&_opCtx, request);
+        TempDir tempDir("PipelineTest");
+        ctx->tempDir = tempDir.path();
 
         // For $graphLookup and $lookup, we have to populate the resolvedNamespaces so that the
         // operations will be able to have a resolved view definition.

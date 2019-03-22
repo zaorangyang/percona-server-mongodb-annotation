@@ -46,12 +46,11 @@ namespace mongo {
 // engine (see SERVER-34165).
 MONGO_EXPORT_SERVER_PARAMETER(enableInMemoryTransactions, bool, false);
 
-boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
-    OperationContext* opCtx,
-    const BSONObj& requestBody,
-    bool requiresAuth,
-    bool isReplSetMemberOrMongos,
-    bool supportsDocLocking) {
+OperationSessionInfoFromClient initializeOperationSessionInfo(OperationContext* opCtx,
+                                                              const BSONObj& requestBody,
+                                                              bool requiresAuth,
+                                                              bool isReplSetMemberOrMongos,
+                                                              bool supportsDocLocking) {
     auto osi = OperationSessionInfoFromClient::parse("OperationSessionInfo"_sd, requestBody);
 
     if (opCtx->getClient()->isInDirectClient()) {
@@ -67,17 +66,21 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
                 !osi.getAutocommit());
         uassert(
             50889, "It is illegal to provide a txnNumber for this command", !osi.getTxnNumber());
-        return boost::none;
     }
 
-    {
+    if (auto authSession = AuthorizationSession::get(opCtx->getClient())) {
         // If we're using the localhost bypass, and the client hasn't authenticated,
         // logical sessions are disabled. A client may authenticate as the __sytem user,
         // or as an externally authorized user.
-        AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
-        if (authSession && authSession->isUsingLocalhostBypass() &&
-            !authSession->isAuthenticated()) {
-            return boost::none;
+        if (authSession->isUsingLocalhostBypass() && !authSession->isAuthenticated()) {
+            return {};
+        }
+
+        // Do not initialize lsid when auth is enabled and no user is logged in since
+        // there is no sensible uid that can be assigned to it.
+        if (AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled() &&
+            !authSession->isAuthenticated() && !requiresAuth) {
+            return {};
         }
     }
 
@@ -88,7 +91,7 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
         if (!lsc) {
             // Ignore session information if the logical session cache has not been set up, e.g. on
             // the embedded version of mongod.
-            return boost::none;
+            return {};
         }
 
         opCtx->setLogicalSessionId(makeLogicalSessionId(osi.getSessionId().get(), opCtx));
@@ -145,6 +148,21 @@ boost::optional<OperationSessionInfoFromClient> initializeOperationSessionInfo(
         uassert(ErrorCodes::InvalidOptions,
                 "Specifying startTransaction=false is not allowed.",
                 osi.getStartTransaction().value());
+    }
+
+    // Populate the session info for doTxn command.
+    if (requestBody.firstElementFieldName() == "doTxn"_sd) {
+        uassert(ErrorCodes::InvalidOptions,
+                "doTxn can only be run with a transaction number.",
+                osi.getTxnNumber());
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                "doTxn can not be run in a transaction",
+                !osi.getAutocommit());
+        // 'autocommit' and 'startTransaction' are populated for 'doTxn' to get the oplog
+        // entry generation behavior used for multi-document transactions. The 'doTxn'
+        // command still logically behaves as a commit.
+        osi.setAutocommit(false);
+        osi.setStartTransaction(true);
     }
 
     return osi;

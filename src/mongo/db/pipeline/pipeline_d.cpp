@@ -386,6 +386,13 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
         plannerOpts |= QueryPlannerParams::NO_UNCOVERED_PROJECTIONS;
     }
 
+    auto* firstSource =
+        pipeline->getSources().empty() ? nullptr : pipeline->getSources().front().get();
+    if (firstSource && firstSource->constraints().isChangeStreamStage()) {
+        invariant(expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData);
+        plannerOpts |= QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
+    }
+
     if (expCtx->needsMerge && expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData) {
         plannerOpts |= QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
     }
@@ -513,9 +520,13 @@ void PipelineD::addCursorSource(Collection* collection,
     // DocumentSourceCursor expects a yielding PlanExecutor that has had its state saved.
     exec->saveState();
 
+    // If this is a change stream pipeline, make sure that we tell DSCursor to track the oplog time.
+    const bool trackOplogTS =
+        (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage());
+
     // Put the PlanExecutor into a DocumentSourceCursor and add it to the front of the pipeline.
     intrusive_ptr<DocumentSourceCursor> pSource =
-        DocumentSourceCursor::create(collection, std::move(exec), expCtx);
+        DocumentSourceCursor::create(collection, std::move(exec), expCtx, trackOplogTS);
 
     // Add the cursor to the pipeline first so that it's correctly disposed of as part of the
     // pipeline if an exception is thrown during this method.
@@ -708,13 +719,20 @@ Status PipelineD::MongoDInterface::attachCursorSourceToPipeline(
     if (expCtx->uuid) {
         try {
             autoColl.emplace(expCtx->opCtx,
-                             NamespaceStringOrUUID{expCtx->ns.db().toString(), *expCtx->uuid});
+                             NamespaceStringOrUUID{expCtx->ns.db().toString(), *expCtx->uuid},
+                             AutoGetCollection::ViewMode::kViewsForbidden,
+                             Date_t::max(),
+                             AutoStatsTracker::LogMode::kUpdateTop);
         } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
             // The UUID doesn't exist anymore
             return ex.toStatus();
         }
     } else {
-        autoColl.emplace(expCtx->opCtx, expCtx->ns);
+        autoColl.emplace(expCtx->opCtx,
+                         expCtx->ns,
+                         AutoGetCollection::ViewMode::kViewsForbidden,
+                         Date_t::max(),
+                         AutoStatsTracker::LogMode::kUpdateTop);
     }
 
     // makePipeline() is only called to perform secondary aggregation requests and expects the

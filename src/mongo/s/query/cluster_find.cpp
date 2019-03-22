@@ -602,6 +602,8 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
     long long batchSize = request.batchSize.value_or(0);
     long long startingFrom = pinnedCursor.getValue().getNumReturnedSoFar();
     auto cursorState = ClusterCursorManager::CursorState::NotExhausted;
+    BSONObj postBatchResumeToken;
+    bool stashedResult = false;
 
     while (!FindCommon::enoughForGetMore(batchSize, batch.size())) {
         auto context = batch.empty()
@@ -639,6 +641,7 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         if (!FindCommon::haveSpaceForNext(
                 *next.getValue().getResult(), batch.size(), bytesBuffered)) {
             pinnedCursor.getValue().queueResult(*next.getValue().getResult());
+            stashedResult = true;
             break;
         }
 
@@ -647,16 +650,26 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
         bytesBuffered +=
             (next.getValue().getResult()->objsize() + kPerDocumentOverheadBytesUpperBound);
         batch.push_back(std::move(*next.getValue().getResult()));
+
+        // Update the postBatchResumeToken. For non-$changeStream aggregations, this will be empty.
+        postBatchResumeToken = pinnedCursor.getValue().getPostBatchResumeToken();
+    }
+
+    // If the cursor has been exhausted, we will communicate this by returning a CursorId of zero.
+    auto idToReturn =
+        (cursorState == ClusterCursorManager::CursorState::Exhausted ? CursorId(0)
+                                                                     : request.cursorid);
+
+    // For empty batches, or in the case where the final result was added to the batch rather than
+    // being stashed, we update the PBRT here to ensure that it is the most recent available.
+    if (idToReturn && !stashedResult) {
+        postBatchResumeToken = pinnedCursor.getValue().getPostBatchResumeToken();
     }
 
     pinnedCursor.getValue().setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
     // Upon successful completion, transfer ownership of the cursor back to the cursor manager. If
     // the cursor has been exhausted, the cursor manager will clean it up for us.
     pinnedCursor.getValue().returnCursor(cursorState);
-
-    CursorId idToReturn = (cursorState == ClusterCursorManager::CursorState::Exhausted)
-        ? CursorId(0)
-        : request.cursorid;
 
     // Set nReturned and whether the cursor has been exhausted.
     CurOp::get(opCtx)->debug().cursorExhausted = (idToReturn == 0);
@@ -669,7 +682,8 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
             "waitBeforeUnpinningOrDeletingCursorAfterGetMoreBatch");
     }
 
-    return CursorResponse(request.nss, idToReturn, std::move(batch), startingFrom);
+    return CursorResponse(
+        request.nss, idToReturn, std::move(batch), startingFrom, boost::none, postBatchResumeToken);
 }
 
 }  // namespace mongo

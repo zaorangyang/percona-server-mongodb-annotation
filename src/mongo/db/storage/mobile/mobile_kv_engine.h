@@ -44,7 +44,7 @@ class JournalListener;
 
 class MobileKVEngine : public KVEngine {
 public:
-    MobileKVEngine(const std::string& path);
+    MobileKVEngine(const std::string& path, std::int32_t durabilityLevel);
 
     RecoveryUnit* newRecoveryUnit() override;
 
@@ -123,6 +123,10 @@ public:
     }
 
     virtual Timestamp getAllCommittedTimestamp() const override {
+        MONGO_UNREACHABLE;
+    }
+
+    virtual Timestamp getOldestOpenReadTimestamp() const override {
         MONGO_UNREACHABLE;
     }
 

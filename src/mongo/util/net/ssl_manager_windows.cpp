@@ -47,6 +47,7 @@
 #include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/stdx/memory.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
@@ -802,10 +803,13 @@ StatusWith<UniqueCertificateWithPrivateKey> readCertPEMFile(StringData fileName,
     // Create the right Crypto context depending on whether we running in a server or outside.
     // See https://msdn.microsoft.com/en-us/library/windows/desktop/aa375195(v=vs.85).aspx
     if (isSSLServer) {
-        // Generate a unique name for our key container
+        // Generate a unique name for each key container
         // Use the the log file if possible
         if (!serverGlobalParams.logpath.empty()) {
-            wstr = toNativeString(serverGlobalParams.logpath.c_str());
+            static AtomicWord<int> counter{0};
+            std::string keyContainerName = str::stream() << serverGlobalParams.logpath
+                                                         << counter.fetchAndAdd(1);
+            wstr = toNativeString(keyContainerName.c_str());
         } else {
             auto us = UUID::gen().toString();
             wstr = toNativeString(us.c_str());
@@ -1130,17 +1134,26 @@ StatusWith<UniqueCertificate> loadAndValidateCertificateSelector(
     DWORD dwKeySpec;
     BOOL freeProvider;
     HCRYPTPROV hCryptProv;
-    BOOL ret = CryptAcquireCertificatePrivateKey(
-        swCert.getValue().get(), 0, NULL, &hCryptProv, &dwKeySpec, &freeProvider);
+    BOOL ret = CryptAcquireCertificatePrivateKey(swCert.getValue().get(),
+                                                 CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG,
+                                                 NULL,
+                                                 &hCryptProv,
+                                                 &dwKeySpec,
+                                                 &freeProvider);
     if (!ret) {
         DWORD gle = GetLastError();
         if (gle == CRYPT_E_NO_KEY_PROPERTY) {
             return Status(ErrorCodes::InvalidSSLConfiguration,
                           str::stream()
                               << "Could not find private key attached to the selected certificate");
+        } else if (gle == NTE_BAD_KEYSET) {
+            return Status(ErrorCodes::InvalidSSLConfiguration,
+                          str::stream() << "Could not read private key attached to the selected "
+                                           "certificate, ensure it exists and check the private "
+                                           "key permissions");
         } else {
             return Status(ErrorCodes::InvalidSSLConfiguration,
-                          str::stream() << "CertGetCertificateContextProperty failed  "
+                          str::stream() << "CryptAcquireCertificatePrivateKey failed  "
                                         << errnoWithDescription(gle));
         }
     }

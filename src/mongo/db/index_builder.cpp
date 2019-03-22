@@ -138,7 +138,7 @@ void IndexBuilder::run() {
         unreplicatedWrites.emplace(opCtx.get());
     }
 
-    AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization();
+    AuthorizationSession::get(opCtx->getClient())->grantInternalAuthorization(opCtx.get());
 
     {
         stdx::lock_guard<Client> lk(*(opCtx->getClient()));
@@ -269,24 +269,14 @@ Status IndexBuilder::_build(OperationContext* opCtx,
         });
 
         if (requiresGhostCommitTimestamp(opCtx, ns)) {
-
-            auto tryTimestamp = [opCtx] {
-                auto status = opCtx->recoveryUnit()->setTimestamp(
-                    LogicalClock::get(opCtx)->getClusterTime().asTimestamp());
-                if (status.code() == ErrorCodes::BadValue) {
-                    LOG(1) << "Temporarily could not timestamp the index build commit: "
-                           << status.reason();
-                    return false;
-                }
-                fassert(50701, status);
-                return true;
-            };
-
-            // Timestamping the index build may fail in rare cases if retrieving the cluster time
-            // races with the stable timestamp advancing. It should be retried immediately.
-            while (!tryTimestamp()) {
-                opCtx->checkForInterrupt();
+            auto status = opCtx->recoveryUnit()->setTimestamp(
+                LogicalClock::get(opCtx)->getClusterTime().asTimestamp());
+            if (status.code() == ErrorCodes::BadValue) {
+                log() << "Temporarily could not timestamp the index build commit, retrying. "
+                      << status.reason();
+                throw WriteConflictException();
             }
+            fassert(50701, status);
         }
         wunit.commit();
     });

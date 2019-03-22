@@ -56,6 +56,9 @@ using std::dec;
 using std::hex;
 using std::string;
 
+const double BSONElement::kLongLongMaxPlusOneAsDouble =
+    scalbn(1, std::numeric_limits<long long>::digits);
+
 string BSONElement::jsonString(JsonStringFormat format, bool includeFieldNames, int pretty) const {
     std::stringstream s;
     if (includeFieldNames)
@@ -547,7 +550,7 @@ bool BSONElement::binaryEqualValues(const BSONElement& rhs) const {
 
 BSONObj BSONElement::embeddedObjectUserCheck() const {
     if (MONGO_likely(isABSONObj()))
-        return BSONObj(value());
+        return BSONObj(value(), BSONObj::LargeSizeTrait{});
     std::stringstream ss;
     ss << "invalid parameter: expected an object (" << fieldName() << ")";
     uasserted(10065, ss.str());
@@ -556,7 +559,7 @@ BSONObj BSONElement::embeddedObjectUserCheck() const {
 
 BSONObj BSONElement::embeddedObject() const {
     verify(isABSONObj());
-    return BSONObj(value());
+    return BSONObj(value(), BSONObj::LargeSizeTrait{});
 }
 
 BSONObj BSONElement::codeWScopeObject() const {

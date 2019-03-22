@@ -67,11 +67,6 @@ using std::vector;
 
 namespace {
 constexpr auto checkValueType = &DocumentSourceChangeStream::checkValueType;
-
-bool isFCVChange(const Document& input) {
-    const auto ns = input[repl::OplogEntry::kNamespaceFieldName];
-    return NamespaceString(ns.getStringData()).isServerConfigurationCollection();
-}
 }  // namespace
 
 DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
@@ -81,11 +76,15 @@ DocumentSourceChangeStreamTransform::DocumentSourceChangeStreamTransform(
     bool isIndependentOfAnyCollection)
     : DocumentSource(expCtx),
       _changeStreamSpec(changeStreamSpec.getOwned()),
-      _resumeTokenFormat(
-          fcv >= ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40
-              ? ResumeToken::SerializationFormat::kHexString
-              : ResumeToken::SerializationFormat::kBinData),
       _isIndependentOfAnyCollection(isIndependentOfAnyCollection) {
+
+    // If 'needsMerge' is true and 'mergeByPBRT' is false, then we are running on a sharded cluster
+    // that is mid-upgrade, and so we generate resume tokens that obey the FCV. Otherwise, we always
+    // generate v1 resume tokens regardless of whether we are in FCV 3.6 or upgraded to FCV 4.0.
+    _resumeTokenFormat = pExpCtx->needsMerge && !pExpCtx->mergeByPBRT &&
+            fcv < ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo40
+        ? ResumeToken::SerializationFormat::kBinData
+        : ResumeToken::SerializationFormat::kHexString;
 
     _nsRegex.emplace(DocumentSourceChangeStream::getNsRegexForChangeStream(expCtx->ns));
 
@@ -177,6 +176,12 @@ ResumeTokenData DocumentSourceChangeStreamTransform::getResumeToken(Value ts,
     resumeTokenData.documentKey = documentKey;
     if (!uuid.missing())
         resumeTokenData.uuid = uuid.getUuid();
+
+    // If 'needsMerge' is true and 'mergeByPBRT' is false, then we are running on a sharded cluster
+    // that is mid-upgrade. We therefore always generate v0 resume tokens for compatibility.
+    if (pExpCtx->needsMerge && !pExpCtx->mergeByPBRT) {
+        resumeTokenData.version = 0;
+    }
 
     return resumeTokenData;
 }
@@ -351,7 +356,8 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
 
     // Note that 'documentKey' and/or 'uuid' might be missing, in which case they will not appear
     // in the output.
-    ResumeTokenData resumeTokenData = getResumeToken(ts, uuid, documentKey);
+    auto resumeTokenData = getResumeToken(ts, uuid, documentKey);
+    auto resumeToken = ResumeToken(resumeTokenData).toDocument(_resumeTokenFormat);
 
     // Add some additional fields only relevant to transactions.
     if (_txnContext) {
@@ -360,15 +366,19 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
         doc.addField(DocumentSourceChangeStream::kLsidField, Value(_txnContext->lsid));
     }
 
-    doc.addField(DocumentSourceChangeStream::kIdField,
-                 Value(ResumeToken(resumeTokenData).toDocument(_resumeTokenFormat)));
+    doc.addField(DocumentSourceChangeStream::kIdField, Value(resumeToken));
     doc.addField(DocumentSourceChangeStream::kOperationTypeField, Value(operationType));
     doc.addField(DocumentSourceChangeStream::kClusterTimeField, Value(resumeTokenData.clusterTime));
 
-    // If we're in a sharded environment, we'll need to merge the results by their sort key, so add
-    // that as metadata.
-    if (pExpCtx->needsMerge) {
+    // We set the resume token as the document's sort key in both the sharded and non-sharded cases,
+    // since we will subsequently rely upon it to generate a correct postBatchResumeToken. When we
+    // are returning results for merging, we first check whether 'mergeByPBRT' has been set. If not,
+    // then the request was sent from an older mongoS which cannot merge by raw resume tokens, and
+    // we must use the old sort key format.
+    if (pExpCtx->needsMerge && !pExpCtx->mergeByPBRT) {
         doc.setSortKeyMetaField(BSON("" << ts << "" << uuid << "" << documentKey));
+    } else {
+        doc.setSortKeyMetaField(resumeToken.toBson());
     }
 
     // "invalidate" and "newShardDetected" entries have fewer fields.
@@ -388,27 +398,6 @@ Document DocumentSourceChangeStreamTransform::applyTransformation(const Document
     // serialized.
     doc.addField("updateDescription", updateDescription);
     return doc.freeze();
-}
-
-void DocumentSourceChangeStreamTransform::switchResumeTokenFormat(
-    const Document& fcvUpdateOplogEntry) {
-    checkValueType(fcvUpdateOplogEntry[repl::OplogEntry::kObjectFieldName],
-                   repl::OplogEntry::kObjectFieldName,
-                   BSONType::Object);
-    Document opObject = fcvUpdateOplogEntry[repl::OplogEntry::kObjectFieldName].getDocument();
-    // The FCV update is done with a replacement-style update, so there will be no $set. Instead,
-    // 'opObject' is the entire new document.
-    Value newVersion = opObject["version"];
-
-    checkValueType(newVersion, "o.version", BSONType::String);
-    if (newVersion.getStringData() == "3.6") {
-        _resumeTokenFormat = ResumeToken::SerializationFormat::kBinData;
-    } else {
-        uassert(65537,
-                "Feature compatibility version updated to an unknown version",
-                newVersion.getStringData() == "4.0");
-        _resumeTokenFormat = ResumeToken::SerializationFormat::kHexString;
-    }
 }
 
 Value DocumentSourceChangeStreamTransform::serialize(
@@ -473,13 +462,6 @@ DocumentSource::GetNextResult DocumentSourceChangeStreamTransform::getNext() {
 
     // Get the next input document.
     auto input = pSource->getNext();
-
-    // Check for FCV changes.
-    while (input.isAdvanced() && isFCVChange(input.getDocument())) {
-        switchResumeTokenFormat(input.getDocument());
-        input = pSource->getNext();
-    }
-
     if (!input.isAdvanced()) {
         return input;
     }

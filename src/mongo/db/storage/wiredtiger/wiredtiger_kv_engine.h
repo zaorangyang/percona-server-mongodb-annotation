@@ -219,6 +219,8 @@ public:
 
     bool supportsReadConcernSnapshot() const final;
 
+    virtual Timestamp getOldestOpenReadTimestamp() const override;
+
     bool supportsReadConcernMajority() const final;
 
     // wiredtiger specific
@@ -294,6 +296,8 @@ public:
     static bool initRsOplogBackgroundThread(StringData ns);
 
     static void appendGlobalStats(BSONObjBuilder& b);
+
+    Timestamp getOldestTimestamp() const;
 
     /**
      * Returns the data file path associated with an ident on disk. Returns boost::none if the data

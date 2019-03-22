@@ -47,6 +47,9 @@ RouterStagePipeline::RouterStagePipeline(std::unique_ptr<RouterExecStage> child,
       _mergePipeline(std::move(mergePipeline)),
       _mongosOnlyPipeline(!_mergePipeline->isSplitForMerge()) {
     if (!_mongosOnlyPipeline) {
+        // Save a pointer to the child RouterExecStage before it is absorbed into the pipeline. This
+        // is either a merge stage, or an ancestor that can forward calls to the RouterStageMerge.
+        _mergeCursorsStage = child.get();
         // Add an adapter to the front of the pipeline to draw results from 'child'.
         _routerAdapter =
             DocumentSourceRouterAdapter::create(_mergePipeline->getContext(), std::move(child)),
@@ -61,6 +64,7 @@ StatusWith<ClusterQueryResult> RouterStagePipeline::next(RouterExecStage::ExecCo
 
     // Pipeline::getNext will return a boost::optional<Document> or boost::none if EOF.
     if (auto result = _mergePipeline->getNext()) {
+        _validateAndRecordSortKey(*result);
         return {result->toBson()};
     }
 
@@ -88,6 +92,34 @@ void RouterStagePipeline::kill(OperationContext* opCtx) {
 
 std::size_t RouterStagePipeline::getNumRemotes() const {
     return _mongosOnlyPipeline ? 0 : _routerAdapter->getNumRemotes();
+}
+
+BSONObj RouterStagePipeline::getPostBatchResumeToken() {
+    auto pbrt = _mergeCursorsStage ? _mergeCursorsStage->getPostBatchResumeToken() : BSONObj();
+    return pbrt.isEmpty() ? pbrt : _setPostBatchResumeTokenUUID(pbrt);
+}
+
+BSONObj RouterStagePipeline::_setPostBatchResumeTokenUUID(BSONObj pbrt) const {
+    // If the PBRT does not match the sort key of the latest document, it is a high water mark.
+    static const auto tokenFormat = ResumeToken::SerializationFormat::kHexString;
+    const bool isHighWaterMark = !pbrt.binaryEqual(_latestSortKey);
+
+    // If this stream is on a single collection and the token is a high water mark, then it may have
+    // come from a shard that does not have the collection. If so, we must fill in the correct UUID.
+    if (isHighWaterMark && _mergePipeline->getContext()->uuid) {
+        auto tokenData = ResumeToken::parse(pbrt).getData();
+        // Check whether the UUID is missing before regenerating the token.
+        if (!tokenData.uuid) {
+            invariant(tokenData.tokenType == ResumeTokenData::kHighWaterMarkToken);
+            tokenData.uuid = _mergePipeline->getContext()->uuid;
+            pbrt = ResumeToken(tokenData).toDocument(tokenFormat).toBson();
+        }
+    }
+    return pbrt;
+}
+
+void RouterStagePipeline::_validateAndRecordSortKey(const Document& doc) {
+    _latestSortKey = doc.getSortKeyMetaField();
 }
 
 bool RouterStagePipeline::remotesExhausted() {

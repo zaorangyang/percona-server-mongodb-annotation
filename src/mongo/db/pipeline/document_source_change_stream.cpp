@@ -45,6 +45,7 @@
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_lookup_change_post_image.h"
 #include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/document_source_watch_for_uuid.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/resume_token.h"
@@ -273,21 +274,11 @@ BSONObj DocumentSourceChangeStream::buildMatchFilter(
     // 3) Look for 'applyOps' which were created as part of a transaction.
     BSONObj applyOps = getTxnApplyOpsFilter(nsMatch["ns"], nss);
 
-    // 4) Look for changes to the feature compatibility version. These show up as updates to the
-    // admin.system.version collection.
-    BSONObj fcvChange = BSON(
-        "$and" << BSON_ARRAY(
-            BSON("ns" << NamespaceString::kServerConfigurationNamespace.ns())
-            // Ignore entries which correspond to the beginning of a transition. We only need to
-            // care about those which actually commit a change to the feature compatibility version.
-            << BSON("o.targetVersion" << BSON("$exists" << false))
-            << BSON("o.version" << BSON("$exists" << true))));
-
     // Match oplog entries after "start" and are either supported (1) commands or (2) operations,
     // excepting those tagged "fromMigrate". Include the resume token, if resuming, so we can verify
     // it was still present in the oplog.
     return BSON("$and" << BSON_ARRAY(BSON("ts" << (startFromInclusive ? GTE : GT) << startFrom)
-                                     << BSON(OR(opMatch, commandMatch, applyOps, fcvChange))
+                                     << BSON(OR(opMatch, commandMatch, applyOps))
                                      << BSON("fromMigrate" << NE << true)));
 }
 
@@ -306,7 +297,7 @@ namespace {
  *        figure out its default collation.
  */
 void assertResumeAllowed(const intrusive_ptr<ExpressionContext>& expCtx,
-                         ResumeTokenData tokenData) {
+                         const ResumeTokenData& tokenData) {
     if (!expCtx->collation.isEmpty()) {
         // Explicit collation has been set, it's okay to resume.
         return;
@@ -317,11 +308,18 @@ void assertResumeAllowed(const intrusive_ptr<ExpressionContext>& expCtx,
         return;
     }
 
+    if (!tokenData.uuid && ResumeToken::isHighWaterMarkToken(tokenData)) {
+        // The only time we see a single-collection high water mark with no UUID is when the stream
+        // was opened on a non-existent collection. We allow this to proceed, as the resumed stream
+        // will immediately invalidate itself if it observes a createCollection event in the oplog
+        // with a non-simple collation.
+        return;
+    }
+
     const auto cannotResumeErrMsg =
         "Attempted to resume a stream on a collection which has been dropped. The change stream's "
         "pipeline may need to make comparisons which should respect the collection's default "
-        "collation, which can no longer be determined. If you wish to resume this change stream "
-        "you must specify a collation with the request.";
+        "collation, which can no longer be determined.";
     // Verify that the UUID on the expression context matches the UUID in the resume token.
     // TODO SERVER-35254: If we're on a stale mongos, this check may incorrectly reject a valid
     // resume token since the UUID on the expression context could be for a previous version of the
@@ -355,16 +353,29 @@ list<intrusive_ptr<DocumentSource>> buildPipeline(
         ResumeToken token = resumeAfter.get();
         ResumeTokenData tokenData = token.getData();
 
+        // Cannot resume a change stream using a 'fromInvalidate' resume token.
+        uassert(ErrorCodes::InvalidResumeToken,
+                "Attempting to resume a change stream using 'resumeAfter' is not allowed from an "
+                "invalidate notification.",
+                !tokenData.fromInvalidate);
+
         // Verify that the requested resume attempt is possible based on the stream type, resume
         // token UUID, and collation.
         assertResumeAllowed(expCtx, tokenData);
 
+        // Store the resume token as the initial postBatchResumeToken for this stream.
+        expCtx->initialPostBatchResumeToken =
+            token.toDocument(ResumeToken::SerializationFormat::kHexString).toBson();
+
+        // For a regular resume token, we must ensure that (1) all shards are capable of resuming
+        // from the given clusterTime, and (2) that we observe the resume token event in the stream
+        // before any event that would sort after it. High water mark tokens, however, do not refer
+        // to a specific event; we thus only need to check (1), similar to 'startAtOperationTime'.
         startFrom = tokenData.clusterTime;
-        if (expCtx->needsMerge) {
-            resumeStage =
-                DocumentSourceShardCheckResumability::create(expCtx, tokenData.clusterTime);
+        if (expCtx->needsMerge || ResumeToken::isHighWaterMarkToken(tokenData)) {
+            resumeStage = DocumentSourceShardCheckResumability::create(expCtx, tokenData);
         } else {
-            resumeStage = DocumentSourceEnsureResumeTokenPresent::create(expCtx, std::move(token));
+            resumeStage = DocumentSourceEnsureResumeTokenPresent::create(expCtx, tokenData);
         }
     }
 
@@ -414,15 +425,29 @@ list<intrusive_ptr<DocumentSource>> buildPipeline(
         stages.push_back(DocumentSourceOplogMatch::create(
             DocumentSourceChangeStream::buildMatchFilter(expCtx, *startFrom, startFromInclusive),
             expCtx));
+
+        // If we haven't already populated the initial PBRT, then we are starting from a specific
+        // timestamp rather than a resume token. Initialize the PBRT to a high water mark token.
+        if (expCtx->initialPostBatchResumeToken.isEmpty()) {
+            Timestamp startTime{startFrom->getSecs(), startFrom->getInc() + (!startFromInclusive)};
+            const auto resumeToken = ResumeToken::makeHighWaterMarkToken(startTime, expCtx->uuid);
+            expCtx->initialPostBatchResumeToken =
+                resumeToken.toDocument(ResumeToken::SerializationFormat::kHexString).toBson();
+        }
     }
 
     stages.push_back(createTransformationStage(expCtx, elem.embeddedObject(), fcv));
-    stages.push_back(DocumentSourceCheckInvalidate::create(expCtx));
 
-    // Resume stage must come after the check invalidate stage to ensure that resuming from an
-    // invalidate or an invalidating command will not ignore the invalidation. Putting the check
-    // invalidate stage first will see the resume token before it is ignored, thereby remembering
-    // that the stream cannot continue.
+    // If this is a single-collection stream but we don't have a UUID set on the expression context,
+    // then the stream was opened before the collection exists. Add a stage which will populate the
+    // UUID using the first change stream result observed by the pipeline during execution.
+    if (!expCtx->uuid && expCtx->isSingleNamespaceAggregation()) {
+        stages.push_back(DocumentSourceWatchForUUID::create(expCtx));
+    }
+
+    // The resume stage must come after the check invalidate stage so that the former can determine
+    // whether the event that matches the resume token should be followed by an "invalidate" event.
+    stages.push_back(DocumentSourceCheckInvalidate::create(expCtx));
     if (resumeStage) {
         stages.push_back(resumeStage);
     }
@@ -464,6 +489,13 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
         // There should only be one close cursor stage. If we're on the shards and producing input
         // to be merged, do not add a close cursor stage, since the mongos will already have one.
         stages.push_back(DocumentSourceCloseCursor::create(expCtx));
+
+        // If this is a single-collection stream but we do not have a UUID set on the expression
+        // context, then the stream was opened before the collection exists. Add a stage on mongoS
+        // which will watch for and populate the UUID using the first result seen by the pipeline.
+        if (expCtx->inMongos && !expCtx->uuid && expCtx->isSingleNamespaceAggregation()) {
+            stages.push_back(DocumentSourceWatchForUUID::create(expCtx));
+        }
 
         // There should be only one post-image lookup stage.  If we're on the shards and producing
         // input to be merged, the lookup is done on the mongos.

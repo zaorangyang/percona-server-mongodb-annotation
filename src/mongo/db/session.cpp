@@ -50,6 +50,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
@@ -388,9 +389,9 @@ void Session::beginOrContinueTxnOnMigration(OperationContext* opCtx, TxnNumber t
     _beginOrContinueTxnOnMigration(lg, txnNumber);
 }
 
-void Session::setSpeculativeTransactionOpTime(OperationContext* opCtx,
-                                              SpeculativeTransactionOpTime opTimeChoice) {
-    stdx::lock_guard<stdx::mutex> lg(_mutex);
+void Session::_setSpeculativeTransactionOpTime(WithLock,
+                                               OperationContext* opCtx,
+                                               SpeculativeTransactionOpTime opTimeChoice) {
     repl::ReplicationCoordinator* replCoord =
         repl::ReplicationCoordinator::get(opCtx->getClient()->getServiceContext());
     opCtx->recoveryUnit()->setTimestampReadSource(
@@ -398,13 +399,12 @@ void Session::setSpeculativeTransactionOpTime(OperationContext* opCtx,
             ? RecoveryUnit::ReadSource::kAllCommittedSnapshot
             : RecoveryUnit::ReadSource::kLastAppliedSnapshot);
     opCtx->recoveryUnit()->preallocateSnapshot();
-    auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
-    invariant(readTimestamp);
+    auto readTimestamp = repl::StorageInterface::get(opCtx)->getPointInTimeReadTimestamp(opCtx);
     // Transactions do not survive term changes, so combining "getTerm" here with the
     // recovery unit timestamp does not cause races.
-    _speculativeTransactionReadOpTime = {*readTimestamp, replCoord->getTerm()};
+    _speculativeTransactionReadOpTime = {readTimestamp, replCoord->getTerm()};
     stdx::lock_guard<stdx::mutex> ls(_statsMutex);
-    _singleTransactionStats.setReadTimestamp(*readTimestamp);
+    _singleTransactionStats.setReadTimestamp(readTimestamp);
 }
 
 void Session::onWriteOpCompletedOnPrimary(OperationContext* opCtx,
@@ -445,18 +445,17 @@ bool Session::onMigrateBeginOnPrimary(OperationContext* opCtx, TxnNumber txnNumb
             return false;
         }
     } catch (const DBException& ex) {
-        // If the transaction chain was truncated on the recipient shard, then we are most likely
-        // copying from a session that hasn't been touched on the recipient shard for a very long
-        // time but could be recent on the donor.
-        //
-        // We continue copying regardless to get the entire transaction from the donor.
-        if (ex.code() != ErrorCodes::IncompleteTransactionHistory) {
-            throw;
+        // If the transaction chain is incomplete because oplog was truncated, just ignore the
+        // incoming oplog and don't attempt to 'patch up' the missing pieces.
+        if (ex.code() == ErrorCodes::IncompleteTransactionHistory) {
+            return false;
         }
 
         if (stmtId == kIncompleteHistoryStmtId) {
             return false;
         }
+
+        throw;
     }
 
     return true;
@@ -591,7 +590,9 @@ void Session::_beginOrContinueTxn(WithLock wl,
                     ->decrementCurrentInactive();
                 _abortTransaction(wl);
                 uasserted(ErrorCodes::NoSuchTransaction,
-                          str::stream() << "Transaction " << txnNumber << " has been aborted.");
+                          str::stream() << "Transaction " << txnNumber
+                                        << " has been aborted because an earlier command in this "
+                                           "transaction failed.");
             }
         }
         return;
@@ -820,11 +821,27 @@ void Session::unstashTransactionResources(OperationContext* opCtx, const std::st
             return;
         }
 
-        // Stashed transaction resources do not exist for this transaction.  If this is a
-        // multi-document transaction, set up the transaction resources on the opCtx.
+        // Stashed transaction resources do not exist for this transaction.
         if (_txnState != MultiDocumentTransactionState::kInProgress) {
             return;
         }
+
+        // Set speculative execution.
+        const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+        const bool speculative =
+            readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
+            !readConcernArgs.getArgsAtClusterTime();
+        // Only set speculative on primary.
+        if (opCtx->writesAreReplicated() && speculative) {
+            _setSpeculativeTransactionOpTime(lg,
+                                             opCtx,
+                                             readConcernArgs.getOriginalLevel() ==
+                                                     repl::ReadConcernLevel::kSnapshotReadConcern
+                                                 ? SpeculativeTransactionOpTime::kAllCommitted
+                                                 : SpeculativeTransactionOpTime::kLastApplied);
+        }
+
+        // If this is a multi-document transaction, set up the transaction resources on the opCtx.
         opCtx->setWriteUnitOfWork(std::make_unique<WriteUnitOfWork>(opCtx));
 
         // If maxTransactionLockRequestTimeoutMillis is set, then we will ensure no

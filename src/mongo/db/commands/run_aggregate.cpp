@@ -41,7 +41,7 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/exec/pipeline_proxy.h"
+#include "mongo/db/exec/change_stream_proxy.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/accumulator.h"
@@ -99,6 +99,7 @@ bool handleCursorCommand(OperationContext* opCtx,
 
     CursorResponseBuilder responseBuilder(true, &result);
     BSONObj next;
+    bool stashedResult = false;
     for (int objCount = 0; objCount < batchSize; objCount++) {
         // The initial getNext() on a PipelineProxyStage may be very expensive so we don't
         // do it when batchSize is 0 since that indicates a desire for a fast return.
@@ -115,8 +116,6 @@ bool handleCursorCommand(OperationContext* opCtx,
         }
 
         if (state == PlanExecutor::IS_EOF) {
-            responseBuilder.setLatestOplogTimestamp(
-                cursor->getExecutor()->getLatestOplogTimestamp());
             if (!cursor->isTailable()) {
                 // make it an obvious error to use cursor or executor after this point
                 cursor = nullptr;
@@ -133,14 +132,24 @@ bool handleCursorCommand(OperationContext* opCtx,
         // for later.
         if (!FindCommon::haveSpaceForNext(next, objCount, responseBuilder.bytesUsed())) {
             cursor->getExecutor()->enqueue(next);
+            stashedResult = true;
             break;
         }
 
+        // Set both the latestOplogTimestamp and the postBatchResumeToken on the response.
         responseBuilder.setLatestOplogTimestamp(cursor->getExecutor()->getLatestOplogTimestamp());
+        responseBuilder.setPostBatchResumeToken(cursor->getExecutor()->getPostBatchResumeToken());
         responseBuilder.append(next);
     }
 
     if (cursor) {
+        // For empty batches, or in the case where the final result was added to the batch rather
+        // than being stashed, we update the PBRT to ensure that it is the most recent available.
+        const auto* exec = cursor->getExecutor();
+        if (!stashedResult) {
+            responseBuilder.setLatestOplogTimestamp(exec->getLatestOplogTimestamp());
+            responseBuilder.setPostBatchResumeToken(exec->getPostBatchResumeToken());
+        }
         // If a time limit was set on the pipeline, remaining time is "rolled over" to the
         // cursor (for use by future getmore ops).
         cursor->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
@@ -357,7 +366,7 @@ Status runAggregate(OperationContext* opCtx,
                 uassertStatusOK(waitForReadConcern(opCtx, readConcernArgs, true));
             }
 
-            if (!origNss.isCollectionlessAggregateNS()) {
+            if (liteParsedPipeline.shouldResolveUUIDAndCollation()) {
                 // AutoGetCollectionForReadCommand will raise an error if 'origNss' is a view.
                 AutoGetCollectionForReadCommand origNssCtx(opCtx, origNss);
 
@@ -387,7 +396,11 @@ Status runAggregate(OperationContext* opCtx,
         // If this is a collectionless aggregation with no foreign namespaces, we don't want to
         // acquire any locks. Otherwise, lock the collection or view.
         if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
-            statsTracker.emplace(opCtx, nss, Top::LockType::NotLocked, 0);
+            statsTracker.emplace(opCtx,
+                                 nss,
+                                 Top::LockType::NotLocked,
+                                 AutoStatsTracker::LogMode::kUpdateTopAndCurop,
+                                 0);
         } else {
             ctx.emplace(opCtx, nss, AutoGetCollection::ViewMode::kViewsPermitted);
         }
@@ -504,7 +517,9 @@ Status runAggregate(OperationContext* opCtx,
         // Transfer ownership of the Pipeline to the PipelineProxyStage.
         unownedPipeline = pipeline.get();
         auto ws = make_unique<WorkingSet>();
-        auto proxy = make_unique<PipelineProxyStage>(opCtx, std::move(pipeline), ws.get());
+        auto proxy = liteParsedPipeline.hasChangeStream()
+            ? make_unique<ChangeStreamProxyStage>(opCtx, std::move(pipeline), ws.get())
+            : make_unique<PipelineProxyStage>(opCtx, std::move(pipeline), ws.get());
 
         // This PlanExecutor will simply forward requests to the Pipeline, so does not need to
         // yield or to be registered with any collection's CursorManager to receive invalidations.

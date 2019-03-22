@@ -1814,6 +1814,13 @@ void WiredTigerKVEngine::setOldestTimestamp(Timestamp oldestTimestamp, bool forc
     invariant(static_cast<std::size_t>(size) < sizeof(oldestTSConfigString));
     invariantWTOK(_conn->set_timestamp(_conn, oldestTSConfigString));
 
+    // set_timestamp above ignores backwards in time unless 'force' is set.
+    if (force) {
+        _oldestTimestamp.store(oldestTimestamp.asULL());
+    } else if (_oldestTimestamp.load() < oldestTimestamp.asULL()) {
+        _oldestTimestamp.store(oldestTimestamp.asULL());
+    }
+
     if (force) {
         LOG(2) << "oldest_timestamp and commit_timestamp force set to " << oldestTimestamp;
     } else {
@@ -1896,6 +1903,21 @@ Timestamp WiredTigerKVEngine::getAllCommittedTimestamp() const {
     return Timestamp(_oplogManager->fetchAllCommittedValue(_conn));
 }
 
+Timestamp WiredTigerKVEngine::getOldestOpenReadTimestamp() const {
+    // Return the minimum read timestamp of all open transactions.
+    char buf[(2 * 8 /*bytes in hex*/) + 1 /*null terminator*/];
+    auto wtstatus = _conn->query_timestamp(_conn, buf, "get=oldest_reader");
+    if (wtstatus == WT_NOTFOUND) {
+        return Timestamp();
+    } else {
+        invariantWTOK(wtstatus);
+    }
+
+    uint64_t tmp;
+    fassert(38802, parseNumberFromStringWithBase(buf, 16, &tmp));
+    return Timestamp(tmp);
+}
+
 boost::optional<Timestamp> WiredTigerKVEngine::getRecoveryTimestamp() const {
     if (!supportsRecoveryTimestamp()) {
         severe() << "WiredTiger is configured to not support providing a recovery timestamp";
@@ -1955,6 +1977,10 @@ void WiredTigerKVEngine::haltOplogManager() {
 
 void WiredTigerKVEngine::replicationBatchIsComplete() const {
     _oplogManager->triggerJournalFlush();
+}
+
+Timestamp WiredTigerKVEngine::getOldestTimestamp() const {
+    return Timestamp(_oldestTimestamp.load());
 }
 
 }  // namespace mongo

@@ -56,9 +56,8 @@ using ResumeStatus = DocumentSourceEnsureResumeTokenPresent::ResumeStatus;
 // tokens, and that we purposefully avoid the user's requested collation if present.
 ResumeStatus compareAgainstClientResumeToken(const intrusive_ptr<ExpressionContext>& expCtx,
                                              const Document& documentFromResumedStream,
-                                             const ResumeToken& tokenFromClient) {
-    // Parse both the stream doc and the client's resume token into comprehensible ResumeTokenData.
-    auto tokenDataFromClient = tokenFromClient.getData();
+                                             const ResumeTokenData& tokenDataFromClient) {
+    // Parse the stream doc into comprehensible ResumeTokenData.
     auto tokenDataFromResumedStream =
         ResumeToken::parse(documentFromResumedStream["_id"].getDocument()).getData();
 
@@ -68,7 +67,16 @@ ResumeStatus compareAgainstClientResumeToken(const intrusive_ptr<ExpressionConte
 
     // If the clusterTime differs from the client's token, this stream cannot be resumed.
     if (tokenDataFromResumedStream.clusterTime != tokenDataFromClient.clusterTime) {
-        return ResumeStatus::kCannotResume;
+        return ResumeStatus::kSurpassedToken;
+    }
+
+    // If the tokenType exceeds the client token's type, then we have passed the resume token point.
+    // This can happen if the client resumes from a synthetic 'high water mark' token from another
+    // shard which happens to have the same clusterTime as an actual change on this shard.
+    if (tokenDataFromResumedStream.tokenType != tokenDataFromClient.tokenType) {
+        return tokenDataFromResumedStream.tokenType > tokenDataFromClient.tokenType
+            ? ResumeStatus::kSurpassedToken
+            : ResumeStatus::kCheckNextDoc;
     }
 
     if (tokenDataFromResumedStream.applyOpsIndex < tokenDataFromClient.applyOpsIndex) {
@@ -76,8 +84,11 @@ ResumeStatus compareAgainstClientResumeToken(const intrusive_ptr<ExpressionConte
     } else if (tokenDataFromResumedStream.applyOpsIndex > tokenDataFromClient.applyOpsIndex) {
         // This could happen if the client provided an applyOpsIndex of 0, yet the 0th document in
         // the applyOps was irrelevant (meaning it was an operation on a collection or DB not being
-        // watched). This indicates a corrupt resume token.
-        uasserted(50792, "Invalid resumeToken: applyOpsIndex was skipped");
+        // watched). If we are looking for the resume token on a shard then this simply means that
+        // the resume token may be on a different shard; otherwise, it indicates a corrupt token.
+        uassert(50792, "Invalid resumeToken: applyOpsIndex was skipped", expCtx->needsMerge);
+        // We are running on a merging shard. Signal that we have read beyond the resume token.
+        return ResumeStatus::kSurpassedToken;
     }
 
     // It is acceptable for the stream UUID to differ from the client's, if this is a whole-database
@@ -85,17 +96,23 @@ ResumeStatus compareAgainstClientResumeToken(const intrusive_ptr<ExpressionConte
     // clusterTime. If the stream UUID sorts after the client's, however, then the stream is not
     // resumable; we are past the point in the stream where the token should have appeared.
     if (tokenDataFromResumedStream.uuid != tokenDataFromClient.uuid) {
-        // If we're not in mongos then this must be a replica set deployment, in which case we don't
-        // ever expect to see identical timestamps and we reject the resume attempt immediately.
-        return !expCtx->inMongos || tokenDataFromResumedStream.uuid > tokenDataFromClient.uuid
-            ? ResumeStatus::kCannotResume
+        // If we are running on a replica set deployment, we don't ever expect to see identical time
+        // stamps and applyOpsIndex but differing UUIDs, and we reject the resume attempt at once.
+        if (!expCtx->inMongos && !expCtx->needsMerge) {
+            return ResumeStatus::kSurpassedToken;
+        }
+        // Otherwise, return a ResumeStatus based on the sort-order of the client and stream UUIDs.
+        return tokenDataFromResumedStream.uuid > tokenDataFromClient.uuid
+            ? ResumeStatus::kSurpassedToken
             : ResumeStatus::kCheckNextDoc;
     }
+
     // If all the fields match exactly, then we have found the token.
     if (ValueComparator::kInstance.evaluate(tokenDataFromResumedStream.documentKey ==
                                             tokenDataFromClient.documentKey)) {
         return ResumeStatus::kFoundToken;
     }
+
     // At this point, we know that the tokens differ only by documentKey. The status we return will
     // depend on whether the stream token is logically before or after the client token. If the
     // latter, then we will never see the resume token and the stream cannot be resumed. However,
@@ -104,7 +121,7 @@ ResumeStatus compareAgainstClientResumeToken(const intrusive_ptr<ExpressionConte
     const auto defaultResumeStatus =
         ValueComparator::kInstance.evaluate(tokenDataFromResumedStream.documentKey >
                                             tokenDataFromClient.documentKey)
-        ? ResumeStatus::kCannotResume
+        ? ResumeStatus::kSurpassedToken
         : ResumeStatus::kCheckNextDoc;
 
     // If we're not running in a sharded context, we don't need to proceed any further.
@@ -157,12 +174,12 @@ Value DocumentSourceEnsureResumeTokenPresent::serialize(
 
 intrusive_ptr<DocumentSourceEnsureResumeTokenPresent>
 DocumentSourceEnsureResumeTokenPresent::create(const intrusive_ptr<ExpressionContext>& expCtx,
-                                               ResumeToken token) {
+                                               ResumeTokenData token) {
     return new DocumentSourceEnsureResumeTokenPresent(expCtx, std::move(token));
 }
 
 DocumentSourceEnsureResumeTokenPresent::DocumentSourceEnsureResumeTokenPresent(
-    const intrusive_ptr<ExpressionContext>& expCtx, ResumeToken token)
+    const intrusive_ptr<ExpressionContext>& expCtx, ResumeTokenData token)
     : DocumentSource(expCtx), _tokenFromClient(std::move(token)) {}
 
 DocumentSource::GetNextResult DocumentSourceEnsureResumeTokenPresent::getNext() {
@@ -194,7 +211,7 @@ DocumentSource::GetNextResult DocumentSourceEnsureResumeTokenPresent::getNext() 
             str::stream()
                 << "resume of change stream was not possible, as the resume token was not found. "
                 << documentFromResumedStream["_id"].getDocument().toString(),
-            _resumeStatus != ResumeStatus::kCannotResume);
+            _resumeStatus != ResumeStatus::kSurpassedToken);
 
     // If we reach this point, then we've seen the resume token.
     invariant(_resumeStatus == ResumeStatus::kFoundToken);
@@ -216,34 +233,64 @@ Value DocumentSourceShardCheckResumability::serialize(
 
 intrusive_ptr<DocumentSourceShardCheckResumability> DocumentSourceShardCheckResumability::create(
     const intrusive_ptr<ExpressionContext>& expCtx, Timestamp ts) {
-    return new DocumentSourceShardCheckResumability(expCtx, ts);
+    // We are resuming from a point in time, not an event. Seed the stage with a high water mark.
+    return create(expCtx, ResumeToken::makeHighWaterMarkToken(ts, expCtx->uuid).getData());
+}
+
+intrusive_ptr<DocumentSourceShardCheckResumability> DocumentSourceShardCheckResumability::create(
+    const intrusive_ptr<ExpressionContext>& expCtx, ResumeTokenData token) {
+    return new DocumentSourceShardCheckResumability(expCtx, std::move(token));
 }
 
 DocumentSourceShardCheckResumability::DocumentSourceShardCheckResumability(
-    const intrusive_ptr<ExpressionContext>& expCtx, Timestamp ts)
-    : DocumentSource(expCtx), _resumeTimestamp(ts), _verifiedResumability(false) {}
+    const intrusive_ptr<ExpressionContext>& expCtx, ResumeTokenData token)
+    : DocumentSource(expCtx), _tokenFromClient(std::move(token)) {}
 
 DocumentSource::GetNextResult DocumentSourceShardCheckResumability::getNext() {
     pExpCtx->checkForInterrupt();
 
-    auto nextInput = pSource->getNext();
-    if (_verifiedResumability)
-        return nextInput;
+    if (_surpassedResumeToken)
+        return pSource->getNext();
 
-    _verifiedResumability = true;
-    if (nextInput.isAdvanced()) {
-        auto doc = nextInput.getDocument();
+    while (!_surpassedResumeToken) {
+        auto nextInput = pSource->getNext();
 
-        auto receivedTimestamp = ResumeToken::parse(doc["_id"].getDocument()).getClusterTime();
-        if (receivedTimestamp == _resumeTimestamp) {
-            // Pass along the document, as the DocumentSourceEnsureResumeTokenPresent stage on the
-            // merger will need to see it.
+        // If we hit EOF, check the oplog to make sure that we are able to resume. This prevents us
+        // from continually returning EOF in cases where the resume point has fallen off the oplog.
+        if (!nextInput.isAdvanced()) {
+            _assertOplogHasEnoughHistory(nextInput);
             return nextInput;
         }
+        // Determine whether the current event sorts before, equal to or after the resume token.
+        auto resumeStatus =
+            compareAgainstClientResumeToken(pExpCtx, nextInput.getDocument(), _tokenFromClient);
+        switch (resumeStatus) {
+            case ResumeStatus::kCheckNextDoc:
+                // If the result was kCheckNextDoc, we are resumable but must swallow this event.
+                _verifiedOplogHasEnoughHistory = true;
+                continue;
+            case ResumeStatus::kSurpassedToken:
+                // In this case the resume token wasn't found; it must be on another shard. We must
+                // examine the oplog to ensure that its history reaches back to before the resume
+                // token, otherwise we may have missed events that fell off the oplog. If we can
+                // resume, fall through into the following case and set _surpassedResumeToken.
+                _assertOplogHasEnoughHistory(nextInput);
+            case ResumeStatus::kFoundToken:
+                // We found the actual token! Set _surpassedResumeToken and return the result.
+                _surpassedResumeToken = true;
+                return nextInput;
+        }
     }
+    MONGO_UNREACHABLE;
+}
 
-    // If we make it here, we need to look up the first document in the oplog and compare it
-    // with the resume token.
+void DocumentSourceShardCheckResumability::_assertOplogHasEnoughHistory(
+    const GetNextResult& nextInput) {
+    // If we have already verified that this stream is resumable, return immediately.
+    if (_verifiedOplogHasEnoughHistory) {
+        return;
+    }
+    // Look up the first document in the oplog and compare it with the resume token's clusterTime.
     auto firstEntryExpCtx = pExpCtx->copyWith(NamespaceString::kRsOplogNamespace);
     auto matchSpec = BSON("$match" << BSONObj());
     auto pipeline = uassertStatusOK(
@@ -253,21 +300,15 @@ DocumentSource::GetNextResult DocumentSourceShardCheckResumability::getNext() {
         uassert(40576,
                 "Resume of change stream was not possible, as the resume point may no longer "
                 "be in the oplog. ",
-                firstOplogEntry["ts"].getTimestamp() < _resumeTimestamp);
+                firstOplogEntry["ts"].getTimestamp() < _tokenFromClient.clusterTime);
     } else {
-        // Very unusual case: the oplog is empty.  We can always resume.  It should never be
-        // possible that the oplog is empty and we got a document matching the filter, however.
-        invariant(nextInput.isEOF());
+        // Very unusual case: the oplog is empty.  We can always resume. However, it should never be
+        // possible to have obtained a document that matched the filter if the oplog is empty.
+        uassert(51087,
+                "Oplog was empty but found an event in the change stream pipeline. It should not "
+                "be possible for this to happen",
+                nextInput.isEOF());
     }
-
-    // The query on the oplog above will overwrite the namespace in current op which is used in
-    // profiling, reset it back to the original namespace. This is a generic problem with any
-    // aggregation that involves sub-operations on different namespaces, and is being tracked by
-    // SERVER-31098.
-    {
-        stdx::lock_guard<Client> lk(*pExpCtx->opCtx->getClient());
-        CurOp::get(pExpCtx->opCtx)->setNS_inlock(pExpCtx->ns.ns());
-    }
-    return nextInput;
+    _verifiedOplogHasEnoughHistory = true;
 }
 }  // namespace mongo

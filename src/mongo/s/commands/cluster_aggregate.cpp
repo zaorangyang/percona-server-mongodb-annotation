@@ -196,6 +196,7 @@ std::set<ShardId> getTargetedShards(OperationContext* opCtx,
 BSONObj createCommandForTargetedShards(
     OperationContext* opCtx,
     const AggregationRequest& request,
+    const LiteParsedPipeline& litePipe,
     const BSONObj originalCmdObj,
     const std::unique_ptr<Pipeline, PipelineDeleter>& pipelineForTargetedShards,
     const BSONObj collationObj,
@@ -212,6 +213,9 @@ BSONObj createCommandForTargetedShards(
 
         if (pipelineForTargetedShards->isSplitForShards()) {
             targetedCmd[AggregationRequest::kNeedsMergeName] = Value(true);
+            // If this is a change stream, set the 'mergeByPBRT' flag on the command. This notifies
+            // the shards that the mongoS is capable of merging streams based on resume token.
+            targetedCmd[AggregationRequest::kMergeByPBRTName] = Value(litePipe.hasChangeStream());
             targetedCmd[AggregationRequest::kCursorName] =
                 Value(DOC(AggregationRequest::kBatchSizeName << 0));
         }
@@ -421,8 +425,13 @@ DispatchShardPipelineResults dispatchShardPipeline(
     }
 
     // Generate the command object for the targeted shards.
-    BSONObj targetedCommand = createCommandForTargetedShards(
-        opCtx, aggRequest, originalCmdObj, pipelineForTargetedShards, collationObj, atClusterTime);
+    BSONObj targetedCommand = createCommandForTargetedShards(opCtx,
+                                                             aggRequest,
+                                                             liteParsedPipeline,
+                                                             originalCmdObj,
+                                                             pipelineForTargetedShards,
+                                                             collationObj,
+                                                             atClusterTime);
 
     // Refresh the shard registry if we're targeting all shards.  We need the shard registry
     // to be at least as current as the logical time used when creating the command for
@@ -432,6 +441,9 @@ DispatchShardPipelineResults dispatchShardPipeline(
         if (!shardRegistry->reload(opCtx)) {
             shardRegistry->reload(opCtx);
         }
+        // Rebuild the set of shards as the shard registry might have changed.
+        shardIds = getTargetedShards(
+            opCtx, mustRunOnAll, executionNsRoutingInfo, shardQuery, aggRequest.getCollation());
     }
 
     // Explain does not produce a cursor, so instead we scatter-gather commands to the shards.
@@ -548,6 +560,7 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
     BSONObjBuilder cursorResponse;
 
     CursorResponseBuilder responseBuilder(true, &cursorResponse);
+    bool stashedResult = false;
 
     for (long long objCount = 0; objCount < request.getBatchSize(); ++objCount) {
         ClusterQueryResult next;
@@ -579,10 +592,19 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
 
         if (!FindCommon::haveSpaceForNext(nextObj, objCount, responseBuilder.bytesUsed())) {
             ccc->queueResult(nextObj);
+            stashedResult = true;
             break;
         }
 
+        // Set the postBatchResumeToken. For non-$changeStream aggregations, this will be empty.
+        responseBuilder.setPostBatchResumeToken(ccc->getPostBatchResumeToken());
         responseBuilder.append(nextObj);
+    }
+
+    // For empty batches, or in the case where the final result was added to the batch rather than
+    // being stashed, we update the PBRT here to ensure that it is the most recent available.
+    if (!stashedResult) {
+        responseBuilder.setPostBatchResumeToken(ccc->getPostBatchResumeToken());
     }
 
     ccc->detachFromOperationContext();
@@ -670,15 +692,17 @@ BSONObj getDefaultCollationForUnshardedCollection(const BSONObj collectionInfo) 
 std::pair<BSONObj, boost::optional<UUID>> getCollationAndUUID(
     const boost::optional<CachedCollectionRoutingInfo>& routingInfo,
     const NamespaceString& nss,
-    const AggregationRequest& request) {
+    const AggregationRequest& request,
+    const LiteParsedPipeline& litePipe) {
     const bool collectionIsSharded = (routingInfo && routingInfo->cm());
     const bool collectionIsNotSharded = (routingInfo && !routingInfo->cm());
 
-    // Because collectionless aggregations are generally run against the 'admin' database, the
-    // standard logic will attempt to resolve its non-existent UUID and collation by sending a
-    // specious 'listCollections' command to the config servers. To prevent this, we immediately
-    // return the user-defined collation if one exists, or an empty BSONObj otherwise.
-    if (nss.isCollectionlessAggregateNS()) {
+    // If the LiteParsedPipeline reports that we should not attempt to resolve the namespace's UUID
+    // and collation, we immediately return the user-defined collation if one exists, or an empty
+    // BSONObj otherwise. For instance, because collectionless aggregations generally run against
+    // the 'admin' database, the standard logic would attempt to resolve its non-existent UUID and
+    // collation by sending a specious 'listCollections' command to the config servers.
+    if (!litePipe.shouldResolveUUIDAndCollation()) {
         return {request.getCollation(), boost::none};
     }
 
@@ -906,6 +930,14 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                       const AggregationRequest& request,
                                       BSONObj cmdObj,
                                       BSONObjBuilder* result) {
+    uassert(51089,
+            str::stream() << "Internal parameter(s) [" << AggregationRequest::kNeedsMergeName
+                          << ", "
+                          << AggregationRequest::kFromMongosName
+                          << ", "
+                          << AggregationRequest::kMergeByPBRTName
+                          << "] cannot be set to 'true' when sent to mongos",
+            !request.needsMerge() && !request.isFromMongos() && !request.mergeByPBRT());
     auto executionNsRoutingInfoStatus = getExecutionNsRoutingInfo(opCtx, namespaces.executionNss);
     boost::optional<CachedCollectionRoutingInfo> routingInfo;
     LiteParsedPipeline litePipe(request);
@@ -943,7 +975,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     }
 
     // Populate the collection UUID and the appropriate collation to use.
-    auto collInfo = getCollationAndUUID(routingInfo, namespaces.executionNss, request);
+    auto collInfo = getCollationAndUUID(routingInfo, namespaces.executionNss, request, litePipe);
     BSONObj collationObj = collInfo.first;
     boost::optional<UUID> uuid = collInfo.second;
 
@@ -1040,7 +1072,7 @@ Status ClusterAggregate::aggPassthrough(OperationContext* opCtx,
     // Format the command for the shard. This adds the 'fromMongos' field, wraps the command as an
     // explain if necessary, and rewrites the result into a format safe to forward to shards.
     cmdObj = CommandHelpers::filterCommandRequestForPassthrough(createCommandForTargetedShards(
-        opCtx, aggRequest, cmdObj, nullptr, BSONObj(), atClusterTime));
+        opCtx, aggRequest, liteParsedPipeline, cmdObj, nullptr, BSONObj(), atClusterTime));
 
     auto cmdResponse = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
         opCtx,

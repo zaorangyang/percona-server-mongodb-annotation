@@ -1,4 +1,3 @@
-
 /**
  *    Copyright (C) 2018-present MongoDB, Inc.
  *
@@ -28,4 +27,26 @@
  *    it in the license file.
  */
 
-// This file intentionally left blank.
+#pragma once
+
+#include <string>
+
+#include "mongo/base/status.h"
+#include "mongo/util/options_parser/environment.h"
+
+namespace mongo {
+
+class MobileGlobalOptions {
+public:
+    MobileGlobalOptions() : mobileDurabilityLevel(1){};
+
+    Status store(const optionenvironment::Environment& params);
+
+    // This is used by the Mobile SE and allows users to set the value
+    // passed to SQLite's PRAGMA synchronous command
+    std::int32_t mobileDurabilityLevel;
+};
+
+extern MobileGlobalOptions mobileGlobalOptions;
+
+}  // namespace mongo

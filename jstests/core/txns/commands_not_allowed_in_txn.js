@@ -99,7 +99,6 @@
         {filemd5: 1, root: "fs"},
         {geoNear: collName, near: [0, 0]},
         {group: {ns: collName, key: {_id: 1}, $reduce: function(curr, result) {}, initial: {}}},
-        {mapReduce: collName, map: function() {}, reduce: function(key, vals) {}, out: "out"},
         {parallelCollectionScan: collName, numCursors: 1},
     ];
 
@@ -121,7 +120,8 @@
           createIndexes: collName,
           indexes: [{name: "a_1", key: {a: 1}}],
           writeConcern: {w: "majority"}
-        }
+        },
+        {mapReduce: collName, map: function() {}, reduce: function(key, vals) {}, out: "out"},
     ];
 
     nonSessionCommands.forEach(testCommand);
@@ -151,7 +151,7 @@
         stmtId: NumberInt(1),
         autocommit: false
     }),
-                                 ErrorCodes.ConflictingOperationInProgress);
+                                 ErrorCodes.OperationNotSupportedInTransaction);
 
     // It is still possible to commit the transaction. The rejected command does not abort the
     // transaction.

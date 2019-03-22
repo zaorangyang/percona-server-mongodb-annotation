@@ -7,12 +7,13 @@ selector:
   # Will always fail on last-stable. In order for the test to succeed, the setFCV
   # command has to reach the shards. Since the cluster will already be
   # running in fully downgraded version, the config server won't forward the
-  # command to the shards - it'll just return success immediately. 
+  # command to the shards - it'll just return success immediately.
   - jstests/sharding/max_time_ms_sharded_new_commands.js
   # Calls setFCV=4.0, which cannot be run on last-stable shards.
   - jstests/sharding/database_versioning_upgrade_downgrade.js
   - jstests/sharding/shard_collection_cache_upgrade_downgrade.js
   #### Enable when 4.0 becomes last-stable.
+  - jstests/sharding/aggregation_internal_parameters.js
   - jstests/sharding/change_stream_no_shards.js
   - jstests/sharding/clone_catalog_data.js
   - jstests/sharding/create_database.js
@@ -24,6 +25,7 @@ selector:
   - jstests/sharding/geo_near_sort.js
   - jstests/sharding/basic_drop_coll.js
   - jstests/sharding/commands_that_write_accept_wc_configRS.js
+  - jstests/sharding/failcommand_ignores_internal.js
   - jstests/sharding/kill_pinned_cursor.js
   - jstests/sharding/movechunk_commit_changelog_stats.js
   - jstests/sharding/configsvr_metadata_commands_require_majority_write_concern.js

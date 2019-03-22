@@ -142,6 +142,8 @@ public:
 
     virtual Timestamp getAllCommittedTimestamp() const override;
 
+    virtual Timestamp getOldestOpenReadTimestamp() const override;
+
     bool supportsReadConcernSnapshot() const final;
 
     bool supportsReadConcernMajority() const final;
@@ -173,6 +175,8 @@ public:
      */
     StatusWith<std::vector<StorageEngine::CollectionIndexNamePair>> reconcileCatalogAndIdents(
         OperationContext* opCtx) override;
+
+    std::string getFilesystemPathForDb(const std::string& dbName) const override;
 
     /**
      * When loading after an unclean shutdown, this performs cleanup on the KVCatalog and unsets the

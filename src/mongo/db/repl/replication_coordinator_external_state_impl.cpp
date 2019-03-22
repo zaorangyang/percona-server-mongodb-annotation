@@ -53,6 +53,7 @@
 #include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_sessions_local.h"
+#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/op_observer.h"
@@ -155,7 +156,7 @@ auto makeThreadPool(const std::string& poolName) {
     threadPoolOptions.poolName = poolName;
     threadPoolOptions.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
-        AuthorizationSession::get(cc())->grantInternalAuthorization();
+        AuthorizationSession::get(cc())->grantInternalAuthorization(&cc());
     };
     return stdx::make_unique<ThreadPool>(threadPoolOptions);
 }
@@ -623,6 +624,10 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
 void ReplicationCoordinatorExternalStateImpl::setGlobalTimestamp(ServiceContext* ctx,
                                                                  const Timestamp& newTime) {
     setNewTimestamp(ctx, newTime);
+}
+
+Timestamp ReplicationCoordinatorExternalStateImpl::getGlobalTimestamp(ServiceContext* service) {
+    return LogicalClock::get(service)->getClusterTime().asTimestamp();
 }
 
 bool ReplicationCoordinatorExternalStateImpl::oplogExists(OperationContext* opCtx) {
