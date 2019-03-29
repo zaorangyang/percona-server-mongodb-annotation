@@ -452,6 +452,11 @@ ExitCode _initAndListen(int listenPort) {
         exitCleanly(EXIT_NEED_DOWNGRADE);
     }
 
+    if (storageGlobalParams.upgrade) {
+        log() << "finished checking dbs";
+        exitCleanly(EXIT_CLEAN);
+    }
+
     // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set. If
     // we are part of a replica set and are started up with no data files, we do not set the
     // featureCompatibilityVersion until a primary is chosen. For this case, we expect the in-memory
@@ -459,11 +464,6 @@ ExitCode _initAndListen(int listenPort) {
     if (canCallFCVSetIfCleanStartup &&
         (!replSettings.usingReplSets() || swNonLocalDatabases.getValue())) {
         invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
-    }
-
-    if (storageGlobalParams.upgrade) {
-        log() << "finished checking dbs";
-        exitCleanly(EXIT_CLEAN);
     }
 
     // Start up health log writer thread.
@@ -867,11 +867,38 @@ MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManage
 
 // NOTE: This function may be called at any time after registerShutdownTask is called below. It
 // must not depend on the prior execution of mongo initializers or the existence of threads.
-void shutdownTask() {
+void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     Client::initThreadIfNotAlready();
 
     auto const client = Client::getCurrent();
     auto const serviceContext = client->getServiceContext();
+
+    // If we don't have shutdownArgs, we're shutting down from a signal, or other clean shutdown
+    // path.
+    //
+    // In that case, do a default step down, still shutting down if stepDown fails.
+    {
+        auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
+        if (replCoord && !shutdownArgs.isUserInitiated) {
+            replCoord->enterTerminalShutdown();
+            ServiceContext::UniqueOperationContext uniqueOpCtx;
+            OperationContext* opCtx = client->getOperationContext();
+            if (!opCtx) {
+                uniqueOpCtx = client->makeOperationContext();
+                opCtx = uniqueOpCtx.get();
+            }
+
+            try {
+                uassertStatusOK(
+                    replCoord->stepDown(opCtx, false /* force */, Seconds(10), Seconds(120)));
+            } catch (const ExceptionFor<ErrorCodes::NotMaster>&) {
+                // ignore not master errors
+            } catch (const DBException& e) {
+                log() << "Failed to stepDown in non-command initiated shutdown path "
+                      << e.toString();
+            }
+        }
+    }
 
     // Terminate the balancer thread so it doesn't leak memory.
     if (auto balancer = Balancer::get(serviceContext)) {

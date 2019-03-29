@@ -104,6 +104,8 @@ public:
 
     virtual void startup(OperationContext* opCtx) override;
 
+    virtual void enterTerminalShutdown() override;
+
     virtual void shutdown(OperationContext* opCtx) override;
 
     virtual const ReplSettings& getSettings() const override;
@@ -790,9 +792,20 @@ private:
         OperationContext* opCtx);
 
     /**
-     * Performs a post member-state update action.  Do not call while holding _mutex.
+     * Performs a post member-state update action.  Do not call while holding _mutex. "action" must
+     * not be kActionWinElection, use _postWonElectionUpdateMemberState_inlock instead.
      */
     void _performPostMemberStateUpdateAction(PostMemberStateUpdateAction action);
+
+    /**
+     * Update state after winning an election.
+     */
+    void _postWonElectionUpdateMemberState_inlock();
+
+    /**
+     * Helper to select appropriate sync source after transitioning from a follower state.
+     */
+    void _onFollowerModeStateChange();
 
     /**
      * Begins an attempt to elect this node.
@@ -1339,6 +1352,9 @@ private:
     // When we decide to step down due to hearing about a higher term, we remember the term we heard
     // here so we can update our term to match as part of finishing stepdown.
     boost::optional<long long> _pendingTermUpdateDuringStepDown;  // (M)
+
+    // If we're in terminal shutdown.  If true, we'll refuse to vote in elections.
+    bool _inTerminalShutdown = false;  // (M)
 };
 
 }  // namespace repl
