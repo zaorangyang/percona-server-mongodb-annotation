@@ -22,7 +22,6 @@ Usage: $0 [OPTIONS]
         --psm_release       PSM_RELEASE(mandatory)
         --mongo_tools_tag   MONGO_TOOLS_TAG(mandatory)
         --debug             build debug tarball
-
         --help) usage ;;
 Example $0 --builddir=/tmp/PSMDB --get_sources=1 --build_src_rpm=1 --build_rpm=1
 EOF
@@ -158,7 +157,7 @@ get_sources(){
     git clone https://github.com/mongodb/mongo-tools.git
     cd mongo-tools
     git checkout $MONGO_TOOLS_TAG
-    echo "export PSMDB_TOOLS_COMMIT_HASH=\"$(git rev-parse HEAD)\"" > set_tools_revision.sh
+    echo "export PSMDB_TOOLS_COMMIT_HASH=\"$(git rev-parse HEAD)\""  >  set_tools_revision.sh
     echo "export PSMDB_TOOLS_REVISION=\"${PSM_VER}-${PSM_RELEASE}\"" >> set_tools_revision.sh
     chmod +x set_tools_revision.sh
     cd ${WORKDIR}
@@ -228,7 +227,7 @@ install_gcc_54_deb(){
         rm -rf /usr/local/gcc-5.4.0
         mv gcc-5.4.0 /usr/local/
     fi
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+    if [[ x"${DEBIAN}" = xcosmic ]] || [[ x"${DEBIAN}" = xbionic ]] || [[ x"${DEBIAN}" = xdisco ]]; then
         apt-get -y install gcc-5 g++-5
     fi
     if [ x"${DEBIAN}" = xstretch ]; then
@@ -240,7 +239,7 @@ install_gcc_54_deb(){
 }
 
 set_compiler(){
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+    if [[ x"${DEBIAN}" = xcosmic ]] || [[ x"${DEBIAN}" = xbionic ]] || [[ x"${DEBIAN}" = xdisco ]]; then
         export CC=/usr/bin/gcc-5
         export CXX=/usr/bin/g++-5
     else
@@ -319,7 +318,7 @@ install_deps() {
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
       INSTALL_LIST="python python-dev valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
-      if [ x"${DEBIAN}" = xstretch -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xcosmic ]; then
+      if [[] x"${DEBIAN}" = xstretch ]] || [[ x"${DEBIAN}" = xbionic ]] || [[ x"${DEBIAN}" = xcosmic ]]; then
         INSTALL_LIST="${INSTALL_LIST} libssl1.0-dev libcurl4-gnutls-dev"
       else
         INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev"
@@ -507,7 +506,7 @@ build_source_deb(){
         echo "source deb package will not be created"
         return;
     fi
-    if [ "x$OS" = "xrmp" ]
+    if [ "x$OS" = "xrpm" ]
     then
         echo "It is not possible to build source deb here"
         exit 1
