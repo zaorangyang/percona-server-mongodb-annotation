@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 shell_quote_string() {
   echo "$1" | sed -e 's,\([^a-zA-Z0-9/_.=-]\),\\\1,g'
@@ -250,7 +250,7 @@ set_compiler(){
 }
 
 fix_rules(){
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic ]; then
+    if [[ x"${DEBIAN}" = xcosmic ]] || [[ x"${DEBIAN}" = xbionic ]] || [[ x"${DEBIAN}" = xdisco ]]; then
         sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-5|' debian/rules
         sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-5|' debian/rules
     else
