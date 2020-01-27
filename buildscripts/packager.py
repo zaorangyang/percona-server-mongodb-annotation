@@ -283,7 +283,7 @@ class Distro(object):
         if re.search("(suse)", self.n):
             return [ "suse11", "suse12" ]
         elif re.search("(redhat|fedora|centos)", self.n):
-            return [ "rhel70", "rhel71", "rhel72", "rhel62", "rhel55" ]
+            return [ "rhel80", "rhel70", "rhel71", "rhel72", "rhel62", "rhel55" ]
         elif self.n == 'amazon':
             return [ "amazon" ]
         elif self.n == 'ubuntu':
@@ -725,13 +725,24 @@ def make_rpm(distro, build_os, arch, spec, srcdir):
     # Do the build.
 
     flags.extend(["-D", "dynamic_version " + spec.pversion(distro), "-D", "dynamic_release " + spec.prelease(), "-D", "_topdir " + topdir])
-    sysassert(["rpmbuild", "-ba", "--target", distro_arch] + flags + ["%s/SPECS/mongodb%s.spec" % (topdir, suffix)])
-    r=distro.repodir(arch, build_os, spec)
-    ensure_dir(r)
+
+    # Versions of RPM after 4.4 ignore our BuildRoot tag so we need to
+    # specify it on the command line args to rpmbuild
+    if ((distro.name() == "suse" and distro.repo_os_version(build_os) == "15")
+            or (distro.name() == "redhat" and distro.repo_os_version(build_os) == "8")):
+        flags.extend([
+            "--buildroot", os.path.join(topdir, "BUILDROOT"),
+        ])
+
+    sysassert(["rpmbuild", "-ba", "--target", distro_arch] + flags +
+              ["%s/SPECS/mongodb%s.spec" % (topdir, suffix)])
+    repo_dir = distro.repodir(arch, build_os, spec)
+    ensure_dir(repo_dir)
+
     # FIXME: see if some combination of shutil.copy<hoohah> and glob
     # can do this without shelling out.
-    sysassert(["sh", "-c", "cp -v \"%s/RPMS/%s/\"*.rpm \"%s\""%(topdir, distro_arch, r)])
-    return r
+    sysassert(["sh", "-c", "cp -v \"%s/RPMS/%s/\"*.rpm \"%s\""%(topdir, distro_arch, repo_dir)])
+    return repo_dir
 
 def make_rpm_repo(repo):
     oldpwd=os.getcwd()
